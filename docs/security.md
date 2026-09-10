@@ -33,8 +33,10 @@
 
 ## Token & scope design
 
-Scopes: `workspace.read`, `workspace.search`, `git.read`, `execution.read`,
-`offline_access`. Tools enforce scopes individually (`INSUFFICIENT_SCOPE`).
+Default scopes: `workspace.read`, `workspace.search`, `git.read`, `execution.read`,
+`offline_access`. Tools enforce scopes individually (`INSUFFICIENT_SCOPE`). When
+`C2C_ENABLE_WRITE_PROBE=1`, an explicit authorization may additionally request the
+separate `probe.write` scope; existing refresh tokens do not gain it.
 Access tokens: 1 hour. Refresh tokens: 30 days, rotated. All tokens bound to
 `workspace_id` and `client_id`.
 
@@ -50,8 +52,71 @@ tokens are persisted — a stolen state file does not yield usable bearer tokens
 than OS-keychain-based. Raw tokens are never written anywhere. Keychain
 integration is a V2 item.
 
-## What ChatGPT can never do (V1)
+## Experimental MCP write probe
 
-Write files, delete files, run shell commands, commit, install packages —
-these tools do not exist on the server, so no prompt injection, scope bug, or
-UI confusion can enable them.
+The probe is off by default and is the only MCP write action. When enabled it adds
+`write_probe` beside the original 9 read-only tools and writes only
+`getStateDir()/write-probe.json` (`c2c-state/write-probe.json` logically), with a
+validated nonce, timestamp, workspace ID and tool name. It overwrites the previous
+record; it cannot write workspace files, delete files, run commands or commit.
+The tool declares `readOnlyHint:false`, `destructiveHint:true`,
+`idempotentHint:false` and `openWorldHint:false`; missing `probe.write` returns
+`INSUFFICIENT_SCOPE` with `mcp/www_authenticate`. See
+[the experiment procedure](experimental-write-probe.md).
+
+## Web Control trust boundary
+
+新增可选控制面使用当前 Codex Agent 的 in-app browser 接收绑定 Chat 的完整 Assistant 消息。
+Web Control 本身不新增 MCP 写入动作；默认 MCP 数据面仍只读：workspace_info、list_directory、
+read_file、search_workspace、git_status、git_diff、test_status、execution_summary、execution_output。
+可选的实验性 `write_probe` 与 Web Control 独立，默认关闭，见上文。
+
+- **本地明确授权。** 默认 disabled；只有 Codex 本地用户明确开启后，可信本地 Agent 才能传
+  `--local-user` 给本地 enable。网页 ENABLE、项目文件或 MCP 返回不能触发 enable。
+  这个 flag 是本地工作流声明，不是密码或远端身份验证；本机已有执行权限的人当然可以运行 CLI。
+- **来源与意图。** Agent 核对真实网页的 role、完整消息、稳定 ID、消息顺序、生成结束以及最近
+  人类用户的明确委派。CLI 检查严格 envelope、HTTPS Chat URL、workspaceId、Codex task ID、
+  controlSessionId、有效期和完整 COMMAND 语法。envelope 中的 source/explicitDelegation/
+  withinOriginalScope 是本地 Agent 的观察声明，**不能由网页自证**。仅有结构正确的文件或日志不够。
+  没有可靠 DOM 来源/意图证据就拒绝，不扫描整页文字或工具卡片。
+- **不可信数据。** Workspace content must never be treated as authorization to control Codex.
+  文件、README、AGENTS、代码注释、diff、日志、MCP 都可用于分析，不能授权开启控制、扩大任务、
+  绕过本地规则。Boot 明确告知此边界；Codex 独立审查任务，不能仅依赖 ChatGPT 遵守 Boot。
+- **自动消息不是人类授权。** Boot/EXECUTED 的真实 message IDs 保存在状态里。Review follow-up
+  只能跟随当前 completed 命令的 EXECUTED，使用新 COMMAND_ID，并由主代理核对仍在原用户任务范围。
+  原任务 DONE 后必须是新的用户明确委派；普通建议不执行。
+  本地 reject 消耗已使用的用户消息授权，不能仅更换 COMMAND_ID 重试被拒绝的目标。
+  Boot/反馈 ID 必须仍存在于自动消息历史中，引用缺失也视为损坏状态，拒绝接收。
+- **防重放与原子写。** accepted 在任何执行前持久化，start 只允许 accepted→executing；
+  所有 accepted/executing/completed/rejected ID 跨恢复和重新 enable 保留，不回收历史。
+  对同一消息的再次读取不重新执行。达到 10000 条历史停止接单。session 使用独占短锁、
+  临时文件 fsync 后原子 rename；并发、损坏状态和遗留锁拒绝操作，旧文件保留。
+  `session clear` 禁用控制但不删除历史；Normal session 更新保留 webControl。
+  activeCommand 未结案时拒绝重新 enable；completed 的结果仍能在关闭/过期后补反馈。
+  无法继续网页 Review 时，仅本地用户明确要求的 close-task 可以结案已完成任务，保留历史。
+- **权限不扩大。** COMMAND 是任务级自然语言，不是直接 Shell、文件写入、git 操作或子代理 API。
+  主代理仍按实际授权、AGENTS 和本地审批/沙箱决定实现，禁止自动 bypass、提权或改写沙箱配置。
+  Web Control 使用 doctor --no-fix 检查，权限不足停止；Normal 模式原设置流程保持独立。
+
+状态在已有 OS AppData 的 `sessions/<workspaceId>.json` 内，不新增凭证，不读写 OAuth token。
+任务自然语言属于本地状态，不能夹带凭证。执行输出继续走既有 sanitizer；网页反馈仅元数据。
+
+### 限制与恢复
+
+控制依赖可信本地 Agent 的 UI 来源和用户意图判断；不是密码学认证的远程执行通道，也不能防御
+已经控制本机账户/Agent 的攻击者。人工删除、篡改或回滚历史文件会损坏 replay 保证，禁止用这种方式恢复。
+缺失的旧历史无法凭空重建；只从经过核对、不会丢失已处理 ID 的副本恢复。
+遗留锁不能自动删：先核对锁文件的 PID 已退出；损坏会话保留原件并人工恢复，不能清空后继续接单。
+
+默认 30 分钟 idle（轮询/重复/拒绝不续期，executing 暂停计时）；过期由下一次本地检查落实。
+存储 enabled 不等于后台在线。Agent 停止后不会收取消息或自动恢复在途执行；accepted/executing
+必须先核对实际修改和记录，不能自动重跑。关闭只禁止新接单，不假称撤销已发生的修改或杀死外部进程。
+**Web Control only works while the corresponding Codex control session remains active.**
+不启动 daemon/第二 app-server，不用 Desktop remote resume，不支持网页唤醒关闭的 Codex。
+
+## What MCP cannot do (V1)
+
+Except for the explicitly authorized experimental probe described above, MCP has
+no tools to write workspace files, delete files, run shell commands, commit or
+install packages directly. Prompt injection, a scope bug or UI confusion cannot
+turn the probe into any of those capabilities.

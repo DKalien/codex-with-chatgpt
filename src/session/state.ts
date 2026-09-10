@@ -1,6 +1,45 @@
 import path from "node:path";
 import fs from "node:fs";
-import { getStateDir, readJsonIfExists, writeSecureJson } from "../config/paths.js";
+import { randomUUID } from "node:crypto";
+import { z } from "zod";
+import { ensureDir, getStateDir } from "../config/paths.js";
+import { CONTROL_KINDS } from "./control-protocol.js";
+
+const controlId = z.string().regex(/^[A-Za-z0-9_-]{1,128}$/);
+const messageId = z.string().min(1).max(200).regex(/^[A-Za-z0-9_-]+$/);
+const controlCommandSchema = z.object({
+  state: z.literal("COMMAND"), controlSessionId: controlId, workspaceId: controlId, commandId: controlId,
+  kind: z.enum(CONTROL_KINDS), goal: z.string().min(1).max(8192),
+  instructions: z.string().min(1).max(8192), successCriteria: z.string().min(1).max(8192),
+}).strict();
+export const webControlStateSchema = z.object({
+  version: z.literal(1), enabled: z.boolean(), controlSessionId: controlId, workspaceId: controlId,
+  codexSessionId: controlId, conversationUrl: z.string().url(),
+  createdAt: z.string().datetime(), expiresAt: z.string().datetime(),
+  idleTimeoutMinutes: z.number().int().min(1).max(240),
+  status: z.enum(["starting", "waiting", "accepted", "executing", "review", "disabled", "expired"]),
+  bootMessageId: messageId.optional(),
+  // 不丢弃旧 ID；达到上限时停止接单，避免历史淘汰重新打开 replay 窗口。
+  seenCommands: z.array(z.object({
+    commandId: controlId, controlSessionId: controlId,
+    status: z.enum(["accepted", "executing", "completed", "rejected"]),
+    updatedAt: z.string().datetime(), reason: z.string().max(500).optional(),
+    userMessageId: messageId.optional(), assistantMessageId: messageId.optional(),
+    feedbackMessageId: messageId.optional(),
+  }).strict()).max(10000),
+  generatedMessageIds: z.array(messageId).max(20000),
+  activeCommand: z.object({
+    command: controlCommandSchema, taskId: controlId, iteration: z.number().int().nonnegative(),
+    rootGoal: z.string().min(1).max(8192), userMessageId: messageId,
+  }).strict().optional(),
+}).strict();
+export type WebControlState = z.infer<typeof webControlStateSchema>;
+
+function validateWebControl(session: SavedSession): void {
+  if (session.webControl !== undefined && !webControlStateSchema.safeParse(session.webControl).success) {
+    throw new Error("网页控制状态损坏，拒绝操作；请保留会话文件并人工恢复防重放历史。");
+  }
+}
 
 export type ConversationMode = "long-chat" | "project";
 
@@ -54,6 +93,7 @@ export interface SavedSession {
   projectUrl?: string;
   connectorName?: string;
   checkpoint?: TaskCheckpoint;
+  webControl?: WebControlState;
 }
 
 export interface SessionPatch {
@@ -85,12 +125,69 @@ export function sessionFile(workspaceId: string): string {
 }
 
 export function readSession(workspaceId: string): SavedSession | null {
-  return readJsonIfExists<SavedSession>(sessionFile(workspaceId));
+  let session: SavedSession;
+  try {
+    const text = fs.readFileSync(sessionFile(workspaceId), "utf8");
+    const value: unknown = JSON.parse(text);
+    if (!value || typeof value !== "object" || Array.isArray(value) ||
+        typeof (value as SavedSession).savedAt !== "string") throw new Error("invalid session");
+    session = value as SavedSession;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw new Error("会话状态无法读取或已损坏，已停止操作。请保留原文件并人工恢复，不能清空防重放记录。");
+  }
+  validateWebControl(session);
+  return session;
 }
 
 export function writeSession(workspaceId: string, session: SavedSession): SavedSession {
-  writeSecureJson(sessionFile(workspaceId), session);
-  return session;
+  return updateSession(workspaceId, (previous) => ({
+    ...session, webControl: previous?.webControl ?? session.webControl,
+  }))!;
+}
+
+/** 同一个 session 的所有写入共享短锁，避免旧快照覆盖 COMMAND 防重放记录。 */
+export function updateSession(
+  workspaceId: string,
+  change: (previous: SavedSession | null) => SavedSession | null
+): SavedSession | null {
+  const file = sessionFile(workspaceId);
+  ensureDir(path.dirname(file));
+  const lock = `${file}.lock`;
+  let lockFd: number;
+  try {
+    lockFd = fs.openSync(lock, "wx", 0o600);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    throw new Error("会话写锁已存在，拒绝并发操作。异常退出后请先核对 .lock 中的 PID，再人工清除遗留锁；不要删除会话 JSON。");
+  }
+  const temporary = `${file}.${randomUUID()}.tmp`;
+  try {
+    fs.writeFileSync(lockFd, JSON.stringify({ pid: process.pid, createdAt: Date.now() }));
+    const previous = readSession(workspaceId);
+    const next = change(previous);
+    if (previous?.webControl && !next?.webControl) throw new Error("不能删除网页控制的防重放历史。");
+    if (next) {
+      validateWebControl(next);
+      const fd = fs.openSync(temporary, "wx", 0o600);
+      try {
+        fs.writeFileSync(fd, JSON.stringify(next, null, 2));
+        fs.fsyncSync(fd);
+      } finally {
+        fs.closeSync(fd);
+      }
+      fs.renameSync(temporary, file);
+    } else {
+      fs.rmSync(file, { force: true });
+    }
+    return next;
+  } finally {
+    try { fs.rmSync(temporary, { force: true }); }
+    finally {
+      fs.closeSync(lockFd);
+      fs.unlinkSync(lock);
+    }
+  }
 }
 
 export function normalizeProjectUrl(url: string): string | null {
@@ -260,25 +357,27 @@ export function mergeSession(previous: SavedSession | null, patch: SessionPatch)
     projectUrl,
     connectorName: patch.connectorName ?? previous?.connectorName,
     checkpoint,
+    webControl: previous?.webControl,
     savedAt: new Date().toISOString(),
   };
 }
 
 /** Drop the current chat pointer. Keep Project binding so the collection stays. */
 export function clearChatPointer(workspaceId: string): { cleared: boolean; keptProject: boolean } {
-  const previous = readSession(workspaceId);
-  if (!previous) return { cleared: false, keptProject: false };
-  const view = resolveConversation(previous);
-  if (view.mode === "project" && view.projectUrl) {
-    writeSession(workspaceId, {
-      conversationMode: "project",
-      projectUrl: view.projectUrl,
-      connectorName: previous.connectorName,
-      checkpoint: previous.checkpoint,
+  let result = { cleared: false, keptProject: false };
+  updateSession(workspaceId, (previous) => {
+    if (!previous) return null;
+    const view = resolveConversation(previous);
+    result = { cleared: true, keptProject: view.mode === "project" && Boolean(view.projectUrl) };
+    if (!result.keptProject && !previous.webControl) return null;
+    return {
+      ...(result.keptProject ? {
+        conversationMode: "project" as const,
+        projectUrl: view.projectUrl!, connectorName: previous.connectorName, checkpoint: previous.checkpoint,
+      } : {}),
+      webControl: previous.webControl ? { ...previous.webControl, enabled: false, status: "disabled" } : undefined,
       savedAt: new Date().toISOString(),
-    });
-    return { cleared: true, keptProject: true };
-  }
-  fs.rmSync(sessionFile(workspaceId), { force: true });
-  return { cleared: true, keptProject: false };
+    };
+  });
+  return result;
 }

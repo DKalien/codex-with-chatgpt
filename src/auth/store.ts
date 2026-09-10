@@ -2,6 +2,7 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { ensureDir, getStateDir, readJsonIfExists, writeSecureJson } from "../config/paths.js";
+import { isWriteProbeEnabled, WRITE_PROBE_SCOPE } from "../mcp/write-probe.js";
 
 export const SUPPORTED_SCOPES = [
   "workspace.read",
@@ -11,7 +12,11 @@ export const SUPPORTED_SCOPES = [
   "offline_access",
 ] as const;
 
-export type Scope = (typeof SUPPORTED_SCOPES)[number];
+export type Scope = (typeof SUPPORTED_SCOPES)[number] | typeof WRITE_PROBE_SCOPE;
+
+export function getSupportedScopes(): string[] {
+  return isWriteProbeEnabled() ? [...SUPPORTED_SCOPES, WRITE_PROBE_SCOPE] : [...SUPPORTED_SCOPES];
+}
 
 export interface ClientRegistration {
   clientId: string;
@@ -273,6 +278,6 @@ export class AuthStore {
 export function filterScopes(requested: string | undefined): string[] {
   if (!requested || requested.trim() === "") return [...SUPPORTED_SCOPES];
   const asked = requested.split(/[\s+]+/).filter(Boolean);
-  const granted = asked.filter((scope) => (SUPPORTED_SCOPES as readonly string[]).includes(scope));
+  const granted = asked.filter((scope) => getSupportedScopes().includes(scope));
   return granted.length > 0 ? granted : [...SUPPORTED_SCOPES];
 }

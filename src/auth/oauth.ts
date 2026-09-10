@@ -1,6 +1,7 @@
 import { Router, type Request, type Response, urlencoded, json } from "express";
 import { randomBytes } from "node:crypto";
-import { AuthStore, SUPPORTED_SCOPES, base64UrlSha256, filterScopes, safeEqual } from "./store.js";
+import { AuthStore, getSupportedScopes, base64UrlSha256, filterScopes, safeEqual } from "./store.js";
+import { WRITE_PROBE_SCOPE } from "../mcp/write-probe.js";
 import { PairingManager } from "../pairing/manager.js";
 import type { Logger } from "../logger/index.js";
 import { PRODUCT_NAME } from "../version.js";
@@ -51,7 +52,7 @@ function authorizationServerMetadata(base: string): Record<string, unknown> {
     grant_types_supported: ["authorization_code", "refresh_token"],
     code_challenge_methods_supported: ["S256"],
     token_endpoint_auth_methods_supported: ["none"],
-    scopes_supported: [...SUPPORTED_SCOPES],
+    scopes_supported: getSupportedScopes(),
   };
 }
 
@@ -59,7 +60,7 @@ function protectedResourceMetadata(base: string): Record<string, unknown> {
   return {
     resource: `${base}/mcp`,
     authorization_servers: [base],
-    scopes_supported: [...SUPPORTED_SCOPES],
+    scopes_supported: getSupportedScopes(),
     bearer_methods_supported: ["header"],
     resource_name: PRODUCT_NAME,
   };
@@ -76,6 +77,7 @@ function pairingPage(opts: {
     "workspace.search": "Search this workspace",
     "git.read": "Read git status and diffs",
     "execution.read": "Read Codex execution summaries",
+    [WRITE_PROBE_SCOPE]: "实验：将测试 nonce 写入 C2C 自身的固定状态文件（不修改工作区）",
     offline_access: "Stay connected between sessions",
   };
   const scopeList = opts.scopes
@@ -119,7 +121,7 @@ function pairingPage(opts: {
 <body>
 <div class="card">
   <h1>${escapedProductName}</h1>
-  <p class="sub">ChatGPT is requesting access to workspace <strong>${escapedWorkspaceName}</strong> (read-only):</p>
+  <p class="sub">ChatGPT is requesting access to workspace <strong>${escapedWorkspaceName}</strong> (${opts.scopes.includes(WRITE_PROBE_SCOPE) ? "工作区只读；另含 C2C 状态写入实验" : "read-only"}):</p>
   <ul>${scopeList}</ul>
   <form method="POST" action="authorize">
     <input type="hidden" name="request_id" value="${escapedRequestId}">

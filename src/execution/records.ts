@@ -18,6 +18,8 @@ export const executionRecordSchema = z.object({
   notes: z.string().optional(),
   outputId: z.number().int().positive().optional(),
   outputAvailable: z.boolean().optional(),
+  controlSessionId: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/).optional(),
+  commandId: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/).optional(),
 });
 
 export type ExecutionRecord = z.infer<typeof executionRecordSchema>;

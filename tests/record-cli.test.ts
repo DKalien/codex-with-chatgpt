@@ -1,8 +1,9 @@
+import fs from "node:fs";
 import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { listExecutionOutputs } from "../src/execution/output.js";
+import { listExecutionOutputs, MAX_OUTPUT_RECORDS, saveExecutionOutput } from "../src/execution/output.js";
 import { appendExecutionRecord, readExecutionRecords, type ExecutionRecord } from "../src/execution/records.js";
 import { Workspace } from "../src/workspace/manager.js";
 import { cleanup, makeTmpDir } from "./helpers.js";
@@ -115,6 +116,91 @@ describe("c2c record", () => {
       expect(listExecutionOutputs(workspace.id)).toEqual([]);
     });
   });
+
+  it.each(["--control-session-id", "--command-id"])(
+    "rejects invalid %s without creating command output",
+    (idOption) => {
+      withRecordEnvironment((root, workspace) => {
+        const stateDir = process.env.C2C_STATE_DIR!;
+        const result = runRecord(root, [
+          "--iteration",
+          "1",
+          idOption,
+          "bad!",
+          "--command",
+          "pnpm test",
+          "--output",
+          "tests passed",
+        ]);
+
+        expect(result.status).toBe(1);
+        expect(readExecutionRecords(workspace.id)).toEqual([]);
+        expect(listExecutionOutputs(workspace.id, MAX_OUTPUT_RECORDS)).toEqual([]);
+        expect(fs.existsSync(path.join(stateDir, "executions", `${workspace.id}.jsonl`))).toBe(false);
+        expect(fs.existsSync(path.join(stateDir, "execution-outputs", workspace.id, "index.json"))).toBe(false);
+        expect(fs.existsSync(path.join(stateDir, "execution-outputs", workspace.id, "bodies"))).toBe(false);
+      });
+    }
+  );
+
+  // 预填满输出保留窗口，验证非法 ID 不会先写入并淘汰旧输出。
+  it.each(["--control-session-id", "--command-id"])(
+    "keeps a full output window unchanged for invalid %s",
+    (idOption) => {
+      withRecordEnvironment((root, workspace) => {
+        const stateDir = process.env.C2C_STATE_DIR!;
+        const seededOutputs = Array.from({ length: MAX_OUTPUT_RECORDS }, (_, iteration) =>
+          saveExecutionOutput(workspace.id, {
+            command: `seed command ${iteration}`,
+            raw: `seed body ${iteration}`,
+            exitCode: 0,
+            taskId: "c2c_seed",
+            iteration,
+          })
+        );
+        appendExecutionRecord(workspace.id, {
+          taskId: "c2c_seed",
+          iteration: 0,
+          changedFiles: 0,
+          tests: null,
+          exitStatus: "ok",
+          timestamp: "2026-01-01T00:00:00.000Z",
+          outputId: seededOutputs[0].id,
+          outputAvailable: true,
+        });
+
+        const indexFile = path.join(stateDir, "execution-outputs", workspace.id, "index.json");
+        const oldestBodyFile = path.join(
+          stateDir,
+          "execution-outputs",
+          workspace.id,
+          "bodies",
+          `${seededOutputs[0].id}.txt`
+        );
+        const indexBefore = fs.readFileSync(indexFile, "utf8");
+        const bodyBefore = fs.readFileSync(oldestBodyFile, "utf8");
+        const recordsBefore = readExecutionRecords(workspace.id);
+        const outputsBefore = listExecutionOutputs(workspace.id, MAX_OUTPUT_RECORDS);
+
+        const result = runRecord(root, [
+          "--iteration",
+          "1",
+          idOption,
+          "bad!",
+          "--command",
+          "pnpm test",
+          "--output",
+          "tests passed",
+        ]);
+
+        expect(result.status).toBe(1);
+        expect(fs.readFileSync(indexFile, "utf8")).toBe(indexBefore);
+        expect(fs.readFileSync(oldestBodyFile, "utf8")).toBe(bodyBefore);
+        expect(readExecutionRecords(workspace.id)).toEqual(recordsBefore);
+        expect(listExecutionOutputs(workspace.id, MAX_OUTPUT_RECORDS)).toEqual(outputsBefore);
+      });
+    }
+  );
 });
 
 describe("execution record persistence", () => {

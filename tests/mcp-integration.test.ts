@@ -5,6 +5,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { startBridge, type Bridge } from "../src/bridge/server.js";
 import { appendExecutionRecord } from "../src/execution/records.js";
+import { SUPPORTED_SCOPES } from "../src/auth/store.js";
 import { saveExecutionOutput } from "../src/execution/output.js";
 import { makeTmpDir, cleanup, write, makeGitRepo, git, isolateStateDir } from "./helpers.js";
 
@@ -89,6 +90,10 @@ describe("MCP tools over Streamable HTTP", () => {
       "search_workspace",
       "test_status",
       "workspace_info",
+    ]);
+    expect(tools.every((tool) => tool.annotations?.readOnlyHint === true)).toBe(true);
+    expect(SUPPORTED_SCOPES).toEqual([
+      "workspace.read", "workspace.search", "git.read", "execution.read", "offline_access",
     ]);
     // no write tools in V1
     for (const forbidden of ["write_file", "delete_file", "execute_shell", "git_commit", "install_package"]) {
@@ -196,6 +201,8 @@ describe("MCP tools over Streamable HTTP", () => {
   it("execution_summary and test_status read harness records", async () => {
     appendExecutionRecord(bridge.workspace.id, {
       taskId: "c2c_test1",
+      controlSessionId: "ctrl_test1",
+      commandId: "cmd_test1",
       iteration: 1,
       changedFiles: ["src/index.ts"],
       tests: "27 passed",
@@ -206,6 +213,7 @@ describe("MCP tools over Streamable HTTP", () => {
       await client.callTool({ name: "execution_summary", arguments: {} })
     );
     expect(summary.records[0].taskId).toBe("c2c_test1");
+    expect(summary.records[0]).toMatchObject({ controlSessionId: "ctrl_test1", commandId: "cmd_test1" });
 
     const status = structuredJsonOf<{ available: boolean; tests: string; outputAvailable: boolean; outputId: number | null }>(
       await client.callTool({ name: "test_status", arguments: {} })

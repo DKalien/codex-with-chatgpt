@@ -1,7 +1,6 @@
 import { Command, InvalidArgumentError } from "commander";
 import fs from "node:fs";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { startBridge } from "../bridge/server.js";
 import { findBridgeObservation, findLiveBridge, type RuntimeState } from "../bridge/runtime.js";
@@ -47,17 +46,21 @@ import {
   mergeSession,
   readSession,
   resolveConversation,
-  writeSession,
+  updateSession,
   PROTOCOL_STATES,
   WAITING_FOR,
   type ConversationMode,
   type ProtocolState,
   type WaitingFor,
 } from "../session/state.js";
-import { appendExecutionRecord } from "../execution/records.js";
+import { appendExecutionRecord, executionRecordSchema } from "../execution/records.js";
 import { saveExecutionOutput } from "../execution/output.js";
+import { checkForUpdates } from "./update-check.js";
+import { registerWebControlCommands } from "./web-control.js";
+import { isWriteProbeEnabled, readWriteProbeStatus, WRITE_PROBE_SCOPE } from "../mcp/write-probe.js";
 
 const program = new Command();
+registerWebControlCommands(program);
 
 const say = (msg: string): void => {
   process.stdout.write(msg + "\n");
@@ -185,6 +188,7 @@ interface AdminInfo {
   tunnel: { running: boolean; url: string | null; provider: string };
   tokenCount: number;
   pairingActive: boolean;
+  writeProbeEnabled?: boolean;
   pid: number;
   startedAt: string;
 }
@@ -273,6 +277,34 @@ program
   });
 
 // ---------------------------------------------------------------- setup
+
+program
+  .command("write-probe-status")
+  .description("只读查看实验性 MCP 写入探针的开关和最近落盘结果")
+  .option("-w, --workspace <path>")
+  .option("--json", "machine-readable output", false)
+  .action(async (opts: { workspace?: string; json: boolean }) => {
+    try {
+      const workspace = new Workspace(resolveWorkspace(opts.workspace));
+      const observation = await findBridgeObservation(workspace.id);
+      const enabled = observation.state === "healthy"
+        ? (await adminFetch<AdminInfo>(observation.runtime, "GET", "/admin/info")).writeProbeEnabled ?? null
+        : observation.state === "stopped" ? false : null;
+      const result = {
+        enabled, configured: isWriteProbeEnabled(), bridgeState: observation.state,
+        requiredScope: WRITE_PROBE_SCOPE, ...readWriteProbeStatus(),
+      };
+      if (opts.json) say(JSON.stringify(result));
+      else {
+        say(`运行中的 Bridge 已开启探针：${enabled === null ? "未知（请检查或重启 Bridge）" : enabled ? "是" : "否"}`);
+        say(`当前 CLI 环境开关：${result.configured ? "开启" : "关闭"}；所需授权：${WRITE_PROBE_SCOPE}`);
+        say(`探针文件：${result.exists ? "存在" : "不存在"}（${result.location}）`);
+        say(`最近 nonce：${result.nonce ?? "无"}；时间：${result.timestamp ?? "无"}；workspaceId：${result.workspaceId ?? "无"}`);
+      }
+    } catch (error) {
+      handleCliError(error, opts.json);
+    }
+  });
 
 program
   .command("setup")
@@ -808,62 +840,16 @@ program
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 
-function runGit(args: string[]): { ok: boolean; stdout: string } {
-  const result = spawnSync("git", args, {
-    cwd: repoRoot,
-    encoding: "utf8",
-    timeout: 8000,
-    env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
-    windowsHide: true,
-  });
-  return { ok: result.status === 0, stdout: (result.stdout ?? "").trim() };
-}
-
 program
   .command("update-check")
-  .description("Check GitHub for a newer version (real check at most once per local day)")
+  .description("只检查当前分支对应的 origin 提交（当天缓存 fetch，只报告，不更新工作区）")
   .option("--force", "check even if already checked today", false)
   .option("--json", "machine-readable output", false)
   .action((opts: { force: boolean; json: boolean }) => {
-    const file = path.join(getStateDir(), "update-check.json");
-    const today = new Date().toLocaleDateString("en-CA"); // YYYY-MM-DD in local tz
-    let last: { date?: string; updateAvailable?: boolean } = {};
-    try {
-      last = JSON.parse(fs.readFileSync(file, "utf8")) as typeof last;
-    } catch {
-      /* first run */
-    }
-
-    const emit = (data: {
-      checked: boolean;
-      updateAvailable: boolean;
-      localCommit?: string;
-      remoteCommit?: string;
-      note?: string;
-    }): void => {
-      if (opts.json) say(JSON.stringify({ ok: true, version: VERSION, ...data }));
-      else if (data.updateAvailable) say(`发现新版本（本地 ${data.localCommit?.slice(0, 7)} → 远端 ${data.remoteCommit?.slice(0, 7)}）。`);
-      else say(data.note ?? "已是最新版本。");
-    };
-
-    if (!opts.force && last.date === today) {
-      emit({ checked: false, updateAvailable: last.updateAvailable ?? false, note: "今天已检查过更新。" });
-      return;
-    }
-
-    const local = runGit(["rev-parse", "HEAD"]);
-    const remote = runGit(["ls-remote", "origin", "HEAD"]);
-    if (!local.ok || !remote.ok || !remote.stdout) {
-      // Offline or not a git checkout: skip quietly and retry tomorrow-ish (do not
-      // record the date so a transient failure does not suppress the daily check).
-      emit({ checked: false, updateAvailable: false, note: "无法检查更新（离线或非 git 安装），已跳过。" });
-      return;
-    }
-    const remoteCommit = remote.stdout.split(/\s/)[0];
-    const updateAvailable = remoteCommit !== local.stdout;
-    fs.mkdirSync(getStateDir(), { recursive: true });
-    fs.writeFileSync(file, JSON.stringify({ date: today, updateAvailable, remoteCommit }), { mode: 0o600 });
-    emit({ checked: true, updateAvailable, localCommit: local.stdout, remoteCommit });
+    const result = checkForUpdates(repoRoot, path.join(getStateDir(), "update-check.json"), opts.force);
+    if (opts.json) say(JSON.stringify({ version: VERSION, ...result }));
+    else say(result.note);
+    if (!result.ok) process.exitCode = 1;
   });
 
 // ---------------------------------------------------------------- session (ChatGPT conversation / Project memory)
@@ -955,7 +941,7 @@ session
       if (waitingNorm && !WAITING_FOR.includes(waitingNorm as WaitingFor)) {
         throw new Error(`waiting-for must be one of ${WAITING_FOR.join(", ")}`);
       }
-      const saved = mergeSession(readSession(workspace.id), {
+      const saved = updateSession(workspace.id, (previous) => mergeSession(previous, {
         url: opts.url,
         title: opts.title,
         taskId: opts.task,
@@ -975,8 +961,7 @@ session
               nextExpectedStep: opts.nextStep,
             }
           : undefined,
-      });
-      writeSession(workspace.id, saved);
+      }))!;
       if (saved.projectUrl && saved.conversationMode === "project") {
         check("已记录 ChatGPT 合集，后续从合集页新开或复用对话");
       } else {
@@ -1058,6 +1043,8 @@ program
   .option("--tests <summary>", "e.g. '27 passed'")
   .option("--exit-status <status>", "ok | failed | blocked", "ok")
   .option("--notes <text>")
+  .option("--control-session-id <id>", "Web Control session metadata (local only)")
+  .option("--command-id <id>", "Web Control command metadata (local only)")
   .option("--command <text>", "command whose output may be offered to ChatGPT")
   .option("--output <text>", "command output (prefer --output-file for long logs)")
   .option("--output-file <path>", "read command output from a local file")
@@ -1071,13 +1058,25 @@ program
       tests?: string;
       exitStatus: string;
       notes?: string;
+      controlSessionId?: string;
+      commandId?: string;
       command?: string;
       output?: string;
       outputFile?: string;
       exitCode?: number;
     }) => {
       const workspace = new Workspace(resolveWorkspace(opts.workspace));
-      const changed = parseChangedFiles(opts.changedFiles);
+      const record = executionRecordSchema.parse({
+        taskId: opts.task,
+        iteration: opts.iteration,
+        changedFiles: parseChangedFiles(opts.changedFiles),
+        tests: opts.tests ?? null,
+        exitStatus: opts.exitStatus,
+        timestamp: new Date().toISOString(),
+        notes: opts.notes?.slice(0, 400),
+        controlSessionId: opts.controlSessionId,
+        commandId: opts.commandId,
+      });
       let outputId: number | undefined;
       let outputAvailable = false;
       const rawOutput =
@@ -1089,20 +1088,14 @@ program
           command: opts.command,
           raw: rawOutput,
           exitCode: opts.exitCode ?? null,
-          taskId: opts.task,
-          iteration: opts.iteration,
+          taskId: record.taskId,
+          iteration: record.iteration,
         });
         outputId = savedOutput.id;
         outputAvailable = savedOutput.allowed;
       }
       appendExecutionRecord(workspace.id, {
-        taskId: opts.task,
-        iteration: opts.iteration,
-        changedFiles: changed,
-        tests: opts.tests ?? null,
-        exitStatus: opts.exitStatus,
-        timestamp: new Date().toISOString(),
-        notes: opts.notes?.slice(0, 400),
+        ...record,
         outputId,
         outputAvailable,
       });

@@ -4,33 +4,74 @@
 > ChatGPT 负责思考，Codex 负责干活。
 
 > [!IMPORTANT]
-> **遇到问题？** 请先向 Codex 发送 **「更新 Codex with ChatGPT」** 并重试。更新到最新版本可以解决大多数已知问题。  
-> **Having trouble?** First ask Codex to **“Update Codex with ChatGPT”** and try again. Updating to the latest version resolves most known issues.
+> **Fork 开发版**：日常仅检查自己的 origin 并报告，不自动更新工作区。
+> Windows 开发部署、官方只读参考分支和状态保留说明见 [本地 Fork 开发版](README.zh-CN.md#本地-fork-开发版)。
 
 ## The problem · 解决什么问题
 
 **中文** — ChatGPT 付费订阅的网页版额度大量闲置，Codex 却在消耗紧张的
 API 额度做规划和 Review。本项目把"思考"交给你已付费的网页版 ChatGPT，
-Codex 只负责执行。不用 API Key、不搞逆向代理——官方网页 + 只读 MCP 桥接。
+Codex 只负责执行。不用 API Key、不搞逆向代理——官方网页 + 默认只读 MCP 桥接。
 
 **EN** — ChatGPT Plus/Pro web quota sits idle while your coding agent burns
 scarce API/Codex tokens on planning and review. This project moves the
 thinking to the subscription you already pay for; Codex only executes.
-No API keys, no reverse proxy — official web UI plus a read-only MCP bridge.
+No API keys, no reverse proxy — official web UI plus a default read-only MCP bridge.
 
 ## What it is · 这是什么
 
 **中文** — 把 ChatGPT 网页版变成 Codex 编码会话的"规划与审查大脑"，执行权
 完全保留在 Codex 手里。你的仓库永远不会被上传：ChatGPT 通过一条安全的、
-OAuth 保护的**只读** MCP 连接，按需读取当前工作区里它真正需要的那几行代码。
+OAuth 保护的**默认只读** MCP 连接，按需读取当前工作区里它真正需要的那几行代码。
 
 **EN** — Use the ChatGPT web app as the planning and review brain for your
 Codex coding sessions, while Codex keeps full ownership of execution. Your
 repository is never uploaded: ChatGPT reads exactly the lines it needs through
-a secure, OAuth-protected, **read-only** MCP connection to your current
+a secure, OAuth-protected, **default read-only** MCP connection to your current
 workspace.
 
 Detailed docs below are in English · 详细中文文档见 **[README.zh-CN.md](README.zh-CN.md)**
+
+## Optional Web Control Mode · 可选网页控制
+
+Normal C2C still starts in Codex and uses `INIT → PLAN → EXECUTED → DONE`.
+Web Control is off by default. In the local Codex workspace, say
+**“开启 ChatGPT 网页控制模式”** (enable ChatGPT Web Control Mode).
+Codex reuses the current task's Chat / Project, shows its actual URL and validity,
+and stays in the current turn waiting. In that Chat, explicitly ask ChatGPT to
+delegate work to Codex. ChatGPT emits a strict COMMAND; the current Codex agent
+validates it, executes or delegates under local rules, records the result and
+sends EXECUTED. ChatGPT reviews via the existing read-only MCP and responds with
+a new COMMAND or DONE. No manual message copying is needed.
+
+Use **“查看 ChatGPT 网页控制状态”** or **“关闭 ChatGPT 网页控制模式”** locally to
+inspect or stop it. DONE ends the task, leaving the mode waiting for a new user
+delegation. The default idle timeout is 30 minutes (locally configurable from
+1–240); polling and duplicates do not extend it. Execution pauses idle timing.
+Browser waits are preferred; the fallback checks every 20–30 seconds.
+
+**Web Control only works while the corresponding Codex control session remains active.**
+It cannot wake a finished agent turn, stopped Codex or closed Desktop. Persisted
+enabled state is not proof of a running listener. State lives in the existing
+`sessions/<workspaceId>.json` under `webControl`, bound to workspace, Codex task,
+Chat URL and a fresh controlSessionId. Accepted/executing/completed/rejected IDs
+are retained across restarts and re-enables; corrupt or conflicting writes fail closed.
+Normal checkpoints stay independent. Existing authentication and Tunnel state are reused.
+
+The trusted local agent verifies real browser message roles, IDs and explicit
+user intent; the local CLI validates the envelope, protocol, binding and replay
+history. Website claims cannot authenticate themselves. Workspace data never
+authorizes control. No remote shell, automatic elevation, daemon, second
+app-server or Desktop resume injection is added. The original **9 read-only
+tools and 5 default OAuth scopes remain unchanged**; the separately gated
+experimental `write_probe` is documented in
+[experimental write probe](docs/experimental-write-probe.md).
+
+See [protocol and CLI](docs/protocol.md#web-control-mode),
+[security boundaries](docs/security.md#web-control-trust-boundary), and the
+[Chinese walkthrough](README.zh-CN.md#可选chatgpt-网页控制模式).
+Deploy source / Skill changes with `powershell -NoProfile -File .\scripts\dev-install.ps1`
+and test from a Codex task that has loaded the updated Skill.
 
 ## One-paste install · 一段话安装
 
@@ -43,13 +84,13 @@ Detailed docs below are in English · 详细中文文档见 **[README.zh-CN.md](
 
 1. 环境自检：需要 git 和 Node.js ≥ 20，缺什么就自动安装
   （macOS 用 Homebrew，Windows 用 winget），同时安装 cloudflared。
-2. 下载：把 https://github.com/XiaoDuoYa/codex-with-chatgpt 克隆到
-   ~/codex-with-chatgpt（已存在就 git pull 更新）。
+2. 下载：把 https://github.com/DKalien/codex-with-chatgpt 克隆到
+   ~/codex-with-chatgpt（已有本地 Fork 就复用，不自动 pull）。
 3. 构建：在该目录里执行 corepack pnpm install 和 corepack pnpm build。
 4. 安装 Skill：把仓库里的 skill/SKILL.md 复制到
    ~/.codex/skills/codex-with-chatgpt/SKILL.md，并把文件中
    "The codex-with-chatgpt checkout lives at:" 那一行的路径改成实际克隆路径。
-5. 首次配置：按 SKILL.md 里的 first-time setup 流程执行
+5. 仅尚未配置时：按 SKILL.md 里的 first-time setup 流程执行
   （运行 c2c setup，用内置浏览器打开 ChatGPT 配置连接器并输入配对码）。
    全程只用内置浏览器，禁止打开任何第三方浏览器。
 6. 只有遇到需要我登录（ChatGPT / Cloudflare）、验证码或两步验证时才叫我，
@@ -69,13 +110,13 @@ I am a non-technical user — do everything yourself:
 1. Check the environment: git and Node.js >= 20 must be available. Install
    anything missing yourself (macOS: Homebrew, Windows: winget). Also install
    cloudflared.
-2. Download: clone https://github.com/XiaoDuoYa/codex-with-chatgpt into
-   ~/codex-with-chatgpt (if it already exists, git pull to update).
+2. Download: clone https://github.com/DKalien/codex-with-chatgpt into
+   ~/codex-with-chatgpt (reuse an existing local Fork; never auto-pull).
 3. Build: inside that folder run `corepack pnpm install` then `corepack pnpm build`.
 4. Install the Skill: copy skill/SKILL.md to
    ~/.codex/skills/codex-with-chatgpt/SKILL.md, and update the line
    "The codex-with-chatgpt checkout lives at:" to the actual clone path.
-5. First-time setup: follow the SKILL.md "first-time setup" workflow
+5. Only if not already configured: follow the SKILL.md "first-time setup" workflow
    (run c2c setup, configure the ChatGPT connector in the BUILT-IN browser,
    enter the pairing code). Never open a third-party browser.
 6. Only interrupt me for logins (ChatGPT / Cloudflare), CAPTCHAs or 2FA —
@@ -86,10 +127,12 @@ I am a non-technical user — do everything yourself:
 ```
 
 
-**Updates · 更新** — The Skill checks GitHub once a day and updates itself when a
-new version is released; no action needed. You can also say "更新 Codex with ChatGPT"
-anytime. / Skill 每天自动检查一次 GitHub，有新版本会自动更新，无需任何操作；
-也可以随时对 Codex 说"更新 Codex with ChatGPT"。
+**Updates · 更新** — Daily checks only compare the current branch with its origin
+counterpart and report remote-ahead or divergence. No automatic working tree updates.
+Skill 每天仅检查自己的 Fork，不自动 pull/stash/merge/rebase/reset/checkout。
+运行 `powershell -NoProfile -File .\scripts\dev-install.ps1` 部署当前源码；
+仅人工运行 `powershell -NoProfile -File .\scripts\update-upstream-track.ps1`
+刷新官方 `upstream-main`，不合入开发分支。既有安装不重复首次配置。
 
 ---
 
@@ -155,11 +198,11 @@ Credentials stay in the OS app state directory, not in the project.
                         ▼          │
              ┌─────────────────────┐
              │      C2C Bridge     │   loopback-only HTTP server
-             │  read-only MCP      │   OAuth 2.1 + one-time pairing code
+             │  default read-only  │   OAuth 2.1 + one-time pairing code
              │  OAuth + Pairing    │   Cloudflare Quick Tunnel
              │  Tunnel Manager     │
              └──────────┬──────────┘
-                        │  read-only
+                        │  default read-only
                         ▼
              ┌─────────────────────┐          ┌─────────────────────┐
              │   Local Workspace   │◀─────────│    Codex Harness    │
@@ -170,18 +213,22 @@ Credentials stay in the OS app state directory, not in the project.
 - **Control plane (Computer Use)**: Codex and ChatGPT exchange tiny structured
   `[C2C]` state messages — `INIT → PLAN → EXECUTED → REVIEW → DONE`. No diffs,
   no logs, no file bodies are ever pasted.
-- **Data plane (MCP)**: ChatGPT pulls what it needs itself through 9 read-only
+- **Data plane (MCP)**: ChatGPT pulls what it needs itself through 9 default read-only
   tools: `workspace_info`, `list_directory`, `read_file`, `search_workspace`,
   `git_status`, `git_diff`, `test_status`, `execution_summary`,
-  `execution_output`.
+  `execution_output`. The opt-in experimental `write_probe` is separate; see
+  [its boundary and test procedure](docs/experimental-write-probe.md).
 - **Independent review**: after Codex executes, ChatGPT inspects the actual
   git diff and test records through MCP — it never trusts "all tests passed"
   claims blindly.
 
 ## Security model (short version)
 
-- **Read-only by construction**: write/delete/shell/commit tools simply do not
-  exist on the server. No prompt injection can enable them.
+- **Default read-only by construction**: the original 9 tools only read workspace
+  data. The opt-in `write_probe` can overwrite one C2C state record when its
+  environment flag and `probe.write` scope are both present; it cannot write
+  workspace files, delete files, run shell commands or commit. No prompt
+  injection can enable those capabilities.
 - **One workspace = one boundary**: every token is bound to a single workspace;
   path containment uses canonical realpaths (symlink/`../`/absolute-path escapes
   are all blocked and tested).
@@ -219,7 +266,7 @@ Docs: [architecture](docs/architecture.md) · [protocol](docs/protocol.md) ·
 ```
 src/
   bridge/     loopback HTTP server, port recovery, admin API
-  mcp/        9 read-only tools, stateless Streamable HTTP
+  mcp/        9 default read-only tools plus an optional write probe, stateless Streamable HTTP
   auth/       OAuth 2.1 (PKCE, DCR, refresh rotation, revocation)
   pairing/    one-time pairing codes (CSPRNG, TTL, rate limits)
   workspace/  path containment, sensitive-file policy, search, git
