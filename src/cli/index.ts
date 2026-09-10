@@ -57,10 +57,12 @@ import { appendExecutionRecord, executionRecordSchema } from "../execution/recor
 import { saveExecutionOutput } from "../execution/output.js";
 import { checkForUpdates } from "./update-check.js";
 import { registerWebControlCommands } from "./web-control.js";
+import { registerRemoteCommands, remoteStatus } from "./remote.js";
 import { isWriteProbeEnabled, readWriteProbeStatus, WRITE_PROBE_SCOPE } from "../mcp/write-probe.js";
 
 const program = new Command();
 registerWebControlCommands(program);
+registerRemoteCommands(program);
 
 const say = (msg: string): void => {
   process.stdout.write(msg + "\n");
@@ -431,7 +433,7 @@ program
     const runtime = observation.runtime;
     const info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
     if (opts.json) {
-      say(JSON.stringify({ ok: true, running: true, ...info }));
+      say(JSON.stringify({ ok: true, running: true, ...info, ...remoteStatus(workspace.id) }));
       return;
     }
     say(PRODUCT_NAME);
@@ -441,6 +443,7 @@ program
     if (info.tunnel.running && info.tunnel.url) check(`安全连接：${info.tunnel.url}/mcp`);
     else say("· 安全连接：未启用（本地模式）");
     say(`· 已授权连接：${info.tokenCount > 0 ? "是" : "否"}`);
+    say(`· Remote Control：${JSON.stringify(remoteStatus(workspace.id))}`);
   });
 
 // ---------------------------------------------------------------- doctor

@@ -77,6 +77,8 @@ function pairingPage(opts: {
     "workspace.search": "Search this workspace",
     "git.read": "Read git status and diffs",
     "execution.read": "Read Codex execution summaries",
+    "codex.control": "在本地已授权工作区创建 Codex 线程并派发任务（可修改文件，使用本机安全配置）",
+    "codex.read": "读取当前工作区的远程 Codex 任务和线程状态",
     [WRITE_PROBE_SCOPE]: "实验：将测试 nonce 写入 C2C 自身的固定状态文件（不修改工作区）",
     offline_access: "Stay connected between sessions",
   };
@@ -121,7 +123,7 @@ function pairingPage(opts: {
 <body>
 <div class="card">
   <h1>${escapedProductName}</h1>
-  <p class="sub">ChatGPT is requesting access to workspace <strong>${escapedWorkspaceName}</strong> (${opts.scopes.includes(WRITE_PROBE_SCOPE) ? "工作区只读；另含 C2C 状态写入实验" : "read-only"}):</p>
+  <p class="sub">ChatGPT is requesting access to workspace <strong>${escapedWorkspaceName}</strong> (${opts.scopes.includes("codex.control") ? "远程 Codex 任务控制，可修改工作区" : opts.scopes.includes(WRITE_PROBE_SCOPE) ? "工作区只读；另含 C2C 状态写入实验" : "read-only"}):</p>
   <ul>${scopeList}</ul>
   <form method="POST" action="authorize">
     <input type="hidden" name="request_id" value="${escapedRequestId}">

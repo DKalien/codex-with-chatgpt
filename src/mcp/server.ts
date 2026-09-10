@@ -1,4 +1,5 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { registerRemoteTools } from "./remote.js";
 import { z } from "zod";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import { Workspace, WorkspaceError } from "../workspace/manager.js";
@@ -499,5 +500,6 @@ export function createMcpServer(ctx: McpContext): McpServer {
     );
   }
 
+  registerRemoteTools(server, workspace);
   return server;
 }

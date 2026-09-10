@@ -12,10 +12,11 @@ export const SUPPORTED_SCOPES = [
   "offline_access",
 ] as const;
 
-export type Scope = (typeof SUPPORTED_SCOPES)[number] | typeof WRITE_PROBE_SCOPE;
+export type Scope = (typeof SUPPORTED_SCOPES)[number] | typeof WRITE_PROBE_SCOPE | "codex.control" | "codex.read";
 
 export function getSupportedScopes(): string[] {
-  return isWriteProbeEnabled() ? [...SUPPORTED_SCOPES, WRITE_PROBE_SCOPE] : [...SUPPORTED_SCOPES];
+  const scopes = [...SUPPORTED_SCOPES, "codex.control", "codex.read"];
+  return isWriteProbeEnabled() ? [...scopes, WRITE_PROBE_SCOPE] : scopes;
 }
 
 export interface ClientRegistration {

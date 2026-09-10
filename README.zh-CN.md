@@ -4,6 +4,14 @@
 
 > ChatGPT 负责思考，Codex 负责干活。
 
+## 跨设备 MCP Remote Control
+
+第三阶段默认关闭。本地 `remote enable` 后，外部设备的 ChatGPT 可通过 `codex_create_thread`、
+`codex_submit_task` 派发任务，再用 `codex_task_status`、`codex_thread_status` 查询。
+独立 Controller 使用官方 app-server，无需 Desktop 对话、内置浏览器或当前 Agent turn。
+正式权限是 `codex.control` / `codex.read`，write_probe 仍默认关闭。
+首次使用、启停、状态位置和崩溃恢复见 [Remote Control 操作说明](docs/remote-control.md)。
+
 ## 解决什么问题
 
 ChatGPT 付费订阅的网页版额度大量闲置，Codex 却在消耗紧张的 API 额度做
@@ -252,7 +260,8 @@ c2c status / doctor / pair / unpair / logs / stop
 ```
 src/
   bridge/     本机回环 HTTP 服务、端口自动恢复、管理 API
-  mcp/        9 个只读工具 + 可选写入探针、无状态 Streamable HTTP
+  mcp/        9 个只读工具 + 可选 Remote Control 和写入探针
+  remote/     持久队列、Controller、官方 app-server 客户端
   auth/       OAuth 2.1（PKCE、动态注册、refresh 轮换、吊销）
   pairing/    一次性配对码（CSPRNG、TTL、限速）
   workspace/  路径收敛、敏感文件策略、搜索、git

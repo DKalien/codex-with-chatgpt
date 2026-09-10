@@ -243,6 +243,17 @@ Rules:
     in that Project's instructions. Do not use another workspace's connector.
 ```
 
+## MCP Remote Control
+
+新增 codex_create_thread / codex_submit_task（codex.control）与
+codex_task_status / codex_thread_status（codex.read），仅本地授权后列出。
+MCP 写入只完成校验和持久化排队；Controller 异步使用官方 app-server。
+创建返回 queued/requestId，按 requestId 查询得到实际 threadId 后才能提交任务；提交返回 queued/taskId。
+Controller 使用 initialize、thread/start、thread/resume、turn/start，监听 turn/completed 才判定完成。
+重复 ID 返回原记录；模糊执行状态保留 needs_reconciliation，禁止自动重试。
+输入、状态机、命令与人工验收见 [Remote Control](remote-control.md)。
+它与下述依赖当前 Agent 的 DOM Web Control 并行保留，Normal C2C 协议不变。
+
 ## Web Control Mode
 
 默认关闭，只能由当前 Codex **本地用户明确开启**；网页 ENABLE/PAUSE 不在协议内。

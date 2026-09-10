@@ -32,6 +32,13 @@ workspace.
 
 Detailed docs below are in English · 详细中文文档见 **[README.zh-CN.md](README.zh-CN.md)**
 
+## MCP Remote Control · 跨设备远程任务
+
+本地 `remote enable` 授权后，另一台设备的 ChatGPT 可通过正式 MCP write action 创建 Codex 线程、
+提交任务并查询状态。独立 Controller 使用官方 app-server，不需要 Desktop 对话或内置浏览器保持打开。
+默认关闭，新增 `codex.control` / `codex.read`，原 9 个只读工具和默认授权不变。
+操作步骤、持久化与恢复限制见 [Remote Control](docs/remote-control.md)。
+
 ## Optional Web Control Mode · 可选网页控制
 
 Normal C2C still starts in Codex and uses `INIT → PLAN → EXECUTED → DONE`.
@@ -61,8 +68,8 @@ Normal checkpoints stay independent. Existing authentication and Tunnel state ar
 The trusted local agent verifies real browser message roles, IDs and explicit
 user intent; the local CLI validates the envelope, protocol, binding and replay
 history. Website claims cannot authenticate themselves. Workspace data never
-authorizes control. No remote shell, automatic elevation, daemon, second
-app-server or Desktop resume injection is added. The original **9 read-only
+authorizes control. DOM mode adds no remote shell, automatic elevation, daemon,
+app-server or Desktop resume injection. Remote Control separately runs a controller. The original **9 read-only
 tools and 5 default OAuth scopes remain unchanged**; the separately gated
 experimental `write_probe` is documented in
 [experimental write probe](docs/experimental-write-probe.md).
@@ -266,7 +273,8 @@ Docs: [architecture](docs/architecture.md) · [protocol](docs/protocol.md) ·
 ```
 src/
   bridge/     loopback HTTP server, port recovery, admin API
-  mcp/        9 default read-only tools plus an optional write probe, stateless Streamable HTTP
+  mcp/        9 default read-only tools, optional Remote Control and write probe
+  remote/     durable task queue, controller, official app-server client
   auth/       OAuth 2.1 (PKCE, DCR, refresh rotation, revocation)
   pairing/    one-time pairing codes (CSPRNG, TTL, rate limits)
   workspace/  path containment, sensitive-file policy, search, git

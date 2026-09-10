@@ -1,5 +1,19 @@
 # Security Model
 
+## MCP Remote Control 授权边界
+
+第三阶段新增 `codex.control` / `codex.read`，不属于默认授权，也不复用 probe.write。
+写入需 OAuth scope 和本地 `remote enable` 同时成立。工作区根目录仅由本地 CLI 注册，
+MCP 只接受当前 Bridge 的 workspaceId 和 C2C 管理的 threadId，不能启用工作区或传任意路径。
+用户目标交给 Codex 主代理；不提供通用 Shell、文件写入 RPC、provider 配置或 Worker 接口。
+Codex 继承本机安全配置，任务本身可能修改文件、调用工具；approval 请求不会自动批准。
+
+队列 JSON 用锁和原子替换保存，ID 永不淘汰；不确定的已开始任务阻塞工作区并要求本地核对。
+状态接口只返回限定元数据，最终回答走现有 execution_output sanitizer，审计不复制任务原文。
+Controller 是独立本机常驻进程，无浏览器依赖，不注册开机启动。
+Remote disable 拒绝新调用和消费，正在执行的 turn 需另用 controller stop 停止。
+完整边界与恢复流程见 [Remote Control](remote-control.md)。
+
 ## Trust boundaries
 
 1. **Workspace root** is the smallest authorization boundary. One bridge serves
@@ -28,7 +42,7 @@
 | Tunnel exposure | Bridge binds 127.0.0.1 only (refuses 0.0.0.0); the only public surface is HTTPS via the tunnel, protected by OAuth; `/health` reveals only a salted workspace hash |
 | Admin API abuse | Loopback-only + random admin token (0600 runtime file) + requests with proxy headers (`cf-connecting-ip`, `x-forwarded-for`) rejected; unauthenticated probes get 404 |
 | Log credential leakage | Logger redacts token prefixes, bearer headers, token-like parameters, and pairing-code-shaped strings before writing |
-| Execution output leak | Codex may nominate test/build/lint logs; a local sanitizer redacts tokens, pairing-code-shaped strings and home paths, truncates size, and refuses private-key blocks entirely. Restricted items are listed without a body. ChatGPT still cannot run commands. |
+| Execution output leak | Codex may nominate logs or Remote turn final responses; a local sanitizer redacts tokens, pairing-code-shaped strings and home paths, truncates size, and refuses private-key blocks entirely. Restricted items are listed without a body. Read-only tools cannot run commands; Remote Control separately authorizes Codex tasks. |
 | Checkpoint / resume dump | Session checkpoints store short protocol fields only (capped). Resume uses the existing chat or HANDOFF — no new protocol state, no log paste, no re-pairing. |
 
 ## Token & scope design
@@ -54,7 +68,7 @@ integration is a V2 item.
 
 ## Experimental MCP write probe
 
-The probe is off by default and is the only MCP write action. When enabled it adds
+The probe is off by default and independent of formal Remote Control. When enabled it adds
 `write_probe` beside the original 9 read-only tools and writes only
 `getStateDir()/write-probe.json` (`c2c-state/write-probe.json` logically), with a
 validated nonce, timestamp, workspace ID and tool name. It overwrites the previous
