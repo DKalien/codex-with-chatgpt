@@ -2,11 +2,13 @@ import express, { type Request, type Response, type NextFunction } from "express
 import type { Server } from "node:http";
 import { randomBytes } from "node:crypto";
 import { Workspace } from "../workspace/manager.js";
-import { AuthStore } from "../auth/store.js";
+import { AuthStore, DESKTOP_CONTROL_SCOPE } from "../auth/store.js";
 import { createOAuthRouter } from "../auth/oauth.js";
 import { bearerAuth } from "../auth/middleware.js";
 import { PairingManager } from "../pairing/manager.js";
 import { createMcpServer } from "../mcp/server.js";
+import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
+import { DesktopError } from "../desktop/store.js";
 import { isWriteProbeEnabled } from "../mcp/write-probe.js";
 import { createMcpHttpHandler } from "../mcp/http.js";
 import { CloudflaredQuickTunnel } from "../tunnel/cloudflared.js";
@@ -126,7 +128,16 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
 
   // ---- MCP endpoint (bearer-protected) --------------------------------------
 
-  const mcpHandler = createMcpHttpHandler(() => createMcpServer({ workspace, logger }), logger);
+  const mcpHandler = createMcpHttpHandler(() => createMcpServer({
+    workspace,
+    logger,
+    desktopAuthorize: (auth: AuthInfo) => {
+      const verdict = authStore.verifyAccessToken(auth.token);
+      if (!verdict.ok || verdict.record.workspaceId !== workspace.id || verdict.record.clientId !== auth.clientId || !verdict.record.scopes.includes(DESKTOP_CONTROL_SCOPE)) {
+        throw new DesktopError("UNAUTHORIZED", "OAuth 授权已失效，请重新授权后再发送。" );
+      }
+    },
+  }), logger);
   app.all(
     "/mcp",
     express.json({ limit: "8mb" }),

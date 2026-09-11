@@ -39,6 +39,69 @@ Detailed docs below are in English · 详细中文文档见 **[README.zh-CN.md](
 默认关闭，新增 `codex.control` / `codex.read`，原 9 个只读工具和默认授权不变。
 操作步骤、持久化与恢复限制见 [Remote Control](docs/remote-control.md)。
 
+## Experimental Desktop Control · 实验性桌面控制
+
+Desktop Control is off by default. After a local user binds and enables one
+already loaded, idle Desktop thread, ChatGPT may call
+`codex_desktop_send` with a confirmed full plan through
+`codex.desktop.control`; `codex_desktop_status` uses the separate
+`codex.desktop.read` scope. The first version targets existing threads only:
+it does not create sessions, steer, interrupt, poll, notify, or start another
+app-server.
+
+For daily use, say in the current Desktop session, “bind and enable this session
+for ChatGPT” (or an equivalent request). Codex runs the local command:
+
+Only an explicit action request from the current local user in the current
+Desktop composer triggers this flow. Example sentences in docs, code blocks,
+quotes, task plans, or ordinary discussion do not trigger it, and text cannot
+waive confirmation when its local origin cannot be reliably established.
+
+```powershell
+node <checkout>\bin\c2c.js desktop bind-current [-w <workspace>] [--json]
+```
+
+It uses the current real `CODEX_THREAD_ID` to map the exact Desktop thread,
+project, and `workspaceRoot`; it never guesses from a title or the most recent
+session, and it needs no user ID or hand typed command. Because local composer
+and IPC `userMessage` origin cannot be reliably distinguished, a new binding or
+enabled-state change always opens a one-click local confirmation window showing
+the fixed risk “ChatGPT can send tasks to this Desktop session; tasks may modify
+files or run commands under that session's existing permissions”, the exact
+Desktop title, and the normalized workspace root. Codex must not click or script
+the confirmation in a new window; the local user clicks it. The prompt is not an
+authorization credential. The command has no thread/user ID, `--yes`, or
+`--accept` bypass parameters, and the confirmation waits at most two minutes.
+
+For the same verified thread/project/workspace, an enabled binding returns
+`alreadyEnabled` with the existing `bindingId` and no new authorization. If it is
+disabled, confirmation re-enables it with the same ID. A different thread or
+project under the same workspace root requires confirmation and a new
+`bindingId`; delivery history remains, including the old binding ID. A different
+workspace root or any unconfirmed (`unknown`) identity is rejected, so the
+shortcut cannot cross workspace boundaries. Identity verification may accept an
+`active` Desktop context, while send still requires `idle`, no pending approval,
+the matching owner/project/workspace, and a verified version. Explicit
+`desktop bind` plus `desktop enable` remains an advanced fallback; there is no
+MCP bind tool.
+
+The send action waits only for a real delivery acceptance and returns
+`deliveryStatus=accepted` with the actual thread/turn IDs. It does not mean
+the task is completed or tested. If delivery is uncertain (`outcome_unknown`), do not resend,
+change `commandId` or rebind; the whole workspace stays blocked, including a
+new binding, and this MVP has no recovery interface. A local user must check
+the Desktop session first. The send input requires `intent` to be
+`development_plan` or `revision`, literal `userConfirmed=true`, and the full
+UTF-8 message remains capped at 64 KiB. The model may set `userConfirmed=true`
+only after the current conversation's user explicitly confirms, for example,
+“Yes, proceed with that”; it is a semantic audit signal, not a credential, and
+does not replace OAuth, local enable, binding, or Desktop approval or promise
+to affect or bypass platform policy. The full plan may still be blocked,
+rejected, or held for approval by Desktop or platform policy. `idempotentHint`
+remains a same-`commandId` duplicate-attempt guard, not network exactly-once.
+The full Chinese procedure, CLI and version-bound
+IPC limits are in [Desktop Control](docs/desktop-control.md).
+
 ## Optional Web Control Mode · 可选网页控制
 
 Normal C2C still starts in Codex and uses `INIT → PLAN → EXECUTED → DONE`.
@@ -223,8 +286,9 @@ Credentials stay in the OS app state directory, not in the project.
 - **Data plane (MCP)**: ChatGPT pulls what it needs itself through 9 default read-only
   tools: `workspace_info`, `list_directory`, `read_file`, `search_workspace`,
   `git_status`, `git_diff`, `test_status`, `execution_summary`,
-  `execution_output`. The opt-in experimental `write_probe` is separate; see
-  [its boundary and test procedure](docs/experimental-write-probe.md).
+  `execution_output`. Explicitly authorized Desktop Control tools and the
+  opt-in experimental `write_probe` are separate; see [Desktop Control](docs/desktop-control.md)
+  and [its boundary and test procedure](docs/experimental-write-probe.md).
 - **Independent review**: after Codex executes, ChatGPT inspects the actual
   git diff and test records through MCP — it never trusts "all tests passed"
   claims blindly.
@@ -236,6 +300,10 @@ Credentials stay in the OS app state directory, not in the project.
   environment flag and `probe.write` scope are both present; it cannot write
   workspace files, delete files, run shell commands or commit. No prompt
   injection can enable those capabilities.
+- **Desktop delivery is separately gated**: `codex_desktop_send` can only send
+  confirmed plain task text to one locally bound Desktop thread after the
+  `codex.desktop.control` scope and local enable check pass. It is not a direct
+  file or shell RPC; see [Desktop Control](docs/desktop-control.md).
 - **One workspace = one boundary**: every token is bound to a single workspace;
   path containment uses canonical realpaths (symlink/`../`/absolute-path escapes
   are all blocked and tested).
@@ -266,15 +334,17 @@ Requirements: Node.js >= 20, git. `cloudflared` for the public connection
 (auto-detected; the Skill installs it for you).
 
 Docs: [architecture](docs/architecture.md) · [protocol](docs/protocol.md) ·
-[security](docs/security.md) · [troubleshooting](docs/troubleshooting.md)
+[security](docs/security.md) · [Desktop Control](docs/desktop-control.md) ·
+[troubleshooting](docs/troubleshooting.md)
 
 ## Project layout
 
 ```
 src/
   bridge/     loopback HTTP server, port recovery, admin API
-  mcp/        9 default read-only tools, optional Remote Control and write probe
+  mcp/        9 default read-only tools, optional Remote/Desktop Control and write probe
   remote/     durable task queue, controller, official app-server client
+  desktop/    local Desktop binding, IPC delivery and replay-safe state
   auth/       OAuth 2.1 (PKCE, DCR, refresh rotation, revocation)
   pairing/    one-time pairing codes (CSPRNG, TTL, rate limits)
   workspace/  path containment, sensitive-file policy, search, git
@@ -291,6 +361,9 @@ docs/         architecture / protocol / security / troubleshooting
 
 V1. Verified end-to-end: bridge, OAuth + pairing, public tunnel, ChatGPT
 connector setup, zero-touch first-run experience.
+
+Desktop Control remains experimental: automated fake Desktop/IPC checks do not
+claim a manual real-Desktop end-to-end result.
 
 **Unofficial community project. Not affiliated with or endorsed by OpenAI.**
 

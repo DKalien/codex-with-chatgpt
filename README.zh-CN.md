@@ -12,6 +12,58 @@
 正式权限是 `codex.control` / `codex.read`，write_probe 仍默认关闭。
 首次使用、启停、状态位置和崩溃恢复见 [Remote Control 操作说明](docs/remote-control.md)。
 
+## 实验性 Desktop Control（默认关闭）
+
+Desktop Control 只在本机用户明确绑定并启用一个已经在 Desktop 中加载、当前空闲的已有
+会话后可用。ChatGPT 讨论并确认完整方案后，通过 `codex_desktop_send` 投递到该会话，
+使用独立的 `codex.desktop.control`；`codex_desktop_status` 使用独立的
+`codex.desktop.read`。第一版不自动新建会话，不做 steer、interrupt、实时进度、推送通知
+或网页持续轮询。
+
+### 日常快捷绑定当前会话
+
+用户在当前 Desktop 会话中说“把这个会话绑定并启用给 ChatGPT”（或同义表达）后，Codex
+在本机运行：
+
+只有当前本机用户明确提出这个动作才会触发；文档、代码块、引用、任务计划或普通讨论中的
+示例句不会触发，来源无法可靠证明来自本机时也不能凭文字免除确认。
+
+```powershell
+node <checkout>\bin\c2c.js desktop bind-current [-w <workspace>] [--json]
+```
+
+命令从当前真实 `CODEX_THREAD_ID` 精确映射 Desktop thread、project 和 workspaceRoot，
+不按标题或最近会话猜测，不需要用户 ID，也不要求用户手打命令。由于本地 composer 与 IPC
+`userMessage` 来源无法可靠区分，新增绑定或改变 enabled 状态前必须显示本机一键确认窗，
+固定显示风险“ChatGPT 可以向此 Desktop 会话发送任务；任务可能按该会话已有权限修改文件或
+执行命令”、当前 Desktop 标题和规范化 workspaceRoot。新窗口不得自动点击或脚本代点，必须
+用户自己点击；触发流程的 prompt 不是授权凭证。命令不接受 thread/user ID、`--yes` 或
+`--accept` 等绕过确认的参数，确认窗最多等待 2 分钟。
+
+同一身份已 enabled 时，身份核验通过后返回 `alreadyEnabled`，复用原 `bindingId`，不生成
+新 ID、不再次授权；同一身份 disabled 时，用户确认后 enable 并复用原 ID；同一 workspaceRoot
+下不同 thread/project 经确认后生成新的 `bindingId`。所有 deliveries history 保留，其中含旧
+`bindingId`；不同 workspaceRoot 或无法确认（`unknown`）时，明确阻断快捷 bind/enable/send，
+不能换 ID 或重新绑定绕过。身份核验允许 Desktop 为 `active`，但 send 仍严格要求 `idle`、无
+待审批、owner/project/workspace 匹配和已验证版本。传统显式 `desktop bind` + `desktop enable`
+仍保留为高级 fallback；不新增 MCP bind 工具。
+
+工具只等待真实的投递接受回执，返回 `deliveryStatus=accepted` 和真实 thread/turn ID；
+这不代表任务已完成或测试已通过。回执不明（`outcome_unknown`）时不要重发、不要更换 `commandId` 或重新绑定，
+整个 workspace（包括新绑定）会暂停后续投递；MVP 没有恢复接口，需本机用户先核对 Desktop。
+用户随后说“干完了，检查一下”时，ChatGPT 才用现有只读
+MCP 检查当次代码、Git 和 record；需要修订时仍发给同一绑定会话。
+
+send 输入还要求 `intent` 必须为 `development_plan` 或 `revision`、`userConfirmed` 必须是字面值
+`true`，并保持完整 UTF-8 正文的 64 KiB 上限。只有当前对话用户明确确认后，模型才可填写
+`userConfirmed=true`，例如用户说“可以，就按这么做”；它只是模型可填写的语义审计信号，不是授权凭证，不替代
+OAuth、本机 enable、binding 或 Desktop 审批，也不承诺能够影响或绕过平台策略；完整计划仍可能
+被 Desktop 或平台策略拦截、拒绝或要求审批。`idempotentHint` 仍只表示同一 `commandId` 防止
+重复尝试，不代表网络 exactly-once。
+
+本机命令、权限提示、64 KiB 正文限制、崩溃恢复和版本门禁见
+[Desktop Control 操作说明](docs/desktop-control.md)。
+
 ## 解决什么问题
 
 ChatGPT 付费订阅的网页版额度大量闲置，Codex 却在消耗紧张的 API 额度做
@@ -216,7 +268,8 @@ Ready.
 - **数据面（MCP）**：ChatGPT 缺什么自己拉什么，原有 9 个只读工具：
   `workspace_info`、`list_directory`、`read_file`、`search_workspace`、
   `git_status`、`git_diff`、`test_status`、`execution_summary`、
-  `execution_output`。实验性 `write_probe` 为单独的可选工具，见
+  `execution_output`。明确授权的 Desktop Control 工具和实验性 `write_probe` 均为独立
+  能力，见 [Desktop Control](docs/desktop-control.md) 与
   [实验性 MCP 写入探针](docs/experimental-write-probe.md)。
 - **独立审查**：Codex 执行完毕后，ChatGPT 通过 MCP 亲自检查真实的 git diff
   和测试记录——绝不因为 Codex 说"测试全过"就直接相信。
@@ -226,6 +279,9 @@ Ready.
 - **默认从构造上只读**：原 9 个工具只读取工作区数据。可选的 `write_probe` 只有
   在开启环境变量并取得 `probe.write` scope 时，才会覆盖一条 C2C 状态记录；它不能
   写工作区文件、删除文件、执行 Shell 或提交，提示注入也无法启用这些能力。
+- **Desktop 投递单独受限**：`codex_desktop_send` 只有在取得
+  `codex.desktop.control` 且本机明确启用绑定后，才能向一个已有 Desktop 会话发送已确认的
+  任务正文；它不是直接写文件或执行 Shell 的 RPC。
 - **一个工作区 = 一道边界**：每个令牌绑定单一工作区；路径校验基于规范化
   realpath（symlink、`../`、绝对路径逃逸全部被拦截并有测试覆盖）。
 - **敏感文件永不外泄**：`.env*`、密钥、SSH、各类凭据默认拒绝
@@ -253,15 +309,17 @@ c2c status / doctor / pair / unpair / logs / stop
 （自动检测，Skill 会替你安装）。
 
 文档：[架构](docs/architecture.md) · [协议](docs/protocol.md) ·
-[安全](docs/security.md) · [故障排查](docs/troubleshooting.md)
+[安全](docs/security.md) · [Desktop Control](docs/desktop-control.md) ·
+[故障排查](docs/troubleshooting.md)
 
 ## 目录结构
 
 ```
 src/
   bridge/     本机回环 HTTP 服务、端口自动恢复、管理 API
-  mcp/        9 个只读工具 + 可选 Remote Control 和写入探针
+  mcp/        9 个只读工具 + 可选 Remote/Desktop Control 和写入探针
   remote/     持久队列、Controller、官方 app-server 客户端
+  desktop/    本机 Desktop 绑定、IPC 投递和防重放状态
   auth/       OAuth 2.1（PKCE、动态注册、refresh 轮换、吊销）
   pairing/    一次性配对码（CSPRNG、TTL、限速）
   workspace/  路径收敛、敏感文件策略、搜索、git
@@ -278,6 +336,9 @@ docs/         架构 / 协议 / 安全 / 故障排查
 
 V1。已端到端验证：Bridge、OAuth + 配对、公网隧道、ChatGPT 连接器配置、
 零操作首次配置体验。
+
+Desktop Control 仍是实验性功能；假 Desktop/假 IPC 自动化检查不等于真实 Desktop 的人工
+端到端验收，不能据此宣称真实会话已经验证。
 
 **非官方社区项目，与 OpenAI 无关联，未获其背书。**
 

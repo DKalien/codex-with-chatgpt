@@ -59,10 +59,12 @@ import { checkForUpdates } from "./update-check.js";
 import { registerWebControlCommands } from "./web-control.js";
 import { registerRemoteCommands, remoteStatus } from "./remote.js";
 import { isWriteProbeEnabled, readWriteProbeStatus, WRITE_PROBE_SCOPE } from "../mcp/write-probe.js";
+import { registerDesktopCommands } from "./desktop.js";
 
 const program = new Command();
 registerWebControlCommands(program);
 registerRemoteCommands(program);
+registerDesktopCommands(program);
 
 const say = (msg: string): void => {
   process.stdout.write(msg + "\n");
@@ -1047,7 +1049,7 @@ program
   .option("--exit-status <status>", "ok | failed | blocked", "ok")
   .option("--notes <text>")
   .option("--control-session-id <id>", "Web Control session metadata (local only)")
-  .option("--command-id <id>", "Web Control command metadata (local only)")
+  .option("--command-id <id>", "关联命令 ID（本地执行记录）")
   .option("--command <text>", "command whose output may be offered to ChatGPT")
   .option("--output <text>", "command output (prefer --output-file for long logs)")
   .option("--output-file <path>", "read command output from a local file")

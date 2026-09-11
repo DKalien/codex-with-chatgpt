@@ -12,10 +12,19 @@ export const SUPPORTED_SCOPES = [
   "offline_access",
 ] as const;
 
-export type Scope = (typeof SUPPORTED_SCOPES)[number] | typeof WRITE_PROBE_SCOPE | "codex.control" | "codex.read";
+export const DESKTOP_CONTROL_SCOPE = "codex.desktop.control";
+export const DESKTOP_READ_SCOPE = "codex.desktop.read";
+
+export type Scope =
+  | (typeof SUPPORTED_SCOPES)[number]
+  | typeof WRITE_PROBE_SCOPE
+  | "codex.control"
+  | "codex.read"
+  | typeof DESKTOP_CONTROL_SCOPE
+  | typeof DESKTOP_READ_SCOPE;
 
 export function getSupportedScopes(): string[] {
-  const scopes = [...SUPPORTED_SCOPES, "codex.control", "codex.read"];
+  const scopes = [...SUPPORTED_SCOPES, "codex.control", "codex.read", DESKTOP_CONTROL_SCOPE, DESKTOP_READ_SCOPE];
   return isWriteProbeEnabled() ? [...scopes, WRITE_PROBE_SCOPE] : scopes;
 }
 

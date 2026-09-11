@@ -5,6 +5,7 @@
 | Normal C2C | Codex → ChatGPT Planner / Reviewer | 当前本地 Agent 和网页流程 |
 | DOM Web Control | ChatGPT COMMAND → 内置浏览器 → 当前 Codex | 对应 Agent turn 正在监听 |
 | MCP Remote Control | 任意设备 ChatGPT → HTTPS MCP → durable queue → Controller → Codex app-server | 本机 Bridge、Tunnel、Controller 正在运行 |
+| Desktop Control | ChatGPT → HTTPS MCP → 本机绑定 → Desktop 内部 IPC → 已有 Desktop thread | 本机 Bridge、Desktop 已加载且空闲、绑定和 enable 正在生效 |
 
 Remote Control 不依赖 Codex Desktop 窗口、当前 conversation、in-app browser 或 DOM listener。
 电脑需保持运行并联网。没有 ChatGPT 主动推送、远程 Shell、任意路径注册、自动审批或开机启动。

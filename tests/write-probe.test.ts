@@ -129,8 +129,8 @@ describe("MCP write_probe", () => {
       expect(tools.every((item) => item.annotations?.readOnlyHint === true)).toBe(true);
       expect(tools.find((item) => item.name === "write_probe")).toBeUndefined();
       readAnnotations = annotationsOf(tools);
-      expect(await discoveryScopes(bridge.localBaseUrl(), "/.well-known/oauth-authorization-server/mcp")).toEqual([...BASE_SCOPES, "codex.control", "codex.read"]);
-      expect(await discoveryScopes(bridge.localBaseUrl(), "/.well-known/oauth-protected-resource/mcp")).toEqual([...BASE_SCOPES, "codex.control", "codex.read"]);
+      expect(await discoveryScopes(bridge.localBaseUrl(), "/.well-known/oauth-authorization-server/mcp")).toEqual([...BASE_SCOPES, "codex.control", "codex.read", "codex.desktop.control", "codex.desktop.read"]);
+      expect(await discoveryScopes(bridge.localBaseUrl(), "/.well-known/oauth-protected-resource/mcp")).toEqual([...BASE_SCOPES, "codex.control", "codex.read", "codex.desktop.control", "codex.desktop.read"]);
     });
 
     await withBridge(true, async ({ bridge, connect }) => {
@@ -151,11 +151,11 @@ describe("MCP write_probe", () => {
       expect(Object.keys(schema.properties ?? {})).toEqual(["nonce"]);
       expect(schema.required).toEqual(["nonce"]);
       expect(await discoveryScopes(bridge.localBaseUrl(), "/.well-known/oauth-authorization-server/mcp")).toEqual([
-        ...BASE_SCOPES, "codex.control", "codex.read",
+        ...BASE_SCOPES, "codex.control", "codex.read", "codex.desktop.control", "codex.desktop.read",
         "probe.write",
       ]);
       expect(await discoveryScopes(bridge.localBaseUrl(), "/.well-known/oauth-protected-resource/mcp")).toEqual([
-        ...BASE_SCOPES, "codex.control", "codex.read",
+        ...BASE_SCOPES, "codex.control", "codex.read", "codex.desktop.control", "codex.desktop.read",
         "probe.write",
       ]);
     });

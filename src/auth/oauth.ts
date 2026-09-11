@@ -1,6 +1,6 @@
 import { Router, type Request, type Response, urlencoded, json } from "express";
 import { randomBytes } from "node:crypto";
-import { AuthStore, getSupportedScopes, base64UrlSha256, filterScopes, safeEqual } from "./store.js";
+import { AuthStore, DESKTOP_CONTROL_SCOPE, DESKTOP_READ_SCOPE, getSupportedScopes, base64UrlSha256, filterScopes, safeEqual } from "./store.js";
 import { WRITE_PROBE_SCOPE } from "../mcp/write-probe.js";
 import { PairingManager } from "../pairing/manager.js";
 import type { Logger } from "../logger/index.js";
@@ -79,6 +79,8 @@ function pairingPage(opts: {
     "execution.read": "Read Codex execution summaries",
     "codex.control": "在本地已授权工作区创建 Codex 线程并派发任务（可修改文件，使用本机安全配置）",
     "codex.read": "读取当前工作区的远程 Codex 任务和线程状态",
+    [DESKTOP_CONTROL_SCOPE]: "Desktop Control：向本机已绑定会话发送任务；任务可能按该会话权限修改文件或执行命令（可随时在本机撤权）",
+    [DESKTOP_READ_SCOPE]: "读取 Desktop 绑定、可用性和投递状态（只读）",
     [WRITE_PROBE_SCOPE]: "实验：将测试 nonce 写入 C2C 自身的固定状态文件（不修改工作区）",
     offline_access: "Stay connected between sessions",
   };
@@ -91,6 +93,9 @@ function pairingPage(opts: {
   const escapedProductName = escapeHtml(PRODUCT_NAME);
   const escapedWorkspaceName = escapeHtml(opts.workspaceName);
   const escapedRequestId = escapeHtml(opts.requestId);
+  const desktopNotice = opts.scopes.includes(DESKTOP_CONTROL_SCOPE)
+    ? `<p class="notice">启用期间，获授权客户端可以向此绑定会话发送任务；任务可能按该 Desktop 会话的现有权限修改文件或执行命令。可随时在本机撤权；网页不能自行启用、绑定或调整权限。</p>`
+    : "";
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -117,14 +122,16 @@ function pairingPage(opts: {
            background: #0071e3; color: #fff; cursor: pointer; }
   button:hover { background: #0077ed; }
   .error { color: #d70015; font-size: 13px; margin: 12px 0 0; }
+  .notice { color: #6e6e73; font-size: 13px; line-height: 1.5; margin: 12px 0 24px; }
   .hint { color: #86868b; font-size: 12px; margin-top: 16px; text-align: center; }
 </style>
 </head>
 <body>
 <div class="card">
   <h1>${escapedProductName}</h1>
-  <p class="sub">ChatGPT is requesting access to workspace <strong>${escapedWorkspaceName}</strong> (${opts.scopes.includes("codex.control") ? "远程 Codex 任务控制，可修改工作区" : opts.scopes.includes(WRITE_PROBE_SCOPE) ? "工作区只读；另含 C2C 状态写入实验" : "read-only"}):</p>
+  <p class="sub">ChatGPT is requesting access to workspace <strong>${escapedWorkspaceName}</strong> (${opts.scopes.includes(DESKTOP_CONTROL_SCOPE) ? "Desktop 任务投递，可修改文件或执行命令" : opts.scopes.includes("codex.control") ? "远程 Codex 任务控制，可修改工作区" : opts.scopes.includes(WRITE_PROBE_SCOPE) ? "工作区只读；另含 C2C 状态写入实验" : "read-only"}):</p>
   <ul>${scopeList}</ul>
+  ${desktopNotice}
   <form method="POST" action="authorize">
     <input type="hidden" name="request_id" value="${escapedRequestId}">
     <input type="text" name="pairing_code" id="pairing_code" placeholder="XXXX-XXXX"

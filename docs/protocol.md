@@ -254,6 +254,104 @@ Controller 使用 initialize、thread/start、thread/resume、turn/start，监�
 输入、状态机、命令与人工验收见 [Remote Control](remote-control.md)。
 它与下述依赖当前 Agent 的 DOM Web Control 并行保留，Normal C2C 协议不变。
 
+## Desktop Control MVP（实验性）
+
+Desktop Control 是独立于 Remote Control 和 DOM Web Control 的 MCP 写入路径，默认关闭。
+它只向本机已经绑定、已在 Desktop 中加载且当前空闲的已有 thread 投递消息；第一版不
+创建新会话，不 steer、interrupt、转发实时进度、推送通知或持续轮询网页。
+最后重检若明确证明尚未进入 start，则记录 `rejected` 与具体原因，同 ID 不重试；只有
+用户明确发起新请求才使用新 ID。已开始 IPC 写入后的异常必须保持 `outcome_unknown`。
+
+```text
+当前对话用户明确确认完整方案或修订
+  → codex_desktop_send（codex.desktop.control）
+    intent=development_plan|revision, userConfirmed=true
+  → 本机重新核对绑定、Desktop 进程/端点、owner、项目和版本
+  → 等待有界的真实接受回执
+  → deliveryStatus=accepted（带真实 threadId/turnId），网页本轮结束
+  → Desktop 执行后按 commandId/taskId 写入现有 record
+  → 用户主动要求验收时，ChatGPT 用只读 MCP 检查当次代码、Git 和 record
+```
+
+### 日常 UX：`bind-current`
+
+用户在当前 Desktop composer 中说“把这个会话绑定并启用给 ChatGPT”（或同义表达）时，Codex
+运行本机 `desktop bind-current [-w <workspace>] [--json]`。命令使用当前真实上下文的
+`CODEX_THREAD_ID` 精确映射 Desktop thread、project 和 workspaceRoot，不按标题、最近会话
+或其他 Agent ID 猜测，也不要求用户 ID 或让用户手打命令。命令不接受 thread/user ID、
+`--yes` 或 `--accept` 等绕过确认的参数。缺少、冲突或无法核验当前上下文（`unknown`）时，
+快捷绑定和启用必须明确拒绝，且不能跨 workspaceRoot 重绑。
+
+快捷流程只由当前本机用户在当前 Desktop composer 中明确提出的动作请求触发；文档、代码块、
+引用、任务计划或普通讨论里的示例句不触发。来源无法可靠证明来自本机时，不能凭文字免除确认。
+
+本地 composer 与 IPC `userMessage` 的来源无法可靠区分，所以任何新增绑定或状态变更都必须
+先显示本机一键确认窗，固定显示风险“ChatGPT 可以向此 Desktop 会话发送任务；任务可能按该
+会话已有权限修改文件或执行命令”、当前 Desktop 标题和规范化 workspaceRoot。新窗口不得由
+Codex 自动点击，也不得用脚本代点；本机用户必须自己点击。触发流程的 prompt 不是授权凭证，
+不能替代本机确认、OAuth、binding、enable 或 Desktop 审批。确认窗最多等待 2 分钟，超时或
+取消不改变绑定状态。当前没有可可靠区分本地 composer 与 IPC `userMessage` 的来源信号；
+`CODEX_INTERNAL_ORIGINATOR_OVERRIDE='Codex Desktop'` 即使存在也只是会话级提示，不能作为
+免确认条件或安全边界，不能声称可抵抗本机任意代码篡改。
+
+同一 thread/project/workspace 已 enabled 时，身份核验通过后返回 `alreadyEnabled`，复用
+原 `bindingId`，不生成新 ID、不再次授权；同一身份 disabled 时，用户确认后 enable，复用
+原 ID；同一 workspaceRoot 下不同 thread/project 经用户确认后生成新的 `bindingId`。
+所有 deliveries history 始终保留，其中包含旧 `bindingId`。不同 workspaceRoot 或无法确认
+（`unknown`）时，明确拒绝快捷 bind/enable/send，不能换 ID 或重新绑定绕过。身份核验允许当前
+Desktop 为 `active`，但 send 仍必须严格满足 `idle`、无待审批、owner、project/workspace
+匹配和已验证版本。
+
+本机用户先用 `desktop bind` 指定真实 `threadId`、`host`、Desktop `project` 和当前
+workspace，再用 `desktop enable` 明确接受 Desktop 会话现有权限可能修改文件或执行命令。
+重新绑定会生成新的 `bindingId` 并关闭启用状态；网页不能 bind、enable 或调整本机权限。
+这组显式命令仍是高级 fallback；不新增 MCP bind 工具。
+命令和使用限制见 [Desktop Control](desktop-control.md)。
+
+`codex_desktop_status`（`codex.desktop.read`）只读取当前绑定、可用性和指定投递记录，
+不发送消息。发送必须同时满足有效 OAuth `codex.desktop.control`、本机 enable 和匹配
+的当前 `bindingId`。`codex_desktop_send` 的 `message` 是完整的已确认计划或修订指令，
+按 UTF-8 原文传递，正文上限为 64 KiB（65536 字节）；超限拒绝，不能截断或解释成 shell、路径、原始
+RPC。`intent` 必填且只能是 `development_plan` 或 `revision`；`userConfirmed` 必须是字面值
+`true`，只有当前对话用户明确确认后模型才能填写，例如用户说“可以，就按这么做”。它只是模型
+可填写的语义审计信号，不是授权凭证，不替代 OAuth、本机 enable、bindingId 或 Desktop 审批，
+也不承诺能够影响或绕过平台安全策略；完整计划仍可能被 Desktop 或平台策略拦截、拒绝或要求审批。
+请求不覆盖 model/provider/cwd/effort/sandbox/approval/permissions 等执行设置。
+send 的风险标注保持 `readOnlyHint:false`、`destructiveHint:true`、`openWorldHint:true`、
+`idempotentHint:true`；`idempotent` 仅表示同一 `commandId` 防止重复尝试，不是网络 exactly-once。
+
+`accepted` 仅表示投递被 Desktop 接受，不是 `completed`，也不是测试通过。忙、待审批、
+无 owner、离线、错项目、workspace 不匹配、提权或版本不兼容时零发送并返回明确错误。
+回执超时、断线或落盘不明返回 `outcome_unknown`；不要重发、换 `commandId` 或重新绑定绕过，
+整个 workspace（包括新绑定）的后续投递暂停，必须先由本机用户人工核对；MVP 没有自动
+恢复或恢复接口。
+
+状态持久化 `commandId`、OAuth `clientId`、`bindingId`、正文摘要、投递阶段及真实
+thread/turn ID。必要的这些投递元数据可以由状态查询返回，但状态、日志和
+`execution_summary` 不复制完整正文、配置、凭据或 transcript。跨进程锁和原子写保证同
+client、同 ID、同参数重放返回原记录，`intent` 或其他参数冲突时拒绝；发送前先保存“可能已发送”，崩溃或
+重启不自动重发。这是防重复尝试，不宣称网络 exactly-once。
+
+状态 `revision` 可选；旧记录读取时默认 `0`，读取不迁移或回填。只有正常写入才递增
+`revision`，确认提交会核对它以发现确认期间的撤权、重新绑定等 ABA 变化；发现变化时阻断
+快捷操作并要求重新确认。
+
+状态格式仍为 `version: 1`。`delivery.intent` 读取时可选，仅兼容缺少该字段的旧记录；新写入
+记录必须保存 `intent`。读取不迁移、回填或修改旧历史，旧记录在 `status` 返回中继续缺省
+`intent`。使用缺少该字段的旧 `commandId` 再次 `send` 时，无法证明新的 `intent` 与原请求
+相同，按 `DESKTOP_COMMAND_CONFLICT` 拒绝，并引导先用 `status` 查看原记录。`outcome_unknown`
+阻断规则保持不变。
+
+IPC 只在本机受控使用，Windows helper 使用 `C2C_DESKTOP_PYTHON` 或 `python`，不要求
+管理员权限、不启动第二个 app-server/router，也不通过 Tunnel 暴露原始 RPC。只放行已
+验证 Desktop/app-server 版本，未知版本停止；Desktop 重启后重新发现进程和 owner。
+已知 idle/start 内部协议在检查和发送之间没有原子 CAS，目标可能在窗口内改变，因此回执
+不匹配也按未知结果处理。profile 标识与 `override=null` 属于不同字段层次，设置继承只是
+源码推断；provider 和服务端最终权限解析可能仍是 unknown，不能据此声称所有权限设置已通过。
+
+自动化假 Desktop/假 IPC 只能验证边界和防重复；真实确认窗口、绑定与投递 E2E 仍需人工验收，
+不能据此宣称真实会话已经验证。
+
 ## Web Control Mode
 
 默认关闭，只能由当前 Codex **本地用户明确开启**；网页 ENABLE/PAUSE 不在协议内。

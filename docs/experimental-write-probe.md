@@ -5,7 +5,7 @@
 ## 默认边界
 
 - `C2C_ENABLE_WRITE_PROBE` 只有精确为 `1` 才启用，默认关闭。
-- 关闭时 `tools/list` 只有原 9 个 read-only 工具。开启后额外注册 `write_probe`；原 5 个 OAuth scopes 不变，探针另用独立的 `probe.write` scope，并且只在显式请求、完成相应授权后可调用。
+- 在没有其他可选写能力时，关闭状态的 `tools/list` 只有原 9 个 read-only 工具。开启后额外注册 `write_probe`；原 5 个 OAuth scopes 不变，探针另用独立的 `probe.write` scope，并且只在显式请求、完成相应授权后可调用。Desktop Control 是独立功能，本机绑定后注册工具，按自己的 `codex.desktop.*` scopes 校验；实际发送另需本机 enable。
 - 输入严格为 `{ "nonce": "..." }`。`nonce` 只能是 1–128 个英文字母、数字、下划线或短横线；不接受 `path` 或 `note`。
 - 唯一副作用是把 `{nonce,timestamp,workspaceId,tool}` 写入 `getStateDir()/write-probe.json`，覆盖上一条记录。逻辑位置返回为 `c2c-state/write-probe.json`；不会修改工作区、删除文件或执行命令。
 - 成功响应包含 `ok:true`、`written:true`、`nonce`、`timestamp` 和 `location`。
