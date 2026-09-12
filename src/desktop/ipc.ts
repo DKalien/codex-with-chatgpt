@@ -27,6 +27,10 @@ export interface DesktopTargetInfo extends DesktopTarget {
   ownerClientId?: string | null;
 }
 
+export interface DesktopExecutionInfo extends DesktopTargetInfo {
+  activeTurnId: string;
+}
+
 export interface DesktopIpcConnection {
   send(message: string): Promise<{ threadId: string; turnId: string }>;
   close(): void;
@@ -61,6 +65,7 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
 const DEFAULT_SEND_TIMEOUT_MS = 40_000;
 const MAX_TIMEOUT_MS = 60_000;
 const MAX_CONTROL_FRAME_BYTES = 512 * 1024;
+const SEND_REQUEST_ID_PLACEHOLDER = "00000000-0000-0000-0000-000000000000";
 
 const SAFE_CODES = new Set([
   "DESKTOP_UNSUPPORTED_PLATFORM",
@@ -161,6 +166,15 @@ function validateMessage(value: string): string {
   return value;
 }
 
+export function validateDesktopWireMessage(value: string): string {
+  const text = validateMessage(value);
+  let encoded: string;
+  try { encoded = JSON.stringify({ id: SEND_REQUEST_ID_PLACEHOLDER, op: "send", message: text }) + "\n"; }
+  catch { throw error("DESKTOP_PROTOCOL_ERROR"); }
+  if (Buffer.byteLength(encoded, "utf8") > MAX_CONTROL_FRAME_BYTES) throw error("DESKTOP_MESSAGE_TOO_LARGE");
+  return text;
+}
+
 function validateInfo(value: unknown, target: DesktopTarget): DesktopTargetInfo {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw error("DESKTOP_PROTOCOL_ERROR");
   const info = value as Partial<DesktopTargetInfo>;
@@ -171,6 +185,16 @@ function validateInfo(value: unknown, target: DesktopTarget): DesktopTargetInfo 
     throw error("DESKTOP_PROTOCOL_ERROR");
   }
   return { ...target, ...info } as DesktopTargetInfo;
+}
+
+function validateExecutionInfo(value: unknown, target: DesktopTarget): DesktopExecutionInfo {
+  const info = validateInfo(value, target);
+  if (info.runtimeStatus !== "active" && info.runtimeStatus !== "inProgress") {
+    throw error("DESKTOP_STATE_UNAVAILABLE");
+  }
+  const activeTurnId = (value as { activeTurnId?: unknown }).activeTurnId;
+  if (!isUuid(activeTurnId)) throw error("DESKTOP_STATE_UNAVAILABLE");
+  return { ...info, activeTurnId };
 }
 
 function normalizePath(value: string): string {
@@ -353,11 +377,16 @@ export class DesktopIpcClient {
     return this.currentOperation("current_identity", workspaceRoot);
   }
 
+  async currentExecution(workspaceRoot: string): Promise<DesktopExecutionInfo> {
+    return this.currentOperation("current_execution", workspaceRoot, validateExecutionInfo) as Promise<DesktopExecutionInfo>;
+  }
+
   async confirmCurrent(workspaceRoot: string): Promise<DesktopTargetInfo> {
     return this.currentOperation("current_confirm", workspaceRoot);
   }
 
-  private async currentOperation(operation: string, workspaceRoot: string): Promise<DesktopTargetInfo> {
+  private async currentOperation(operation: string, workspaceRoot: string,
+    validate: (value: unknown, target: DesktopTarget) => DesktopTargetInfo = validateInfo): Promise<DesktopTargetInfo> {
     const threadId = process.env.CODEX_THREAD_ID;
     if (!isUuid(threadId) || (process.env.CODEX_SESSION_ID && process.env.CODEX_SESSION_ID !== threadId) ||
       typeof workspaceRoot !== "string" || !workspaceRoot.trim()) throw error("DESKTOP_CURRENT_CONTEXT_INVALID");
@@ -366,7 +395,7 @@ export class DesktopIpcClient {
       // 不传 thread/project/host：helper 从继承的当前 Agent 上下文和 Desktop 映射精确解析。
       const value = await session.request<DesktopTargetInfo>(operation, { workspaceRoot });
       const target = validateTarget({ threadId, hostId: "local", projectId: value?.projectId, workspaceRoot });
-      return validateInfo(value, target);
+      return validate(value, target);
     } finally { session.close(); }
   }
 

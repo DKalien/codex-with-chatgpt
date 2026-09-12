@@ -18,6 +18,7 @@ export interface RuntimeState {
   adminToken: string;
   publicUrl: string | null;
   startedAt: string;
+  runtimeBuildId?: string;
 }
 
 export function runtimeFile(workspaceId: string): string {
@@ -32,7 +33,12 @@ export function readRuntimeState(workspaceId: string): RuntimeState | null {
   return readJsonIfExists<RuntimeState>(runtimeFile(workspaceId));
 }
 
-export function clearRuntimeState(workspaceId: string): void {
+export function clearRuntimeState(workspaceId: string, expected?: Pick<RuntimeState, "pid" | "startedAt" | "adminToken">): void {
+  if (expected) {
+    const current = readRuntimeState(workspaceId);
+    if (!current || current.pid !== expected.pid || current.startedAt !== expected.startedAt ||
+      current.adminToken !== expected.adminToken) return;
+  }
   try {
     fs.rmSync(runtimeFile(workspaceId), { force: true });
   } catch {
@@ -45,6 +51,9 @@ export interface HealthPayload {
   version: string;
   workspaceId: string;
   status: string;
+  pid?: number;
+  startedAt?: string;
+  runtimeBuildId?: string;
 }
 
 /** Probe a port and check whether a healthy c2c bridge for the workspace answers. */
@@ -66,10 +75,35 @@ export async function probeBridge(
   }
 }
 
+export async function adminFetch<T = unknown>(
+  runtime: RuntimeState,
+  method: "GET" | "POST",
+  route: string,
+  timeoutMs = 60_000
+): Promise<T> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(`http://127.0.0.1:${runtime.port}${route}`, {
+      method,
+      headers: { Authorization: `Bearer ${runtime.adminToken}` },
+      signal: controller.signal,
+      redirect: "error",
+    });
+    const body = (await response.json().catch(() => ({}))) as T & { message?: string };
+    if (!response.ok) {
+      throw new Error((body as { message?: string }).message ?? `Admin request failed (${response.status})`);
+    }
+    return body;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export type BridgeObservation =
   | { state: "healthy"; runtime: RuntimeState }
-  | { state: "stopped"; runtime: RuntimeState | null; reason: "runtime_missing" | "pid_missing" }
-  | { state: "unknown"; runtime: RuntimeState | null; reason: "probe_failed" | "pid_unknown" | "workspace_mismatch" };
+  | { state: "stopped"; runtime: RuntimeState | null; reason: "runtime_missing" | "pid_missing" | "stale_runtime" }
+  | { state: "unknown"; runtime: RuntimeState | null; reason: "probe_failed" | "pid_unknown" | "workspace_mismatch" | "identity_mismatch" };
 
 function observePid(pid: number): "present" | "missing" | "unknown" {
   if (!Number.isInteger(pid) || pid <= 0) return "unknown";
@@ -88,16 +122,47 @@ function observePid(pid: number): "present" | "missing" | "unknown" {
 export async function findBridgeObservation(workspaceId: string): Promise<BridgeObservation> {
   const runtime = readRuntimeState(workspaceId);
   if (!runtime) return { state: "stopped", runtime: null, reason: "runtime_missing" };
-
-  const health = await probeBridge(runtime.port);
-  if (health && health.workspaceId === workspaceId) {
-    return { state: "healthy", runtime };
-  }
-  if (health) {
+  if (runtime.workspaceId !== workspaceId || runtime.service !== SERVICE_NAME) {
     return { state: "unknown", runtime, reason: "workspace_mismatch" };
   }
 
+  const health = await probeBridge(runtime.port);
   const pid = observePid(runtime.pid);
+  if (health) {
+    if (health.status !== "ok" || typeof health.workspaceId !== "string" || !health.workspaceId) {
+      return { state: "unknown", runtime, reason: "identity_mismatch" };
+    }
+    const legacy = health.pid === undefined && health.startedAt === undefined;
+    const healthStart = typeof health.startedAt === "string" ? Date.parse(health.startedAt) : NaN;
+    const identified = typeof health.pid === "number" && Number.isSafeInteger(health.pid) &&
+      health.pid > 0 && Number.isFinite(healthStart);
+    const savedStart = Date.parse(runtime.startedAt);
+    const samePid = health.pid === runtime.pid;
+    const sameStart = identified && healthStart === savedStart;
+    // 端口复用不是身份矛盾的充分证据：旧 PID 必须已死亡，或同一 PID 的启动时间证明已被复用。
+    if ((legacy || identified) && (
+      (pid === "missing" && !samePid) ||
+      (identified && samePid && pid === "present" && Number.isFinite(savedStart) &&
+        healthStart > savedStart)
+    )) return { state: "stopped", runtime, reason: "stale_runtime" };
+    if (health.workspaceId !== workspaceId) {
+      return { state: "unknown", runtime, reason: "workspace_mismatch" };
+    }
+    if (legacy && pid === "present" && Number.isFinite(savedStart) &&
+      typeof runtime.adminToken === "string" && runtime.adminToken.length > 0) {
+      try {
+        const info = await adminFetch<Partial<RuntimeState>>(runtime, "GET", "/admin/info", 2000);
+        if (info.service === runtime.service && info.workspaceId === workspaceId &&
+          info.pid === runtime.pid && info.startedAt === runtime.startedAt &&
+          observePid(runtime.pid) === "present") return { state: "healthy", runtime };
+      } catch {
+        // 旧 health 不是授权证明；认证失败、重定向或端口复用均保持 unknown。
+      }
+    }
+    if (pid === "present" && identified && samePid && sameStart) return { state: "healthy", runtime };
+    return { state: "unknown", runtime, reason: "identity_mismatch" };
+  }
+
   if (pid === "missing") return { state: "stopped", runtime, reason: "pid_missing" };
   return { state: "unknown", runtime, reason: pid === "unknown" ? "pid_unknown" : "probe_failed" };
 }

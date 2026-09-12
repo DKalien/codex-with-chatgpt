@@ -1,7 +1,9 @@
 import type { Command } from "commander";
+import fs from "node:fs";
 import { Workspace } from "../workspace/manager.js";
 import { bindCurrentDesktop, bindDesktop, desktopStatus, disableDesktop, enableDesktop } from "../desktop/service.js";
 import { DesktopError, targetInput } from "../desktop/store.js";
+import { recordDesktopResult } from "../desktop/result.js";
 
 const say = (message: string): void => { process.stdout.write(`${message}\n`); };
 
@@ -16,6 +18,53 @@ function print(payload: unknown, json: boolean, message: string): void {
 
 export function registerDesktopCommands(program: Command): void {
   const desktop = program.command("desktop").description("管理本机已绑定的 Desktop Control 会话");
+
+  desktop.command("record-result", { hidden: true })
+    .description("记录当前 Desktop turn 的执行结果（仅本机）")
+    .option("-w, --workspace <path>", "workspace 根目录")
+    .requiredOption("--command-id <id>", "原 accepted commandId")
+    .requiredOption("--changed-files <files>", "本轮实际修改文件，逗号分隔；无修改传空字符串")
+    .requiredOption("--tests <summary>", "本轮测试摘要；未运行填 not run")
+    .requiredOption("--exit-status <status>", "ok / failed / blocked")
+    .option("--notes <text>", "本轮说明")
+    .option("--command <text>", "已执行命令的描述，不执行此文本")
+    .option("--output <text>", "已执行命令的输出")
+    .option("--output-file <path>", "已执行命令的 UTF-8 汇总输出文件，最多 256 KiB")
+    .option("--exit-code <code>", "已执行命令的退出码")
+    .option("--json", "输出机器可读结果", false)
+    .action(async (opts: { workspace?: string; commandId: string; changedFiles: string; tests: string;
+      exitStatus: "ok" | "failed" | "blocked"; notes?: string; command?: string; output?: string;
+      outputFile?: string; exitCode?: string; json: boolean }) => {
+      try {
+        if (opts.output !== undefined && opts.outputFile !== undefined) {
+          throw new DesktopError("DESKTOP_RESULT_INVALID", "output 与 output-file 不能同时指定。");
+        }
+        let output = opts.output;
+        if (opts.outputFile !== undefined) {
+          const fd = fs.openSync(opts.outputFile, "r");
+          try {
+            const buffer = Buffer.alloc(256 * 1024 + 1);
+            const count = fs.readSync(fd, buffer, 0, buffer.length, 0);
+            if (count === buffer.length) throw new DesktopError("DESKTOP_RESULT_INVALID", "输出文件超过 256 KiB；请先生成本轮汇总，不会截断证据。");
+            output = new TextDecoder("utf-8", { fatal: true }).decode(buffer.subarray(0, count));
+          } finally { fs.closeSync(fd); }
+        }
+        if (opts.exitCode !== undefined && (!/^-?\d+$/.test(opts.exitCode) || !Number.isSafeInteger(Number(opts.exitCode)))) {
+          throw new DesktopError("DESKTOP_RESULT_INVALID", "exit-code 必须为安全整数。");
+        }
+        const result = await recordDesktopResult(new Workspace(workspaceRoot(opts.workspace)), {
+          commandId: opts.commandId, changedFiles: opts.changedFiles.split(",").map(file => file.trim()).filter(Boolean),
+          tests: opts.tests, exitStatus: opts.exitStatus, notes: opts.notes, command: opts.command,
+          output, exitCode: opts.exitCode === undefined ? undefined : Number(opts.exitCode),
+        });
+        print({ ok: true, ...result }, opts.json, "本轮 Desktop execution receipt 已记录。");
+      } catch (error) {
+        const code = error instanceof DesktopError ? error.code : "DESKTOP_RESULT_INVALID";
+        const message = error instanceof DesktopError ? error.message : "执行结果记录失败；未确认验收闭环完成。";
+        print({ ok: false, error: code, message }, opts.json, message);
+        process.exitCode = 1;
+      }
+    });
 
   desktop.command("bind-current")
     .description("识别当前 Desktop 会话，经本机确认后绑定并启用")

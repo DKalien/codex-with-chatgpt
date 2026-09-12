@@ -111,6 +111,38 @@ describe("Desktop IPC wrapper（fake helper）", () => {
     } finally { vi.unstubAllEnvs(); }
   });
 
+  it("currentExecution 只传workspace并严格验证运行态与 activeTurnId", async () => {
+    vi.stubEnv("CODEX_THREAD_ID", target.threadId); vi.stubEnv("CODEX_SESSION_ID", target.threadId);
+    const activeTurnId = "01a00000-0000-7000-8000-000000000003";
+    try {
+      for (const runtimeStatus of ["active", "inProgress"] as const) {
+        const fake = fakeSpawner(request => request.op === "current_execution" ?
+          { ok: true, value: { ...target, title: "当前执行会话", cwd: target.workspaceRoot, runtimeStatus, activeTurnId } } :
+          { ok: true, value: { ...target, title: "Fake Desktop 会话", cwd: target.workspaceRoot, runtimeStatus: "idle" } });
+        const result = await makeClient(fake.spawnImpl).currentExecution(target.workspaceRoot);
+        expect(result.activeTurnId).toBe(activeTurnId);
+        expect(result.runtimeStatus).toBe(runtimeStatus);
+        const request = fake.requests.find(item => item.op === "current_execution");
+        expect(request && Object.keys(request).sort()).toEqual(["id", "op", "workspaceRoot"]);
+        expect(request?.workspaceRoot).toBe(target.workspaceRoot);
+      }
+
+      for (const invalid of [undefined, null, 1, "not-a-uuid"]) {
+        const fake = fakeSpawner(request => request.op === "current_execution" ?
+          { ok: true, value: { ...target, title: "当前执行会话", cwd: target.workspaceRoot, runtimeStatus: "active", activeTurnId: invalid } } :
+          { ok: true, value: { ...target, title: "Fake Desktop 会话", cwd: target.workspaceRoot, runtimeStatus: "idle" } });
+        await expect(makeClient(fake.spawnImpl).currentExecution(target.workspaceRoot))
+          .rejects.toMatchObject({ code: "DESKTOP_STATE_UNAVAILABLE" });
+      }
+
+      const idle = fakeSpawner(request => request.op === "current_execution" ?
+        { ok: true, value: { ...target, title: "当前执行会话", cwd: target.workspaceRoot, runtimeStatus: "idle", activeTurnId } } :
+        { ok: true, value: { ...target, title: "Fake Desktop 会话", cwd: target.workspaceRoot, runtimeStatus: "idle" } });
+      await expect(makeClient(idle.spawnImpl).currentExecution(target.workspaceRoot))
+        .rejects.toMatchObject({ code: "DESKTOP_STATE_UNAVAILABLE" });
+    } finally { vi.unstubAllEnvs(); }
+  });
+
   it("缺失/伪造当前ID或helper错目标不能绑定", async () => {
     const fake = fakeSpawner(() => ({ ok: true, value: { ...target, threadId: randomUUID(), title: "错误会话", cwd: target.workspaceRoot } }));
     try {

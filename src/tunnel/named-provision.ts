@@ -3,15 +3,20 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { findBinary } from "./detect.js";
-import { suggestedNamedHostname } from "./hostname.js";
+import { suggestedNamedHostname, uniqueNamedHostname } from "./hostname.js";
 import { normalizeNamedTunnelHostname } from "./cloudflared-named.js";
 import {
+  hasLocalTunnelBindingConflict,
   NAMED_FALLBACK_MESSAGE,
+  isNamedTunnelReady,
+  readTunnelState,
+  resolveMigrationZone,
   writeTunnelState,
   type TunnelState,
 } from "./state.js";
 
 const TUNNEL_ID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+const VALID_TUNNEL_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const LOGIN_TIMEOUT_MS = 5 * 60_000;
 const COMMAND_TIMEOUT_MS = 45_000;
 
@@ -25,7 +30,7 @@ export interface CloudflaredAccount {
   login(): Promise<void>;
   listTunnels(): Promise<ListedTunnel[]>;
   createTunnel(name: string): Promise<ListedTunnel>;
-  routeDns(tunnelName: string, hostname: string): Promise<void>;
+  routeDns(tunnelName: string, hostname: string, options?: { strict?: boolean }): Promise<void>;
 }
 
 export function cloudflaredCertPath(): string {
@@ -72,7 +77,8 @@ export function parseTunnelList(output: string): ListedTunnel[] {
 
 export function parseCreatedTunnel(output: string, name: string): ListedTunnel | null {
   const id = output.match(TUNNEL_ID_RE)?.[0];
-  return id ? { id, name } : null;
+  const returnedName = output.match(/created\s+tunnel\s+([^\s]+)\s+with\s+id/i)?.[1];
+  return id ? { id, name: returnedName ?? name } : null;
 }
 
 export function isBenignRouteError(message: string): boolean {
@@ -156,9 +162,9 @@ export class ProcessCloudflaredAccount implements CloudflaredAccount {
     throw new Error(result.stderr || result.stdout || `Unable to create tunnel ${name}`);
   }
 
-  async routeDns(tunnelName: string, hostname: string): Promise<void> {
+  async routeDns(tunnelName: string, hostname: string, options?: { strict?: boolean }): Promise<void> {
     const result = this.run(["tunnel", "route", "dns", tunnelName, hostname]);
-    if (result.ok || isBenignRouteError(`${result.stdout}\n${result.stderr}`)) return;
+    if (result.ok || (!options?.strict && isBenignRouteError(`${result.stdout}\n${result.stderr}`))) return;
     throw new Error(result.stderr || result.stdout || `Unable to route ${hostname}`);
   }
 
@@ -189,23 +195,88 @@ export async function provisionNamedTunnel(opts: {
   workspaceName: string;
   zone: string;
   hostname?: string;
+  requireNamed?: boolean;
   account?: CloudflaredAccount;
 }): Promise<ProvisionNamedResult> {
+  const requireNamed = opts.requireNamed === true;
+  const previous = readTunnelState(opts.workspaceId);
   const account = opts.account ?? new ProcessCloudflaredAccount();
+  let zone: string;
   let hostname: string;
+  let tunnelName: string;
   try {
-    hostname = opts.hostname
-      ? normalizeNamedTunnelHostname(opts.hostname)
-      : suggestedNamedHostname(opts.zone, opts.workspaceName, opts.workspaceId);
+    zone = normalizeNamedTunnelHostname(opts.zone);
+    tunnelName = `c2c-${opts.workspaceId.trim().toLowerCase()}`;
+    if (requireNamed) {
+      if (resolveMigrationZone(opts.workspaceId).zoneResolution === "corrupt") {
+        throw new Error("Tunnel state is corrupt; migration is blocked until it is repaired");
+      }
+      const expectedHostname = uniqueNamedHostname(zone, opts.workspaceId);
+      hostname = opts.hostname ? normalizeNamedTunnelHostname(opts.hostname) : expectedHostname;
+      if (hostname !== expectedHostname) {
+        throw new Error("Strict named tunnel hostname must include the current workspace id");
+      }
+      if (previous.workspaceId !== opts.workspaceId) {
+        throw new Error("Tunnel state belongs to another workspace");
+      }
+      if (hasLocalTunnelBindingConflict(opts.workspaceId, { tunnelName, hostname })) {
+        throw new Error("Named tunnel binding conflicts with another workspace");
+      }
+      if (
+        isNamedTunnelReady(previous) &&
+        previous.tunnelName === tunnelName &&
+        previous.tunnelId &&
+        VALID_TUNNEL_ID_RE.test(previous.tunnelId) &&
+        previous.hostname
+      ) {
+        const previousHostname = normalizeNamedTunnelHostname(previous.hostname);
+        if (
+          hasLocalTunnelBindingConflict(opts.workspaceId, {
+            tunnelName: previous.tunnelName,
+            tunnelId: previous.tunnelId,
+            hostname: previousHostname,
+          })
+        ) {
+          throw new Error("Saved tunnel binding conflicts with another workspace");
+        }
+        return { ok: true, state: previous, fallback: false };
+      }
+    } else {
+      hostname = opts.hostname
+        ? normalizeNamedTunnelHostname(opts.hostname)
+        : suggestedNamedHostname(zone, opts.workspaceName, opts.workspaceId);
+    }
   } catch (error) {
-    return fallbackState(opts.workspaceId, "invalid_hostname", (error as Error).message);
+    return provisionFailure(opts.workspaceId, requireNamed, "invalid_hostname", (error as Error).message);
   }
 
-  const tunnelName = `c2c-${opts.workspaceId}`;
   try {
     if (!account.hasCert()) await account.login();
+    const listed = requireNamed ? await account.listTunnels() : [];
     const tunnel = await account.createTunnel(tunnelName);
-    await account.routeDns(tunnel.name, hostname);
+    if (requireNamed) {
+      if (tunnel.name !== tunnelName) throw new Error("Cloudflare returned a tunnel for another workspace");
+      if (!VALID_TUNNEL_ID_RE.test(tunnel.id)) throw new Error("Cloudflare returned an invalid tunnel id");
+      const collision = listed.find((candidate) => candidate.id === tunnel.id && candidate.name !== tunnelName);
+      if (collision) throw new Error("Cloudflare tunnel id belongs to another workspace");
+      const existing = listed.find((candidate) => candidate.name === tunnelName);
+      if (existing && existing.id !== tunnel.id) {
+        throw new Error("Cloudflare returned a different tunnel for this workspace");
+      }
+      if (previous.tunnelId && previous.tunnelId !== tunnel.id) {
+        throw new Error("Saved tunnel id does not match the current workspace tunnel");
+      }
+      if (
+        hasLocalTunnelBindingConflict(opts.workspaceId, {
+          tunnelName: tunnel.name,
+          tunnelId: tunnel.id,
+          hostname,
+        })
+      ) {
+        throw new Error("Tunnel binding conflicts with another workspace");
+      }
+    }
+    await account.routeDns(tunnel.name, hostname, requireNamed ? { strict: true } : undefined);
     const state = writeTunnelState({
       workspaceId: opts.workspaceId,
       preference: "named",
@@ -214,12 +285,12 @@ export async function provisionNamedTunnel(opts: {
       tunnelName: tunnel.name,
       tunnelId: tunnel.id,
       hostname,
-      zone: normalizeNamedTunnelHostname(opts.zone),
+      zone,
       configuredAt: new Date().toISOString(),
     });
     return { ok: true, state, fallback: false };
   } catch (error) {
-    return fallbackState(opts.workspaceId, "provision_failed", (error as Error).message);
+    return provisionFailure(opts.workspaceId, requireNamed, "provision_failed", (error as Error).message);
   }
 }
 
@@ -242,4 +313,21 @@ function fallbackState(workspaceId: string, reason: string, error: string): Prov
     userMessage: NAMED_FALLBACK_MESSAGE,
     error,
   };
+}
+
+function provisionFailure(
+  workspaceId: string,
+  requireNamed: boolean,
+  reason: string,
+  error: string
+): ProvisionNamedResult {
+  if (requireNamed) {
+    return {
+      ok: false,
+      state: readTunnelState(workspaceId),
+      fallback: false,
+      error,
+    };
+  }
+  return fallbackState(workspaceId, reason, error);
 }

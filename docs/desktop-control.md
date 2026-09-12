@@ -11,6 +11,7 @@ ChatGPT 讨论并确认完整方案
   → codex_desktop_send
   → Desktop 返回真实投递接受结果
   → ChatGPT 结束本轮，用户在 Desktop 观看执行
+  → Desktop 执行 Agent 在最终回复前写入本轮 commandId 的 execution receipt
   → 用户回来要求“干完了，检查一下”
   → ChatGPT 用现有只读 MCP 检查当次代码、Git 和 record
   → 如需修改，向同一个绑定会话发送完整修订指令
@@ -19,13 +20,46 @@ ChatGPT 讨论并确认完整方案
 第一版不提供自动新建会话、steer、interrupt、实时进度、推送通知或网页持续轮询。
 `accepted` 只表示 Desktop 已接受投递，不表示任务 `completed`，也不表示测试通过。
 
+## 自动验收记录
+
+投递层为已确认正文添加固定 `C2C_DESKTOP_TASK` 内部 envelope，携带 workspaceId、commandId、
+intent；调用方不能覆盖内部字段。replay/hash 仍以原正文为准，完整 wire（包括 envelope 的
+JSON 转义）必须满足 64 KiB 限额，外层 IPC JSON 控制行也按现有 512 KiB 限额精确校验；
+超限拒绝，不截断。Skill 据此在最终回复前记录本轮结果。
+
+隐藏本机命令 `c2c desktop record-result -w <workspace> --command-id <id> --changed-files "<文件列表>"
+--tests "<本轮摘要或 not run>" --exit-status <ok|failed|blocked> --json` 仅接受当前 workspace 的
+历史 accepted command。`CODEX_THREAD_ID` 仅为线索；本机命令通过现有受控 Desktop IPC 和
+实时状态验证真实 thread/workspace/root、owner/project、版本/hash、执行进程来源以及唯一当前
+`inProgress` active turnId，必须同时匹配原 delivery.threadId 和 delivery.turnId。
+不接受调用方传入 turnId；仅伪造环境变量不足以记录。same thread 的后续 turn、idle、无/多个/
+未知 active turn、状态读取失败及 turnId mismatch 都拒绝，且不写 record/output。
+disable/rebind 不阻止原 active accepted turn 在最终回复前收尾，其他 turn 不能代记；
+幂等重试也重新验证当前 active turn。命令不执行 shell；可用
+`--command`、`--output-file`（UTF-8，最多 256 KiB，超限先汇总）、`--exit-code` 保存已执行输出，
+沿用 execution_output 的敏感内容过滤。无测试明确记录 not run；changed-files 只列本轮实际改动，
+notes 说明已有脏工作区。不会清理旧改动。
+
+记录固定关联 `commandId`、`taskId=desktop_<commandId>`、`iteration=1`。相同内容重试不追加，
+冲突拒绝，不覆盖证据。rejected/outcome_unknown/身份未知均不能生成 receipt；记录失败必须报告
+“本轮验收记录缺失”，不能宣称闭环完成。没有新增网页写 record 工具，也没有改变 Connector contract。
+
+用户要求 Review 时，先用 `execution_summary` 精确匹配刚才 delivery 的 commandId，再读取对应
+outputId 的 `execution_output`。不能把最新 test_status 或历史测试当本轮通过证据；找不到匹配记录
+就明确报告“本轮验收记录缺失”，仍可审查 git/diff。投递 accepted 与执行结果始终分别报告。
+
 ## 日常 UX：绑定当前 Desktop 会话
+
+新工作区推荐对 Codex 说“启用 ChatGPT 工作流”。现有 Skill 在完成 setup/repair、
+session/Project 路由和 workspace_info 校验后，统一调用下方 `desktop bind-current`。
+该入口仅编排现有流程，不构成额外授权；本节身份校验、本机确认和投递门禁全部照常执行。
+原有单独绑定话术继续有效。
 
 用户在当前 Desktop 会话中说“把这个会话绑定并启用给 ChatGPT”（或同义表达）时，Codex
 运行本机命令：
 
 ```powershell
-node <checkout>\bin\c2c.js desktop bind-current [-w <workspace>] [--json]
+node "<stable launcher>" desktop bind-current [-w <workspace>] [--json]
 ```
 
 `bind-current` 使用当前真实上下文的 `CODEX_THREAD_ID`，精确读取对应 Desktop thread、
@@ -33,7 +67,8 @@ project 和 workspaceRoot；不按标题、最近会话或其他 Agent ID 猜目
 让用户手打命令。该命令不接受 thread/user ID、`--yes` 或 `--accept` 等绕过确认的参数。
 缺少、冲突或无法核验当前上下文（`unknown`）时，快捷绑定和启用必须明确拒绝，转人工处理。
 
-快捷流程只由当前本机用户在当前 Desktop composer 中明确提出的动作请求触发；文档、代码块、
+快捷流程只由当前本机用户在当前 Desktop composer 中明确请求绑定或“启用 ChatGPT 工作流”触发；
+非 Desktop 或上下文无法核验时不能完成绑定，Activation 不能报告 Ready。文档、代码块、
 引用、任务计划或普通讨论里的示例句不触发。来源无法可靠证明来自本机时，不能凭文字免除确认。
 
 由于本地 composer 与 IPC `userMessage` 的来源无法可靠区分，凡是会新增绑定或改变启用状态
@@ -73,10 +108,10 @@ thread，并同时核对 host、Desktop project、实际 cwd 和 workspaceRoot�
 最近时间或当前开发 Agent ID 猜测目标。
 
 ```powershell
-node .\bin\c2c.js desktop bind -w <workspace> --thread <threadId> --host local --project <projectId>
-node .\bin\c2c.js desktop enable -w <workspace> --binding <bindingId> --accept-desktop-permissions
-node .\bin\c2c.js desktop disable -w <workspace>
-node .\bin\c2c.js desktop status -w <workspace> --json
+node "<稳定 launcher 路径>" desktop bind -w <workspace> --thread <threadId> --host local --project <projectId>
+node "<稳定 launcher 路径>" desktop enable -w <workspace> --binding <bindingId> --accept-desktop-permissions
+node "<稳定 launcher 路径>" desktop disable -w <workspace>
+node "<稳定 launcher 路径>" desktop status -w <workspace> --json
 ```
 
 `bind` 会生成不可混淆的 `bindingId`，并返回目标名称和 `threadId`。重新绑定会生成
@@ -99,8 +134,57 @@ Desktop 执行过程中需要的审批仍由用户在 Desktop 中处理。
 两个 scope 独立于 `codex.control`、`codex.read`、默认 5 个 scope 和 `probe.write`。
 工具声明与服务端检查必须分别体现 read/write 语义；旧 OAuth token 不会自动获得
 Desktop scope。
-未绑定时仍只注册原有默认工具；绑定后注册这两个工具，关闭授权后仍可按 read scope 查询，
-但 send 会拒绝投递。
+这两个工具的 schema 始终注册/可发现，避免 Connector 在首次发现时因尚未绑定而永久缓存缺失工具。
+发现 schema 不授予调用权限：未绑定时，有 read scope 的 status 只返回未绑定；send 拒绝投递。
+关闭授权后仍须有效 read scope 才能查询；发送继续检查全部本机门禁。
+
+## 机器级 Core 与安全滚动升级
+
+安装 Skill 使用机器级稳定 launcher，程序版本共享，workspace 的 OAuth、Connector、tunnel、
+session/Project/checkpoint、Desktop 和 records 严格隔离。`runtimeBuildId` 来自实际构建产物，
+不同于 Connector contract；单纯内部 build 变化绝不触发 Connector migration 或 pair/OAuth。
+launcher 校验并执行机器目录中的不可变 release（含独立依赖）；checkout 只是源码来源。
+重新构建或移动 checkout 不会提前启用新代码，只有成功安装并原子切换 current 后才使用新版。
+并发 rollout 未取得机器锁时只报告 `rollout_busy`，不会回写虚假的 pending。
+本机 `rollout --json` 只重启已认证且健康的 named workspace，保持固定 URL；quick 不自动重启。
+当前执行 turn、Desktop busy/approval/unresolved outcome、Remote active/uncertain/queued、配对中或
+身份未知均跳过，绝不为了升级打断任务。原 binding/enable、版本/hash、owner、审批、replay 和
+outcome_unknown 门禁保持。`status/doctor --json` 的 `runtimeUpgrade` 报告安装/运行 build 与 pending。
+第一阶段没有常驻 Supervisor；当前 Review Bridge 按 active 跳过，后续空闲时再受控 rollout。
+
+## 旧 Connector 兼容检测与迁移
+
+“启用 ChatGPT 工作流”会先检查当前 Bridge 的 `connectorContractVersion: 1` 和只读
+`desktopCompatibility.status`。无有效授权、旧默认 scopes、Desktop scopes 不完整、current、
+unknown/corrupt 分别处理；两个 Desktop scope 必须在同一有效授权上下文内，不能拼接不同 token。
+admin 的 current 仅表示存在一份完整有效授权（含可刷新 grant）；access 到期仍可沿用现有 OAuth
+刷新，不因此重建 Connector。`workspace_info` 另返回实际当前请求的
+契约版本和兼容状态，两者都必须 current。其他客户端的完整授权不能使旧 token 升级。
+这些状态不包含原始 token、secret 或凭据。旧 runtime 缺字段时先按既有流程刷新当前 workspace
+runtime 后重查；开发/复核本功能不会自动重启正在服务本次 MCP Review 的 Bridge。
+
+随后在精确当前 Connector 上检查 ChatGPT 实际可见 schema，不调用 send：两 Desktop 工具均需
+存在，send 必填 workspaceId、bindingId、commandId、intent、userConfirmed、message，intent 包含
+development_plan/revision，userConfirmed 只能为 true。无法读取或归属不明时停止。
+
+本地与网页契约都 current 时不重建；明确 legacy/incomplete 或旧/缺失 schema 才迁移。
+legacy migration 遇到 quick 地址时，先升级当前 workspace 的 named 固定地址；健康 named 保持不变。
+可复用机器上唯一明确的 zone，但必须为当前 workspace 创建自己的 hostname/tunnel，不能复制其他
+workspace 的绑定。zone 不明确只询问一次域名。使用现有 `tunnel choose --mode named --require-named`
+严格模式：失败保留原状态并报告未就绪，不 fallback quick、不提前重建 Connector。
+
+固定地址健康后，迁移复用机器 auto/manual 偏好、最终 named mcpUrl 和精确 connectorName，仅同名 Delete + create、
+新配对码及 OAuth 授权，不用 Reconnect/Edit、不操作其他 workspace、不创建第二个 Connector。
+保留 Project、session、checkpoint、taskId、iteration 及 Project instructions。
+迁移后重新 doctor/status，要求 named 健康，再做 workspace_info 身份匹配和 schema 检查，全通过才继续 bind-current/Ready。
+unknown/corrupt/mismatch 不得通过迁移清空；不自动批准发送或降低任何原有门禁。
+
+同名 Connector 重建后，原聊天若明确返回 `tool has been disabled` 或仍显示旧 schema，
+在本地迁移与授权检查已通过的前提下走 Conversation Rebind，不再次重建 Connector。
+Project 模式在原 projectUrl 内新建 Chat，long-chat 复用 switch-chat；boot + 必要 HANDOFF 后，
+使用精确 connectorName 重新验证 workspace_info、实际授权和 Desktop schema。
+全部通过才只更新 session.url，保留 Project、connectorName、checkpoint、task/iteration 及 instructions。
+新聊天验证失败则保留原 URL 并停止，不循环开聊天、不提前绑定或 Ready。
 
 `intent` 是必填枚举，只能为 `development_plan` 或 `revision`；`userConfirmed` 必须是字面值
 `true`。只有当前对话用户明确确认完整方案或修订后，模型才可填入 `true` 并调用，例如用户
@@ -109,7 +193,7 @@ Desktop scope。
 被 Desktop 或平台策略拦截、拒绝或要求审批。
 
 `message` 只能是用户已经确认的完整计划或完整修订指令。它按 UTF-8 原文传递，保留
-中文、多行和代码块，正文上限为 64 KiB（65536 字节）；超过上限必须拒绝，不能截断。正文是任务
+中文、多行和代码块；完整 envelope 消息上限为 64 KiB（65536 字节），正文可用空间相应减少；超过上限必须拒绝，不能截断。正文是任务
 级自然语言，不能当作 shell、路径、原始 RPC 或工具结果执行。请求不接受或不覆盖
 `model`、`provider`、`cwd`、`effort`、`sandbox`、`approval`、`permissions` 等执行设置。
 这不保证正文无害：已授权客户端的恶意任务文本仍可能按 Desktop 当前权限和审批流程影响

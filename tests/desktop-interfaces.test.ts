@@ -7,7 +7,6 @@ import { desktopFile } from "../src/desktop/store.js";
 import { startBridge, type Bridge } from "../src/bridge/server.js";
 import { bindDesktop, enableDesktop } from "../src/desktop/service.js";
 import { desktopIpc } from "../src/desktop/ipc.js";
-import { MAX_MESSAGE_BYTES } from "../src/desktop/store.js";
 import { DESKTOP_CONTROL_SCOPE, DESKTOP_READ_SCOPE, filterScopes, getSupportedScopes, SUPPORTED_SCOPES } from "../src/auth/store.js";
 import { registerDesktopCommands } from "../src/cli/desktop.js";
 import { cleanup, isolateStateDir, makeTmpDir } from "./helpers.js";
@@ -102,10 +101,34 @@ describe("Desktop MCP 与本地接口", () => {
     expect(html).not.toContain("(read-only)");
   });
 
-  it("未绑定时保留九个只读工具，绑定后 disabled 仍只开放状态查询", async () => {
-    const unbound = await clientFor(["workspace.read"]);
-    expect((await unbound.listTools()).tools).toHaveLength(9);
+  it("未绑定时注册 Desktop 工具并安全返回状态，绑定后 disabled 仍只开放状态查询", async () => {
+    const unbound = await clientFor([DESKTOP_READ_SCOPE]);
+    const unboundTools = (await unbound.listTools()).tools;
+    expect(unboundTools).toHaveLength(11);
+    const unboundSend = unboundTools.find(tool => tool.name === "codex_desktop_send")!;
+    expect(unboundSend.inputSchema.required).toEqual(expect.arrayContaining(["intent", "userConfirmed", "message", "bindingId", "commandId", "workspaceId"]));
+    expect(unboundSend.inputSchema.properties?.intent).toMatchObject({ enum: ["development_plan", "revision"] });
+    expect(unboundSend.inputSchema.properties?.userConfirmed).toMatchObject({ const: true });
+    const unboundStatus = jsonOf<{ enabled: boolean; binding: null; availability: { available: boolean } }>(await unbound.callTool({
+      name: "codex_desktop_status",
+      arguments: { workspaceId: bridge.workspace.id },
+    }));
+    expect(unboundStatus).toMatchObject({ enabled: false, binding: null, availability: { available: false } });
     await unbound.close();
+
+    const prepare = vi.spyOn(desktopIpc, "prepare");
+    const control = await clientFor([DESKTOP_CONTROL_SCOPE]);
+    const rejected = await control.callTool({
+      name: "codex_desktop_send",
+      arguments: {
+        intent: "development_plan", userConfirmed: true, workspaceId: bridge.workspace.id,
+        bindingId: "00000000-0000-0000-0000-000000000001", commandId: "unbound_command", message: "未绑定不应发送",
+      },
+    });
+    expect(rejected.isError).toBe(true);
+    expect(jsonOf<{ error: string }>(rejected).error).toBe("DESKTOP_DISABLED");
+    expect(prepare).not.toHaveBeenCalled();
+    await control.close();
 
     vi.spyOn(desktopIpc, "inspect").mockResolvedValue({ title: "测试 Desktop 会话" } as never);
     const binding = await bindDesktop(bridge.workspace, { threadId: THREAD_ID, hostId: "local", projectId: "project_test" });
@@ -137,10 +160,10 @@ describe("Desktop MCP 与本地接口", () => {
   it.each(["development_plan", "revision"])("Bridge %s 保留完整中文正文，并只返回真实 accepted 回执", async intent => {
     vi.spyOn(desktopIpc, "inspect").mockResolvedValue({ title: "测试 Desktop 会话" } as never);
     const prefix = "中文计划\n\n";
-    const message = prefix + "中".repeat(21840) + "x";
-    expect(Buffer.byteLength(message, "utf8")).toBe(MAX_MESSAGE_BYTES - 1);
+    const message = prefix + "中".repeat(21000) + "x";
     const send = vi.fn(async (sent: string) => {
-      expect(sent).toBe(message);
+      expect(JSON.parse(sent)).toEqual({ type: "C2C_DESKTOP_TASK", version: 1, workspaceId: bridge.workspace.id,
+        commandId: "accepted_command", intent, message });
       return { threadId: THREAD_ID, turnId: "01a00000-0000-7000-8000-000000000002" };
     });
     vi.spyOn(desktopIpc, "prepare").mockResolvedValue({ send, close: vi.fn() } as never);
@@ -228,7 +251,7 @@ describe("Desktop MCP 与本地接口", () => {
     const program = new Command();
     registerDesktopCommands(program);
     const desktop = program.commands.find(command => command.name() === "desktop");
-    expect(desktop?.commands.map(command => command.name())).toEqual(["bind-current", "bind", "enable", "disable", "status"]);
+    expect(desktop?.commands.map(command => command.name())).toEqual(["record-result", "bind-current", "bind", "enable", "disable", "status"]);
     expect(desktop?.commands.find(command => command.name() === "enable")?.options.map(option => option.long)).toContain("--accept-desktop-permissions");
   });
 

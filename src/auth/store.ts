@@ -1,7 +1,8 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { ensureDir, getStateDir, readJsonIfExists, writeSecureJson } from "../config/paths.js";
+import { z } from "zod";
+import { ensureDir, getStateDir, writeSecureJson } from "../config/paths.js";
 import { isWriteProbeEnabled, WRITE_PROBE_SCOPE } from "../mcp/write-probe.js";
 
 export const SUPPORTED_SCOPES = [
@@ -14,6 +15,19 @@ export const SUPPORTED_SCOPES = [
 
 export const DESKTOP_CONTROL_SCOPE = "codex.desktop.control";
 export const DESKTOP_READ_SCOPE = "codex.desktop.read";
+export const CONNECTOR_CONTRACT_VERSION = 1 as const;
+
+export type DesktopCompatibilityStatus =
+  | "none"
+  | "legacy"
+  | "incomplete"
+  | "current"
+  | "unknown"
+  | "corrupt";
+
+export interface DesktopCompatibility {
+  status: DesktopCompatibilityStatus;
+}
 
 export type Scope =
   | (typeof SUPPORTED_SCOPES)[number]
@@ -63,6 +77,46 @@ interface PersistedAuthState {
   tokens: TokenRecord[];
 }
 
+type DesktopScopeProfile = "none" | "read" | "control" | "both";
+
+function isClientId(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 256;
+}
+
+const persistedAuthStateSchema = z.object({
+  clients: z.array(z.object({
+    clientId: z.string().min(1).max(256),
+    clientName: z.string().optional(),
+    redirectUris: z.array(z.string()),
+    createdAt: z.string(),
+  }).passthrough()),
+  tokens: z.array(z.object({
+    hash: z.string().min(1),
+    kind: z.enum(["access", "refresh"]),
+    clientId: z.string().min(1).max(256),
+    workspaceId: z.string().min(1),
+    scopes: z.array(z.string()),
+    issuedAt: z.number().finite(),
+    expiresAt: z.number().finite(),
+    revoked: z.boolean(),
+  }).passthrough()),
+}).passthrough();
+
+function desktopScopeProfile(scopes: readonly string[]): DesktopScopeProfile {
+  const read = scopes.includes(DESKTOP_READ_SCOPE);
+  const control = scopes.includes(DESKTOP_CONTROL_SCOPE);
+  if (read && control) return "both";
+  if (read) return "read";
+  if (control) return "control";
+  return "none";
+}
+
+function desktopCompatibilityStatus(profile: DesktopScopeProfile): DesktopCompatibilityStatus {
+  if (profile === "both") return "current";
+  if (profile === "none") return "legacy";
+  return "incomplete";
+}
+
 export type VerifyTokenResult =
   | { ok: true; record: TokenRecord }
   | { ok: false; reason: "unknown" | "expired" | "revoked" | "wrong_kind" };
@@ -96,6 +150,7 @@ export class AuthStore {
   private tokens = new Map<string, TokenRecord>();
   private authCodes = new Map<string, AuthorizationCodeRecord>();
   private readonly file: string;
+  private stateCorrupt = false;
 
   constructor(
     readonly workspaceId: string,
@@ -107,16 +162,41 @@ export class AuthStore {
   }
 
   private load(): void {
-    const data = readJsonIfExists<PersistedAuthState>(this.file);
-    if (!data) return;
+    let raw: string;
+    try {
+      raw = fs.readFileSync(this.file, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      this.stateCorrupt = true;
+      return;
+    }
+
+    let data: unknown;
+    try {
+      data = JSON.parse(raw);
+    } catch {
+      this.stateCorrupt = true;
+      return;
+    }
+    const parsed = persistedAuthStateSchema.safeParse(data);
+    if (!parsed.success) {
+      this.stateCorrupt = true;
+      return;
+    }
+    const state = parsed.data;
     const now = Date.now();
-    for (const client of data.clients ?? []) this.clients.set(client.clientId, client);
-    for (const token of data.tokens ?? []) {
+    for (const client of state.clients) this.clients.set(client.clientId, client);
+    for (const token of state.tokens) {
       if (!token.revoked && token.expiresAt > now) this.tokens.set(token.hash, token);
     }
   }
 
+  private assertStateHealthy(): void {
+    if (this.stateCorrupt) throw new Error("授权状态损坏；请保留原文件并人工核对，不能通过重新授权覆盖。");
+  }
+
   private save(): void {
+    this.assertStateHealthy();
     const now = Date.now();
     const state: PersistedAuthState = {
       clients: [...this.clients.values()],
@@ -128,6 +208,7 @@ export class AuthStore {
   // ---- Dynamic Client Registration -------------------------------------
 
   registerClient(input: { clientName?: string; redirectUris: string[] }): ClientRegistration {
+    this.assertStateHealthy();
     const client: ClientRegistration = {
       clientId: `c2c_client_${randomBytes(12).toString("base64url")}`,
       clientName: input.clientName,
@@ -153,6 +234,7 @@ export class AuthStore {
     pairingSessionId: string;
     resource?: string;
   }): string {
+    this.assertStateHealthy();
     const code = newToken("c2c_ac");
     this.authCodes.set(code, {
       code,
@@ -185,6 +267,7 @@ export class AuthStore {
     workspaceId?: string;
     accessTtlMs?: number;
   }): { accessToken: string; refreshToken: string | null; expiresIn: number; scopes: string[] } {
+    this.assertStateHealthy();
     const now = Date.now();
     const workspaceId = input.workspaceId ?? this.workspaceId;
     const accessTtl = input.accessTtlMs ?? ACCESS_TOKEN_TTL_MS;
@@ -233,11 +316,47 @@ export class AuthStore {
     return { ok: true, record };
   }
 
+  /** 描述当前 Desktop OAuth 兼容性；无上下文时汇总独立授权，不合并不同 token。 */
+  desktopCompatibility(accessToken?: string): DesktopCompatibility {
+    if (this.stateCorrupt) return { status: "corrupt" };
+
+    if (accessToken !== undefined) {
+      const verdict = this.verifyAccessToken(accessToken);
+      if (
+        !verdict.ok ||
+        verdict.record.workspaceId !== this.workspaceId ||
+        verdict.record.expiresAt <= Date.now() ||
+        !isClientId(verdict.record.clientId)
+      ) return { status: "unknown" };
+      return { status: desktopCompatibilityStatus(desktopScopeProfile(verdict.record.scopes)) };
+    }
+
+    const profiles = new Set<DesktopScopeProfile>();
+    let invalidContext = false;
+    const now = Date.now();
+    for (const record of this.tokens.values()) {
+      if (record.revoked || record.expiresAt <= now || record.workspaceId !== this.workspaceId) {
+        continue;
+      }
+      if (!isClientId(record.clientId)) {
+        invalidContext = true;
+        continue;
+      }
+      profiles.add(desktopScopeProfile(record.scopes));
+    }
+    if (invalidContext) return { status: "unknown" };
+    if (profiles.size === 0) return { status: "none" };
+    if (profiles.has("both")) return { status: "current" };
+    if (profiles.size !== 1) return { status: "unknown" };
+    return { status: desktopCompatibilityStatus(profiles.values().next().value as DesktopScopeProfile) };
+  }
+
   /** Refresh-token rotation: old refresh token is revoked, a new pair is issued. */
   refresh(
     refreshToken: string,
     clientId: string
   ): { ok: true; tokens: ReturnType<AuthStore["issueTokens"]> } | { ok: false; reason: string } {
+    if (this.stateCorrupt) return { ok: false, reason: "invalid_grant" };
     const record = this.tokens.get(sha256hex(refreshToken));
     if (!record || record.kind !== "refresh") return { ok: false, reason: "invalid_grant" };
     if (record.revoked) return { ok: false, reason: "invalid_grant" };
@@ -254,6 +373,7 @@ export class AuthStore {
   }
 
   revokeToken(token: string): boolean {
+    this.assertStateHealthy();
     const record = this.tokens.get(sha256hex(token));
     if (!record) return false;
     record.revoked = true;
@@ -264,6 +384,7 @@ export class AuthStore {
 
   /** Used by `c2c unpair`: revoke everything for this workspace. */
   revokeAll(): number {
+    this.assertStateHealthy();
     const count = this.tokens.size;
     this.tokens.clear();
     this.authCodes.clear();

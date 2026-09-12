@@ -23,15 +23,93 @@ export const executionRecordSchema = z.object({
 });
 
 export type ExecutionRecord = z.infer<typeof executionRecordSchema>;
+// Desktop receipt 的防重放摘要只存在本机 JSONL；不加入公开 execution_summary schema。
+const storedExecutionRecordSchema = executionRecordSchema.extend({
+  desktopReceiptSha256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+});
+export type StoredExecutionRecord = z.infer<typeof storedExecutionRecordSchema>;
+
+export class ExecutionRecordsBusyError extends Error {
+  readonly code = "EXECUTION_RECORDS_BUSY";
+  constructor() { super("执行记录写锁繁忙；稍后重试。遗留锁须核对后人工恢复，不要删除历史。"); }
+}
+
+const waitCell = new Int32Array(new SharedArrayBuffer(4));
 
 function recordsFile(workspaceId: string): string {
   const dir = ensureDir(path.join(getStateDir(), "executions"));
   return path.join(dir, `${workspaceId}.jsonl`);
 }
 
-export function appendExecutionRecord(workspaceId: string, record: ExecutionRecord): void {
+/** 对 execution JSONL 的短跨进程锁；Desktop 结果需要在此锁内查重并追加。 */
+export function withExecutionRecordsLock<T>(workspaceId: string, action: () => T): T {
+  const file = `${recordsFile(workspaceId)}.lock`;
+  const deadline = Date.now() + 500;
+  let lock: number;
+  for (;;) {
+    try {
+      lock = fs.openSync(file, "wx", 0o600);
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      if (Date.now() >= deadline) throw new ExecutionRecordsBusyError();
+      Atomics.wait(waitCell, 0, 0, 10);
+    }
+  }
+  try {
+    fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, createdAt: Date.now() }));
+    fs.fsyncSync(lock);
+    return action();
+  } finally {
+    try { fs.closeSync(lock); }
+    finally { fs.unlinkSync(file); }
+  }
+}
+
+/** 仅供已持有 withExecutionRecordsLock 的事务追加；普通调用请用 appendExecutionRecord。 */
+export function appendExecutionRecordLocked(workspaceId: string, record: StoredExecutionRecord): void {
   const file = recordsFile(workspaceId);
-  fs.appendFileSync(file, JSON.stringify(executionRecordSchema.parse(record)) + "\n", { mode: 0o600 });
+  const serialized = JSON.stringify(storedExecutionRecordSchema.parse(record)) + "\n";
+  const fd = fs.openSync(file, "a", 0o600);
+  try {
+    fs.writeFileSync(fd, serialized, "utf8");
+    fs.fsyncSync(fd);
+  } finally { fs.closeSync(fd); }
+}
+
+export function appendExecutionRecord(workspaceId: string, record: ExecutionRecord): void {
+  const parsed = executionRecordSchema.parse(record);
+  withExecutionRecordsLock(workspaceId, () => appendExecutionRecordLocked(workspaceId, parsed));
+}
+
+/**
+ * 在已持有 execution 锁时严格读取全部 JSONL。任何空文件、缺少尾换行、坏 JSON
+ * 或 schema 不合法都停止调用方，避免把部分落盘当作可继续追加的历史。
+ */
+export function readExecutionRecordsStrict(workspaceId: string): StoredExecutionRecord[] {
+  const file = recordsFile(workspaceId);
+  let raw: string;
+  try {
+    raw = fs.readFileSync(file, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw new Error("执行记录无法读取；请保留原文件并人工核对。");
+  }
+  if (raw.length === 0 || !raw.endsWith("\n")) {
+    throw new Error("执行记录 JSONL 不完整；请保留原文件并人工核对。");
+  }
+  const lines = raw.slice(0, -1).split("\n");
+  const records: StoredExecutionRecord[] = [];
+  for (const line of lines) {
+    if (!line) throw new Error("执行记录 JSONL 含空行；请保留原文件并人工核对。");
+    let parsed: unknown;
+    try { parsed = JSON.parse(line); }
+    catch { throw new Error("执行记录 JSONL 损坏；请保留原文件并人工核对。"); }
+    const record = storedExecutionRecordSchema.safeParse(parsed);
+    if (!record.success) throw new Error("执行记录 schema 损坏；请保留原文件并人工核对。");
+    records.push(record.data);
+  }
+  return records;
 }
 
 export function readExecutionRecords(workspaceId: string, limit = 10): ExecutionRecord[] {

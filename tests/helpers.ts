@@ -3,6 +3,8 @@ import path from "node:path";
 import { createHash, randomBytes } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { writeBuildId } from "../scripts/write-build-id.mjs";
+import release from "../scripts/core-release.cjs";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -62,6 +64,19 @@ export function isolateStateDir(): string {
   const dir = makeTmpDir("state");
   process.env.C2C_STATE_DIR = dir;
   return dir;
+}
+
+/** 用最小真实 artifact 测试机器安装，保留与 build 相同的入口/脚本/依赖摘要契约。 */
+export function buildCoreFixture(root: string): string {
+  const assets = path.join(root, "dist", "core-assets");
+  fs.mkdirSync(assets, { recursive: true });
+  for (const name of ["core-release.cjs", "core-launcher.cjs", "install-core.mjs"]) {
+    fs.copyFileSync(path.join(projectRoot, "scripts", name), path.join(assets, name));
+  }
+  fs.copyFileSync(path.join(root, "bin/c2c.js"), path.join(assets, "c2c-entry.js"));
+  fs.copyFileSync(path.join(root, "package.json"), path.join(assets, "package.json"));
+  fs.writeFileSync(path.join(assets, "dependencies-sha256.txt"), release.dependencyHash(path.join(root, "node_modules")));
+  return writeBuildId(path.join(root, "dist"));
 }
 
 export function pkceVerifierAndChallenge(): { verifier: string; challenge: string } {

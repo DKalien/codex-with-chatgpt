@@ -8,6 +8,8 @@ import { AuthStore, filterScopes, SUPPORTED_SCOPES } from "../src/auth/store.js"
 import { cleanup, makeTmpDir, write } from "./helpers.js";
 
 const BASE_TOOL_NAMES = [
+  "codex_desktop_send",
+  "codex_desktop_status",
   "execution_output",
   "execution_summary",
   "git_diff",
@@ -120,13 +122,13 @@ async function withBridge<T>(enabled: boolean, fn: (context: ProbeContext) => Pr
 }
 
 describe("MCP write_probe", () => {
-  it("默认关闭时列出9个工具，开启时恰增write_probe且动态advertise probe.write", async () => {
+  it("默认关闭时列出基础与 Desktop 工具，开启时恰增 write_probe 且动态 advertise probe.write", async () => {
     let readAnnotations: Record<string, unknown> | undefined;
     await withBridge(false, async ({ bridge, connect }) => {
       const { client } = await connect(READ_SCOPES, "default");
       const { tools } = await client.listTools();
       expect(tools.map((item) => item.name).sort()).toEqual([...BASE_TOOL_NAMES].sort());
-      expect(tools.every((item) => item.annotations?.readOnlyHint === true)).toBe(true);
+      expect(tools.filter((item) => item.name !== "codex_desktop_send").every((item) => item.annotations?.readOnlyHint === true)).toBe(true);
       expect(tools.find((item) => item.name === "write_probe")).toBeUndefined();
       readAnnotations = annotationsOf(tools);
       expect(await discoveryScopes(bridge.localBaseUrl(), "/.well-known/oauth-authorization-server/mcp")).toEqual([...BASE_SCOPES, "codex.control", "codex.read", "codex.desktop.control", "codex.desktop.read"]);

@@ -1,10 +1,10 @@
-import { Command, InvalidArgumentError } from "commander";
+import { Command, InvalidArgumentError, Option } from "commander";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { startBridge } from "../bridge/server.js";
 import { findBridgeObservation, findLiveBridge, type RuntimeState } from "../bridge/runtime.js";
-import { adminFetch, ensureBridge, stopBridge } from "../process/daemon.js";
+import { adminFetch, ensureBridge, ensureBridgeAndTunnel, restartBridge, stopBridge, type BridgeAdminInfo as AdminInfo } from "../process/daemon.js";
 import { Workspace } from "../workspace/manager.js";
 import { AuthStore } from "../auth/store.js";
 import { detectTunnelBinaries } from "../tunnel/detect.js";
@@ -21,6 +21,7 @@ import {
   NAMED_REPAIR_MESSAGE,
   needsTunnelChoice,
   readTunnelState,
+  resolveMigrationZone,
   TUNNEL_CHOICE_PROMPT,
 } from "../tunnel/state.js";
 import { Logger } from "../logger/index.js";
@@ -60,6 +61,8 @@ import { registerWebControlCommands } from "./web-control.js";
 import { registerRemoteCommands, remoteStatus } from "./remote.js";
 import { isWriteProbeEnabled, readWriteProbeStatus, WRITE_PROBE_SCOPE } from "../mcp/write-probe.js";
 import { registerDesktopCommands } from "./desktop.js";
+import { rollout } from "../core/rollout.js";
+import { readRuntimeUpgrade } from "../core/upgrade.js";
 
 const program = new Command();
 registerWebControlCommands(program);
@@ -145,7 +148,8 @@ function persistWorkspaceEndpoint(opts: {
 
 function tunnelChoicePayload(workspace: Workspace, zoneHint?: string): Record<string, unknown> {
   const state = readTunnelState(workspace.id);
-  const zone = parseZoneInput(zoneHint ?? "") ?? state.zone ?? null;
+  const migration = resolveMigrationZone(workspace.id);
+  const zone = parseZoneInput(zoneHint ?? "") ?? migration.migrationZone;
   return {
     ok: true,
     needsChoice: needsTunnelChoice(state),
@@ -153,6 +157,8 @@ function tunnelChoicePayload(workspace: Workspace, zoneHint?: string): Record<st
     loggedIn: hasCloudflaredCert(),
     namedReady: isNamedTunnelReady(state),
     zone,
+    migrationZone: migration.migrationZone,
+    zoneResolution: migration.zoneResolution,
     hostname: state.hostname ?? null,
     suggestedHostname: zone ? suggestedNamedHostname(zone, workspace.name, workspace.id) : null,
     userPrompt: needsTunnelChoice(state) ? TUNNEL_CHOICE_PROMPT : undefined,
@@ -183,41 +189,6 @@ interface PairingResponse {
   expiresAt: number;
 }
 
-interface AdminInfo {
-  workspaceId: string;
-  workspaceName: string;
-  workspaceRoot: string;
-  port: number;
-  publicUrl: string | null;
-  tunnel: { running: boolean; url: string | null; provider: string };
-  tokenCount: number;
-  pairingActive: boolean;
-  writeProbeEnabled?: boolean;
-  pid: number;
-  startedAt: string;
-}
-
-async function ensureBridgeAndTunnel(
-  workspaceRoot: string,
-  opts: { tunnel: boolean }
-): Promise<{ runtime: RuntimeState; info: AdminInfo; mcpUrl: string | null }> {
-  const { runtime } = await ensureBridge(workspaceRoot);
-  let info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
-  let mcpUrl: string | null = info.publicUrl ? `${info.publicUrl}/mcp` : null;
-  if (opts.tunnel && !info.publicUrl) {
-    const binaries = detectTunnelBinaries();
-    if (!binaries.cloudflared) {
-      throw new Error(
-        "NEED_CLOUDFLARED: cloudflared is not installed. Install it first (macOS: brew install cloudflared)."
-      );
-    }
-    const result = await adminFetch<TunnelStartResponse>(runtime, "POST", "/admin/tunnel/start", 90_000);
-    if (!result.url) throw new Error(result.message ?? "Tunnel start failed");
-    info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
-    mcpUrl = `${result.url}/mcp`;
-  }
-  return { runtime, info, mcpUrl };
-}
 
 program
   .name("c2c")
@@ -387,7 +358,7 @@ program
   .action(async (opts: { workspace?: string }) => {
     const stopped = await stopBridge(resolveWorkspace(opts.workspace));
     if (stopped) check("Bridge 已停止");
-    else say("没有正在运行的 Bridge。");
+    else say("未停止 Bridge：没有可确认的运行实例，或认证关闭失败。");
   });
 
 program
@@ -397,10 +368,8 @@ program
   .option("--tunnel", "re-establish the secure public connection", false)
   .action(async (opts: { workspace?: string; tunnel: boolean }) => {
     const root = resolveWorkspace(opts.workspace);
-    await stopBridge(root);
-    await new Promise((resolve) => setTimeout(resolve, 500));
     try {
-      const { info, mcpUrl } = await ensureBridgeAndTunnel(root, { tunnel: opts.tunnel });
+      const { info, mcpUrl } = await restartBridge(root, { tunnel: opts.tunnel });
       check(`Bridge 已重启（${info.workspaceName}）`);
       if (mcpUrl) check(`安全连接已建立`);
     } catch (error) {
@@ -411,6 +380,25 @@ program
 // ---------------------------------------------------------------- status
 
 program
+  .command("rollout")
+  .description("Safely upgrade running named workspace bridges to the installed Core")
+  .option("-w, --workspace <path>", "limit rollout to this workspace")
+  .option("--json", "machine-readable output", false)
+  .addOption(new Option("--result-file <path>", "exclusive local installer receipt file").hideHelp())
+  .action(async (opts: { workspace?: string; json: boolean; resultFile?: string }) => {
+    let resultFd: number | undefined;
+    try {
+      // 先验证输出可写且不存在，再维护 runtime；不覆盖调用方的已有文件。
+      if (opts.resultFile) resultFd = fs.openSync(path.resolve(opts.resultFile), "wx", 0o600);
+      const result = await rollout({ workspaceRoot: opts.workspace ? resolveWorkspace(opts.workspace) : undefined });
+      if (resultFd !== undefined) { fs.writeFileSync(resultFd, JSON.stringify(result)); fs.fsyncSync(resultFd); }
+      say(opts.json ? JSON.stringify(result) : JSON.stringify(result, null, 2));
+    } catch (error) {
+      handleCliError(error, opts.json);
+    } finally { if (resultFd !== undefined) fs.closeSync(resultFd); }
+  });
+
+program
   .command("status")
   .description("Show bridge status for this workspace")
   .option("-w, --workspace <path>")
@@ -419,23 +407,25 @@ program
     const root = resolveWorkspace(opts.workspace);
     const workspace = new Workspace(root);
     const observation = await findBridgeObservation(workspace.id);
+    const upgrade = readRuntimeUpgrade(workspace, observation.state === "stopped" ? null : observation.runtime);
+    const runtimeUpgrade = observation.state === "unknown" ? { ...upgrade, state: "unknown", reason: "runtime_unknown" } : upgrade;
     if (observation.state === "unknown") {
       if (opts.json) {
-        say(JSON.stringify({ ok: false, running: null, state: "unknown", reason: observation.reason }));
+        say(JSON.stringify({ ok: false, running: null, state: "unknown", reason: observation.reason, runtimeUpgrade }));
       } else {
         cross(`Bridge 状态无法确认（${observation.reason}），未将其视为未运行。`);
       }
       return;
     }
     if (observation.state === "stopped") {
-      if (opts.json) say(JSON.stringify({ ok: false, running: false }));
+      if (opts.json) say(JSON.stringify({ ok: false, running: false, runtimeUpgrade }));
       else say("Bridge 未运行。使用 `c2c start` 启动。");
       return;
     }
     const runtime = observation.runtime;
     const info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
     if (opts.json) {
-      say(JSON.stringify({ ok: true, running: true, ...info, ...remoteStatus(workspace.id) }));
+      say(JSON.stringify({ ok: true, running: true, ...info, runtimeUpgrade, ...remoteStatus(workspace.id) }));
       return;
     }
     say(PRODUCT_NAME);
@@ -445,6 +435,7 @@ program
     if (info.tunnel.running && info.tunnel.url) check(`安全连接：${info.tunnel.url}/mcp`);
     else say("· 安全连接：未启用（本地模式）");
     say(`· 已授权连接：${info.tokenCount > 0 ? "是" : "否"}`);
+    say(`· Core：${JSON.stringify(runtimeUpgrade)}`);
     say(`· Remote Control：${JSON.stringify(remoteStatus(workspace.id))}`);
   });
 
@@ -577,14 +568,13 @@ program
     if (runtime) {
       let info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
       if (namedReady && opts.fix && info.tunnel.provider !== "cloudflare-named") {
-        await stopBridge(root);
-        await new Promise((resolve) => setTimeout(resolve, 400));
         try {
-          runtime = (await ensureBridge(root)).runtime;
-          info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
+          ({ runtime, info } = await restartBridge(root, { tunnel: false, expectedRuntime: runtime }));
+          if (info.tunnel.provider !== "cloudflare-named") throw new Error("旧 Bridge 尚未退出，未切换固定域名连接。");
           results.push("已切换到固定域名连接");
         } catch (error) {
-          report.tunnel = { ok: false, detail: (error as Error).message };
+          handleCliError(error, opts.json);
+          return;
         }
       }
       const expectedPublic = Boolean(lastEndpoint?.publicUrl) || namedReady;
@@ -692,7 +682,9 @@ program
     }
 
     if (opts.json) {
-      say(JSON.stringify({ report, repairs: results, chatgptRepair, namedRepair }));
+      say(JSON.stringify({ report, repairs: results, chatgptRepair, namedRepair,
+        runtimeUpgrade: workspace ? { ...readRuntimeUpgrade(workspace, runtime),
+          ...(bridgeUnknown ? { state: "unknown", reason: "runtime_unknown" } : {}) } : null }));
       return;
     }
     say(`${PRODUCT_NAME} Doctor`);
@@ -1141,17 +1133,37 @@ tunnelCmd
   .option("-w, --workspace <path>")
   .option("--zone <domain>", "Cloudflare domain for a named hostname")
   .option("--hostname <hostname>", "override the default c2c-<project>.<zone>")
+  .option("--require-named", "strictly require a named tunnel; never fall back to quick", false)
   .option("--json", "machine-readable output", false)
-  .action(async (opts: { mode: string; workspace?: string; zone?: string; hostname?: string; json: boolean }) => {
+  .action(async (opts: {
+    mode: string;
+    workspace?: string;
+    zone?: string;
+    hostname?: string;
+    requireNamed: boolean;
+    json: boolean;
+  }) => {
     const root = resolveWorkspace(opts.workspace);
     try {
       const workspace = new Workspace(root);
       const mode = opts.mode.trim().toLowerCase();
       const previous = readTunnelState(workspace.id);
       if (mode === "quick") {
+        if (opts.requireNamed) {
+          const payload = {
+            ok: false,
+            fallback: false,
+            error: "--require-named 只能与 --mode named 一起使用",
+          };
+          if (opts.json) say(JSON.stringify(payload));
+          else cross(payload.error);
+          return;
+        }
         const state = chooseQuickTunnel(workspace.id);
         if (await findLiveBridge(workspace.id)) {
-          if (previous.preference === "named") await stopBridge(root);
+          if (previous.preference === "named" && !await stopBridge(root)) {
+            throw new Error("Bridge 认证关闭失败；连接选择已保存，但运行连接尚未切换。");
+          }
         }
         const payload = { ...tunnelChoicePayload(workspace), state };
         if (opts.json) say(JSON.stringify(payload));
@@ -1165,6 +1177,7 @@ tunnelCmd
       if (!zone) {
         const payload = {
           ok: false,
+          fallback: false,
           need: "zone",
           userMessage: "请告诉我已经加在 Cloudflare 上的域名，例如 example.com",
           loginPrompt: NAMED_LOGIN_PROMPT,
@@ -1182,21 +1195,32 @@ tunnelCmd
         workspaceName: workspace.name,
         zone,
         hostname: opts.hostname,
+        requireNamed: opts.requireNamed,
       });
-      if (await findLiveBridge(workspace.id)) await stopBridge(root);
       const payload = {
         ...tunnelChoicePayload(workspace),
-        ok: true,
+        ok: result.ok,
         fallback: result.fallback,
         userMessage: result.userMessage,
         error: result.error,
         state: result.state,
       };
+      const reusedNamedBinding =
+        opts.requireNamed &&
+        previous.preference === "named" &&
+        previous.tunnelName === result.state.tunnelName &&
+        previous.tunnelId === result.state.tunnelId &&
+        previous.hostname === result.state.hostname;
+      if (result.ok && !reusedNamedBinding && (await findLiveBridge(workspace.id)) && !await stopBridge(root)) {
+        throw new Error("Bridge 认证关闭失败；固定域名配置已保存，但运行连接尚未切换。");
+      }
       if (opts.json) {
         say(JSON.stringify(payload));
         return;
       }
-      if (result.fallback) say(result.userMessage ?? "");
+      if (!result.ok) {
+        cross(`固定域名未就绪：${result.error ?? "命名隧道配置失败"}`);
+      } else if (result.fallback) say(result.userMessage ?? "");
       else check(`固定域名已就绪：${result.state.hostname}`);
     } catch (error) {
       handleCliError(error, opts.json);

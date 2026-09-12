@@ -269,8 +269,8 @@ Desktop Control 是独立于 Remote Control 和 DOM Web Control 的 MCP 写入�
   → 本机重新核对绑定、Desktop 进程/端点、owner、项目和版本
   → 等待有界的真实接受回执
   → deliveryStatus=accepted（带真实 threadId/turnId），网页本轮结束
-  → Desktop 执行后按 commandId/taskId 写入现有 record
-  → 用户主动要求验收时，ChatGPT 用只读 MCP 检查当次代码、Git 和 record
+  → Desktop 在原 active turn 最终回复前用 desktop record-result 写 exact commandId receipt
+  → 用户主动要求验收时，ChatGPT 精确匹配该 commandId，再读 record/outputId 与当次代码、Git
 ```
 
 ### 日常 UX：`bind-current`
@@ -311,8 +311,9 @@ workspace，再用 `desktop enable` 明确接受 Desktop 会话现有权限可�
 `codex_desktop_status`（`codex.desktop.read`）只读取当前绑定、可用性和指定投递记录，
 不发送消息。发送必须同时满足有效 OAuth `codex.desktop.control`、本机 enable 和匹配
 的当前 `bindingId`。`codex_desktop_send` 的 `message` 是完整的已确认计划或修订指令，
-按 UTF-8 原文传递，正文上限为 64 KiB（65536 字节）；超限拒绝，不能截断或解释成 shell、路径、原始
-RPC。`intent` 必填且只能是 `development_plan` 或 `revision`；`userConfirmed` 必须是字面值
+投递层将正文封装为固定 `C2C_DESKTOP_TASK`；原正文和包含 envelope/JSON 转义的完整 wire
+分别检查 64 KiB（65536 字节）上限，超限拒绝，不能截断或解释成 shell、路径、原始 RPC。
+`intent` 必填且只能是 `development_plan` 或 `revision`；`userConfirmed` 必须是字面值
 `true`，只有当前对话用户明确确认后模型才能填写，例如用户说“可以，就按这么做”。它只是模型
 可填写的语义审计信号，不是授权凭证，不替代 OAuth、本机 enable、bindingId 或 Desktop 审批，
 也不承诺能够影响或绕过平台安全策略；完整计划仍可能被 Desktop 或平台策略拦截、拒绝或要求审批。
@@ -325,6 +326,11 @@ send 的风险标注保持 `readOnlyHint:false`、`destructiveHint:true`、`open
 回执超时、断线或落盘不明返回 `outcome_unknown`；不要重发、换 `commandId` 或重新绑定绕过，
 整个 workspace（包括新绑定）的后续投递暂停，必须先由本机用户人工核对；MVP 没有自动
 恢复或恢复接口。
+
+执行 receipt 只能由匹配 delivery.threadId / delivery.turnId 的真实当前 active turn 写入，
+不能用普通 `c2c record` 或后续 turn 补写。Review 必须从 `execution_summary` 精确匹配该
+commandId，再读取 outputId；缺失时明确报告“本轮验收记录缺失”，不得引用历史 `test_status`
+冒充本轮通过。完整 envelope、幂等和输出限制见 [自动验收记录](desktop-control.md#自动验收记录)。
 
 状态持久化 `commandId`、OAuth `clientId`、`bindingId`、正文摘要、投递阶段及真实
 thread/turn ID。必要的这些投递元数据可以由状态查询返回，但状态、日志和
@@ -405,7 +411,8 @@ COMMAND_ID: cmd_unique_001
 
 ### 本地 CLI 与观察证明
 
-所有命令使用当前 Fork 的 `node <checkout>/bin/c2c.js`，明确 `-w <workspace>`，返回 JSON。
+所有日常命令使用已安装的 `node "<稳定 launcher 路径>"`，明确 `-w <workspace>`，返回 JSON。
+源码 checkout 入口仅用于明确的开发验证；构建与机器安装的区别见 [架构](architecture.md)。
 CLI 只保存/验证任务和元数据，不执行自然语言、不连接浏览器、不监听公网。
 
 | 命令 | 用途 |

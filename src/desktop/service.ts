@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 import type { Workspace } from "../workspace/manager.js";
-import { desktopIpc, DESKTOP_IPC_ERROR_MESSAGES } from "./ipc.js";
+import { desktopIpc, DESKTOP_IPC_ERROR_MESSAGES, validateDesktopWireMessage } from "./ipc.js";
 import { DesktopError, desktopId, publicDelivery, readDesktop, sendInput, targetInput, updateDesktop,
   type DesktopBinding, type DesktopDelivery, type DesktopState } from "./store.js";
 
@@ -87,6 +87,18 @@ function replay(state: DesktopState, input: z.infer<typeof sendInput>, clientId:
     throw new DesktopError("DESKTOP_COMMAND_CONFLICT", "commandId 的意图、客户端、目标或正文不一致，或旧记录未保存意图；拒绝投递，请通过 status 查询原记录。");
   return prior;
 }
+
+function desktopTaskEnvelope(input: z.infer<typeof sendInput>): string {
+  return JSON.stringify({
+    type: "C2C_DESKTOP_TASK",
+    version: 1,
+    workspaceId: input.workspaceId,
+    commandId: input.commandId,
+    intent: input.intent,
+    message: input.message,
+  });
+}
+
 function assertNoUncertainDelivery(state: DesktopState) {
   if (state.deliveries.some(item => item.deliveryStatus === "outcome_unknown"))
     throw new DesktopError("DESKTOP_OUTCOME_UNRESOLVED", "已有结果不明的投递；不要更换 commandId 或重新绑定绕过，须在 Desktop 人工核对。");
@@ -104,6 +116,7 @@ export async function sendDesktop(workspace: LocalWorkspace, raw: z.infer<typeof
   const digest = createHash("sha256").update(input.message, "utf8").digest("hex");
   const prior = replay(snapshot, input, clientId, digest);
   if (prior) return publicDelivery(prior);
+  const wireMessage = validateDesktopWireMessage(desktopTaskEnvelope(input));
   assertNoUncertainDelivery(snapshot);
   const connection = await desktopIpc.prepare(target(workspace, snapshot.binding));
   try {
@@ -136,7 +149,7 @@ export async function sendDesktop(workspace: LocalWorkspace, raw: z.infer<typeof
     if (!committed.attempt) return publicDelivery(committed.record);
     try {
       // 上面的 fsync/原子替换是本地提交点。此后 disable 不能撤回在途消息，任何不明结果均不重发。
-      const receipt = z.object({ threadId: z.string().uuid(), turnId: z.string().uuid() }).strict().parse(await connection.send(input.message));
+      const receipt = z.object({ threadId: z.string().uuid(), turnId: z.string().uuid() }).strict().parse(await connection.send(wireMessage));
       if (receipt.threadId !== committed.record.threadId) throw new Error("wrong receipt target");
       const accepted = updateDesktop(workspace.id, previous => {
         const state = checked(workspace, previous);

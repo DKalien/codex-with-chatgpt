@@ -2,7 +2,7 @@ import express, { type Request, type Response, type NextFunction } from "express
 import type { Server } from "node:http";
 import { randomBytes } from "node:crypto";
 import { Workspace } from "../workspace/manager.js";
-import { AuthStore, DESKTOP_CONTROL_SCOPE } from "../auth/store.js";
+import { AuthStore, CONNECTOR_CONTRACT_VERSION, DESKTOP_CONTROL_SCOPE } from "../auth/store.js";
 import { createOAuthRouter } from "../auth/oauth.js";
 import { bearerAuth } from "../auth/middleware.js";
 import { PairingManager } from "../pairing/manager.js";
@@ -18,6 +18,7 @@ import { namedTunnelBinding, readTunnelState } from "../tunnel/state.js";
 import { Logger, nullLogger } from "../logger/index.js";
 import { DEFAULT_HOST, DEFAULT_PORT } from "../config/paths.js";
 import { SERVICE_NAME, VERSION } from "../version.js";
+import { getRuntimeBuildId, isRuntimeBuildId } from "../build-id.js";
 import { writeRuntimeState, clearRuntimeState, type RuntimeState } from "./runtime.js";
 
 function tunnelForWorkspace(workspaceId: string, logger: Logger): TunnelProvider {
@@ -43,6 +44,8 @@ export interface BridgeOptions {
   authStoreFile?: string;
   pairingTtlMs?: number;
   accessTokenTtlMs?: number;
+  /** Build artifact ID captured at startup; source/test runs may inject null or a valid ID. */
+  runtimeBuildId?: string | null;
 }
 
 export interface Bridge {
@@ -94,6 +97,10 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   const pairing = new PairingManager(workspace.id, { ttlMs: opts.pairingTtlMs });
   const tunnel = opts.tunnelProvider ?? tunnelForWorkspace(workspace.id, logger);
   const adminToken = `c2c_admin_${randomBytes(24).toString("base64url")}`;
+  const runtimeBuildId = opts.runtimeBuildId === undefined ? getRuntimeBuildId() : opts.runtimeBuildId;
+  if (runtimeBuildId !== null && !isRuntimeBuildId(runtimeBuildId)) {
+    throw new Error("runtimeBuildId must be a 64-character lowercase SHA-256 hex string or null");
+  }
 
   let publicBaseUrl: string | null = null;
 
@@ -110,8 +117,10 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
 
   // ---- Health (public but minimal) ---------------------------------------
 
+  const startedAt = new Date().toISOString();
   app.get("/health", (_req, res) => {
-    res.json({ service: SERVICE_NAME, version: VERSION, workspaceId: workspace.id, status: "ok" });
+    res.json({ service: SERVICE_NAME, version: VERSION, workspaceId: workspace.id, status: "ok",
+      pid: process.pid, startedAt, ...(runtimeBuildId === null ? {} : { runtimeBuildId }) });
   });
 
   // ---- OAuth + discovery ---------------------------------------------------
@@ -137,6 +146,8 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
         throw new DesktopError("UNAUTHORIZED", "OAuth 授权已失效，请重新授权后再发送。" );
       }
     },
+    desktopCompatibility: (auth: AuthInfo | undefined) =>
+      auth?.token ? authStore.desktopCompatibility(auth.token) : { status: "unknown" },
   }), logger);
   app.all(
     "/mcp",
@@ -180,10 +191,13 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
       publicUrl: publicBaseUrl,
       tunnel: tunnel.status(),
       tokenCount: authStore.tokenCount(),
+      desktopCompatibility: authStore.desktopCompatibility(),
+      connectorContractVersion: CONNECTOR_CONTRACT_VERSION,
       pairingActive: pairing.hasActiveSession(),
       writeProbeEnabled: isWriteProbeEnabled(),
       pid: process.pid,
       startedAt,
+      ...(runtimeBuildId === null ? {} : { runtimeBuildId }),
     });
   });
 
@@ -224,7 +238,6 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   });
 
   const { server, port } = await listen(app, host, opts.port ?? DEFAULT_PORT);
-  const startedAt = new Date().toISOString();
   logger.info(`Bridge listening on ${host}:${port} for workspace ${workspace.name} (${workspace.id})`);
 
   const persistRuntime = (): void => {
@@ -239,6 +252,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
       adminToken,
       publicUrl: publicBaseUrl,
       startedAt,
+      ...(runtimeBuildId === null ? {} : { runtimeBuildId }),
     };
     writeRuntimeState(state);
   };
@@ -250,7 +264,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     closed = true;
     await tunnel.stop().catch(() => undefined);
     await new Promise<void>((resolve) => server.close(() => resolve()));
-    if (opts.persistRuntime !== false) clearRuntimeState(workspace.id);
+    if (opts.persistRuntime !== false) clearRuntimeState(workspace.id, { pid: process.pid, startedAt, adminToken });
     logger.info("Bridge stopped");
   };
 

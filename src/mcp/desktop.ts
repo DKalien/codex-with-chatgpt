@@ -2,7 +2,7 @@ import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { Workspace } from "../workspace/manager.js";
-import { DesktopError, desktopIntent, readDesktop, sendInput, statusInput } from "../desktop/store.js";
+import { DesktopError, desktopIntent, sendInput, statusInput } from "../desktop/store.js";
 import { desktopStatus, sendDesktop } from "../desktop/service.js";
 import { DESKTOP_CONTROL_SCOPE, DESKTOP_READ_SCOPE } from "../auth/store.js";
 
@@ -94,19 +94,12 @@ function result(action: () => unknown | Promise<unknown>, scope?: string): Promi
   );
 }
 
-/** Register Desktop tools only after a local user has bound a real Desktop session. */
+/** 无论是否绑定都注册 Desktop 工具；处理器内部严格校验状态和授权。 */
 export function registerDesktopTools(
   server: McpServer,
   workspace: Workspace,
   desktopAuthorize?: (auth: AuthInfo) => void,
 ): void {
-  try {
-    if (!readDesktop(workspace.id)?.binding) return;
-  } catch (error) {
-    // 已存在但损坏的状态仍提供错误诊断；工具内部读取严格校验，绝不恢复或发送。
-    if (!(error instanceof DesktopError) || error.code !== "DESKTOP_STATE_CORRUPT") throw error;
-  }
-
   server.registerTool(
     "codex_desktop_send",
     {

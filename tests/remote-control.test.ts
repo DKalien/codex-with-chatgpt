@@ -272,7 +272,7 @@ describe("Controller 状态机", () => {
     finally { controller.stop(); await running; }
   });
 });
-it("真实 MCP 传输校验 scopes、本地授权及工作区；默认仍九个只读工具", async () => {
+it("真实 MCP 传输校验 scopes、本地授权及工作区；默认包含九个只读基础工具和 Desktop 工具", async () => {
   const bridge = await startBridge({ workspaceRoot: root, port: 0, persistRuntime: false });
   const clients: Client[] = [];
   const connect = async (scopes: string[]) => {
@@ -284,10 +284,10 @@ it("真实 MCP 传输校验 scopes、本地授权及工作区；默认仍九个�
   const payload = (r: any) => JSON.parse(r.content[0].text);
   try {
     const read = await connect(["workspace.read"]);
-    expect((await read.listTools()).tools).toHaveLength(9);
+    expect((await read.listTools()).tools).toHaveLength(11);
     ready();
     const tools = (await read.listTools()).tools;
-    expect(tools).toHaveLength(13);
+    expect(tools).toHaveLength(15);
     expect(tools.find(t => t.name === "codex_submit_task")!.annotations!.readOnlyHint).toBe(false);
     expect(tools.some(t => t.name === "write_probe")).toBe(false);
     const args = { workspaceId: workspace.id, requestId: "req" };
@@ -298,8 +298,8 @@ it("真实 MCP 传输校验 scopes、本地授权及工作区；默认仍九个�
     expect(payload(await write.callTool({ name: "codex_thread_status", arguments: args })).requestId).toBe("req");
     expect((await read.listTools()).tools.filter(t => !t.name.startsWith("codex_")).every(t => t.annotations!.readOnlyHint)).toBe(true);
     setRemoteEnabled(workspace, false);
-    expect((await write.listTools()).tools).toHaveLength(9);
+    expect((await write.listTools()).tools).toHaveLength(11);
     fs.writeFileSync(remoteFile(workspace.id), "broken");
-    expect((await read.listTools()).tools).toHaveLength(9);
+    expect((await read.listTools()).tools).toHaveLength(11);
   } finally { for (const client of clients) await client.close(); await bridge.close(); }
 });

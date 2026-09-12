@@ -75,6 +75,19 @@ describe("resolveConversation", () => {
 });
 
 describe("mergeSession", () => {
+  it.each(["project", "long-chat"] as const)("Conversation Rebind 的 %s 只更新聊天 URL", (mode) => {
+    const previous = mergeSession(null, {
+      conversationMode: mode, projectUrl: PROJECT, connectorName: "Exact connector",
+      url: "https://chatgpt.com/c/old", taskId: "c2c_keep", iteration: 4, lastState: "EXECUTED",
+      checkpoint: { taskId: "c2c_keep", iteration: 4, protocolState: "EXECUTED_SENT",
+        waitingFor: "GPT_REVIEW", chatUrl: "https://chatgpt.com/c/old", projectUrl: PROJECT },
+    });
+    const next = mergeSession(previous, { url: "https://chatgpt.com/c/rebound" });
+    expect(next).toEqual({ ...previous, url: "https://chatgpt.com/c/rebound", savedAt: expect.any(String) });
+    expect(next.checkpoint).toEqual(previous.checkpoint);
+    expect(previous.url).toBe("https://chatgpt.com/c/old");
+  });
+
   it("keeps Project fields when only the chat URL is updated", () => {
     const next = mergeSession(
       {

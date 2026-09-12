@@ -132,6 +132,99 @@ class ProtocolTests(unittest.TestCase):
         ancestor.assert_called_once_with(RUNTIME)
         self.assertEqual(self.pipe.starts(), [])
 
+    def test_current_execution_reads_single_active_turn_from_flat_and_canonical_state(self):
+        state_file = Path(self.temp.name) / "global-state.json"
+        state_file.write_text(json.dumps({
+            "thread-project-assignments": {THREAD: {"projectKind": "local", "projectId": "project_test"}},
+            "local-projects": {"project_test": {"rootPaths": [self.temp.name]}},
+        }), encoding="utf-8")
+        cases = [
+            ("flat", {"turns": [{"turnId": NEW_TURN, "status": "inProgress"}]}),
+            ("canonical", {"turnHistory": {"kind": "canonical", "history": {
+                "islands": [{"entries": [{"value": "turn-1"}], "newerBoundary": {"status": "exhausted"}}],
+                "entitiesByKey": {"turn-1": {"turnId": NEW_TURN, "status": "inProgress"}},
+            }}}),
+        ]
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": THREAD, "CODEX_SESSION_ID": THREAD}, clear=False), \
+                patch.object(h, "_global_state_path", return_value=state_file), \
+                patch.object(h, "_verify_current_runner_ancestor"):
+            for shape, turns in cases:
+                with self.subTest(shape=shape):
+                    self.pipe.state.pop("turns", None)
+                    self.pipe.state.pop("turnHistory", None)
+                    self.pipe.state["threadRuntimeStatus"] = {"type": "active"}
+                    self.pipe.state.update(copy.deepcopy(turns))
+                    info = h._current_execution(self.temp.name)
+                    self.assertEqual(info["activeTurnId"], NEW_TURN)
+                    self.assertEqual(info["runtimeStatus"], "active")
+        self.assertEqual(self.pipe.starts(), [])
+
+    def test_current_execution_rejects_missing_multiple_unknown_or_invalid_active_turn(self):
+        state_file = Path(self.temp.name) / "global-state.json"
+        state_file.write_text(json.dumps({
+            "thread-project-assignments": {THREAD: {"projectKind": "local", "projectId": "project_test"}},
+            "local-projects": {"project_test": {"rootPaths": [self.temp.name]}},
+        }), encoding="utf-8")
+        cases = [
+            ("missing", {"turns": []}),
+            ("multiple", {"turns": [
+                {"turnId": NEW_TURN, "status": "inProgress"},
+                {"turnId": "01a00000-0000-7000-8000-000000000006", "status": "inProgress"},
+            ]}),
+            ("unknown_status", {"turns": [{"turnId": NEW_TURN, "status": "futureStatus"}]}),
+            ("invalid_uuid", {"turns": [{"turnId": "not-a-uuid", "status": "inProgress"}]}),
+            ("idle_runtime", {"turns": [{"turnId": NEW_TURN, "status": "inProgress"}],
+                              "threadRuntimeStatus": {"type": "idle"}}),
+        ]
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": THREAD, "CODEX_SESSION_ID": THREAD}, clear=False), \
+                patch.object(h, "_global_state_path", return_value=state_file), \
+                patch.object(h, "_verify_current_runner_ancestor"):
+            for name, update in cases:
+                with self.subTest(case=name):
+                    self.pipe.state.pop("turnHistory", None)
+                    self.pipe.state["threadRuntimeStatus"] = {"type": "active"}
+                    self.pipe.state.update(copy.deepcopy(update))
+                    with self.assertRaises(h.DesktopIpcError) as caught:
+                        h._current_execution(self.temp.name)
+                    self.assertEqual(caught.exception.code, "DESKTOP_STATE_UNAVAILABLE")
+        self.assertEqual(self.pipe.starts(), [])
+
+    def test_current_execution_rejects_forged_context_without_runner_ancestor(self):
+        state_file = Path(self.temp.name) / "global-state.json"
+        state_file.write_text(json.dumps({
+            "thread-project-assignments": {THREAD: {"projectKind": "local", "projectId": "project_test"}},
+            "local-projects": {"project_test": {"rootPaths": [self.temp.name]}},
+        }), encoding="utf-8")
+        self.pipe.state["threadRuntimeStatus"] = {"type": "active"}
+        self.pipe.state["turns"] = [{"turnId": NEW_TURN, "status": "inProgress"}]
+        failure = h._error("DESKTOP_CURRENT_CONTEXT_INVALID")
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": THREAD, "CODEX_SESSION_ID": THREAD}, clear=False), \
+                patch.object(h, "_global_state_path", return_value=state_file), \
+                patch.object(h, "_verify_current_runner_ancestor", side_effect=failure) as ancestor:
+            with self.assertRaises(h.DesktopIpcError) as caught:
+                h._current_execution(self.temp.name)
+        self.assertEqual(caught.exception.code, "DESKTOP_CURRENT_CONTEXT_INVALID")
+        ancestor.assert_called_once_with(RUNTIME)
+        self.assertEqual(self.pipe.starts(), [])
+
+    def test_current_execution_rechecks_snapshot_age_after_runtime_validation(self):
+        state_file = Path(self.temp.name) / "global-state.json"
+        state_file.write_text(json.dumps({
+            "thread-project-assignments": {THREAD: {"projectKind": "local", "projectId": "project_test"}},
+            "local-projects": {"project_test": {"rootPaths": [self.temp.name]}},
+        }), encoding="utf-8")
+        self.pipe.state["threadRuntimeStatus"] = {"type": "active"}
+        self.pipe.state["turns"] = [{"turnId": NEW_TURN, "status": "inProgress"}]
+        ages = iter([0.0, 0.0, 0.0, h.MAX_OBSERVATION_AGE_SECONDS + 1.0])
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": THREAD, "CODEX_SESSION_ID": THREAD}, clear=False), \
+                patch.object(h, "_global_state_path", return_value=state_file), \
+                patch.object(h, "_verify_current_runner_ancestor"), \
+                patch.object(h._IpcClient, "snapshot_age", side_effect=lambda: next(ages)):
+            with self.assertRaises(h.DesktopIpcError) as caught:
+                h._current_execution(self.temp.name)
+        self.assertEqual(caught.exception.code, "DESKTOP_STATE_UNAVAILABLE")
+        self.assertEqual(self.pipe.starts(), [])
+
     def test_current_confirm_cancelled_is_local_only_and_does_not_start(self):
         state_file = Path(self.temp.name) / "global-state.json"
         state_file.write_text(json.dumps({

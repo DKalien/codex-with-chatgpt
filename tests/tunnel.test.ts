@@ -1,6 +1,7 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
 import { EventEmitter } from "node:events";
 import fs from "node:fs";
+import path from "node:path";
 import type { ChildProcess } from "node:child_process";
 import { PassThrough } from "node:stream";
 import { findBinary } from "../src/tunnel/detect.js";
@@ -10,7 +11,12 @@ import {
   type CloudflaredQuickTunnelOptions,
 } from "../src/tunnel/cloudflared.js";
 import { normalizeNamedTunnelHostname } from "../src/tunnel/cloudflared-named.js";
-import { hostnameSlug, parseZoneInput, suggestedNamedHostname } from "../src/tunnel/hostname.js";
+import {
+  hostnameSlug,
+  parseZoneInput,
+  suggestedNamedHostname,
+  uniqueNamedHostname,
+} from "../src/tunnel/hostname.js";
 import {
   chooseQuickTunnel,
   isBenignRouteError,
@@ -19,7 +25,15 @@ import {
   provisionNamedTunnel,
   type CloudflaredAccount,
 } from "../src/tunnel/named-provision.js";
-import { isNamedTunnelReady, needsTunnelChoice, readTunnelState } from "../src/tunnel/state.js";
+import {
+  isNamedTunnelReady,
+  needsTunnelChoice,
+  readTunnelState,
+  resolveMigrationZone,
+  tunnelStateFile,
+  writeTunnelState,
+} from "../src/tunnel/state.js";
+import { sessionFile } from "../src/session/state.js";
 import { cleanup, isolateStateDir, makeTmpDir, write } from "./helpers.js";
 
 const stateDirs: string[] = [];
@@ -227,6 +241,10 @@ describe("named hostname helpers", () => {
     expect(parseZoneInput("https://Example.com/")).toBe("example.com");
     expect(parseZoneInput("not a domain")).toBeNull();
   });
+
+  it("为严格迁移生成含 workspaceId 的唯一 hostname", () => {
+    expect(uniqueNamedHostname("Example.COM", "abcdef123456")).toBe("c2c-abcdef123456.example.com");
+  });
 });
 
 describe("cloudflared output parsers", () => {
@@ -309,5 +327,361 @@ describe("tunnel preference state", () => {
       expect(result.state.preference).toBe("quick");
       expect(result.userMessage).toMatch(/临时地址/);
     });
+  });
+
+  it("当前 workspace 有可靠 zone 时优先使用当前记录", () => {
+    stateDirs.push(isolateStateDir());
+    writeTunnelState({ workspaceId: "current", preference: "quick", zone: "current.example.com" });
+    writeTunnelState({ workspaceId: "other", preference: "quick", zone: "other.example.com" });
+
+    expect(resolveMigrationZone("current")).toEqual({
+      migrationZone: "current.example.com",
+      zoneResolution: "current",
+    });
+  });
+
+  it("机器 tunnels 目录只有一个可靠 zone 时返回 machine-unique", () => {
+    stateDirs.push(isolateStateDir());
+    writeTunnelState({ workspaceId: "other", preference: "quick", zone: "example.com" });
+
+    expect(resolveMigrationZone("missing-workspace")).toEqual({
+      migrationZone: "example.com",
+      zoneResolution: "machine-unique",
+    });
+  });
+
+  it("机器 tunnels 目录有多个 zone 时返回 ambiguous 且不猜测", () => {
+    stateDirs.push(isolateStateDir());
+    writeTunnelState({ workspaceId: "one", preference: "quick", zone: "one.example.com" });
+    writeTunnelState({ workspaceId: "two", preference: "quick", zone: "two.example.com" });
+
+    expect(resolveMigrationZone("missing-workspace")).toEqual({
+      migrationZone: null,
+      zoneResolution: "ambiguous",
+    });
+  });
+
+  it("当前或机器 tunnel 状态损坏时返回 corrupt", () => {
+    stateDirs.push(isolateStateDir());
+    const file = tunnelStateFile("corrupt-workspace");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, "{broken");
+
+    expect(resolveMigrationZone("corrupt-workspace")).toEqual({
+      migrationZone: null,
+      zoneResolution: "corrupt",
+    });
+  });
+
+  it("严格 named 不会覆盖损坏的当前状态", async () => {
+    stateDirs.push(isolateStateDir());
+    const file = tunnelStateFile("corrupt-workspace");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, "{broken");
+    const before = fs.readFileSync(file);
+    const account: CloudflaredAccount = {
+      hasCert: vi.fn(() => false),
+      login: vi.fn(async () => undefined),
+      listTunnels: vi.fn(async () => []),
+      createTunnel: vi.fn(async (name) => ({
+        id: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        name,
+      })),
+      routeDns: vi.fn(async () => undefined),
+    };
+
+    const result = await provisionNamedTunnel({
+      workspaceId: "corrupt-workspace",
+      workspaceName: "Target",
+      zone: "example.com",
+      requireNamed: true,
+      account,
+    });
+
+    expect(result).toMatchObject({ ok: false, fallback: false });
+    expect(account.hasCert).not.toHaveBeenCalled();
+    expect(fs.readFileSync(file)).toEqual(before);
+  });
+
+  it("严格 named 失败时返回失败并保留所有既有 bytes", async () => {
+    stateDirs.push(isolateStateDir());
+    const otherState = writeTunnelState({
+      workspaceId: "other-workspace",
+      preference: "quick",
+      fallbackReason: "existing",
+    });
+    const otherFile = tunnelStateFile(otherState.workspaceId);
+    writeTunnelState({ workspaceId: "target-workspace", preference: "quick" });
+    const targetFile = tunnelStateFile("target-workspace");
+    const beforeTarget = fs.readFileSync(targetFile);
+    const beforeOther = fs.readFileSync(otherFile);
+    const sessionPath = sessionFile("target-workspace");
+    const sessionContent = JSON.stringify({
+      url: "https://chatgpt.com/c/target",
+      projectUrl: "https://chatgpt.com/project/target",
+      connectorName: "Target connector",
+      taskId: "task-target",
+      iteration: 4,
+      savedAt: "2026-09-12T00:00:00.000Z",
+      checkpoint: {
+        taskId: "task-target",
+        iteration: 4,
+        protocolState: "EXECUTED_SENT",
+        waitingFor: "GPT_REVIEW",
+        projectUrl: "https://chatgpt.com/project/target",
+        chatUrl: "https://chatgpt.com/c/target",
+        updatedAt: "2026-09-12T00:00:00.000Z",
+      },
+    });
+    write(path.dirname(sessionPath), path.basename(sessionPath), sessionContent);
+    const beforeSession = fs.readFileSync(sessionPath);
+    let routeCalled = false;
+    const account: CloudflaredAccount = {
+      hasCert: () => true,
+      login: async () => undefined,
+      listTunnels: async () => [],
+      createTunnel: async () => {
+        throw new Error("Cloudflare unavailable");
+      },
+      routeDns: async () => {
+        routeCalled = true;
+      },
+    };
+
+    const result = await provisionNamedTunnel({
+      workspaceId: "target-workspace",
+      workspaceName: "Target",
+      zone: "example.com",
+      requireNamed: true,
+      account,
+    });
+
+    expect(result).toMatchObject({ ok: false, fallback: false });
+    expect(routeCalled).toBe(false);
+    expect(fs.readFileSync(targetFile)).toEqual(beforeTarget);
+    expect(fs.readFileSync(otherFile)).toEqual(beforeOther);
+    expect(fs.readFileSync(sessionPath)).toEqual(beforeSession);
+  });
+
+  it.each([
+    {
+      label: "Cloudflare 返回了其他 tunnel 名称",
+      createTunnel: async () => ({
+        id: "44444444-4444-4444-4444-444444444444",
+        name: "c2c-other-workspace",
+      }),
+      listTunnels: async () => [],
+    },
+    {
+      label: "Cloudflare 返回了其他 workspace 的 tunnel id",
+      createTunnel: async () => ({
+        id: "55555555-5555-5555-5555-555555555555",
+        name: "c2c-target-workspace",
+      }),
+      listTunnels: async () => [
+        { id: "55555555-5555-5555-5555-555555555555", name: "c2c-other-workspace" },
+      ],
+    },
+  ])("严格 named 拒绝$label", async ({ createTunnel, listTunnels }) => {
+    stateDirs.push(isolateStateDir());
+    writeTunnelState({ workspaceId: "target-workspace", preference: "quick" });
+    const targetFile = tunnelStateFile("target-workspace");
+    const before = fs.readFileSync(targetFile);
+    const routeDns = vi.fn(async () => undefined);
+    const account: CloudflaredAccount = {
+      hasCert: () => true,
+      login: async () => undefined,
+      listTunnels,
+      createTunnel,
+      routeDns,
+    };
+
+    const result = await provisionNamedTunnel({
+      workspaceId: "target-workspace",
+      workspaceName: "Target",
+      zone: "example.com",
+      requireNamed: true,
+      account,
+    });
+
+    expect(result).toMatchObject({ ok: false, fallback: false });
+    expect(routeDns).not.toHaveBeenCalled();
+    expect(fs.readFileSync(targetFile)).toEqual(before);
+  });
+
+  it.each([
+    {
+      label: "hostname",
+      other: {
+        tunnelName: "foreign-binding",
+        tunnelId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        hostname: "c2c-target-workspace.example.com",
+      },
+    },
+    {
+      label: "tunnelId",
+      other: {
+        tunnelName: "foreign-binding",
+        tunnelId: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        hostname: "c2c-other-workspace.example.com",
+      },
+    },
+  ])("严格 named 拒绝与其他 workspace 的 $label 冲突", async ({ other }) => {
+    stateDirs.push(isolateStateDir());
+    writeTunnelState({ workspaceId: "target-workspace", preference: "quick" });
+    const otherState = writeTunnelState({
+      workspaceId: "other-workspace",
+      preference: "named",
+      provider: "cloudflare-named",
+      ...other,
+      zone: "example.com",
+    });
+    const targetFile = tunnelStateFile("target-workspace");
+    const beforeTarget = fs.readFileSync(targetFile);
+    const otherFile = tunnelStateFile(otherState.workspaceId);
+    const beforeOther = fs.readFileSync(otherFile);
+    const routeDns = vi.fn(async () => undefined);
+    const account: CloudflaredAccount = {
+      hasCert: () => true,
+      login: async () => undefined,
+      listTunnels: async () => [],
+      createTunnel: async (name) => ({
+        id: other.tunnelId,
+        name,
+      }),
+      routeDns,
+    };
+
+    const result = await provisionNamedTunnel({
+      workspaceId: "target-workspace",
+      workspaceName: "Target",
+      zone: "example.com",
+      requireNamed: true,
+      account,
+    });
+
+    expect(result).toMatchObject({ ok: false, fallback: false });
+    expect(routeDns).not.toHaveBeenCalled();
+    expect(fs.readFileSync(targetFile)).toEqual(beforeTarget);
+    expect(fs.readFileSync(otherFile)).toEqual(beforeOther);
+  });
+
+  it("严格 named 使用唯一 hostname，并把 strict 传给 DNS route", async () => {
+    stateDirs.push(isolateStateDir());
+    writeTunnelState({ workspaceId: "abcdef123456", preference: "quick", provider: "cloudflare-quick" });
+    const sessionPath = sessionFile("abcdef123456");
+    const sessionContent = JSON.stringify({
+      url: "https://chatgpt.com/c/abcdef",
+      projectUrl: "https://chatgpt.com/project/abcdef",
+      connectorName: "Demo connector",
+      taskId: "task-abcdef",
+      iteration: 7,
+      savedAt: "2026-09-12T00:00:00.000Z",
+      checkpoint: {
+        taskId: "task-abcdef",
+        iteration: 7,
+        protocolState: "EXECUTED_SENT",
+        waitingFor: "GPT_REVIEW",
+        projectUrl: "https://chatgpt.com/project/abcdef",
+        chatUrl: "https://chatgpt.com/c/abcdef",
+        updatedAt: "2026-09-12T00:00:00.000Z",
+      },
+    });
+    write(path.dirname(sessionPath), path.basename(sessionPath), sessionContent);
+    const beforeSession = fs.readFileSync(sessionPath);
+    const createTunnel = vi.fn(async (name: string) => ({
+      id: "66666666-6666-6666-6666-666666666666",
+      name,
+    }));
+    const routeDns = vi.fn(async (_tunnelName: string, _hostname: string, options?: { strict?: boolean }) => {
+      expect(options).toEqual({ strict: true });
+    });
+    const account: CloudflaredAccount = {
+      hasCert: () => true,
+      login: async () => undefined,
+      listTunnels: async () => [],
+      createTunnel,
+      routeDns,
+    };
+
+    const result = await provisionNamedTunnel({
+      workspaceId: "abcdef123456",
+      workspaceName: "Same Name",
+      zone: "example.com",
+      requireNamed: true,
+      account,
+    });
+
+    expect(result).toMatchObject({ ok: true, fallback: false });
+    expect(createTunnel).toHaveBeenCalledWith("c2c-abcdef123456");
+    expect(routeDns).toHaveBeenCalledWith(
+      "c2c-abcdef123456",
+      "c2c-abcdef123456.example.com",
+      { strict: true }
+    );
+    expect(result.state.hostname).toBe("c2c-abcdef123456.example.com");
+    expect(fs.readFileSync(sessionPath)).toEqual(beforeSession);
+  });
+
+  it("严格 named 遇到 DNS duplicate 错误时不降级为 quick", async () => {
+    stateDirs.push(isolateStateDir());
+    writeTunnelState({ workspaceId: "dns-target", preference: "quick" });
+    const targetFile = tunnelStateFile("dns-target");
+    const before = fs.readFileSync(targetFile);
+    const account: CloudflaredAccount = {
+      hasCert: () => true,
+      login: async () => undefined,
+      listTunnels: async () => [],
+      createTunnel: async (name) => ({ id: "77777777-7777-7777-7777-777777777777", name }),
+      routeDns: async () => {
+        throw new Error("record already exists");
+      },
+    };
+
+    const result = await provisionNamedTunnel({
+      workspaceId: "dns-target",
+      workspaceName: "Target",
+      zone: "example.com",
+      requireNamed: true,
+      account,
+    });
+
+    expect(result).toMatchObject({ ok: false, fallback: false });
+    expect(fs.readFileSync(targetFile)).toEqual(before);
+  });
+
+  it("已有当前 workspace 的完整 named binding 时幂等返回且不重复 provision", async () => {
+    stateDirs.push(isolateStateDir());
+    const state = writeTunnelState({
+      workspaceId: "named-target",
+      preference: "named",
+      provider: "cloudflare-named",
+      tunnelName: "c2c-named-target",
+      tunnelId: "88888888-8888-8888-8888-888888888888",
+      hostname: "c2c-target.example.com",
+      zone: "example.com",
+    });
+    const account: CloudflaredAccount = {
+      hasCert: vi.fn(() => false),
+      login: vi.fn(async () => undefined),
+      listTunnels: vi.fn(async () => []),
+      createTunnel: vi.fn(async (name) => ({ id: "99999999-9999-9999-9999-999999999999", name })),
+      routeDns: vi.fn(async () => undefined),
+    };
+
+    const result = await provisionNamedTunnel({
+      workspaceId: "named-target",
+      workspaceName: "Target",
+      zone: "example.com",
+      requireNamed: true,
+      account,
+    });
+
+    expect(result).toEqual({ ok: true, state, fallback: false });
+    expect(account.hasCert).not.toHaveBeenCalled();
+    expect(account.login).not.toHaveBeenCalled();
+    expect(account.listTunnels).not.toHaveBeenCalled();
+    expect(account.createTunnel).not.toHaveBeenCalled();
+    expect(account.routeDns).not.toHaveBeenCalled();
   });
 });

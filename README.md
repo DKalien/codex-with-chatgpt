@@ -41,9 +41,9 @@ Detailed docs below are in English · 详细中文文档见 **[README.zh-CN.md](
 
 ## Experimental Desktop Control · 实验性桌面控制
 
-Desktop Control is off by default. After a local user binds and enables one
-already loaded, idle Desktop thread, ChatGPT may call
-`codex_desktop_send` with a confirmed full plan through
+Desktop Control is off by default. A local user binds and enables one already
+loaded Desktop thread; binding may verify an active thread, while actual delivery
+requires it to be idle. ChatGPT may call `codex_desktop_send` with a confirmed full plan through
 `codex.desktop.control`; `codex_desktop_status` uses the separate
 `codex.desktop.read` scope. The first version targets existing threads only:
 it does not create sessions, steer, interrupt, poll, notify, or start another
@@ -58,7 +58,7 @@ quotes, task plans, or ordinary discussion do not trigger it, and text cannot
 waive confirmation when its local origin cannot be reliably established.
 
 ```powershell
-node <checkout>\bin\c2c.js desktop bind-current [-w <workspace>] [--json]
+node "<stable launcher>" desktop bind-current [-w <workspace>] [--json]
 ```
 
 It uses the current real `CODEX_THREAD_ID` to map the exact Desktop thread,
@@ -92,7 +92,8 @@ change `commandId` or rebind; the whole workspace stays blocked, including a
 new binding, and this MVP has no recovery interface. A local user must check
 the Desktop session first. The send input requires `intent` to be
 `development_plan` or `revision`, literal `userConfirmed=true`, and the full
-UTF-8 message remains capped at 64 KiB. The model may set `userConfirmed=true`
+UTF-8 wire message, including the internal task envelope and JSON escaping, is capped at 64 KiB.
+The model may set `userConfirmed=true`
 only after the current conversation's user explicitly confirms, for example,
 “Yes, proceed with that”; it is a semantic audit signal, not a credential, and
 does not replace OAuth, local enable, binding, or Desktop approval or promise
@@ -143,6 +144,21 @@ See [protocol and CLI](docs/protocol.md#web-control-mode),
 Deploy source / Skill changes with `powershell -NoProfile -File .\scripts\dev-install.ps1`
 and test from a Codex task that has loaded the updated Skill.
 
+The installer saves a self-contained release under the machine state directory's `releases/<buildId>`
+and atomically switches `current.json` only after validating its artifacts and copied dependencies.
+The stable launcher verifies and executes that installed release. Rebuilding, editing or moving the
+source checkout does not change the installed program; another successful dev-install selects the new build.
+Legacy checkout pointers are frozen to the same installed build before dependency installation/build begins,
+so a failed build or pointer switch keeps the previous release usable. No PATH or workspace configuration changes.
+Program versions are shared; OAuth, Connector, tunnel, session, Project, checkpoint, Desktop and
+records remain isolated per workspace. Rollout restarts only authenticated, healthy named tunnels
+with idle Desktop/Remote state, no pairing, approval or unresolved outcome, preserving their URL.
+Quick tunnels and active tasks are skipped; stopped workspaces use the current build on next start.
+`status/doctor --json` reports `runtimeUpgrade` and pending reasons. Build changes alone never rebuild
+Connectors or reauthorize OAuth. Per-workspace skips/errors do not undo installation. Phase 1 has
+no resident Supervisor; retry local `rollout --json` when idle (`-w <workspace>` limits its scope).
+A rollout that cannot acquire the machine lock only reports `rollout_busy`; it never writes pending state.
+
 ## One-paste install · 一段话安装
 
 **中文** — 不懂 git、Node、终端？完全不需要懂。把下面这段话原样复制给你的
@@ -156,14 +172,15 @@ and test from a Codex task that has loaded the updated Skill.
   （macOS 用 Homebrew，Windows 用 winget），同时安装 cloudflared。
 2. 下载：把 https://github.com/DKalien/codex-with-chatgpt 克隆到
    ~/codex-with-chatgpt（已有本地 Fork 就复用，不自动 pull）。
-3. 构建：在该目录里执行 corepack pnpm install 和 corepack pnpm build。
-4. 安装 Skill：把仓库里的 skill/SKILL.md 复制到
-   ~/.codex/skills/codex-with-chatgpt/SKILL.md，并把文件中
-   "The codex-with-chatgpt checkout lives at:" 那一行的路径改成实际克隆路径。
-5. 仅尚未配置时：按 SKILL.md 里的 first-time setup 流程执行
-  （运行 c2c setup，用内置浏览器打开 ChatGPT 配置连接器并输入配对码）。
+3. 构建前先运行 node scripts/install-core.mjs --protect-current --json 保护旧安装，
+   成功后执行 corepack pnpm install --frozen-lockfile 和 corepack pnpm build。
+4. 安装机器 Core：运行 node scripts/install-core.mjs，再把 skill/SKILL.md 复制到
+   ~/.codex/skills/codex-with-chatgpt/SKILL.md，将单一 launcher 占位符替换为安装输出的稳定路径。
+   Windows 可直接运行 scripts/dev-install.ps1 完成以上构建/安装与安全 rollout。
+5. 启用 ChatGPT 工作流：按 SKILL.md 的 Activation 路由复用现有状态，
+   新工作区才首次配置；恢复连接、Project 和当前 Desktop 绑定也沿用该流程。
    全程只用内置浏览器，禁止打开任何第三方浏览器。
-6. 只有遇到需要我登录（ChatGPT / Cloudflare）、验证码或两步验证时才叫我，
+6. 只有登录、验证码、两步验证、首次 Project 创建或本机确认等必要用户动作才叫我，
    而且一次只告诉我一个动作。
 7. 完成后给我看 ✓ 清单，并确认文件读取测试通过。我不懂 MCP、OAuth、
    Tunnel、端口这些词，不要向我解释；出了问题先自己修。
@@ -182,14 +199,18 @@ I am a non-technical user — do everything yourself:
    cloudflared.
 2. Download: clone https://github.com/DKalien/codex-with-chatgpt into
    ~/codex-with-chatgpt (reuse an existing local Fork; never auto-pull).
-3. Build: inside that folder run `corepack pnpm install` then `corepack pnpm build`.
-4. Install the Skill: copy skill/SKILL.md to
-   ~/.codex/skills/codex-with-chatgpt/SKILL.md, and update the line
-   "The codex-with-chatgpt checkout lives at:" to the actual clone path.
-5. Only if not already configured: follow the SKILL.md "first-time setup" workflow
-   (run c2c setup, configure the ChatGPT connector in the BUILT-IN browser,
-   enter the pairing code). Never open a third-party browser.
-6. Only interrupt me for logins (ChatGPT / Cloudflare), CAPTCHAs or 2FA —
+3. Before building, protect any old installation with
+   `node scripts/install-core.mjs --protect-current --json`. Only on success run
+   `corepack pnpm install --frozen-lockfile` then `corepack pnpm build`.
+4. Install the machine Core with node scripts/install-core.mjs. Copy skill/SKILL.md to
+   ~/.codex/skills/codex-with-chatgpt/SKILL.md and replace its single launcher placeholder
+   with the stable launcher path reported by the installer. On Windows, scripts/dev-install.ps1
+   performs build, Core/Skill installation, and safe rollout together.
+5. Enable the ChatGPT workflow: follow SKILL.md Activation, reusing existing state;
+   only new workspaces need first-time setup. Use the BUILT-IN browser for ChatGPT,
+   and complete the existing connection, Project and current Desktop binding flows.
+6. Only interrupt me for required user actions: logins, CAPTCHAs, 2FA,
+   initial Project creation or local confirmation —
    and give me exactly ONE action at a time.
 7. When done, show me the ✓ checklist and confirm the file-read test passed.
    I don't know what MCP, OAuth, tunnels or ports are. Don't explain them.
@@ -199,6 +220,10 @@ I am a non-technical user — do everything yourself:
 
 **Updates · 更新** — Daily checks only compare the current branch with its origin
 counterpart and report remote-ahead or divergence. No automatic working tree updates.
+The current `update-check` locates Git relative to its executable. An installed immutable
+release has no `.git`, so its check reports unavailable; that is not proof the Fork is current.
+Source-update checking through the machine entry remains pending. Explicit source maintenance
+can run the checkout's command as described in the [Fork guide](README.zh-CN.md#本地-fork-开发版).
 Skill 每天仅检查自己的 Fork，不自动 pull/stash/merge/rebase/reset/checkout。
 运行 `powershell -NoProfile -File .\scripts\dev-install.ps1` 部署当前源码；
 仅人工运行 `powershell -NoProfile -File .\scripts\update-upstream-track.ps1`
@@ -206,13 +231,28 @@ Skill 每天仅检查自己的 Fork，不自动 pull/stash/merge/rebase/reset/ch
 
 ---
 
+## Recommended for a new workspace
+
+For a new workspace, say **“Enable the ChatGPT workflow.”** The existing Skill automatically
+reuses the `setup`, `repair`, `session`, and `Project` flows, prompts for any required user
+action one step at a time, and finishes by running `desktop bind-current` for the current
+Desktop session. The existing **“Set up Codex with ChatGPT.”**, **“Use Codex with ChatGPT to
+implement XXX.”**, and **“bind and enable this session for ChatGPT”** prompts remain supported.
+
+Activation checks OAuth compatibility and the connector's actual tool schemas. Compatible connectors
+stay unchanged; migration only replaces this workspace's same-name connector and preserves its
+Project/session/checkpoint. Desktop schemas are always discoverable; all call permissions still apply.
+Legacy migration upgrades a quick URL to a workspace-specific named address before recreating the
+connector. An ambiguous domain requires user input; named setup failure never silently falls back to quick.
+
 *The sections below are in English. 以下详细内容为英文，中文完整版见
 [README.zh-CN.md](README.zh-CN.md)。*
 
 ## Install → Setup → Use (manual)
 
-1. Install the Codex Skill: copy `skill/` to `~/.codex/skills/codex-with-chatgpt/`.
-2. Tell Codex: **"Set up Codex with ChatGPT."** (中文: "使用 Codex with ChatGPT 完成首次配置。")
+1. Install the machine Core and Codex Skill using the installation steps above;
+   the installed Skill must contain the stable launcher path, not the source placeholder.
+2. Tell Codex: **"Enable the ChatGPT workflow."** (中文: "启用 ChatGPT 工作流")
 3. Use Codex normally: **"Use Codex with ChatGPT to implement XXX."**
 
 That's the whole manual. You don't need to know what MCP, OAuth, tunnels,
@@ -223,15 +263,14 @@ just see:
 Codex with ChatGPT
 
 ✓ Project detected
-✓ Workspace Bridge started
-✓ Secure connection established
 ✓ ChatGPT connected
-✓ File read test passed
+✓ Current Desktop session bound; ready to receive tasks when idle
 
 Ready.
 ```
 
-The only steps that may need you: logging into ChatGPT (and, if you want a
+Required actions are shown one at a time: initial setup/connection preferences,
+the local Desktop binding confirmation (never auto-clicked), and logging into ChatGPT (and, if you want a
 stable hostname, logging into Cloudflare once). A **new** workspace also asks
 you to create a ChatGPT Project (collection) once — pick **project-only
 memory**, name it after the workspace. If the sidebar has no Projects row,
@@ -250,8 +289,9 @@ If you have a Cloudflare account and a domain already on Cloudflare, first-time
 setup (and the next coding session, once) will ask whether you want a stable
 hostname such as `c2c-<project>.your-domain.com`. That path opens a browser so
 you can authorize Cloudflare. After that, the ChatGPT connector keeps working
-across restarts. If you skip it, or the login fails, Codex stays on the temporary
-address — same features, just a slower repair.
+across restarts. In ordinary setup, if you skip it or login fails, Codex can stay on the temporary
+address — same features, just a slower repair. Legacy Connector migration requires named:
+failure preserves state and remains not ready, with no fallback to quick.
 
 Credentials stay in the OS app state directory, not in the project.
 
@@ -321,14 +361,19 @@ Full threat model: [docs/security.md](docs/security.md)
 ## For developers
 
 ```bash
-pnpm install
-pnpm build          # -> dist/, exposes the `c2c` bin
-pnpm test           # vitest: 146 tests (path security, OAuth, pairing, MCP e2e)
+pnpm install --frozen-lockfile
+pnpm run build      # -> dist/ and deterministic build ID; does not switch installed Core
+pnpm test --maxWorkers=1 --testTimeout=60000
+pnpm run typecheck
+git diff --check
 
-c2c setup           # bridge + tunnel + pairing code, all in one
-c2c sandbox-allow   # whitelist the settings dir in Codex (macOS + Windows)
-c2c status / doctor / pair / unpair / logs / stop
+# Explicit source-development entry (current checkout):
+pnpm dev -- status --json
 ```
+
+For normal workspace commands, use `node "<stable launcher>" <command> -w <workspace>`.
+On Windows, `scripts/dev-install.ps1` installs Core and Skill after a successful build;
+it does not restart busy/unknown workspaces. Developer boundaries are in [AGENTS.md](AGENTS.md).
 
 Requirements: Node.js >= 20, git. `cloudflared` for the public connection
 (auto-detected; the Skill installs it for you).
@@ -341,8 +386,9 @@ Docs: [architecture](docs/architecture.md) · [protocol](docs/protocol.md) ·
 
 ```
 src/
+  core/       installed release metadata, safe rollout and pending upgrades
   bridge/     loopback HTTP server, port recovery, admin API
-  mcp/        9 default read-only tools, optional Remote/Desktop Control and write probe
+  mcp/        9 read-only tools, always-discoverable guarded Desktop tools, optional Remote/write probe
   remote/     durable task queue, controller, official app-server client
   desktop/    local Desktop binding, IPC delivery and replay-safe state
   auth/       OAuth 2.1 (PKCE, DCR, refresh rotation, revocation)
@@ -359,8 +405,10 @@ docs/         architecture / protocol / security / troubleshooting
 
 ## Status & disclaimer
 
-V1. Verified end-to-end: bridge, OAuth + pairing, public tunnel, ChatGPT
-connector setup, zero-touch first-run experience.
+V1. Setup and Activation automate local steps; login, initial Project creation
+and Desktop binding confirmation still require the user's action.
+Local build/test results do not prove that every running workspace uses the installed Core;
+check `runtimeUpgrade` and verify the intended workspace's real connection separately.
 
 Desktop Control remains experimental: automated fake Desktop/IPC checks do not
 claim a manual real-Desktop end-to-end result.

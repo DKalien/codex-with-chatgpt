@@ -77,10 +77,12 @@ afterAll(async () => {
 });
 
 describe("MCP tools over Streamable HTTP", () => {
-  it("lists all nine read-only tools", async () => {
+  it("lists nine base read-only tools and Desktop tools", async () => {
     const { tools } = await client.listTools();
     const names = tools.map((tool) => tool.name).sort();
     expect(names).toEqual([
+      "codex_desktop_send",
+      "codex_desktop_status",
       "execution_output",
       "execution_summary",
       "git_diff",
@@ -91,7 +93,13 @@ describe("MCP tools over Streamable HTTP", () => {
       "test_status",
       "workspace_info",
     ]);
-    expect(tools.every((tool) => tool.annotations?.readOnlyHint === true)).toBe(true);
+    expect(tools.filter((tool) => tool.name !== "codex_desktop_send").every((tool) => tool.annotations?.readOnlyHint === true)).toBe(true);
+    const desktopSend = tools.find((tool) => tool.name === "codex_desktop_send")!;
+    expect(desktopSend.inputSchema.required).toEqual(expect.arrayContaining(["intent", "userConfirmed", "message", "bindingId", "commandId", "workspaceId"]));
+    expect(desktopSend.inputSchema.properties?.intent).toMatchObject({ enum: ["development_plan", "revision"] });
+    expect(desktopSend.inputSchema.properties?.userConfirmed).toMatchObject({ const: true });
+    expect(desktopSend.inputSchema.additionalProperties).toBe(false);
+    expect(tools.find((tool) => tool.name === "codex_desktop_status")?.annotations?.readOnlyHint).toBe(true);
     expect(SUPPORTED_SCOPES).toEqual([
       "workspace.read", "workspace.search", "git.read", "execution.read", "offline_access",
     ]);
@@ -109,6 +117,8 @@ describe("MCP tools over Streamable HTTP", () => {
     expectToolOutputSchema(tools, "test_status", ["available", "tests", "outputAvailable", "outputId"]);
     expectToolOutputSchema(tools, "execution_summary", ["records"]);
     expectToolOutputSchema(tools, "execution_output", ["action", "items", "text"]);
+    expectToolOutputSchema(tools, "codex_desktop_send", ["commandId", "bindingId", "threadId", "deliveryStatus"]);
+    expectToolOutputSchema(tools, "codex_desktop_status", ["workspaceId", "enabled", "binding", "availability"]);
   });
 
   it("documents git_diff pagination with its output field names", async () => {
@@ -222,6 +232,22 @@ describe("MCP tools over Streamable HTTP", () => {
     expect(status.tests).toBe("27 passed");
     expect(status.outputAvailable).toBe(false);
     expect(status.outputId).toBeNull();
+  });
+
+  it("Desktop Review 从 summary 精确选 commandId 而不是较新的历史测试", async () => {
+    const output = saveExecutionOutput(bridge.workspace.id, { command: "pnpm test", raw: "本轮 2 tests failed", exitCode: 1 });
+    appendExecutionRecord(bridge.workspace.id, { taskId: "desktop_exact_command", commandId: "exact_command", iteration: 1,
+      changedFiles: ["src/index.ts"], tests: "2 failed", exitStatus: "failed", outputId: output.id,
+      outputAvailable: true, timestamp: new Date().toISOString() });
+    appendExecutionRecord(bridge.workspace.id, { taskId: "unrelated", iteration: 1, changedFiles: [],
+      tests: "100 passed", exitStatus: "ok", timestamp: new Date().toISOString() });
+    const summary = structuredJsonOf<{ records: { commandId?: string; tests: string; outputId?: number }[] }>(
+      await client.callTool({ name: "execution_summary", arguments: { limit: 50 } }));
+    const exact = summary.records.find(record => record.commandId === "exact_command");
+    expect(exact).toMatchObject({ tests: "2 failed", outputId: output.id });
+    expect(summary.records.find(record => record.commandId === "missing_command")).toBeUndefined();
+    const result = await client.callTool({ name: "execution_output", arguments: { action: "read", id: exact!.outputId } });
+    expect(textOf(result)).toContain("本轮 2 tests failed");
   });
 
   it("skips invalid persisted records when reporting execution status", async () => {

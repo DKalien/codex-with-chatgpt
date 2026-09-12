@@ -3,10 +3,13 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
-import { cleanup, git, makeGitRepo, makeTmpDir, write } from "./helpers.js";
+import { buildCoreFixture, cleanup, git, makeGitRepo, makeTmpDir, write } from "./helpers.js";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const devInstallSource = path.join(projectRoot, "scripts", "dev-install.ps1");
+const installCoreSource = path.join(projectRoot, "scripts", "install-core.mjs");
+const launcherSource = path.join(projectRoot, "scripts", "core-launcher.cjs");
+const releaseSource = path.join(projectRoot, "scripts", "core-release.cjs");
 const updateSource = path.join(projectRoot, "scripts", "update-upstream-track.ps1");
 const skillSource = path.join(projectRoot, "skill", "SKILL.md");
 
@@ -69,13 +72,37 @@ function update(repoInfo: { repo: string; script: string }) {
   return powerShell(repoInfo.script, repoInfo.repo);
 }
 
-function makeDevRepo(name: string): { repo: string; script: string; installRoot: string } {
+function makeDevRepo(name: string): { repo: string; script: string; installRoot: string; coreStateDir: string } {
   const repo = tempDir(`dev-install-${name}`);
   makeGitRepo(repo);
-  write(repo, "package.json", "{}\n");
+  write(repo, "package.json", '{"type":"module"}\n');
+  write(repo, "bin/c2c.js", `import fs from "node:fs";
+import { spawn } from "node:child_process";
+const summary = {
+  targetBuildId: "should-not-leak",
+  counts: { current: 1, upgraded: 0, stopped: 0, pending_busy: 0, skipped_quick: 0, pending: 0, error: 0 },
+  workspaces: [{ workspaceId: "abc123def456", workspaceName: "测试工作区", status: "current", reason: "safe" }],
+};
+const resultFile = process.argv[process.argv.indexOf("--result-file") + 1];
+if (process.argv.includes("--result-file")) fs.writeFileSync(resultFile, JSON.stringify(summary), { flag: "wx" });
+console.log(JSON.stringify(summary));
+if (process.env.C2C_TEST_ROLLOUT_CHILD) {
+  fs.writeFileSync(process.env.C2C_TEST_ROLLOUT_CHILD, "alive");
+  spawn(process.execPath, ["-e", 'setTimeout(() => require("node:fs").rmSync(process.env.C2C_TEST_ROLLOUT_CHILD, {force:true}), 8000)'],
+    { detached: true, stdio: "inherit", windowsHide: true }).unref();
+}
+process.exit(Number(process.env.C2C_ROLLOUT_EXIT_CODE || "0"));
+`);
   copyIntoRepo(repo, devInstallSource, "scripts/dev-install.ps1");
+  copyIntoRepo(repo, installCoreSource, "scripts/install-core.mjs");
+  copyIntoRepo(repo, launcherSource, "scripts/core-launcher.cjs");
+  copyIntoRepo(repo, releaseSource, "scripts/core-release.cjs");
+  write(repo, "dist/cli/index.js", "// fixture runtime");
+  fs.mkdirSync(path.join(repo, "node_modules"));
+  buildCoreFixture(repo);
+  const coreStateDir = tempDir(`core-state-${name}`);
   copyIntoRepo(repo, skillSource, "skill/SKILL.md");
-  return { repo, script: path.join(repo, "scripts", "dev-install.ps1"), installRoot: tempDir(`skill-${name}`) };
+  return { repo, script: path.join(repo, "scripts", "dev-install.ps1"), installRoot: tempDir(`skill-${name}`), coreStateDir };
 }
 
 function makeFakePnpm(): { bin: string; log: string } {
@@ -84,7 +111,7 @@ function makeFakePnpm(): { bin: string; log: string } {
   write(
     bin,
     "pnpm.ps1",
-    "$argsLine = ($args -join ' ')\nAdd-Content -LiteralPath $env:C2C_FAKE_PNPM_LOG -Value $argsLine\nexit 0\n"
+    "$argsLine = ($args -join ' ')\nAdd-Content -LiteralPath $env:C2C_FAKE_PNPM_LOG -Value $argsLine\nif ($env:C2C_FAKE_BUILD_FAIL -eq '1' -and $argsLine -eq 'run build') { exit 7 }\nexit 0\n"
   );
   return { bin, log };
 }
@@ -100,6 +127,35 @@ function withFakePnpm(fake: { bin: string; log: string }): NodeJS.ProcessEnv {
 const windowsTests = describe.skipIf(process.platform !== "win32");
 
 windowsTests("fork maintenance scripts", () => {
+  it("已安装 A 后源 checkout 变 B 且构建失败，launcher 仍运行 A", () => {
+    const fixture = makeDevRepo("build-failure");
+    const fake = makeFakePnpm();
+    const env = { ...withFakePnpm(fake), C2C_STATE_DIR: fixture.coreStateDir };
+    const first = powerShell(fixture.script, fixture.repo, ["-InstallRoot", fixture.installRoot], env);
+    expect(first.status, first.output).toBe(0);
+    const pointer = fs.readFileSync(path.join(fixture.coreStateDir, "current.json"));
+    write(fixture.repo, "bin/c2c.js", 'throw new Error("uninstalled B must not run");');
+    write(fixture.repo, "dist/cli/index.js", "// B changed build");
+    buildCoreFixture(fixture.repo);
+    const failed = powerShell(fixture.script, fixture.repo, ["-InstallRoot", fixture.installRoot], { ...env, C2C_FAKE_BUILD_FAIL: "1" });
+    expect(failed.status).toBe(1);
+    expect(fs.readFileSync(path.join(fixture.coreStateDir, "current.json"))).toEqual(pointer);
+    const launched = spawnSync(process.execPath, [path.join(fixture.coreStateDir, "bin", "c2c.js"), "rollout", "--json"],
+      { encoding: "utf8", windowsHide: true, env: { ...process.env, C2C_STATE_DIR: fixture.coreStateDir } });
+    expect(launched.status, launched.stderr).toBe(0);
+    expect(JSON.parse(launched.stdout).counts.current).toBe(1);
+  });
+  it("rollout 创建后台进程后安装仍返回，不等待 daemon 的输出管道", () => {
+    const fixture = makeDevRepo("background");
+    const fake = makeFakePnpm();
+    const marker = path.join(fixture.coreStateDir, "background-alive");
+    const result = powerShell(fixture.script, fixture.repo, ["-InstallRoot", fixture.installRoot], {
+      ...withFakePnpm(fake), C2C_STATE_DIR: fixture.coreStateDir, C2C_TEST_ROLLOUT_CHILD: marker,
+    });
+    expect(result.status, result.output).toBe(0);
+    expect(result.output).toContain('"current":1');
+    expect(fs.existsSync(marker)).toBe(true);
+  });
   it("开发安装运行冻结依赖、构建，并把 Skill 写入隔离目录", () => {
     const fixture = makeDevRepo("install");
     const fake = makeFakePnpm();
@@ -107,7 +163,7 @@ windowsTests("fork maintenance scripts", () => {
       fixture.script,
       fixture.repo,
       ["-InstallRoot", fixture.installRoot],
-      withFakePnpm(fake)
+      { ...withFakePnpm(fake), C2C_STATE_DIR: fixture.coreStateDir }
     );
 
     expect(result.status, result.output).toBe(0);
@@ -115,22 +171,48 @@ windowsTests("fork maintenance scripts", () => {
     expect(calls).toContain("install --frozen-lockfile");
     expect(calls).toContain("run build");
     expect(calls).not.toContain("test");
+    expect(result.output).toContain('"current":1');
+    expect(result.output).toContain('"workspaceId":"abc123def456"');
+    expect(result.output).toContain('"workspaceName":"测试工作区"');
+    expect(result.output).not.toContain("should-not-leak");
 
     const installed = path.join(fixture.installRoot, "SKILL.md");
     const installedText = fs.readFileSync(installed, "utf8");
-    expect(installedText).toContain(fixture.repo);
-    expect(installedText).not.toContain("<ACTUAL_CHECKOUT_PATH>");
+    expect(installedText).not.toContain("<C2C_LAUNCHER_PATH>");
+    expect(installedText).toContain(path.join(fixture.coreStateDir, "bin", "c2c.js"));
+    expect(fs.existsSync(path.join(fixture.coreStateDir, "current.json"))).toBe(true);
 
     fs.chmodSync(installed, 0o444);
     const repeated = powerShell(
       fixture.script,
       fixture.repo,
       ["-InstallRoot", fixture.installRoot],
-      withFakePnpm(fake)
+      { ...withFakePnpm(fake), C2C_STATE_DIR: fixture.coreStateDir }
     );
     expect(repeated.status).toBe(0);
     expect(fs.readFileSync(installed, "utf8")).toBe(installedText);
     fs.chmodSync(installed, 0o666);
+  });
+
+  it("rollout 失败时保持 best effort，保留已安装 core 与 Skill", () => {
+    const fixture = makeDevRepo("rollout-failure");
+    const fake = makeFakePnpm();
+    const result = powerShell(
+      fixture.script,
+      fixture.repo,
+      ["-InstallRoot", fixture.installRoot],
+      {
+        ...withFakePnpm(fake),
+        C2C_STATE_DIR: fixture.coreStateDir,
+        C2C_ROLLOUT_EXIT_CODE: "9",
+      }
+    );
+
+    expect(result.status, result.output).toBe(0);
+    expect(result.output).toContain("rollout 未成功");
+    expect(result.output).toContain("abc123def456");
+    expect(fs.existsSync(path.join(fixture.coreStateDir, "current.json"))).toBe(true);
+    expect(fs.existsSync(path.join(fixture.installRoot, "SKILL.md"))).toBe(true);
   });
 
   it("-Test 排除本测试，且 checkout upstream-main 时拒绝安装", () => {
@@ -140,7 +222,7 @@ windowsTests("fork maintenance scripts", () => {
       fixture.script,
       fixture.repo,
       ["-Test", "-InstallRoot", fixture.installRoot],
-      withFakePnpm(fake)
+      { ...withFakePnpm(fake), C2C_STATE_DIR: fixture.coreStateDir }
     );
     expect(testRun.status, testRun.output).toBe(0);
     expect(fs.readFileSync(fake.log, "utf8")).toContain("test -- --exclude tests/fork-scripts.test.ts");
@@ -152,7 +234,7 @@ windowsTests("fork maintenance scripts", () => {
       fixture.script,
       fixture.repo,
       ["-InstallRoot", fixture.installRoot],
-      withFakePnpm(fake)
+      { ...withFakePnpm(fake), C2C_STATE_DIR: fixture.coreStateDir }
     );
     expect(rejected.status).not.toBe(0);
     expect(rejected.output).toContain("upstream-main");

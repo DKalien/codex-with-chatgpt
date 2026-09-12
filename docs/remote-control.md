@@ -14,29 +14,35 @@ write_probe 仍默认关闭，正式功能不依赖 C2C_ENABLE_WRITE_PROBE。
 
 ## 第一次跨设备测试
 
+以下命令使用机器安装输出的稳定 launcher，并明确目标 workspace；不要用未安装的 checkout build
+启动日常服务。启用和停止仍须当前本机用户明确授权。
+
 ```powershell
-cd D:\python\codex-with-chatgpt
-node .\bin\c2c.js remote enable
-node .\bin\c2c.js start --tunnel
-node .\bin\c2c.js controller start
-node .\bin\c2c.js remote status --json
+$c2cLauncher = '<稳定 launcher 绝对路径>'
+$c2cWorkspace = '<目标 workspace 绝对路径>'
+node $c2cLauncher remote enable -w $c2cWorkspace
+node $c2cLauncher start -w $c2cWorkspace --tunnel
+node $c2cLauncher controller start -w $c2cWorkspace
+node $c2cLauncher remote status -w $c2cWorkspace --json
 ```
 
 如果 PATH 中的 Codex 较旧，可在本地启动时指定 `controller start --codex <codex.exe绝对路径>`，
 或设置本地 `C2C_CODEX_EXECUTABLE`。MCP 不能设置该路径。
-本开发环境实测可用的启动命令是：
+显式指定本机已核验版本时：
 
 ```powershell
-node .\bin\c2c.js controller start --codex 'C:\Users\10630\AppData\Local\OpenAI\Codex\bin\fd4c151a749f3ab4\codex.exe'
+node $c2cLauncher controller start -w $c2cWorkspace --codex '<已核验 codex.exe 绝对路径>'
 ```
 
-不要照抄这台电脑的路径到其他电脑；升级后使用匹配配置的新安装路径。
+不要复用其他电脑或旧安装的可执行路径；升级后核对当前配置和实际路径。
 
 确认 remoteControl:true、controller:running、appServer:running、bridge:healthy、tunnel:running。
 Tunnel running 表示本地进程状态，外网可达性需实际验证。status 给出的 workspaceId 是 MCP 输入，不能传绝对路径。
-在另一台设备的 ChatGPT Plugins 打开对应 Connector，Refresh，应看到原 9 个只读工具加 4 个 codex_* 工具。
+在另一台设备检查对应 Connector 的工具定义，应看到原 9 个只读工具、两个始终可发现的 Desktop
+工具及 4 个 Remote Control 工具。旧 Connector 的兼容检测与同名迁移见
+[Desktop Control](desktop-control.md)；工具可发现不表示已有调用授权。
 授权需 codex.control 和 codex.read；旧 token refresh 不自动增权。提示重新授权时核对工作区与权限，
-本机 `node .\bin\c2c.js pair` 取得一次性配对码。随后在新 ChatGPT 对话中说：
+本机 `node $c2cLauncher pair -w $c2cWorkspace` 取得一次性配对码。随后在新 ChatGPT 对话中说：
 
 > 给当前项目创建一个新的 Codex 会话线程，让它检查 README 与 package.json 是否一致。不要修改文件。
 > 用 codex_thread_status 等待 threadId 后提交 ANALYZE 任务，稍后用 codex_task_status 查询。
@@ -61,7 +67,8 @@ kind 仅 TASK/ANALYZE/TEST/REVIEW；ID 仅 1–128 位字母数字、下划线�
 写工具标注 readOnlyHint:false、destructiveHint:true、idempotentHint:true、openWorldHint:true。
 幂等标注依赖持久 ID 去重；底层 thread/start、turn/start 不能盲目重试。
 权限由 _meta.securitySchemes 声明，服务端独立检查，缺权返回 INSUFFICIENT_SCOPE 和 OAuth challenge。
-OAuth codex.control **且** 本地 enabled 才能派发，网页不能启用工作区。默认只列原 9 个工具。
+OAuth codex.control **且** 本地 enabled 才能派发，网页不能启用工作区。Remote 关闭时不注册其
+4 个工具；原 9 个只读工具与两个独立鉴权的 Desktop schema 仍可发现。
 
 ## 状态与恢复
 
@@ -78,9 +85,9 @@ OAuth codex.control **且** 本地 enabled 才能派发，网页不能启用工�
 即使创建响应丢失，也保留 requestId：可能有一个需人工认领的线程，但不会重试创建第二个。
 
 ```powershell
-node .\bin\c2c.js controller stop
-node .\bin\c2c.js controller status --json
-node .\bin\c2c.js remote disable
+node $c2cLauncher controller stop -w $c2cWorkspace
+node $c2cLauncher controller status -w $c2cWorkspace --json
+node $c2cLauncher remote disable -w $c2cWorkspace
 ```
 
 stop 保存停止请求并结束专属 app-server，未确认结束的 turn 保留待核对。
@@ -93,7 +100,7 @@ index 损坏、读取失败，或 index 缺失但初始化标记/正文仍存在
 用官方 Codex 恢复相应 thread 核对。确定旧执行已停止、不会再写入后：
 
 ```powershell
-node .\bin\c2c.js remote reconcile --task <taskId> --confirm-stopped
+node $c2cLauncher remote reconcile -w $c2cWorkspace --task <taskId> --confirm-stopped
 # 创建请求使用 --request <requestId> 代替 --task
 ```
 

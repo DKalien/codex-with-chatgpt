@@ -39,7 +39,7 @@ Remote disable 拒绝新调用和消费，正在执行的 turn 需另用 control
 | Symlink escape | Canonicalization resolves symlinks before the containment check (file and directory symlinks both covered by tests) |
 | Sensitive files | Deny-by-default patterns (.env*, keys, SSH, cloud creds, keychains…) enforced at resolve time — reads, listings, and search all pass through the same gate; `git diff` adds pathspec excludes; `.env.example` allowed |
 | Oversized file / diff DoS | read_file caps lines and bytes per response; git_diff paginates by byte offset with hard caps; search caps matches and file sizes |
-| Tunnel exposure | Bridge binds 127.0.0.1 only (refuses 0.0.0.0); the only public surface is HTTPS via the tunnel, protected by OAuth; `/health` reveals only a salted workspace hash |
+| Tunnel exposure | Bridge binds 127.0.0.1 only (refuses 0.0.0.0); `/mcp` requires OAuth. Public `/health` exposes service/version/status, hashed workspace ID, PID/start time and available runtime build ID, never the workspace root or credentials. OAuth discovery/authorization routes retain their own checks. |
 | Admin API abuse | Loopback-only + random admin token (0600 runtime file) + requests with proxy headers (`cf-connecting-ip`, `x-forwarded-for`) rejected; unauthenticated probes get 404 |
 | Log credential leakage | Logger redacts token prefixes, bearer headers, token-like parameters, and pairing-code-shaped strings before writing |
 | Execution output leak | Codex may nominate logs or Remote turn final responses; a local sanitizer redacts tokens, pairing-code-shaped strings and home paths, truncates size, and refuses private-key blocks entirely. Restricted items are listed without a body. Read-only tools cannot run commands; Remote Control and Desktop Control are separate, explicitly authorized paths. |
@@ -85,6 +85,12 @@ Desktop Control 是默认关闭的独立 MCP 写入能力，使用 `codex.deskto
 scope 或 `probe.write`。有效 OAuth scope 只是远端条件，发送还必须通过本机 `desktop enable`
 和当前 `bindingId` 校验。
 
+两个 Desktop schema 始终可发现，但未绑定、未 enable 或缺少对应 scope 均不能发送。
+Activation 的旧 Connector 迁移只检查同一有效授权的 Desktop scopes 和实际网页 schema；
+兼容则不重建，不兼容仅迁移当前 workspace 同名 Connector。unknown/corrupt 停止诊断，
+不暴露凭据，不改变 Project/session/checkpoint，具体门禁见 [Desktop Control](desktop-control.md)。
+AuthStore 加载授权文件失败或结构损坏时保留原文件并拒绝重新注册/发放授权覆盖；需要人工核对。
+
 绑定由本机用户明确指定真实 Desktop `threadId`、`host`、project 和 workspaceRoot，并
 在绑定时核对 Desktop 当前 cwd、owner 和版本。每个 workspace 只有一个当前绑定；重新绑定
 生成新的 `bindingId` 并关闭启用状态，旧请求不能转投新目标。网页不能 bind、enable 或改
@@ -121,8 +127,9 @@ owner/project/workspace 匹配和已验证版本。传统显式 `desktop bind` +
 提权时零发送。Windows helper 仅使用 `C2C_DESKTOP_PYTHON` 或 `python` 完成受控标准库
 IPC，不要求管理员权限，不启动第二个 app-server/router，也不把原始 RPC 暴露到 Tunnel。
 
-`codex_desktop_send` 只接受完整的用户确认计划或修订指令，以 UTF-8 原文传递，正文上限
-为 64 KiB（65536 字节），超限拒绝且不截断。`intent` 必填且只能为 `development_plan` 或
+`codex_desktop_send` 只接受完整的用户确认计划或修订指令；投递层添加固定内部 envelope。
+原正文和包含 envelope/JSON 转义的完整 wire 均校验 64 KiB（65536 字节）上限，超限拒绝且不截断。
+`intent` 必填且只能为 `development_plan` 或
 `revision`；`userConfirmed` 必须是字面值 `true`，只有当前对话用户明确确认后模型才能填写，
 例如用户说“可以，就按这么做”。它只是模型可填写的语义审计信号，不是授权凭证，不替代 OAuth、
 本机 `enable`、`bindingId` 或 Desktop 审批，也不承诺能够影响或绕过平台安全策略；完整计划仍
@@ -130,6 +137,10 @@ IPC，不要求管理员权限，不启动第二个 app-server/router，也不�
 model/provider/cwd/effort/sandbox/approval/permissions 等 Desktop 执行设置。工具仅在
 Desktop 接受真实投递后返回 `deliveryStatus=accepted`，它不等待 `completed`，也不产生
 测试通过结论。
+
+执行完成的证据使用本机 `desktop record-result`，必须验证真实当前 thread 和唯一 active turn
+与 accepted delivery 一致；网页无写 record 工具。Review 以 exact commandId 关联 record/output，
+不能从旧 `test_status` 推导本轮通过。完整规则见 [自动验收记录](desktop-control.md#自动验收记录)。
 
 send 的风险标注保持 `readOnlyHint:false`、`destructiveHint:true`、`openWorldHint:true`、
 `idempotentHint:true`；`idempotent` 仅表示同一 `commandId` 防止重复尝试，不是网络 exactly-once，

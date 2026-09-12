@@ -11,7 +11,7 @@
     "node": ">=20"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json && node scripts/copy-desktop-helper.mjs",
+    "build": "tsc -p tsconfig.json && node scripts/copy-desktop-helper.mjs && node scripts/write-build-id.mjs",
     "dev": "tsx src/cli/index.ts",
     "test": "vitest run",
     "test:watch": "vitest",

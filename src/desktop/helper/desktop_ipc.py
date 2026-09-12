@@ -1,7 +1,7 @@
 """Codex Desktop Control 的受控 Windows IPC helper。
 
 这个程序只接受 stdin 上的固定操作：``inspect``、``prepare``、``send``、
-``current_identity`` 和 ``current_confirm``。其中 ``current_*`` 只接受
+``current_identity``、``current_confirm`` 和 ``current_execution``。其中 ``current_*`` 只接受
 顶层 ``workspaceRoot``，从继承的当前 Agent 环境解析 thread/project/host；
 它不会接受 stdin 提供的目标身份，也不会执行 stdin 提供的命令或启动
 Desktop、router、app-server。named pipe 帧与请求版本来自
@@ -1366,6 +1366,49 @@ def _current_identity(workspace_root: Any) -> dict[str, Any]:
     return info
 
 
+def _active_turn_id(state: dict[str, Any]) -> str:
+    runtime = state.get("threadRuntimeStatus")
+    runtime_type = runtime.get("type") if isinstance(runtime, dict) else None
+    if runtime_type not in {"active", "inProgress"}:
+        raise _error("DESKTOP_STATE_UNAVAILABLE")
+    active: list[str] = []
+    for turn in _turns(state):
+        if turn.get("status") != "inProgress":
+            continue
+        turn_id = _uuid(turn.get("turnId"))
+        if turn_id is None:
+            raise _error("DESKTOP_STATE_UNAVAILABLE")
+        active.append(turn_id)
+    if len(active) != 1:
+        raise _error("DESKTOP_STATE_UNAVAILABLE")
+    return active[0]
+
+
+def _current_execution(workspace_root: Any) -> dict[str, Any]:
+    target = _current_target(workspace_root)
+    session, _ = _prepare(target, allow_active=True, require_runner_ancestor=True)
+    try:
+        # 取 prepare 阶段之后仍在窗口内的新鲜状态；不接受环境变量提供的 turnId。
+        session.client.drain(0.1)
+        state = session.client.current_state()
+        if state is None or session.client.snapshot_age() > MAX_OBSERVATION_AGE_SECONDS:
+            raise _error("DESKTOP_STATE_UNAVAILABLE")
+        _validate_state(state, target, session.client.owner or "", allow_active=True)
+        # 使用 prepare 时捕获的 runtime 做同一进程/版本复核，避免把新进程或伪造环境当作当前执行。
+        _verify_runtime(session.pipe, target, session.runtime)
+        _verify_current_runner_ancestor(session.runtime)
+        # runtime/runner 核验可能消耗时间；回传前再次确认仍在观测窗口内。
+        if session.client.snapshot_age() > MAX_OBSERVATION_AGE_SECONDS:
+            raise _error("DESKTOP_STATE_UNAVAILABLE")
+        active_turn_id = _active_turn_id(state)
+        return {
+            **_public_info(state, target, session.runtime, session.client),
+            "activeTurnId": active_turn_id,
+        }
+    finally:
+        session.close()
+
+
 def _current_confirm(workspace_root: Any) -> dict[str, Any]:
     before, before_runtime = _current_identity_checked(workspace_root)
     try:
@@ -1413,10 +1456,15 @@ def _main() -> int:
                 session, info = _prepare(target)
                 session.close()
                 _reply({"id": request_id, "ok": True, "value": info})
-            elif op in {"current_identity", "current_confirm"}:
+            elif op in {"current_identity", "current_confirm", "current_execution"}:
                 if set(request) != {"id", "op", "workspaceRoot"} or prepared is not None:
                     raise _error("DESKTOP_INVALID_REQUEST")
-                info = _current_identity(request["workspaceRoot"]) if op == "current_identity" else _current_confirm(request["workspaceRoot"])
+                if op == "current_identity":
+                    info = _current_identity(request["workspaceRoot"])
+                elif op == "current_confirm":
+                    info = _current_confirm(request["workspaceRoot"])
+                else:
+                    info = _current_execution(request["workspaceRoot"])
                 _reply({"id": request_id, "ok": True, "value": info})
             elif op == "prepare":
                 if prepared is not None:

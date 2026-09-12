@@ -33,7 +33,8 @@ describe("Desktop 持久化投递", () => {
     const request = { ...input(), intent };
     const first = await sendDesktop(workspace, request, "client");
     expect(first.intent).toBe(intent);
-    expect(send).toHaveBeenCalledWith(request.message);
+    expect(JSON.parse(send.mock.calls[0][0])).toEqual({ type: "C2C_DESKTOP_TASK", version: 1,
+      workspaceId: workspace.id, commandId: request.commandId, intent, message: request.message });
     expect(readDesktop(workspace.id)?.deliveries[0].intent).toBe(intent);
     expect(await sendDesktop(workspace, request, "client")).toEqual(first);
     await expect(sendDesktop(workspace, { ...request, intent: intent === "revision" ? "development_plan" : "revision" }, "client"))
@@ -79,7 +80,7 @@ describe("Desktop 持久化投递", () => {
     expect(result).toMatchObject({ deliveryStatus: "accepted", threadId: target.threadId });
     expect(result.turnId).toBeTruthy();
     expect(result).not.toHaveProperty("completed");
-    expect(send).toHaveBeenCalledWith(input().message);
+    expect(JSON.parse(send.mock.calls[0][0])).toMatchObject({ type: "C2C_DESKTOP_TASK", message: input().message });
     await desktopStatus(workspace, "command_1");
     expect(send).toHaveBeenCalledTimes(1);
   });
