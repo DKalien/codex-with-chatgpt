@@ -327,7 +327,8 @@ send 的风险标注保持 `readOnlyHint:false`、`destructiveHint:true`、`open
 整个 workspace（包括新绑定）的后续投递暂停，必须先由本机用户人工核对；MVP 没有自动
 恢复或恢复接口。
 
-执行 receipt 只能由匹配 delivery.threadId / delivery.turnId 的真实当前 active turn 写入，
+执行 receipt 只能由匹配 delivery.threadId / delivery.turnId 的真实当前 active turn，或 idle 下
+canonical history 最新侧完整的最后 terminal turn 写入；写入前及幂等返回前仍须复核，
 不能用普通 `c2c record` 或后续 turn 补写。Review 必须从 `execution_summary` 精确匹配该
 commandId，再读取 outputId；缺失时明确报告“本轮验收记录缺失”，不得引用历史 `test_status`
 冒充本轮通过。完整 envelope、幂等和输出限制见 [自动验收记录](desktop-control.md#自动验收记录)。

@@ -300,6 +300,121 @@ describe("findBridgeObservation", () => {
     }
   });
 
+  it("新版 health 身份完整但 pid 检测 unknown 时通过 admin token 认证", async () => {
+    dirs.push(isolateStateDir());
+    const root = makeTmpDir("obs-authenticated-fallback");
+    dirs.push(root);
+    write(root, "a.txt", "a");
+    const workspace = new Workspace(root);
+    const startedAt = "2026-09-12T00:00:00.000Z";
+    const info = adminInfoPayload(workspace.id, workspace.root, {
+      pid: process.pid,
+      port: 0,
+      startedAt,
+    });
+    const health = await startHealthServer(
+      healthPayload(workspace.id, { pid: process.pid, startedAt }),
+      200,
+      info,
+    );
+    info.port = health.port;
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(((pid: number, signal?: NodeJS.Signals | number) => {
+      if (signal === 0) throw Object.assign(new Error("permission denied"), { code: "EPERM" });
+      throw new Error(`unexpected signal ${String(signal)} for ${pid}`);
+    }) as typeof process.kill);
+    try {
+      const runtime = { ...stubRuntime(workspace.id, workspace.root, process.pid, health.port), startedAt };
+      writeRuntimeState(runtime);
+      await expect(findBridgeObservation(workspace.id)).resolves.toMatchObject({ state: "healthy", runtime });
+      expect(health.requests).toContainEqual({ path: "/admin/info", authorization: "Bearer test-token" });
+      expect(killSpy.mock.calls.every(([, signal]) => signal === 0)).toBe(true);
+    } finally {
+      killSpy.mockRestore();
+      await health.close();
+    }
+  });
+
+  it("authenticated fallback 的 admin 身份不匹配时 restart 拒绝且不 shutdown", async () => {
+    dirs.push(isolateStateDir());
+    const root = makeTmpDir("obs-authenticated-mismatch");
+    const otherRoot = makeTmpDir("obs-authenticated-mismatch-other");
+    dirs.push(root, otherRoot);
+    write(root, "a.txt", "a");
+    write(otherRoot, "a.txt", "a");
+    const workspace = new Workspace(root);
+    const other = new Workspace(otherRoot);
+    const startedAt = "2026-09-12T00:00:00.000Z";
+    const info = adminInfoPayload(workspace.id, workspace.root, {
+      pid: process.pid,
+      port: 0,
+      startedAt,
+    });
+    info.workspaceId = other.id;
+    info.workspaceRoot = other.root;
+    const health = await startHealthServer(
+      healthPayload(workspace.id, { pid: process.pid, startedAt }),
+      200,
+      info,
+    );
+    info.port = health.port;
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(((pid: number, signal?: NodeJS.Signals | number) => {
+      if (signal === 0) throw Object.assign(new Error("permission denied"), { code: "EPERM" });
+      throw new Error(`unexpected signal ${String(signal)} for ${pid}`);
+    }) as typeof process.kill);
+    try {
+      writeRuntimeState({ ...stubRuntime(workspace.id, workspace.root, process.pid, health.port), startedAt });
+      await expect(restartBridge(root, { tunnel: false })).rejects.toThrow("身份无法确认");
+      expect(health.requests.some(request => request.path === "/admin/shutdown")).toBe(false);
+      expect(killSpy.mock.calls.every(([, signal]) => signal === 0)).toBe(true);
+    } finally {
+      killSpy.mockRestore();
+      await health.close();
+    }
+  });
+
+  it("authenticated fallback 可通过 restart 的预关闭 gate，gate 失败时不重启", async () => {
+    dirs.push(isolateStateDir());
+    const root = makeTmpDir("restart-authenticated-fallback");
+    dirs.push(root);
+    write(root, "a.txt", "a");
+    const workspace = new Workspace(root);
+    const startedAt = "2026-09-12T00:00:00.000Z";
+    const info = adminInfoPayload(workspace.id, workspace.root, {
+      pid: process.pid,
+      port: 0,
+      startedAt,
+    });
+    const health = await startHealthServer(
+      healthPayload(workspace.id, { pid: process.pid, startedAt }),
+      200,
+      info,
+    );
+    info.port = health.port;
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(((pid: number, signal?: NodeJS.Signals | number) => {
+      if (signal === 0) throw Object.assign(new Error("permission denied"), { code: "EPERM" });
+      throw new Error(`unexpected signal ${String(signal)} for ${pid}`);
+    }) as typeof process.kill);
+    try {
+      const runtime = { ...stubRuntime(workspace.id, workspace.root, process.pid, health.port), startedAt };
+      writeRuntimeState(runtime);
+      let gateCalled = false;
+      await expect(restartBridge(root, {
+        tunnel: false,
+        expectedRuntime: runtime,
+        beforeShutdown: async () => {
+          gateCalled = true;
+          throw new Error("test gate");
+        },
+      })).rejects.toThrow("test gate");
+      expect(gateCalled).toBe(true);
+      expect(health.requests.some(request => request.path === "/admin/shutdown")).toBe(false);
+      expect(killSpy.mock.calls.every(([, signal]) => signal === 0)).toBe(true);
+    } finally {
+      killSpy.mockRestore();
+      await health.close();
+    }
+  });
+
   it("同 pid 但 startedAt 更新时识别为 stale_runtime", async () => {
     dirs.push(isolateStateDir());
     const root = makeTmpDir("obs-pid-reuse");

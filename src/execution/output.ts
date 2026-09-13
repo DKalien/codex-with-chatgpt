@@ -69,12 +69,14 @@ function bodyFile(workspaceId: string, id: number): string {
 }
 
 function readIndex(workspaceId: string): OutputIndex {
+  const directory = path.join(getStateDir(), "execution-outputs", workspaceId);
+  const file = path.join(directory, "index.json");
   let raw: string;
-  try { raw = fs.readFileSync(indexFile(workspaceId), "utf8"); }
+  try { raw = fs.readFileSync(file, "utf8"); }
   catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw new Error("输出 index 无法读取，已停止操作；请保留状态并人工恢复。");
-    const bodies = path.join(outputDir(workspaceId), "bodies");
-    if (fs.existsSync(`${indexFile(workspaceId)}.initialized`) || (fs.existsSync(bodies) && fs.readdirSync(bodies).length)) {
+    const bodies = path.join(directory, "bodies");
+    if (fs.existsSync(`${file}.initialized`) || (fs.existsSync(bodies) && fs.readdirSync(bodies).length)) {
       throw new Error("已初始化的输出 index 缺失，拒绝重置 ID。");
     }
     return { nextId: 1, items: [] };
@@ -88,6 +90,11 @@ function readIndex(workspaceId: string): OutputIndex {
     }
     return index;
   } catch { throw new Error("输出 index 损坏，拒绝重置 ID；请保留状态并人工恢复。"); }
+}
+
+/** 只读发现使用同一严格 index 校验，不创建目录或写锁。 */
+export function readExecutionOutputMetadataStrict(workspaceId: string): ExecutionOutputMeta[] {
+  return readIndex(workspaceId).items;
 }
 
 function writeIndex(workspaceId: string, index: OutputIndex): void {

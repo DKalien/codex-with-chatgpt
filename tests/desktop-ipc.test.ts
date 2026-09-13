@@ -6,6 +6,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   DesktopIpcClient,
   resolveDesktopHelperPath,
+  validateDesktopCompatibility,
   validateDesktopMessage,
   validateDesktopTarget,
 } from "../src/desktop/ipc.js";
@@ -19,7 +20,7 @@ const target = {
 } as const;
 
 type FakeRequest = Record<string, unknown> & { op?: string; id?: string };
-type FakeReply = { ok: true; value: unknown } | { ok: false; code: string; notSent?: boolean };
+type FakeReply = { ok: true; value: unknown } | { ok: false; code: string; notSent?: boolean; compatibility?: unknown };
 
 class FakeChild extends EventEmitter {
   readonly stdin = new PassThrough();
@@ -143,6 +144,33 @@ describe("Desktop IPC wrapper（fake helper）", () => {
     } finally { vi.unstubAllEnvs(); }
   });
 
+  it("currentResultContext 只传workspace，支持 active exact 与 idle terminal exact", async () => {
+    vi.stubEnv("CODEX_THREAD_ID", target.threadId); vi.stubEnv("CODEX_SESSION_ID", target.threadId);
+    const resultTurnId = "01a00000-0000-7000-8000-000000000003";
+    try {
+      for (const [runtimeStatus, resultTurnStatus] of [["active", "inProgress"], ["inProgress", "inProgress"], ["idle", "completed"]] as const) {
+        const fake = fakeSpawner(request => request.op === "current_result_context" ?
+          { ok: true, value: { ...target, title: "结果会话", cwd: target.workspaceRoot, runtimeStatus, resultTurnId, resultTurnStatus } } :
+          { ok: true, value: { ...target, title: "Fake Desktop 会话", cwd: target.workspaceRoot, runtimeStatus: "idle" } });
+        const result = await makeClient(fake.spawnImpl).currentResultContext(target.workspaceRoot);
+        expect(result).toMatchObject({ runtimeStatus, resultTurnId, resultTurnStatus });
+        const request = fake.requests.find(item => item.op === "current_result_context");
+        expect(request && Object.keys(request).sort()).toEqual(["id", "op", "workspaceRoot"]);
+      }
+
+      for (const value of [
+        { ...target, title: "结果会话", cwd: target.workspaceRoot, runtimeStatus: "idle", resultTurnId, resultTurnStatus: "inProgress" },
+        { ...target, title: "结果会话", cwd: target.workspaceRoot, runtimeStatus: "idle", resultTurnId, resultTurnStatus: "future" },
+        { ...target, title: "结果会话", cwd: target.workspaceRoot, runtimeStatus: "active", resultTurnId, resultTurnStatus: "completed" },
+      ]) {
+        const fake = fakeSpawner(request => request.op === "current_result_context" ? { ok: true, value } :
+          { ok: true, value: { ...target, title: "Fake Desktop 会话", cwd: target.workspaceRoot, runtimeStatus: "idle" } });
+        await expect(makeClient(fake.spawnImpl).currentResultContext(target.workspaceRoot))
+          .rejects.toMatchObject({ code: "DESKTOP_STATE_UNAVAILABLE" });
+      }
+    } finally { vi.unstubAllEnvs(); }
+  });
+
   it("缺失/伪造当前ID或helper错目标不能绑定", async () => {
     const fake = fakeSpawner(() => ({ ok: true, value: { ...target, threadId: randomUUID(), title: "错误会话", cwd: target.workspaceRoot } }));
     try {
@@ -155,6 +183,60 @@ describe("Desktop IPC wrapper（fake helper）", () => {
       await expect(makeClient(fake.spawnImpl).currentIdentity(target.workspaceRoot)).rejects.toMatchObject({ code: "DESKTOP_TARGET_NOT_FOUND" });
     } finally { vi.unstubAllEnvs(); }
   });
+
+  it("compatibility 只发送 id/op，并严格投影安全诊断字段", async () => {
+    const expected = {
+      observedDesktopVersion: "26.903.9818.0",
+      observedAppServerVersion: "0.154.0-alpha.6.2",
+      status: "current" as const,
+      profile: "desktop-ipc-v1",
+    };
+    const fake = fakeSpawner(request => request.op === "compatibility" ? {
+      ok: true,
+      value: { ...expected, token: "secret-token", pipe: "\\\\.\\pipe\\secret" },
+    } : { ok: true, value: {} });
+    await expect(makeClient(fake.spawnImpl).compatibility()).resolves.toEqual(expected);
+    expect(fake.requests).toHaveLength(1);
+    expect(Object.keys(fake.requests[0]).sort()).toEqual(["id", "op"]);
+    expect(fake.requests[0].op).toBe("compatibility");
+  });
+
+  it("compatibility 错误保留安全诊断且不带回任意字段", async () => {
+    const expected = {
+      observedDesktopVersion: "26.903.9818.0",
+      observedAppServerVersion: "0.153.4",
+      status: "incompatible" as const,
+      profile: "desktop-ipc-v1",
+    };
+    const fake = fakeSpawner(request => request.op === "compatibility" ? {
+      ok: false,
+      code: "DESKTOP_VERSION_UNSUPPORTED",
+      notSent: true,
+      compatibility: { ...expected, token: "secret-token", pipe: "\\\\.\\pipe\\secret", rawError: "secret-error" },
+    } : { ok: true, value: {} });
+    try {
+      await makeClient(fake.spawnImpl).compatibility();
+      throw new Error("compatibility 错误未被拒绝");
+    } catch (error) {
+      expect(error).toMatchObject({ code: "DESKTOP_VERSION_UNSUPPORTED", notSent: true, compatibility: expected });
+      expect(error).not.toHaveProperty("token");
+      expect(String((error as Error).message)).not.toContain("secret");
+    }
+  });
+
+  it("拒绝非法版本、profile 和 current 缺失诊断", () => {
+    const base = {
+      observedDesktopVersion: "26.903.9818.0",
+      observedAppServerVersion: "0.153.4",
+      status: "current" as const,
+      profile: "desktop-ipc-v1",
+    };
+    expect(() => validateDesktopCompatibility({ ...base, observedDesktopVersion: "token" })).toThrowError(/无法确认/);
+    expect(() => validateDesktopCompatibility({ ...base, profile: "token" })).toThrowError(/无法确认/);
+    expect(() => validateDesktopCompatibility({ ...base, observedDesktopVersion: null })).toThrowError(/无法确认/);
+    expect(() => validateDesktopCompatibility({ ...base, profile: null })).toThrowError(/无法确认/);
+  });
+
   it("使用隔离、无 shell 的 helper，并保留中文多行正文直到接受回执", async () => {
     const fake = fakeSpawner();
     const client = makeClient(fake.spawnImpl);

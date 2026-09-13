@@ -138,7 +138,8 @@ model/provider/cwd/effort/sandbox/approval/permissions 等 Desktop 执行设置�
 Desktop 接受真实投递后返回 `deliveryStatus=accepted`，它不等待 `completed`，也不产生
 测试通过结论。
 
-执行完成的证据使用本机 `desktop record-result`，必须验证真实当前 thread 和唯一 active turn
+执行终态证据使用本机 `desktop record-result`，必须验证真实当前 thread 和唯一 active turn，或
+idle 时 canonical history 最新侧完整的最后 terminal turn，写入前再次确认其
 与 accepted delivery 一致；网页无写 record 工具。Review 以 exact commandId 关联 record/output，
 不能从旧 `test_status` 推导本轮通过。完整规则见 [自动验收记录](desktop-control.md#自动验收记录)。
 

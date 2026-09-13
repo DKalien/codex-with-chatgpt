@@ -14,6 +14,11 @@ import { writeRuntimeState, type RuntimeState } from "../src/bridge/runtime.js";
 import { writeTunnelState } from "../src/tunnel/state.js";
 import { readSession, sessionFile, writeSession } from "../src/session/state.js";
 import { pendingFile, readPending, writePending } from "../src/core/upgrade.js";
+import { listExecutionOutputs, MAX_OUTPUT_RECORDS, saveExecutionOutput } from "../src/execution/output.js";
+import { reconcileLegacyAccepted, legacyReconciliationFile } from "../src/desktop/legacy-reconciliation.js";
+import { retireLegacyAccepted } from "../src/desktop/legacy-retirement.js";
+import { previewAbandonment, abandonHistoricalAccepted } from "../src/desktop/abandonment.js";
+import { listDesktopHistory } from "../src/desktop/history.js";
 import { SERVICE_NAME, VERSION } from "../src/version.js";
 import { Workspace } from "../src/workspace/manager.js";
 import { cleanup, makeTmpDir, write } from "./helpers.js";
@@ -21,6 +26,8 @@ import { cleanup, makeTmpDir, write } from "./helpers.js";
 const targetBuildId = "a".repeat(64);
 const oldBuildId = "b".repeat(64);
 const threadId = "01a00000-0000-7000-8000-000000000001";
+const historicalThreadId = "01a00000-0000-7000-8000-000000000002";
+const reboundCommandId = "rebound-command";
 let stateDir: string;
 const roots: string[] = [];
 const contexts = new Map<string, Context>();
@@ -230,7 +237,7 @@ function seedRemoteController(context: Context, appServer: "unknown" | "offline"
   }));
 }
 
-function seedDesktopRebound(context: Context): void {
+function seedDesktopRebound(context: Context, deliveryAt = new Date().toISOString()): void {
   const now = new Date().toISOString();
   const bindingId = randomUUID();
   updateDesktop(context.workspace.id, () => ({
@@ -248,16 +255,16 @@ function seedDesktopRebound(context: Context): void {
         boundAt: now,
       },
       deliveries: [{
-        commandId: "rebound-command",
+        commandId: reboundCommandId,
         clientId: "rollout-client",
         bindingId: randomUUID(),
-        threadId: "01a00000-0000-7000-8000-000000000002",
+        threadId: historicalThreadId,
         turnId: randomUUID(),
         messageSha256: "1".repeat(64),
         messageBytes: 1,
         deliveryStatus: "accepted" as const,
-        createdAt: now,
-        updatedAt: now,
+        createdAt: deliveryAt,
+        updatedAt: deliveryAt,
       }],
     },
     result: undefined,
@@ -271,6 +278,88 @@ function seedDesktopRebound(context: Context): void {
     cwd: context.workspace.root,
     runtimeStatus: "idle",
   } as never);
+}
+
+function seedLegacyReconciliation(context: Context): void {
+  const output = saveExecutionOutput(context.workspace.id, {
+    command: "legacy execution evidence",
+    raw: "legacy output",
+    exitCode: 0,
+    taskId: `desktop_${reboundCommandId}`,
+    iteration: 1,
+  });
+  writeExecutionRecords(context, [desktopReceiptRecord({
+    desktopReceiptSha256: undefined,
+    outputId: output.id,
+    outputAvailable: output.allowed,
+    timestamp: new Date().toISOString(),
+  })]);
+  reconcileLegacyAccepted(context.workspace, reboundCommandId);
+}
+
+function executionFile(context: Context): string {
+  return path.join(stateDir, "executions", `${context.workspace.id}.jsonl`);
+}
+
+function desktopReceiptRecord(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    taskId: `desktop_${reboundCommandId}`,
+    iteration: 1,
+    changedFiles: [],
+    tests: "not run",
+    exitStatus: "ok",
+    timestamp: "2026-09-12T00:00:00.000Z",
+    commandId: reboundCommandId,
+    desktopReceiptSha256: "0".repeat(64),
+    ...overrides,
+  };
+}
+
+function writeExecutionRecords(context: Context, records: Record<string, unknown>[], suffix = "\n"): void {
+  const file = executionFile(context);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, records.map(record => JSON.stringify(record)).join("\n") + suffix);
+}
+
+function mockReboundInspect(allIdle = false): void {
+  vi.mocked(desktopIpc.inspect).mockImplementation(async target => {
+    if (!allIdle && target.threadId !== threadId) {
+      throw Object.assign(new Error("historical thread unavailable"), { code: "DESKTOP_TARGET_NOT_FOUND" });
+    }
+    return {
+      threadId: target.threadId,
+      hostId: target.hostId,
+      projectId: target.projectId,
+      workspaceRoot: target.workspaceRoot,
+      title: "rebound fixture",
+      cwd: target.workspaceRoot,
+      runtimeStatus: "idle",
+    } as never;
+  });
+}
+
+function addOutcomeUnknown(context: Context): void {
+  const now = new Date().toISOString();
+  updateDesktop(context.workspace.id, previous => {
+    if (!previous) throw new Error("missing desktop state");
+    return {
+      state: {
+        ...previous,
+        deliveries: [...previous.deliveries, {
+          commandId: "unknown-command",
+          clientId: "rollout-client",
+          bindingId: previous.binding?.bindingId ?? randomUUID(),
+          threadId,
+          messageSha256: "2".repeat(64),
+          messageBytes: 1,
+          deliveryStatus: "outcome_unknown" as const,
+          createdAt: now,
+          updatedAt: now,
+        }],
+      },
+      result: undefined,
+    };
+  });
 }
 
 function seedSession(context: Context, suffix: string): void {
@@ -506,6 +595,404 @@ describe("core rollout", () => {
     });
     const summary = await rollout();
     expect(resultFor(summary, context.workspace.id)).toMatchObject({ status: "pending", reason: "desktop_unknown" });
+    expect(vi.mocked(daemon.restartBridge)).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["DESKTOP_TARGET_NOT_FOUND", "upgraded", undefined], ["idle", "upgraded", undefined],
+    ["active", "pending_busy", "busy"], ["inProgress", "pending_busy", "busy"],
+    ["DESKTOP_BUSY", "pending_busy", "busy"], ["DESKTOP_STATE_UNAVAILABLE", "pending", "desktop_unknown"],
+    ["DESKTOP_APPROVAL_PENDING", "pending", "desktop_unknown"], ["DESKTOP_NO_OWNER", "pending", "desktop_unknown"],
+  ] as const)("retired 旧目标 %s 每次仍检查", async (observation, status, reason) => {
+    const context = addContext("desktop-retired");
+    makeAfter(context);
+    seedDesktopRebound(context);
+    mockReboundInspect();
+    await retireLegacyAccepted(context.workspace, reboundCommandId);
+    vi.mocked(desktopIpc.inspect).mockClear();
+    vi.mocked(desktopIpc.inspect).mockImplementation(async target => {
+      if (target.threadId === historicalThreadId && observation.startsWith("DESKTOP_")) {
+        throw Object.assign(new Error("fixture"), { code: observation });
+      }
+      return { ...target, title: "fixture", cwd: target.workspaceRoot,
+        runtimeStatus: target.threadId === historicalThreadId ? observation : "idle" } as never;
+    });
+    const summary = await rollout();
+    expect(resultFor(summary, context.workspace.id)).toMatchObject({ status, ...(reason ? { reason } : {}) });
+    expect(vi.mocked(desktopIpc.inspect).mock.calls.some(([target]) => target.threadId === threadId)).toBe(true);
+    expect(vi.mocked(desktopIpc.inspect).mock.calls.some(([target]) => target.threadId === historicalThreadId)).toBe(true);
+    expect(daemon.restartBridge).toHaveBeenCalledTimes(status === "upgraded" ? 1 : 0);
+  });
+
+  it.each(["active", "DESKTOP_STATE_UNAVAILABLE"])("retired 不能绕过当前 binding %s", async observation => {
+    const context = addContext("desktop-retired-current");
+    makeAfter(context);
+    seedDesktopRebound(context);
+    mockReboundInspect();
+    await retireLegacyAccepted(context.workspace, reboundCommandId);
+    vi.mocked(desktopIpc.inspect).mockImplementation(async () => {
+      if (observation.startsWith("DESKTOP_")) throw Object.assign(new Error("fixture"), { code: observation });
+      return { runtimeStatus: observation } as never;
+    });
+    expect(resultFor(await rollout(), context.workspace.id)).toMatchObject({
+      status: observation === "active" ? "pending_busy" : "pending",
+      reason: observation === "active" ? "busy" : "desktop_unknown",
+    });
+    expect(daemon.restartBridge).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["DESKTOP_NO_OWNER", "upgraded"], ["DESKTOP_TARGET_NOT_FOUND", "upgraded"], ["idle", "upgraded"],
+    ["active", "pending_busy"], ["inProgress", "pending_busy"], ["DESKTOP_BUSY", "pending_busy"],
+    ["DESKTOP_STATE_UNAVAILABLE", "pending"], ["DESKTOP_PROJECT_MISMATCH", "pending"],
+    ["DESKTOP_OWNER_CHANGED", "pending"], ["DESKTOP_APPROVAL_PENDING", "pending"],
+  ])("ownerless 处置后 rebind 仍实时检查新 binding 与旧 thread %s", async (observation, status) => {
+    const context = addContext("ownerless-retired");
+    makeAfter(context); seedDesktopRebound(context);
+    vi.stubEnv("CODEX_THREAD_ID", threadId);
+    vi.spyOn(desktopIpc, "currentResultContext").mockResolvedValue({
+      threadId, hostId: "local", projectId: "rollout-project", workspaceRoot: context.workspace.root,
+      cwd: context.workspace.root, title: "maintenance", runtimeStatus: "active",
+      resultTurnId: randomUUID(), resultTurnStatus: "inProgress",
+    });
+    vi.mocked(desktopIpc.inspect).mockRejectedValue(Object.assign(new Error("fixture"), { code: "DESKTOP_NO_OWNER" }));
+    await retireLegacyAccepted(context.workspace, reboundCommandId, { ownerless: true });
+    const reboundThread = randomUUID();
+    updateDesktop(context.workspace.id, state => ({
+      state: { ...state!, binding: { ...state!.binding!, threadId: reboundThread } }, result: undefined,
+    }));
+    expect(listDesktopHistory(context.workspace)).toContainEqual({ commandId: reboundCommandId, status: "retired" });
+    vi.mocked(desktopIpc.inspect).mockClear();
+    vi.mocked(desktopIpc.inspect).mockImplementation(async target => {
+      if (target.threadId === historicalThreadId && observation!.startsWith("DESKTOP_"))
+        throw Object.assign(new Error("fixture"), { code: observation });
+      return { ...target, title: "fixture", cwd: target.workspaceRoot,
+        runtimeStatus: target.threadId === historicalThreadId ? observation : "idle" } as never;
+    });
+    const summary = await rollout();
+    expect(resultFor(summary, context.workspace.id)).toMatchObject({ status });
+    expect(vi.mocked(desktopIpc.inspect).mock.calls.some(([target]) => target.threadId === reboundThread)).toBe(true);
+    expect(vi.mocked(desktopIpc.inspect).mock.calls.some(([target]) => target.threadId === historicalThreadId)).toBe(true);
+    expect(daemon.restartBridge).toHaveBeenCalledTimes(status === "upgraded" ? 1 : 0);
+  });
+
+  it.each(["current_active", "shared_accepted", "outcome_unknown"])("ownerless 不能绕过 %s", async mode => {
+    const context = addContext("ownerless-boundaries");
+    makeAfter(context); seedDesktopRebound(context);
+    vi.stubEnv("CODEX_THREAD_ID", threadId);
+    vi.spyOn(desktopIpc, "currentResultContext").mockResolvedValue({
+      threadId, hostId: "local", projectId: "rollout-project", workspaceRoot: context.workspace.root,
+      cwd: context.workspace.root, title: "maintenance", runtimeStatus: "active",
+      resultTurnId: randomUUID(), resultTurnStatus: "inProgress",
+    });
+    vi.mocked(desktopIpc.inspect).mockRejectedValue(Object.assign(new Error("fixture"), { code: "DESKTOP_NO_OWNER" }));
+    await retireLegacyAccepted(context.workspace, reboundCommandId, { ownerless: true });
+    if (mode === "shared_accepted") updateDesktop(context.workspace.id, state => ({
+      state: { ...state!, deliveries: [...state!.deliveries, { ...state!.deliveries[0]!, commandId: "unretired-shared" }] },
+      result: undefined,
+    }));
+    if (mode === "outcome_unknown") addOutcomeUnknown(context);
+    vi.mocked(desktopIpc.inspect).mockClear();
+    vi.mocked(desktopIpc.inspect).mockImplementation(async target => {
+      if (target.threadId === historicalThreadId) throw Object.assign(new Error("fixture"), { code: "DESKTOP_NO_OWNER" });
+      return { ...target, title: "fixture", cwd: target.workspaceRoot, runtimeStatus: mode === "current_active" ? "active" : "idle" };
+    });
+    const summary = await rollout();
+    expect(resultFor(summary, context.workspace.id)).toMatchObject({
+      status: mode === "current_active" ? "pending_busy" : "pending",
+      reason: mode === "current_active" ? "busy" : mode === "outcome_unknown" ? "desktop_unresolved" : "desktop_unknown",
+    });
+    expect(daemon.restartBridge).not.toHaveBeenCalled();
+    if (mode === "outcome_unknown") expect(desktopIpc.inspect).not.toHaveBeenCalled();
+  });
+
+  it.each(["historical_active", "current_active", "future_accepted", "outcome_unknown", "binding_changed"])(
+    "行政 abandonment 与共享 history 判定保留 %s 门禁", async mode => {
+      const context = addContext("administrative-abandonment");
+      makeAfter(context); seedDesktopRebound(context);
+      updateDesktop(context.workspace.id, state => ({
+        state: { ...state!, deliveries: state!.deliveries.map(d => ({ ...d, intent: "revision" as const })) }, result: undefined,
+      }));
+      vi.stubEnv("CODEX_THREAD_ID", threadId);
+      vi.spyOn(desktopIpc, "currentResultContext").mockResolvedValue({
+        threadId, hostId: "local", projectId: "rollout-project", workspaceRoot: context.workspace.root,
+        cwd: context.workspace.root, title: "maintenance", runtimeStatus: "active",
+        resultTurnId: randomUUID(), resultTurnStatus: "inProgress",
+      });
+      const preview = previewAbandonment(context.workspace, [reboundCommandId]);
+      await abandonHistoricalAccepted(context.workspace, [reboundCommandId], preview.confirmationSha256);
+      expect(listDesktopHistory(context.workspace)).toContainEqual({ commandId: reboundCommandId, status: "abandoned" });
+      if (mode === "future_accepted") updateDesktop(context.workspace.id, state => ({
+        state: { ...state!, deliveries: [...state!.deliveries, { ...state!.deliveries[0]!, commandId: "future-command" }] }, result: undefined,
+      }));
+      if (mode === "outcome_unknown") addOutcomeUnknown(context);
+      if (mode === "binding_changed") updateDesktop(context.workspace.id, state => ({
+        state: { ...state!, binding: { ...state!.binding!, threadId: historicalThreadId } }, result: undefined,
+      }));
+      vi.mocked(desktopIpc.inspect).mockClear();
+      vi.mocked(desktopIpc.inspect).mockImplementation(async target => ({
+        ...target, title: "fixture", cwd: target.workspaceRoot,
+        runtimeStatus: target.threadId === historicalThreadId || mode === "current_active" ? "active" : "idle",
+      }));
+      const summary = await rollout();
+      const expected = mode === "historical_active" ? "upgraded" :
+        mode === "current_active" || mode === "future_accepted" ? "pending_busy" : "pending";
+      expect(resultFor(summary, context.workspace.id)).toMatchObject({ status: expected });
+      expect(daemon.restartBridge).toHaveBeenCalledTimes(expected === "upgraded" ? 1 : 0);
+      if (mode === "historical_active") {
+        expect(desktopIpc.inspect).toHaveBeenCalled();
+        expect(vi.mocked(desktopIpc.inspect).mock.calls.every(([target]) => target.threadId === threadId)).toBe(true);
+      }
+      if (mode === "future_accepted") {
+        expect(listDesktopHistory(context.workspace)).toContainEqual({ commandId: "future-command", status: "unresolved" });
+        expect(vi.mocked(desktopIpc.inspect).mock.calls.some(([target]) => target.threadId === historicalThreadId)).toBe(true);
+      }
+      if (mode === "outcome_unknown" || mode === "binding_changed") expect(desktopIpc.inspect).not.toHaveBeenCalled();
+    });
+
+  it("同 thread 还有未 retired accepted 时不能豁免 TARGET_NOT_FOUND", async () => {
+    const context = addContext("desktop-retired-shared");
+    makeAfter(context);
+    seedDesktopRebound(context);
+    mockReboundInspect();
+    await retireLegacyAccepted(context.workspace, reboundCommandId);
+    updateDesktop(context.workspace.id, previous => ({ state: { ...previous!, deliveries: [
+      ...previous!.deliveries, { ...previous!.deliveries[0], commandId: "other-accepted", turnId: randomUUID() },
+    ] }, result: undefined }));
+    const result = resultFor(await rollout(), context.workspace.id);
+    expect(result).toMatchObject({ status: "pending", reason: "desktop_unknown" });
+    expect(daemon.restartBridge).not.toHaveBeenCalled();
+  });
+
+  it.each(["binding", "outcome_unknown"])("retirement 不能绕过 %s 后续变化", async change => {
+    const context = addContext("desktop-retired-change");
+    makeAfter(context);
+    seedDesktopRebound(context);
+    mockReboundInspect();
+    await retireLegacyAccepted(context.workspace, reboundCommandId);
+    if (change === "binding") updateDesktop(context.workspace.id, previous => ({
+      state: { ...previous!, binding: { ...previous!.binding!, threadId: historicalThreadId } }, result: undefined,
+    }));
+    else addOutcomeUnknown(context);
+    vi.mocked(desktopIpc.inspect).mockClear();
+    expect(resultFor(await rollout(), context.workspace.id)).toMatchObject({
+      status: "pending", reason: change === "binding" ? "desktop_unknown" : "desktop_unresolved",
+    });
+    expect(desktopIpc.inspect).not.toHaveBeenCalled();
+    expect(daemon.restartBridge).not.toHaveBeenCalled();
+  });
+
+  it("唯一完整 Desktop receipt 过滤历史 accepted thread，但仍检查当前 binding", async () => {
+    const context = addContext("desktop-receipt");
+    makeAfter(context);
+    seedDesktopRebound(context);
+    writeExecutionRecords(context, [desktopReceiptRecord()]);
+    mockReboundInspect();
+
+    const summary = await rollout();
+
+    expect(resultFor(summary, context.workspace.id)).toMatchObject({ status: "upgraded" });
+    expect(vi.mocked(daemon.restartBridge)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(desktopIpc.inspect).mock.calls.length).toBeGreaterThan(0);
+    expect(vi.mocked(desktopIpc.inspect).mock.calls.every(([target]) => target.threadId === threadId)).toBe(true);
+  });
+
+  it("legacy reconciliation 过滤旧 accepted thread，但仍检查当前 binding", async () => {
+    const context = addContext("desktop-legacy-reconciled");
+    makeAfter(context);
+    seedDesktopRebound(context, "2026-09-11T00:00:00.000Z");
+    seedLegacyReconciliation(context);
+    mockReboundInspect();
+
+    const summary = await rollout();
+
+    expect(resultFor(summary, context.workspace.id)).toMatchObject({ status: "upgraded" });
+    expect(vi.mocked(daemon.restartBridge)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(desktopIpc.inspect).mock.calls.length).toBeGreaterThan(0);
+    expect(vi.mocked(desktopIpc.inspect).mock.calls.every(([target]) => target.threadId === threadId)).toBe(true);
+  });
+
+  it("legacy reconciliation 在 retention 淘汰 output 后仍跳过旧 thread 并检查当前 binding", async () => {
+    const context = addContext("desktop-legacy-retention");
+    makeAfter(context);
+    seedDesktopRebound(context, "2026-09-11T00:00:00.000Z");
+    seedLegacyReconciliation(context);
+    const reconciledOutputId = listExecutionOutputs(context.workspace.id, MAX_OUTPUT_RECORDS)[0]!.id;
+    for (let index = 0; index < MAX_OUTPUT_RECORDS; index++) {
+      saveExecutionOutput(context.workspace.id, {
+        command: `retention output ${index}`,
+        raw: `retention output ${index}`,
+        exitCode: 0,
+        taskId: `retention-task-${index}`,
+        iteration: 1,
+      });
+    }
+    const retained = listExecutionOutputs(context.workspace.id, MAX_OUTPUT_RECORDS);
+    expect(retained).toHaveLength(MAX_OUTPUT_RECORDS);
+    expect(retained.some(item => item.id === reconciledOutputId)).toBe(false);
+    expect(new Set(retained.map(item => item.taskId)).size).toBe(MAX_OUTPUT_RECORDS);
+    mockReboundInspect();
+
+    const summary = await rollout();
+
+    expect(resultFor(summary, context.workspace.id)).toMatchObject({ status: "upgraded" });
+    expect(vi.mocked(daemon.restartBridge)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(desktopIpc.inspect).mock.calls.length).toBeGreaterThan(0);
+    expect(vi.mocked(desktopIpc.inspect).mock.calls.every(([target]) => target.threadId === threadId)).toBe(true);
+  });
+
+  it("legacy reconciliation 重验发现 execution 事实变化时 fail closed", async () => {
+    const context = addContext("desktop-legacy-record-changed");
+    makeAfter(context);
+    seedDesktopRebound(context, "2026-09-11T00:00:00.000Z");
+    seedLegacyReconciliation(context);
+    const file = executionFile(context);
+    const record = JSON.parse(fs.readFileSync(file, "utf8").trim()) as Record<string, unknown>;
+    record.tests = "changed after reconciliation";
+    fs.writeFileSync(file, `${JSON.stringify(record)}\n`);
+
+    const summary = await rollout();
+
+    expect(resultFor(summary, context.workspace.id)).toMatchObject({ status: "pending", reason: "desktop_unknown" });
+    expect(vi.mocked(desktopIpc.inspect)).not.toHaveBeenCalled();
+    expect(vi.mocked(daemon.restartBridge)).not.toHaveBeenCalled();
+  });
+
+  it.each(["changed", "corrupt"] as const)("legacy reconciliation 重验发现 output index %s 时 fail closed", async mode => {
+    const context = addContext(`desktop-legacy-output-${mode}`);
+    makeAfter(context);
+    seedDesktopRebound(context, "2026-09-11T00:00:00.000Z");
+    seedLegacyReconciliation(context);
+    const file = path.join(stateDir, "execution-outputs", context.workspace.id, "index.json");
+    if (mode === "changed") {
+      const index = JSON.parse(fs.readFileSync(file, "utf8")) as { items: Array<Record<string, unknown>> };
+      index.items[0]!.taskId = "changed-after-reconciliation";
+      fs.writeFileSync(file, JSON.stringify(index));
+    } else fs.writeFileSync(file, "not-json");
+
+    const summary = await rollout();
+
+    expect(resultFor(summary, context.workspace.id)).toMatchObject({ status: "pending", reason: "desktop_unknown" });
+    expect(vi.mocked(desktopIpc.inspect)).not.toHaveBeenCalled();
+    expect(vi.mocked(daemon.restartBridge)).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["普通 record 无 receipt", { desktopReceiptSha256: undefined }],
+    ["commandId 不匹配", { commandId: "other-command" }],
+    ["taskId 不匹配", { taskId: "other-task" }],
+    ["iteration 不是 1", { iteration: 2 }],
+    ["带 hash 的空白 tests", { tests: "   " }],
+    ["带 hash 的 null tests", { tests: null }],
+    ["带 hash 的非 canonical timestamp", { timestamp: "2026-09-12T00:00:00Z" }],
+    ["带 hash 的数值 changedFiles", { changedFiles: 0 }],
+    ["带 hash 的非终态 exitStatus", { exitStatus: "running" }],
+  ] as const)("%s 时仍检查历史 accepted thread", async (_name, overrides) => {
+    const context = addContext("desktop-untrusted");
+    makeAfter(context);
+    seedDesktopRebound(context);
+    writeExecutionRecords(context, [desktopReceiptRecord(overrides)]);
+    mockReboundInspect();
+
+    const summary = await rollout();
+
+    expect(resultFor(summary, context.workspace.id)).toMatchObject({ status: "pending", reason: "desktop_unknown" });
+    expect(vi.mocked(desktopIpc.inspect).mock.calls.some(([target]) => target.threadId === historicalThreadId)).toBe(true);
+    expect(vi.mocked(daemon.restartBridge)).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["缺少 taskId", { taskId: undefined }],
+    ["缺少 changedFiles", { changedFiles: undefined }],
+    ["缺少 tests", { tests: undefined }],
+    ["缺少 exitStatus", { exitStatus: undefined }],
+    ["缺少 timestamp", { timestamp: undefined }],
+    ["receipt hash 长度不完整", { desktopReceiptSha256: "0".repeat(63) }],
+  ] as const)("%s 时严格记录读取 fail closed", async (_name, overrides) => {
+    const context = addContext("desktop-incomplete");
+    makeAfter(context);
+    seedDesktopRebound(context);
+    writeExecutionRecords(context, [desktopReceiptRecord(overrides)]);
+
+    const summary = await rollout();
+
+    expect(resultFor(summary, context.workspace.id)).toMatchObject({ status: "pending", reason: "desktop_unknown" });
+    expect(vi.mocked(desktopIpc.inspect)).not.toHaveBeenCalled();
+    expect(vi.mocked(daemon.restartBridge)).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["changedFiles 摘要", { changedFiles: 0 }], ["tests null", { tests: null }],
+    ["空白 tests", { tests: "   " }], ["非法 exitStatus", { exitStatus: "running" }],
+  ] as const)("%s 仍 live inspect", async (_name, overrides) => {
+    const context = addContext("desktop-shape"); makeAfter(context); seedDesktopRebound(context);
+    writeExecutionRecords(context, [desktopReceiptRecord(overrides)]); mockReboundInspect(true);
+    const summary = await rollout();
+    expect(resultFor(summary, context.workspace.id)).toMatchObject({ status: "upgraded" });
+    expect(vi.mocked(desktopIpc.inspect).mock.calls.some(([target]) => target.threadId === historicalThreadId)).toBe(true);
+    expect(vi.mocked(daemon.restartBridge)).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["commandId 重复", [desktopReceiptRecord(), desktopReceiptRecord({ timestamp: "2026-09-12T00:00:01.000Z" })]],
+    ["taskId 冲突", [desktopReceiptRecord(), desktopReceiptRecord({
+      commandId: "other-command", taskId: `desktop_${reboundCommandId}`, desktopReceiptSha256: "1".repeat(64),
+    })]],
+  ] as const)("%s 时拒绝使用重复或冲突 receipt", async (_name, records) => {
+    const context = addContext("desktop-conflict");
+    makeAfter(context);
+    seedDesktopRebound(context);
+    writeExecutionRecords(context, records);
+    mockReboundInspect();
+
+    const summary = await rollout();
+
+    expect(resultFor(summary, context.workspace.id)).toMatchObject({ status: "pending", reason: "desktop_unknown" });
+    expect(vi.mocked(desktopIpc.inspect)).not.toHaveBeenCalled();
+    expect(vi.mocked(daemon.restartBridge)).not.toHaveBeenCalled();
+  });
+
+  it("损坏 execution JSONL 时不调用 Desktop inspect", async () => {
+    const context = addContext("desktop-records-corrupt");
+    makeAfter(context);
+    seedDesktopRebound(context);
+    const file = executionFile(context);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, "not-json\n");
+
+    const summary = await rollout();
+
+    expect(resultFor(summary, context.workspace.id)).toMatchObject({ status: "pending", reason: "desktop_unknown" });
+    expect(vi.mocked(desktopIpc.inspect)).not.toHaveBeenCalled();
+    expect(vi.mocked(daemon.restartBridge)).not.toHaveBeenCalled();
+  });
+
+  it("outcome_unknown 即使存在有效 receipt 仍全局阻塞", async () => {
+    const context = addContext("desktop-unresolved-with-receipt");
+    makeAfter(context);
+    seedDesktopRebound(context);
+    addOutcomeUnknown(context);
+    writeExecutionRecords(context, [desktopReceiptRecord()]);
+
+    const summary = await rollout();
+
+    expect(resultFor(summary, context.workspace.id)).toMatchObject({ status: "pending", reason: "desktop_unresolved" });
+    expect(vi.mocked(desktopIpc.inspect)).not.toHaveBeenCalled();
+    expect(vi.mocked(daemon.restartBridge)).not.toHaveBeenCalled();
+  });
+
+  it("outcome_unknown 在读取 legacy reconciliation 证据前全局阻塞", async () => {
+    const context = addContext("desktop-unresolved-before-legacy");
+    makeAfter(context);
+    seedDesktopRebound(context, "2026-09-11T00:00:00.000Z");
+    addOutcomeUnknown(context);
+    fs.mkdirSync(path.dirname(legacyReconciliationFile(context.workspace.id)), { recursive: true });
+    fs.writeFileSync(legacyReconciliationFile(context.workspace.id), "not-json");
+
+    const summary = await rollout();
+
+    expect(resultFor(summary, context.workspace.id)).toMatchObject({ status: "pending", reason: "desktop_unresolved" });
+    expect(vi.mocked(desktopIpc.inspect)).not.toHaveBeenCalled();
     expect(vi.mocked(daemon.restartBridge)).not.toHaveBeenCalled();
   });
 

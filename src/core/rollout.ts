@@ -13,6 +13,7 @@ import { readTunnelState, isNamedTunnelReady } from "../tunnel/state.js";
 import { desktopIpc } from "../desktop/ipc.js";
 import { readDesktop } from "../desktop/store.js";
 import { readRemote } from "../remote/store.js";
+import { desktopHistory } from "../desktop/history.js";
 
 const runtimeSchema = z.object({ service: z.literal(SERVICE_NAME), version: z.string(),
   workspaceId: z.string().regex(/^[a-f0-9]{12}$/), workspaceRoot: z.string().refine(path.isAbsolute),
@@ -67,16 +68,34 @@ async function idle(workspace: Workspace, info: BridgeAdminInfo): Promise<void> 
   if (typeof info.pairingActive !== "boolean") throw new Skip("runtime_unknown");
   if (info.pairingActive) throw new Skip("pairing_active");
   try {
-    const desktop = readDesktop(workspace.id);
-    if (desktop && desktop.workspaceRoot !== workspace.root) throw new Skip("desktop_unknown");
-    if (desktop?.deliveries.some(item => item.deliveryStatus === "outcome_unknown")) throw new Skip("desktop_unresolved");
-    // rebind 后原 accepted thread 也可能还在执行；逐一只读校验，不能以 receipt 推断 idle。
-    const acceptedThreads = desktop?.deliveries.filter(item => item.deliveryStatus === "accepted").map(item => item.threadId!) ?? [];
+    const before = readDesktop(workspace.id);
+    if (before && before.workspaceRoot !== workspace.root) throw new Skip("desktop_unknown");
+    if (before?.deliveries.some(item => item.deliveryStatus === "outcome_unknown")) throw new Skip("desktop_unresolved");
+    const { desktop, accepted, skipHistory, retired, ownerless } = desktopHistory(workspace);
+    if (JSON.stringify(desktop) !== JSON.stringify(before)) throw new Skip("desktop_unknown");
+    const acceptedThreads = accepted.filter(item => !skipHistory.has(item.commandId) || item.threadId === desktop?.binding?.threadId)
+      .map(item => item.threadId!);
     const binding = desktop?.binding;
     if (acceptedThreads.length && !binding) throw new Skip("desktop_unknown");
     if (binding) for (const threadId of new Set([binding.threadId, ...acceptedThreads])) {
-      const observed = await desktopIpc.inspect({ threadId, hostId: binding.hostId,
-        projectId: binding.projectId, workspaceRoot: workspace.root });
+      // 同一历史 thread 的所有待检查 delivery 都已 retired 才能接受明确不存在。
+      const retirementOnly = threadId !== binding.threadId && accepted
+        .filter(item => item.threadId === threadId && !skipHistory.has(item.commandId))
+        .every(item => retired.has(item.commandId));
+      let observed;
+      try {
+        observed = await desktopIpc.inspect({ threadId, hostId: binding.hostId,
+          projectId: binding.projectId, workspaceRoot: workspace.root });
+      } catch (error) {
+        if (!retirementOnly) throw error;
+        const code = (error as { code?: string }).code;
+        if (code === "DESKTOP_TARGET_NOT_FOUND") continue;
+        // 无 owner 仅对显式 ownerless 处置生效；同 thread 任一未处置项仍阻塞。
+        if (code === "DESKTOP_NO_OWNER" && accepted
+          .filter(item => item.threadId === threadId && !skipHistory.has(item.commandId))
+          .every(item => ownerless.has(item.commandId))) continue;
+        throw new Skip(code === "DESKTOP_BUSY" ? "busy" : "desktop_unknown");
+      }
       if (observed.runtimeStatus !== "idle") throw new Skip(
         observed.runtimeStatus === "active" || observed.runtimeStatus === "inProgress" ? "busy" : "desktop_unknown");
     }

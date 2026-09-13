@@ -25,7 +25,7 @@ beforeEach(() => {
   vi.stubEnv("C2C_STATE_DIR", stateDir);
   vi.stubEnv("CODEX_THREAD_ID", threadId);
   seedAcceptedDelivery();
-  vi.spyOn(desktopIpc, "currentExecution").mockResolvedValue(currentExecutionInfo(acceptedTurnId) as never);
+  vi.spyOn(desktopIpc, "currentResultContext").mockResolvedValue(currentResultContext(acceptedTurnId) as never);
 });
 
 afterEach(() => {
@@ -70,7 +70,7 @@ function seedAcceptedDelivery(): void {
   }));
 }
 
-function currentExecutionInfo(activeTurnId?: string): Record<string, unknown> {
+function currentResultContext(resultTurnId?: string): Record<string, unknown> {
   return {
     threadId,
     hostId: "local",
@@ -79,7 +79,7 @@ function currentExecutionInfo(activeTurnId?: string): Record<string, unknown> {
     title: "当前 Desktop 会话",
     cwd: workspace.root,
     runtimeStatus: "active",
-    ...(activeTurnId === undefined ? {} : { activeTurnId }),
+    ...(resultTurnId === undefined ? {} : { resultTurnId, resultTurnStatus: "inProgress" }),
   };
 }
 
@@ -182,7 +182,7 @@ describe("desktop record-result CLI", () => {
   });
 
   it("同一线程但 active turn 较新时拒绝，且不写入 record/output", async () => {
-    vi.mocked(desktopIpc.currentExecution).mockResolvedValue(currentExecutionInfo(randomUUID()) as never);
+    vi.mocked(desktopIpc.currentResultContext).mockResolvedValue(currentResultContext(randomUUID()) as never);
 
     const result = await runRecord(["--output", "later turn 不应记录"]);
     expect(result.exitCode).toBe(1);
@@ -201,8 +201,8 @@ describe("desktop record-result CLI", () => {
     expect(listExecutionOutputs(workspace.id)).toEqual([]);
   });
 
-  it("currentExecution 缺少 active turn 标识时拒绝，不能仅凭 threadId 伪造", async () => {
-    vi.mocked(desktopIpc.currentExecution).mockResolvedValue(currentExecutionInfo() as never);
+  it("current result context 缺少 turn 标识时拒绝，不能仅凭 threadId 伪造", async () => {
+    vi.mocked(desktopIpc.currentResultContext).mockResolvedValue(currentResultContext() as never);
 
     const result = await runRecord(["--output", "缺少 turn 标识不应记录"]);
     expect(result.exitCode).toBe(1);

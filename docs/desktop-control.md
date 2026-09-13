@@ -31,11 +31,15 @@ JSON 转义）必须满足 64 KiB 限额，外层 IPC JSON 控制行也按现有
 --tests "<本轮摘要或 not run>" --exit-status <ok|failed|blocked> --json` 仅接受当前 workspace 的
 历史 accepted command。`CODEX_THREAD_ID` 仅为线索；本机命令通过现有受控 Desktop IPC 和
 实时状态验证真实 thread/workspace/root、owner/project、版本/hash、执行进程来源以及唯一当前
-`inProgress` active turnId，必须同时匹配原 delivery.threadId 和 delivery.turnId。
-不接受调用方传入 turnId；仅伪造环境变量不足以记录。same thread 的后续 turn、idle、无/多个/
+`inProgress` active turnId；idle 时仅允许 canonical history 最新侧完整且最后一条为 terminal 的
+turn。两种情况均必须同时匹配原 delivery.threadId 和 delivery.turnId。
+不接受调用方传入 turnId；仅伪造环境变量不足以记录。same thread 的后续 turn、无/多个/
 未知 active turn、状态读取失败及 turnId mismatch 都拒绝，且不写 record/output。
 disable/rebind 不阻止原 active accepted turn 在最终回复前收尾，其他 turn 不能代记；
-幂等重试也重新验证当前 active turn。命令不执行 shell；可用
+写入前和幂等返回前都重新验证 exact result context；只对短暂 STATE_UNAVAILABLE 做有界重试。
+进程核验耗时导致旧快照超过 2 秒时，result 路径仅尝试一次新 serial 的新鲜快照并重新核验；
+保留原 2 秒快照上限和独立总时限，旧缓存、超时、owner/process 变化仍拒绝。
+命令不执行 shell；可用
 `--command`、`--output-file`（UTF-8，最多 256 KiB，超限先汇总）、`--exit-code` 保存已执行输出，
 沿用 execution_output 的敏感内容过滤。无测试明确记录 not run；changed-files 只列本轮实际改动，
 notes 说明已有脏工作区。不会清理旧改动。
@@ -152,6 +156,88 @@ launcher 校验并执行机器目录中的不可变 release（含独立依赖）
 outcome_unknown 门禁保持。`status/doctor --json` 的 `runtimeUpgrade` 报告安装/运行 build 与 pending。
 第一阶段没有常驻 Supervisor；当前 Review Bridge 按 active 跳过，后续空闲时再受控 rollout。
 
+receipt 机制上线前留下的旧 accepted delivery 不会按时间自动推断完成。必要时可针对明确的历史
+`commandId` 执行一次本机核对：
+
+```
+c2c desktop legacy-reconcile -w <workspace> --command-id <历史 commandId> --json
+```
+
+只读发现使用 `c2c desktop legacy-reconcile -w <workspace> --list --json`，与 `--command-id`
+互斥。返回的 `items` 仅含 `commandId`、`status`：`reconciled` 表示现有证据重验通过；
+`retired` / `abandoned` 表示已通过对应历史等待处置；`eligible` 表示可显式核对；
+`missing_execution` / `missing_output` 表示缺少必要证据；
+`conflict` 表示事实不合格或与已存证据冲突。只列出缺失 intent 的 accepted，并排除已有
+Desktop receipt 的记录，不返回 thread/turn ID 或消息正文。JSONL、output index 或证据存储
+损坏时整个发现失败。list 不写文件、不自动核对、不触发 rollout；发现结果也不代表执行已迁移。
+
+该入口只接受缺失 `intent` 的旧 delivery，并严格要求唯一的终态 execution record、匹配的
+`outputId` 与 output index 元数据，以及 execution/output 时间晚于 accepted delivery。核对结果只写入
+独立的本机 reconciliation 证据摘要，不伪造 `desktopReceiptSha256`，不修改 Desktop delivery、
+execution JSONL 或 output index，也不会触发 rollout。普通 `c2c record`、重复/冲突/损坏/缺证据的
+状态继续 fail-closed；当前和未来含 `intent` 的 delivery 永远不能走此入口。
+
+新 reconciliation 证据同时保存严格的 output metadata snapshot。后续每次仍重验 delivery 和
+execution record；原 output 仍在 index 时必须与 snapshot 完全一致。只有严格读取的 index
+已满 `MAX_OUTPUT_RECORDS`，且最老 retained id 大于原 outputId，才可使用 snapshot 证明正常
+retention 淘汰。其他缺失、metadata 变化或 index 损坏仍拒绝。旧证据若没有 snapshot，仍要求
+原 output 存在，不自动回填或推断淘汰；显式 CLI 和 rollout 都遵守相同复核。
+
+对没有任何 execution 或对应 orphan output 的 pre-receipt 等待项，可显式使用
+`c2c desktop legacy-retire -w <workspace> --command-id <历史 commandId> --json`。
+仅允许缺失 intent 的 accepted、有合法 turnId、旧 thread 不等于当前 binding、没有
+outcome_unknown 或 reconciliation 证据。必须实时确认旧目标明确 `DESKTOP_TARGET_NOT_FOUND`，
+然后确认当前 binding idle；IPC 前后本地事实变化会拒绝。证据独立保存，不改历史，不表示
+任务完成或成功，也不补 execution/receipt。list 以 `retired` 单独显示。
+每次 rollout 仍检查 retired 旧 thread：明确不存在或 idle 才能继续，active/inProgress 仍 busy，
+其它未知状态继续阻塞；当前 binding 永远正常检查。reconciliation 与 retirement 双证据、
+损坏证据、后续出现执行证据或旧 thread 成为当前 binding 都 fail-closed。
+
+owner discovery 的精确 `no-client-found` 响应表示没有客户端可处理该 thread，首次发现报告
+`DESKTOP_NO_OWNER`，指定 owner 的复核报告 `DESKTOP_OWNER_CHANGED`；它不是 IPC 超时，也不
+证明 thread 不存在。global project assignment、磁盘中的终态历史或 `notLoaded` 状态不能
+代替当前 Desktop 的新鲜状态证明。
+
+对符合上述 pre-receipt、无 execution/output 资格的 ownerless 历史等待项，可在当前绑定的
+Desktop 维护 turn 中显式执行 `desktop legacy-retire --command-id <id> --ownerless`。
+此模式只接受经过进程、版本和 project 前后复核的 `DESKTOP_NO_OWNER`，独立证据明确记录
+`kind: ownerless`、观测时间和维护 thread/turn；它表示停止把该旧投递视为活动等待项，绝不
+表示不存在、完成或成功。普通 retirement 的 missing-target 门槛不变。
+maintenanceThreadId / maintenanceTurnId 仅为创建时审计信息，正常 rebind 后不迁移或重写，
+也不要求当前 binding 仍等于原维护 thread；当前 binding 仍不得是被处置的历史 thread。
+创建及幂等返回前两次 `currentResultContext` 必须证明同一个当前 binding 的 active 维护 turn，
+并保留 workspace/project/host/runner/approval/freshness 门禁；此授权仅用于写历史处置证据。
+rollout 仍要求当前 binding idle，每次重查旧 thread；只有显式 ownerless 证据才允许无 owner，
+owner 恢复且 active/inProgress 时重新阻塞，其他未知错误仍 fail-closed。同一旧 thread 任一
+accepted 未被相应处置时不能借用该豁免。list 以 `retired` 表示这一非 completion 处置。
+
+### 显式行政停止等待
+
+`desktop history -w <workspace> --json` 只读列出 accepted 的 `commandId` 与
+`receipted / reconciled / retired / abandoned / unresolved` 状态。它与 rollout 共用严格证据
+判定，不返回消息正文；损坏或双证据拒绝读取，不把错误当作已解决。
+
+对于本机用户明确决定不再等待的历史 accepted，可以使用独立的行政 abandonment：
+
+```text
+c2c desktop abandon -w <workspace> --command-ids <id1,id2,...> --json
+c2c desktop abandon -w <workspace> --command-ids <相同精确列表> --confirm <上一步 confirmationSha256> --json
+```
+
+第一条只读预览，明确提示“仅停止等待，不代表完成/成功”；第二条才是本机显式确认。
+没有 `--all` 或动态候选全选。集合排序并拒绝重复，确认摘要绑定集合和对应不可变事实；
+确认后发生变化不能顺带处置新增项。独立 store 原子保存批次与每条 delivery 的摘要，保留
+当前维护 thread/turn 的证明，不写 execution record/output，不伪造 receipt，不改写 delivery。
+
+带 intent 的历史 accepted 可以显式 abandonment；当前 binding/current thread、outcome_unknown、
+已有可信 receipt/reconciliation/retirement 的条目不允许。维护身份首尾通过 currentResultContext
+复核，幂等也重新验证，进程/owner/project/turn 或本机事实变化均拒绝。共享证据锁防止不同处置
+同时提交；双证据、损坏、部分写入不覆盖或清理。
+
+行政决定只停止等待列出的旧 commandId。因此它们所在的旧 thread 之后恢复 active，也不撤销
+这一决定；当前 binding 仍始终实时检查，新 commandId 仍正常检查，outcome_unknown 仍全局阻塞。
+rollout 从不自动生成 abandonment，active/inProgress 时仍禁止重启 Bridge。
+
 ## 旧 Connector 兼容检测与迁移
 
 “启用 ChatGPT 工作流”会先检查当前 Bridge 的 `connectorContractVersion: 1` 和只读
@@ -248,17 +334,46 @@ IPC 发送前会重新核验 Desktop 服务进程、端点、owner 和绑定目�
 重启后重新发现，不能永久信任旧 PID。已知的 Desktop idle/start 内部协议在检查和实际
 发送之间没有原子 CAS，目标可能在窗口内改变；因此回执不匹配或不明时必须按未知结果
 处理，不能据此宣称 exactly-once。未知版本停止，不能自动降级验证。本机已验证的
-参考版本为 Desktop `26.903.9818.0` 与 app-server `0.153.4`，后续版本需要重新做
-兼容性核验。
+精确组合包括 Desktop `26.903.9818.0` / app-server `0.153.4`，以及
+Desktop `26.908.4834.0` / app-server `0.154.0-alpha.6.2`；其他组合仍须重新核验。
 
-已验证组合统一保存在 helper 的 `VERIFIED_RUNTIME`：Desktop/package 版本、app-server
+已验证组合统一保存在 helper 的 `VERIFIED_PROFILES`，每个协议 profile 包含精确运行时组合：Desktop/package 版本、app-server
 二进制 SHA-256、两个协议模块 SHA-256，以及同一安装包的 ASAR 头部布局。2026-09-11
 核验确认 ASAR 头部为 2,441,036 字节；原先 1 MiB 解析上限会误报
 `DESKTOP_VERSION_UNSUPPORTED`。现改为匹配已验证的精确头部布局，仍逐一验证全部哈希，
-未知头部、未知哈希或混合版本继续拒绝。app-server 哈希来自普通权限成功 PoC 的
+未知头部、未知哈希或混合版本继续拒绝。旧组合的 app-server 哈希来自普通权限成功 PoC 的
 `binding.json`（output 21/22 关联证据），不是按版本字符串猜测的新白名单。
-内部异常可区分 package、ASAR 头部/模块、app-server 不匹配；MCP/CLI 保留统一错误，
-不暴露安装路径或内部配置。
+本地 `c2c desktop compatibility --json` 提供只读兼容性诊断，不绑定、不启用、不投递，
+也不修改机器状态。返回 `observedDesktopVersion`、`observedAppServerVersion`、`status`
+和匹配的 `profile`，不返回 token、pipe、进程路径或原始 IPC 数据。
+`current` 表示精确版本组合及全部 profile 哈希通过；`unverified` 表示观察到的组合没有
+已验证 profile；`incompatible` 表示匹配组合的完整性或协议要求不符。无法读取的版本为
+`null`，不能猜成已验证版本。诊断成功不代表 owner、项目、运行态或投递权限通过。
+
+`DESKTOP_VERSION_UNSUPPORTED` 保留原错误码，附带同样的安全诊断字段。Activation 应直接
+报告实际观察版本；不要把这里的 Desktop 协议 profile 与 OAuth Connector 的
+`desktopCompatibility` 混淆，也不能通过重新配对修复协议不兼容。
+新增组合必须审计 IPC 请求版本、owner、project/workspace、turn state、current identity、
+current execution 和 prepare/send 假设，并固定同一安装包的精确版本及 hash。
+协议兼容才复用 `desktop-ipc-v1`；协议变化须新增独立 profile 并保留旧组合。
+不接受 wildcard、版本范围或“更新版本默认兼容”。真实投递前先完成只读身份验证，
+再经原本的本机确认、OAuth、idle、审批、binding 和 replay 门禁进行最小 E2E。
+
+2026-09-12 升级审计观察到 Desktop `26.908.4834.0`、实际运行 app-server
+`0.154.0-alpha.6.2`（直接读取运行文件的静态 provenance 版本标记）。运行中 app-server SHA-256 为
+`081e4de4be8e38fac6ed4d95e3b1a0b9f6d31c090ddc36e1696b349fe406f575`；
+ASAR 头部为 `(4, 2489280, 2489276, 2489269)`，主模块
+`.vite/build/src-CCXHtyvY.js` SHA-256 为
+`a42da38cbb14b28399f1d54fcf453bffc5e9802663e7e098f187c8378f4c7a40`。
+UI 模块 `webview/assets/app-initial-d9bed9d614d8.js` SHA-256 为
+`7c3a89e7e224f76031b45a88f72af8cd60f0c3d47aac9ca34b2c70e11dfe9867`。
+静态核验确认请求版本、following/snapshot、owner 和 start 返回结构保持兼容；固定上述
+hash 后，在主会话进行真实只读握手，普通权限、runner ancestor、project/workspace、owner、
+新鲜 snapshot 及唯一 `inProgress` turn 全部通过，因此该精确组合复用 `desktop-ipc-v1`。
+安装包内附 app-server 的 hash 不同，不作为该运行组合的替代项。只读证据不冒充真实 send/receipt E2E。
+正式 `current_identity` 与 `current_execution` 也已通过；当前会话为 active，`inspect` 和
+`prepare` 均返回 `DESKTOP_BUSY`、`notSent=true`。完整 hash 复核仍逐次执行；只有未知
+hash 才额外扫描静态版本标记，避免重复扫描使快照超过原有 2 秒新鲜度限制。
 
 Windows 受控 helper 需要 Python 3.11 或更高版本，使用环境变量 `C2C_DESKTOP_PYTHON`
 指定解释器路径，未设置时使用 `python`；它

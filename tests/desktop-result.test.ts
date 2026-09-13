@@ -5,7 +5,7 @@ import { spawn } from "node:child_process";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { listExecutionOutputs, readExecutionOutput, saveExecutionOutput } from "../src/execution/output.js";
 import { appendExecutionRecord, readExecutionRecords } from "../src/execution/records.js";
-import { desktopIpc, type DesktopExecutionInfo } from "../src/desktop/ipc.js";
+import { desktopIpc, type DesktopResultContext } from "../src/desktop/ipc.js";
 import { recordDesktopResult, type DesktopResultInput } from "../src/desktop/result.js";
 import { DesktopError, desktopFile } from "../src/desktop/store.js";
 import { cleanup, isolateStateDir } from "./helpers.js";
@@ -19,7 +19,7 @@ const commandId = "desktop_command_1";
 let stateDir: string;
 let previousThread: string | undefined;
 
-function validCurrentExecution(overrides: Partial<DesktopExecutionInfo> = {}): DesktopExecutionInfo {
+function validResultContext(overrides: Partial<DesktopResultContext> = {}): DesktopResultContext {
   return {
     threadId,
     hostId: "local",
@@ -27,7 +27,9 @@ function validCurrentExecution(overrides: Partial<DesktopExecutionInfo> = {}): D
     workspaceRoot: workspace.root,
     title: "Desktop 结果测试",
     cwd: workspace.root,
-    activeTurnId: turnId,
+    runtimeStatus: "active",
+    resultTurnId: turnId,
+    resultTurnStatus: "inProgress",
     ...overrides,
   };
 }
@@ -132,7 +134,7 @@ beforeEach(() => {
   stateDir = isolateStateDir();
   previousThread = process.env.CODEX_THREAD_ID;
   process.env.CODEX_THREAD_ID = threadId;
-  vi.spyOn(desktopIpc, "currentExecution").mockResolvedValue(validCurrentExecution());
+  vi.spyOn(desktopIpc, "currentResultContext").mockResolvedValue(validResultContext());
 });
 
 afterEach(() => {
@@ -211,22 +213,67 @@ describe("Desktop execution result", () => {
   it.each([
     ["thread 不一致", { threadId: otherThreadId }],
     ["workspaceRoot 不一致", { workspaceRoot: path.join(workspace.root, "other") }],
-    ["active turn 不一致", { activeTurnId: "00000000-0000-4000-8000-000000000104" }],
-    ["active turn 缺失", { activeTurnId: undefined as unknown as string }],
+    ["result turn 不一致", { resultTurnId: "00000000-0000-4000-8000-000000000104" }],
+    ["result turn 缺失", { resultTurnId: undefined as unknown as string }],
   ] as const)("真实 Desktop execution %s 时拒绝且不写入", async (_name, overrides) => {
     writeDesktopState();
-    vi.mocked(desktopIpc.currentExecution).mockResolvedValue(validCurrentExecution(overrides));
+    vi.mocked(desktopIpc.currentResultContext).mockResolvedValue(validResultContext(overrides as Partial<DesktopResultContext>));
     await expect(recordDesktopResult(workspace, input())).rejects.toMatchObject({ code: "DESKTOP_RESULT_CURRENT_EXECUTION" });
     expect(fs.existsSync(recordsFile())).toBe(false);
     expect(listExecutionOutputs(workspace.id)).toEqual([]);
   });
 
-  it("currentExecution 读取失败时拒绝，不把错误当作完成", async () => {
+  it("current result context 读取失败时拒绝，不把错误当作完成", async () => {
     writeDesktopState();
-    vi.mocked(desktopIpc.currentExecution).mockImplementation(async () => {
+    vi.mocked(desktopIpc.currentResultContext).mockImplementation(async () => {
       throw new DesktopError("DESKTOP_STATE_UNAVAILABLE", "Desktop 状态不可确认");
     });
     await expect(recordDesktopResult(workspace, input())).rejects.toMatchObject({ code: "DESKTOP_STATE_UNAVAILABLE" });
+    expect(desktopIpc.currentResultContext).toHaveBeenCalledTimes(3);
+    expect(fs.existsSync(recordsFile())).toBe(false);
+    expect(listExecutionOutputs(workspace.id)).toEqual([]);
+  });
+
+  it("写入前第二次复核短暂不可用时有界重试并继续要求 exact turn", async () => {
+    writeDesktopState();
+    vi.mocked(desktopIpc.currentResultContext)
+      .mockResolvedValueOnce(validResultContext())
+      .mockRejectedValueOnce(new DesktopError("DESKTOP_STATE_UNAVAILABLE", "Desktop 状态短暂不可确认"))
+      .mockResolvedValue(validResultContext());
+    const result = await recordDesktopResult(workspace, input({ output: undefined }));
+    expect(result.record.commandId).toBe(commandId);
+    expect(desktopIpc.currentResultContext).toHaveBeenCalledTimes(3);
+    expect(readExecutionRecords(workspace.id)).toHaveLength(1);
+  });
+
+  it("idle 且 accepted turn 是完整历史中的最新 terminal turn 时允许记录", async () => {
+    writeDesktopState();
+    vi.mocked(desktopIpc.currentResultContext).mockResolvedValue(validResultContext({
+      runtimeStatus: "idle", resultTurnStatus: "completed",
+    }));
+    const result = await recordDesktopResult(workspace, input({ output: undefined }));
+    expect(result.record.commandId).toBe(commandId);
+    expect(result.output).toBeNull();
+    expect(readExecutionRecords(workspace.id)).toHaveLength(1);
+  });
+
+  it("accepted terminal turn 之后已有更晚 turn 时拒绝记录", async () => {
+    writeDesktopState();
+    vi.mocked(desktopIpc.currentResultContext).mockResolvedValue(validResultContext({
+      resultTurnId: "00000000-0000-4000-8000-000000000104",
+      runtimeStatus: "idle", resultTurnStatus: "completed",
+    }));
+    await expect(recordDesktopResult(workspace, input())).rejects.toMatchObject({ code: "DESKTOP_RESULT_CURRENT_EXECUTION" });
+    expect(fs.existsSync(recordsFile())).toBe(false);
+    expect(listExecutionOutputs(workspace.id)).toEqual([]);
+  });
+
+  it("写入前 result context 切换到新 turn 时拒绝且不落盘", async () => {
+    writeDesktopState();
+    vi.mocked(desktopIpc.currentResultContext)
+      .mockResolvedValueOnce(validResultContext())
+      .mockResolvedValueOnce(validResultContext({ resultTurnId: "00000000-0000-4000-8000-000000000104" }));
+    await expect(recordDesktopResult(workspace, input())).rejects.toMatchObject({ code: "DESKTOP_RESULT_CURRENT_EXECUTION" });
     expect(fs.existsSync(recordsFile())).toBe(false);
     expect(listExecutionOutputs(workspace.id)).toEqual([]);
   });
@@ -235,14 +282,14 @@ describe("Desktop execution result", () => {
     writeDesktopState();
     process.env.CODEX_THREAD_ID = otherThreadId;
     let called = false;
-    vi.mocked(desktopIpc.currentExecution).mockImplementation(async () => { called = true; return validCurrentExecution(); });
+    vi.mocked(desktopIpc.currentResultContext).mockImplementation(async () => { called = true; return validResultContext(); });
     await expect(recordDesktopResult(workspace, input())).rejects.toMatchObject({ code: "DESKTOP_RESULT_THREAD" });
     expect(called).toBe(false);
     expect(fs.existsSync(recordsFile())).toBe(false);
     expect(listExecutionOutputs(workspace.id)).toEqual([]);
   });
 
-  it("相同完整输入重试幂等，但后续 active turn 仍拒绝重放", async () => {
+  it("相同完整输入重试幂等，但后续 turn 仍拒绝重放", async () => {
     writeDesktopState();
     const first = await recordDesktopResult(workspace, input());
     const recordsBefore = fs.readFileSync(recordsFile(), "utf8");
@@ -256,7 +303,7 @@ describe("Desktop execution result", () => {
     expect(fs.readFileSync(recordsFile(), "utf8")).toBe(recordsBefore);
     expect(listExecutionOutputs(workspace.id)).toEqual(outputsBefore);
 
-    vi.mocked(desktopIpc.currentExecution).mockResolvedValue(validCurrentExecution({ activeTurnId: "00000000-0000-4000-8000-000000000104" }));
+    vi.mocked(desktopIpc.currentResultContext).mockResolvedValue(validResultContext({ resultTurnId: "00000000-0000-4000-8000-000000000104" }));
     await expect(recordDesktopResult(workspace, input())).rejects.toMatchObject({ code: "DESKTOP_RESULT_CURRENT_EXECUTION" });
     expect(fs.readFileSync(recordsFile(), "utf8")).toBe(recordsBefore);
     expect(listExecutionOutputs(workspace.id)).toEqual(outputsBefore);
@@ -352,7 +399,7 @@ describe("Desktop execution result", () => {
     const script = path.join(stateDir, "desktop-result-worker.mjs");
     fs.writeFileSync(script, `import { recordDesktopResult } from ${JSON.stringify(moduleUrl)};
 import { desktopIpc } from ${JSON.stringify(pathToFileURL(path.resolve("src/desktop/ipc.ts")).href)};
-desktopIpc.currentExecution = async () => (${JSON.stringify(validCurrentExecution())});
+desktopIpc.currentResultContext = async () => (${JSON.stringify(validResultContext())});
 await recordDesktopResult(${JSON.stringify(workspace)}, ${JSON.stringify(input())});
 `);
     const results = await Promise.all(Array.from({ length: 6 }, () => child(script)));

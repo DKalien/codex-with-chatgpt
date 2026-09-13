@@ -121,3 +121,44 @@ it("CLI 无需ID参数成功，拒绝target覆盖和免确认选项", async () =
   }
   expect(desktopIpc.confirmCurrent).toHaveBeenCalledTimes(1);
 });
+
+it("CLI compatibility JSON 只读诊断，接受 workspace 参数但不初始化状态", async () => {
+  const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+  const compatibility = {
+    observedDesktopVersion: "26.903.9818.0",
+    observedAppServerVersion: "0.153.4",
+    status: "current" as const,
+    profile: "desktop-ipc-v1",
+  };
+  vi.spyOn(desktopIpc, "compatibility").mockResolvedValue(compatibility);
+  const program = new Command().exitOverride(); registerDesktopCommands(program);
+  await program.parseAsync(["node", "c2c", "desktop", "compatibility", "-w", workspace.root, "--json"]);
+  expect(JSON.parse(String(out.mock.calls[0][0]))).toEqual({ ok: true, ...compatibility });
+  expect(desktopIpc.compatibility).toHaveBeenCalledOnce();
+  expect(bytes()).toBeNull();
+});
+
+it("CLI bind-current 错误只输出安全 compatibility 投影", async () => {
+  const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+  const failure = new DesktopError("DESKTOP_VERSION_UNSUPPORTED", "secret token pipe");
+  (failure as DesktopError & { compatibility: unknown }).compatibility = {
+    observedDesktopVersion: "26.903.9818.0",
+    observedAppServerVersion: "0.153.4",
+    status: "incompatible",
+    profile: "desktop-ipc-v1",
+    token: "secret-token",
+    pipe: "\\\\.\\pipe\\secret",
+  };
+  vi.mocked(desktopIpc.currentIdentity).mockRejectedValue(failure);
+  const program = new Command().exitOverride(); registerDesktopCommands(program);
+  await program.parseAsync(["node", "c2c", "desktop", "bind-current", "--json"]);
+  const payload = JSON.parse(String(out.mock.calls[0][0])) as Record<string, unknown>;
+  expect(payload).toMatchObject({ ok: false, error: "DESKTOP_VERSION_UNSUPPORTED", compatibility: {
+    observedDesktopVersion: "26.903.9818.0", observedAppServerVersion: "0.153.4",
+    status: "incompatible", profile: "desktop-ipc-v1",
+  } });
+  expect(payload).not.toHaveProperty("token");
+  expect(payload).not.toHaveProperty("pipe");
+  expect(String(payload.message)).not.toContain("secret");
+  expect(bytes()).toBeNull();
+});

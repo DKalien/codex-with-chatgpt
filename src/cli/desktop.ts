@@ -2,8 +2,13 @@ import type { Command } from "commander";
 import fs from "node:fs";
 import { Workspace } from "../workspace/manager.js";
 import { bindCurrentDesktop, bindDesktop, desktopStatus, disableDesktop, enableDesktop } from "../desktop/service.js";
+import { desktopCompatibilityFromError, desktopIpc, DESKTOP_IPC_ERROR_MESSAGES } from "../desktop/ipc.js";
 import { DesktopError, targetInput } from "../desktop/store.js";
 import { recordDesktopResult } from "../desktop/result.js";
+import { LegacyReconciliationError, listLegacyReconciliations, reconcileLegacyAccepted } from "../desktop/legacy-reconciliation.js";
+import { retireLegacyAccepted } from "../desktop/legacy-retirement.js";
+import { abandonHistoricalAccepted, previewAbandonment } from "../desktop/abandonment.js";
+import { listDesktopHistory } from "../desktop/history.js";
 
 const say = (message: string): void => { process.stdout.write(`${message}\n`); };
 
@@ -14,6 +19,90 @@ function workspaceRoot(option?: string): string {
 function print(payload: unknown, json: boolean, message: string): void {
   if (json) say(JSON.stringify(payload));
   else say(message);
+}
+
+const SAFE_CLI_ERROR_MESSAGES: Record<string, string> = {
+  ...DESKTOP_IPC_ERROR_MESSAGES,
+  DESKTOP_BINDING_CHANGED: "确认期间本机状态发生变化；未覆盖撤权或重新绑定，请重新操作。",
+  DESKTOP_OUTCOME_UNRESOLVED: "已有结果不明的投递；不要更换 commandId 或重新绑定绕过，须在 Desktop 人工核对。",
+  DESKTOP_HISTORY_FULL: "投递历史容量已满；保留 ID，须人工迁移后继续。",
+  DESKTOP_STATE_CORRUPT: "Desktop 状态损坏或已初始化的历史缺失；保留文件并人工核对，不能重置投递 ID。",
+  DESKTOP_STORE_BUSY: "Desktop 状态写锁繁忙；遗留锁须人工核对进程和历史后恢复，不要删除投递记录。",
+  DESKTOP_DISABLED: "本机 Desktop Control 未启用或已撤权。",
+  DESKTOP_BINDING_MISMATCH: "bindingId 已失效；不能自动切换到新的投递目标。",
+  DESKTOP_WRONG_WORKSPACE: "当前工作区与保存的绑定根目录不一致。",
+  LEGACY_RECONCILIATION_INVALID: "legacy accepted reconciliation 的 commandId 无效。",
+  LEGACY_RECONCILIATION_NOT_ELIGIBLE: "该历史 Desktop delivery 不满足严格 legacy reconciliation 条件。",
+  LEGACY_RECONCILIATION_CONFLICT: "legacy reconciliation 事实存在冲突；未覆盖原证据。",
+  LEGACY_RECONCILIATION_RECORDS_CORRUPT: "execution JSONL 损坏或不完整；未写入 legacy reconciliation 证据。",
+  LEGACY_RECONCILIATION_OUTPUT_CORRUPT: "execution output index 损坏；未写入 legacy reconciliation 证据。",
+  LEGACY_RECONCILIATION_STORE_CORRUPT: "legacy reconciliation 证据存储损坏或未完成；未覆盖原证据。",
+  LEGACY_RECONCILIATION_BUSY: "legacy reconciliation 写锁繁忙；请稍后重试。",
+  LEGACY_RETIREMENT_INVALID: "legacy retirement 参数无效；未修改状态。",
+  LEGACY_RETIREMENT_NOT_ELIGIBLE: "该历史 Desktop delivery 不满足严格 legacy retirement 条件。",
+  LEGACY_RETIREMENT_CONFLICT: "legacy retirement 事实存在冲突；未覆盖原证据。",
+  LEGACY_RETIREMENT_DESKTOP_CORRUPT: "Desktop 状态损坏；未写入 legacy retirement 证据。",
+  LEGACY_RETIREMENT_RECORDS_CORRUPT: "execution JSONL 损坏或不完整；未写入 legacy retirement 证据。",
+  LEGACY_RETIREMENT_OUTPUT_CORRUPT: "execution output index 损坏；未写入 legacy retirement 证据。",
+  LEGACY_RETIREMENT_STORE_CORRUPT: "legacy retirement 证据存储损坏或未完成；未覆盖原证据。",
+  LEGACY_RETIREMENT_STORE_WRITE: "legacy retirement 证据提交失败；保留原文件并人工核对。",
+  LEGACY_RETIREMENT_IPC: "无法安全确认当前 Desktop maintenance context；未写入 legacy retirement 证据。",
+  LEGACY_RETIREMENT_BUSY: "legacy retirement 写锁繁忙；请稍后重试。",
+  DESKTOP_ABANDONMENT_INVALID: "abandonment 参数无效；未修改状态。",
+  DESKTOP_ABANDONMENT_NOT_ELIGIBLE: "指定 Desktop 投递不满足 abandonment 条件；未修改状态。",
+  DESKTOP_ABANDONMENT_CONFLICT: "abandonment 事实存在冲突；未覆盖原证据。",
+  DESKTOP_ABANDONMENT_CONFIRMATION_INVALID: "confirmation 摘要必须是 64 位十六进制值；未修改状态。",
+  DESKTOP_ABANDONMENT_CONFIRMATION_MISMATCH: "confirmation 摘要不匹配；未修改状态。",
+  DESKTOP_ABANDONMENT_STORE_CORRUPT: "abandonment 证据存储损坏；未覆盖原证据。",
+  DESKTOP_ABANDONMENT_STORE_WRITE: "abandonment 证据提交失败；保留原文件并人工核对。",
+  DESKTOP_ABANDONMENT_DESKTOP_CORRUPT: "Desktop 状态损坏；保留文件并人工核对。",
+  DESKTOP_ABANDONMENT_RECORDS_CORRUPT: "execution JSONL 损坏或不完整；未写入 abandonment 证据。",
+  DESKTOP_ABANDONMENT_OUTPUT_CORRUPT: "execution output index 损坏或不完整；未写入 abandonment 证据。",
+  DESKTOP_ABANDONMENT_RECONCILIATION_CORRUPT: "reconciliation 证据无法安全读取；未写入 abandonment 证据。",
+  DESKTOP_ABANDONMENT_RETIREMENT_CORRUPT: "retirement 证据无法安全读取；未写入 abandonment 证据。",
+  DESKTOP_ABANDONMENT_IPC: "无法安全确认当前 Desktop maintenance context；未写入 abandonment 证据。",
+  DESKTOP_ABANDONMENT_BUSY: "abandonment 写锁繁忙；请稍后重试。",
+  DESKTOP_HISTORY_CONFLICT: "Desktop 历史存在冲突；未修改状态。",
+  DESKTOP_HISTORY_CORRUPT: "Desktop 历史损坏或不完整；未修改状态。",
+};
+
+const ABANDONMENT_NOTICE = "仅停止等待，不代表完成/成功";
+
+function parseAbandonmentCommandIds(value: string): string[] {
+  const commandIds = value.split(",");
+  if (commandIds.some(commandId => commandId.length === 0 || commandId.trim() !== commandId ||
+    !/^[A-Za-z0-9_-]{1,128}$/u.test(commandId))) {
+    throw new DesktopError("DESKTOP_ABANDONMENT_INVALID", "commandIds 必须是逗号分隔的非空 commandId，不能含空白。" );
+  }
+  if (new Set(commandIds).size !== commandIds.length) {
+    throw new DesktopError("DESKTOP_ABANDONMENT_INVALID", "commandIds 不能重复；未自动去重。" );
+  }
+  return commandIds;
+}
+
+function parseAbandonmentConfirmation(value?: string): string | undefined {
+  if (value !== undefined && !/^[a-f0-9]{64}$/u.test(value)) {
+    throw new DesktopError("DESKTOP_ABANDONMENT_CONFIRMATION_INVALID", "confirmation 摘要必须是 64 位十六进制值。" );
+  }
+  return value;
+}
+
+function safeCliError(error: unknown, fallbackCode: string, fallbackMessage: string): {
+  code: string;
+  message: string;
+  compatibility?: ReturnType<typeof desktopCompatibilityFromError>;
+} {
+  const candidate = error instanceof DesktopError ? error.code : undefined;
+  const known = candidate !== undefined && Object.prototype.hasOwnProperty.call(SAFE_CLI_ERROR_MESSAGES, candidate);
+  const message = known ? SAFE_CLI_ERROR_MESSAGES[candidate!] : fallbackMessage;
+  const code = known ? candidate! : fallbackCode;
+  const compatibility = desktopCompatibilityFromError(error);
+  return { code, message, ...(compatibility ? { compatibility } : {}) };
+}
+
+function compatibilityMessage(message: string, compatibility?: ReturnType<typeof desktopCompatibilityFromError>): string {
+  if (!compatibility) return message;
+  return `${message} Desktop：${compatibility.observedDesktopVersion ?? "unknown"}；app-server：${compatibility.observedAppServerVersion ?? "unknown"}；profile：${compatibility.profile ?? "unknown"}。`;
 }
 
 export function registerDesktopCommands(program: Command): void {
@@ -66,6 +155,81 @@ export function registerDesktopCommands(program: Command): void {
       }
     });
 
+  desktop.command("legacy-reconcile")
+    .description("一次性核对 receipt 上线前的历史 accepted Desktop delivery（不会触发 rollout）")
+    .option("-w, --workspace <path>", "workspace 根目录")
+    .option("--command-id <id>", "要核对的历史 accepted commandId；与 --list 互斥")
+    .option("--list", "只读列出 legacy accepted 的核对状态", false)
+    .option("--json", "输出机器可读结果", false)
+    .action((opts: { workspace?: string; commandId?: string; list: boolean; json: boolean }) => {
+      try {
+        if (opts.list === (opts.commandId !== undefined)) {
+          throw new LegacyReconciliationError("LEGACY_RECONCILIATION_INVALID", "必须且只能选择 --list 或 --command-id。");
+        }
+        const workspace = new Workspace(workspaceRoot(opts.workspace));
+        if (opts.list) {
+          const items = listLegacyReconciliations(workspace);
+          print({ ok: true, items }, opts.json, items.map(item => `${item.commandId}: ${item.status}`).join("\n") || "没有 legacy accepted 候选。");
+          return;
+        }
+        const result = reconcileLegacyAccepted(workspace, opts.commandId!);
+        print({ ok: true, ...result }, opts.json,
+          result.status === "already_reconciled" ? "legacy reconciliation 证据已存在且重新核对一致。" : "已写入 legacy reconciliation 证据；未修改 Desktop delivery。" );
+      } catch (error) {
+        const code = error instanceof DesktopError ? error.code : "LEGACY_RECONCILIATION_INVALID";
+        const message = opts.list ? (SAFE_CLI_ERROR_MESSAGES[code] ?? "legacy 发现失败；未修改状态。") :
+          error instanceof LegacyReconciliationError ? error.message : "legacy reconciliation 失败；未写入证据。";
+        print({ ok: false, error: code, message }, opts.json, message);
+        process.exitCode = 1;
+      }
+    });
+
+  desktop.command("legacy-retire")
+    .description("处置缺失执行证据的旧 accepted 等待项；不表示任务完成或成功")
+    .option("-w, --workspace <path>", "workspace 根目录")
+    .requiredOption("--command-id <id>", "明确要处置的历史 accepted commandId")
+    .option("--ownerless", "明确处置没有可确认 owner 的历史 accepted 投递", false)
+    .option("--json", "输出机器可读结果", false)
+    .action(async (opts: { workspace?: string; commandId: string; ownerless: boolean; json: boolean }) => {
+      try {
+        const workspace = new Workspace(workspaceRoot(opts.workspace));
+        const result = opts.ownerless
+          ? await retireLegacyAccepted(workspace, opts.commandId, { ownerless: true })
+          : await retireLegacyAccepted(workspace, opts.commandId);
+        print({ ok: true, ...result }, opts.json, "已核对历史等待处置证据；不代表完成或成功，rollout 仍需实时检查。");
+      } catch (error) {
+        const code = error instanceof DesktopError ? error.code : "LEGACY_RETIREMENT_INVALID";
+        print({ ok: false, error: code, message: "历史等待处置被拒绝；未覆盖证据，不表示完成或成功。" }, opts.json, "历史等待处置被拒绝；请保留证据并核对。");
+        process.exitCode = 1;
+      }
+    });
+
+  desktop.command("abandon")
+    .description(`行政处置明确指定的历史 accepted Desktop delivery；${ABANDONMENT_NOTICE}`)
+    .option("-w, --workspace <path>", "workspace 根目录")
+    .requiredOption("--command-ids <ids>", "逗号分隔的精确 commandId 列表；禁止重复或空白项")
+    .option("--confirm <sha256>", "preview 返回的 64 位 confirmationSha256；省略则只读预览")
+    .option("--json", "输出机器可读结果", false)
+    .action(async (opts: { workspace?: string; commandIds: string; confirm?: string; json: boolean }) => {
+      try {
+        const commandIds = parseAbandonmentCommandIds(opts.commandIds);
+        const confirmationSha256 = parseAbandonmentConfirmation(opts.confirm);
+        const workspace = new Workspace(workspaceRoot(opts.workspace));
+        if (confirmationSha256 === undefined) {
+          const preview = await previewAbandonment(workspace, commandIds);
+          print({ ok: true, ...preview }, opts.json,
+            `${preview.notice || ABANDONMENT_NOTICE}\ncommandIds: ${preview.commandIds.join(",")}\n--confirm ${preview.confirmationSha256}`);
+          return;
+        }
+        const result = await abandonHistoricalAccepted(workspace, commandIds, confirmationSha256);
+        print({ ok: true, ...result }, opts.json, `已写入 abandonment 证据；${ABANDONMENT_NOTICE}`);
+      } catch (error) {
+        const failure = safeCliError(error, "DESKTOP_ABANDONMENT_FAILED", "abandonment 操作失败；未覆盖原证据。" );
+        print({ ok: false, error: failure.code, message: failure.message }, opts.json, failure.message);
+        process.exitCode = 1;
+      }
+    });
+
   desktop.command("bind-current")
     .description("识别当前 Desktop 会话，经本机确认后绑定并启用")
     .option("-w, --workspace <path>", "workspace 根目录")
@@ -76,9 +240,10 @@ export function registerDesktopCommands(program: Command): void {
         print({ ok: true, ...result }, opts.json, result.alreadyEnabled ?
           "当前会话已绑定并启用，ChatGPT 可以向这里发送任务。" : "已绑定并启用当前会话，ChatGPT 现在可以向这里发送任务。");
       } catch (error) {
-        const code = error instanceof DesktopError ? error.code : "DESKTOP_CURRENT_CONTEXT_INVALID";
-        const message = error instanceof DesktopError ? error.message : "无法确认当前 Desktop 会话；未绑定或启用。";
-        print({ ok: false, error: code, message }, opts.json, message);
+        const failure = safeCliError(error, "DESKTOP_CURRENT_CONTEXT_INVALID", "无法确认当前 Desktop 会话；未绑定或启用。");
+        print({ ok: false, error: failure.code, message: failure.message,
+          ...(failure.compatibility ? { compatibility: failure.compatibility } : {}) }, opts.json,
+        compatibilityMessage(failure.message, failure.compatibility));
         process.exitCode = 1;
       }
     });
@@ -136,5 +301,43 @@ export function registerDesktopCommands(program: Command): void {
       const workspace = new Workspace(workspaceRoot(opts.workspace));
       const status = await desktopStatus(workspace, opts.commandId);
       print({ ok: true, ...status }, opts.json, `Desktop Control：${status.enabled ? "已启用" : "未启用"}；绑定：${status.binding?.title ?? "无"}；可用性：${status.availability.available ? "可用" : "不可用"}。`);
+    });
+
+  desktop.command("history")
+    .description("只读列出 Desktop delivery 的统一历史状态")
+    .option("-w, --workspace <path>", "workspace 根目录")
+    .option("--json", "输出机器可读结果", false)
+    .action((opts: { workspace?: string; json: boolean }) => {
+      try {
+        const items = listDesktopHistory(new Workspace(workspaceRoot(opts.workspace)))
+          .map(({ commandId, status }) => ({ commandId, status }));
+        print({ ok: true, items }, opts.json,
+          items.map(item => `${item.commandId}: ${item.status}`).join("\n") || "没有 Desktop history 条目。");
+      } catch (error) {
+        const failure = safeCliError(error, "DESKTOP_HISTORY_INVALID", "无法读取 Desktop 历史；未修改状态。" );
+        print({ ok: false, error: failure.code, message: failure.message }, opts.json, failure.message);
+        process.exitCode = 1;
+      }
+    });
+
+  desktop.command("compatibility")
+    .description("只读诊断本机 Desktop/app-server 兼容性")
+    .option("-w, --workspace <path>", "兼容参数；诊断不读取 workspace 状态")
+    .option("--json", "输出机器可读结果", false)
+    .action(async (opts: { workspace?: string; json: boolean }) => {
+      try {
+        const compatibility = await desktopIpc.compatibility();
+        const observedDesktopVersion = compatibility.observedDesktopVersion ?? "unknown";
+        const observedAppServerVersion = compatibility.observedAppServerVersion ?? "unknown";
+        const profile = compatibility.profile ?? "unknown";
+        print({ ok: true, ...compatibility }, opts.json,
+          `Desktop 兼容性：${compatibility.status}；Desktop：${observedDesktopVersion}；app-server：${observedAppServerVersion}；profile：${profile}。`);
+      } catch (error) {
+        const failure = safeCliError(error, "DESKTOP_IPC_UNAVAILABLE", "无法读取本机 Desktop 兼容性；没有发送消息。");
+        print({ ok: false, error: failure.code, message: failure.message,
+          ...(failure.compatibility ? { compatibility: failure.compatibility } : {}) }, opts.json,
+        compatibilityMessage(failure.message, failure.compatibility));
+        process.exitCode = 1;
+      }
     });
 }

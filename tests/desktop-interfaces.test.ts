@@ -251,8 +251,20 @@ describe("Desktop MCP 与本地接口", () => {
     const program = new Command();
     registerDesktopCommands(program);
     const desktop = program.commands.find(command => command.name() === "desktop");
-    expect(desktop?.commands.map(command => command.name())).toEqual(["record-result", "bind-current", "bind", "enable", "disable", "status"]);
+    expect(desktop?.commands.map(command => command.name())).toEqual(["record-result", "legacy-reconcile", "legacy-retire", "abandon", "bind-current", "bind", "enable", "disable", "status", "history", "compatibility"]);
     expect(desktop?.commands.find(command => command.name() === "enable")?.options.map(option => option.long)).toContain("--accept-desktop-permissions");
+    expect(desktop?.commands.find(command => command.name() === "legacy-reconcile")?.options.map(option => option.long)).toEqual([
+      "--workspace", "--command-id", "--list", "--json",
+    ]);
+    expect(desktop?.commands.find(command => command.name() === "legacy-retire")?.options.find(option => option.long === "--command-id")?.mandatory).toBe(true);
+    expect(desktop?.commands.find(command => command.name() === "abandon")?.options.map(option => option.long)).toEqual([
+      "--workspace", "--command-ids", "--confirm", "--json",
+    ]);
+    expect(desktop?.commands.find(command => command.name() === "abandon")?.options.find(option => option.long === "--command-ids")?.mandatory).toBe(true);
+    expect(desktop?.commands.find(command => command.name() === "abandon")?.options.map(option => option.long)).not.toContain("--all");
+    expect(desktop?.commands.find(command => command.name() === "history")?.options.map(option => option.long)).toEqual([
+      "--workspace", "--json",
+    ]);
   });
 
   it("CLI 解析时拒绝没有确认参数的 enable 和缺少目标的 bind", async () => {

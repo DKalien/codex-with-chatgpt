@@ -115,6 +115,26 @@ function observePid(pid: number): "present" | "missing" | "unknown" {
   }
 }
 
+async function authenticateRuntimeIdentity(runtime: RuntimeState, health: HealthPayload): Promise<boolean> {
+  if (health.pid !== runtime.pid || typeof health.startedAt !== "string" || health.startedAt !== runtime.startedAt)
+    return false;
+  if (health.runtimeBuildId !== undefined && runtime.runtimeBuildId !== undefined && health.runtimeBuildId !== runtime.runtimeBuildId)
+    return false;
+  try {
+    const info = await adminFetch<Partial<RuntimeState>>(runtime, "GET", "/admin/info", 2000);
+    if (info.service !== runtime.service || info.workspaceId !== runtime.workspaceId ||
+      info.workspaceRoot !== runtime.workspaceRoot || info.pid !== runtime.pid ||
+      info.startedAt !== runtime.startedAt || info.port !== runtime.port ||
+      (runtime.runtimeBuildId !== undefined && info.runtimeBuildId !== runtime.runtimeBuildId)) return false;
+    const confirmed = await probeBridge(runtime.port);
+    return !!confirmed && confirmed.status === "ok" && confirmed.workspaceId === runtime.workspaceId &&
+      confirmed.pid === runtime.pid && confirmed.startedAt === runtime.startedAt &&
+      (runtime.runtimeBuildId === undefined || confirmed.runtimeBuildId === runtime.runtimeBuildId);
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Distinguish a dead bridge from a probe that simply failed.
  * Read-only: never starts, stops, or clears runtime.
@@ -159,6 +179,8 @@ export async function findBridgeObservation(workspaceId: string): Promise<Bridge
         // 旧 health 不是授权证明；认证失败、重定向或端口复用均保持 unknown。
       }
     }
+    if (!legacy && identified && samePid && pid === "unknown" && Number.isFinite(savedStart) &&
+      await authenticateRuntimeIdentity(runtime, health)) return { state: "healthy", runtime };
     if (pid === "present" && identified && samePid && sameStart) return { state: "healthy", runtime };
     return { state: "unknown", runtime, reason: "identity_mismatch" };
   }

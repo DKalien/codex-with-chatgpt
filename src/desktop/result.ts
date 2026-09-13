@@ -4,10 +4,10 @@ import { listExecutionOutputs, saveExecutionOutput, type ExecutionOutputMeta } f
 import {
   appendExecutionRecordLocked,
   readExecutionRecordsStrict,
-  withExecutionRecordsLock,
+  withExecutionRecordsLockAsync,
   type StoredExecutionRecord,
 } from "../execution/records.js";
-import { desktopIpc, type DesktopExecutionInfo } from "./ipc.js";
+import { desktopIpc, type DesktopResultContext } from "./ipc.js";
 import {
   DesktopError,
   desktopId,
@@ -47,6 +47,12 @@ export interface DesktopResultReceipt {
 
 const uuid = z.string().uuid();
 const workspaceInput = z.object({ id: desktopId, root: z.string().min(1) });
+const RESULT_CONTEXT_ATTEMPTS = 3;
+const RESULT_CONTEXT_RETRY_DELAY_MS = 25;
+
+function waitForResultContextRetry(): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, RESULT_CONTEXT_RETRY_DELAY_MS));
+}
 
 function currentThreadId(): string {
   const value = process.env.CODEX_THREAD_ID;
@@ -75,23 +81,34 @@ function strictUuid(value: unknown): value is string {
   return typeof value === "string" && value === value.toLowerCase() && uuid.safeParse(value).success;
 }
 
-async function assertCurrentExecution(
+async function assertCurrentResultContext(
   workspace: DesktopResultWorkspace,
   accepted: DesktopDelivery,
 ): Promise<void> {
   let current: unknown;
-  try {
-    current = await desktopIpc.currentExecution(workspace.root);
-  } catch (error) {
-    if (error instanceof DesktopError) throw error;
-    throw new DesktopResultError("DESKTOP_RESULT_CURRENT_EXECUTION", "无法确认当前 Desktop execution；拒绝记录执行结果。");
+  for (let attempt = 1; attempt <= RESULT_CONTEXT_ATTEMPTS; attempt += 1) {
+    try {
+      current = await desktopIpc.currentResultContext(workspace.root);
+      break;
+    } catch (error) {
+      const retryable = error instanceof DesktopError && error.code === "DESKTOP_STATE_UNAVAILABLE";
+      if (!retryable || attempt === RESULT_CONTEXT_ATTEMPTS) {
+        if (error instanceof DesktopError) throw error;
+        throw new DesktopResultError("DESKTOP_RESULT_CURRENT_EXECUTION", "无法确认当前 Desktop result context；拒绝记录执行结果。");
+      }
+      await waitForResultContextRetry();
+    }
   }
-  const execution = current as Partial<DesktopExecutionInfo> | null;
-  if (!execution || typeof execution !== "object" || Array.isArray(execution) ||
-      !strictUuid(execution.threadId) || !strictUuid(execution.activeTurnId) ||
-      execution.workspaceRoot !== workspace.root ||
-      execution.threadId !== accepted.threadId || execution.activeTurnId !== accepted.turnId) {
-    throw new DesktopResultError("DESKTOP_RESULT_CURRENT_EXECUTION", "当前 Desktop execution 与 accepted 投递的 thread、workspace 或 active turn 不一致；拒绝记录执行结果。");
+  const context = current as Partial<DesktopResultContext> | null;
+  const terminal = context?.resultTurnStatus === "completed" || context?.resultTurnStatus === "failed" ||
+    context?.resultTurnStatus === "interrupted" || context?.resultTurnStatus === "cancelled";
+  if (!context || typeof context !== "object" || Array.isArray(context) ||
+      !strictUuid(context.threadId) || !strictUuid(context.resultTurnId) ||
+      context.workspaceRoot !== workspace.root ||
+      context.threadId !== accepted.threadId || context.resultTurnId !== accepted.turnId ||
+      (context.runtimeStatus === "idle" && !terminal) ||
+      ((context.runtimeStatus === "active" || context.runtimeStatus === "inProgress") && context.resultTurnStatus !== "inProgress")) {
+    throw new DesktopResultError("DESKTOP_RESULT_CURRENT_EXECUTION", "当前 Desktop result context 与 accepted 投递的 thread、workspace 或 turn 不一致；拒绝记录执行结果。");
   }
 }
 
@@ -157,7 +174,7 @@ function hasPartialOutput(workspaceId: string, taskId: string): boolean {
 
 /**
  * 记录已由 Desktop 接受的本次结果。CODEX_THREAD_ID 仅提供调用线程候选，
- * 还必须通过新鲜 currentExecution 与同工作区历史 accepted delivery 的 turn 校验；
+ * 还必须通过新鲜 current result context 与同工作区历史 accepted delivery 的 turn 校验；
  * 不信任当前 enabled/binding。
  */
 export async function recordDesktopResult(
@@ -168,11 +185,11 @@ export async function recordDesktopResult(
   const input = desktopResultInput.parse(rawInput);
   const threadId = currentThreadId();
   const accepted = assertDesktopResultContext(workspace, input.commandId, threadId);
-  await assertCurrentExecution(workspace, accepted);
+  await assertCurrentResultContext(workspace, accepted);
 
   const taskId = `desktop_${input.commandId}`;
   const digest = receiptHash(input);
-  return withExecutionRecordsLock(workspace.id, () => {
+  return withExecutionRecordsLockAsync(workspace.id, async () => {
     // execution 锁只串行化记录；在输出或追加前再次验证状态，避免校验后 workspace 被撤权/损坏。
     const acceptedNow = assertDesktopResultContext(workspace, input.commandId, threadId);
     if (acceptedNow.turnId !== accepted.turnId) {
@@ -186,11 +203,15 @@ export async function recordDesktopResult(
     }
 
     const prior = existingRecord(records, input.commandId, taskId, digest);
-    if (prior) return { record: prior, output: outputForRecord(workspace.id, prior) };
+    if (prior) {
+      await assertCurrentResultContext(workspace, acceptedNow);
+      return { record: prior, output: outputForRecord(workspace.id, prior) };
+    }
     if (hasPartialOutput(workspace.id, taskId)) {
       return failClosed("DESKTOP_RESULT_PARTIAL", "已有未完成的 Desktop 结果输出但缺少执行记录；拒绝追加或覆盖，请人工核对。");
     }
 
+    await assertCurrentResultContext(workspace, acceptedNow);
     // 输出先提交；若随后记录追加中断，下次会通过 taskId 发现孤立 output 并 fail closed。
     const output = input.output === undefined ? null : saveExecutionOutput(workspace.id, {
       command: input.command ?? `Desktop result ${input.commandId}`,

@@ -29,6 +29,31 @@ Do not interrupt an active Review Bridge to clear pending status.
 
 ## Common situations
 
+### 普通权限无法停止管理员 Bridge
+
+Windows 普通权限对管理员进程执行 PID 存活探测可能得到 `unknown`。当 `/health` 的
+workspace、PID、startedAt 与保存的 runtime 精确一致时，CLI 会使用保存的 loopback
+admin token 请求 `/admin/info`，再次核对 workspaceRoot、端口、runtimeBuildId 和身份，
+并复查 health 后才允许现有认证 `/admin/shutdown`。认证失败、字段缺失或任一身份变化
+仍保持 unknown；不会按 PID kill、猜测端口或跨 workspace 操作。此流程只管理 Bridge
+生命周期，不放宽 Desktop IPC 的 `DESKTOP_ELEVATED`，因此正常启动应使用普通权限终端。
+
+### 历史 Desktop delivery 阻塞 rollout
+
+Core rollout 始终检查当前 binding 的实时 idle/approval 状态。历史 accepted delivery
+存在本机严格 execution JSONL 中唯一的 Desktop receipt（exact commandId、
+`taskId=desktop_<commandId>`、iteration 1、stored-only `desktopReceiptSha256`），或严格重验通过的
+reconciliation / 显式 abandonment 时跳过对应旧 thread inspect。retired 仍按其证据类型实时检查。
+普通 `c2c record` 不构成完成证明，仍回退到 live inspect；损坏或重复记录 fail-closed。
+同一旧 thread 仍有未解决 accepted 时仍需 inspect，无法确认则 `desktop_unknown`。
+failed/blocked receipt 只证明该 delivery 已有终态，不表示测试通过；不会改写历史或自动补记。
+
+receipt 机制上线前的旧 accepted delivery 如果旧 thread 已无法安全 inspect，可先人工确认其
+`commandId`，再显式运行 `c2c desktop legacy-reconcile -w <workspace> --command-id <id> --json`。
+它只核对缺失 `intent` 的历史 delivery，并要求唯一终态 execution record、对应 output index
+元数据和晚于 accepted 时间的本机事实；证据写入独立本机存储，失败、冲突或损坏时不覆盖既有证据。
+含 `intent` 的当前/未来 delivery、普通 `c2c record`、缺 output 或 `outcome_unknown` 仍不能通过。
+
 ### "Bridge 未运行"
 `c2c start` (or let doctor do it). Bridge logs:
 `c2c logs`, or verbose: `c2c logs --verbose`.

@@ -5,6 +5,11 @@ const skill = fs.readFileSync(new URL("../skill/SKILL.md", import.meta.url), "ut
 const activation = skill.split('## Workflow: Activation（"启用 ChatGPT 工作流"）')[1]?.split("## Workflow: first-time setup")[0] ?? "";
 
 describe("Activation Skill 文本契约", () => {
+  it("Desktop 版本拒绝报告真实观察值，不以 OAuth 兼容状态替代协议核验", () => {
+    for (const text of ["DESKTOP_VERSION_UNSUPPORTED", "observedDesktopVersion", "observedAppServerVersion",
+      "c2c desktop compatibility --json", "不是 OAuth `desktopCompatibility`", "不自动添加 profile"])
+      expect(activation).toContain(text);
+  });
   it("机器 launcher 是唯一安装路径，内部 build 更新不迁移 Connector", () => {
     expect(skill.match(/<C2C_LAUNCHER_PATH>/g)).toHaveLength(1);
     expect(skill).not.toContain("<ACTUAL_CHECKOUT_PATH>");

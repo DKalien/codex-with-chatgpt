@@ -29,6 +29,17 @@ const storedExecutionRecordSchema = executionRecordSchema.extend({
 });
 export type StoredExecutionRecord = z.infer<typeof storedExecutionRecordSchema>;
 
+/** 本机 Desktop receipt 的严格终态条件；调用方必须先拒绝重复或冲突记录。 */
+export function isTrustedDesktopReceipt(record: StoredExecutionRecord, commandId: string): boolean {
+  return record.commandId === commandId && record.taskId === `desktop_${commandId}` && record.iteration === 1 &&
+    Array.isArray(record.changedFiles) && record.changedFiles.every(file => typeof file === "string") &&
+    typeof record.tests === "string" && record.tests.trim().length > 0 &&
+    ["ok", "failed", "blocked"].includes(record.exitStatus) &&
+    typeof record.timestamp === "string" && Number.isFinite(Date.parse(record.timestamp)) &&
+    new Date(record.timestamp).toISOString() === record.timestamp &&
+    typeof record.desktopReceiptSha256 === "string" && /^[a-f0-9]{64}$/.test(record.desktopReceiptSha256);
+}
+
 export class ExecutionRecordsBusyError extends Error {
   readonly code = "EXECUTION_RECORDS_BUSY";
   constructor() { super("执行记录写锁繁忙；稍后重试。遗留锁须核对后人工恢复，不要删除历史。"); }
@@ -66,6 +77,31 @@ export function withExecutionRecordsLock<T>(workspaceId: string, action: () => T
   }
 }
 
+/** 对需要在 execution 锁内再次读取 Desktop 状态的结果写入提供 async 事务。 */
+export async function withExecutionRecordsLockAsync<T>(workspaceId: string, action: () => Promise<T>): Promise<T> {
+  const file = `${recordsFile(workspaceId)}.lock`;
+  const deadline = Date.now() + 500;
+  let lock: number;
+  for (;;) {
+    try {
+      lock = fs.openSync(file, "wx", 0o600);
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      if (Date.now() >= deadline) throw new ExecutionRecordsBusyError();
+      await new Promise<void>(resolve => setTimeout(resolve, 10));
+    }
+  }
+  try {
+    fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, createdAt: Date.now() }));
+    fs.fsyncSync(lock);
+    return await action();
+  } finally {
+    try { fs.closeSync(lock); }
+    finally { fs.unlinkSync(file); }
+  }
+}
+
 /** 仅供已持有 withExecutionRecordsLock 的事务追加；普通调用请用 appendExecutionRecord。 */
 export function appendExecutionRecordLocked(workspaceId: string, record: StoredExecutionRecord): void {
   const file = recordsFile(workspaceId);
@@ -87,7 +123,7 @@ export function appendExecutionRecord(workspaceId: string, record: ExecutionReco
  * 或 schema 不合法都停止调用方，避免把部分落盘当作可继续追加的历史。
  */
 export function readExecutionRecordsStrict(workspaceId: string): StoredExecutionRecord[] {
-  const file = recordsFile(workspaceId);
+  const file = path.join(getStateDir(), "executions", `${workspaceId}.jsonl`);
   let raw: string;
   try {
     raw = fs.readFileSync(file, "utf8");

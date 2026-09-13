@@ -37,6 +37,7 @@ class FakePipe:
         self.owner = OWNER
         self.turn_id = NEW_TURN
         self.failure = None
+        self.response_errors = {}
         self.closed = False
         self.server_pid = 100
         self.server_exe = str(Path(target["workspaceRoot"]) / "ChatGPT.exe")
@@ -48,6 +49,10 @@ class FakePipe:
         value = h._Decoder().feed(raw)[0]
         self.frames.append(value)
         method = value.get("method")
+        if method in self.response_errors:
+            self.pending.append(h._frame({"type": "response", "requestId": value["requestId"],
+                "resultType": "error", "error": self.response_errors[method]}))
+            return
         if method == "thread-stream-following-changed":
             self.pending.append(h._frame({"type": "broadcast", "method": "thread-stream-state-changed", "version": 11,
                 "sourceClientId": OWNER, "params": {"conversationId": THREAD, "hostId": "local",
@@ -225,6 +230,333 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "DESKTOP_STATE_UNAVAILABLE")
         self.assertEqual(self.pipe.starts(), [])
 
+    def test_current_result_context_accepts_active_or_complete_latest_terminal_history(self):
+        state_file = Path(self.temp.name) / "global-state.json"
+        state_file.write_text(json.dumps({
+            "thread-project-assignments": {THREAD: {"projectKind": "local", "projectId": "project_test"}},
+            "local-projects": {"project_test": {"rootPaths": [self.temp.name]}},
+        }), encoding="utf-8")
+        canonical = {
+            "turnHistory": {"kind": "canonical", "history": {
+                "islands": [{
+                    "olderBoundary": {"status": "exhausted"},
+                    "entries": [{"value": "turn-1"}, {"value": "turn-2"}],
+                    "newerBoundary": {"status": "exhausted"},
+                }],
+                "entitiesByKey": {
+                    "turn-1": {"turnId": OLD_TURN, "status": "completed"},
+                    "turn-2": {"turnId": NEW_TURN, "status": "failed"},
+                },
+            }},
+        }
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": THREAD, "CODEX_SESSION_ID": THREAD}, clear=False), \
+                patch.object(h, "_global_state_path", return_value=state_file), \
+                patch.object(h, "_verify_current_runner_ancestor"):
+            self.pipe.state.pop("turns", None)
+            self.pipe.state.update(copy.deepcopy(canonical))
+            result = h._current_result_context(self.temp.name)
+            self.assertEqual(result["runtimeStatus"], "idle")
+            self.assertEqual(result["resultTurnId"], NEW_TURN)
+            self.assertEqual(result["resultTurnStatus"], "failed")
+
+            canonical["turnHistory"]["history"]["islands"][0]["olderBoundary"] = {"status": "loading"}
+            self.pipe.state.update(copy.deepcopy(canonical))
+            result = h._current_result_context(self.temp.name)
+            self.assertEqual(result["resultTurnId"], NEW_TURN)
+
+            canonical["turnHistory"]["history"]["islands"] = [
+                {"olderBoundary": {"status": "loading"}, "entries": [{"value": "turn-1"}], "newerBoundary": {"status": "loading"}},
+                {"olderBoundary": {"status": "exhausted"}, "entries": [{"value": "turn-2"}], "newerBoundary": {"status": "exhausted"}},
+            ]
+            self.pipe.state.update(copy.deepcopy(canonical))
+            result = h._current_result_context(self.temp.name)
+            self.assertEqual(result["resultTurnId"], NEW_TURN)
+
+            self.pipe.state.pop("turnHistory", None)
+            self.pipe.state["threadRuntimeStatus"] = {"type": "active"}
+            self.pipe.state["turns"] = [{"turnId": NEW_TURN, "status": "inProgress"}]
+            result = h._current_result_context(self.temp.name)
+            self.assertEqual(result["runtimeStatus"], "active")
+            self.assertEqual(result["resultTurnId"], NEW_TURN)
+            self.assertEqual(result["resultTurnStatus"], "inProgress")
+
+    def test_current_result_context_rejects_incomplete_or_ambiguous_idle_history(self):
+        state_file = Path(self.temp.name) / "global-state.json"
+        state_file.write_text(json.dumps({
+            "thread-project-assignments": {THREAD: {"projectKind": "local", "projectId": "project_test"}},
+            "local-projects": {"project_test": {"rootPaths": [self.temp.name]}},
+        }), encoding="utf-8")
+        base_history = {
+            "kind": "canonical", "history": {
+                "islands": [{
+                    "olderBoundary": {"status": "exhausted"},
+                    "entries": [{"value": "turn-1"}, {"value": "turn-2"}],
+                    "newerBoundary": {"status": "exhausted"},
+                }],
+                "entitiesByKey": {
+                    "turn-1": {"turnId": OLD_TURN, "status": "completed"},
+                    "turn-2": {"turnId": NEW_TURN, "status": "completed"},
+                },
+            },
+        }
+        cases = {
+            "flat": {"turns": [{"turnId": NEW_TURN, "status": "completed"}]},
+            "newer_not_exhausted": {"turnHistory": {**base_history, "history": {
+                **base_history["history"], "islands": [{**base_history["history"]["islands"][0],
+                    "newerBoundary": {"status": "loading"}}],
+            }}},
+            "multiple_islands": {"turnHistory": {**base_history, "history": {
+                **base_history["history"], "islands": base_history["history"]["islands"] * 2,
+            }}},
+            "duplicate_turn_id": {"turnHistory": {**base_history, "history": {
+                **base_history["history"], "entitiesByKey": {
+                    **base_history["history"]["entitiesByKey"], "turn-2": {"turnId": OLD_TURN, "status": "completed"},
+                },
+            }}},
+            "idle_in_progress": {"turnHistory": {**base_history, "history": {
+                **base_history["history"], "entitiesByKey": {
+                    **base_history["history"]["entitiesByKey"], "turn-2": {"turnId": NEW_TURN, "status": "inProgress"},
+                },
+            }}},
+        }
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": THREAD, "CODEX_SESSION_ID": THREAD}, clear=False), \
+                patch.object(h, "_global_state_path", return_value=state_file), \
+                patch.object(h, "_verify_current_runner_ancestor"):
+            for name, update in cases.items():
+                with self.subTest(case=name):
+                    self.pipe.state["threadRuntimeStatus"] = {"type": "idle"}
+                    self.pipe.state.pop("turns", None)
+                    self.pipe.state.pop("turnHistory", None)
+                    self.pipe.state.update(copy.deepcopy(update))
+                    with self.assertRaises(h.DesktopIpcError) as caught:
+                        h._current_result_context(self.temp.name)
+                    self.assertEqual(caught.exception.code, "DESKTOP_STATE_UNAVAILABLE")
+
+    def test_current_result_context_refreshes_stale_snapshot_for_new_turn(self):
+        state_file = Path(self.temp.name) / "global-state.json"
+        state_file.write_text(json.dumps({
+            "thread-project-assignments": {THREAD: {"projectKind": "local", "projectId": "project_test"}},
+            "local-projects": {"project_test": {"rootPaths": [self.temp.name]}},
+        }), encoding="utf-8")
+        self.pipe.state["threadRuntimeStatus"] = {"type": "active"}
+        self.pipe.state["turns"] = [{"turnId": OLD_TURN, "status": "inProgress"}]
+        ages = iter([0.1, 1.0, 1.1, 3.0, 0.1])
+
+        def snapshot_age():
+            age = next(ages)
+            if age == 3.0:
+                self.pipe.state["turns"] = [{"turnId": NEW_TURN, "status": "inProgress"}]
+            return age
+
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": THREAD, "CODEX_SESSION_ID": THREAD}, clear=False), \
+                patch.object(h, "_global_state_path", return_value=state_file), \
+                patch.object(h, "_verify_current_runner_ancestor"), \
+                patch.object(h._IpcClient, "snapshot_age", side_effect=snapshot_age):
+            result = h._current_result_context(self.temp.name)
+        self.assertEqual(result["resultTurnId"], NEW_TURN)
+        self.assertEqual(sum(frame.get("method") == "thread-stream-following-changed" for frame in self.pipe.frames), 2)
+
+    def test_current_result_context_refresh_timeout_or_stale_remains_unavailable(self):
+        state_file = Path(self.temp.name) / "global-state.json"
+        state_file.write_text(json.dumps({
+            "thread-project-assignments": {THREAD: {"projectKind": "local", "projectId": "project_test"}},
+            "local-projects": {"project_test": {"rootPaths": [self.temp.name]}},
+        }), encoding="utf-8")
+        self.pipe.state["threadRuntimeStatus"] = {"type": "active"}
+        self.pipe.state["turns"] = [{"turnId": OLD_TURN, "status": "inProgress"}]
+        original_snapshot = h._IpcClient.snapshot
+
+        for failure in ("timeout", "stale"):
+            with self.subTest(failure=failure):
+                self.pipe.closed = False
+                self.pipe.frames.clear()
+                calls = 0
+
+                def snapshot(client):
+                    nonlocal calls
+                    calls += 1
+                    if calls == 2 and failure == "timeout":
+                        raise h._error("DESKTOP_STATE_UNAVAILABLE")
+                    return original_snapshot(client)
+
+                values = [0.1, 1.0, 1.1, 3.0]
+                if failure == "stale":
+                    values.append(3.0)
+                with patch.dict(os.environ, {"CODEX_THREAD_ID": THREAD, "CODEX_SESSION_ID": THREAD}, clear=False), \
+                        patch.object(h, "_global_state_path", return_value=state_file), \
+                        patch.object(h, "_verify_current_runner_ancestor"), \
+                        patch.object(h._IpcClient, "snapshot_age", side_effect=iter(values)), \
+                        patch.object(h._IpcClient, "snapshot", new=snapshot):
+                    with self.assertRaises(h.DesktopIpcError) as caught:
+                        h._current_result_context(self.temp.name)
+                self.assertEqual(caught.exception.code, "DESKTOP_STATE_UNAVAILABLE")
+                self.assertEqual(calls, 2)
+                self.assertTrue(self.pipe.closed)
+
+    def test_current_result_context_refresh_rechecks_pipe_server_identity(self):
+        state_file = Path(self.temp.name) / "global-state.json"
+        state_file.write_text(json.dumps({
+            "thread-project-assignments": {THREAD: {"projectKind": "local", "projectId": "project_test"}},
+            "local-projects": {"project_test": {"rootPaths": [self.temp.name]}},
+        }), encoding="utf-8")
+        self.pipe.state["threadRuntimeStatus"] = {"type": "active"}
+        self.pipe.state["turns"] = [{"turnId": OLD_TURN, "status": "inProgress"}]
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": THREAD, "CODEX_SESSION_ID": THREAD}, clear=False), \
+                patch.object(h, "_global_state_path", return_value=state_file), \
+                patch.object(h, "_verify_current_runner_ancestor"), \
+                patch.object(h._IpcClient, "snapshot_age", side_effect=iter([0.1, 1.0, 1.1, 3.0])), \
+                patch.object(self.pipe, "verify_server", side_effect=h._error("DESKTOP_PROCESS_CHANGED")) as verify:
+            with self.assertRaises(h.DesktopIpcError) as caught:
+                h._current_result_context(self.temp.name)
+        self.assertEqual(caught.exception.code, "DESKTOP_PROCESS_CHANGED")
+        verify.assert_called_once_with()
+        self.assertTrue(self.pipe.closed)
+
+    def test_current_result_context_refresh_has_independent_runtime_freshness_bound(self):
+        state_file = Path(self.temp.name) / "global-state.json"
+        state_file.write_text(json.dumps({
+            "thread-project-assignments": {THREAD: {"projectKind": "local", "projectId": "project_test"}},
+            "local-projects": {"project_test": {"rootPaths": [self.temp.name]}},
+        }), encoding="utf-8")
+        self.pipe.state["threadRuntimeStatus"] = {"type": "active"}
+        self.pipe.state["turns"] = [{"turnId": OLD_TURN, "status": "inProgress"}]
+        ages = iter([0.1, 1.0, 1.1, 3.0, 0.1])
+        real_monotonic = h.time.monotonic
+        expired = False
+        verify_calls = 0
+
+        def monotonic():
+            return real_monotonic() + (h.SNAPSHOT_TIMEOUT_SECONDS + 1.0 if expired else 0.0)
+
+        def verify_runtime(*args):
+            nonlocal expired, verify_calls
+            verify_calls += 1
+            if verify_calls == 3:
+                expired = True
+            return RUNTIME
+
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": THREAD, "CODEX_SESSION_ID": THREAD}, clear=False), \
+                patch.object(h, "_global_state_path", return_value=state_file), \
+                patch.object(h, "_verify_current_runner_ancestor"), \
+                patch.object(h, "_verify_runtime", side_effect=verify_runtime), \
+                patch.object(h._IpcClient, "snapshot_age", side_effect=iter(ages)), \
+                patch.object(h.time, "monotonic", new=monotonic):
+            with self.assertRaises(h.DesktopIpcError) as caught:
+                h._current_result_context(self.temp.name)
+        self.assertEqual(caught.exception.code, "DESKTOP_STATE_UNAVAILABLE")
+        self.assertEqual(verify_calls, 3)
+        self.assertEqual(sum(frame.get("method") == "thread-stream-following-changed" for frame in self.pipe.frames), 1)
+
+    def test_current_result_context_refresh_rejects_runtime_or_project_change(self):
+        state_file = Path(self.temp.name) / "global-state.json"
+        state_file.write_text(json.dumps({
+            "thread-project-assignments": {THREAD: {"projectKind": "local", "projectId": "project_test"}},
+            "local-projects": {"project_test": {"rootPaths": [self.temp.name]}},
+        }), encoding="utf-8")
+
+        for code in ("DESKTOP_PROCESS_CHANGED", "DESKTOP_PROJECT_MISMATCH"):
+            with self.subTest(code=code):
+                self.pipe.closed = False
+                self.pipe.frames.clear()
+                self.pipe.state["threadRuntimeStatus"] = {"type": "active"}
+                self.pipe.state["turns"] = [{"turnId": OLD_TURN, "status": "inProgress"}]
+                calls = 0
+
+                def verify_runtime(*args):
+                    nonlocal calls
+                    calls += 1
+                    if calls == 4:
+                        raise h._error(code)
+                    return RUNTIME
+
+                with patch.dict(os.environ, {"CODEX_THREAD_ID": THREAD, "CODEX_SESSION_ID": THREAD}, clear=False), \
+                        patch.object(h, "_global_state_path", return_value=state_file), \
+                        patch.object(h, "_verify_runtime", side_effect=verify_runtime), \
+                        patch.object(h, "_verify_current_runner_ancestor") as runner, \
+                        patch.object(h._IpcClient, "snapshot_age", side_effect=iter([0.1, 1.0, 1.1, 3.0, 0.1])):
+                    with self.assertRaises(h.DesktopIpcError) as caught:
+                        h._current_result_context(self.temp.name)
+                self.assertEqual(caught.exception.code, code)
+                self.assertEqual(calls, 4)
+                self.assertEqual(runner.call_count, 2)
+                self.assertEqual(sum(frame.get("method") == "thread-stream-following-changed" for frame in self.pipe.frames), 2)
+                self.assertTrue(self.pipe.closed)
+
+    def test_current_result_context_slow_refresh_runtime_recheck_fails_closed(self):
+        state_file = Path(self.temp.name) / "global-state.json"
+        state_file.write_text(json.dumps({
+            "thread-project-assignments": {THREAD: {"projectKind": "local", "projectId": "project_test"}},
+            "local-projects": {"project_test": {"rootPaths": [self.temp.name]}},
+        }), encoding="utf-8")
+        self.pipe.state["threadRuntimeStatus"] = {"type": "active"}
+        self.pipe.state["turns"] = [{"turnId": OLD_TURN, "status": "inProgress"}]
+        real_monotonic = h.time.monotonic
+        expired = False
+        calls = 0
+
+        def monotonic():
+            return real_monotonic() + (h.SNAPSHOT_TIMEOUT_SECONDS + 1.0 if expired else 0.0)
+
+        def verify_runtime(*args):
+            nonlocal calls, expired
+            calls += 1
+            if calls == 4:
+                expired = True
+            return RUNTIME
+
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": THREAD, "CODEX_SESSION_ID": THREAD}, clear=False), \
+                patch.object(h, "_global_state_path", return_value=state_file), \
+                patch.object(h, "_verify_runtime", side_effect=verify_runtime), \
+                patch.object(h, "_verify_current_runner_ancestor") as runner, \
+                patch.object(h._IpcClient, "snapshot_age", side_effect=iter([0.1, 1.0, 1.1, 3.0, 0.1])), \
+                patch.object(h.time, "monotonic", new=monotonic):
+            with self.assertRaises(h.DesktopIpcError) as caught:
+                h._current_result_context(self.temp.name)
+        self.assertEqual(caught.exception.code, "DESKTOP_STATE_UNAVAILABLE")
+        self.assertEqual(calls, 4)
+        self.assertEqual(runner.call_count, 2)
+        self.assertEqual(sum(frame.get("method") == "thread-stream-following-changed" for frame in self.pipe.frames), 2)
+        self.assertTrue(self.pipe.closed)
+
+    def test_current_result_context_refresh_revalidates_approval_and_propagates_new_turn(self):
+        state_file = Path(self.temp.name) / "global-state.json"
+        state_file.write_text(json.dumps({
+            "thread-project-assignments": {THREAD: {"projectKind": "local", "projectId": "project_test"}},
+            "local-projects": {"project_test": {"rootPaths": [self.temp.name]}},
+        }), encoding="utf-8")
+        self.pipe.state["threadRuntimeStatus"] = {"type": "active"}
+        self.pipe.state["turns"] = [{"turnId": OLD_TURN, "status": "inProgress"}]
+
+        for state_change in ("approval", "new_turn"):
+            with self.subTest(state_change=state_change):
+                self.pipe.closed = False
+                self.pipe.frames.clear()
+                self.pipe.state["requests"] = []
+                self.pipe.state["turns"] = [{"turnId": OLD_TURN, "status": "inProgress"}]
+                ages = iter([0.1, 1.0, 1.1, 3.0, 0.1])
+
+                def snapshot_age():
+                    age = next(ages)
+                    if age == 3.0:
+                        if state_change == "approval":
+                            self.pipe.state["requests"] = [{"kind": "approval"}]
+                        else:
+                            self.pipe.state["turns"] = [{"turnId": NEW_TURN, "status": "inProgress"}]
+                    return age
+
+                with patch.dict(os.environ, {"CODEX_THREAD_ID": THREAD, "CODEX_SESSION_ID": THREAD}, clear=False), \
+                        patch.object(h, "_global_state_path", return_value=state_file), \
+                        patch.object(h, "_verify_current_runner_ancestor"), \
+                        patch.object(h._IpcClient, "snapshot_age", side_effect=snapshot_age):
+                    if state_change == "approval":
+                        with self.assertRaises(h.DesktopIpcError) as caught:
+                            h._current_result_context(self.temp.name)
+                        self.assertEqual(caught.exception.code, "DESKTOP_APPROVAL_PENDING")
+                    else:
+                        result = h._current_result_context(self.temp.name)
+                        self.assertEqual(result["resultTurnId"], NEW_TURN)
+                self.assertEqual(sum(frame.get("method") == "thread-stream-following-changed" for frame in self.pipe.frames), 2)
+
     def test_current_confirm_cancelled_is_local_only_and_does_not_start(self):
         state_file = Path(self.temp.name) / "global-state.json"
         state_file.write_text(json.dumps({
@@ -250,6 +582,74 @@ class ProtocolTests(unittest.TestCase):
                     session.send("完整方案")
                 self.assertEqual(caught.exception.code, "DESKTOP_OUTCOME_UNKNOWN")
                 self.assertFalse(caught.exception.not_sent)
+
+    def test_owner_discovery_exact_no_client_found_classifies_by_target(self):
+        for target_owner, expected in ((None, "DESKTOP_NO_OWNER"), (OWNER, "DESKTOP_OWNER_CHANGED")):
+            with self.subTest(target_owner=target_owner):
+                client = h._IpcClient(self.pipe, THREAD, "local")
+                client.initialize()
+                client.owner = target_owner
+                self.pipe.response_errors["thread-owner-discovery"] = "no-client-found"
+                with self.assertRaises(h.DesktopIpcError) as caught:
+                    client.discover()
+                self.assertEqual(caught.exception.code, expected)
+                self.assertNotEqual(caught.exception.code, "DESKTOP_TARGET_NOT_FOUND")
+                self.pipe.response_errors.clear()
+
+    def test_owner_discovery_non_exact_or_other_method_errors_keep_timeout_gate(self):
+        for method, error in (("thread-owner-discovery", "target-not-found"),
+                              ("thread-owner-discovery", "server-error"),
+                              ("initialize", "no-client-found")):
+            with self.subTest(method=method, error=error):
+                client = h._IpcClient(self.pipe, THREAD, "local")
+                self.pipe.response_errors[method] = error
+                with self.assertRaises(h.DesktopIpcError) as caught:
+                    client.initialize() if method == "initialize" else client.discover()
+                self.assertEqual(caught.exception.code, "DESKTOP_IPC_TIMEOUT")
+                self.pipe.response_errors.clear()
+
+    def test_prepare_no_owner_rechecks_initial_runtime_before_close(self):
+        self.pipe.owner = None
+        verify = Mock(side_effect=[RUNTIME, RUNTIME])
+        with patch.object(h, "_verify_runtime", verify):
+            with self.assertRaises(h.DesktopIpcError) as caught:
+                h._prepare(self.target)
+        self.assertEqual(caught.exception.code, "DESKTOP_NO_OWNER")
+        self.assertEqual(verify.call_count, 2)
+        self.assertEqual(verify.call_args_list[1].args, (self.pipe, self.target, RUNTIME))
+        self.assertTrue(self.pipe.closed)
+
+    def test_prepare_no_owner_recheck_rejects_runtime_project_or_process_change(self):
+        for code in ("DESKTOP_VERSION_UNSUPPORTED", "DESKTOP_PROJECT_MISMATCH", "DESKTOP_PROCESS_CHANGED"):
+            with self.subTest(code=code):
+                self.pipe.owner = None
+                self.pipe.closed = False
+                verify = Mock(side_effect=[RUNTIME, h._error(code)])
+                with patch.object(h, "_verify_runtime", verify):
+                    with self.assertRaises(h.DesktopIpcError) as caught:
+                        h._prepare(self.target)
+                self.assertEqual(caught.exception.code, code)
+                self.assertEqual(verify.call_count, 2)
+                self.assertTrue(self.pipe.closed)
+
+    def test_prepare_initial_token_errors_do_not_recheck_uninitialized_runtime(self):
+        for code in ("DESKTOP_TOKEN_UNVERIFIED", "DESKTOP_ELEVATED"):
+            with self.subTest(code=code):
+                verify = Mock()
+                with patch.object(h, "_query_standard_token", side_effect=h._error(code)), \
+                        patch.object(h, "_verify_runtime", verify):
+                    with self.assertRaises(h.DesktopIpcError) as caught:
+                        h._prepare(self.target)
+                self.assertEqual(caught.exception.code, code)
+                verify.assert_not_called()
+
+    def test_send_error_remains_outcome_unknown(self):
+        session, _ = h._prepare(self.target)
+        self.pipe.response_errors["thread-follower-start-turn"] = "no-client-found"
+        with self.assertRaises(h.DesktopIpcError) as caught:
+            session.send("完整方案")
+        self.assertEqual(caught.exception.code, "DESKTOP_OUTCOME_UNKNOWN")
+        self.assertFalse(caught.exception.not_sent)
 
     def test_old_turn_id_is_not_an_acceptance(self):
         session, _ = h._prepare(self.target)
@@ -311,8 +711,112 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(fake.send.call_count, 1)
         self.assertEqual(fake.send.call_args.args[0], "\x00" * 65536)
 
+    def test_compatibility_operation_is_read_only_and_returns_only_safe_fields(self):
+        request = {"id": CLIENT, "op": "compatibility"}
+        source = SimpleNamespace(buffer=io.BytesIO(h._json_bytes(request) + b"\n"))
+        output = SimpleNamespace(buffer=io.BytesIO())
+        expected = {"observedDesktopVersion": "26.908.4834.0", "observedAppServerVersion": "0.154.0-alpha.6.2",
+                    "status": "current", "profile": h.VERIFIED_PROFILE}
+        rows = [{"pid": 100, "name": "ChatGPT.exe", "parentPid": 1, "exe": "ChatGPT.exe", "creation": 10},
+                {"pid": 101, "name": "codex.exe", "parentPid": 100, "exe": "codex.exe", "creation": 11}]
+        with patch.object(h, "_Pipe") as pipe, patch.object(h, "_processes", return_value=rows), \
+                patch.object(h, "_compatibility_for_paths", return_value=expected), \
+                patch.object(sys, "stdin", source), patch.object(sys, "stdout", output):
+            h._main()
+        self.assertEqual(json.loads(output.buffer.getvalue()), {"id": CLIENT, "ok": True, "value": expected})
+        pipe.assert_not_called()
+
 
 class RuntimeTests(unittest.TestCase):
+    def test_missing_or_ambiguous_runtime_diagnosis_is_unverified_without_ipc(self):
+        for rows in ([], [
+            {"pid": 1, "name": "ChatGPT.exe", "creation": 1, "exe": "desktop"},
+            {"pid": 2, "parentPid": 1, "name": "codex.exe", "creation": 2, "exe": "server1"},
+            {"pid": 3, "parentPid": 1, "name": "codex.exe", "creation": 3, "exe": "server2"},
+        ]):
+            with patch.object(h, "_query_standard_token"), patch.object(h, "_processes", return_value=rows), \
+                    patch.object(h, "_Pipe") as pipe:
+                self.assertEqual(h._compatibility(), {"observedDesktopVersion": None,
+                    "observedAppServerVersion": None, "status": "unverified", "profile": None})
+                pipe.assert_not_called()
+
+    def test_audited_runtime_pairs_share_one_profile_and_require_exact_hashes(self):
+        for profile in (h.VERIFIED_RUNTIME, h.VERIFIED_RUNTIME_26_908):
+            with self.subTest(pair=(profile["desktopVersion"], profile["appServerVersion"])), \
+                    tempfile.TemporaryDirectory(prefix="c2c-profile-offline-") as directory:
+                root = Path(directory) / f"OpenAI.Codex_{profile['desktopVersion']}_x64" / "app"
+                root.mkdir(parents=True)
+                desktop = root / "ChatGPT.exe"
+                server = root / "codex.exe"
+                if profile is h.VERIFIED_RUNTIME_26_908:
+                    server.write_bytes(b"standalone local buildversion: 0.154.0-alpha.6.2 platform: audited")
+                else:
+                    server.write_bytes(b"legacy app-server without a provenance marker")
+                module_hashes = {"fixture.js": hashlib.sha256(b"fixture module").hexdigest()}
+                fixture = {**profile, "appServerSha256": hashlib.sha256(server.read_bytes()).hexdigest(),
+                           "moduleHashes": module_hashes}
+                with patch.dict(h.VERIFIED_PROFILES, {h.VERIFIED_PROFILE: (fixture,)}, clear=True), \
+                        patch.object(h, "_asar_module_hashes", return_value=module_hashes) as asar:
+                    runtime = h._runtime_version(str(desktop), str(server))
+                    self.assertEqual(runtime["profile"], h.VERIFIED_PROFILE)
+                    self.assertEqual(runtime["desktopVersion"], profile["desktopVersion"])
+                    self.assertEqual(runtime["appServerVersion"], profile["appServerVersion"])
+                    self.assertEqual(h._compatibility_for_paths(str(desktop), str(server)), {
+                        "observedDesktopVersion": profile["desktopVersion"],
+                        "observedAppServerVersion": profile["appServerVersion"],
+                        "status": "current", "profile": h.VERIFIED_PROFILE,
+                    })
+                    self.assertEqual(asar.call_count, 2)
+
+    def test_unknown_mixed_and_hash_mismatch_are_fail_closed_diagnostics(self):
+        with tempfile.TemporaryDirectory(prefix="c2c-compatibility-offline-") as directory:
+            root = Path(directory) / f"OpenAI.Codex_{h.VERIFIED_RUNTIME['desktopVersion']}_x64" / "app"
+            root.mkdir(parents=True)
+            desktop = root / "ChatGPT.exe"
+            server = root / "codex.exe"
+
+            server.write_bytes(b"standalone local buildversion: 9.9.9 platform: unknown")
+            unknown = h._compatibility_for_paths(str(desktop), str(server))
+            self.assertEqual(unknown, {"observedDesktopVersion": h.VERIFIED_RUNTIME["desktopVersion"],
+                                       "observedAppServerVersion": "9.9.9", "status": "unverified", "profile": None})
+
+            server.write_bytes(b"standalone local buildversion: 0.154.0-alpha.6.2 platform: mixed")
+            mixed = h._compatibility_for_paths(str(desktop), str(server))
+            self.assertEqual(mixed, {"observedDesktopVersion": h.VERIFIED_RUNTIME["desktopVersion"],
+                                     "observedAppServerVersion": "0.154.0-alpha.6.2", "status": "unverified",
+                                     "profile": None})
+
+            server.write_bytes(b"standalone local buildversion: 0.153.4 platform: changed")
+            with patch.object(h, "_asar_module_hashes") as asar:
+                mismatched = h._compatibility_for_paths(str(desktop), str(server))
+            self.assertEqual(mismatched, {"observedDesktopVersion": h.VERIFIED_RUNTIME["desktopVersion"],
+                                          "observedAppServerVersion": h.VERIFIED_RUNTIME["appServerVersion"],
+                                          "status": "incompatible", "profile": h.VERIFIED_PROFILE})
+            asar.assert_not_called()
+
+    def test_provenance_parser_accepts_prerelease_and_rejects_ambiguous_marker(self):
+        with tempfile.TemporaryDirectory(prefix="c2c-provenance-offline-") as directory:
+            binary = Path(directory) / "codex.exe"
+            marker = b"standalone local buildversion: "
+            binary.write_bytes(b"prefix\x00" + marker + b"0.154.0-alpha.6.2 platform: install method: commit:")
+            self.assertEqual(h._static_file_version(str(binary)), "0.154.0-alpha.6.2")
+            binary.write_bytes(marker + b"0.153.4 platform:x\x00" + marker + b"0.154.0-alpha.6.2 platform:y")
+            self.assertIsNone(h._static_file_version(str(binary)))
+
+    def test_known_hash_skips_binary_scan_but_unknown_hash_uses_static_evidence(self):
+        desktop = f"OpenAI.Codex_{h.VERIFIED_RUNTIME['desktopVersion']}_x64/app/ChatGPT.exe"
+        with patch.object(h, "_sha256_file", return_value=h.VERIFIED_RUNTIME["appServerSha256"]), \
+                patch.object(h, "_static_file_version") as static_version:
+            observed = h._observe_runtime_versions(desktop, "codex.exe")
+        self.assertEqual(observed["observedAppServerVersion"], h.VERIFIED_RUNTIME["appServerVersion"])
+        static_version.assert_not_called()
+
+        with patch.object(h, "_sha256_file", return_value="0" * 64), \
+                patch.object(h, "_static_file_version", return_value="9.9.9") as static_version:
+            observed = h._observe_runtime_versions(desktop, "codex.exe")
+        self.assertEqual(observed["observedAppServerVersion"], "9.9.9")
+        static_version.assert_called_once_with("codex.exe")
+
     def test_verified_large_asar_header_and_mixed_or_corrupt_combinations(self):
         # 不 mock ASAR 读取：复现真实 2.44 MB 头部，旧 1 MiB guard 会失败。
         with tempfile.TemporaryDirectory(prefix="c2c-asar-offline-") as directory:
@@ -320,7 +824,8 @@ class RuntimeTests(unittest.TestCase):
             asar = desktop.parent / "resources" / "app.asar"
             asar.parent.mkdir(parents=True)
             server = desktop.parent / "codex.exe"
-            server.write_bytes(b"verified offline app-server")
+            server_bytes = b"standalone local buildversion: 0.153.4 platform: offline"
+            server.write_bytes(server_bytes)
             module = b"verified offline protocol"
             layout = h.VERIFIED_RUNTIME["asarHeader"]
             tree = {"files": {"protocol.js": {"offset": "0", "size": len(module)}}, "padding": ""}
@@ -331,7 +836,7 @@ class RuntimeTests(unittest.TestCase):
             valid = header + raw_tree + bytes(8 + layout[1] - 16 - len(raw_tree)) + module
             profile = {**h.VERIFIED_RUNTIME, "appServerSha256": hashlib.sha256(server.read_bytes()).hexdigest(),
                        "moduleHashes": {"protocol.js": hashlib.sha256(module).hexdigest()}}
-            with patch.object(h, "VERIFIED_RUNTIME", profile):
+            with patch.dict(h.VERIFIED_PROFILES, {h.VERIFIED_PROFILE: (profile,)}, clear=True):
                 asar.write_bytes(valid)
                 self.assertEqual(h._runtime_version(str(desktop), str(server))["moduleHashes"], profile["moduleHashes"])
                 cases = [
@@ -350,13 +855,13 @@ class RuntimeTests(unittest.TestCase):
                         self.assertTrue(caught.exception.not_sent)
                 asar.write_bytes(valid)
                 # 只要整组中的一个成员变化，即便版本字符串相同也拒绝。
-                server.write_bytes(b"other app-server same version label")
+                server.write_bytes(b"standalone local buildversion: 0.153.4 platform: changed")
                 with self.assertRaises(h.DesktopIpcError) as caught:
                     h._runtime_version(str(desktop), str(server))
                 self.assertEqual(caught.exception.mismatch, "app_server_sha256")
                 with self.assertRaises(h.DesktopIpcError) as caught:
                     h._runtime_version(str(desktop).replace("26.903.9818.0", "26.903.9999.0"), str(server))
-                self.assertEqual(caught.exception.mismatch, "desktop_package_version")
+                self.assertEqual(caught.exception.mismatch, "runtime_pair_unverified")
 
     def test_internal_mismatch_does_not_leak_through_helper_reply(self):
         request = {"id": CLIENT, "op": "inspect", "target": {"threadId": THREAD}}
@@ -366,7 +871,9 @@ class RuntimeTests(unittest.TestCase):
                 patch.object(sys, "stdin", source), patch.object(sys, "stdout", output):
             h._main()
         self.assertEqual(json.loads(output.buffer.getvalue()),
-                         {"id": CLIENT, "ok": False, "code": "DESKTOP_VERSION_UNSUPPORTED", "notSent": True})
+                         {"id": CLIENT, "ok": False, "code": "DESKTOP_VERSION_UNSUPPORTED", "notSent": True,
+                          "compatibility": {"observedDesktopVersion": None, "observedAppServerVersion": None,
+                                             "status": "unverified", "profile": None}})
 
     def test_new_connection_rediscovers_but_inflight_pid_reuse_is_rejected(self):
         target = {"threadId": THREAD, "hostId": "local", "projectId": "project_test", "workspaceRoot": str(Path.cwd())}
@@ -405,11 +912,14 @@ class RuntimeTests(unittest.TestCase):
             server.write_bytes(b"verified fake binary")
             digest = hashlib.sha256(server.read_bytes()).hexdigest()
             desktop = "OpenAI.Codex_26.903.9818.0_x64/app/ChatGPT.exe"
-            with patch.dict(h.VERIFIED_RUNTIME, {"appServerSha256": digest}), patch.object(h, "_asar_module_hashes", return_value={}):
+            profile = {**h.VERIFIED_RUNTIME, "appServerSha256": digest}
+            with patch.dict(h.VERIFIED_PROFILES, {h.VERIFIED_PROFILE: (profile,)}, clear=True), \
+                    patch.object(h, "_asar_module_hashes", return_value={}):
                 h._runtime_version(desktop, str(server))
                 server.write_bytes(b"changed")
-                with self.assertRaises(h.DesktopIpcError):
+                with self.assertRaises(h.DesktopIpcError) as caught:
                     h._runtime_version(desktop, str(server))
+                self.assertEqual(caught.exception.mismatch, "runtime_pair_unverified")
 
 
 if __name__ == "__main__":

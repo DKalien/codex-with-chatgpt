@@ -386,6 +386,11 @@ Speak only of 临时地址 / 固定域名 / 登录 Cloudflare.
    同一身份已 enabled 的 `alreadyEnabled` 直接复用 bindingId；重新启用或新 thread
    仍等待本机用户确认，不代点、不传绕过参数。上下文 unknown、workspace 不匹配、
    取消、超时或其他失败均报告未就绪，不猜目标、不回退到显式 bind/enable 绕过检查。
+   遇到 `DESKTOP_VERSION_UNSUPPORTED`，直接报告错误中 `compatibility` 的
+   `observedDesktopVersion`、`observedAppServerVersion`、`status` 和 `profile`；旧运行时
+   未返回诊断时运行 `c2c desktop compatibility --json`，仍无法观察则明确写 unknown。
+   这是本机 Desktop 协议诊断，不是 OAuth `desktopCompatibility`；不能以其中一个替代另一个。
+   未验证版本保持未就绪，不自动添加 profile、放宽版本/hash 或重新授权来绕过。
    只有返回 `ok: true`、`enabled: true` 且 binding 身份与当前 thread/workspace 核验一致
    才可标记绑定成功；发送时仍受 idle、owner、审批、OAuth scope 和版本门禁约束。
 5. **Ready。** 能自动完成的步骤自动完成；登录、首次 Project 创建、本机确认及既有
@@ -910,11 +915,14 @@ envelope 是单个 JSON 对象：`{"type":"C2C_DESKTOP_TASK","version":1,"worksp
    不手动指定 taskId/iteration/thread：自动派生 `desktop_<commandId>` / `1`，并写入 commandId。
 4. 只接受同 workspace 历史 `deliveryStatus=accepted` 的精确 commandId。`CODEX_THREAD_ID`
    只是上下文线索，不能单独授权写记录：本机入口通过受控 Desktop IPC 验证当前真实 thread/workspace/root、
-   owner、project、版本/hash 和执行进程来源，要求唯一当前 `inProgress` active turnId 与
+   owner、project、版本/hash 和执行进程来源；active 时要求唯一当前 `inProgress` turn，idle 时仅允许
+   canonical history 最新侧完整且最后一条为 terminal 的 turn。两条路径的 turnId 均须与
    `delivery.turnId` 完全一致，真实 threadId 同时等于 `delivery.threadId`。
    即使后来 disable/rebind，原 accepted turn 仍可在自身执行结束前收尾；后续 turn 不能代记。
-   idle、无/多个/未知 active turn、状态读取失败、turnId mismatch 或只有伪造环境变量都拒绝，
-   不创建/修改 execution record 或 output。完全相同 receipt 重试也必须通过当前 active turn 校验；
+   active 时无/多个/未知 active turn、idle 最新侧不完整、存在更晚 turn、状态读取失败、turnId mismatch
+   或只有伪造环境变量都拒绝，不创建/修改 execution record 或 output。
+   写入前再次校验；完全相同 receipt 重试也必须通过相同 exact-turn 校验。
+   仅 `DESKTOP_STATE_UNAVAILABLE` 做最多 3 次、间隔 25ms 的短重试，不重试身份或 turn 不匹配；
    不接受调用方传入 turnId，不要设置或伪造环境变量来绕过身份验证。
    rejected、outcome_unknown、不存在的 commandId 均拒绝，不能把 accepted 冒充 completed。
    完全相同重试幂等；内容冲突停止，不能覆盖旧证据或换 ID 绕过。
@@ -947,7 +955,8 @@ C2C 状态复用现有 `getStateDir`，持久化 OAuth `clientId`、`bindingId`�
 发送前重新核验 Desktop 进程、端点、owner、project、workspace 和版本；Desktop 重启后重新
 发现，不能永久信任旧 PID。已知 idle/start 内部协议在检查和发送之间没有原子 CAS，目标可能
 在窗口内改变，因此回执不匹配也按未知结果处理。只放行已验证版本，未知版本停止，不自动
-降级；当前本机参考版本为 Desktop `26.903.9818.0`、app-server `0.153.4`。
+降级；已验证精确组合见 helper 的 `VERIFIED_PROFILES` 与 `docs/desktop-control.md`，
+不能按该列表推断任何未列出的版本或 hash 兼容。
 
 Windows 受控 helper 需要 Python 3.11+，使用 `C2C_DESKTOP_PYTHON`，未设置时使用 `python`；仅执行必要的标准库
 IPC/身份核验，不要求管理员权限，不借用 renderer/Agent 身份，不启动第二个 app-server、

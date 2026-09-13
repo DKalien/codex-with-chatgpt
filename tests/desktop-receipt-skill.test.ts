@@ -18,10 +18,11 @@ it("本机 receipt 绑定原 accepted thread，按本轮文件记录并对失败
     expect(receipt).toContain(text);
 });
 
-it("receipt 必须机器校验真实 active turn，后续 turn 和未知状态均不落盘", () => {
+it("receipt 校验 exact active 或 idle latest terminal，后续 turn 和未知状态均不落盘", () => {
   for (const text of ["受控 Desktop IPC", "唯一当前 `inProgress`", "delivery.turnId", "后续 turn 不能代记",
     "无/多个/未知 active turn", "状态读取失败", "不创建/修改 execution record 或 output",
-    "不接受调用方传入 turnId", "不能单独授权写记录", "重试也必须通过当前 active turn 校验"])
+    "不接受调用方传入 turnId", "不能单独授权写记录", "重试也必须通过相同 exact-turn 校验",
+    "canonical history 最新侧完整", "存在更晚 turn", "写入前再次校验", "DESKTOP_STATE_UNAVAILABLE"])
     expect(receipt).toContain(text);
 });
 

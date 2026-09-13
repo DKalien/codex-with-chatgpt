@@ -69,7 +69,8 @@ returns `accepted` only with the real Desktop thread/turn IDs; it never waits fo
 task completion or exposes raw IPC through the tunnel.
 
 **Desktop execution evidence**: the internal task envelope routes the accepted Desktop turn to
-the Skill's local receipt flow. Before its final reply, that same verified active turn records
+the Skill's local receipt flow. Before its final reply, the verified exact active turn (or the
+latest terminal turn with a complete newest history boundary while idle) records
 the exact command ID and this turn's test/output evidence. Review resolves that record and its
 output ID, never a historical latest test result. See [automatic receipts](desktop-control.md#自动验收记录).
 

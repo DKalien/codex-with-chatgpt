@@ -23,12 +23,29 @@ export interface DesktopTargetInfo extends DesktopTarget {
   requestsCount?: number;
   desktopVersion?: string;
   appServerVersion?: string;
+  profile?: string | null;
   /** 内部诊断字段；不会由 MCP 直接返回。 */
   ownerClientId?: string | null;
 }
 
+export type DesktopCompatibilityStatus = "current" | "unverified" | "incompatible";
+
+export interface DesktopCompatibility {
+  observedDesktopVersion: string | null;
+  observedAppServerVersion: string | null;
+  status: DesktopCompatibilityStatus;
+  profile: string | null;
+}
+
 export interface DesktopExecutionInfo extends DesktopTargetInfo {
   activeTurnId: string;
+}
+
+export type DesktopResultTurnStatus = "inProgress" | "completed" | "failed" | "interrupted" | "cancelled";
+
+export interface DesktopResultContext extends DesktopTargetInfo {
+  resultTurnId: string;
+  resultTurnStatus: DesktopResultTurnStatus;
 }
 
 export interface DesktopIpcConnection {
@@ -52,6 +69,7 @@ type HelperResponse = {
   value?: unknown;
   code?: unknown;
   notSent?: unknown;
+  compatibility?: unknown;
 };
 
 type Pending = {
@@ -96,6 +114,14 @@ const SAFE_CODES = new Set([
   "DESKTOP_CONFIRMATION_CANCELLED",
 ]);
 
+const COMPATIBILITY_VERSION = /^\d+\.\d+\.\d+(?:\.\d+)?(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?(?:\+[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?$/;
+const COMPATIBILITY_PROFILE = /^desktop-ipc-v[1-9]\d*$/;
+const COMPATIBILITY_STATUSES = new Set<DesktopCompatibilityStatus>([
+  "current",
+  "unverified",
+  "incompatible",
+]);
+
 const ERROR_MESSAGES: Record<string, string> = {
   DESKTOP_UNSUPPORTED_PLATFORM: "当前平台不支持 Desktop Control。",
   DESKTOP_TOKEN_UNVERIFIED: "当前进程权限无法安全确认；已拒绝 Desktop 投递。",
@@ -129,9 +155,65 @@ function messageFor(code: string, fallback = "DESKTOP_INTERNAL_ERROR"): string {
   return ERROR_MESSAGES[code] ?? ERROR_MESSAGES[fallback] ?? "Desktop Control 暂时不可用。";
 }
 
-function error(code: string, options: { notSent?: boolean } = {}): DesktopError & { notSent: boolean } {
-  const result = new DesktopError(code, messageFor(code)) as DesktopError & { notSent: boolean };
+function compatibilityVersion(value: unknown): string | null {
+  if (value === null) return null;
+  if (typeof value !== "string" || value.length > 64 || !COMPATIBILITY_VERSION.test(value)) {
+    throw error("DESKTOP_PROTOCOL_ERROR");
+  }
+  return value;
+}
+
+function compatibilityProfile(value: unknown): string | null {
+  if (value === null) return null;
+  if (typeof value !== "string" || value.length > 64 || !COMPATIBILITY_PROFILE.test(value)) {
+    throw error("DESKTOP_PROTOCOL_ERROR");
+  }
+  return value;
+}
+
+export function validateDesktopCompatibility(value: unknown): DesktopCompatibility {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw error("DESKTOP_PROTOCOL_ERROR");
+  const input = value as Record<string, unknown>;
+  for (const key of ["observedDesktopVersion", "observedAppServerVersion", "status", "profile"] as const) {
+    if (!Object.prototype.hasOwnProperty.call(input, key)) throw error("DESKTOP_PROTOCOL_ERROR");
+  }
+  const status = input.status;
+  if (typeof status !== "string" || !COMPATIBILITY_STATUSES.has(status as DesktopCompatibilityStatus)) {
+    throw error("DESKTOP_PROTOCOL_ERROR");
+  }
+  const observedDesktopVersion = compatibilityVersion(input.observedDesktopVersion);
+  const observedAppServerVersion = compatibilityVersion(input.observedAppServerVersion);
+  const profile = compatibilityProfile(input.profile);
+  if (status === "current" && (!observedDesktopVersion || !observedAppServerVersion || !profile)) {
+    throw error("DESKTOP_PROTOCOL_ERROR");
+  }
+  return {
+    observedDesktopVersion,
+    observedAppServerVersion,
+    status: status as DesktopCompatibilityStatus,
+    profile,
+  };
+}
+
+export function desktopCompatibilityFromError(value: unknown): DesktopCompatibility | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  try {
+    return validateDesktopCompatibility((value as { compatibility?: unknown }).compatibility);
+  } catch {
+    return undefined;
+  }
+}
+
+function error(
+  code: string,
+  options: { notSent?: boolean; compatibility?: DesktopCompatibility } = {},
+): DesktopError & { notSent: boolean; compatibility?: DesktopCompatibility } {
+  const result = new DesktopError(code, messageFor(code)) as DesktopError & {
+    notSent: boolean;
+    compatibility?: DesktopCompatibility;
+  };
   result.notSent = options.notSent ?? true;
+  if (options.compatibility !== undefined) result.compatibility = options.compatibility;
   return result;
 }
 
@@ -195,6 +277,25 @@ function validateExecutionInfo(value: unknown, target: DesktopTarget): DesktopEx
   const activeTurnId = (value as { activeTurnId?: unknown }).activeTurnId;
   if (!isUuid(activeTurnId)) throw error("DESKTOP_STATE_UNAVAILABLE");
   return { ...info, activeTurnId };
+}
+
+function validateResultContext(value: unknown, target: DesktopTarget): DesktopResultContext {
+  const info = validateInfo(value, target);
+  const input = value as { resultTurnId?: unknown; resultTurnStatus?: unknown };
+  if (!isUuid(input.resultTurnId) || typeof input.resultTurnStatus !== "string" ||
+      !(["inProgress", "completed", "failed", "interrupted", "cancelled"] as const).includes(input.resultTurnStatus as DesktopResultTurnStatus)) {
+    throw error("DESKTOP_STATE_UNAVAILABLE");
+  }
+  if (info.runtimeStatus === "idle" && input.resultTurnStatus === "inProgress") {
+    throw error("DESKTOP_STATE_UNAVAILABLE");
+  }
+  if ((info.runtimeStatus === "active" || info.runtimeStatus === "inProgress") && input.resultTurnStatus !== "inProgress") {
+    throw error("DESKTOP_STATE_UNAVAILABLE");
+  }
+  if (info.runtimeStatus !== "idle" && info.runtimeStatus !== "active" && info.runtimeStatus !== "inProgress") {
+    throw error("DESKTOP_STATE_UNAVAILABLE");
+  }
+  return { ...info, resultTurnId: input.resultTurnId, resultTurnStatus: input.resultTurnStatus as DesktopResultTurnStatus };
 }
 
 function normalizePath(value: string): string {
@@ -329,7 +430,11 @@ class HelperSession {
           : pending.operation === "send" ? "DESKTOP_OUTCOME_UNKNOWN" : "DESKTOP_PROTOCOL_ERROR";
         // 缺失 notSent 不能证明尚未进入真实 start；send 必须保守为 unknown。
         const notSent = response.notSent === true;
-        pending.reject(error(requestedCode, { notSent }));
+        const compatibility = desktopCompatibilityFromError(response);
+        pending.reject(error(requestedCode, {
+          notSent,
+          ...(compatibility ? { compatibility } : {}),
+        }));
       }
     }
   }
@@ -373,12 +478,26 @@ export class DesktopIpcClient {
     }
   }
 
+  async compatibility(): Promise<DesktopCompatibility> {
+    const session = this.open();
+    try {
+      const value = await session.request("compatibility", {});
+      return validateDesktopCompatibility(value);
+    } finally {
+      session.close();
+    }
+  }
+
   async currentIdentity(workspaceRoot: string): Promise<DesktopTargetInfo> {
     return this.currentOperation("current_identity", workspaceRoot);
   }
 
   async currentExecution(workspaceRoot: string): Promise<DesktopExecutionInfo> {
     return this.currentOperation("current_execution", workspaceRoot, validateExecutionInfo) as Promise<DesktopExecutionInfo>;
+  }
+
+  async currentResultContext(workspaceRoot: string): Promise<DesktopResultContext> {
+    return this.currentOperation("current_result_context", workspaceRoot, validateResultContext) as Promise<DesktopResultContext>;
   }
 
   async confirmCurrent(workspaceRoot: string): Promise<DesktopTargetInfo> {
