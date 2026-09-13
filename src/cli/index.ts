@@ -217,6 +217,11 @@ program
   .version(VERSION, "-v, --version")
   .configureHelp({ sortSubcommands: true });
 
+/** Machine-wide commands ignore `-w` so a Skill that always passes it cannot crash them. */
+function acceptUnusedWorkspaceOption(command: Command): Command {
+  return command.option("-w, --workspace <path>", "ignored; this command is machine-wide");
+}
+
 // ---------------------------------------------------------------- serve (internal)
 
 program
@@ -609,14 +614,7 @@ program
           previousMcpUrl: lastEndpoint?.mcpUrl ?? null,
         };
         if (action === "update") {
-          try {
-            const pairing = await adminFetch<PairingResponse>(runtime, "POST", "/admin/pairing");
-            chatgptRepair.pairingCode = pairing.code;
-            chatgptRepair.pairingExpiresAt = pairing.expiresAt;
-            results.push(`已生成新的配对码，需要更新「${boundName}」`);
-          } catch (error) {
-            report.oauth = { ok: false, detail: (error as Error).message };
-          }
+          results.push(`安全连接地址已更换，需要更新「${boundName}」`);
         }
       } else if (namedReady) {
         report.tunnel = report.tunnel ?? { ok: false, detail: "NAMED_TUNNEL_DOWN" };
@@ -784,10 +782,12 @@ program
 
 // ---------------------------------------------------------------- sandbox-allow (Codex writable_roots, macOS + Windows)
 
-program
-  .command("sandbox-allow")
-  .description("Add the local settings directory to the Codex sandbox allowlist")
-  .option("--json", "machine-readable output", false)
+acceptUnusedWorkspaceOption(
+  program
+    .command("sandbox-allow")
+    .description("Add the local settings directory to the Codex sandbox allowlist")
+    .option("--json", "machine-readable output", false)
+)
   .action((opts: { json: boolean }) => {
     const result = trySandboxAllow();
     if (opts.json) {
@@ -819,11 +819,13 @@ function runGit(args: string[]): { ok: boolean; stdout: string } {
   return { ok: result.status === 0, stdout: (result.stdout ?? "").trim() };
 }
 
-program
-  .command("update-check")
-  .description("Check GitHub for a newer version (real check at most once per local day)")
-  .option("--force", "check even if already checked today", false)
-  .option("--json", "machine-readable output", false)
+acceptUnusedWorkspaceOption(
+  program
+    .command("update-check")
+    .description("Check GitHub for a newer version (real check at most once per local day)")
+    .option("--force", "check even if already checked today", false)
+    .option("--json", "machine-readable output", false)
+)
   .action((opts: { force: boolean; json: boolean }) => {
     const file = path.join(getStateDir(), "update-check.json");
     const today = new Date().toLocaleDateString("en-CA"); // YYYY-MM-DD in local tz
@@ -1001,10 +1003,12 @@ const prefsCmd = program
   .command("prefs")
   .description("Remember ChatGPT developer mode and setup choice for this machine");
 
-prefsCmd
-  .command("get", { isDefault: true })
-  .description("Show remembered ChatGPT setup choices (not per workspace)")
-  .option("--json", "machine-readable output", false)
+acceptUnusedWorkspaceOption(
+  prefsCmd
+    .command("get", { isDefault: true })
+    .description("Show remembered ChatGPT setup choices (not per workspace)")
+    .option("--json", "machine-readable output", false)
+)
   .action((opts: { json: boolean }) => {
     const prefs = readUiPrefs();
     if (opts.json) {
@@ -1017,12 +1021,14 @@ prefsCmd
     else say("配置方式：尚未选择");
   });
 
-prefsCmd
-  .command("set")
-  .description("Save a ChatGPT setup choice for this machine")
-  .option("--developer-mode", "remember that ChatGPT developer mode is on", false)
-  .option("--setup-mode <mode>", "auto (preview) or manual")
-  .option("--json", "machine-readable output", false)
+acceptUnusedWorkspaceOption(
+  prefsCmd
+    .command("set")
+    .description("Save a ChatGPT setup choice for this machine")
+    .option("--developer-mode", "remember that ChatGPT developer mode is on", false)
+    .option("--setup-mode <mode>", "auto (preview) or manual")
+    .option("--json", "machine-readable output", false)
+)
   .action((opts: { developerMode: boolean; setupMode?: string; json: boolean }) => {
     try {
       const modeRaw = opts.setupMode?.trim().toLowerCase();
@@ -1205,10 +1211,12 @@ tunnelCmd
     }
   });
 
-tunnelCmd
-  .command("login")
-  .description("Open the Cloudflare login window used by a named hostname")
-  .option("--json", "machine-readable output", false)
+acceptUnusedWorkspaceOption(
+  tunnelCmd
+    .command("login")
+    .description("Open the Cloudflare login window used by a named hostname")
+    .option("--json", "machine-readable output", false)
+)
   .action(async (opts: { json: boolean }) => {
     try {
       if (!opts.json) say(NAMED_LOGIN_PROMPT);
