@@ -184,7 +184,7 @@ try {
         Invoke-PnpmChecked -Arguments @("install", "--frozen-lockfile")
         Invoke-PnpmChecked -Arguments @("run", "build")
         if ($Test) {
-            Invoke-PnpmChecked -Arguments @("test", "--", "--exclude", "tests/fork-scripts.test.ts")
+            Invoke-PnpmChecked -Arguments @("test", "--exclude", "tests/fork-scripts.test.ts", "--maxWorkers=1", "--testTimeout=60000")
         }
         Invoke-NodeChecked -Arguments @(
             (Join-Path $script:RepoRoot "scripts\install-core.mjs"),

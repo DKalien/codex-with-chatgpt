@@ -173,9 +173,12 @@ function hasPartialOutput(workspaceId: string, taskId: string): boolean {
 }
 
 /**
- * 记录已由 Desktop 接受的本次结果。CODEX_THREAD_ID 仅提供调用线程候选，
- * 还必须通过新鲜 current result context 与同工作区历史 accepted delivery 的 turn 校验；
- * 不信任当前 enabled/binding。
+ * 记录已由 Desktop 接受的本次结果。
+ *
+ * 首次写入仍要求新鲜 current result context 与 accepted delivery 的 exact turn 对齐，
+ * 不接受后续 turn 冒充。已落盘且 digest 完全一致的终态，在 Desktop context 暂时
+ * 不可用时可只读恢复——terminal truth 与 UI 窗口解耦，不因此永久丢失。
+ * 若 context 可用且指向其他 turn，即使已有 prior 也 fail closed。
  */
 export async function recordDesktopResult(
   workspaceRaw: DesktopResultWorkspace,
@@ -185,7 +188,6 @@ export async function recordDesktopResult(
   const input = desktopResultInput.parse(rawInput);
   const threadId = currentThreadId();
   const accepted = assertDesktopResultContext(workspace, input.commandId, threadId);
-  await assertCurrentResultContext(workspace, accepted);
 
   const taskId = `desktop_${input.commandId}`;
   const digest = receiptHash(input);
@@ -204,8 +206,7 @@ export async function recordDesktopResult(
 
     const prior = existingRecord(records, input.commandId, taskId, digest);
     if (prior) {
-      await assertCurrentResultContext(workspace, acceptedNow);
-      return { record: prior, output: outputForRecord(workspace.id, prior) };
+      return recoverPriorDesktopResult(workspace, acceptedNow, prior);
     }
     if (hasPartialOutput(workspace.id, taskId)) {
       return failClosed("DESKTOP_RESULT_PARTIAL", "已有未完成的 Desktop 结果输出但缺少执行记录；拒绝追加或覆盖，请人工核对。");
@@ -235,4 +236,23 @@ export async function recordDesktopResult(
     appendExecutionRecordLocked(workspace.id, record);
     return { record, output };
   });
+}
+
+/** 已有 exact terminal 时的只读恢复；context 可用且 turn 不一致仍拒绝。 */
+async function recoverPriorDesktopResult(
+  workspace: DesktopResultWorkspace,
+  accepted: DesktopDelivery,
+  prior: StoredExecutionRecord,
+): Promise<DesktopResultReceipt> {
+  try {
+    await assertCurrentResultContext(workspace, accepted);
+    return { record: prior, output: outputForRecord(workspace.id, prior) };
+  } catch (error) {
+    const code = error instanceof DesktopError ? error.code : null;
+    const durable = code === "DESKTOP_STATE_UNAVAILABLE" || code === "DESKTOP_IPC_UNAVAILABLE" ||
+      code === "DESKTOP_IPC_TIMEOUT" || code === "DESKTOP_IPC_REJECTED";
+    if (!durable) throw error;
+    // UI context 消失不推翻已写入的 exact terminal；不创建新记录、不改 digest。
+    return { record: prior, output: outputForRecord(workspace.id, prior) };
+  }
 }

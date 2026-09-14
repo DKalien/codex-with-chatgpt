@@ -224,6 +224,28 @@ read_file、search_workspace、git_status、git_diff、test_status、execution_s
 **Web Control only works while the corresponding Codex control session remains active.**
 不启动 daemon/第二 app-server，不用 Desktop remote resume，不支持网页唤醒关闭的 Codex。
 
+## Machine Core 的 fast/full 验证边界
+
+machine bin launcher/helper 与 current pointer 属于受信任本机安装状态。路径必须是规范的普通文件；
+这不能抵御能同时重写本机校验程序、pointer 和 release 的攻击者，manifest 摘要不是发行者数字签名。
+helper 先于 pointer 更新时必须仍能启动旧 current，因此不要求 machine helper 字节等于旧 release 快照。
+
+新 v3 pointer 严格绑定 releaseRoot、runtimeBuildId、artifactSha256 和 manifestSha256；
+release manifest v2 严格绑定固定 bootstrap 清单和各文件内容摘要。fast 每次重新读/hash 这些文件并
+检查路径，不以 stat/mtime/cache 代替内容验证。清单包括 bin 入口、package、dist CLI 入口、build-id、
+三个安装脚本及对应 core-assets 快照、依赖快照摘要。缺失/额外字段、错误 hash、关键路径外链均拒绝。
+
+fast 不验证任意深层 dist、node_modules 内容、新增文件或其中后来出现的链接；深层篡改可能在
+full 维护检查前影响运行。pnpm-lock 快照不参与启动，引入的完整 buildId/full 验证仍保护它。
+需要逐次完整扫描时使用默认 `readCurrent(stateDir, "full")`；开发测量入口也可通过
+`node scripts/measure-core-release.cjs --state-dir <stateDir> --mode full` 显式只读检查。
+install/publish、protect-current、rollout 和 doctor（文本/JSON）的 runtimeUpgrade 检查继续 full。
+普通 status 的 runtimeUpgrade 元数据显式请求 fast；其 `current` 只说明通过 fast 后安装与运行
+build 一致，不表示深层依赖刚经过全检。pointer/manifest/bootstrap 损坏仍返回 unknown/install_corrupt，
+不能以其声称 current。底层 readCurrent 和 TypeScript 安装读取 API 的默认值保持 full。
+完整验证仍拒绝 artifact/buildId 不匹配与依赖 symlink 越界；旧 v2 始终 fallback full。
+校验与子进程启动不是原子事务，不能声称抵御校验后本机并发改写。
+
 ## What MCP cannot do (V1)
 
 Except for the explicitly authorized write actions described above, MCP has no

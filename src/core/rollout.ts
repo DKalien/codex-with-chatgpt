@@ -14,6 +14,11 @@ import { desktopIpc } from "../desktop/ipc.js";
 import { readDesktop } from "../desktop/store.js";
 import { readRemote } from "../remote/store.js";
 import { desktopHistory } from "../desktop/history.js";
+import { appendCleanupError, releaseMaintenanceOrThrow, tryAcquireMaintenanceLock } from "./maintenance-lock.js";
+import { releaseRolloutFence, tryAcquireRolloutFence } from "./rollout-fence.js";
+import { assessRolloutIdle, blockerToReason, type IdleAssessment } from "./rollout-idle.js";
+import { schedulePostTurnFinalizer } from "./post-turn-finalizer.js";
+import type { spawn } from "node:child_process";
 
 const runtimeSchema = z.object({ service: z.literal(SERVICE_NAME), version: z.string(),
   workspaceId: z.string().regex(/^[a-f0-9]{12}$/), workspaceRoot: z.string().refine(path.isAbsolute),
@@ -21,7 +26,13 @@ const runtimeSchema = z.object({ service: z.literal(SERVICE_NAME), version: z.st
   publicUrl: z.string().nullable(), startedAt: z.string().datetime(),
   runtimeBuildId: z.string().refine(isRuntimeBuildId).optional() });
 type RolloutStatus = "current" | "upgraded" | "stopped" | "pending_busy" | "skipped_quick" | "pending" | "error";
-interface RolloutItem { workspaceId: string; workspaceName?: string; status: RolloutStatus; reason?: UpgradeReason }
+interface RolloutItem {
+  workspaceId: string;
+  workspaceName?: string;
+  status: RolloutStatus;
+  reason?: UpgradeReason;
+  finalizer?: { jobId: string; status: "scheduled" | "existing" };
+}
 
 class Skip extends Error {
   constructor(readonly reason: UpgradeReason) { super(reason); }
@@ -62,60 +73,51 @@ async function namedUrl(workspace: Workspace, info: BridgeAdminInfo): Promise<st
   return expected;
 }
 
-async function idle(workspace: Workspace, info: BridgeAdminInfo): Promise<void> {
-  // 环境变量只能保守拒绝，绝不能以它证明 idle 或授予权限。
-  if (process.env.CODEX_THREAD_ID && new Workspace(process.cwd()).id === workspace.id) throw new Skip("busy");
-  if (typeof info.pairingActive !== "boolean") throw new Skip("runtime_unknown");
-  if (info.pairingActive) throw new Skip("pairing_active");
-  try {
-    const before = readDesktop(workspace.id);
-    if (before && before.workspaceRoot !== workspace.root) throw new Skip("desktop_unknown");
-    if (before?.deliveries.some(item => item.deliveryStatus === "outcome_unknown")) throw new Skip("desktop_unresolved");
-    const { desktop, accepted, skipHistory, retired, ownerless } = desktopHistory(workspace);
-    if (JSON.stringify(desktop) !== JSON.stringify(before)) throw new Skip("desktop_unknown");
-    const acceptedThreads = accepted.filter(item => !skipHistory.has(item.commandId) || item.threadId === desktop?.binding?.threadId)
-      .map(item => item.threadId!);
-    const binding = desktop?.binding;
-    if (acceptedThreads.length && !binding) throw new Skip("desktop_unknown");
-    if (binding) for (const threadId of new Set([binding.threadId, ...acceptedThreads])) {
-      // 同一历史 thread 的所有待检查 delivery 都已 retired 才能接受明确不存在。
-      const retirementOnly = threadId !== binding.threadId && accepted
-        .filter(item => item.threadId === threadId && !skipHistory.has(item.commandId))
-        .every(item => retired.has(item.commandId));
-      let observed;
-      try {
-        observed = await desktopIpc.inspect({ threadId, hostId: binding.hostId,
-          projectId: binding.projectId, workspaceRoot: workspace.root });
-      } catch (error) {
-        if (!retirementOnly) throw error;
-        const code = (error as { code?: string }).code;
-        if (code === "DESKTOP_TARGET_NOT_FOUND") continue;
-        // 无 owner 仅对显式 ownerless 处置生效；同 thread 任一未处置项仍阻塞。
-        if (code === "DESKTOP_NO_OWNER" && accepted
-          .filter(item => item.threadId === threadId && !skipHistory.has(item.commandId))
-          .every(item => ownerless.has(item.commandId))) continue;
-        throw new Skip(code === "DESKTOP_BUSY" ? "busy" : "desktop_unknown");
-      }
-      if (observed.runtimeStatus !== "idle") throw new Skip(
-        observed.runtimeStatus === "active" || observed.runtimeStatus === "inProgress" ? "busy" : "desktop_unknown");
-    }
-  } catch (error) {
-    if (error instanceof Skip) throw error;
-    const code = (error as { code?: string }).code;
-    throw new Skip(code === "DESKTOP_BUSY" ? "busy" : code === "DESKTOP_APPROVAL_PENDING" ? "approval_pending" : "desktop_unknown");
+async function idle(workspace: Workspace, info: BridgeAdminInfo, assessment?: IdleAssessment): Promise<IdleAssessment> {
+  const result = assessment ?? await assessRolloutIdle(workspace, info);
+  if (!result.idle) {
+    const first = result.blockers[0]!;
+    throw new Skip(blockerToReason(first));
   }
+  return result;
+}
+
+/** 显式 rollout 在 reason=busy 且严格 self-busy proof 时 schedule 一次性 finalizer。 */
+async function tryScheduleSelfBusyFinalizer(
+  workspace: Workspace,
+  targetBuildId: string,
+  info: BridgeAdminInfo,
+  saved: RuntimeState,
+  spawnImpl?: typeof spawn,
+): Promise<{ jobId: string; status: "scheduled" | "existing" } | null> {
   try {
-    const remote = readRemote(workspace.id);
-    if (remote && remote.workspaceRoot !== workspace.root) throw new Skip("remote_unknown");
-    const pending = new Set(["queued", "starting", "running", "awaiting_approval", "needs_reconciliation"]);
-    if (remote && [...remote.threads, ...remote.tasks].some(item => pending.has(item.status))) throw new Skip("remote_active");
-    if (remote?.controller && (remote.controller.error || ["starting", "unknown"].includes(remote.controller.appServer)))
-      throw new Skip("remote_unknown");
-  } catch (error) { throw error instanceof Skip ? error : new Skip("remote_unknown"); }
+    const assessment = await assessRolloutIdle(workspace, info);
+    if (assessment.blockers.length !== 1 || assessment.blockers[0]!.kind !== "self_turn" || !assessment.selfBusyProof) {
+      return null;
+    }
+    const scheduled = await schedulePostTurnFinalizer(workspace, targetBuildId, {
+      stateDir: getStateDir(),
+      assessment,
+      runtime: saved,
+      ...(spawnImpl ? { spawnImpl } : {}),
+    });
+    if (!scheduled.ok) return null;
+    // existing 不再 spawn，避免重复 worker。
+    if (scheduled.status === "existing") {
+      return { jobId: scheduled.job.jobId, status: "existing" };
+    }
+    return { jobId: scheduled.job.jobId, status: scheduled.status };
+  } catch {
+    return null;
+  }
 }
 
 /** 本机显式维护；只共享程序版本，不迁移 Connector 或 workspace 业务状态。 */
-export async function rollout(opts: { workspaceRoot?: string } = {}) {
+export async function rollout(opts: {
+  workspaceRoot?: string;
+  /** 测试注入：仅用于替代 detached spawn；生产默认真实 spawn。 */
+  finalizerSpawnImpl?: typeof spawn;
+} = {}) {
   const installed = readCurrentInstall();
   if (!installed || getRuntimeBuildId() !== installed.runtimeBuildId) {
     throw new Error("Core install/build 无法确认；请从已安装的当前 launcher 运行 rollout。");
@@ -126,13 +128,10 @@ export async function rollout(opts: { workspaceRoot?: string } = {}) {
   const stateDir = getStateDir();
   const runtimeDir = path.join(stateDir, "runtime");
   const names = fs.existsSync(runtimeDir) ? fs.readdirSync(runtimeDir).filter(name => /^[a-f0-9]{12}\.json$/.test(name)).sort() : [];
-  // ponytail: 显式 rollout 使用一把短期机器锁；不偷锁、不引入后台 Supervisor。
+  // 固定顺序：maintenance → rollout。GC/install/bridge-start 共享 maintenance 边界。
   fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
-  const lockPath = path.join(stateDir, "rollout.lock");
-  let lock: number | undefined;
-  try { lock = fs.openSync(lockPath, "wx", 0o600); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw new Error("无法取得 rollout lock。"); }
-  if (lock === undefined) {
+  const maintenance = tryAcquireMaintenanceLock(stateDir, "rollout");
+  if (!maintenance.ok) {
     for (const name of names) {
       const workspaceId = name.slice(0, -5);
       if (selected && selected.id !== workspaceId) continue;
@@ -141,16 +140,42 @@ export async function rollout(opts: { workspaceRoot?: string } = {}) {
     const counts: Record<RolloutStatus, number> = { current: 0, upgraded: 0, stopped: 0, pending_busy: 0, skipped_quick: 0, pending: items.length, error: 0 };
     return { targetBuildId, counts, workspaces: items };
   }
+  const fence = tryAcquireRolloutFence(stateDir);
+  if (!fence.ok) {
+    releaseMaintenanceOrThrow(maintenance.handle);
+    for (const name of names) {
+      const workspaceId = name.slice(0, -5);
+      if (selected && selected.id !== workspaceId) continue;
+      items.push({ workspaceId, status: "pending", reason: "rollout_busy" });
+    }
+    const counts: Record<RolloutStatus, number> = { current: 0, upgraded: 0, stopped: 0, pending_busy: 0, skipped_quick: 0, pending: items.length, error: 0 };
+    return { targetBuildId, counts, workspaces: items };
+  }
+  let actionError: unknown = null;
   try {
+    // TOCTOU：拿到 maintenance 后重新确认 current install 仍等于最初 target。
+    const reconfirm = readCurrentInstall(stateDir, "fast");
+    if (!reconfirm || reconfirm.runtimeBuildId !== targetBuildId || getRuntimeBuildId() !== reconfirm.runtimeBuildId) {
+      for (const name of names) {
+        const workspaceId = name.slice(0, -5);
+        if (selected && selected.id !== workspaceId) continue;
+        items.push({ workspaceId, status: "error", reason: "install_changed" });
+      }
+      const counts: Record<RolloutStatus, number> = { current: 0, upgraded: 0, stopped: 0, pending_busy: 0, skipped_quick: 0, pending: 0, error: items.length };
+      return { targetBuildId, counts, workspaces: items };
+    }
     for (const name of names) {
       const workspaceId = name.slice(0, -5);
       if (selected && selected.id !== workspaceId) continue;
       let workspace: Workspace | undefined;
       let restarting = false;
+      let lastInfo: BridgeAdminInfo | undefined;
+      let lastSaved: RuntimeState | undefined;
       try {
         let saved: RuntimeState;
         try { saved = runtimeSchema.parse(JSON.parse(fs.readFileSync(path.join(runtimeDir, name), "utf8"))); }
         catch { throw new Skip("runtime_corrupt"); }
+        lastSaved = saved;
         const resolved = new Workspace(saved.workspaceRoot);
         if (resolved.id !== workspaceId || saved.workspaceId !== workspaceId || saved.workspaceRoot !== resolved.root ||
           (selected && selected.root !== resolved.root)) throw new Skip("identity_mismatch");
@@ -164,6 +189,7 @@ export async function rollout(opts: { workspaceRoot?: string } = {}) {
         }
         if (observation.state !== "healthy") throw new Skip("runtime_unknown");
         const info = await authenticatedInfo(workspace, saved);
+        lastInfo = info;
         if (info.runtimeBuildId === targetBuildId) {
           clearPending(workspace);
           items.push({ workspaceId, workspaceName: workspace.name, status: "current" });
@@ -175,6 +201,7 @@ export async function rollout(opts: { workspaceRoot?: string } = {}) {
         const url = await namedUrl(workspace, info);
         restarting = true;
         const result = await restartBridge(workspace.root, { tunnel: true, expectedRuntime: saved,
+          maintenance: maintenance.handle,
           beforeShutdown: async () => {
             const fresh = await authenticatedInfo(workspace!, saved);
             if (await namedUrl(workspace!, fresh) !== url) throw new Skip("named_unhealthy");
@@ -189,14 +216,18 @@ export async function rollout(opts: { workspaceRoot?: string } = {}) {
         const reason = error instanceof Skip ? error.reason : restarting ? "restart_failed" : "runtime_unknown";
         let status: RolloutStatus = reason === "quick" ? "skipped_quick" :
           ["busy", "approval_pending", "pairing_active"].includes(reason) ? "pending_busy" : restarting && !(error instanceof Skip) ? "error" : "pending";
+        let finalizer: RolloutItem["finalizer"];
         if (workspace) {
           try { writePending(workspace, targetBuildId, reason); } catch { status = "error"; }
+          if (reason === "busy" && !restarting && lastInfo && lastSaved) {
+            finalizer = await tryScheduleSelfBusyFinalizer(workspace, targetBuildId, lastInfo, lastSaved, opts.finalizerSpawnImpl) ?? undefined;
+          }
         } else status = "error";
-        items.push({ workspaceId, ...(workspace ? { workspaceName: workspace.name } : {}), status, reason });
+        items.push({ workspaceId, ...(workspace ? { workspaceName: workspace.name } : {}), status, reason, ...(finalizer ? { finalizer } : {}) });
       }
     }
     // runtime 文件已消失的 workspace 不启动；其 pending 可在此显式维护操作中清理。
-    if (lock !== undefined) {
+    {
       const directory = path.join(stateDir, "runtime-upgrades");
       for (const name of fs.existsSync(directory) ? fs.readdirSync(directory) : []) {
         if (!/^[a-f0-9]{12}\.json$/.test(name) || names.includes(name) || (selected && name !== `${selected.id}.json`)) continue;
@@ -209,7 +240,30 @@ export async function rollout(opts: { workspaceRoot?: string } = {}) {
         } catch { items.push({ workspaceId: name.slice(0, -5), status: "error", reason: "runtime_corrupt" }); }
       }
     }
-  } finally { if (lock !== undefined) { fs.closeSync(lock); fs.unlinkSync(lockPath); } }
+  } catch (error) {
+    actionError = error;
+    throw error;
+  } finally {
+    const fenceReport = releaseRolloutFence(fence.handle);
+    if (actionError) {
+      if (!fenceReport.rolloutReleased) {
+        appendCleanupError(actionError, new Error(fenceReport.issues.join("; ") || "rollout fence release failed"));
+      }
+      try {
+        releaseMaintenanceOrThrow(maintenance.handle, { actionError: undefined, result: { targetBuildId, items } });
+      } catch (maintenanceError) {
+        appendCleanupError(actionError, maintenanceError instanceof Error ? maintenanceError : new Error(String(maintenanceError)));
+      }
+    } else {
+      if (!fenceReport.rolloutReleased) {
+        const fenceError = new Error(fenceReport.issues.join("; ") || "rollout fence release failed");
+        (fenceError as { result?: unknown }).result = { targetBuildId, items };
+        releaseMaintenanceOrThrow(maintenance.handle, { actionError: fenceError, result: { targetBuildId, items } });
+      } else {
+        releaseMaintenanceOrThrow(maintenance.handle, { result: { targetBuildId, items } });
+      }
+    }
+  }
   const counts: Record<RolloutStatus, number> = { current: 0, upgraded: 0, stopped: 0, pending_busy: 0, skipped_quick: 0, pending: 0, error: 0 };
   for (const item of items) counts[item.status] += 1;
   return { targetBuildId, counts, workspaces: items };

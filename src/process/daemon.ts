@@ -7,6 +7,22 @@ import { adminFetch, findBridgeObservation, findLiveBridge, type RuntimeState } 
 import { Workspace } from "../workspace/manager.js";
 import type { DesktopCompatibility } from "../auth/store.js";
 import { detectTunnelBinaries } from "../tunnel/detect.js";
+import {
+  tryAcquireMaintenanceLock,
+  assertMaintenanceHandle,
+  MaintenanceBusyError,
+  appendCleanupError,
+  releaseMaintenanceOrThrow,
+  type MaintenanceLockHandle,
+} from "../core/maintenance-lock.js";
+import {
+  STARTUP_LEASE_ENV,
+  cleanupStartupLeaseClaim,
+  createStartLock,
+  encodeStartupLease,
+  issueStartupLease,
+  type StartupLease,
+} from "../core/startup-lease.js";
 
 export { adminFetch } from "../bridge/runtime.js";
 
@@ -44,17 +60,58 @@ export function buildServeArgs(baseArgs: string[], workspaceRoot: string, port?:
  * Ensure a bridge is running for the workspace. Reuses a live instance,
  * otherwise spawns a detached daemon and waits for it to become healthy.
  */
-export async function ensureBridge(workspaceRoot: string, opts: { port?: number } = {}): Promise<EnsureBridgeResult> {
+export async function ensureBridge(workspaceRoot: string, opts: {
+  port?: number;
+  /** rollout 已持有 maintenance 时传入，避免 nested self-deadlock。 */
+  maintenance?: MaintenanceLockHandle;
+} = {}): Promise<EnsureBridgeResult> {
   const workspace = new Workspace(workspaceRoot);
-  const lockFile = path.join(ensureDir(path.join(getStateDir(), "runtime")), `${workspace.id}.start.lock`);
-  let lock: number;
-  try { lock = fs.openSync(lockFile, "wx", 0o600); }
-  catch { throw new Error("Bridge start lock 存在或无法取得；未启动重复实例，请稍后重试。"); }
-  try { return await ensureUnlocked(workspace, opts); }
-  finally { fs.closeSync(lock); fs.unlinkSync(lockFile); }
+  const stateDir = getStateDir();
+  const start = createStartLock(stateDir, workspace.id);
+  let ownedMaintenance: MaintenanceLockHandle | null = null;
+  if (opts.maintenance) {
+    try {
+      assertMaintenanceHandle(stateDir, opts.maintenance);
+    } catch (error) {
+      start.release();
+      throw error;
+    }
+  } else {
+    const acquired = tryAcquireMaintenanceLock(stateDir, "bridge-start");
+    if (!acquired.ok) {
+      start.release();
+      throw new MaintenanceBusyError("Bridge start 需要 machine maintenance lock，当前繁忙");
+    }
+    ownedMaintenance = acquired.handle;
+  }
+  const maintenance = opts.maintenance ?? ownedMaintenance!;
+  const lease = issueStartupLease({ stateDir, workspace, maintenance, startLockNonce: start.nonce });
+  let result: EnsureBridgeResult | undefined;
+  let actionError: unknown = null;
+  try {
+    result = await ensureUnlocked(workspace, { ...opts, startupLease: lease });
+  } catch (error) {
+    actionError = error;
+  }
+  // fail-closed：start.lock 未成功退休时保留 claim，避免同 lease 再 claim 窗口。
+  const startReleased = start.release();
+  if (startReleased) {
+    cleanupStartupLeaseClaim(stateDir, lease);
+  } else {
+    const startError = new Error("start.lock release failed");
+    if (actionError) appendCleanupError(actionError, startError);
+    else {
+      (startError as { result?: EnsureBridgeResult }).result = result;
+      actionError = startError;
+    }
+  }
+  releaseMaintenanceOrThrow(ownedMaintenance, { result, actionError: actionError ?? undefined });
+  return result!;
 }
 
-async function ensureUnlocked(workspace: Workspace, opts: { port?: number }): Promise<EnsureBridgeResult> {
+export type { StartupLease };
+
+async function ensureUnlocked(workspace: Workspace, opts: { port?: number; startupLease?: StartupLease }): Promise<EnsureBridgeResult> {
   const observation = await findBridgeObservation(workspace.id);
   if (observation.state === "healthy") return { runtime: observation.runtime, spawned: false };
   if (observation.state === "unknown") {
@@ -74,13 +131,15 @@ async function ensureUnlocked(workspace: Workspace, opts: { port?: number }): Pr
     // Windows / filesystems without chmod semantics
   }
   const { cmd, args } = cliEntry();
+  const env = { ...process.env };
+  if (opts.startupLease) env[STARTUP_LEASE_ENV] = encodeStartupLease(opts.startupLease);
   const child = spawn(
     cmd,
     buildServeArgs(args, workspace.root, opts.port),
     {
       detached: true,
       stdio: ["ignore", out, out],
-      env: { ...process.env },
+      env,
       windowsHide: true,
     }
   );
@@ -139,9 +198,9 @@ export interface BridgeAdminInfo {
 
 export async function ensureBridgeAndTunnel(
   workspaceRoot: string,
-  opts: { tunnel: boolean }
+  opts: { tunnel: boolean; maintenance?: MaintenanceLockHandle }
 ): Promise<{ runtime: RuntimeState; info: BridgeAdminInfo; mcpUrl: string | null }> {
-  const { runtime } = await ensureBridge(workspaceRoot);
+  const { runtime } = await ensureBridge(workspaceRoot, { maintenance: opts.maintenance });
   let info = await adminFetch<BridgeAdminInfo>(runtime, "GET", "/admin/info");
   let mcpUrl: string | null = info.publicUrl ? `${info.publicUrl}/mcp` : null;
   if (opts.tunnel && !info.publicUrl) {
@@ -159,7 +218,7 @@ export async function ensureBridgeAndTunnel(
 /** 所有重启共用认证 shutdown；等待关闭期间绝不按 PID kill 或猜测已停止。 */
 export async function restartBridge(
   workspaceRoot: string,
-  opts: { tunnel: boolean; expectedRuntime?: RuntimeState; beforeShutdown?: () => Promise<void> }
+  opts: { tunnel: boolean; expectedRuntime?: RuntimeState; beforeShutdown?: () => Promise<void>; maintenance?: MaintenanceLockHandle }
 ): Promise<{ runtime: RuntimeState; info: BridgeAdminInfo; mcpUrl: string | null }> {
   const workspace = new Workspace(workspaceRoot);
   const before = await findBridgeObservation(workspace.id);

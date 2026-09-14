@@ -6,11 +6,12 @@ import { getStateDir } from "../config/paths.js";
 import { isRuntimeBuildId } from "../build-id.js";
 import type { RuntimeState } from "../bridge/runtime.js";
 import type { Workspace } from "../workspace/manager.js";
-import { getCurrentInstall } from "./install.js";
+import { getCurrentInstall, type CoreVerification } from "./install.js";
 
 export const UPGRADE_REASONS = ["busy", "approval_pending", "quick", "named_unhealthy", "pairing_active",
   "desktop_unresolved", "desktop_unknown", "remote_active", "remote_unknown", "runtime_unknown",
-  "runtime_corrupt", "identity_mismatch", "restart_failed", "postcheck_failed", "rollout_busy", "build_unknown"] as const;
+  "runtime_corrupt", "identity_mismatch", "restart_failed", "postcheck_failed", "rollout_busy", "build_unknown",
+  "install_changed"] as const;
 export type UpgradeReason = typeof UPGRADE_REASONS[number];
 type LocalWorkspace = Pick<Workspace, "id" | "root">;
 const pendingSchema = z.object({
@@ -54,9 +55,9 @@ export function clearPending(workspace: LocalWorkspace): void {
   if (readPending(workspace)) fs.unlinkSync(pendingFile(workspace.id));
 }
 
-/** status/doctor 只读，不以 metadata 将旧进程冒充为新 build。 */
-export function readRuntimeUpgrade(workspace: LocalWorkspace, runtime: RuntimeState | null) {
-  const installed = getCurrentInstall();
+/** 调用点明确选择 status 的 fast 或维护的 full；不以 metadata 冒充运行 build。 */
+export function readRuntimeUpgrade(workspace: LocalWorkspace, runtime: RuntimeState | null, verification: CoreVerification) {
+  const installed = getCurrentInstall(undefined, verification);
   const runtimeBuildId = isRuntimeBuildId(runtime?.runtimeBuildId) ? runtime.runtimeBuildId : null;
   const installedBuildId = installed.metadata?.runtimeBuildId ?? null;
   let pending: UpgradePending | null;

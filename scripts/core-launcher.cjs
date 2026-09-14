@@ -7,9 +7,15 @@ async function main() {
   const path = (await import("node:path")).default;
   const { pathToFileURL } = await import("node:url");
   const { spawnSync } = await import("node:child_process");
-  const bin = path.dirname(fs.realpathSync(process.argv[1]));
-  const { default: release } = await import(pathToFileURL(path.join(bin, "core-release.cjs")).href);
-  const metadata = release.readCurrent(path.dirname(bin));
+  const launcher = path.resolve(process.argv[1]);
+  const bin = path.dirname(launcher);
+  const helper = path.join(bin, "core-release.cjs");
+  // machine bin 是本机信任根；允许更新后的 helper 在 pointer 切换前验证旧 release。
+  for (const file of [launcher, helper]) {
+    if (!fs.lstatSync(file).isFile() || fs.realpathSync(file) !== file) throw new Error("machine bootstrap 路径身份不匹配");
+  }
+  const { default: release } = await import(pathToFileURL(helper).href);
+  const metadata = release.readCurrent(path.dirname(bin), "fast");
   if (!metadata) throw new Error("current.json 缺失");
   const entry = path.join(metadata.releaseRoot, "bin", "c2c.js");
   const result = spawnSync(process.execPath, [entry, ...process.argv.slice(2)], { stdio: "inherit", windowsHide: true });

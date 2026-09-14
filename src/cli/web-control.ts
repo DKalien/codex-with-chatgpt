@@ -5,8 +5,10 @@ import { Workspace } from "../workspace/manager.js";
 import { readSession } from "../session/state.js";
 import {
   closeControlTask, completeControlCommand, controlBootPrompt, disableWebControl, enableWebControl,
+  recoverControlCommand,
+  reconcileControlCommand,
   markBootSent, markControlFeedbackSent, receiveControl, rejectControlCommand,
-  startControlCommand, webControlStatus,
+  startControlCommand, webControlStatus, listPendingControlFeedback,
 } from "../session/web-control.js";
 
 interface Options {
@@ -60,7 +62,9 @@ export function registerWebControlCommands(program: Command): void {
   };
   run(group.command("status"), (workspaceId) => {
     const state = webControlStatus(workspaceId);
+    const pendingFeedback = state ? listPendingControlFeedback(workspaceId) : [];
     return { enabled: state?.enabled ?? false, state: state ?? null,
+      pendingFeedback,
       projectUrl: readSession(workspaceId)?.projectUrl ?? null,
       listening: "仅当前 Agent 保持运行并等待网页时生效；此 CLI 不启动监听器。" };
   });
@@ -90,6 +94,10 @@ export function registerWebControlCommands(program: Command): void {
     ({ state: rejectControlCommand(workspaceId, owner(options), options.commandId!, options.reason!) }));
   run(group.command("complete").requiredOption("--command-id <id>"), (workspaceId, options) =>
     completeControlCommand(workspaceId, owner(options), options.commandId!));
+  run(group.command("recover").requiredOption("--command-id <id>"), (workspaceId, options) =>
+    recoverControlCommand(workspaceId, owner(options), options.commandId!));
+  run(group.command("reconcile").requiredOption("--command-id <id>"), (workspaceId, options) =>
+    reconcileControlCommand(workspaceId, owner(options), options.commandId!));
   run(group.command("close-task").requiredOption("--command-id <id>")
     .option("--local-user", "仅本地用户明确放弃已完成任务的后续网页 Review"), (workspaceId, options) =>
     ({ state: closeControlTask(workspaceId, owner(options), options.commandId!, options.localUser ?? false) }));

@@ -237,12 +237,11 @@ describe("Desktop execution result", () => {
   it("写入前第二次复核短暂不可用时有界重试并继续要求 exact turn", async () => {
     writeDesktopState();
     vi.mocked(desktopIpc.currentResultContext)
-      .mockResolvedValueOnce(validResultContext())
       .mockRejectedValueOnce(new DesktopError("DESKTOP_STATE_UNAVAILABLE", "Desktop 状态短暂不可确认"))
       .mockResolvedValue(validResultContext());
     const result = await recordDesktopResult(workspace, input({ output: undefined }));
     expect(result.record.commandId).toBe(commandId);
-    expect(desktopIpc.currentResultContext).toHaveBeenCalledTimes(3);
+    expect(desktopIpc.currentResultContext).toHaveBeenCalledTimes(2);
     expect(readExecutionRecords(workspace.id)).toHaveLength(1);
   });
 
@@ -271,8 +270,7 @@ describe("Desktop execution result", () => {
   it("写入前 result context 切换到新 turn 时拒绝且不落盘", async () => {
     writeDesktopState();
     vi.mocked(desktopIpc.currentResultContext)
-      .mockResolvedValueOnce(validResultContext())
-      .mockResolvedValueOnce(validResultContext({ resultTurnId: "00000000-0000-4000-8000-000000000104" }));
+      .mockResolvedValue(validResultContext({ resultTurnId: "00000000-0000-4000-8000-000000000104" }));
     await expect(recordDesktopResult(workspace, input())).rejects.toMatchObject({ code: "DESKTOP_RESULT_CURRENT_EXECUTION" });
     expect(fs.existsSync(recordsFile())).toBe(false);
     expect(listExecutionOutputs(workspace.id)).toEqual([]);
@@ -307,6 +305,22 @@ describe("Desktop execution result", () => {
     await expect(recordDesktopResult(workspace, input())).rejects.toMatchObject({ code: "DESKTOP_RESULT_CURRENT_EXECUTION" });
     expect(fs.readFileSync(recordsFile(), "utf8")).toBe(recordsBefore);
     expect(listExecutionOutputs(workspace.id)).toEqual(outputsBefore);
+  });
+
+  it("已有 exact terminal 时 Desktop context 不可用可只读恢复，不改记录", async () => {
+    writeDesktopState();
+    const first = await recordDesktopResult(workspace, input());
+    const recordsBefore = fs.readFileSync(recordsFile(), "utf8");
+    vi.mocked(desktopIpc.currentResultContext).mockRejectedValue(
+      new DesktopError("DESKTOP_STATE_UNAVAILABLE", "Desktop 已关闭"),
+    );
+    const recovered = await recordDesktopResult(workspace, input());
+    expect(recovered).toEqual(first);
+    expect(fs.readFileSync(recordsFile(), "utf8")).toBe(recordsBefore);
+    // 首次写入路径仍拒绝；context 消失不能凭空造终态。
+    writeDesktopState({ deliveries: [delivery({ commandId: "desktop_late_new" })] });
+    await expect(recordDesktopResult(workspace, input({ commandId: "desktop_late_new" })))
+      .rejects.toMatchObject({ code: "DESKTOP_STATE_UNAVAILABLE" });
   });
 
   it("已有同 commandId 的普通记录或孤立 output 时拒绝覆盖", async () => {

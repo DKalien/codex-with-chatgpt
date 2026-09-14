@@ -87,13 +87,21 @@ requires matching authenticated `/admin/info` before reusing a live instance.
 Configuration follows automatically via
 the current workspace's runtime file; other workspace processes are untouched.
 
-**Machine Core**: a dependency-free Node launcher in the machine state directory reads strictly
-validated v2 `current.json` and executes its immutable `releases/<buildId>` with the same Node and arguments.
-The checkoutRoot field is source provenance only. Each release contains copied runtime files and dependencies;
-dependency links are confined to the release, and its manifest/content digest and dist build ID are verified before execution.
-Rebuilding or moving the checkout cannot alter the installed release. Installation stages and validates a new release,
-then atomically switches the pointer; an existing release is never overwritten. Legacy v1 pointers are frozen to the same
-installed build before install/build can mutate the checkout; failure stops the installer and preserves the old pointer.
+**Machine Core**：机器状态目录中的无依赖 Node launcher 严格读取 `current.json`，以相同 Node 和参数
+执行 immutable `releases/<buildId>`。`checkoutRoot` 仅记录源码来源，修改或移动 checkout 不影响已安装代码。
+新 pointer v3 用 `manifestSha256` 绑定 release manifest v2；manifest 保存 `runtimeBuildId`、完整
+`artifactSha256` 与固定 bootstrap 文件的 SHA-256。launcher 显式使用 fast，逐次检查规范路径、
+manifest 绑定、build-id 与 bootstrap 内容，不递归扫描完整 dist/node_modules，也不声称完整性全检。
+`readCurrent`、`readCurrentInstall`、`getCurrentInstall` 默认 full；安装/publish、protect-current、
+rollout 保留完整 dist buildId、release artifact 与依赖链接边界验证。普通 status 显式以 fast
+读取 `runtimeUpgrade` 元数据；doctor 的文本与 JSON 输出均显式 full，并通过 `report.core`
+报告完整性结果。两者的信任级别在 CLI 调用点指定，不全局切换默认值。
+旧 pointer v2 / manifest v1 在新 helper 下 fallback full；旧 bootstrap 快照继续发布 v2。
+安装先完整验证新 release，再更新 machine bin helper/launcher，最后原子切 pointer；
+中间的新 helper 能读取旧 current，失败保留旧 pointer，已有 release/manifest 不覆盖。
+v1 pointer 仍在 install/build 修改 checkout 前冻结到同一旧 build，失败停止安装。
+machine bin 和 current pointer 是本机信任根，不是数字签名；fast/full 保证与本轮测量见
+[长期开发计划](development-plan.md)。
 The deterministic SHA-256 `dist/build-id.txt` hashes runtime artifacts including the Desktop helper and Core installer assets, excluding itself.
 The build captures entrypoint/package/installer snapshots and a dependency-content digest. Installation copies these snapshots
 and verifies dependency contents before and after copying; post-build edits cannot be published under the earlier build ID.

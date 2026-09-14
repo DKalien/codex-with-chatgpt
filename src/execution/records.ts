@@ -26,8 +26,69 @@ export type ExecutionRecord = z.infer<typeof executionRecordSchema>;
 // Desktop receipt 的防重放摘要只存在本机 JSONL；不加入公开 execution_summary schema。
 const storedExecutionRecordSchema = executionRecordSchema.extend({
   desktopReceiptSha256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
-});
+}).strict();
 export type StoredExecutionRecord = z.infer<typeof storedExecutionRecordSchema>;
+
+export const TERMINAL_EXECUTION_STATUSES = ["ok", "failed", "blocked"] as const;
+
+export interface TerminalExecutionIdentity {
+  controlSessionId: string;
+  commandId: string;
+  taskId: string;
+  iteration: number;
+}
+
+/**
+ * status 轮询用的分类结果：missing/not_terminal 是正常 no-op，
+ * corrupt、重复、partial identity 一律 throw fail closed，不靠错误文案分支。
+ */
+export type TerminalExecutionLookup =
+  | { status: "terminal"; record: StoredExecutionRecord }
+  | { status: "not_terminal" }
+  | { status: "missing" };
+
+export function tryResolveTerminalExecutionRecord(
+  workspaceId: string,
+  expected: TerminalExecutionIdentity,
+): TerminalExecutionLookup {
+  const records = readExecutionRecordsStrict(workspaceId);
+  const byCommand = records.filter((record) => record.commandId === expected.commandId);
+  const byTaskIteration = records.filter((record) =>
+    record.taskId === expected.taskId && record.iteration === expected.iteration);
+  if (byCommand.length > 1 || byTaskIteration.length > 1) {
+    throw new Error("执行终态记录重复或冲突；拒绝猜测或重复回流。");
+  }
+  const candidates = [...new Set([...byCommand, ...byTaskIteration])];
+  if (candidates.length === 0) return { status: "missing" };
+  if (candidates.length !== 1) {
+    throw new Error("执行终态记录重复或冲突；拒绝猜测或重复回流。");
+  }
+  const record = candidates[0];
+  if (record.commandId !== expected.commandId || record.controlSessionId !== expected.controlSessionId ||
+      record.taskId !== expected.taskId || record.iteration !== expected.iteration) {
+    throw new Error("执行终态记录的 workspace/session/command/task/iteration 身份不匹配；拒绝回流。");
+  }
+  if (!(TERMINAL_EXECUTION_STATUSES as readonly string[]).includes(record.exitStatus)) {
+    return { status: "not_terminal" };
+  }
+  return { status: "terminal", record };
+}
+
+/**
+ * 严格解析指定 command 的唯一终态。commandId 与 taskId/iteration 都是身份键；
+ * 任一键重复、冲突、缺失或历史 JSONL 损坏都拒绝猜测，供 Web Control 恢复复用。
+ */
+export function resolveTerminalExecutionRecord(
+  workspaceId: string,
+  expected: TerminalExecutionIdentity,
+): StoredExecutionRecord {
+  const lookup = tryResolveTerminalExecutionRecord(workspaceId, expected);
+  if (lookup.status === "terminal") return lookup.record;
+  if (lookup.status === "not_terminal") {
+    throw new Error("执行记录尚未进入 ok/failed/blocked 终态；accepted 或其他状态不能视为完成。");
+  }
+  throw new Error("缺少唯一匹配的执行终态记录；不能把其他任务或历史 test_status 当作本次完成。");
+}
 
 /** 本机 Desktop receipt 的严格终态条件；调用方必须先拒绝重复或冲突记录。 */
 export function isTrustedDesktopReceipt(record: StoredExecutionRecord, commandId: string): boolean {

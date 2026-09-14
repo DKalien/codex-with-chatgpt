@@ -2,7 +2,11 @@ import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { readSession, updateSession, type SavedSession, type WebControlState } from "./state.js";
 import { candidateCommandId, parseControlMessage } from "./control-protocol.js";
-import { readExecutionRecords, type ExecutionRecord } from "../execution/records.js";
+import {
+  resolveTerminalExecutionRecord,
+  tryResolveTerminalExecutionRecord,
+  type ExecutionRecord,
+} from "../execution/records.js";
 
 const id = z.string().regex(/^[A-Za-z0-9_-]{1,128}$/);
 const messageId = z.string().min(1).max(200).regex(/^[A-Za-z0-9_-]+$/);
@@ -86,13 +90,71 @@ function changeControl<T>(workspaceId: string, fn: (state: WebControlState, sess
   return result!;
 }
 
+/**
+ * 纯状态 helper：仅在 activeCommand 仍为 executing 时，用唯一严格终态推进
+ * completed + pending。missing/not_terminal 是 no-op；损坏/冲突/mismatch 抛错。
+ * 不重新执行，不重新 enable，不递归调用 updateSession。
+ */
+function applyTerminalReconciliation(
+  state: WebControlState,
+  workspaceId: string,
+  now: number,
+): boolean {
+  const active = state.activeCommand;
+  if (!active) return false;
+  const receipt = state.seenCommands.find((item) => item.commandId === active.command.commandId);
+  if (!receipt || receipt.status !== "executing") return false;
+  const lookup = tryResolveTerminalExecutionRecord(workspaceId, {
+    controlSessionId: state.controlSessionId,
+    commandId: active.command.commandId,
+    taskId: active.taskId,
+    iteration: active.iteration,
+  });
+  if (lookup.status !== "terminal") return false;
+  receipt.status = "completed";
+  receipt.updatedAt = new Date(now).toISOString();
+  if (!receipt.feedbackMessageId) receipt.feedbackStatus = "pending";
+  if (state.enabled) {
+    state.status = "review";
+    touch(state, now);
+  }
+  return true;
+}
+
+function hasActiveExecuting(state: WebControlState): boolean {
+  const active = state.activeCommand;
+  if (!active) return false;
+  return state.seenCommands.some(
+    (item) => item.commandId === active.command.commandId && item.status === "executing",
+  );
+}
+
 export function webControlStatus(workspaceId: string, now = Date.now()): WebControlState | undefined {
   const session = readSession(workspaceId);
   const state = checkedState(session, workspaceId);
   if (!state) return undefined;
-  const before = state.status;
+  const beforeStatus = state.status;
+  const beforeEnabled = state.enabled;
   expire(state, session!, now);
-  return before === state.status ? state : changeControl(workspaceId, (latest) => latest, now);
+  const expireChanged = beforeStatus !== state.status || beforeEnabled !== state.enabled;
+  let reconcileChanged = false;
+  if (!expireChanged && hasActiveExecuting(state)) {
+    // 锁外只做分类：missing/not_terminal 不写盘；损坏/冲突直接 fail closed。
+    const active = state.activeCommand!;
+    const lookup = tryResolveTerminalExecutionRecord(workspaceId, {
+      controlSessionId: state.controlSessionId,
+      commandId: active.command.commandId,
+      taskId: active.taskId,
+      iteration: active.iteration,
+    });
+    reconcileChanged = lookup.status === "terminal";
+  }
+  if (!expireChanged && !reconcileChanged) return state;
+  return changeControl(workspaceId, (latest, sess) => {
+    expire(latest, sess, now);
+    applyTerminalReconciliation(latest, workspaceId, now);
+    return latest;
+  }, now);
 }
 
 export function enableWebControl(workspaceId: string, options: {
@@ -314,17 +376,26 @@ export function completeControlCommand(workspaceId: string, owner: string, comma
     const receipt = activeReceipt(state, commandId);
     if (!["executing", "completed"].includes(receipt.status)) throw new Error("COMMAND 尚未开始执行。");
     const active = state.activeCommand!;
-    const record = readExecutionRecords(workspaceId, Number.MAX_SAFE_INTEGER).reverse().find((item) =>
-      item.commandId === commandId && item.controlSessionId === state.controlSessionId &&
-      item.taskId === active.taskId && item.iteration === active.iteration);
-    if (!record) throw new Error("先用 c2c record 保存匹配的 command/session/task/iteration 执行记录。");
+    const record = resolveTerminalExecutionRecord(workspaceId, {
+      controlSessionId: state.controlSessionId,
+      commandId,
+      taskId: active.taskId,
+      iteration: active.iteration,
+    });
     if (receipt.status !== "completed") {
       receipt.status = "completed"; receipt.updatedAt = new Date(now).toISOString();
+      receipt.feedbackStatus = "pending";
       if (state.enabled) { state.status = "review"; touch(state, now); }
     }
+    if (!receipt.feedbackMessageId) receipt.feedbackStatus = "pending";
     return { feedback: executionFeedback(state, record), feedbackMessageId: receipt.feedbackMessageId };
   }, now);
 }
+
+/** 重启/反馈失败后的幂等恢复入口：只消费已存在的严格终态，不重新执行。 */
+export const recoverControlCommand = completeControlCommand;
+/** 状态检查路径使用的幂等 reconciliation；与 recover 共用严格终态门禁。 */
+export const reconcileControlCommand = completeControlCommand;
 
 export function markControlFeedbackSent(workspaceId: string, owner: string, commandId: string, sentMessageId: string, now = Date.now()) {
   return changeControl(workspaceId, (state) => {
@@ -333,11 +404,39 @@ export function markControlFeedbackSent(workspaceId: string, owner: string, comm
     if (receipt.status !== "completed") throw new Error("尚未记录执行完成。");
     if (receipt.feedbackMessageId) {
       if (receipt.feedbackMessageId !== sentMessageId) throw new Error("EXECUTED 已发送，不能重复标记其他消息。");
+      // legacy：仅有 messageId、没有 feedbackStatus 时，在同 ID 再次确认后规范化为 sent。
+      if (receipt.feedbackStatus !== "sent") receipt.feedbackStatus = "sent";
     } else {
       if (state.generatedMessageIds.length >= 20000) throw new Error("自动消息历史已达上限。");
       receipt.feedbackMessageId = messageId.parse(sentMessageId);
+      receipt.feedbackStatus = "sent";
       state.generatedMessageIds.push(receipt.feedbackMessageId);
     }
     return state;
   }, now);
+}
+
+/** status/recover 共用：列出当前仍 pending 的 EXECUTED，供自动回流发送。 */
+export function listPendingControlFeedback(workspaceId: string, now = Date.now()): Array<{
+  commandId: string; feedback: string; feedbackMessageId?: string;
+}> {
+  const state = webControlStatus(workspaceId, now);
+  if (!state) return [];
+  const pending: Array<{ commandId: string; feedback: string; feedbackMessageId?: string }> = [];
+  for (const receipt of state.seenCommands) {
+    if (receipt.status !== "completed" || receipt.feedbackStatus !== "pending") continue;
+    if (!state.activeCommand || state.activeCommand.command.commandId !== receipt.commandId) continue;
+    const record = resolveTerminalExecutionRecord(workspaceId, {
+      controlSessionId: state.controlSessionId,
+      commandId: receipt.commandId,
+      taskId: state.activeCommand.taskId,
+      iteration: state.activeCommand.iteration,
+    });
+    pending.push({
+      commandId: receipt.commandId,
+      feedback: executionFeedback(state, record),
+      ...(receipt.feedbackMessageId ? { feedbackMessageId: receipt.feedbackMessageId } : {}),
+    });
+  }
+  return pending;
 }

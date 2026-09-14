@@ -26,13 +26,19 @@ export const webControlStateSchema = z.object({
     updatedAt: z.string().datetime(), reason: z.string().max(500).optional(),
     userMessageId: messageId.optional(), assistantMessageId: messageId.optional(),
     feedbackMessageId: messageId.optional(),
+    feedbackStatus: z.enum(["pending", "sent"]).optional(),
   }).strict()).max(10000),
   generatedMessageIds: z.array(messageId).max(20000),
   activeCommand: z.object({
     command: controlCommandSchema, taskId: controlId, iteration: z.number().int().nonnegative(),
     rootGoal: z.string().min(1).max(8192), userMessageId: messageId,
   }).strict().optional(),
-}).strict();
+}).strict().superRefine((state, ctx) => {
+  for (const [i, receipt] of state.seenCommands.entries()) {
+    if (receipt.feedbackMessageId && receipt.feedbackStatus !== undefined && receipt.feedbackStatus !== "sent") ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["seenCommands", i, "feedbackStatus"], message: "feedbackMessageId 必须对应 sent" });
+    if (receipt.feedbackStatus === "sent" && !receipt.feedbackMessageId) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["seenCommands", i, "feedbackMessageId"], message: "sent 必须有 feedbackMessageId" });
+  }
+});
 export type WebControlState = z.infer<typeof webControlStateSchema>;
 
 function validateWebControl(session: SavedSession): void {

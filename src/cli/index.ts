@@ -3,9 +3,22 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { startBridge } from "../bridge/server.js";
+import {
+  tryAcquireMaintenanceLock,
+  MaintenanceBusyError,
+  appendCleanupError,
+  releaseMaintenanceOrThrow,
+  type MaintenanceLockHandle,
+} from "../core/maintenance-lock.js";
+import {
+  claimStartupLease,
+  consumeStartupLeaseFromEnv,
+  createStartLock,
+  type StartLockHandle,
+} from "../core/startup-lease.js";
+import { Workspace } from "../workspace/manager.js";
 import { findBridgeObservation, findLiveBridge, type RuntimeState } from "../bridge/runtime.js";
 import { adminFetch, ensureBridge, ensureBridgeAndTunnel, restartBridge, stopBridge, type BridgeAdminInfo as AdminInfo } from "../process/daemon.js";
-import { Workspace } from "../workspace/manager.js";
 import { AuthStore } from "../auth/store.js";
 import { detectTunnelBinaries } from "../tunnel/detect.js";
 import {
@@ -58,14 +71,122 @@ import { appendExecutionRecord, executionRecordSchema } from "../execution/recor
 import { saveExecutionOutput } from "../execution/output.js";
 import { checkForUpdates } from "./update-check.js";
 import { registerWebControlCommands } from "./web-control.js";
+import {
+  claimFinalizerWorker,
+  commitFinalizerResult,
+  projectFinalizerExecution,
+  readActiveFinalizer,
+  readFinalizerResult,
+  releaseFinalizerWorkerClaim,
+  runFinalizerAttempt,
+  FINALIZER_POLL_MS,
+} from "../core/post-turn-finalizer.js";
 import { registerRemoteCommands, remoteStatus } from "./remote.js";
 import { isWriteProbeEnabled, readWriteProbeStatus, WRITE_PROBE_SCOPE } from "../mcp/write-probe.js";
 import { registerDesktopCommands } from "./desktop.js";
 import { rollout } from "../core/rollout.js";
 import { readRuntimeUpgrade } from "../core/upgrade.js";
+import { planGc, gcPlanSummary } from "../core/gc-plan.js";
+import { applyGc } from "../core/gc-apply.js";
+import { isMaintenanceLockBusy } from "../core/maintenance-lock.js";
 
 const program = new Command();
 registerWebControlCommands(program);
+
+// ---------------------------------------------------------------- post-turn finalizer
+const ptf = program.command("post-turn-finalizer").description("一次性 post-turn finalizer（非 generic scheduler）");
+ptf.command("status").requiredOption("-w, --workspace <path>").option("--json").action((opts: { workspace: string; json?: boolean }) => {
+  const workspace = new Workspace(path.resolve(opts.workspace));
+  const stateDir = getStateDir();
+  const active = readActiveFinalizer(stateDir, workspace.id);
+  const latest = readFinalizerResult(stateDir, workspace.id);
+  const payload = {
+    active: Boolean(active),
+    jobId: active?.jobId ?? null,
+    targetBuildId: active?.targetBuildId ?? null,
+    status: active?.status ?? null,
+    expiresAt: active?.expiresAt ?? null,
+    latestResult: latest,
+  };
+  say(JSON.stringify(payload));
+});
+ptf.command("run").requiredOption("-w, --workspace <path>").action(async (opts: { workspace: string }) => {
+  const workspace = new Workspace(path.resolve(opts.workspace));
+  const stateDir = getStateDir();
+  delete process.env.CODEX_THREAD_ID;
+  delete process.env.CODEX_SESSION_ID;
+  delete process.env.C2C_STARTUP_LEASE;
+  const job = readActiveFinalizer(stateDir, workspace.id);
+  if (!job) {
+    process.exitCode = 1;
+    return;
+  }
+  let claim;
+  try {
+    claim = claimFinalizerWorker(stateDir, job);
+  } catch {
+    process.exitCode = 1;
+    return;
+  }
+  const startedAt = new Date().toISOString();
+  let cleanupFailed = false;
+  let claimReleased = false;
+  const releaseClaim = (): void => {
+    if (claimReleased) return;
+    claimReleased = true;
+    if (!releaseFinalizerWorkerClaim(stateDir, job, claim)) cleanupFailed = true;
+  };
+  try {
+    for (;;) {
+      const attempt = await runFinalizerAttempt(job, stateDir);
+      if (attempt.kind === "terminal") {
+        let committed;
+        try {
+          committed = commitFinalizerResult(stateDir, job, {
+            ...attempt.result,
+            startedAt,
+          });
+        } catch (error) {
+          if (error && typeof error === "object" && "result" in error) {
+            committed = (error as { result: import("../core/post-turn-finalizer.js").FinalizerResult }).result;
+            cleanupFailed = true;
+          } else throw error;
+        }
+        releaseClaim();
+        projectFinalizerExecution(workspace.id, job, committed);
+        say(JSON.stringify(committed));
+        process.exitCode = committed.status === "ok" && !cleanupFailed ? 0 : 1;
+        return;
+      }
+      if (Date.now() >= Date.parse(job.expiresAt)) {
+        let committed;
+        try {
+          committed = commitFinalizerResult(stateDir, job, {
+            status: "blocked", reason: "timeout_self_busy",
+            scheduledAt: job.createdAt, startedAt, finishedAt: new Date().toISOString(),
+          });
+        } catch (error) {
+          if (error && typeof error === "object" && "result" in error) {
+            committed = (error as { result: import("../core/post-turn-finalizer.js").FinalizerResult }).result;
+            cleanupFailed = true;
+          } else throw error;
+        }
+        releaseClaim();
+        projectFinalizerExecution(workspace.id, job, committed);
+        say(JSON.stringify(committed));
+        process.exitCode = 1;
+        return;
+      }
+      await new Promise(r => setTimeout(r, FINALIZER_POLL_MS));
+    }
+  } catch {
+    process.exitCode = 1;
+  } finally {
+    // orderly exit（含 owner-lost）统一 owner-safe 清理 claim；仅 crash 允许残留。
+    releaseClaim();
+    if (cleanupFailed) process.exitCode = 1;
+  }
+});
 registerRemoteCommands(program);
 registerDesktopCommands(program);
 
@@ -74,6 +195,35 @@ const say = (msg: string): void => {
 };
 const check = (msg: string): void => say(`✓ ${msg}`);
 const cross = (msg: string): void => say(`✗ ${msg}`);
+
+program.command("gc").description("immutable Core release 回收：只读 plan/dry-run，或显式 apply")
+  .option("--plan")
+  .option("--dry-run")
+  .option("--apply", "显式 destructive：maintenance lock 内重新校验后 tombstone+删除")
+  .option("--json")
+  .action((opts: { json?: boolean; plan?: boolean; dryRun?: boolean; apply?: boolean }) => {
+    const modes = [opts.plan, opts.dryRun, opts.apply].filter(Boolean).length;
+    if (modes !== 1) {
+      throw new InvalidArgumentError("gc 必须显式指定 --plan、--dry-run 或 --apply 之一，且不可组合");
+    }
+    if (opts.apply) {
+      const result = applyGc();
+      if (!result.ok) process.exitCode = 1;
+      if (opts.json) { say(JSON.stringify(result)); return; }
+      say(`Release GC apply：deleted ${result.totals.deletedCount}，tombstoned ${result.totals.tombstonedCount}，bytesDeleted ${result.totals.bytesDeleted}`);
+      for (const item of result.items) say(`${item.status} ${item.buildId}（${item.reason}）`);
+      for (const issue of result.issues) cross(issue);
+      return;
+    }
+    const plan = planGc();
+    // exit contract 与输出形态无关：ok=false 时 text/--json 都必须非零退出。
+    if (!plan.ok) process.exitCode = 1;
+    if (opts.json) { say(JSON.stringify(plan)); return; }
+    const mode = opts.dryRun ? "dry-run" : "plan";
+    say(`Release GC ${mode}：${plan.releases.length} 项，候选回收 ${plan.totals.bytesCandidateReclaimable} bytes，issue ${plan.totals.issueCount}`);
+    for (const item of plan.releases) say(`${item.disposition} ${item.buildId}（${item.reasons.join("、") || "无引用"}） ${item.logicalBytes}B`);
+    for (const issue of plan.issues) cross(issue);
+  });
 
 function resolveWorkspace(option?: string): string {
   return path.resolve(option ?? process.cwd());
@@ -205,17 +355,54 @@ program
   .option("--port <port>", "preferred port")
   .action(async (opts: { workspace: string; port?: string }) => {
     const logger = new Logger({ name: "bridge", console: true });
-    const bridge = await startBridge({
-      workspaceRoot: resolveWorkspace(opts.workspace),
-      port: opts.port ? parseInt(opts.port, 10) : undefined,
-      logger,
-    });
+    const workspaceRoot = resolveWorkspace(opts.workspace);
+    const workspace = new Workspace(workspaceRoot);
+    const port = opts.port ? parseInt(opts.port, 10) : undefined;
+    // one-shot：读取后立即从 env 删除，避免 grandchild 继承。
+    const lease = consumeStartupLeaseFromEnv();
+    let ownedMaintenance: MaintenanceLockHandle | null = null;
+    const ownedStartLocks: StartLockHandle[] = [];
+
+    const start = async (): Promise<Awaited<ReturnType<typeof startBridge>>> => {
+      const stateDir = getStateDir();
+      if (lease) {
+        // parent ensureBridge 已持有 maintenance + start.lock；child 做跨进程 one-shot claim。
+        claimStartupLease(lease, workspace);
+        return startBridge({ workspaceRoot, port, logger });
+      }
+      // 直接 serve：在 persistRuntime 落盘前自持 fence，防止与 GC destructive 并发。
+      const acquired = tryAcquireMaintenanceLock(stateDir, "bridge-serve");
+      if (!acquired.ok) throw new MaintenanceBusyError("serve 需要 machine maintenance lock，当前繁忙");
+      ownedMaintenance = acquired.handle;
+      ownedStartLocks.push(createStartLock(stateDir, workspace.id));
+      return startBridge({ workspaceRoot, port, logger });
+    };
+
+    let bridge: Awaited<ReturnType<typeof startBridge>> | undefined;
+    let actionError: unknown = null;
+    try {
+      bridge = await start();
+    } catch (error) {
+      actionError = error;
+    }
+    for (const startLock of ownedStartLocks) {
+      if (!startLock.release()) {
+        const startError = new Error("start.lock release failed");
+        if (actionError) appendCleanupError(actionError, startError);
+        else {
+          (startError as { result?: unknown }).result = bridge;
+          actionError = startError;
+        }
+      }
+    }
+    releaseMaintenanceOrThrow(ownedMaintenance, { result: bridge, actionError: actionError ?? undefined });
+    const started = bridge!;
     const shutdown = (): void => {
-      void bridge.close().then(() => process.exit(0));
+      void started.close().then(() => process.exit(0));
     };
     process.on("SIGINT", shutdown);
     process.on("SIGTERM", shutdown);
-    say(`bridge ready on ${bridge.localBaseUrl()} (workspace ${bridge.workspace.name})`);
+    say(`bridge ready on ${started.localBaseUrl()} (workspace ${started.workspace.name})`);
   });
 
 // ---------------------------------------------------------------- start
@@ -407,7 +594,7 @@ program
     const root = resolveWorkspace(opts.workspace);
     const workspace = new Workspace(root);
     const observation = await findBridgeObservation(workspace.id);
-    const upgrade = readRuntimeUpgrade(workspace, observation.state === "stopped" ? null : observation.runtime);
+    const upgrade = readRuntimeUpgrade(workspace, observation.state === "stopped" ? null : observation.runtime, "fast");
     const runtimeUpgrade = observation.state === "unknown" ? { ...upgrade, state: "unknown", reason: "runtime_unknown" } : upgrade;
     if (observation.state === "unknown") {
       if (opts.json) {
@@ -681,9 +868,25 @@ program
       };
     }
 
+    // doctor 是维护入口，文本与 JSON 均做 full；普通 status 不承担这次全量扫描。
+    const upgrade = workspace ? readRuntimeUpgrade(workspace, runtime, "full") : null;
+    if (upgrade) report.core = { ok: upgrade.installedBuildId !== null,
+      detail: upgrade.installedBuildId === null ? upgrade.reason ?? "install_unknown" : "完整 release 校验通过" };
+    // 只读 GC 摘要；doctor --fix 绝不调用 applyGc。
+    let gcSummary: ReturnType<typeof gcPlanSummary> | null = null;
+    try {
+      gcSummary = gcPlanSummary(planGc());
+      report.gc = { ok: gcSummary.ok,
+        detail: `releases=${gcSummary.releaseCount} reclaimable=${gcSummary.bytesCandidateReclaimable}B unknown=${gcSummary.unknownReleaseCount}` };
+    } catch (error) {
+      report.gc = { ok: false, detail: error instanceof Error ? error.message : "gc summary failed" };
+    }
+    const maintenanceBusy = isMaintenanceLockBusy();
     if (opts.json) {
       say(JSON.stringify({ report, repairs: results, chatgptRepair, namedRepair,
-        runtimeUpgrade: workspace ? { ...readRuntimeUpgrade(workspace, runtime),
+        gc: gcSummary,
+        maintenanceLockBusy: maintenanceBusy,
+        runtimeUpgrade: upgrade ? { ...upgrade,
           ...(bridgeUnknown ? { state: "unknown", reason: "runtime_unknown" } : {}) } : null }));
       return;
     }
@@ -697,6 +900,8 @@ program
       mcp: "MCP",
       oauth: "OAuth",
       tunnel: "Tunnel",
+      core: "Core",
+      gc: "Release GC",
     };
     let allOk = true;
     for (const [key, value] of Object.entries(report)) {

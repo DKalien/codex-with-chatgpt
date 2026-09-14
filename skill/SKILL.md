@@ -1084,11 +1084,22 @@ c2c record -w <ws> --task <active-task-id> --iteration <active-iteration> --cont
 
 测试/构建日志继续使用现有 `--command` / `--output-file`，不将原始网页文本作为参数。
 失败/阻塞也记录真实结果（failed/blocked），不把“命令结束”说成验收通过。
-`c2c web-control complete -w <ws> --command-id <id>` 检查匹配 record 并返回简短 `feedback`。
-只把这份 EXECUTED 元数据发到绑定 Chat，完整 diff/文件/长日志由 ChatGPT 从原只读 MCP 读取。
-发送后观察真实 user message ID：
-`c2c web-control feedback-sent -w <ws> --command-id <id> --message-id <actual-id>`。
-发送不确定先查页面，已记录反馈 ID 不重发；complete 可重读反馈但不能重新执行。
+
+终态回流不依赖手工搬运“做完了”：
+
+1. `c2c web-control status -w <ws>`（或 `complete`/`recover`）会用 exact
+   controlSessionId/commandId/taskId/iteration 严格解析唯一 terminal（ok/failed/blocked）。
+   accepted 永远不是 complete。无 terminal 是 no-op；损坏、重复、冲突、身份不匹配 fail closed。
+2. status 在发现唯一 terminal 后自动把 executing 推进为 completed + `feedbackStatus=pending`，
+   并在 JSON 中返回 `pendingFeedback`。正常路径不要求先运行 `reconcile` CLI。
+3. 有 pending 时，把同一份 EXECUTED 元数据发到绑定 Chat（完整 diff/文件/长日志由
+   ChatGPT 从原只读 MCP 读取）。发送后观察真实 user message ID：
+   `c2c web-control feedback-sent -w <ws> --command-id <id> --message-id <actual-id>`。
+4. 发送失败、进程退出或 messageId 暂时拿不到时保留 pending，不重执行、不丢 terminal。
+   下一轮 `status`/`recover` 读取同一终态并重试同一反馈。已记录反馈 ID 不重发；
+   同 messageId 幂等，不同 messageId fail closed。
+5. `recover`/`reconcile` CLI 仅用于诊断与人工恢复，不是正常 UX 的必要步骤。
+
 然后等待独立 Review 的新 COMMAND 或严格 DONE。每次 follow-up 新 ID，保持同一 taskId，
 iteration 自动加一；沿用已有 maxIterations（默认 12），达到上限停止并由本地用户决定继续。
 
@@ -1101,8 +1112,9 @@ Normal `session set` 保留 webControl；`session clear` 保留防重放历史�
 换 Chat URL 自动使原绑定失效，不能将原授权转移到另一个 Chat。
 
 重启/上下文恢复先查 status，不能把持久化的 accepted/executing 当成“待重跑队列”。
-先核对工作区与执行记录；已执行则仅 record/complete/补反馈，无法确认就报告并等本地处理，
-不得重新 start。有 activeCommand 时重新 enable 会拒绝，防止丢弃待反馈任务。
+先核对工作区与执行记录；已执行则 status 会自动 reconcile 出 pending 反馈，补发即可；
+无法确认就报告并等本地处理，不得重新 start。有 activeCommand 时重新 enable 会拒绝，
+防止丢弃待反馈任务。disabled/expired 中的 terminal reconciliation 不会重新 enable。
 completed 后可在关闭/过期状态补发已记录结果；要放弃剩余 Review，必须本地用户明确要求，
 然后 `c2c web-control close-task -w <ws> --command-id <id> --local-user`。这只结案已完成任务，
 保留执行和防重放历史；不得为了 enable 自动调用，也不替代对未完成执行的人工核对。

@@ -1,10 +1,12 @@
 import fs from "node:fs";
 import { describe, expect, it } from "vitest";
 
-const skill = fs.readFileSync(new URL("../skill/SKILL.md", import.meta.url), "utf8");
-const activation = skill.split('## Workflow: Activation（"启用 ChatGPT 工作流"）')[1]?.split("## Workflow: first-time setup")[0] ?? "";
+const skillSource = fs.readFileSync(new URL("../skill/SKILL.md", import.meta.url), "utf8");
 
-describe("Activation Skill 文本契约", () => {
+describe.each(["LF", "CRLF"])("Activation Skill 文本契约（%s）", style => {
+  // 仅在内存中构造两种输入；解析边界统一为 LF，不重写 Skill 文件。
+  const skill = skillSource.replace(/\r?\n/g, style === "CRLF" ? "\r\n" : "\n").replace(/\r\n/g, "\n");
+  const activation = skill.split('## Workflow: Activation（"启用 ChatGPT 工作流"）')[1]?.split("## Workflow: first-time setup")[0] ?? "";
   it("Desktop 版本拒绝报告真实观察值，不以 OAuth 兼容状态替代协议核验", () => {
     for (const text of ["DESKTOP_VERSION_UNSUPPORTED", "observedDesktopVersion", "observedAppServerVersion",
       "c2c desktop compatibility --json", "不是 OAuth `desktopCompatibility`", "不自动添加 profile"])

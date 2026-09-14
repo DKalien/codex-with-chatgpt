@@ -225,7 +225,7 @@ windowsTests("fork maintenance scripts", () => {
       { ...withFakePnpm(fake), C2C_STATE_DIR: fixture.coreStateDir }
     );
     expect(testRun.status, testRun.output).toBe(0);
-    expect(fs.readFileSync(fake.log, "utf8")).toContain("test -- --exclude tests/fork-scripts.test.ts");
+    expect(fs.readFileSync(fake.log, "utf8")).toContain("test --exclude tests/fork-scripts.test.ts --maxWorkers=1 --testTimeout=60000");
 
     git(fixture.repo, "branch", "upstream-main");
     git(fixture.repo, "checkout", "upstream-main");
