@@ -611,3 +611,15 @@ counts 契约兼容。
 - MCP：`feedback_companion_pair|status|revoke`
 - 验证：**58 files / 992 passed**；typecheck / build / `git diff --check`
 - **not deployed**；不写 MV3/DOM；runtime 仍 pre-E1a
+
+## Phase E1b1 Edge-first passive companion（2026-09-15，代码完成 + 真机验收通过，未部署 Bridge）
+
+- 统一 route：`src/chatgpt/route.ts`；支持 `/c/<id>`、`www.`、`/g/g-.../c/<id>`（Project/GPT）
+- MV3：`browser-companion/` → `dist/browser-companion`；permissions=`storage`+`activeTab`；hosts 仅 ChatGPT
+- document ownership + popup 显式 Bind；SPA 轮询；只读 DOM adapter（未知不安全）
+- ownership review-fix：popup status 经 content→SW；同 tab 换 document / 缺 documentId 清 owner
+- **Edge 真机被动验收通过**（真实 Project conversation bind/reload/tab-switch；无 Send）
+- **不** composer 写 / native Send / reserve / begin-send / Bridge deploy
+- 验证：**60 files / 1024 passed**；typecheck / build（含 companion）/ diff-check
+- **Bridge runtime not deployed**（extension 本机验收 ≠ Bridge rollout）
+- next：**E1b2**

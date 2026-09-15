@@ -5,6 +5,10 @@ import {
   type ConversationPrincipal,
 } from "../mcp/conversation-principal.js";
 import {
+  normalizeChatgptConversationRoute,
+  ChatGptRouteError,
+} from "../chatgpt/route.js";
+import {
   beginSend,
   COMPANION_PAIRING_TTL_MS,
   FeedbackError,
@@ -24,35 +28,16 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export class CompanionError extends FeedbackError {}
 
-/** 仅接受 https://chatgpt.com/c/<uuid>；存 canonical 小写 uuid。 */
+/** 统一 route 解析；companion 严格拒绝 query/hash。 */
 export function normalizeChatgptRoute(raw: string): string {
-  if (typeof raw !== "string" || raw.length > 512) {
-    throw new CompanionError("ROUTE_INVALID", "delivery route 无效");
-  }
-  let url: URL;
   try {
-    url = new URL(raw);
-  } catch {
+    return normalizeChatgptConversationRoute(raw);
+  } catch (error) {
+    if (error instanceof ChatGptRouteError) {
+      throw new CompanionError("ROUTE_INVALID", error.message);
+    }
     throw new CompanionError("ROUTE_INVALID", "delivery route 无效");
   }
-  if (url.protocol !== "https:") {
-    throw new CompanionError("ROUTE_INVALID", "delivery route 必须使用 https");
-  }
-  if (url.hostname.toLowerCase() !== "chatgpt.com") {
-    throw new CompanionError("ROUTE_INVALID", "delivery route 仅支持 chatgpt.com");
-  }
-  if (url.search || url.hash || url.username || url.password) {
-    throw new CompanionError("ROUTE_INVALID", "delivery route 不得包含 query/hash/凭据");
-  }
-  const match = /^\/c\/([0-9a-fA-F-]{36})\/?$/.exec(url.pathname);
-  if (!match) {
-    throw new CompanionError("ROUTE_INVALID", "delivery route 必须为 https://chatgpt.com/c/<id>");
-  }
-  const id = match[1]!.toLowerCase();
-  if (!UUID.test(id)) {
-    throw new CompanionError("ROUTE_INVALID", "delivery route conversation id 无效");
-  }
-  return `https://chatgpt.com/c/${id}`;
 }
 
 function sha256Hex(material: string): string {

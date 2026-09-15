@@ -7,6 +7,7 @@ import {
   tryResolveTerminalExecutionRecord,
   type ExecutionRecord,
 } from "../execution/records.js";
+import { normalizeControlConversationUrl } from "../chatgpt/route.js";
 
 const id = z.string().regex(/^[A-Za-z0-9_-]{1,128}$/);
 const messageId = z.string().min(1).max(200).regex(/^[A-Za-z0-9_-]+$/);
@@ -28,13 +29,11 @@ export type ControlEnvelope = z.infer<typeof controlEnvelopeSchema>;
 const observationSchema = controlEnvelopeSchema.omit({ authorization: true }).passthrough();
 
 export function normalizeControlUrl(input: string): string {
-  const url = new URL(input);
-  if (url.protocol !== "https:" || !["chatgpt.com", "www.chatgpt.com"].includes(url.hostname) ||
-      url.username || url.password || url.port ||
-      !/^\/(?:g\/g-[A-Za-z0-9_-]+\/)?c\/[A-Za-z0-9_-]+\/?$/.test(url.pathname)) {
+  try {
+    return normalizeControlConversationUrl(input);
+  } catch {
     throw new Error("网页控制必须绑定实际的 HTTPS ChatGPT conversation URL。");
   }
-  return `https://chatgpt.com${url.pathname.replace(/\/$/, "")}`;
 }
 
 function checkedState(session: SavedSession | null, workspaceId: string): WebControlState | undefined {

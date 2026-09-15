@@ -596,3 +596,43 @@ trusted principal → active bindingId+epoch
 权威入口补充：
 - companion：`src/feedback/companion.ts` / `src/bridge/companion.ts`
 - companion tests：`tests/companion-feedback.test.ts`
+
+---
+
+# Phase E1b1 Edge-first passive Browser Companion（代码，未部署；未执行 native Send）
+
+日期：2026-09-15。E1b0 complete；runtime 仍 **not deployed**。
+
+## 范围（本阶段）
+
+- 统一 ChatGPT conversation route 解析：`src/chatgpt/route.ts`（browser-safe，无 Node import）
+- 支持：`/c/<id>`、`www.chatgpt.com`、`/g/g-.../c/<id>`（Project/GPT shaped）
+- canonical host=`chatgpt.com`；companion **拒绝** query/hash；web-control **剥离** query/hash（不弱化）
+- MV3 extension：`browser-companion/` → 打包 `dist/browser-companion/`
+- permissions：`storage` + `activeTab`；hosts 仅 chatgpt.com / www.chatgpt.com
+- **无** `<all_urls>` / debugger / nativeMessaging / webRequest / remote JS
+- document ownership：tabId + documentId + canonicalRoute；popup 显式 Bind
+- SPA route 轮询 + popstate/hashchange；无 MAIN-world history hook
+- 只读 DOM adapter：composer empty/dirty/absent/unknown；generation idle/generating/unknown
+- **未知一律不安全**；不写 composer；**不点 Send**；无 companion credential 下放 content script
+
+## 明确未实现
+
+reserve polling / begin-send / SEND_INTENT / composer write / native Send / native user-turn ACK / WSS / production deploy
+
+## 存储
+
+- `chrome.storage.local`：schemaVersion、targetRoute、paired 标记
+- `chrome.storage.session`：tab/document registry、owner document、liveness
+
+## Edge 验证
+
+产物目录：`dist/browser-companion`（`pnpm run build:companion`）。
+
+真实 Edge 观察流程需本机登录 ChatGPT：`edge://extensions` → Load unpacked → 打开 Project conversation → popup 显示 canonical URL → Bind → 切走 conversation 应失效 owner。**本自动化环境未执行真实 ChatGPT 页面 Send 或用户会话注入。**
+
+## 门禁
+
+定向 route/companion/web-control + 全量 **60 files / 1024 passed**；typecheck / build（含 companion 打包）/ diff-check 通过。
+
+Ownership review-fix：popup `isOwner` 经 content script → SW（真实 MessageSender）；同 tab 出现不同 documentId 或缺 documentId 时 fail-closed 清 owner；移除死 `c2c.unobserve` 路径。

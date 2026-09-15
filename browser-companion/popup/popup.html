@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>C2C Companion</title>
+  <style>
+    body {
+      font: 13px/1.4 system-ui, "Segoe UI", sans-serif;
+      margin: 0;
+      min-width: 320px;
+      background: #0f1115;
+      color: #e8eaed;
+    }
+    header {
+      padding: 10px 12px;
+      border-bottom: 1px solid #2a2f3a;
+      font-weight: 600;
+    }
+    main { padding: 12px; display: grid; gap: 8px; }
+    .row { display: grid; gap: 2px; }
+    .label { color: #9aa0a6; font-size: 11px; }
+    .value { word-break: break-all; font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
+    .ok { color: #81c995; }
+    .bad { color: #f28b82; }
+    .warn { color: #fdd663; }
+    button {
+      margin-top: 6px;
+      padding: 8px 10px;
+      border-radius: 6px;
+      border: 1px solid #3c4043;
+      background: #1a73e8;
+      color: #fff;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    button.secondary { background: #2a2f3a; }
+    .note { color: #9aa0a6; font-size: 11px; }
+  </style>
+</head>
+<body>
+  <header>C2C Browser Companion（E1b1 只读）</header>
+  <main>
+    <div class="row">
+      <div class="label">当前页面 route</div>
+      <div class="value" id="page-route">检测中…</div>
+    </div>
+    <div class="row">
+      <div class="label">本地 target route</div>
+      <div class="value" id="target-route">—</div>
+    </div>
+    <div class="row">
+      <div class="label">本 document 是否 owner</div>
+      <div class="value" id="owner-status">—</div>
+    </div>
+    <div class="row">
+      <div class="label">DOM 安全观察（只读）</div>
+      <div class="value" id="dom-safety">—</div>
+    </div>
+    <button id="bind">Bind this conversation tab</button>
+    <button id="unbind" class="secondary">Clear local target</button>
+    <div class="note">本地绑定 ≠ E1b0 server pairing。不会写入 composer，不会点击 Send。</div>
+  </main>
+  <script src="../route-global.js"></script>
+  <script src="../dom-adapter.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>
