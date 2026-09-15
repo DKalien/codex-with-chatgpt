@@ -18,6 +18,7 @@ import {
   ConversationPrincipalError,
 } from "../src/mcp/conversation-principal.js";
 import { resolveTrustedPrincipal } from "../src/feedback/probe-store.js";
+import { FEEDBACK_APP_ONLY_META_SHAPE } from "../src/mcp/feedback.js";
 import {
   appendExecutionRecord,
   appendExecutionRecordLocked,
@@ -509,5 +510,56 @@ describe("MCP production feedback tools", () => {
       requestId: 1,
     });
     expect(denied.isError).toBe(true);
+  });
+
+  it("companion 与 production feedback 工具对模型可见且仍要求 codex.feedback", () => {
+    const server = createMcpServer({ workspace, logger: { info() {}, error() {}, warn() {}, debug() {} } as never });
+    const tools = (server as unknown as {
+      _registeredTools?: Record<string, {
+        _meta?: {
+          securitySchemes?: Array<{ type?: string; scopes?: string[] }>;
+          ui?: { visibility?: string[] };
+          "openai/visibility"?: string;
+          "openai/widgetAccessible"?: boolean;
+        };
+      }>;
+    })._registeredTools ?? {};
+
+    const modelVisible = [
+      "feedback_companion_pair",
+      "feedback_companion_status",
+      "feedback_companion_revoke",
+      "feedback_status",
+      "feedback_enable",
+      "feedback_takeover",
+      "feedback_claim_next",
+      "feedback_ack_observed",
+      "feedback_stop",
+    ];
+    for (const name of modelVisible) {
+      const meta = tools[name]?._meta;
+      expect(meta?.ui?.visibility, name).toEqual(["model"]);
+      expect(meta?.["openai/visibility"], name).toBe("public");
+      expect(meta?.securitySchemes?.[0], name).toMatchObject({
+        type: "oauth2",
+        scopes: ["codex.feedback"],
+      });
+      expect(meta?.["openai/widgetAccessible"], name).toBeUndefined();
+    }
+  });
+
+  it("app-only/private meta 不会被误用到 production feedback 工具", () => {
+    const server = createMcpServer({ workspace, logger: { info() {}, error() {}, warn() {}, debug() {} } as never });
+    const tools = (server as unknown as {
+      _registeredTools?: Record<string, {
+        _meta?: { ui?: { visibility?: string[] }; "openai/visibility"?: string };
+      }>;
+    })._registeredTools ?? {};
+    for (const name of Object.keys(tools).filter((k) => k.startsWith("feedback_"))) {
+      expect(tools[name]?._meta?.ui?.visibility, name).not.toEqual(["app"]);
+      expect(tools[name]?._meta?.["openai/visibility"], name).not.toBe("private");
+    }
+    expect(FEEDBACK_APP_ONLY_META_SHAPE.ui.visibility).toEqual(["app"]);
+    expect(FEEDBACK_APP_ONLY_META_SHAPE["openai/visibility"]).toBe("private");
   });
 });

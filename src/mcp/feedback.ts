@@ -87,12 +87,41 @@ function principalFromExtra(extra: Extra): ConversationPrincipal {
 
 const securitySchemes = [{ type: "oauth2", scopes: [CODEX_FEEDBACK_SCOPE] }] as const;
 
-const appMeta = {
-  securitySchemes,
+/** 仅 widget/app 内部状态机（production feedback 当前无 card UI；保留便于回归区分）。 */
+function appWidgetMeta(extra?: Record<string, unknown>): Record<string, unknown> {
+  return {
+    securitySchemes,
+    ui: { visibility: ["app"] },
+    "openai/widgetAccessible": true,
+    "openai/visibility": "private",
+    ...extra,
+  };
+}
+
+// 回归锚点：app-only/private 形状不得被误用到 production model 工具。
+export const FEEDBACK_APP_ONLY_META_SHAPE = {
   ui: { visibility: ["app"] },
-  "openai/widgetAccessible": true,
   "openai/visibility": "private",
 } as const;
+
+/** 供测试断言 appWidgetMeta 存在且与 model 路径分离。 */
+export function feedbackAppWidgetMeta(extra?: Record<string, unknown>): Record<string, unknown> {
+  return appWidgetMeta(extra);
+}
+
+/**
+ * 模型可见：production feedback / companion 由 ChatGPT conversation 模型直接调用。
+ * private 会从模型隐藏工具；与 ui.visibility=["model"] 冲突，故显式 public。
+ * OAuth 仍要求 codex.feedback。
+ */
+function modelVisibleMeta(extra?: Record<string, unknown>): Record<string, unknown> {
+  return {
+    securitySchemes,
+    ui: { visibility: ["model"] },
+    "openai/visibility": "public",
+    ...extra,
+  };
+}
 
 /**
  * Production feedback tools（E1a：无 card UI / 无 emit / 无 model_confirm）。
@@ -116,7 +145,7 @@ export function registerFeedbackTools(server: McpServer, workspace: Workspace): 
         events: z.array(z.unknown()),
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-      _meta: appMeta,
+      _meta: modelVisibleMeta(),
     },
     async (_args, extra: Extra) => {
       const denied = requireScope(extra.authInfo, CODEX_FEEDBACK_SCOPE);
@@ -150,7 +179,7 @@ export function registerFeedbackTools(server: McpServer, workspace: Workspace): 
         }),
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-      _meta: appMeta,
+      _meta: modelVisibleMeta(),
     },
     async (args, extra: Extra) => {
       const denied = requireScope(extra.authInfo, CODEX_FEEDBACK_SCOPE);
@@ -193,7 +222,7 @@ export function registerFeedbackTools(server: McpServer, workspace: Workspace): 
         principalFingerprint: z.string(),
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
-      _meta: appMeta,
+      _meta: modelVisibleMeta(),
     },
     async (args, extra: Extra) => {
       const denied = requireScope(extra.authInfo, CODEX_FEEDBACK_SCOPE);
@@ -232,7 +261,7 @@ export function registerFeedbackTools(server: McpServer, workspace: Workspace): 
         event: z.unknown(),
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
-      _meta: appMeta,
+      _meta: modelVisibleMeta(),
     },
     async (args, extra: Extra) => {
       const denied = requireScope(extra.authInfo, CODEX_FEEDBACK_SCOPE);
@@ -266,7 +295,7 @@ export function registerFeedbackTools(server: McpServer, workspace: Workspace): 
       },
       outputSchema: { eventId: z.string(), status: z.string() },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-      _meta: appMeta,
+      _meta: modelVisibleMeta(),
     },
     async (args, extra: Extra) => {
       const denied = requireScope(extra.authInfo, CODEX_FEEDBACK_SCOPE);
@@ -296,7 +325,7 @@ export function registerFeedbackTools(server: McpServer, workspace: Workspace): 
       inputSchema: {},
       outputSchema: { stopped: z.boolean(), workspaceId: z.string() },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-      _meta: appMeta,
+      _meta: modelVisibleMeta(),
     },
     async (_args, extra: Extra) => {
       const denied = requireScope(extra.authInfo, CODEX_FEEDBACK_SCOPE);
@@ -326,7 +355,7 @@ export function registerFeedbackTools(server: McpServer, workspace: Workspace): 
         epoch: z.number(),
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
-      _meta: appMeta,
+      _meta: modelVisibleMeta(),
     },
     async (_args, extra: Extra) => {
       const denied = requireScope(extra.authInfo, CODEX_FEEDBACK_SCOPE);
@@ -358,7 +387,7 @@ export function registerFeedbackTools(server: McpServer, workspace: Workspace): 
         pairingIntentActive: z.boolean(),
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-      _meta: appMeta,
+      _meta: modelVisibleMeta(),
     },
     async (_args, extra: Extra) => {
       const denied = requireScope(extra.authInfo, CODEX_FEEDBACK_SCOPE);
@@ -384,7 +413,7 @@ export function registerFeedbackTools(server: McpServer, workspace: Workspace): 
       inputSchema: {},
       outputSchema: { revoked: z.boolean() },
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
-      _meta: appMeta,
+      _meta: modelVisibleMeta(),
     },
     async (_args, extra: Extra) => {
       const denied = requireScope(extra.authInfo, CODEX_FEEDBACK_SCOPE);
