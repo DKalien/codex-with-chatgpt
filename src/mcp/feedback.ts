@@ -18,6 +18,11 @@ import {
   stopReceiver,
   takeoverReceiver,
 } from "../feedback/store.js";
+import {
+  companionStatusForPrincipal,
+  createPairingIntent,
+  revokeCompanion,
+} from "../feedback/companion.js";
 import { reconcileFeedbackOutbox } from "../feedback/projector.js";
 
 type ToolResult = {
@@ -107,6 +112,7 @@ export function registerFeedbackTools(server: McpServer, workspace: Workspace): 
         ownsBinding: z.boolean(),
         projectionCursor: z.number(),
         binding: z.unknown(),
+        companion: z.unknown(),
         events: z.array(z.unknown()),
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
@@ -299,6 +305,93 @@ export function registerFeedbackTools(server: McpServer, workspace: Workspace): 
         const principal = principalFromExtra(extra);
         stopReceiver({ workspaceId: workspace.id, principal });
         return ok({ stopped: true, workspaceId: workspace.id });
+      } catch (error) {
+        return mapError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "feedback_companion_pair",
+    {
+      title: "Create one-time companion pairing intent",
+      description:
+        "为当前 active binding 创建短时 one-time pairing intent。返回的 secret 只出现一次，需安全转交 browser companion；浏览器不得使用 MCP principal/admin token。",
+      inputSchema: {},
+      outputSchema: {
+        intentId: z.string(),
+        secret: z.string(),
+        expiresAt: z.string(),
+        bindingId: z.string(),
+        epoch: z.number(),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+      _meta: appMeta,
+    },
+    async (_args, extra: Extra) => {
+      const denied = requireScope(extra.authInfo, CODEX_FEEDBACK_SCOPE);
+      if (denied) return denied;
+      try {
+        const principal = principalFromExtra(extra);
+        reconcileFeedbackOutbox(workspace.id);
+        const intent = createPairingIntent({
+          workspaceId: workspace.id,
+          principal,
+        });
+        return ok(intent);
+      } catch (error) {
+        return mapError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "feedback_companion_status",
+    {
+      title: "Companion pairing status",
+      description: "读取当前 binding 的 companion 元数据；不返回 secret 或 credential hash。",
+      inputSchema: {},
+      outputSchema: {
+        workspaceId: z.string(),
+        ownsBinding: z.boolean(),
+        companion: z.unknown(),
+        pairingIntentActive: z.boolean(),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      _meta: appMeta,
+    },
+    async (_args, extra: Extra) => {
+      const denied = requireScope(extra.authInfo, CODEX_FEEDBACK_SCOPE);
+      if (denied) return denied;
+      try {
+        const principal = principalFromExtra(extra);
+        reconcileFeedbackOutbox(workspace.id);
+        return ok(companionStatusForPrincipal({
+          workspaceId: workspace.id,
+          principal,
+        }));
+      } catch (error) {
+        return mapError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "feedback_companion_revoke",
+    {
+      title: "Revoke companion pairing",
+      description: "撤销当前 companion 与未消费 pairing intent；不自动 stop receiver binding。",
+      inputSchema: {},
+      outputSchema: { revoked: z.boolean() },
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+      _meta: appMeta,
+    },
+    async (_args, extra: Extra) => {
+      const denied = requireScope(extra.authInfo, CODEX_FEEDBACK_SCOPE);
+      if (denied) return denied;
+      try {
+        const principal = principalFromExtra(extra);
+        return ok(revokeCompanion({ workspaceId: workspace.id, principal }));
       } catch (error) {
         return mapError(error);
       }

@@ -526,3 +526,73 @@ messageId、模板、crash recovery、workspace 隔离、HTML 单实现、open_c
 - synthetic probe：`src/feedback/probe-store.ts` / `probe-ui.ts` / `src/mcp/feedback-probe.ts`
 - production：`src/feedback/store.ts` / `projector.ts` / `src/mcp/feedback.ts` / `src/mcp/conversation-principal.ts`
 - tests：`tests/feedback-probe.test.ts` / `feedback-probe-cli.test.ts` / `production-feedback.test.ts`
+
+
+---
+
+# Phase E1b0 browser companion 委派与 delivery 合同（代码，未部署）
+
+日期：2026-09-15。**不写 extension / DOM**；不 deploy / rollout / restart。
+
+## 状态机
+
+```
+queued → ready → reserved → claimed → observed
+                      ↓          ↓
+                   ready     outcome_unknown
+              (release/stale)   (stale claimed)
+```
+
+- `reserved`：可逆预占；`FEEDBACK_RESERVATION_STALE_MS=2min`；stale → ready
+- `reserved → claimed`（`beginSend`）：不可逆 send-intent；持久化 `attemptId`
+- `claimed` 仍不可自动回 ready；stale claimed → `outcome_unknown`
+- `reserved` / `claimed` / `outcome_unknown` 均阻止 takeover
+- MCP `claimNext` 跳过 reserved
+
+## 委派信任链
+
+```
+trusted principal → active bindingId+epoch
+  → one-time pairing intent (hashed secret, 10min)
+  → companion credential (hashed, scoped)
+  → https://chatgpt.com/c/<uuid>
+```
+
+- companion **不得**接收 `openai/session`、principal fingerprint、admin token、OAuth/MCP/Desktop scope
+- credential/secret 只存 SHA-256；明文仅 pair/exchange 响应一次
+- re-pair = transport takeover：存在 `reserved/claimed/outcome_unknown` 时 **fail closed**（`COMPANION_REPAIR_BLOCKED`）；reserved 须先 release 或等 stale→ready；成功 re-pair 时旧 credential 立即失效
+- epoch 变更立即失效旧 companion
+- route 仅 `https://chatgpt.com/c/<uuid>`（delivery locator，非 identity）
+
+## 公共 HTTP（`/api/companion/v1`）
+
+| Method | Path | Auth |
+| --- | --- | --- |
+| POST | `/pair` | pairing intent |
+| GET | `/state` | companion Bearer |
+| POST | `/reserve` | companion |
+| POST | `/release` | companion |
+| POST | `/begin-send` | companion |
+| POST | `/ack` | companion |
+
+挂载于 Bridge，**不**使用 adminGuard / bearerAuth / MCP。经 named tunnel 暴露；production 不依赖同机 localhost。E1b0 仅 REST。
+
+## MCP 新增
+
+- `feedback_companion_pair` — trusted 创建 pairing intent（secret 一次）
+- `feedback_companion_status` — 元数据，无 secret
+- `feedback_companion_revoke` — 撤销 companion/intent
+
+## 代码入口
+
+- `src/feedback/store.ts` — reserved 状态机 + companion/intent 字段
+- `src/feedback/companion.ts` — route/credential/pair/exchange/verify
+- `src/bridge/companion.ts` + `src/bridge/server.ts` — public transport
+- `src/mcp/feedback.ts` — pair/status/revoke tools
+- `tests/companion-feedback.test.ts` — 安全/状态机/HTTP
+
+**not deployed**；runtime 仍为 pre-E1a。
+
+权威入口补充：
+- companion：`src/feedback/companion.ts` / `src/bridge/companion.ts`
+- companion tests：`tests/companion-feedback.test.ts`

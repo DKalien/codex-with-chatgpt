@@ -494,6 +494,9 @@ describe("MCP production feedback tools", () => {
     expect(names.sort()).toEqual([
       "feedback_ack_observed",
       "feedback_claim_next",
+      "feedback_companion_pair",
+      "feedback_companion_revoke",
+      "feedback_companion_status",
       "feedback_enable",
       "feedback_status",
       "feedback_stop",

@@ -12,9 +12,13 @@ import {
 export const CODEX_FEEDBACK_SCOPE = "codex.feedback";
 export const FEEDBACK_EVENT_KIND = "C2C_EXECUTED";
 export const FEEDBACK_CLAIM_STALE_MS = 10 * 60_000;
+/** reserved 可逆；比 claimed 短，避免长期占位。 */
+export const FEEDBACK_RESERVATION_STALE_MS = 2 * 60_000;
+export const COMPANION_PAIRING_TTL_MS = 10 * 60_000;
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const HEX32 = /^[a-f0-9]{32}$/;
+const HEX64 = /^[a-f0-9]{64}$/;
 const WORKSPACE_ID = /^[a-f0-9]{12}$/;
 const DESKTOP_ID = /^[A-Za-z0-9_-]{1,128}$/;
 
@@ -56,9 +60,35 @@ export const feedbackEventSchema = z.object({
   targetBindingId: z.string().regex(UUID).nullable(),
   targetEpoch: z.number().int().nonnegative().nullable(),
   targetPrincipalFingerprint: z.string().regex(HEX32).nullable(),
-  status: z.enum(["queued", "ready", "claimed", "observed", "outcome_unknown"]),
+  status: z.enum(["queued", "ready", "reserved", "claimed", "observed", "outcome_unknown"]),
   attemptId: z.string().regex(UUID).optional(),
   claimedAt: z.string().datetime().optional(),
+  reservationId: z.string().regex(UUID).optional(),
+  reservedAt: z.string().datetime().optional(),
+  reservedBy: z.string().regex(UUID).optional(),
+}).strict();
+
+export const pairingIntentSchema = z.object({
+  version: z.literal(1),
+  intentId: z.string().regex(UUID),
+  bindingId: z.string().regex(UUID),
+  epoch: z.number().int().nonnegative(),
+  principalFingerprint: z.string().regex(HEX32),
+  secretHash: z.string().regex(HEX64),
+  expiresAt: z.string().datetime(),
+  consumedAt: z.string().datetime().optional(),
+}).strict();
+
+export const companionRecordSchema = z.object({
+  version: z.literal(1),
+  companionId: z.string().regex(UUID),
+  bindingId: z.string().regex(UUID),
+  epoch: z.number().int().nonnegative(),
+  principalFingerprint: z.string().regex(HEX32),
+  credentialHash: z.string().regex(HEX64),
+  routeCanonical: z.string().min(1).max(512),
+  pairedAt: z.string().datetime(),
+  supersededAt: z.string().datetime().optional(),
 }).strict();
 
 export const feedbackStateSchema = z.object({
@@ -67,11 +97,15 @@ export const feedbackStateSchema = z.object({
   projectionCursor: z.number().int().nonnegative(),
   binding: feedbackBindingSchema.nullable(),
   events: z.array(feedbackEventSchema).max(10000),
+  pairingIntent: pairingIntentSchema.nullable().default(null),
+  companion: companionRecordSchema.nullable().default(null),
 }).strict();
 
 export type FeedbackBinding = z.infer<typeof feedbackBindingSchema>;
 export type FeedbackEvent = z.infer<typeof feedbackEventSchema>;
 export type FeedbackState = z.infer<typeof feedbackStateSchema>;
+export type PairingIntent = z.infer<typeof pairingIntentSchema>;
+export type CompanionRecord = z.infer<typeof companionRecordSchema>;
 
 export function feedbackStateFile(workspaceId: string, stateDir = getStateDir()): string {
   if (!WORKSPACE_ID.test(workspaceId)) {
@@ -81,7 +115,15 @@ export function feedbackStateFile(workspaceId: string, stateDir = getStateDir())
 }
 
 function emptyState(workspaceId: string, projectionCursor = 0): FeedbackState {
-  return { version: 1, workspaceId, projectionCursor, binding: null, events: [] };
+  return {
+    version: 1,
+    workspaceId,
+    projectionCursor,
+    binding: null,
+    events: [],
+    pairingIntent: null,
+    companion: null,
+  };
 }
 
 function readState(workspaceId: string, stateDir: string): FeedbackState | null {
@@ -197,6 +239,34 @@ function recoverStaleClaimed(state: FeedbackState, nowMs: number): FeedbackState
   return changed ? { ...state, events } : state;
 }
 
+function recoverStaleReserved(state: FeedbackState, nowMs: number): FeedbackState {
+  let changed = false;
+  const events = state.events.map((event) => {
+    if (event.status !== "reserved" || !event.reservedAt) return event;
+    const age = nowMs - Date.parse(event.reservedAt);
+    if (Number.isFinite(age) && age >= FEEDBACK_RESERVATION_STALE_MS) {
+      changed = true;
+      const {
+        reservationId: _rid,
+        reservedAt: _rat,
+        reservedBy: _rby,
+        ...rest
+      } = event;
+      return {
+        ...rest,
+        status: "ready" as const,
+        updatedAt: new Date(nowMs).toISOString(),
+      };
+    }
+    return event;
+  });
+  return changed ? { ...state, events } : state;
+}
+
+function recoverStaleInMemory(state: FeedbackState, nowMs: number): FeedbackState {
+  return recoverStaleReserved(recoverStaleClaimed(state, nowMs), nowMs);
+}
+
 /** 锁内 stale convergence；reconcile 每次调用，resident 重开仅 status 即可恢复。 */
 export function recoverStaleFeedback(
   workspaceId: string,
@@ -205,7 +275,7 @@ export function recoverStaleFeedback(
 ): FeedbackState {
   return withFeedbackLock(workspaceId, stateDir, (read) => {
     const previous = requireInitializedState(read(), workspaceId);
-    const recovered = recoverStaleClaimed(previous, nowMs);
+    const recovered = recoverStaleInMemory(previous, nowMs);
     if (recovered !== previous) {
       writeState(workspaceId, stateDir, recovered);
     }
@@ -243,7 +313,7 @@ export function enableReceiver(input: {
       );
     }
     const now = Date.now();
-    const recovered = recoverStaleClaimed(previous, now);
+    const recovered = recoverStaleInMemory(previous, now);
     const epoch = (recovered.binding?.epoch ?? 0) + 1;
     const binding: FeedbackBinding = {
       version: 1,
@@ -293,18 +363,18 @@ export function takeoverReceiver(input: {
     if (previous.binding.epoch !== input.expectedEpoch) {
       throw new FeedbackError("FEEDBACK_EPOCH_CONFLICT", "绑定代次已变化，接管失败");
     }
-    if (previous.events.some((e) => e.status === "claimed" || e.status === "outcome_unknown")) {
+    if (previous.events.some((e) => e.status === "claimed" || e.status === "outcome_unknown" || e.status === "reserved")) {
       throw new FeedbackError(
         "FEEDBACK_TAKEOVER_BLOCKED",
-        "存在 claimed/outcome_unknown 事件；禁止接管以免重发",
+        "存在 claimed/outcome_unknown/reserved 事件；禁止接管以免重发",
       );
     }
     const now = Date.now();
-    const recovered = recoverStaleClaimed(previous, now);
-    if (recovered.events.some((e) => e.status === "claimed" || e.status === "outcome_unknown")) {
+    const recovered = recoverStaleInMemory(previous, now);
+    if (recovered.events.some((e) => e.status === "claimed" || e.status === "outcome_unknown" || e.status === "reserved")) {
       throw new FeedbackError(
         "FEEDBACK_TAKEOVER_BLOCKED",
-        "存在 claimed/outcome_unknown 事件；禁止接管以免重发",
+        "存在 claimed/outcome_unknown/reserved 事件；禁止接管以免重发",
       );
     }
     const binding: FeedbackBinding = {
@@ -353,7 +423,7 @@ export function stopReceiver(input: {
     }
     const now = Date.now();
     const next: FeedbackState = {
-      ...recoverStaleClaimed(previous, now),
+      ...recoverStaleInMemory(previous, now),
       binding: { ...previous.binding, status: "superseded" },
     };
     writeState(input.workspaceId, stateDir, next);
@@ -420,7 +490,7 @@ export function claimNext(input: {
   const stateDir = input.stateDir ?? getStateDir();
   return withFeedbackLock(input.workspaceId, stateDir, (read) => {
     const previous = requireInitializedState(read(), input.workspaceId);
-    const recovered = recoverStaleClaimed(previous, Date.now());
+    const recovered = recoverStaleInMemory(previous, Date.now());
     if (recovered !== previous) {
       writeState(input.workspaceId, stateDir, recovered);
     }
@@ -463,7 +533,7 @@ export function ackObserved(input: {
   const stateDir = input.stateDir ?? getStateDir();
   return withFeedbackLock(input.workspaceId, stateDir, (read) => {
     const previous = requireInitializedState(read(), input.workspaceId);
-    const recovered = recoverStaleClaimed(previous, Date.now());
+    const recovered = recoverStaleInMemory(previous, Date.now());
     if (recovered !== previous) {
       writeState(input.workspaceId, stateDir, recovered);
     }
@@ -499,6 +569,237 @@ export function ackObserved(input: {
   });
 }
 
+function requireActiveCompanionBinding(
+  state: FeedbackState,
+  input: {
+    bindingId: string;
+    epoch: number;
+    principalFingerprint: string;
+  },
+): FeedbackBinding {
+  if (!state.binding || state.binding.status !== "active") {
+    throw new FeedbackError("FEEDBACK_NOT_ENABLED", "production feedback 未启用");
+  }
+  if (
+    state.binding.bindingId !== input.bindingId
+    || state.binding.epoch !== input.epoch
+    || state.binding.principalFingerprint !== input.principalFingerprint
+  ) {
+    throw new FeedbackError("FEEDBACK_EPOCH_STALE", "companion 绑定代次已失效");
+  }
+  return state.binding;
+}
+
+/** ready → reserved；已有 active reserved 时 fence。 */
+export function reserveNext(input: {
+  workspaceId: string;
+  bindingId: string;
+  epoch: number;
+  principalFingerprint: string;
+  companionId: string;
+  stateDir?: string;
+}): { event: FeedbackEvent; reservationId: string } {
+  const stateDir = input.stateDir ?? getStateDir();
+  return withFeedbackLock(input.workspaceId, stateDir, (read) => {
+    const previous = requireInitializedState(read(), input.workspaceId);
+    const recovered = recoverStaleInMemory(previous, Date.now());
+    if (recovered !== previous) {
+      writeState(input.workspaceId, stateDir, recovered);
+    }
+    requireActiveCompanionBinding(recovered, input);
+    if (recovered.events.some((e) => e.status === "reserved")) {
+      throw new FeedbackError("FEEDBACK_RESERVED_FENCE", "已有 active reservation；禁止并发预占");
+    }
+    const ready = recovered.events
+      .filter((e) => e.status === "ready")
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    if (ready.length === 0) {
+      throw new FeedbackError("FEEDBACK_NO_READY_EVENT", "没有可预占的 ready 事件");
+    }
+    const target = ready[0]!;
+    const reservationId = randomUUID();
+    const reservedAt = new Date().toISOString();
+    const next: FeedbackState = {
+      ...recovered,
+      events: recovered.events.map((e) =>
+        e.eventId === target.eventId
+          ? {
+              ...e,
+              status: "reserved" as const,
+              reservationId,
+              reservedAt,
+              reservedBy: input.companionId,
+              updatedAt: reservedAt,
+            }
+          : e,
+      ),
+    };
+    writeState(input.workspaceId, stateDir, next);
+    return {
+      event: next.events.find((e) => e.eventId === target.eventId)!,
+      reservationId,
+    };
+  });
+}
+
+/** reserved → ready；exact reservationId + companionId。 */
+export function releaseReservation(input: {
+  workspaceId: string;
+  bindingId: string;
+  epoch: number;
+  principalFingerprint: string;
+  companionId: string;
+  eventId: string;
+  reservationId: string;
+  stateDir?: string;
+}): FeedbackEvent {
+  const stateDir = input.stateDir ?? getStateDir();
+  return withFeedbackLock(input.workspaceId, stateDir, (read) => {
+    const previous = requireInitializedState(read(), input.workspaceId);
+    const recovered = recoverStaleInMemory(previous, Date.now());
+    if (recovered !== previous) {
+      writeState(input.workspaceId, stateDir, recovered);
+    }
+    requireActiveCompanionBinding(recovered, input);
+    const event = recovered.events.find((e) => e.eventId === input.eventId);
+    if (!event) throw new FeedbackError("FEEDBACK_EVENT_NOT_FOUND", "feedback 事件不存在");
+    if (event.status === "ready") {
+      if (event.reservationId) {
+        throw new FeedbackError("FEEDBACK_RESERVATION_MISMATCH", "reservation 状态不一致");
+      }
+      return event;
+    }
+    if (event.status !== "reserved" || event.reservationId !== input.reservationId) {
+      throw new FeedbackError("FEEDBACK_RESERVATION_MISMATCH", "reservation 身份不匹配");
+    }
+    if (
+      event.reservedBy !== input.companionId
+      || event.targetBindingId !== recovered.binding!.bindingId
+      || event.targetEpoch !== recovered.binding!.epoch
+      || event.targetPrincipalFingerprint !== input.principalFingerprint
+    ) {
+      throw new FeedbackError("FEEDBACK_RESERVATION_MISMATCH", "reservation 目标绑定不匹配");
+    }
+    const {
+      reservationId: _rid,
+      reservedAt: _rat,
+      reservedBy: _rby,
+      ...rest
+    } = event;
+    const released: FeedbackEvent = {
+      ...rest,
+      status: "ready",
+      updatedAt: new Date().toISOString(),
+    };
+    const next: FeedbackState = {
+      ...recovered,
+      events: recovered.events.map((e) => (e.eventId === input.eventId ? released : e)),
+    };
+    writeState(input.workspaceId, stateDir, next);
+    return released;
+  });
+}
+
+/** reserved → claimed：不可逆 send-intent 边界。companionId 必须是 reservation 归属。 */
+export function beginSend(input: {
+  workspaceId: string;
+  bindingId: string;
+  epoch: number;
+  principalFingerprint: string;
+  companionId: string;
+  eventId: string;
+  reservationId: string;
+  stateDir?: string;
+}): { event: FeedbackEvent; attemptId: string } {
+  const stateDir = input.stateDir ?? getStateDir();
+  return withFeedbackLock(input.workspaceId, stateDir, (read) => {
+    const previous = requireInitializedState(read(), input.workspaceId);
+    const recovered = recoverStaleInMemory(previous, Date.now());
+    if (recovered !== previous) {
+      writeState(input.workspaceId, stateDir, recovered);
+    }
+    const binding = requireActiveCompanionBinding(recovered, input);
+    const event = recovered.events.find((e) => e.eventId === input.eventId);
+    if (!event) throw new FeedbackError("FEEDBACK_EVENT_NOT_FOUND", "feedback 事件不存在");
+    // claimed 幂等也必须绑定 reservedBy：其它 companion 不得继承本 attempt。
+    if (event.status === "claimed" && event.reservationId === input.reservationId) {
+      if (event.reservedBy !== input.companionId) {
+        throw new FeedbackError(
+          "FEEDBACK_RESERVATION_MISMATCH",
+          "claimed attempt 不属于当前 companion",
+        );
+      }
+      if (!event.attemptId) {
+        throw new FeedbackError("FEEDBACK_RESERVATION_MISMATCH", "claimed 事件缺少 attemptId");
+      }
+      return { event, attemptId: event.attemptId };
+    }
+    if (event.status !== "reserved" || event.reservationId !== input.reservationId) {
+      throw new FeedbackError("FEEDBACK_RESERVATION_MISMATCH", "begin-send 需要 exact reserved 事件");
+    }
+    if (
+      event.reservedBy !== input.companionId
+      || event.targetBindingId !== binding.bindingId
+      || event.targetEpoch !== binding.epoch
+      || event.targetPrincipalFingerprint !== input.principalFingerprint
+    ) {
+      throw new FeedbackError("FEEDBACK_RESERVATION_MISMATCH", "reservation 归属不匹配");
+    }
+    const attemptId = randomUUID();
+    const claimedAt = new Date().toISOString();
+    const claimed: FeedbackEvent = {
+      ...event,
+      status: "claimed",
+      attemptId,
+      claimedAt,
+      updatedAt: claimedAt,
+    };
+    const next: FeedbackState = {
+      ...recovered,
+      events: recovered.events.map((e) => (e.eventId === input.eventId ? claimed : e)),
+    };
+    writeState(input.workspaceId, stateDir, next);
+    return { event: claimed, attemptId };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Companion pairing / credential (state-owned; secrets never stored plaintext)
+// ---------------------------------------------------------------------------
+
+export function putPairingIntent(input: {
+  workspaceId: string;
+  intent: PairingIntent;
+  stateDir?: string;
+}): FeedbackState {
+  const stateDir = input.stateDir ?? getStateDir();
+  return withFeedbackLock(input.workspaceId, stateDir, (read) => {
+    const previous = requireInitializedState(read(), input.workspaceId);
+    const next: FeedbackState = { ...previous, pairingIntent: input.intent };
+    writeState(input.workspaceId, stateDir, next);
+    return next;
+  });
+}
+
+export function mutateCompanionPairing<T>(
+  workspaceId: string,
+  stateDir: string,
+  fn: (state: FeedbackState) => { state: FeedbackState; result: T },
+): T {
+  return withFeedbackLock(workspaceId, stateDir, (read) => {
+    const previous = requireInitializedState(read(), workspaceId);
+    const recovered = recoverStaleInMemory(previous, Date.now());
+    if (recovered !== previous) {
+      writeState(workspaceId, stateDir, recovered);
+    }
+    const { state: next, result } = fn(recovered);
+    if (next !== recovered) {
+      writeState(workspaceId, stateDir, next);
+    }
+    return result;
+  });
+}
+
 /** 确定性 eventId：同一 receipt 重复扫描不会重复创建。 */
 export function feedbackEventId(parts: {
   workspaceId: string;
@@ -510,15 +811,68 @@ export function feedbackEventId(parts: {
   return createHash("sha256").update(JSON.stringify(parts), "utf8").digest("hex").slice(0, 32);
 }
 
+export function publicFeedbackEvent(event: FeedbackEvent): Record<string, unknown> {
+  return {
+    eventId: event.eventId,
+    kind: event.kind,
+    commandId: event.commandId,
+    taskId: event.taskId,
+    iteration: event.iteration,
+    result: event.result,
+    status: event.status,
+    outputAvailable: event.outputAvailable,
+    ...(event.outputId !== undefined ? { outputId: event.outputId } : {}),
+    ...(event.attemptId ? { attemptId: event.attemptId } : {}),
+    ...(event.reservationId ? { reservationId: event.reservationId } : {}),
+    targetEpoch: event.targetEpoch,
+    createdAt: event.createdAt,
+    updatedAt: event.updatedAt,
+  };
+}
+
+/**
+ * Companion 公网 delivery DTO：只含生成固定 C2C 消息所需字段。
+ * 禁止 principalFingerprint / targetBindingId / reservedBy / secret 等内部身份。
+ */
+export function publicCompanionDeliveryEvent(event: FeedbackEvent): Record<string, unknown> {
+  return {
+    eventId: event.eventId,
+    kind: event.kind,
+    commandId: event.commandId,
+    taskId: event.taskId,
+    iteration: event.iteration,
+    result: event.result,
+    status: event.status,
+    changedFilesSummary: event.changedFilesSummary,
+    testsSummary: event.testsSummary,
+    outputAvailable: event.outputAvailable,
+    ...(event.outputId !== undefined ? { outputId: event.outputId } : {}),
+    ...(event.attemptId ? { attemptId: event.attemptId } : {}),
+    occurredAt: event.occurredAt,
+    createdAt: event.createdAt,
+    updatedAt: event.updatedAt,
+  };
+}
+
 export function feedbackStatusSummary(state: FeedbackState, callerFingerprint?: string): Record<string, unknown> {
+  const binding = state.binding && state.binding.status === "active" ? state.binding : null;
+  const owns = Boolean(
+    binding
+    && callerFingerprint
+    && binding.principalFingerprint === callerFingerprint,
+  );
+  // 仅当前 active binding/epoch/fingerprint 可见 companion route；旧 companion 不泄露。
+  const companion = owns && state.companion && !state.companion.supersededAt
+    && binding
+    && state.companion.bindingId === binding.bindingId
+    && state.companion.epoch === binding.epoch
+    && state.companion.principalFingerprint === binding.principalFingerprint
+    ? state.companion
+    : null;
   return {
     workspaceId: state.workspaceId,
-    enabled: state.binding?.status === "active",
-    ownsBinding: Boolean(
-      state.binding?.status === "active"
-      && callerFingerprint
-      && state.binding.principalFingerprint === callerFingerprint,
-    ),
+    enabled: Boolean(binding),
+    ownsBinding: owns,
     projectionCursor: state.projectionCursor,
     binding: state.binding
       ? {
@@ -529,20 +883,15 @@ export function feedbackStatusSummary(state: FeedbackState, callerFingerprint?: 
           widgetId: state.binding.widgetId,
         }
       : null,
-    events: state.events.map((e) => ({
-      eventId: e.eventId,
-      kind: e.kind,
-      commandId: e.commandId,
-      taskId: e.taskId,
-      iteration: e.iteration,
-      result: e.result,
-      status: e.status,
-      outputAvailable: e.outputAvailable,
-      ...(e.outputId !== undefined ? { outputId: e.outputId } : {}),
-      ...(e.attemptId ? { attemptId: e.attemptId } : {}),
-      targetEpoch: e.targetEpoch,
-      createdAt: e.createdAt,
-      updatedAt: e.updatedAt,
-    })),
+    companion: companion
+      ? {
+          companionId: companion.companionId,
+          bindingId: companion.bindingId,
+          epoch: companion.epoch,
+          routeCanonical: companion.routeCanonical,
+          pairedAt: companion.pairedAt,
+        }
+      : null,
+    events: state.events.map((e) => publicFeedbackEvent(e)),
   };
 }

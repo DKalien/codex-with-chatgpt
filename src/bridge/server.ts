@@ -11,6 +11,7 @@ import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import { DesktopError } from "../desktop/store.js";
 import { isWriteProbeEnabled } from "../mcp/write-probe.js";
 import { createMcpHttpHandler } from "../mcp/http.js";
+import { createCompanionRouter } from "./companion.js";
 import { CloudflaredQuickTunnel } from "../tunnel/cloudflared.js";
 import { CloudflaredNamedTunnel } from "../tunnel/cloudflared-named.js";
 import type { TunnelProvider } from "../tunnel/provider.js";
@@ -156,6 +157,13 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     (req: Request, res: Response) => {
       void mcpHandler(req, res);
     }
+  );
+
+  // ---- Companion public transport (scoped credential; tunnel-reachable) ----
+  // 不使用 admin token / OAuth bearer；不代理 MCP/Desktop。
+  app.use(
+    "/api/companion/v1",
+    createCompanionRouter({ workspaceId: workspace.id }),
   );
 
   // ---- Admin API (loopback + admin token only; used by the CLI/Skill) --------

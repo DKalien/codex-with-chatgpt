@@ -601,3 +601,13 @@ counts 契约兼容。
 - **not deployed**；next transport = browser companion
 
 过程与终态详见 [phase-e-feedback.md](phase-e-feedback.md)。
+
+## Phase E1b0 companion 委派 + reserved 状态机（2026-09-15，代码完成未部署）
+
+- 状态机：`ready → reserved → claimed → observed|outcome_unknown`；reserved 可 release/stale→ready；claimed 仍不可逆
+- 委派：one-time pairing intent → scoped companion credential（hash 存储）；绑定 `https://chatgpt.com/c/<id>`
+- re-pair：有 in-flight（reserved/claimed/outcome_unknown）时 fail closed，禁止跨 companion 继承 attempt
+- 公共面：`/api/companion/v1`（pair/state/reserve/release/begin-send/ack），经 tunnel；不弱化 MCP/admin
+- MCP：`feedback_companion_pair|status|revoke`
+- 验证：**58 files / 992 passed**；typecheck / build / `git diff --check`
+- **not deployed**；不写 MV3/DOM；runtime 仍 pre-E1a
