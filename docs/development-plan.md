@@ -623,3 +623,16 @@ counts 契约兼容。
 - 验证：**60 files / 1024 passed**；typecheck / build（含 companion）/ diff-check
 - **Bridge runtime not deployed**（extension 本机验收 ≠ Bridge rollout）
 - next：**E1b2**
+
+## Phase E1b2 transport + reversible reservation（2026-09-15，**code review passed, live transport pending**）
+
+- 全部 Bridge HTTP / credential 仅在 MV3 service worker；`storage.local` 设 `TRUSTED_CONTEXTS`
+- Bridge origin：生产 HTTPS；开发可 loopback HTTP；optional_host_permissions 显式授权
+- Pairing：仅 exact owner；route 取自 owner；secret 不持久化；响应后清输入
+- GET /state：identity 五元组校验；暴露 `inFlight`（仅本 companion reservationId）
+- 证据：content ~5s heartbeat；reserve 需 owner + fresh(≤12s) + safe + empty + idle
+- Journal：`NONE → RESERVE_REQUESTED → RESERVED | RESERVATION_RECOVERY`；无 SEND_INTENT
+- POST /reserve、/release；**不** begin-send/ack/Send
+- 验证：**61 files / 1044 passed**；typecheck / build companion / diff-check
+- review-fix / closeout：fail-closed storage、ownerProof、MessageSender reserve、RESERVED recover、authStale re-pair、原子 SPA route refresh
+- **Bridge not deployed**；**live transport 验收 pending**

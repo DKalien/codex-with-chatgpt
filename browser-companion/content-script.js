@@ -87,6 +87,10 @@
     void sendToWorker(buildObserveMessage());
   }
 
+  function heartbeat() {
+    void sendToWorker({ ...buildObserveMessage(), type: "c2c.heartbeat" });
+  }
+
   function onMaybeNavigate() {
     if (location.href === lastHref) return;
     lastHref = location.href;
@@ -95,10 +99,15 @@
   }
 
   setInterval(onMaybeNavigate, 800);
+  // E1b2: periodic passive freshness evidence (~5s)
+  setInterval(heartbeat, 5000);
   window.addEventListener("popstate", onMaybeNavigate);
   window.addEventListener("hashchange", onMaybeNavigate);
   document.addEventListener("visibilitychange", () => {
-    if (!document.hidden) report();
+    if (!document.hidden) {
+      report();
+      heartbeat();
+    }
   });
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -127,6 +136,20 @@
     if (message.type === "c2c.bind.request") {
       const msg = buildObserveMessage();
       void sendToWorker({ ...msg, type: "c2c.bind" }).then((response) => {
+        sendResponse(response);
+      });
+      return true;
+    }
+    if (message.type === "c2c.owner-proof.request") {
+      // Carry current route/safety so SW can atomically refresh before mint.
+      void sendToWorker({ ...buildObserveMessage(), type: "c2c.owner-proof.request" }).then((response) => {
+        sendResponse(response);
+      });
+      return true;
+    }
+    if (message.type === "c2c.reserve.request") {
+      // Reserve uses MessageSender identity only; payload tab/document ignored by SW.
+      void sendToWorker({ ...buildObserveMessage(), type: "c2c.reserve.page" }).then((response) => {
         sendResponse(response);
       });
       return true;

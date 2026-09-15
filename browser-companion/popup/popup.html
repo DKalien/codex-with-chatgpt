@@ -7,7 +7,7 @@
     body {
       font: 13px/1.4 system-ui, "Segoe UI", sans-serif;
       margin: 0;
-      min-width: 320px;
+      min-width: 340px;
       background: #0f1115;
       color: #e8eaed;
     }
@@ -23,6 +23,16 @@
     .ok { color: #81c995; }
     .bad { color: #f28b82; }
     .warn { color: #fdd663; }
+    input {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 6px 8px;
+      border-radius: 4px;
+      border: 1px solid #3c4043;
+      background: #171a21;
+      color: #e8eaed;
+      font: 12px ui-monospace, Consolas, monospace;
+    }
     button {
       margin-top: 6px;
       padding: 8px 10px;
@@ -36,18 +46,15 @@
     button:disabled { opacity: 0.5; cursor: not-allowed; }
     button.secondary { background: #2a2f3a; }
     .note { color: #9aa0a6; font-size: 11px; }
+    hr { border: 0; border-top: 1px solid #2a2f3a; margin: 4px 0; }
   </style>
 </head>
 <body>
-  <header>C2C Browser Companion（E1b1 只读）</header>
+  <header>C2C Browser Companion（E1b2 transport / reserve）</header>
   <main>
     <div class="row">
       <div class="label">当前页面 route</div>
       <div class="value" id="page-route">检测中…</div>
-    </div>
-    <div class="row">
-      <div class="label">本地 target route</div>
-      <div class="value" id="target-route">—</div>
     </div>
     <div class="row">
       <div class="label">本 document 是否 owner</div>
@@ -59,7 +66,37 @@
     </div>
     <button id="bind">Bind this conversation tab</button>
     <button id="unbind" class="secondary">Clear local target</button>
-    <div class="note">本地绑定 ≠ E1b0 server pairing。不会写入 composer，不会点击 Send。</div>
+
+    <hr />
+    <div class="row">
+      <div class="label">Transport</div>
+      <div class="value" id="transport-status">未配对</div>
+    </div>
+    <div class="row">
+      <div class="label">Bridge origin（仅 HTTPS；开发可用 http://127.0.0.1:port）</div>
+      <input id="bridge-origin" placeholder="https://xxxx.trycloudflare.com" />
+    </div>
+    <div class="row">
+      <div class="label">Pairing intentId</div>
+      <input id="intent-id" placeholder="uuid from feedback_companion_pair" autocomplete="off" />
+    </div>
+    <div class="row">
+      <div class="label">One-time pairing secret（不持久化）</div>
+      <input id="pair-secret" type="password" placeholder="c2c_pair_..." autocomplete="off" />
+    </div>
+    <button id="pair" disabled>Pair Bridge（仅 exact owner）</button>
+    <button id="fetch-state" class="secondary" disabled>GET /state</button>
+    <button id="reserve" class="secondary" disabled>Reserve next (E1b2 test)</button>
+    <button id="release" class="secondary" disabled>Release reservation</button>
+    <button id="recover" class="secondary" disabled>Recover from /state</button>
+    <button id="clear-transport" class="secondary" disabled>Clear transport</button>
+    <div class="row">
+      <div class="label">Bridge /state</div>
+      <div class="value" id="bridge-state">—</div>
+    </div>
+    <div class="note">
+      Route 来自已绑定 owner document。不写 composer、不点 Send、不进入不可逆发送边界。
+    </div>
   </main>
   <script src="../route-global.js"></script>
   <script src="../dom-adapter.js"></script>

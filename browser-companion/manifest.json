@@ -2,12 +2,17 @@
   "manifest_version": 3,
   "name": "C2C Browser Companion",
   "version": "0.1.1",
-  "description": "Passive ChatGPT conversation ownership companion for Codex with ChatGPT (E1b1 read-only).",
+  "description": "Passive ChatGPT conversation ownership companion for Codex with ChatGPT (E1b2 transport+reserve, no Send).",
   "minimum_edge_version": "116",
   "permissions": ["storage", "activeTab"],
   "host_permissions": [
     "https://chatgpt.com/*",
     "https://www.chatgpt.com/*"
+  ],
+  "optional_host_permissions": [
+    "https://*/*",
+    "http://127.0.0.1/*",
+    "http://localhost/*"
   ],
   "background": {
     "service_worker": "service-worker.js",

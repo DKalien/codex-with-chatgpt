@@ -286,6 +286,19 @@ export function companionPublicState(input: {
     && e.targetEpoch === input.ctx.epoch
     && e.targetPrincipalFingerprint === input.ctx.principalFingerprint);
   const events = scoped.map((e) => publicCompanionDeliveryEvent(e));
+  // E1b2 crash/recovery: only this companion's in-flight reservation/claim.
+  // Never expose reservedBy / principal fingerprint / credential material.
+  const inflightEvent = scoped.find((e) =>
+    (e.status === "reserved" || e.status === "claimed")
+    && e.reservedBy === input.ctx.companionId);
+  const inFlight = inflightEvent
+    ? {
+        eventId: inflightEvent.eventId,
+        status: inflightEvent.status,
+        ...(inflightEvent.reservationId ? { reservationId: inflightEvent.reservationId } : {}),
+        ...(inflightEvent.attemptId ? { attemptId: inflightEvent.attemptId } : {}),
+      }
+    : null;
   return {
     workspaceId: state.workspaceId,
     bindingId: input.ctx.bindingId,
@@ -297,6 +310,7 @@ export function companionPublicState(input: {
     reserved: scoped.filter((e) => e.status === "reserved").length,
     claimed: scoped.filter((e) => e.status === "claimed").length,
     outcomeUnknown: scoped.filter((e) => e.status === "outcome_unknown").length,
+    inFlight,
     events,
   };
 }

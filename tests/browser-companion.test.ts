@@ -46,6 +46,9 @@ describe("browser companion manifest", () => {
     }
     expect(perms).toContain("storage");
     expect(perms).toContain("activeTab");
+    expect(manifest.optional_host_permissions ?? []).toContain("https://*/*");
+    expect(manifest.host_permissions).not.toContain("<all_urls>");
+    expect(manifest.optional_host_permissions).not.toContain("<all_urls>");
     expect(manifest.background?.service_worker).toBe("service-worker.js");
     expect(manifest.background?.type).toBe("module");
     expect(manifest.content_scripts?.[0]?.all_frames).toBe(false);

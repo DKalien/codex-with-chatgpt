@@ -644,3 +644,46 @@ E1b1 = Edge-first **passive ownership layer** 验收完成。仍未实现 reserv
 定向 route/companion/web-control + 全量 **60 files / 1024 passed**；typecheck / build（含 companion 打包）/ diff-check 通过。
 
 Ownership review-fix：popup `isOwner` 经 content script → SW（真实 MessageSender）；同 tab 出现不同 documentId 或缺 documentId 时 fail-closed 清 owner；移除死 `c2c.unobserve` 路径。
+
+---
+
+# Phase E1b2 transport + reversible reservation（代码完成，待 review；未部署；无 Send）
+
+日期：2026-09-15。基于 E1b1 `main@66e0e49`。
+
+## 范围
+
+- SW-only Bridge HTTP + credential；content/popup 不持 secret
+- `chrome.storage.local.setAccessLevel(TRUSTED_CONTEXTS)` before storing credential
+- Bridge origin parser（HTTPS 生产 / loopback HTTP 开发）
+- Pairing（exact owner + 权限 + POST /pair）
+- GET /state + identity 校验 + `inFlight` recovery 投影
+- 5s heartbeat 证据；reserve 门禁；durable journal
+- POST /reserve + /release
+- **不** /begin-send、/ack、composer 写、native Send
+
+## Journal
+
+`NONE` | `RESERVE_REQUESTED` | `RESERVED` | `RESERVATION_RECOVERY`
+
+## 门禁
+
+**61 files / 1033 passed**；typecheck / build（含 companion）/ diff-check。
+
+**not deployed**；**not committed** pending review。
+
+## E1b2 review-fix（2026-09-15）
+
+- `storageProtected`：TRUSTED_CONTEXTS 失败则不加载/不写 credential，pair/fetch/reserve fail closed
+- pair：popup→content mint one-use ownerProof→SW 验 proof 后 /pair（secret 不经 content）
+- reserve：popup→content→SW `c2c.reserve.page`，identity 只来自 MessageSender
+- active journal（REQUESTED/RESERVED/RECOVERY）拒绝 `transport.clear` 与 pair
+- 401/identity mismatch 先 `persistTransport` authStale=true
+- 门禁：**61 files / 1036 passed**
+
+## E1b2 atomic route refresh closeout（2026-09-15）
+
+- owner-proof / reserve 请求携带当前 href+safety；SW 先 `refreshPageObservation` 再 exact-owner 判定
+- 同 document SPA 已切 route 时立即拒绝（不等 800ms poll）
+- popup pair 使用 try/finally 清空 secret
+- fresh full gates：**61 files / 1044 passed**；typecheck / build companion / diff-check
