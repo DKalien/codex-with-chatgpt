@@ -265,17 +265,21 @@
           secret,
           ownerProofId: proof.proof.id,
         });
+        // refresh() rewrites transport-status; apply pair result AFTER it so HTTP reason is kept.
+        await refresh();
+        const failReason = res?.reason
+          || (typeof res?.status === "number" ? `http_${res.status}` : "unknown");
         if (res?.ok) {
           setText(els.transportStatus, "paired", "ok");
           els.pairHint.textContent = "Pairing 成功。secret 已清空。";
           els.pairHint.className = "note ok";
         } else {
-          setText(els.transportStatus, `pair 失败: ${res?.reason || "unknown"}`, "bad");
-          els.pairHint.textContent = "Pairing 未成功；secret/intentId 已清空，可重新粘贴 pairing JSON。";
+          setText(els.transportStatus, `pair 失败: ${failReason}`, "bad");
+          els.pairHint.textContent = `Pairing 未成功（${failReason}）；secret/intentId 已清空，可重新粘贴 pairing JSON。`;
           els.pairHint.className = "note bad";
         }
-        await refresh();
       } catch (e) {
+        await refresh().catch(() => undefined);
         setText(els.transportStatus, `pair 异常: ${e?.message || "runtime"}`, "bad");
       } finally {
         await clearPairingForm({ includeIntent: true });

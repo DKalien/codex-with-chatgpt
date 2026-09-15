@@ -67,9 +67,33 @@ describe("bridge origin parser", () => {
       .toThrow(BridgeOriginError);
   });
 
-  it("companionApiUrl appends exact path", () => {
+  it("companionApiUrl builds full /api/companion/v1 URLs from short endpoints", () => {
+    // Real SW call sites use short endpoints; builder must add the Bridge mount prefix.
+    expect(companionApiUrl("https://b.example.com", "/pair"))
+      .toBe("https://b.example.com/api/companion/v1/pair");
+    expect(companionApiUrl("https://b.example.com", "/state"))
+      .toBe("https://b.example.com/api/companion/v1/state");
+    expect(companionApiUrl("https://b.example.com", "/reserve"))
+      .toBe("https://b.example.com/api/companion/v1/reserve");
+    expect(companionApiUrl("https://b.example.com", "/release"))
+      .toBe("https://b.example.com/api/companion/v1/release");
+    expect(companionApiUrl("http://127.0.0.1:48765", "pair"))
+      .toBe("http://127.0.0.1:48765/api/companion/v1/pair");
+    // Idempotent when prefix already present
     expect(companionApiUrl("https://b.example.com", "/api/companion/v1/state"))
       .toBe("https://b.example.com/api/companion/v1/state");
+  });
+
+  it("service-worker short endpoints always resolve via companionApiUrl", () => {
+    const sw = fs.readFileSync(path.join(projectRoot, "browser-companion", "service-worker.js"), "utf8");
+    expect(sw).toMatch(/companionApiUrl\(origin,\s*"\/pair"\)/);
+    expect(sw).toMatch(/fetchCompanion\("\/state"/);
+    expect(sw).toMatch(/fetchCompanion\("\/reserve"/);
+    expect(sw).toMatch(/fetchCompanion\("\/release"/);
+    // fetchCompanion must go through companionApiUrl (not raw path concat)
+    const fetchIdx = sw.indexOf("async function fetchCompanion");
+    const fetchBody = sw.slice(fetchIdx, fetchIdx + 500);
+    expect(fetchBody).toMatch(/companionApiUrl/);
   });
 });
 
@@ -396,6 +420,20 @@ describe("E1b2 recovery / authStale / storage policy (final closeout)", () => {
     expect(reserveBody).toMatch(/refreshPageObservation/);
   });
 
+  it("popup keeps pair failure reason after refresh", () => {
+    const popup = fs.readFileSync(
+      path.join(projectRoot, "browser-companion", "popup", "popup.js"),
+      "utf8",
+    );
+    // pair result must be applied after refresh so reason is not overwritten
+    const pairIdx = popup.indexOf('els.pair.onclick');
+    const pairBody = popup.slice(pairIdx, pairIdx + 2200);
+    const refreshIdx = pairBody.indexOf("await refresh()");
+    const failIdx = pairBody.indexOf("pair 失败");
+    expect(refreshIdx).toBeGreaterThan(-1);
+    expect(failIdx).toBeGreaterThan(refreshIdx);
+  });
+
   it("popup persists origin local + intent session; never stores secret", () => {
     const popup = fs.readFileSync(
       path.join(projectRoot, "browser-companion", "popup", "popup.js"),
@@ -405,7 +443,6 @@ describe("E1b2 recovery / authStale / storage policy (final closeout)", () => {
     expect(popup).toMatch(/chrome\.storage\.session\.set/);
     expect(popup).toMatch(/LOCAL_ORIGIN_KEY/);
     expect(popup).toMatch(/SESSION_INTENT_KEY/);
-    // Secret must not be written to any storage key.
     expect(popup).not.toMatch(/storage\.(local|session)\.set\(\{[^}]*secret/);
     expect(popup).toMatch(/clearPairingForm/);
     expect(popup).toMatch(/extractPairingFields/);

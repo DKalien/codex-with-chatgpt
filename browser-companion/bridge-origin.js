@@ -11,6 +11,9 @@ export class BridgeOriginError extends Error {
   }
 }
 
+/** Mounted Bridge companion router prefix. Keep in sync with src/bridge/server.ts. */
+export const COMPANION_API_PREFIX = "/api/companion/v1";
+
 /**
  * @param {string} raw
  * @param {{ allowLoopbackHttp?: boolean }} [opts]
@@ -53,9 +56,16 @@ export function parseBridgeOrigin(raw, opts = {}) {
   throw new BridgeOriginError("Bridge origin 协议无效");
 }
 
-/** Append companion API path; origin must already be validated. */
+/**
+ * Build companion API URL under /api/companion/v1.
+ * Callers pass short endpoints only ("/pair", "/state", …).
+ * Idempotent if path already includes the prefix.
+ */
 export function companionApiUrl(origin, path) {
   const base = parseBridgeOrigin(origin, { allowLoopbackHttp: origin.startsWith("http://") });
-  const p = path.startsWith("/") ? path : `/${path}`;
+  let p = path.startsWith("/") ? path : `/${path}`;
+  if (!p.startsWith(`${COMPANION_API_PREFIX}/`) && p !== COMPANION_API_PREFIX) {
+    p = `${COMPANION_API_PREFIX}${p}`;
+  }
   return `${base}${p}`;
 }
