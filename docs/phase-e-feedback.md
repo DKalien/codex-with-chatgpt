@@ -629,7 +629,15 @@ reserve polling / begin-send / SEND_INTENT / composer write / native Send / nati
 
 产物目录：`dist/browser-companion`（`pnpm run build:companion`）。
 
-真实 Edge 观察流程需本机登录 ChatGPT：`edge://extensions` → Load unpacked → 打开 Project conversation → popup 显示 canonical URL → Bind → 切走 conversation 应失效 owner。**本自动化环境未执行真实 ChatGPT 页面 Send 或用户会话注入。**
+**真机验收（2026-09-15）：已通过。** 本机 Microsoft Edge 加载 unpacked 后，对真实已登录 ChatGPT Project conversation 被动观察：
+
+- popup 显示真实 Project conversation canonical route（`/g/g-.../c/<uuid>`，与 parser 的 gpt-conversation 支持一致）
+- Bind 后 popup 显示 **是 owner**
+- 切走 conversation / reload：owner 失效，不静默继承
+- 同 route 另一 tab 不成为 owner
+- 全程 **未写 composer、未点 Send**
+
+E1b1 = Edge-first **passive ownership layer** 验收完成。仍未实现 reserve / begin-send / SEND_INTENT / native Send / ACK / Bridge production deploy。
 
 ## 门禁
 
