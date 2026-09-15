@@ -104,7 +104,7 @@ describe("Desktop MCP 与本地接口", () => {
   it("未绑定时注册 Desktop 工具并安全返回状态，绑定后 disabled 仍只开放状态查询", async () => {
     const unbound = await clientFor([DESKTOP_READ_SCOPE]);
     const unboundTools = (await unbound.listTools()).tools;
-    expect(unboundTools).toHaveLength(11);
+    expect(unboundTools).toHaveLength(17);
     const unboundSend = unboundTools.find(tool => tool.name === "codex_desktop_send")!;
     expect(unboundSend.inputSchema.required).toEqual(expect.arrayContaining(["intent", "userConfirmed", "message", "bindingId", "commandId", "workspaceId"]));
     expect(unboundSend.inputSchema.properties?.intent).toMatchObject({ enum: ["development_plan", "revision"] });

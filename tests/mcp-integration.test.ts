@@ -77,7 +77,7 @@ afterAll(async () => {
 });
 
 describe("MCP tools over Streamable HTTP", () => {
-  it("lists nine base read-only tools and Desktop tools", async () => {
+  it("lists base read-only tools, Desktop tools, and production feedback tools", async () => {
     const { tools } = await client.listTools();
     const names = tools.map((tool) => tool.name).sort();
     expect(names).toEqual([
@@ -85,6 +85,12 @@ describe("MCP tools over Streamable HTTP", () => {
       "codex_desktop_status",
       "execution_output",
       "execution_summary",
+      "feedback_ack_observed",
+      "feedback_claim_next",
+      "feedback_enable",
+      "feedback_status",
+      "feedback_stop",
+      "feedback_takeover",
       "git_diff",
       "git_status",
       "list_directory",
@@ -93,7 +99,16 @@ describe("MCP tools over Streamable HTTP", () => {
       "test_status",
       "workspace_info",
     ]);
-    expect(tools.filter((tool) => tool.name !== "codex_desktop_send").every((tool) => tool.annotations?.readOnlyHint === true)).toBe(true);
+    const nonReadonly = new Set([
+      "codex_desktop_send",
+      "feedback_ack_observed",
+      "feedback_claim_next",
+      "feedback_enable",
+      "feedback_status",
+      "feedback_stop",
+      "feedback_takeover",
+    ]);
+    expect(tools.filter((tool) => !nonReadonly.has(tool.name)).every((tool) => tool.annotations?.readOnlyHint === true)).toBe(true);
     const desktopSend = tools.find((tool) => tool.name === "codex_desktop_send")!;
     expect(desktopSend.inputSchema.required).toEqual(expect.arrayContaining(["intent", "userConfirmed", "message", "bindingId", "commandId", "workspaceId"]));
     expect(desktopSend.inputSchema.properties?.intent).toMatchObject({ enum: ["development_plan", "revision"] });

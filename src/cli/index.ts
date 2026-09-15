@@ -82,6 +82,7 @@ import {
   FINALIZER_POLL_MS,
 } from "../core/post-turn-finalizer.js";
 import { registerRemoteCommands, remoteStatus } from "./remote.js";
+import { registerFeedbackProbeCommands } from "./feedback-probe.js";
 import { isWriteProbeEnabled, readWriteProbeStatus, WRITE_PROBE_SCOPE } from "../mcp/write-probe.js";
 import { registerDesktopCommands } from "./desktop.js";
 import { rollout } from "../core/rollout.js";
@@ -189,6 +190,7 @@ ptf.command("run").requiredOption("-w, --workspace <path>").action(async (opts: 
 });
 registerRemoteCommands(program);
 registerDesktopCommands(program);
+registerFeedbackProbeCommands(program);
 
 const say = (msg: string): void => {
   process.stdout.write(msg + "\n");

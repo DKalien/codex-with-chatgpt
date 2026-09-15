@@ -27,6 +27,7 @@
 | D1 | 严格引用集 + 只读 GC plan | done | `release-references` + `gc-plan`；定向 21/21；见下方 D1 节 |
 | D2 | maintenance lock / apply / safe delete | done | lock + two-pass apply + tombstone；定向见 D2 节 |
 | B | 已证明 self-busy 的一次性 post-turn finalizer | done | structured idle + bounded finalizer + review/closeout；见下方 B 节 |
+| E | 原任务 ChatGPT 对话的后台执行反馈与独立 review | preflight blocked | 2026-09-14 首轮仅做 E0 / 接收合同核验；见 [Phase E 预检](phase-e-feedback.md)，未开发生产回流 |
 
 A/B 共享 strict terminal receipt/reconciliation，不建设万能 scheduler；B 单独使用有限生命周期
 finalizer job。C/D 共享 trusted release manifest、reference graph 和 machine maintenance lock
@@ -492,7 +493,23 @@ release maintenance             # 失败 → ok=false，保留 items
 
 ## NEXT_EXPECTED_STEP
 
-计划阶段 C/A/D1/D2/B 均已完成；真实部署与 post-turn 收敛已验证，见末尾验收记录。
+历史源码阶段 C/A/D1/D2/B 已完成；其中 A 的 pending/sent 状态机制不等于无 DOM 的生产回流。
+此前部署验收只对应各节记录的 build，不能代表后来所有源码均已在机器收敛。
+
+2026-09-14 Phase E 首轮核验：干净 `main@dcf8db0` 与实时 origin/main 一致；当前源码运行产物、
+installed/runtime 均为 `30cd260920fc8a2fc44ef00874c7f4a323f14108375d5ed0237807d3ece3051e`，
+完整 release 校验和 128 项内存 emit 比对通过，本地及 named 公网健康。
+但 `upgradePending=true / named_unhealthy` 仍保留，latest finalizer
+`c5d31ea0-fcab-4058-8726-5af43b8227d8` 为 blocked，无 active job。本轮按已运行正确目标的规则
+只读确认，未重新安装、rollout 或重启；**E0=blocked（遗留维护状态尚未收敛）**。
+
+**RECEIVER_GATE=BLOCKED**：Workspace Agents 官方资料未证明进入指定已有普通 ChatGPT conversation
+和最终可见消息回执；另有用户已确认的测试配置缺口（本轮尚未提供或确认测试目标/专用凭据）。
+两类阻塞分开记录，补 token 不能解决路由缺口，也不据此断言整个 Phase E 不可行；真实事件/E2E 均为 0。
+下一步先补齐原目标接收合同、账户与目标映射，明确遗留 pending 的限定 workspace 收敛范围；
+条件成立后才做有限只读接收探针。独立 Agent 对话需用户确认需求变化。
+生产 outbox、常驻 feedback pump、自动 revision 和 scheduler 不进入下一轮开发。
+详细证据、能力矩阵及本轮普通 record 身份见 [Phase E 预检](phase-e-feedback.md)。
 
 ### B：strict post-turn finalizer（done）
 
@@ -572,4 +589,15 @@ counts 契约兼容。
 
 - 安装拒绝 machine bin 目录外链；GC runtime/pending 引用验证 canonical regular file 与 workspaceRoot 身份。
 - 修订后 core-install 29/29、gc-plan + gc-apply 50/50；typecheck / build / diff-check 通过。
-- 此次修订未重新部署，机器仍运行上节已验收 build。
+- 此次源码修订验收时未重新部署；2026-09-14 Phase E 的后续机器观察见
+  [Phase E 预检](phase-e-feedback.md)，不得将本条历史状态当作当前机器结论。
+
+
+## Phase E UI 探针 + E1a production feedback（2026-09-15 收官，未再部署）
+
+- synthetic probe：默认关闭 `C2C_ENABLE_FEEDBACK_PROBE`；scope `feedback.probe`；UI `ui://c2c/feedback-probe/v4.html`
+- production outbox：永久 scope `codex.feedback`；`stateDir/feedback/<ws>.json`；Desktop terminal → `C2C_EXECUTED`
+- 验证：**57 files / 973 passed**；typecheck / build / `git diff --check`
+- **not deployed**；next transport = browser companion
+
+过程与终态详见 [phase-e-feedback.md](phase-e-feedback.md)。

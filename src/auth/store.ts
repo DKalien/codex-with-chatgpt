@@ -4,6 +4,8 @@ import path from "node:path";
 import { z } from "zod";
 import { ensureDir, getStateDir, writeSecureJson } from "../config/paths.js";
 import { isWriteProbeEnabled, WRITE_PROBE_SCOPE } from "../mcp/write-probe.js";
+import { FEEDBACK_PROBE_SCOPE, isFeedbackProbeEnabled } from "../feedback/probe-store.js";
+import { CODEX_FEEDBACK_SCOPE } from "../feedback/store.js";
 
 export const SUPPORTED_SCOPES = [
   "workspace.read",
@@ -32,14 +34,26 @@ export interface DesktopCompatibility {
 export type Scope =
   | (typeof SUPPORTED_SCOPES)[number]
   | typeof WRITE_PROBE_SCOPE
+  | typeof FEEDBACK_PROBE_SCOPE
+  | typeof CODEX_FEEDBACK_SCOPE
   | "codex.control"
   | "codex.read"
   | typeof DESKTOP_CONTROL_SCOPE
   | typeof DESKTOP_READ_SCOPE;
 
 export function getSupportedScopes(): string[] {
-  const scopes = [...SUPPORTED_SCOPES, "codex.control", "codex.read", DESKTOP_CONTROL_SCOPE, DESKTOP_READ_SCOPE];
-  return isWriteProbeEnabled() ? [...scopes, WRITE_PROBE_SCOPE] : scopes;
+  const scopes = [
+    ...SUPPORTED_SCOPES,
+    "codex.control",
+    "codex.read",
+    DESKTOP_CONTROL_SCOPE,
+    DESKTOP_READ_SCOPE,
+    CODEX_FEEDBACK_SCOPE,
+  ];
+  const optional: string[] = [];
+  if (isWriteProbeEnabled()) optional.push(WRITE_PROBE_SCOPE);
+  if (isFeedbackProbeEnabled()) optional.push(FEEDBACK_PROBE_SCOPE);
+  return [...scopes, ...optional];
 }
 
 export interface ClientRegistration {

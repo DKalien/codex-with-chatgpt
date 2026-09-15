@@ -10,6 +10,8 @@ import { listExecutionOutputs, readExecutionOutput } from "../execution/output.j
 import type { Logger } from "../logger/index.js";
 import { PRODUCT_NAME, VERSION } from "../version.js";
 import { isWriteProbeEnabled, probeNonceSchema, writeProbe, WRITE_PROBE_LOCATION, WRITE_PROBE_SCOPE } from "./write-probe.js";
+import { registerFeedbackProbeTools } from "./feedback-probe.js";
+import { registerFeedbackTools } from "./feedback.js";
 import { registerDesktopTools } from "./desktop.js";
 import { CONNECTOR_CONTRACT_VERSION, type DesktopCompatibility } from "../auth/store.js";
 
@@ -194,7 +196,7 @@ export function createMcpServer(ctx: McpContext): McpServer {
   const { workspace } = ctx;
   const server = new McpServer(
     { name: PRODUCT_NAME, version: VERSION },
-    { capabilities: { tools: {} }, instructions: UNTRUSTED_NOTE }
+    { capabilities: { tools: {}, resources: {} }, instructions: UNTRUSTED_NOTE }
   );
 
   server.registerTool(
@@ -513,5 +515,9 @@ export function createMcpServer(ctx: McpContext): McpServer {
 
   registerRemoteTools(server, workspace);
   registerDesktopTools(server, workspace, ctx.desktopAuthorize);
+  // 默认关闭；C2C_ENABLE_FEEDBACK_PROBE=1 时注册 UI resource + 探针工具。
+  registerFeedbackProbeTools(server, workspace);
+  // production feedback：永久 scope codex.feedback；与 synthetic probe 分离。
+  registerFeedbackTools(server, workspace);
   return server;
 }
