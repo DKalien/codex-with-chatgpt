@@ -1,9 +1,13 @@
 /**
  * Popup: ownership via content→SW; pairing/reserve via SW only.
- * Pairing secret is never persisted and never goes through content script.
+ * Pairing secret NEVER persisted (not local, not session) — popup memory only.
+ * Bridge origin: storage.local (not a secret). intentId: storage.session only.
  */
 (function () {
   "use strict";
+
+  const LOCAL_ORIGIN_KEY = "c2c_companion_bridge_origin_v1";
+  const SESSION_INTENT_KEY = "c2c_companion_pair_intent_v1";
 
   const els = {
     pageRoute: document.getElementById("page-route"),
@@ -13,8 +17,11 @@
     unbind: document.getElementById("unbind"),
     transportStatus: document.getElementById("transport-status"),
     bridgeOrigin: document.getElementById("bridge-origin"),
+    pairJson: document.getElementById("pair-json"),
+    applyPairJson: document.getElementById("apply-pair-json"),
     intentId: document.getElementById("intent-id"),
     pairSecret: document.getElementById("pair-secret"),
+    pairHint: document.getElementById("pair-hint"),
     pair: document.getElementById("pair"),
     fetchState: document.getElementById("fetch-state"),
     reserve: document.getElementById("reserve"),
@@ -38,17 +45,76 @@
     return chrome.tabs.sendMessage(tabId, { type: "c2c.status.request" });
   }
 
-  async function clearSecretInputs() {
+  async function loadPairingPrefs() {
+    try {
+      const local = await chrome.storage.local.get(LOCAL_ORIGIN_KEY);
+      if (typeof local[LOCAL_ORIGIN_KEY] === "string" && local[LOCAL_ORIGIN_KEY]) {
+        els.bridgeOrigin.value = local[LOCAL_ORIGIN_KEY];
+      }
+    } catch { /* ignore */ }
+    try {
+      const session = await chrome.storage.session.get(SESSION_INTENT_KEY);
+      if (typeof session[SESSION_INTENT_KEY] === "string" && session[SESSION_INTENT_KEY]) {
+        els.intentId.value = session[SESSION_INTENT_KEY];
+      }
+    } catch { /* ignore */ }
+  }
+
+  async function saveBridgeOrigin(origin) {
+    const value = (origin ?? "").trim();
+    if (!value) return;
+    try {
+      await chrome.storage.local.set({ [LOCAL_ORIGIN_KEY]: value });
+    } catch { /* ignore */ }
+  }
+
+  async function saveIntentSession(intentId) {
+    try {
+      if (intentId) {
+        await chrome.storage.session.set({ [SESSION_INTENT_KEY]: intentId });
+      } else {
+        await chrome.storage.session.remove(SESSION_INTENT_KEY);
+      }
+    } catch { /* ignore */ }
+  }
+
+  /** Destroy secret from DOM + clear session intentId. Never touch secret storage. */
+  async function clearPairingForm({ includeIntent = true } = {}) {
     els.pairSecret.value = "";
-    els.intentId.value = "";
+    els.pairJson.value = "";
+    if (includeIntent) {
+      els.intentId.value = "";
+      await saveIntentSession(null);
+    }
+  }
+
+  function extractPairingFields(raw) {
+    let text = (raw ?? "").trim();
+    if (!text) return null;
+    // Tolerate markdown fences / surrounding prose: take first JSON object.
+    const fenced = /```(?:json)?\s*([\s\S]*?)```/i.exec(text);
+    if (fenced?.[1]) text = fenced[1].trim();
+    const start = text.indexOf("{");
+    const end = text.lastIndexOf("}");
+    if (start >= 0 && end > start) text = text.slice(start, end + 1);
+    let obj;
+    try {
+      obj = JSON.parse(text);
+    } catch {
+      return null;
+    }
+    if (!obj || typeof obj !== "object") return null;
+    const intentId = typeof obj.intentId === "string" ? obj.intentId.trim() : "";
+    const secret = typeof obj.secret === "string" ? obj.secret : "";
+    if (!intentId || !secret) return null;
+    return { intentId, secret };
   }
 
   async function requestBridgePermission(origin) {
     try {
       const url = new URL(origin);
       const pattern = `${url.protocol}//${url.hostname}/*`;
-      const granted = await chrome.permissions.request({ origins: [pattern] });
-      return granted;
+      return await chrome.permissions.request({ origins: [pattern] });
     } catch {
       return false;
     }
@@ -110,6 +176,11 @@
         `connected origin=${transport.bridgeOrigin} companion=${transport.companionId}`,
         "ok",
       );
+      // Remember last connected origin (not a secret).
+      if (transport.bridgeOrigin) {
+        els.bridgeOrigin.value = transport.bridgeOrigin;
+        void saveBridgeOrigin(transport.bridgeOrigin);
+      }
     } else if (transport?.authStale) {
       setText(els.transportStatus, "auth stale — 需重新 pair", "bad");
     } else {
@@ -120,6 +191,7 @@
     const hasTransport = Boolean(transport?.connected);
     els.bind.disabled = !parsed || !tab?.id;
     els.pair.disabled = !isOwner;
+    els.applyPairJson.disabled = false;
     els.fetchState.disabled = !hasTransport;
     els.reserve.disabled = !hasTransport || !isOwner;
     els.release.disabled = !hasTransport;
@@ -139,6 +211,21 @@
       await refresh();
     };
 
+    els.applyPairJson.onclick = async () => {
+      const fields = extractPairingFields(els.pairJson.value);
+      if (!fields) {
+        els.pairHint.textContent = "无法从 JSON 提取 intentId + secret；请粘贴完整 pairing 输出。";
+        els.pairHint.className = "note bad";
+        return;
+      }
+      els.intentId.value = fields.intentId;
+      els.pairSecret.value = fields.secret;
+      await saveIntentSession(fields.intentId);
+      els.pairJson.value = "";
+      els.pairHint.textContent = "已提取 intentId / secret（secret 仅内存）。立即 Pair。";
+      els.pairHint.className = "note ok";
+    };
+
     els.pair.onclick = async () => {
       const origin = els.bridgeOrigin.value.trim();
       const intentId = els.intentId.value.trim();
@@ -148,8 +235,9 @@
         return;
       }
       if (!tab?.id) return;
+      await saveBridgeOrigin(origin);
+      await saveIntentSession(intentId);
       try {
-        // 1) permission FIRST; 2) mint proof from current document; 3) pair immediately
         const granted = await requestBridgePermission(origin);
         if (!granted) {
           setText(els.transportStatus, "未授予 Bridge origin 权限；transport 禁用", "bad");
@@ -179,15 +267,18 @@
         });
         if (res?.ok) {
           setText(els.transportStatus, "paired", "ok");
+          els.pairHint.textContent = "Pairing 成功。secret 已清空。";
+          els.pairHint.className = "note ok";
         } else {
           setText(els.transportStatus, `pair 失败: ${res?.reason || "unknown"}`, "bad");
+          els.pairHint.textContent = "Pairing 未成功；secret/intentId 已清空，可重新粘贴 pairing JSON。";
+          els.pairHint.className = "note bad";
         }
         await refresh();
       } catch (e) {
         setText(els.transportStatus, `pair 异常: ${e?.message || "runtime"}`, "bad");
       } finally {
-        // Always destroy one-time secret from the form.
-        await clearSecretInputs();
+        await clearPairingForm({ includeIntent: true });
       }
     };
 
@@ -242,7 +333,18 @@
     };
   }
 
-  refresh().catch(() => {
+  (async () => {
+    await loadPairingPrefs();
+    // Popup may be destroyed on blur (e.g. copying JSON) — save on input, not change.
+    els.bridgeOrigin.addEventListener("input", () => {
+      void saveBridgeOrigin(els.bridgeOrigin.value);
+    });
+    els.intentId.addEventListener("input", () => {
+      void saveIntentSession(els.intentId.value.trim() || null);
+    });
+    // Secret input: never write to storage.
+    await refresh();
+  })().catch(() => {
     setText(els.pageRoute, "popup 初始化失败", "bad");
   });
 })();

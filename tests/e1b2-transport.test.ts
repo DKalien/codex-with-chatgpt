@@ -396,13 +396,20 @@ describe("E1b2 recovery / authStale / storage policy (final closeout)", () => {
     expect(reserveBody).toMatch(/refreshPageObservation/);
   });
 
-  it("popup clears pairing secret in finally", () => {
+  it("popup persists origin local + intent session; never stores secret", () => {
     const popup = fs.readFileSync(
       path.join(projectRoot, "browser-companion", "popup", "popup.js"),
       "utf8",
     );
+    expect(popup).toMatch(/chrome\.storage\.local\.set/);
+    expect(popup).toMatch(/chrome\.storage\.session\.set/);
+    expect(popup).toMatch(/LOCAL_ORIGIN_KEY/);
+    expect(popup).toMatch(/SESSION_INTENT_KEY/);
+    // Secret must not be written to any storage key.
+    expect(popup).not.toMatch(/storage\.(local|session)\.set\(\{[^}]*secret/);
+    expect(popup).toMatch(/clearPairingForm/);
+    expect(popup).toMatch(/extractPairingFields/);
     expect(popup).toMatch(/finally\s*\{/);
-    expect(popup).toMatch(/clearSecretInputs/);
   });
 
   it("SW implements recover RESERVED + authStale re-pair + storage delete", () => {

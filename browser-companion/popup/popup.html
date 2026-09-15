@@ -23,7 +23,7 @@
     .ok { color: #81c995; }
     .bad { color: #f28b82; }
     .warn { color: #fdd663; }
-    input {
+    input, textarea {
       width: 100%;
       box-sizing: border-box;
       padding: 6px 8px;
@@ -33,6 +33,7 @@
       color: #e8eaed;
       font: 12px ui-monospace, Consolas, monospace;
     }
+    textarea { resize: vertical; }
     button {
       margin-top: 6px;
       padding: 8px 10px;
@@ -73,17 +74,23 @@
       <div class="value" id="transport-status">未配对</div>
     </div>
     <div class="row">
-      <div class="label">Bridge origin（仅 HTTPS；开发可用 http://127.0.0.1:port）</div>
-      <input id="bridge-origin" placeholder="https://xxxx.trycloudflare.com" />
+      <div class="label">Bridge origin（持久保存；非 secret；仅 HTTPS / 开发 loopback）</div>
+      <input id="bridge-origin" placeholder="https://c2c-codex-with-chatgpt.devworklink.com" autocomplete="off" />
     </div>
     <div class="row">
-      <div class="label">Pairing intentId</div>
-      <input id="intent-id" placeholder="uuid from feedback_companion_pair" autocomplete="off" />
+      <div class="label">Paste pairing JSON（一次粘贴 feedback_companion_pair 整段输出）</div>
+      <textarea id="pair-json" rows="4" placeholder='{"intentId":"...","secret":"c2c_pair_...","expiresAt":"...","bindingId":"...","epoch":1}'></textarea>
+    </div>
+    <button id="apply-pair-json" class="secondary">Apply pairing JSON（提取 intentId / secret）</button>
+    <div class="row">
+      <div class="label">Pairing intentId（session 临时；浏览器会话结束后消失）</div>
+      <input id="intent-id" placeholder="uuid" autocomplete="off" />
     </div>
     <div class="row">
-      <div class="label">One-time pairing secret（不持久化）</div>
+      <div class="label">One-time pairing secret（仅 popup 内存；不进任何 storage）</div>
       <input id="pair-secret" type="password" placeholder="c2c_pair_..." autocomplete="off" />
     </div>
+    <div class="note" id="pair-hint">复制 pairing JSON → 打开扩展 → 粘贴并 Apply → Pair。</div>
     <button id="pair" disabled>Pair Bridge（仅 exact owner）</button>
     <button id="fetch-state" class="secondary" disabled>GET /state</button>
     <button id="reserve" class="secondary" disabled>Reserve next (E1b2 test)</button>
