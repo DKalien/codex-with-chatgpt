@@ -647,7 +647,7 @@ Ownership review-fix：popup `isOwner` 经 content script → SW（真实 Messag
 
 ---
 
-# Phase E1b2 transport + reversible reservation（代码完成，待 review；未部署；无 Send）
+# Phase E1b2 transport + reversible reservation（**code review passed, live transport pending**）
 
 日期：2026-09-15。基于 E1b1 `main@66e0e49`。
 
@@ -668,9 +668,11 @@ Ownership review-fix：popup `isOwner` 经 content script → SW（真实 Messag
 
 ## 门禁
 
-**61 files / 1033 passed**；typecheck / build（含 companion）/ diff-check。
+**61 files / 1044 passed**；typecheck / build（含 companion）/ diff-check。
 
-**not deployed**；**not committed** pending review。
+- **code review passed**
+- **live transport pending**
+- **Bridge not deployed**；**无 native Send**
 
 ## E1b2 review-fix（2026-09-15）
 
