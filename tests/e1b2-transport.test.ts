@@ -23,6 +23,7 @@ import {
   reconcileReservedJournal,
   pairAllowedWithJournal,
   applyStorageProtectionPolicy,
+  wrapFetchResponse,
 } from "../browser-companion/reservation-journal.js";
 import { companionPublicState } from "../src/feedback/companion.js";
 import {
@@ -447,6 +448,36 @@ describe("E1b2 recovery / authStale / storage policy (final closeout)", () => {
     expect(popup).toMatch(/clearPairingForm/);
     expect(popup).toMatch(/extractPairingFields/);
     expect(popup).toMatch(/finally\s*\{/);
+  });
+
+  it("wrapFetchResponse keeps ok for HTTP 200", () => {
+    expect(wrapFetchResponse({ ok: true, status: 200 }, { a: 1 }))
+      .toEqual({ ok: true, status: 200, body: { a: 1 } });
+    // Missing Response.ok but 2xx status still success
+    expect(wrapFetchResponse({ status: 200 }, { a: 1 }).ok).toBe(true);
+    expect(wrapFetchResponse({ ok: false, status: 401 }, {}).ok).toBe(false);
+    expect(wrapFetchResponse(null, {}).ok).toBe(false);
+  });
+
+  it("fetchCompanion preserves Response.ok for 200 success paths", () => {
+    const sw = fs.readFileSync(path.join(projectRoot, "browser-companion", "service-worker.js"), "utf8");
+    const fetchIdx = sw.indexOf("async function fetchCompanion");
+    const fetchBody = sw.slice(fetchIdx, fetchIdx + 700);
+    expect(fetchBody).toMatch(/wrapFetchResponse/);
+    // Callers must branch on res.ok, not only status===200
+    const stateIdx = sw.indexOf("async function handleFetchState");
+    const stateBody = sw.slice(stateIdx, stateIdx + 900);
+    expect(stateBody).toMatch(/res\.ok/);
+    expect(stateBody).not.toMatch(/status\s*===\s*200/);
+    const reserveIdx = sw.indexOf("async function handleReservePage");
+    const reserveBody = sw.slice(reserveIdx, reserveIdx + 1800);
+    expect(reserveBody).toMatch(/if \(!res\.ok\)/);
+    expect(reserveBody).not.toMatch(/status\s*===\s*200/);
+    const releaseIdx = sw.indexOf("async function handleRelease");
+    const releaseBody = sw.slice(releaseIdx, releaseIdx + 900);
+    expect(releaseBody).toMatch(/if \(res\.ok\)/);
+    expect(releaseBody).toMatch(/clearJournal/);
+    expect(releaseBody).not.toMatch(/status\s*===\s*200/);
   });
 
   it("SW implements recover RESERVED + authStale re-pair + storage delete", () => {

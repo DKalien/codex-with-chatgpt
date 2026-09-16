@@ -193,6 +193,19 @@ export function pairAllowedWithJournal(journal, authStale) {
 }
 
 /**
+ * Normalize fetch Response for companion clients.
+ * HTTP 2xx must be ok=true so 200 is never treated as failure.
+ */
+export function wrapFetchResponse(res, body) {
+  if (!res || typeof res !== "object") {
+    return { ok: false, status: 0, body: body ?? {} };
+  }
+  const status = Number.isFinite(res.status) ? res.status : 0;
+  const ok = res.ok === true || (status >= 200 && status < 300);
+  return { ok, status, body: body ?? {} };
+}
+
+/**
  * Hydrate policy for durable transport credential.
  * Fail-closed: without storage protection, credential must be absent on disk.
  */

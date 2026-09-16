@@ -31,6 +31,7 @@ import {
   reconcileReservedJournal,
   pairAllowedWithJournal,
   applyStorageProtectionPolicy,
+  wrapFetchResponse,
 } from "./reservation-journal.js";
 import {
   mintOwnerProof,
@@ -234,7 +235,7 @@ async function fetchCompanion(path, init = {}) {
     signal: init.signal ?? AbortSignal.timeout(15_000),
   });
   const body = await res.json().catch(() => ({}));
-  return { status: res.status, body };
+  return wrapFetchResponse(res, body);
 }
 
 /** Persist authStale before returning (survives SW restart). */
