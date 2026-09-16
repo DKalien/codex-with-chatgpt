@@ -187,6 +187,91 @@ describe("DOM adapter generation positive evidence (P1)", () => {
     expect(s.safe).toBe(false);
   });
 
+  it("empty composer + composer-submit-button-color → idle/safe", () => {
+    const s = observeChatGptSafety(
+      fakeDom({ composerText: "", stop: false, sendEnabled: false, actionSlot: true }),
+      { routeValid: true },
+    );
+    expect(s.composer).toBe("empty");
+    expect(s.generation).toBe("idle");
+    expect(s.safe).toBe(true);
+  });
+
+  it("dirty composer + action slot → idle generation but safe=false", () => {
+    const s = observeChatGptSafety(
+      fakeDom({ composerText: "draft", stop: false, sendEnabled: false, actionSlot: true }),
+      { routeValid: true },
+    );
+    expect(s.composer).toBe("dirty");
+    expect(s.generation).toBe("idle");
+    expect(s.safe).toBe(false);
+  });
+
+  it("stop + action slot → generating; stop wins", () => {
+    const s = observeChatGptSafety(
+      fakeDom({ composerText: "", stop: true, sendEnabled: false, actionSlot: true }),
+      { routeValid: true },
+    );
+    expect(s.generation).toBe("generating");
+    expect(s.safe).toBe(false);
+  });
+
+  it("no stop / no send / no action slot → unknown", () => {
+    const s = observeChatGptSafety(
+      fakeDom({ composerText: "", stop: false, sendEnabled: false, actionSlot: false }),
+      { routeValid: true },
+    );
+    expect(s.generation).toBe("unknown");
+    expect(s.safe).toBe(false);
+  });
+
+  it("generating-state sample: action slot becomes stop-button → generating (not idle)", () => {
+    // Real Edge sample 2026-09-16: same composer-submit-button-color with data-testid=stop-button
+    const s = observeChatGptSafety(
+      fakeDom({
+        composerText: "",
+        stop: false,
+        sendEnabled: false,
+        actionSlot: true,
+        actionSlotClass:
+          "composer-submit-btn composer-submit-button-color h-9 w-9",
+        actionSlotTestId: "stop-button",
+      }),
+      { routeValid: true },
+    );
+    expect(s.generation).toBe("generating");
+    expect(s.safe).toBe(false);
+  });
+
+  it("idle action slot requires text-submit-btn-text and not composer-submit-btn-only", () => {
+    const idle = observeChatGptSafety(
+      fakeDom({
+        composerText: "",
+        stop: false,
+        sendEnabled: false,
+        actionSlot: true,
+        actionSlotClass: "composer-submit-button-color text-submit-btn-text",
+      }),
+      { routeValid: true },
+    );
+    expect(idle.generation).toBe("idle");
+    expect(idle.safe).toBe(true);
+
+    // stop-shaped class without text-submit-btn-text must not be idle
+    const stopShaped = observeChatGptSafety(
+      fakeDom({
+        composerText: "",
+        stop: false,
+        sendEnabled: false,
+        actionSlot: true,
+        actionSlotClass: "composer-submit-btn composer-submit-button-color",
+      }),
+      { routeValid: true },
+    );
+    expect(stopShaped.generation).toBe("generating");
+    expect(stopShaped.safe).toBe(false);
+  });
+
   it("unsupported DOM → unknown unsafe", () => {
     const s = observeChatGptSafety(fakeDom({ hasBody: false, hasComposer: false }), {
       routeValid: true,

@@ -1,5 +1,5 @@
 /**
- * Read-only ChatGPT DOM adapter (E1b1).
+ * Read-only ChatGPT DOM adapter (E1b1/E1b2).
  * Pure functions over a Document-like object for unit tests; no mutations.
  * Unknown is always unsafe.
  */
@@ -52,10 +52,11 @@ function isDisabled(btn) {
 
 /**
  * Observe composer / generation without mutation.
- * Generation requires positive evidence:
- * - generating: stop affordance present
- * - idle: send control present and not disabled, and no stop
- * - otherwise: unknown (unsafe)
+ * Generation requires positive evidence (fail-closed):
+ * 1) Stop control => generating (priority)
+ * 2) enabled send-button / aria Send prompt => idle (legacy)
+ * 3) form button.composer-submit-button-color => idle (current ChatGPT action slot)
+ * Never treat "no Stop found" alone as idle. No localized aria text matching.
  */
 export function observeChatGptSafety(doc, opts = {}) {
   const routeValid = opts.routeValid !== false;
@@ -90,6 +91,7 @@ export function observeChatGptSafety(doc, opts = {}) {
       return unsafeDomSafety("unsupported_dom");
     }
   } else {
+    // Normalize NBSP (U+00A0) from ChatGPT composer text.
     const text = textOf(editor).replace(/ /g, " ").trim();
     if (text.length === 0) composer = "empty";
     else {
@@ -101,19 +103,42 @@ export function observeChatGptSafety(doc, opts = {}) {
   // Positive evidence only. Absence of stop is NOT idle.
   let generation = "unknown";
   const stopBtn =
-    query(doc, 'button[aria-label="Stop generating"]')
-    || query(doc, 'button[data-testid="stop-button"]')
+    query(doc, 'button[data-testid="stop-button"]')
+    || query(doc, 'button[aria-label="Stop generating"]')
     || query(doc, 'button[aria-label*="Stop"]')
     || query(doc, 'div.streaming button[aria-label*="Stop"]');
   const sendBtn =
     query(doc, 'button[data-testid="send-button"]')
     || query(doc, 'button[aria-label="Send prompt"]')
     || query(doc, 'button[aria-label*="Send"]');
+  // Action slot must be scoped to the editor's own form (not document-wide).
+  const editorForm = editor && typeof editor.closest === "function"
+    ? editor.closest("form")
+    : null;
+  const composerActionBtn = editorForm
+    ? query(editorForm, "button.composer-submit-button-color")
+    : null;
+  // Generating-state sample (2026-09-16): same class becomes stop-button.
+  const actionIsStop =
+    Boolean(composerActionBtn)
+    && (
+      composerActionBtn.getAttribute?.("data-testid") === "stop-button"
+      || composerActionBtn.getAttribute?.("data-testid") === "composer-stop-button"
+      || /(?:^|\s)composer-submit-btn(?:\s|$)/.test(String(composerActionBtn.className || ""))
+        && !/(?:^|\s)text-submit-btn-text(?:\s|$)/.test(String(composerActionBtn.className || ""))
+    );
+  const actionLooksIdle =
+    Boolean(composerActionBtn)
+    && !isDisabled(composerActionBtn)
+    && !actionIsStop
+    && /(?:^|\s)text-submit-btn-text(?:\s|$)/.test(String(composerActionBtn.className || ""));
 
-  if (stopBtn) {
+  if (stopBtn || actionIsStop) {
     generation = "generating";
     reasons.push("generating");
   } else if (sendBtn && !isDisabled(sendBtn)) {
+    generation = "idle";
+  } else if (actionLooksIdle) {
     generation = "idle";
   } else {
     generation = "unknown";
@@ -152,11 +177,24 @@ export function fakeDom({
   stop = false,
   hasBody = true,
   sendEnabled = false,
+  actionSlot = false,
+  actionSlotClass = null,
+  actionSlotTestId = null,
 } = {}) {
   const nodes = {};
   if (hasBody) nodes.body = { textContent: "" };
   if (hasComposer) {
     nodes.prose = { textContent: composerText, value: composerText };
+    // Support editor.closest("form") so action-slot lookup is form-scoped.
+    nodes.form = {
+      querySelector(selector) {
+        if (actionSlot && selector === "button.composer-submit-button-color") {
+          return nodes.action ?? null;
+        }
+        return null;
+      },
+    };
+    nodes.prose.closest = (sel) => (sel === "form" ? nodes.form : null);
   }
   if (stop) nodes.stop = { ariaLabel: "Stop generating" };
   if (sendEnabled) {
@@ -165,6 +203,15 @@ export function fakeDom({
       hasAttribute: () => false,
       disabled: false,
       testId: "send-button",
+    };
+  }
+  if (actionSlot) {
+    nodes.action = {
+      className: actionSlotClass
+        || "composer-submit-button-color text-submit-btn-text",
+      getAttribute: (name) => (name === "data-testid" ? actionSlotTestId : null),
+      hasAttribute: (name) => name === "data-testid" && Boolean(actionSlotTestId),
+      disabled: false,
     };
   }
   return {
@@ -188,8 +235,17 @@ export function fakeDom({
       ) {
         return hasComposer || hasBody ? {} : null;
       }
-      if (selector.includes("send-button") || selector.includes("Send prompt") || selector.includes('aria-label*="Send"')) {
+      if (
+        selector.includes("send-button")
+        || selector.includes("Send prompt")
+        || selector.includes('aria-label*="Send"')
+      ) {
         return sendEnabled ? nodes.send : null;
+      }
+      // Current ChatGPT structural action slot (form-scoped only).
+      if (selector === "form button.composer-submit-button-color" || selector === "button.composer-submit-button-color") {
+        // Document-level selector must not hit; only form.querySelector does.
+        return null;
       }
       return null;
     },
