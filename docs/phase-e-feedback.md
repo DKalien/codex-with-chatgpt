@@ -647,9 +647,21 @@ Ownership review-fix：popup `isOwner` 经 content script → SW（真实 Messag
 
 ---
 
-# Phase E1b2 transport + reversible reservation（**code review passed, live transport pending**）
+# Phase E1b2 transport + reversible reservation（**code review passed；Bridge 已部署；live transport pending**）
 
-日期：2026-09-15。基于 E1b1 `main@66e0e49`。
+日期：2026-09-15~16。基于 E1b1 `main@66e0e49`。
+
+## 现役状态（2026-09-16）
+
+| 项 | 状态 |
+| --- | --- |
+| code review | passed |
+| Bridge deploy | **runtime `637edb28` current**（workspace-scoped） |
+| MCP companion tools 可见性 | **model-visible**（`5b5032f`） |
+| companion API | `/api/companion/v1`；`ok` 字段保留；autonomous reconcile on `/state`+`/reserve` |
+| extension 包 | `dist/browser-companion` 已含 paste-JSON / idle evidence / base path |
+| live transport 端到端 | **pending** |
+| native Send | **从未发生** |
 
 ## 范围
 
@@ -666,13 +678,9 @@ Ownership review-fix：popup `isOwner` 经 content script → SW（真实 Messag
 
 `NONE` | `RESERVE_REQUESTED` | `RESERVED` | `RESERVATION_RECOVERY`
 
-## 门禁
+## 门禁（最新）
 
-**61 files / 1044 passed**；typecheck / build（含 companion）/ diff-check。
-
-- **code review passed**
-- **live transport pending**
-- **Bridge not deployed**；**无 native Send**
+**61 files / 1059 passed**；typecheck / build（含 companion）/ diff-check。
 
 ## E1b2 review-fix（2026-09-15）
 
@@ -689,3 +697,13 @@ Ownership review-fix：popup `isOwner` 经 content script → SW（真实 Messag
 - 同 document SPA 已切 route 时立即拒绝（不等 800ms poll）
 - popup pair 使用 try/finally 清空 secret
 - fresh full gates：**61 files / 1044 passed**；typecheck / build companion / diff-check
+
+## E1b2 运行时收尾 hotfix（2026-09-15~16，均已 commit）
+
+- `5b5032f`：production feedback MCP **model-visible**（部署后 ChatGPT 可刷新看到 companion tools）
+- `cecc710`：popup paste pairing JSON；origin local 持久；intentId session-only
+- `39d3075`：`companionApiUrl` 固定 `/api/companion/v1`
+- `a96a210`：`fetchCompanion` 保留 `Response.ok`（修 `http_200` 误判）
+- `1413969`：generating 实证——同 class 变 `data-testid=stop-button` → generating；idle 须 `text-submit-btn-text`
+- `a5f337e`：认证后 `/state`+`/reserve` **autonomous reconcile**；已 rollout 至 `637edb28`
+

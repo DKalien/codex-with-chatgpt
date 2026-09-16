@@ -624,15 +624,17 @@ counts 契约兼容。
 - **Bridge runtime not deployed**（extension 本机验收 ≠ Bridge rollout）
 - next：**E1b2**
 
-## Phase E1b2 transport + reversible reservation（2026-09-15，**code review passed, live transport pending**）
+## Phase E1b2 transport + reversible reservation（2026-09-15~16，**code + server deployed**；live full-path **pending**）
 
-- 全部 Bridge HTTP / credential 仅在 MV3 service worker；`storage.local` 设 `TRUSTED_CONTEXTS`
-- Bridge origin：生产 HTTPS；开发可 loopback HTTP；optional_host_permissions 显式授权
-- Pairing：仅 exact owner；route 取自 owner；secret 不持久化；响应后清输入
-- GET /state：identity 五元组校验；暴露 `inFlight`（仅本 companion reservationId）
-- 证据：content ~5s heartbeat；reserve 需 owner + fresh(≤12s) + safe + empty + idle
+现役（2026-09-16）：
+
+- SW-only Bridge HTTP + credential；`TRUSTED_CONTEXTS`；optional host permission
+- Pairing：exact owner + ownerProof；secret 仅 popup 内存；paste pairing JSON；origin local / intentId session
 - Journal：`NONE → RESERVE_REQUESTED → RESERVED | RESERVATION_RECOVERY`；无 SEND_INTENT
-- POST /reserve、/release；**不** begin-send/ack/Send
-- 验证：**61 files / 1044 passed**；typecheck / build companion / diff-check
-- review-fix / closeout：fail-closed storage、ownerProof、MessageSender reserve、RESERVED recover、authStale re-pair、原子 SPA route refresh
-- **Bridge not deployed**；**live transport 验收 pending**
+- `/api/companion/v1`：pair/state/reserve/release；`companionApiUrl` 强制前缀
+- fetchCompanion 保留 `Response.ok`；DOM idle：Stop 优先 + `text-submit-btn-text` action slot（generating 实证已锁）
+- **已部署** Bridge runtime `637edb28`（workspace-scoped rollout）：认证后 `/state`、`/reserve` 自主 `reconcileFeedbackOutbox`，无需 MCP 踢一下
+- MCP production feedback tools：**model-visible**（`ui.model` + `openai/visibility=public`）；OAuth `codex.feedback` 未放宽
+- **不** begin-send / ack / composer / native Send
+- 门禁：**61 files / 1059 passed**
+- **live transport 端到端**（pair→state→reserve→release 在真机 Edge 完整通过）**仍 pending**；下一阶段 E1b3 在 Send 边界前必须先完成 live 验收
