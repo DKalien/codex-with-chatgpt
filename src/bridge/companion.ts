@@ -12,6 +12,7 @@ import {
 } from "../feedback/companion.js";
 import { CompanionError } from "../feedback/companion.js";
 import { FeedbackError } from "../feedback/store.js";
+import { reconcileFeedbackOutbox } from "../feedback/projector.js";
 
 const pairBodySchema = z.object({
   intentId: z.string().uuid(),
@@ -119,7 +120,10 @@ export function createCompanionRouter(opts: CompanionRouterOptions): Router {
 
   router.get("/state", (req, res) => {
     try {
+      // Auth first: unauthenticated must 401 without touching projector.
       const ctx = auth(req);
+      // E1b2 autonomous reconcile: browser can pull outbox without MCP kick.
+      reconcileFeedbackOutbox(opts.workspaceId, opts.stateDir);
       res.json(companionPublicState({
         workspaceId: opts.workspaceId,
         ctx,
@@ -134,6 +138,8 @@ export function createCompanionRouter(opts: CompanionRouterOptions): Router {
     try {
       const ctx = auth(req);
       const body = routeBodySchema.parse(req.body);
+      // Project newly landed trusted receipts before reserving.
+      reconcileFeedbackOutbox(opts.workspaceId, opts.stateDir);
       const result = companionReserveNext({
         workspaceId: opts.workspaceId,
         ctx,

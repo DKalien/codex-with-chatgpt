@@ -832,4 +832,107 @@ describe("public companion HTTP surface", () => {
     expect(badBody.status).toBe(400);
     expect(badBody.body.error).toBe("COMPANION_VALIDATION");
   });
+
+  async function pairCompanionHttp() {
+    const intent = createPairingIntent({
+      workspaceId: workspace.id,
+      principal: principalA(),
+      stateDir,
+    });
+    const paired = await fetchJson("/api/companion/v1/pair", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        intentId: intent.intentId,
+        secret: intent.secret,
+        routeCanonical: ROUTE,
+      }),
+    });
+    expect(paired.status).toBe(200);
+    return {
+      authorization: `Bearer ${paired.body.credential as string}`,
+      "content-type": "application/json",
+    };
+  }
+
+  it("autonomous /state: pair 后 seed 新 receipt，无 MCP 仅 GET /state 即投影", async () => {
+    reconcileFeedbackOutbox(workspace.id, stateDir);
+    seedTrustedReceipt("http-cmd");
+    reconcileFeedbackOutbox(workspace.id, stateDir);
+    enableReceiver({
+      workspaceId: workspace.id,
+      principal: principalA(),
+      widgetId: "w",
+      stateDir,
+    });
+    const auth = await pairCompanionHttp();
+
+    const baseline = await fetchJson("/api/companion/v1/state", { headers: auth });
+    expect(baseline.status).toBe(200);
+    const baselineReady = baseline.body.pendingReady as number;
+    expect(baselineReady).toBeGreaterThanOrEqual(1);
+
+    // 测试侧不调用 reconcileFeedbackOutbox
+    seedTrustedReceipt("auto-cmd-1");
+    const state1 = await fetchJson("/api/companion/v1/state", { headers: auth });
+    expect(state1.status).toBe(200);
+    expect(state1.body.pendingReady).toBe(baselineReady + 1);
+
+    // 重复 GET 不重复投影
+    const state2 = await fetchJson("/api/companion/v1/state", { headers: auth });
+    expect(state2.status).toBe(200);
+    expect(state2.body.pendingReady).toBe(baselineReady + 1);
+    expect(state2.body.events?.length).toBe(state1.body.events?.length);
+  });
+
+  it("autonomous /reserve: pendingReady=0 时 seed 新 receipt，直接 reserve 即可命中", async () => {
+    // 干净基线：无 event、无 ready
+    reconcileFeedbackOutbox(workspace.id, stateDir);
+    enableReceiver({
+      workspaceId: workspace.id,
+      principal: principalA(),
+      widgetId: "w",
+      stateDir,
+    });
+    const auth = await pairCompanionHttp();
+
+    const empty = await fetchJson("/api/companion/v1/state", { headers: auth });
+    expect(empty.status).toBe(200);
+    expect(empty.body.pendingReady).toBe(0);
+
+    // 新 receipt 落盘；不 reconcile，不先 GET /state
+    seedTrustedReceipt("reserve-auto-cmd");
+    const reserved = await fetchJson("/api/companion/v1/reserve", {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({ routeCanonical: ROUTE }),
+    });
+    expect(reserved.status).toBe(200);
+    expect(reserved.body.delivery?.status).toBe("reserved");
+    expect(reserved.body.delivery?.commandId).toBe("reserve-auto-cmd");
+  });
+
+  it("匿名 /state 401 且不推进 projectionCursor", async () => {
+    reconcileFeedbackOutbox(workspace.id, stateDir);
+    seedTrustedReceipt("http-cmd");
+    reconcileFeedbackOutbox(workspace.id, stateDir);
+    enableReceiver({
+      workspaceId: workspace.id,
+      principal: principalA(),
+      widgetId: "w",
+      stateDir,
+    });
+
+    const before = readFeedbackState(workspace.id, stateDir).projectionCursor;
+    // 有一条尚未投影的 trusted receipt
+    seedTrustedReceipt("anon-should-not-project");
+    const mid = readFeedbackState(workspace.id, stateDir).projectionCursor;
+    expect(mid).toBe(before);
+
+    const anon = await fetchJson("/api/companion/v1/state");
+    expect(anon.status).toBe(401);
+
+    const after = readFeedbackState(workspace.id, stateDir).projectionCursor;
+    expect(after).toBe(before);
+  });
 });
