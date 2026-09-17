@@ -50,6 +50,8 @@
 | `workspace/` | Canonical-path containment (realpath of deepest existing ancestor), sensitive-file policy, `.c2cignore`, paginated read/list, ripgrep search with Node fallback, git status/diff with pagination |
 | `tunnel/` | `TunnelProvider` interface + Cloudflare Quick and workspace-configured Named Tunnel implementations; business logic is vendor-agnostic |
 | `execution/` | JSONL execution records plus optional sanitized command output (`execution_output`) |
+| `feedback/` | Production feedback outbox + companion transport: pairing/credential, reserve/begin-send/ack/retire, stale → `outcome_unknown`, exact late-positive ACK |
+| `browser-companion/` | MV3 extension sources (packaged to `dist/browser-companion`): SW-only Bridge HTTP, durable send journal, popup recover; zero DOM/Send unless explicit production one-shot |
 | `process/` | Daemon spawn/reuse, health probing, graceful shutdown |
 | `core/` | Verified machine install metadata, guarded rollout and per-workspace pending upgrades |
 | `cli/` | `c2c` commands; `--json` everywhere for the Skill |
@@ -73,6 +75,8 @@ the Skill's local receipt flow. Before its final reply, the verified exact activ
 latest terminal turn with a complete newest history boundary while idle) records
 the exact command ID and this turn's test/output evidence. Review resolves that record and its
 output ID, never a historical latest test result. See [automatic receipts](desktop-control.md#自动验收记录).
+
+**Production feedback companion**: ChatGPT MCP (trusted principal) enables receiver → one-time pairing → Edge MV3 companion holds scoped credential **only in SW** → named URL `/api/companion/v1` reserve/begin-send/ack. Journal is durable and single-flight; observation timeout becomes `outcome_unknown` (never auto-resend). Late-positive closeout requires exact identity: Companion `/ack` or trusted `feedback_ack_observed` (`claimed|outcome_unknown` + exact attempt → `observed`), or SW clear from authenticated `/state` observed proof when `inFlight=null`. `retired_unknown` is a manual terminal that never ACKs or resurrects.
 
 **Authorization**: 401 with `WWW-Authenticate: resource_metadata=…` →
 `/.well-known/oauth-protected-resource/mcp` → AS metadata → DCR →

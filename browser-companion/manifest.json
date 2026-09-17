@@ -2,8 +2,7 @@
   "manifest_version": 3,
   "name": "C2C Browser Companion",
   "version": "0.1.1",
-  "description": "Passive ChatGPT conversation ownership companion for Codex with ChatGPT (E1b2 transport+reserve, no Send).",
-  "minimum_edge_version": "116",
+  "description": "ChatGPT conversation ownership companion for Codex with ChatGPT (E1b2 transport+reserve, E1b3d3b explicit production one-shot Send).",
   "permissions": ["storage", "activeTab"],
   "host_permissions": [
     "https://chatgpt.com/*",
@@ -28,7 +27,7 @@
         "https://chatgpt.com/*",
         "https://www.chatgpt.com/*"
       ],
-      "js": ["route-global.js", "dom-adapter.js", "content-script.js"],
+      "js": ["route-global.js", "dom-adapter.js", "turn-observer.js", "shadow-evidence.js", "composer-write-adapter.js", "send-click-adapter.js", "send-probe-message-global.js", "send-probe-run.js", "production-send-runtime-global.js", "content-script.js"],
       "run_at": "document_idle",
       "all_frames": false
     }

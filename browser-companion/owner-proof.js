@@ -44,12 +44,8 @@ export function markProofUsed(proof) {
   return { ...proof, used: true };
 }
 
-/** Journal-active guards shared by pair / clear transport. */
+/** Journal-active guards shared by pair / clear transport (includes E1b3 send-side states). */
 export function journalBlocksTransportMutation(journal) {
   if (!journal || !journal.state || journal.state === "NONE") return false;
-  return (
-    journal.state === "RESERVE_REQUESTED"
-    || journal.state === "RESERVED"
-    || journal.state === "RESERVATION_RECOVERY"
-  );
+  return true;
 }

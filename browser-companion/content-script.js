@@ -1,6 +1,7 @@
 /**
- * Content script: passive SPA route observation + read-only DOM safety.
- * Never receives companion credentials. Never mutates ChatGPT DOM. Never sends.
+ * Content script: passive SPA route observation + production send DI shell.
+ * Never holds Bridge secrets. Never owns journal authority.
+ * Composer write / native Send only via production-send-runtime globals (explicit popup).
  */
 (function () {
   "use strict";
@@ -154,8 +155,386 @@
       });
       return true;
     }
+    if (message.type === "c2c.send.shadow.inspect") {
+      // E1b3d1: read-only shadow evidence. No DOM mutation / Send.
+      let evidence;
+      try {
+        evidence = typeof globalThis.__c2cInspectShadowEvidence === "function"
+          ? globalThis.__c2cInspectShadowEvidence(document, { locationHref: location.href })
+          : { ok: false, reason: "capability_missing", mode: "read_only" };
+      } catch {
+        evidence = { ok: false, reason: "inspect_error", mode: "read_only" };
+      }
+      const parsed = parseRoute(location.href);
+      sendResponse({
+        ...evidence,
+        type: "c2c.send.shadow.evidence",
+        generation,
+        documentHref: location.href,
+        documentCanonicalRoute: parsed ? parsed.canonical : null,
+      });
+      return false;
+    }
+    if (message.type === "c2c.write.probe.execute") {
+      // E1b3d2a: fixed write probe. Zero Send. Local fences only; same handler, no await.
+      const expectedRoute = typeof message.expectedRoute === "string" ? message.expectedRoute : "";
+      const expectedGeneration = message.expectedGeneration;
+      if (typeof globalThis.__c2cRunWriteProbe !== "function") {
+        sendResponse({
+          ok: false,
+          reason: "write_capability_missing",
+          mode: "write_probe_no_send",
+          noSend: true,
+          generation,
+        });
+        return false;
+      }
+      let result;
+      try {
+        result = globalThis.__c2cRunWriteProbe(document, {
+          expectedRoute,
+          expectedGeneration,
+          locationHref: location.href,
+          localGeneration: generation,
+        });
+      } catch {
+        result = { ok: false, reason: "write_probe_error", wrote: false, verified: false };
+      }
+      const parsed = parseRoute(location.href);
+      sendResponse({
+        ok: result?.ok === true,
+        mode: "write_probe_no_send",
+        reason: result?.ok ? undefined : (result?.reason || "write_probe_failed"),
+        wrote: result?.wrote === true,
+        verified: result?.verified === true,
+        mutationAttempted: result?.mutationAttempted === true,
+        readback: result?.readback ?? null,
+        editorKind: result?.editorKind ?? null,
+        composerEvidence: result?.composerEvidence ?? null,
+        canonicalRoute: parsed ? parsed.canonical : null,
+        generation,
+        noSend: true,
+        type: "c2c.write.probe.result",
+      });
+      return false;
+    }
+    if (message.type === "c2c.send.probe.execute") {
+      // E1b3d3a: one-shot REAL Send probe. Zero production journal. No auto-retry.
+      const expectedRoute = typeof message.expectedRoute === "string" ? message.expectedRoute : "";
+      const expectedGeneration = message.expectedGeneration;
+      const attemptId = typeof message.attemptId === "string" ? message.attemptId : "";
+      const probeMessage = typeof message.probeMessage === "string" ? message.probeMessage : "";
+      if (typeof globalThis.__c2cRunRealSendProbe !== "function") {
+        sendResponse({
+          ok: false,
+          reason: "send_probe_capability_missing",
+          mode: "send_probe_real",
+          mutationAttempted: false,
+          clickAttempted: false,
+          generation,
+        });
+        return false;
+      }
+      void (async () => {
+        let result;
+        try {
+          result = await globalThis.__c2cRunRealSendProbe(document, {
+            expectedRoute,
+            expectedGeneration,
+            attemptId,
+            probeMessage,
+            locationHref: location.href,
+            getCurrentGeneration: () => generation,
+          });
+        } catch {
+          result = {
+            ok: false,
+            reason: "send_probe_error",
+            mutationAttempted: true,
+            clickAttempted: true,
+            clicked: false,
+            observed: false,
+          };
+        }
+        const parsed = parseRoute(location.href);
+        sendResponse({
+          ok: result?.ok === true,
+          mode: "send_probe_real",
+          reason: result?.ok ? undefined : (result?.reason || "send_probe_failed"),
+          mutationAttempted: result?.mutationAttempted === true,
+          wrote: result?.wrote === true,
+          verified: result?.verified === true,
+          clickAttempted: result?.clickAttempted === true,
+          clicked: result?.clicked === true,
+          observed: result?.observed === true,
+          attemptId,
+          canonicalRoute: parsed ? parsed.canonical : null,
+          generation,
+          type: "c2c.send.probe.result",
+        });
+      })();
+      return true;
+    }
+    if (message.type === "c2c.production.send.execute") {
+      // E1b3d3b: exact-document production one-shot. SW holds journal/secret authority.
+      return handleProductionExecute(message, sendResponse);
+    }
+    if (message.type === "c2c.production.send.recover") {
+      return handleProductionRecover(message, sendResponse);
+    }
     return false;
   });
+
+  function swRpc(payload) {
+    return sendToWorker(payload);
+  }
+
+  function buildProductionDomDeps() {
+    return {
+      doc: document,
+      getCurrentRoute: () => {
+        const parsed = parseRoute(location.href);
+        return parsed ? parsed.canonical : "";
+      },
+      getCurrentGeneration: () => generation,
+      inspectComposerWriteCapability:
+        typeof globalThis.__c2cInspectComposerWriteCapability === "function"
+          ? (doc, opts) => globalThis.__c2cInspectComposerWriteCapability(doc, opts)
+          : undefined,
+      writeCanonicalMessage:
+        typeof globalThis.__c2cWriteCanonicalMessage === "function"
+          ? (doc, message, opts) => globalThis.__c2cWriteCanonicalMessage(doc, message, opts)
+          : undefined,
+      verifyCanonicalComposer:
+        typeof globalThis.__c2cVerifyCanonicalComposer === "function"
+          ? (doc, message, opts) => globalThis.__c2cVerifyCanonicalComposer(doc, message, opts)
+          : undefined,
+      dispatchNativeSend:
+        typeof globalThis.__c2cDispatchNativeSend === "function"
+          ? (doc, message, opts) => globalThis.__c2cDispatchNativeSend(doc, message, opts)
+          : undefined,
+      snapshotUserTurns:
+        typeof globalThis.snapshotUserTurns === "function"
+          ? (doc) => globalThis.snapshotUserTurns(doc)
+          : undefined,
+      findCanonicalUserTurn:
+        typeof globalThis.findCanonicalUserTurn === "function"
+          ? (doc, input) => globalThis.findCanonicalUserTurn(doc, input)
+          : undefined,
+      hasExactAttemptMarker:
+        typeof globalThis.hasExactAttemptMarker === "function"
+          ? (message, attemptId) => globalThis.hasExactAttemptMarker(message, attemptId)
+          : undefined,
+      // Send-ready readiness DI — reuse already-packaged runtime globals only.
+      resolveChatGptComposer:
+        typeof globalThis.resolveChatGptComposer === "function"
+          ? (doc) => globalThis.resolveChatGptComposer(doc)
+          : undefined,
+      resolveChatGptAction:
+        typeof globalThis.resolveChatGptAction === "function"
+          ? (doc, editor) => globalThis.resolveChatGptAction(doc, editor)
+          : undefined,
+      readCanonicalComposerText:
+        typeof globalThis.__c2cReadCanonicalComposerText === "function"
+          ? (editor) => globalThis.__c2cReadCanonicalComposerText(editor)
+          : undefined,
+      normalizeCanonicalDomText:
+        typeof globalThis.normalizeCanonicalDomText === "function"
+          ? (text) => globalThis.normalizeCanonicalDomText(text)
+          : undefined,
+    };
+  }
+
+  function buildProductionNetworkDeps() {
+    let currentJournal = null;
+    return {
+      get currentJournal() {
+        return currentJournal;
+      },
+      setCurrentJournal(j) {
+        currentJournal = j;
+      },
+      persistJournal: async (next) => {
+        const res = await swRpc({
+          type: "c2c.production.journal.persist",
+          expectedPrevious: currentJournal,
+          proposed: next,
+        });
+        if (!res || res.ok !== true) {
+          throw new Error(res?.reason || "production_persist_failed");
+        }
+        currentJournal = next;
+        return next;
+      },
+      beginSend: async (input) => {
+        const res = await swRpc({
+          type: "c2c.production.begin.send",
+          eventId: input?.eventId,
+          reservationId: input?.reservationId,
+          routeCanonical: input?.routeCanonical,
+          bindingId: input?.bindingId,
+          epoch: input?.epoch,
+        });
+        if (!res || res.ok !== true) {
+          const err = new Error(res?.reason || "begin_send_failed");
+          err.productionReason = res?.reason;
+          throw err;
+        }
+        return {
+          eventId: res.eventId,
+          status: res.status,
+          attemptId: res.attemptId,
+          message: res.message,
+          messageSha256: res.messageSha256,
+        };
+      },
+      ackObserved: async (input) => {
+        const res = await swRpc({
+          type: "c2c.production.ack",
+          eventId: input?.eventId,
+          attemptId: input?.attemptId,
+          reservationId: input?.reservationId,
+        });
+        if (!res || res.ok !== true) {
+          const err = new Error(res?.reason || "ack_failed");
+          err.productionReason = res?.reason;
+          err.retryAck = res?.retryAck === true;
+          throw err;
+        }
+        return { eventId: res.eventId, status: res.status };
+      },
+    };
+  }
+
+  function handleProductionExecute(message, sendResponse) {
+    const expectedRoute = typeof message.expectedRoute === "string" ? message.expectedRoute : "";
+    const expectedGeneration = message.expectedGeneration;
+    const startJournal = message.startJournal;
+    if (typeof globalThis.__c2cRunProductionSend !== "function") {
+      sendResponse({
+        ok: false,
+        reason: "production_send_capability_missing",
+        mode: "production_send",
+        journalState: startJournal?.state ?? "NONE",
+        zeroWrite: true,
+        zeroClick: true,
+      });
+      return false;
+    }
+    if (!startJournal || startJournal.state !== "RESERVED") {
+      sendResponse({
+        ok: false,
+        reason: "production_start_journal_invalid",
+        mode: "production_send",
+        zeroWrite: true,
+        zeroClick: true,
+      });
+      return false;
+    }
+    void (async () => {
+      const dom = buildProductionDomDeps();
+      const net = buildProductionNetworkDeps();
+      net.setCurrentJournal(startJournal);
+      let result;
+      try {
+        result = await globalThis.__c2cRunProductionSend({
+          ...dom,
+          journal: startJournal,
+          expectedRoute,
+          expectedGeneration,
+          routeCanonical: startJournal.routeCanonical,
+          bindingId: startJournal.bindingId,
+          epoch: startJournal.epoch,
+          persistJournal: net.persistJournal,
+          beginSend: net.beginSend,
+          ackObserved: net.ackObserved,
+        });
+      } catch {
+        result = {
+          ok: false,
+          reason: "production_send_error",
+          journal: net.currentJournal,
+        };
+      }
+      sendResponse({
+        ok: result?.ok === true,
+        mode: "production_send",
+        reason: result?.ok ? undefined : (result?.reason || "production_send_failed"),
+        attemptId: result?.attemptId ?? result?.journal?.attemptId ?? null,
+        eventId: result?.journal?.eventId ?? startJournal.eventId,
+        journalState: result?.journal?.state ?? net.currentJournal?.state ?? startJournal.state,
+        retryAck: result?.retryAck === true,
+        zeroWrite: result?.zeroWrite === true,
+        zeroClick: result?.zeroClick === true,
+        action: result?.action,
+        generation,
+        type: "c2c.production.send.result",
+      });
+    })();
+    return true;
+  }
+
+  function handleProductionRecover(message, sendResponse) {
+    const expectedRoute = typeof message.expectedRoute === "string" ? message.expectedRoute : "";
+    const expectedGeneration = message.expectedGeneration;
+    const startJournal = message.startJournal;
+    const inFlight = message.inFlight ?? null;
+    if (typeof globalThis.__c2cRecoverProductionSend !== "function") {
+      sendResponse({
+        ok: false,
+        reason: "production_recover_capability_missing",
+        mode: "production_recover",
+        journalState: startJournal?.state ?? "NONE",
+        zeroWrite: true,
+        zeroClick: true,
+      });
+      return false;
+    }
+    void (async () => {
+      const dom = buildProductionDomDeps();
+      const net = buildProductionNetworkDeps();
+      net.setCurrentJournal(startJournal);
+      let result;
+      try {
+        result = await globalThis.__c2cRecoverProductionSend({
+          ...dom,
+          journal: startJournal,
+          expectedRoute,
+          expectedGeneration,
+          routeCanonical: startJournal.routeCanonical,
+          bindingId: startJournal.bindingId,
+          epoch: startJournal.epoch,
+          inFlight,
+          persistJournal: net.persistJournal,
+          beginSend: net.beginSend,
+          ackObserved: net.ackObserved,
+        });
+      } catch {
+        result = {
+          ok: false,
+          reason: "production_recover_error",
+          journal: net.currentJournal,
+          zeroWrite: true,
+          zeroClick: true,
+        };
+      }
+      sendResponse({
+        ok: result?.ok === true,
+        mode: "production_recover",
+        reason: result?.ok ? undefined : (result?.reason || "production_recover_failed"),
+        recovered: result?.ok === true,
+        action: result?.action,
+        journalState: result?.journal?.state ?? net.currentJournal?.state ?? startJournal?.state,
+        retryAck: result?.retryAck === true,
+        zeroWrite: result?.zeroWrite === true,
+        zeroClick: result?.zeroClick === true,
+        diagnostic: result?.diagnostic ?? null,
+        generation,
+        type: "c2c.production.recover.result",
+      });
+    })();
+    return true;
+  }
 
   report();
 })();

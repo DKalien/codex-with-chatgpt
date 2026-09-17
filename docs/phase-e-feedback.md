@@ -707,3 +707,54 @@ Ownership review-fix：popup `isOwner` 经 content script → SW（真实 Messag
 - `1413969`：generating 实证——同 class 变 `data-testid=stop-button` → generating；idle 须 `text-submit-btn-text`
 - `a5f337e`：认证后 `/state`+`/reserve` **autonomous reconcile**；已 rollout 至 `637edb28`
 
+---
+
+# Phase E1b3d3 production Send + late-positive closeout
+
+日期：2026-09-17。**现役终态**。本节覆盖代码与已部署 Core；上方各段为历史过程记录。E1b0 状态机图中 `outcome_unknown` 的“死端”只描述当时；现役允许 **exact late-positive** 闭环。
+
+## 状态机（现役）
+
+```
+ready → reserved → claimed → observed
+                 ↓    ↓
+              release  outcome_unknown
+                       ↓ exact DOM turn late-positive
+                 OBSERVED_PENDING_ACK → /ack → NONE
+                       ↓
+                 trusted ACK / server observed closeout → NONE
+                       ↓
+                 manual retired_unknown（永不重发 / 永不 ACK）
+```
+
+- `OUTCOME_UNKNOWN` **不是**永久粘死：仅在 **同一 authenticated identity** 下闭环。
+- 允许：Companion `/ack` 与 trusted MCP `feedback_ack_observed` 在 **exact attempt** 上 `claimed|outcome_unknown → observed`。
+- 允许：本地 journal `OUTCOME_UNKNOWN` + server `inFlight=null` + exact `observed` proof → SW durable clear（`server_observed_clear`），零 DOM。
+- 允许：本地 late-positive DOM 观察（exact canonical user turn）→ `OBSERVED_PENDING_ACK` → 复用既有 ACK。
+- 禁止：`retired_unknown` 再 ACK / resurrect；identity 或 attempt 不一致仍 fail closed。
+
+## 代码入口（现役）
+
+| 层 | 文件 |
+| --- | --- |
+| journal / late-positive transition | `browser-companion/reservation-journal.js`（`markLateObservedPendingAck`） |
+| pure send / observed proof | `browser-companion/production-send.js` |
+| orchestration recovery | `browser-companion/send-orchestrator.js` |
+| production DI runtime | `browser-companion/production-send-runtime.js` |
+| SW recover / state / retire | `browser-companion/service-worker.js` |
+| popup structured recover | `browser-companion/popup/popup.js` |
+| server ACK + retire | `src/feedback/store.ts` / `src/feedback/companion.ts` |
+| trusted MCP ACK description | `src/mcp/feedback.ts`（`feedback_ack_observed`） |
+
+## 部署 / live（2026-09-17）
+
+| 项 | 状态 |
+| --- | --- |
+| Core trusted late-positive ACK | **deployed** 至 `codex-with-chatgpt`：`runtimeBuildId=installedBuildId=6349ad9887d2…`，`upgradePending=false` |
+| MCP `feedback_ack_observed` 描述 | **live**：`exact claimed/outcome_unknown → observed；observed same-attempt idempotent` |
+| Browser extension | `dist/browser-companion` 已含 latest recover/diagnostics/server-observed；**需用户 Reload 后** 才应用 |
+| live event `e600aed6ef94…` | server **`observed`**；browser local 预期仍 `OUTCOME_UNKNOWN` 直至 Reload + Recover |
+| 安全边界 | credential 仍 SW-only；zero-Send 运行时（除用户显式 send-click-adapter）；journal NONE 不自动重发 |
+
+门禁：typecheck / build / `pnpm test --maxWorkers=1`（1452 passed）/ `git diff --check` 通过。
+

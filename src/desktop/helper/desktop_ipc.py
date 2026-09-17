@@ -67,8 +67,22 @@ VERIFIED_RUNTIME_26_908 = {
         "webview/assets/app-initial-d9bed9d614d8.js": "7c3a89e7e224f76031b45a88f72af8cd60f0c3d47aac9ca34b2c70e11dfe9867",
     },
 }
+# 2026-09-17 只读静态审计：IPC 主模块与 26.908.4834.0 byte-identical；
+# webview bundle 与 app-server hash 变化，因此仍按 exact 组合单独固定，不放宽到版本范围。
+VERIFIED_RUNTIME_26_908_9136 = {
+    "desktopVersion": "26.908.9136.0",
+    "appServerVersion": "0.154.0-alpha.6.2",
+    "appServerSha256": "960c111d47afd61669954b9df9e56083e302edbfa3ef6962d81dcc14a30051dc",
+    "asarHeader": (4, 2489280, 2489276, 2489269),
+    "moduleHashes": {
+        ".vite/build/src-CCXHtyvY.js": "a42da38cbb14b28399f1d54fcf453bffc5e9802663e7e098f187c8378f4c7a40",
+        "webview/assets/app-initial-bcc2ff475eb6.js": "3c15444f96a8d48844258618fe0d4278409e626f0ee563a77d2c669ec669c510",
+    },
+}
 # 一个 protocol profile 可以包含多个经过独立审计的精确运行时组合。
-VERIFIED_PROFILES = {VERIFIED_PROFILE: (VERIFIED_RUNTIME, VERIFIED_RUNTIME_26_908)}
+VERIFIED_PROFILES = {
+    VERIFIED_PROFILE: (VERIFIED_RUNTIME, VERIFIED_RUNTIME_26_908, VERIFIED_RUNTIME_26_908_9136)
+}
 
 COMPATIBILITY_STATUSES = {"current", "unverified", "incompatible"}
 _VERSION_PATTERN = re.compile(
@@ -780,19 +794,45 @@ def _sha256_file(path: str) -> str | None:
 
 
 def _static_file_version(path: str) -> str | None:
-    """只读提取二进制 provenance 中的版本；不执行未知程序，歧义时不猜。"""
+    """只读提取二进制 provenance 中的版本；不执行未知程序，歧义时不猜。
+
+    仅接受 exact accepted markers；任一 marker 出现多次、新旧 marker 同时出现、
+    缺少已观察到的 platform delimiter 或 version 非法时一律 fail closed。
+    """
+    markers = (
+        b"standalone local buildversion: ",
+        b"standalonelocal buildversion: ",
+    )
+    # Exact delimiters observed in audited binaries (space vs newline before platform).
+    delimiters = (
+        b" platform:",
+        b"\nplatform:",
+    )
     try:
         with open(path, "rb") as stream:
             if not 0 < os.fstat(stream.fileno()).st_size <= 512 * 1024 * 1024:
                 return None
             with mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ) as data:
-                marker = b"standalone local buildversion: "
-                offset = data.find(marker)
-                if offset < 0 or data.find(marker, offset + len(marker)) >= 0:
+                hits: list[tuple[bytes, int]] = []
+                for marker in markers:
+                    offset = data.find(marker)
+                    if offset < 0:
+                        continue
+                    if data.find(marker, offset + len(marker)) >= 0:
+                        return None
+                    hits.append((marker, offset))
+                if len(hits) != 1:
                     return None
+                marker, offset = hits[0]
                 tail = data[offset + len(marker):offset + len(marker) + 96]
-                raw, separator, _ = tail.partition(b" platform:")
-                return _safe_version(raw.decode("ascii")) if separator else None
+                versions: list[bytes] = []
+                for delimiter in delimiters:
+                    raw, separator, _ = tail.partition(delimiter)
+                    if separator:
+                        versions.append(raw)
+                if len(versions) != 1:
+                    return None
+                return _safe_version(versions[0].decode("ascii"))
     except (OSError, ValueError, UnicodeDecodeError):
         return None
 

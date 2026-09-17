@@ -52,6 +52,21 @@ describe("browser companion manifest", () => {
     expect(manifest.background?.service_worker).toBe("service-worker.js");
     expect(manifest.background?.type).toBe("module");
     expect(manifest.content_scripts?.[0]?.all_frames).toBe(false);
+    // Edge rejects unrecognized keys; do not ship unsupported manifest fields.
+    expect(manifest).not.toHaveProperty("minimum_edge_version");
+    expect(JSON.stringify(manifest)).not.toContain("minimum_edge_version");
+  });
+
+  it("built companion manifest drops unsupported keys", () => {
+    const distManifestPath = path.join(projectRoot, "dist", "browser-companion", "manifest.json");
+    if (!fs.existsSync(distManifestPath)) {
+      expect(true).toBe(true);
+      return;
+    }
+    const raw = fs.readFileSync(distManifestPath, "utf8");
+    expect(raw).not.toContain("minimum_edge_version");
+    const manifest = JSON.parse(raw);
+    expect(manifest).not.toHaveProperty("minimum_edge_version");
   });
 });
 

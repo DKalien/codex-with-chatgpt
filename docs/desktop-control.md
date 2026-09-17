@@ -334,8 +334,10 @@ IPC 发送前会重新核验 Desktop 服务进程、端点、owner 和绑定目�
 重启后重新发现，不能永久信任旧 PID。已知的 Desktop idle/start 内部协议在检查和实际
 发送之间没有原子 CAS，目标可能在窗口内改变；因此回执不匹配或不明时必须按未知结果
 处理，不能据此宣称 exactly-once。未知版本停止，不能自动降级验证。本机已验证的
-精确组合包括 Desktop `26.903.9818.0` / app-server `0.153.4`，以及
-Desktop `26.908.4834.0` / app-server `0.154.0-alpha.6.2`；其他组合仍须重新核验。
+精确组合包括 Desktop `26.903.9818.0` / app-server `0.153.4`，
+Desktop `26.908.4834.0` / app-server `0.154.0-alpha.6.2`，以及
+Desktop `26.908.9136.0` / app-server `0.154.0-alpha.6.2`；其他组合仍须重新核验。
+这不是“所有 26.908 都兼容”，而是三个分别固定的 exact runtime。
 
 已验证组合统一保存在 helper 的 `VERIFIED_PROFILES`，每个协议 profile 包含精确运行时组合：Desktop/package 版本、app-server
 二进制 SHA-256、两个协议模块 SHA-256，以及同一安装包的 ASAR 头部布局。2026-09-11
@@ -374,6 +376,23 @@ hash 后，在主会话进行真实只读握手，普通权限、runner ancestor
 正式 `current_identity` 与 `current_execution` 也已通过；当前会话为 active，`inspect` 和
 `prepare` 均返回 `DESKTOP_BUSY`、`notSent=true`。完整 hash 复核仍逐次执行；只有未知
 hash 才额外扫描静态版本标记，避免重复扫描使快照超过原有 2 秒新鲜度限制。
+
+2026-09-17 只读审计新增 Desktop `26.908.9136.0` / app-server `0.154.0-alpha.6.2`
+exact 组合。运行中 app-server SHA-256 为
+`960c111d47afd61669954b9df9e56083e302edbfa3ef6962d81dcc14a30051dc`；
+ASAR 头部仍为 `(4, 2489280, 2489276, 2489269)`。IPC 主模块
+`.vite/build/src-CCXHtyvY.js` SHA-256 仍为
+`a42da38cbb14b28399f1d54fcf453bffc5e9802663e7e098f187c8378f4c7a40`，
+与 `26.908.4834.0` byte-identical；request versions 仍为 initialize=0、
+thread-owner-discovery=1、thread-follower-start-turn=2，静态审计未发现
+owner/project/workspace/snapshot/following/turn identity protocol change。
+UI 模块变为 `webview/assets/app-initial-bcc2ff475eb6.js`，SHA-256 为
+`3c15444f96a8d48844258618fe0d4278409e626f0ee563a77d2c669ec669c510`。
+app-server provenance marker 改为 compact 形式
+`standalonelocal buildversion: `，且 platform delimiter 可为换行；
+parser 仍仅接受 exact accepted markers，歧义一律 fail closed。
+因为 IPC 协议语义未变，该组合复用 `desktop-ipc-v1`，但 desktop/app-server/module
+hash 仍整组单独固定；不接受版本范围、wildcard 或“26.908 默认兼容”。
 
 Windows 受控 helper 需要 Python 3.11 或更高版本，使用环境变量 `C2C_DESKTOP_PYTHON`
 指定解释器路径，未设置时使用 `python`；它

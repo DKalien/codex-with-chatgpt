@@ -8,6 +8,9 @@ import {
   FEEDBACK_RESERVATION_STALE_MS,
   readFeedbackState,
   takeoverReceiver,
+  reserveNext,
+  beginSend,
+  retireOutcomeUnknown,
 } from "../src/feedback/store.js";
 import {
   companionAckObserved,
@@ -15,6 +18,7 @@ import {
   companionPublicState,
   companionRelease,
   companionReserveNext,
+  companionRetireOutcomeUnknown,
   companionStatusForPrincipal,
   createPairingIntent,
   exchangePairingIntent,
@@ -34,6 +38,18 @@ import { updateDesktop } from "../src/desktop/store.js";
 import { Workspace } from "../src/workspace/manager.js";
 import { CODEX_FEEDBACK_SCOPE } from "../src/feedback/store.js";
 import { cleanup, isolateStateDir, makeTmpDir } from "./helpers.js";
+import {
+  clearJournal,
+  markClaimed,
+  markComposerWriteIntent,
+  markObservedPendingAck,
+  markReserveRequested,
+  markReserved,
+  markSendDispatchIntent,
+  markSendIntent,
+  reconcileSendJournal,
+  emptyJournal,
+} from "../browser-companion/reservation-journal.js";
 
 let stateDir: string;
 let wsRoot: string;
@@ -446,7 +462,7 @@ describe("reserved state machine", () => {
       ctx,
       routeCanonical: ROUTE,
       stateDir,
-    }), "FEEDBACK_RESERVED_FENCE");
+    }), "FEEDBACK_INFLIGHT_FENCE");
 
     const released = companionRelease({
       workspaceId: workspace.id,
@@ -676,6 +692,692 @@ describe("reserved state machine", () => {
   });
 });
 
+describe("E1b3a single-flight fence", () => {
+  function pairCtx(route = ROUTE) {
+    const paired = pairCompanion(route);
+    return verifyCompanionCredential({
+      workspaceId: workspace.id,
+      credential: paired.credential,
+      stateDir,
+    });
+  }
+
+  it("claimed 阻止 later ready 的 reserve", () => {
+    const event = setupReadyEvent("fence-claimed");
+    const ctx = pairCtx();
+    const reserved = companionReserveNext({
+      workspaceId: workspace.id,
+      ctx,
+      routeCanonical: ROUTE,
+      stateDir,
+    });
+    companionBeginSend({
+      workspaceId: workspace.id,
+      ctx,
+      routeCanonical: ROUTE,
+      eventId: event.eventId,
+      reservationId: reserved.reservationId,
+      stateDir,
+    });
+    seedTrustedReceipt("fence-later-ready");
+    reconcileFeedbackOutbox(workspace.id, stateDir);
+    expectCode(() => companionReserveNext({
+      workspaceId: workspace.id,
+      ctx,
+      routeCanonical: ROUTE,
+      stateDir,
+    }), "FEEDBACK_INFLIGHT_FENCE");
+  });
+
+  it("outcome_unknown 阻止 later ready 的 reserve", () => {
+    const event = setupReadyEvent("fence-unknown");
+    const ctx = pairCtx();
+    const reserved = companionReserveNext({
+      workspaceId: workspace.id,
+      ctx,
+      routeCanonical: ROUTE,
+      stateDir,
+    });
+    companionBeginSend({
+      workspaceId: workspace.id,
+      ctx,
+      routeCanonical: ROUTE,
+      eventId: event.eventId,
+      reservationId: reserved.reservationId,
+      stateDir,
+    });
+    const file = path.join(stateDir, "feedback", `${workspace.id}.json`);
+    const state = JSON.parse(fs.readFileSync(file, "utf8"));
+    state.events[0].claimedAt = new Date(Date.now() - 11 * 60_000).toISOString();
+    fs.writeFileSync(file, JSON.stringify(state, null, 2));
+
+    seedTrustedReceipt("fence-unknown-later");
+    reconcileFeedbackOutbox(workspace.id, stateDir);
+    expectCode(() => companionReserveNext({
+      workspaceId: workspace.id,
+      ctx,
+      routeCanonical: ROUTE,
+      stateDir,
+    }), "FEEDBACK_INFLIGHT_FENCE");
+  });
+
+  it("stale reserved 恢复为 ready 后可以继续 reserve", () => {
+    setupReadyEvent("stale-r-2");
+    const ctx = pairCtx();
+    companionReserveNext({
+      workspaceId: workspace.id,
+      ctx,
+      routeCanonical: ROUTE,
+      stateDir,
+    });
+    const file = path.join(stateDir, "feedback", `${workspace.id}.json`);
+    const state = JSON.parse(fs.readFileSync(file, "utf8"));
+    state.events[0].reservedAt = new Date(Date.now() - FEEDBACK_RESERVATION_STALE_MS - 1000).toISOString();
+    fs.writeFileSync(file, JSON.stringify(state, null, 2));
+
+    const again = companionReserveNext({
+      workspaceId: workspace.id,
+      ctx,
+      routeCanonical: ROUTE,
+      stateDir,
+    });
+    expect(again.delivery.status).toBe("reserved");
+  });
+});
+
+describe("E1b3a canonical production feedback message", () => {
+  it("begin-send 返回 deterministic message；exact retry byte-identical", () => {
+    const event = setupReadyEvent("msg-cmd");
+    const ctx = (() => {
+      const paired = pairCompanion();
+      return verifyCompanionCredential({
+        workspaceId: workspace.id,
+        credential: paired.credential,
+        stateDir,
+      });
+    })();
+    const reserved = companionReserveNext({
+      workspaceId: workspace.id,
+      ctx,
+      routeCanonical: ROUTE,
+      stateDir,
+    });
+    const first = companionBeginSend({
+      workspaceId: workspace.id,
+      ctx,
+      routeCanonical: ROUTE,
+      eventId: event.eventId,
+      reservationId: reserved.reservationId,
+      stateDir,
+    });
+    const second = companionBeginSend({
+      workspaceId: workspace.id,
+      ctx,
+      routeCanonical: ROUTE,
+      eventId: event.eventId,
+      reservationId: reserved.reservationId,
+      stateDir,
+    });
+    expect(first.attemptId).toBe(second.attemptId);
+    expect(first.message).toBe(second.message);
+    expect(first.messageSha256).toBe(second.messageSha256);
+    expect(first.message).toContain("[C2C_CONTROL]");
+    expect(first.message).toContain("STATE: EXECUTED");
+    expect(first.message).toContain(`WORKSPACE_ID: ${workspace.id}`);
+    expect(first.message).toContain(`EVENT_ID: ${event.eventId}`);
+    expect(first.message).toContain(`ATTEMPT_ID: ${first.attemptId}`);
+    expect(first.message).toContain("CHANGED_FILES:");
+    expect(first.message).toContain("TESTS:");
+    expect(first.message).toContain("OUTPUT_AVAILABLE:");
+    expect(first.message).toContain("INSTRUCTION:");
+    // Public DTO / message must not leak internal identity material.
+    // (Raw FeedbackEvent is server-internal; HTTP response only uses public fields.)
+    expect(first.message).not.toContain("principalFingerprint");
+    expect(first.message).not.toContain("reservedBy");
+    expect(first.message).not.toContain("targetBindingId");
+    expect(first.message).not.toContain("openai/session");
+    expect(first.message).not.toContain(ctx.principalFingerprint);
+
+    // /state claimed inFlight carries the same canonical message.
+    const st = companionPublicState({
+      workspaceId: workspace.id,
+      ctx,
+      stateDir,
+    });
+    const inFlight = st.inFlight as Record<string, unknown>;
+    expect(inFlight.status).toBe("claimed");
+    expect(inFlight.message).toBe(first.message);
+    expect(inFlight.messageSha256).toBe(first.messageSha256);
+    expect(inFlight.attemptId).toBe(first.attemptId);
+  });
+
+  it("claimed stale → outcome_unknown 后 /state 仍恢复 message + attempt，且不得重发", () => {
+    const event = setupReadyEvent("unknown-msg");
+    const paired = pairCompanion();
+    const ctx = verifyCompanionCredential({
+      workspaceId: workspace.id,
+      credential: paired.credential,
+      stateDir,
+    });
+    const reserved = companionReserveNext({
+      workspaceId: workspace.id,
+      ctx,
+      routeCanonical: ROUTE,
+      stateDir,
+    });
+    const sent = companionBeginSend({
+      workspaceId: workspace.id,
+      ctx,
+      routeCanonical: ROUTE,
+      eventId: event.eventId,
+      reservationId: reserved.reservationId,
+      stateDir,
+    });
+    const file = path.join(stateDir, "feedback", `${workspace.id}.json`);
+    const state = JSON.parse(fs.readFileSync(file, "utf8"));
+    state.events[0].claimedAt = new Date(Date.now() - 11 * 60_000).toISOString();
+    fs.writeFileSync(file, JSON.stringify(state, null, 2));
+
+    const st = companionPublicState({
+      workspaceId: workspace.id,
+      ctx,
+      stateDir,
+    });
+    expect(st.outcomeUnknown).toBe(1);
+    const inFlight = st.inFlight as Record<string, unknown>;
+    expect(inFlight.status).toBe("outcome_unknown");
+    expect(inFlight.eventId).toBe(event.eventId);
+    expect(inFlight.attemptId).toBe(sent.attemptId);
+    expect(inFlight.message).toBe(sent.message);
+    expect(inFlight.messageSha256).toBe(sent.messageSha256);
+    const json = JSON.stringify(st);
+    expect(json).not.toContain("reservedBy");
+    expect(json).not.toContain("principalFingerprint");
+  });
+});
+
+describe("E1b3a late positive ACK", () => {
+  it("ACK response-loss contract: observed inFlight=null; journal retry_ack; idempotent ACK", () => {
+    // 1) reserve
+    const event = setupReadyEvent("ack-lost");
+    const paired = pairCompanion();
+    const ctx = verifyCompanionCredential({
+      workspaceId: workspace.id,
+      credential: paired.credential,
+      stateDir,
+    });
+    const reserved = companionReserveNext({
+      workspaceId: workspace.id,
+      ctx,
+      routeCanonical: ROUTE,
+      stateDir,
+    });
+    // 2) begin-send → claimed
+    const sent = companionBeginSend({
+      workspaceId: workspace.id,
+      ctx,
+      routeCanonical: ROUTE,
+      eventId: event.eventId,
+      reservationId: reserved.reservationId,
+      stateDir,
+    });
+    // 3) local journal → OBSERVED_PENDING_ACK (pure only; no DOM)
+    let journal = emptyJournal();
+    journal = markReserveRequested(journal, {
+      routeCanonical: ROUTE,
+      bindingId: ctx.bindingId,
+      epoch: ctx.epoch,
+    });
+    journal = markReserved(journal, {
+      eventId: event.eventId,
+      reservationId: reserved.reservationId,
+      routeCanonical: ROUTE,
+      bindingId: ctx.bindingId,
+      epoch: ctx.epoch,
+    });
+    journal = markSendIntent(journal, {
+      eventId: event.eventId,
+      reservationId: reserved.reservationId,
+      routeCanonical: ROUTE,
+      bindingId: ctx.bindingId,
+      epoch: ctx.epoch,
+    });
+    journal = markClaimed(journal, {
+      eventId: event.eventId,
+      reservationId: reserved.reservationId,
+      attemptId: sent.attemptId,
+      message: sent.message,
+      messageSha256: sent.messageSha256,
+    });
+    journal = markComposerWriteIntent(journal, { attemptId: sent.attemptId });
+    journal = markSendDispatchIntent(journal, { attemptId: sent.attemptId });
+    journal = markObservedPendingAck(journal, { attemptId: sent.attemptId });
+    expect(journal.state).toBe("OBSERVED_PENDING_ACK");
+
+    // 4) server ACK success (response lost to client)
+    companionAckObserved({
+      workspaceId: workspace.id,
+      ctx,
+      routeCanonical: ROUTE,
+      eventId: event.eventId,
+      attemptId: sent.attemptId,
+      stateDir,
+    });
+
+    // 5) real contract: observed → inFlight === null
+    const st = companionPublicState({
+      workspaceId: workspace.id,
+      ctx,
+      stateDir,
+    });
+    expect(st.inFlight).toBeNull();
+
+    // 6) reconcile: retry_ack (idempotent ACK, never resend)
+    const rec = reconcileSendJournal(journal, st.inFlight);
+    expect(rec.action).toBe("retry_ack");
+
+    // 7) duplicate exact ACK still observed
+    const again = companionAckObserved({
+      workspaceId: workspace.id,
+      ctx,
+      routeCanonical: ROUTE,
+      eventId: event.eventId,
+      attemptId: sent.attemptId,
+      stateDir,
+    });
+    expect(again.status).toBe("observed");
+
+    // 8) after successful ACK response, journal can clear
+    const cleared = clearJournal();
+    expect(cleared.state).toBe("NONE");
+  });
+
+  it("exact late ACK：outcome_unknown → observed", () => {
+    const event = setupReadyEvent("late-ack");
+    const paired = pairCompanion();
+    const ctx = verifyCompanionCredential({
+      workspaceId: workspace.id,
+      credential: paired.credential,
+      stateDir,
+    });
+    const reserved = companionReserveNext({
+      workspaceId: workspace.id,
+      ctx,
+      routeCanonical: ROUTE,
+      stateDir,
+    });
+    const sent = companionBeginSend({
+      workspaceId: workspace.id,
+      ctx,
+      routeCanonical: ROUTE,
+      eventId: event.eventId,
+      reservationId: reserved.reservationId,
+      stateDir,
+    });
+    const file = path.join(stateDir, "feedback", `${workspace.id}.json`);
+    const state = JSON.parse(fs.readFileSync(file, "utf8"));
+    state.events[0].claimedAt = new Date(Date.now() - 11 * 60_000).toISOString();
+    fs.writeFileSync(file, JSON.stringify(state, null, 2));
+
+    const observed = companionAckObserved({
+      workspaceId: workspace.id,
+      ctx,
+      routeCanonical: ROUTE,
+      eventId: event.eventId,
+      attemptId: sent.attemptId,
+      stateDir,
+    });
+    expect(observed.status).toBe("observed");
+
+    // observed duplicate ACK idempotent
+    const again = companionAckObserved({
+      workspaceId: workspace.id,
+      ctx,
+      routeCanonical: ROUTE,
+      eventId: event.eventId,
+      attemptId: sent.attemptId,
+      stateDir,
+    });
+    expect(again.status).toBe("observed");
+  });
+
+  it("wrong attempt late ACK rejected；different companion late ACK rejected", () => {
+    const event = setupReadyEvent("late-ack-bad");
+    const paired = pairCompanion();
+    const ctx = verifyCompanionCredential({
+      workspaceId: workspace.id,
+      credential: paired.credential,
+      stateDir,
+    });
+    const reserved = companionReserveNext({
+      workspaceId: workspace.id,
+      ctx,
+      routeCanonical: ROUTE,
+      stateDir,
+    });
+    const sent = companionBeginSend({
+      workspaceId: workspace.id,
+      ctx,
+      routeCanonical: ROUTE,
+      eventId: event.eventId,
+      reservationId: reserved.reservationId,
+      stateDir,
+    });
+    const file = path.join(stateDir, "feedback", `${workspace.id}.json`);
+    const state = JSON.parse(fs.readFileSync(file, "utf8"));
+    state.events[0].claimedAt = new Date(Date.now() - 11 * 60_000).toISOString();
+    fs.writeFileSync(file, JSON.stringify(state, null, 2));
+
+    expectCode(() => companionAckObserved({
+      workspaceId: workspace.id,
+      ctx,
+      routeCanonical: ROUTE,
+      eventId: event.eventId,
+      attemptId: "99999999-9999-4999-8999-999999999999",
+      stateDir,
+    }), "FEEDBACK_ACK_MISMATCH");
+
+    const forged = {
+      workspaceId: workspace.id,
+      companionId: "99999999-9999-4999-8999-999999999999",
+      bindingId: ctx.bindingId,
+      epoch: ctx.epoch,
+      principalFingerprint: ctx.principalFingerprint,
+      routeCanonical: ROUTE,
+    };
+    expectCode(() => companionAckObserved({
+      workspaceId: workspace.id,
+      ctx: forged,
+      routeCanonical: ROUTE,
+      eventId: event.eventId,
+      attemptId: sent.attemptId,
+      stateDir,
+    }), "FEEDBACK_ACK_MISMATCH");
+  });
+});
+
+describe("E1b3d3b outcome_unknown retirement", () => {
+  function setupOutcomeUnknown(commandId = "cmd-retire") {
+    const event = setupReadyEvent(commandId);
+    const paired = pairCompanion();
+    const ctx = verifyCompanionCredential({
+      workspaceId: workspace.id,
+      credential: paired.credential,
+      stateDir,
+    });
+    const reserved = companionReserveNext({
+      workspaceId: workspace.id,
+      ctx,
+      routeCanonical: ROUTE,
+      stateDir,
+    });
+    const sent = companionBeginSend({
+      workspaceId: workspace.id,
+      ctx,
+      routeCanonical: ROUTE,
+      eventId: event.eventId,
+      reservationId: reserved.reservationId,
+      stateDir,
+    });
+    // Force claimed → outcome_unknown via stale recovery.
+    const file = path.join(stateDir, "feedback", `${workspace.id}.json`);
+    const state = JSON.parse(fs.readFileSync(file, "utf8"));
+    state.events[0].claimedAt = new Date(Date.now() - 11 * 60_000).toISOString();
+    fs.writeFileSync(file, JSON.stringify(state, null, 2));
+    // Trigger recoverStale via public state read.
+    companionPublicState({ workspaceId: workspace.id, ctx, stateDir });
+    return { event, ctx, reserved, sent };
+  }
+
+  it("A. exact outcome_unknown → retired_unknown", () => {
+    const { event, ctx, reserved, sent } = setupOutcomeUnknown();
+    const retired = companionRetireOutcomeUnknown({
+      workspaceId: workspace.id,
+      ctx,
+      routeCanonical: ROUTE,
+      eventId: event.eventId,
+      reservationId: reserved.reservationId,
+      attemptId: sent.attemptId,
+      stateDir,
+    });
+    expect(retired.status).toBe("retired_unknown");
+    expect(retired.eventId).toBe(event.eventId);
+    expect(retired.reservationId).toBe(reserved.reservationId);
+    expect(retired.attemptId).toBe(sent.attemptId);
+    expect(retired.reservedBy).toBe(ctx.companionId);
+    expect(retired.claimedAt).toBeTruthy();
+    expect(retired.retiredAt).toBeTruthy();
+    // Not in-flight.
+    const st = companionPublicState({ workspaceId: workspace.id, ctx, stateDir });
+    expect(st.inFlight).toBeNull();
+    expect(st.retiredUnknown).toBe(1);
+    expect(st.outcomeUnknown).toBe(0);
+  });
+
+  it("B. mismatch rejected", () => {
+    const { event, ctx, reserved, sent } = setupOutcomeUnknown("cmd-mismatch");
+    const base = {
+      workspaceId: workspace.id,
+      ctx,
+      routeCanonical: ROUTE,
+      eventId: event.eventId,
+      reservationId: reserved.reservationId,
+      attemptId: sent.attemptId,
+      stateDir,
+    };
+    expectCode(() => companionRetireOutcomeUnknown({
+      ...base, eventId: "f".repeat(32),
+    }), "FEEDBACK_EVENT_NOT_FOUND");
+    expectCode(() => companionRetireOutcomeUnknown({
+      ...base, attemptId: "99999999-9999-4999-8999-999999999999",
+    }), "FEEDBACK_RETIRE_MISMATCH");
+    expectCode(() => companionRetireOutcomeUnknown({
+      ...base, reservationId: "99999999-9999-4999-8999-999999999999",
+    }), "FEEDBACK_RETIRE_MISMATCH");
+    // Wrong route
+    expectCode(() => companionRetireOutcomeUnknown({
+      ...base, routeCanonical: ROUTE_B,
+    }), "ROUTE_MISMATCH");
+    // Wrong companion: forge a different companionId against the same event.
+    const forged = { ...ctx, companionId: "99999999-9999-4999-8999-999999999999" };
+    expectCode(() => companionRetireOutcomeUnknown({
+      ...base, ctx: forged,
+    }), "FEEDBACK_RETIRE_MISMATCH");
+  });
+
+  it("C. non-outcome_unknown statuses rejected", () => {
+    const event = setupReadyEvent("cmd-not-unknown");
+    const paired = pairCompanion();
+    const ctx = verifyCompanionCredential({
+      workspaceId: workspace.id,
+      credential: paired.credential,
+      stateDir,
+    });
+    // ready → reject
+    expectCode(() => companionRetireOutcomeUnknown({
+      workspaceId: workspace.id,
+      ctx,
+      routeCanonical: ROUTE,
+      eventId: event.eventId,
+      reservationId: "11111111-1111-4111-8111-111111111111",
+      attemptId: "22222222-2222-4222-8222-222222222222",
+      stateDir,
+    }), "FEEDBACK_RETIRE_MISMATCH");
+    // reserved → reject
+    const reserved = companionReserveNext({
+      workspaceId: workspace.id,
+      ctx,
+      routeCanonical: ROUTE,
+      stateDir,
+    });
+    expectCode(() => companionRetireOutcomeUnknown({
+      workspaceId: workspace.id,
+      ctx,
+      routeCanonical: ROUTE,
+      eventId: event.eventId,
+      reservationId: reserved.reservationId,
+      attemptId: "22222222-2222-4222-8222-222222222222",
+      stateDir,
+    }), "FEEDBACK_RETIRE_MISMATCH");
+    // claimed → reject
+    const sent = companionBeginSend({
+      workspaceId: workspace.id,
+      ctx,
+      routeCanonical: ROUTE,
+      eventId: event.eventId,
+      reservationId: reserved.reservationId,
+      stateDir,
+    });
+    expectCode(() => companionRetireOutcomeUnknown({
+      workspaceId: workspace.id,
+      ctx,
+      routeCanonical: ROUTE,
+      eventId: event.eventId,
+      reservationId: reserved.reservationId,
+      attemptId: sent.attemptId,
+      stateDir,
+    }), "FEEDBACK_RETIRE_MISMATCH");
+    // observed → reject
+    companionAckObserved({
+      workspaceId: workspace.id,
+      ctx,
+      routeCanonical: ROUTE,
+      eventId: event.eventId,
+      attemptId: sent.attemptId,
+      stateDir,
+    });
+    expectCode(() => companionRetireOutcomeUnknown({
+      workspaceId: workspace.id,
+      ctx,
+      routeCanonical: ROUTE,
+      eventId: event.eventId,
+      reservationId: reserved.reservationId,
+      attemptId: sent.attemptId,
+      stateDir,
+    }), "FEEDBACK_RETIRE_MISMATCH");
+  });
+
+  it("D. idempotent exact retry succeeds; different attempt fails", () => {
+    const { event, ctx, reserved, sent } = setupOutcomeUnknown("cmd-idem");
+    const first = companionRetireOutcomeUnknown({
+      workspaceId: workspace.id,
+      ctx,
+      routeCanonical: ROUTE,
+      eventId: event.eventId,
+      reservationId: reserved.reservationId,
+      attemptId: sent.attemptId,
+      stateDir,
+    });
+    expect(first.status).toBe("retired_unknown");
+    const again = companionRetireOutcomeUnknown({
+      workspaceId: workspace.id,
+      ctx,
+      routeCanonical: ROUTE,
+      eventId: event.eventId,
+      reservationId: reserved.reservationId,
+      attemptId: sent.attemptId,
+      stateDir,
+    });
+    expect(again.status).toBe("retired_unknown");
+    expectCode(() => companionRetireOutcomeUnknown({
+      workspaceId: workspace.id,
+      ctx,
+      routeCanonical: ROUTE,
+      eventId: event.eventId,
+      reservationId: reserved.reservationId,
+      attemptId: "99999999-9999-4999-8999-999999999999",
+      stateDir,
+    }), "FEEDBACK_RETIRE_MISMATCH");
+  });
+
+  it("E. retired_unknown no longer fences later ready event", () => {
+    const { event, ctx, reserved, sent } = setupOutcomeUnknown("cmd-fence");
+    companionRetireOutcomeUnknown({
+      workspaceId: workspace.id,
+      ctx,
+      routeCanonical: ROUTE,
+      eventId: event.eventId,
+      reservationId: reserved.reservationId,
+      attemptId: sent.attemptId,
+      stateDir,
+    });
+    // Seed a second ready event.
+    seedTrustedReceipt("cmd-after-retire");
+    reconcileFeedbackOutbox(workspace.id, stateDir);
+    const next = companionReserveNext({
+      workspaceId: workspace.id,
+      ctx,
+      routeCanonical: ROUTE,
+      stateDir,
+    });
+    expect(next.delivery.status).toBe("reserved");
+    expect(next.delivery.eventId).not.toBe(event.eventId);
+  });
+
+  it("F. retired event never returns ready; takeover allowed; late ACK rejected", () => {
+    const { event, ctx, reserved, sent } = setupOutcomeUnknown("cmd-perm");
+    companionRetireOutcomeUnknown({
+      workspaceId: workspace.id,
+      ctx,
+      routeCanonical: ROUTE,
+      eventId: event.eventId,
+      reservationId: reserved.reservationId,
+      attemptId: sent.attemptId,
+      stateDir,
+    });
+    // Stale recovery must not revive.
+    const state = readFeedbackState(workspace.id, stateDir);
+    const still = state.events.find((e) => e.eventId === event.eventId);
+    expect(still?.status).toBe("retired_unknown");
+    // Takeover allowed (retired_unknown is not a takeover fence).
+    const takeover = takeoverReceiver({
+      workspaceId: workspace.id,
+      principal: principalA(),
+      widgetId: "w2",
+      expectedEpoch: ctx.epoch,
+      stateDir,
+    });
+    expect(takeover.state.binding?.epoch).toBe(ctx.epoch + 1);
+    // Late ACK after retirement rejected.
+    const ctx2 = verifyCompanionCredential({
+      workspaceId: workspace.id,
+      credential: pairCompanion().credential,
+      stateDir,
+    });
+    expectCode(() => companionAckObserved({
+      workspaceId: workspace.id,
+      ctx: ctx2,
+      routeCanonical: ROUTE,
+      eventId: event.eventId,
+      attemptId: sent.attemptId,
+      stateDir,
+    }), "FEEDBACK_ACK_MISMATCH");
+  });
+
+  it("store-level retireOutcomeUnknown requires exact identity", () => {
+    const { event, ctx, reserved, sent } = setupOutcomeUnknown("cmd-store");
+    const base = {
+      workspaceId: workspace.id,
+      bindingId: ctx.bindingId,
+      epoch: ctx.epoch,
+      principalFingerprint: ctx.principalFingerprint,
+      companionId: ctx.companionId,
+      eventId: event.eventId,
+      reservationId: reserved.reservationId,
+      attemptId: sent.attemptId,
+      stateDir,
+    };
+    expectCode(() => retireOutcomeUnknown({
+      ...base, bindingId: "99999999-9999-4999-8999-999999999999",
+    }), "FEEDBACK_EPOCH_STALE");
+    expectCode(() => retireOutcomeUnknown({
+      ...base, companionId: "99999999-9999-4999-8999-999999999999",
+    }), "FEEDBACK_RETIRE_MISMATCH");
+    const ok = retireOutcomeUnknown(base);
+    expect(ok.status).toBe("retired_unknown");
+  });
+});
+
 describe("public companion HTTP surface", () => {
   let bridge: Bridge;
   let base: string;
@@ -764,7 +1466,33 @@ describe("public companion HTTP surface", () => {
     });
     expect(sent.status).toBe(200);
     expect(sent.body.status).toBe("claimed");
+    expect(sent.body.message).toContain("[C2C_CONTROL]");
+    expect(sent.body.message).toContain(`ATTEMPT_ID: ${sent.body.attemptId}`);
+    expect(typeof sent.body.messageSha256).toBe("string");
+    expect(sent.body.messageSha256).toMatch(/^[a-f0-9]{64}$/);
     const attemptId = sent.body.attemptId as string;
+
+    // Lost response: exact begin-send retry returns same attempt + byte-identical message/hash.
+    const sentRetry = await fetchJson("/api/companion/v1/begin-send", {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({ routeCanonical: ROUTE, eventId, reservationId }),
+    });
+    expect(sentRetry.status).toBe(200);
+    expect(sentRetry.body.attemptId).toBe(attemptId);
+    expect(sentRetry.body.message).toBe(sent.body.message);
+    expect(sentRetry.body.messageSha256).toBe(sent.body.messageSha256);
+
+    // Single-flight: claimed blocks reserve of later ready events.
+    await fetchJson("/api/companion/v1/state", { headers: auth }); // reconcile
+    seedTrustedReceipt("later-ready-cmd");
+    const blocked = await fetchJson("/api/companion/v1/reserve", {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({ routeCanonical: ROUTE }),
+    });
+    expect(blocked.status).toBe(409);
+    expect(blocked.body.error).toBe("FEEDBACK_INFLIGHT_FENCE");
 
     const acked = await fetchJson("/api/companion/v1/ack", {
       method: "POST",

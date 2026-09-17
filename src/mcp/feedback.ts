@@ -286,7 +286,7 @@ export function registerFeedbackTools(server: McpServer, workspace: Workspace): 
     "feedback_ack_observed",
     {
       title: "Ack feedback event observed",
-      description: "精确匹配 workspace/binding/epoch/principal/eventId/attemptId；claimed→observed。",
+      description: "精确匹配 workspace/binding/epoch/principal/eventId/attemptId；exact claimed/outcome_unknown → observed；observed same-attempt idempotent。调用者必须已拥有正观察证据，工具不判断 UI 是否显示消息。",
       inputSchema: {
         bindingId: z.string().uuid(),
         epoch: z.number().int().nonnegative(),

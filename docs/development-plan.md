@@ -638,3 +638,13 @@ counts 契约兼容。
 - **不** begin-send / ack / composer / native Send
 - 门禁：**61 files / 1059 passed**
 - **live transport 端到端**（pair→state→reserve→release 在真机 Edge 完整通过）**仍 pending**；下一阶段 E1b3 在 Send 边界前必须先完成 live 验收
+
+## Phase E1b3d3 production Send + late-positive ACK（2026-09-17，现役）
+
+- Browser companion：显式 one-shot production Send（idle-only preflight）；durable journal 至 `OBSERVED_PENDING_ACK` / `OUTCOME_UNKNOWN`；**零自动重发**
+- Late-positive：`OUTCOME_UNKNOWN` 仅在 exact server claimed/outcome_unknown + exact DOM user turn 时 `OBSERVED_PENDING_ACK → /ack → NONE`
+- Trusted MCP ACK：`claimed|outcome_unknown` + exact attempt → `observed`；`observed` same-attempt 幂等；`retired_unknown` 拒绝
+- Server-observed local closeout：authenticated `/state` exact observed proof + `inFlight=null` → SW clear local journal（零 DOM/ACK）
+- Popup Recover：结构化 `ok/reason/action/zeroWrite/zeroClick/journal.*` + bounded diagnostic（无 message/credential）
+- **Core deployed**：workspace `codex-with-chatgpt` build `6349ad98…`；live server event `observed`
+- 详细终态见 [phase-e-feedback.md](phase-e-feedback.md)

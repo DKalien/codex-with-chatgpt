@@ -27,6 +27,22 @@
     reserve: document.getElementById("reserve"),
     release: document.getElementById("release"),
     recover: document.getElementById("recover"),
+    retireUnknown: document.getElementById("retire-unknown"),
+    retireUnknownConfirm: document.getElementById("retire-unknown-confirm"),
+    shadowInspect: document.getElementById("shadow-inspect"),
+    shadowEvidence: document.getElementById("shadow-evidence"),
+    shadowControls: document.getElementById("shadow-controls"),
+    shadowContainers: document.getElementById("shadow-containers"),
+    writeProbe: document.getElementById("write-probe"),
+    writeProbeResult: document.getElementById("write-probe-result"),
+    sendProbe: document.getElementById("send-probe"),
+    sendProbeConfirm: document.getElementById("send-probe-confirm"),
+    sendProbeReset: document.getElementById("send-probe-reset"),
+    sendProbeResult: document.getElementById("send-probe-result"),
+    productionStatus: document.getElementById("production-status"),
+    productionSend: document.getElementById("production-send"),
+    productionSendConfirm: document.getElementById("production-send-confirm"),
+    productionSendResult: document.getElementById("production-send-result"),
     clearTransport: document.getElementById("clear-transport"),
     bridgeState: document.getElementById("bridge-state"),
   };
@@ -34,6 +50,41 @@
   function setText(el, text, cls) {
     el.textContent = text;
     el.className = "value" + (cls ? " " + cls : "");
+  }
+
+  /** Bounded recover result — no message body / credential / secret. */
+  function formatRecoverResult(res) {
+    const j = res?.journal ?? {};
+    const lines = [
+      `ok=${res?.ok === true}`,
+      `reason=${res?.reason ?? (res?.ok ? "ok" : "-")}`,
+      `action=${res?.action ?? "-"}`,
+      `retryAck=${res?.retryAck === true}`,
+      `zeroWrite=${res?.zeroWrite === true}`,
+      `zeroClick=${res?.zeroClick === true}`,
+      `journal.state=${j.state ?? res?.journalState ?? "-"}`,
+      `journal.eventId=${j.eventId ?? "-"}`,
+      `journal.attemptId=${j.attemptId ?? "-"}`,
+    ];
+    const d = res?.diagnostic;
+    if (d && typeof d === "object") {
+      const safe = {
+        candidateCount: d.candidateCount,
+        exactTextMatchCount: d.exactTextMatchCount,
+        exactAttemptMarkerCount: d.exactAttemptMarkerCount,
+        ambiguousCount: d.ambiguousCount,
+        targetLength: d.targetLength,
+        firstMismatchIndex: d.firstMismatchIndex,
+        candidateLengths: Array.isArray(d.candidateLengths)
+          ? d.candidateLengths.slice(0, 5)
+          : undefined,
+      };
+      for (const key of Object.keys(safe)) {
+        if (safe[key] === undefined) delete safe[key];
+      }
+      lines.push(`diagnostic=${JSON.stringify(safe)}`);
+    }
+    return lines.join("\n");
   }
 
   async function activeTab() {
@@ -189,6 +240,13 @@
 
     const isOwner = status?.isOwner === true;
     const hasTransport = Boolean(transport?.connected);
+    const journalState = status?.journal?.state ?? "NONE";
+    const sendProbeLatch = status?.sendProbeLatch ?? "NONE";
+    const productionInFlight = status?.productionSendInFlight === true;
+    const pageIdleSafe = safety?.safety?.safe === true
+      && safety?.safety?.composer === "empty"
+      && safety?.safety?.generation === "idle";
+
     els.bind.disabled = !parsed || !tab?.id;
     els.pair.disabled = !isOwner;
     els.applyPairJson.disabled = false;
@@ -196,14 +254,59 @@
     els.reserve.disabled = !hasTransport || !isOwner;
     els.release.disabled = !hasTransport;
     els.recover.disabled = !hasTransport;
+
+    const canRetire =
+      hasTransport
+      && journalState === "OUTCOME_UNKNOWN"
+      && els.retireUnknownConfirm?.checked === true;
+    if (els.retireUnknown) {
+      els.retireUnknown.disabled = !canRetire;
+    }
     els.clearTransport.disabled = !transport;
+
+    if (els.productionStatus) {
+      const j = status?.journal ?? { state: "NONE" };
+      const lines = [
+        `state=${j.state}`,
+        `eventId=${j.eventId ?? "-"}`,
+        `reservationId=${j.reservationId ?? "-"}`,
+        `attemptId=${j.attemptId ?? "-"}`,
+        `sendProbeLatch=${sendProbeLatch}`,
+        `productionInFlight=${productionInFlight}`,
+        `blocked=${journalState === "OUTCOME_UNKNOWN" || sendProbeLatch !== "NONE" || !hasTransport || !isOwner}`,
+      ];
+      els.productionStatus.textContent = lines.join("\n");
+      els.productionStatus.className = "value" + (journalState === "RESERVED" ? " warn" : "");
+    }
+
+    if (els.productionSend && els.productionSendConfirm) {
+      const canProduction =
+        isOwner
+        && hasTransport
+        && journalState === "RESERVED"
+        && sendProbeLatch === "NONE"
+        && !productionInFlight
+        && pageIdleSafe
+        && els.productionSendConfirm.checked;
+      els.productionSend.disabled = !canProduction;
+    }
 
     els.bind.onclick = async () => {
       if (!tab?.id || !parsed) return;
+      let bindReason = "";
+      let bindOk = false;
       try {
-        await chrome.tabs.sendMessage(tab.id, { type: "c2c.bind.request" });
-      } catch { /* ignore */ }
+        const res = await chrome.tabs.sendMessage(tab.id, { type: "c2c.bind.request" });
+        bindOk = res?.ok === true;
+        if (!bindOk) bindReason = res?.reason || "bind_failed";
+      } catch {
+        bindOk = false;
+        bindReason = "content_script_unavailable";
+      }
       await refresh();
+      if (!bindOk) {
+        setText(els.ownerStatus, `bind 失败: ${bindReason}`, "bad");
+      }
     };
 
     els.unbind.onclick = async () => {
@@ -327,9 +430,314 @@
 
     els.recover.onclick = async () => {
       const res = await chrome.runtime.sendMessage({ type: "c2c.recover" });
-      setText(els.bridgeState, JSON.stringify(res?.journal ?? res), res?.ok ? "ok" : "bad");
+      setText(els.bridgeState, formatRecoverResult(res), res?.ok ? "ok" : "bad");
       await refresh();
     };
+
+    if (els.retireUnknown && els.retireUnknownConfirm) {
+      els.retireUnknownConfirm.addEventListener("change", () => {
+        const jState = status?.journal?.state ?? "NONE";
+        els.retireUnknown.disabled = !(
+          els.retireUnknownConfirm.checked
+          && Boolean(status?.transport?.connected)
+          && jState === "OUTCOME_UNKNOWN"
+        );
+      });
+      els.retireUnknown.onclick = async () => {
+        if (!els.retireUnknownConfirm.checked) return;
+        els.retireUnknown.disabled = true;
+        setText(els.bridgeState, "Retiring unknown event…", "warn");
+        let res;
+        try {
+          // Identity always from durable SW journal; popup never supplies identity.
+          res = await chrome.runtime.sendMessage({ type: "c2c.retire.unknown" });
+        } catch (e) {
+          res = { ok: false, reason: e?.message || "runtime_error" };
+        }
+        const j = res?.journal ?? {};
+        setText(
+          els.bridgeState,
+          `retire ok=${res?.ok === true} reason=${res?.reason ?? (res?.ok ? "ok" : "unknown")} `
+          + `eventId=${res?.eventId ?? j.eventId ?? "-"} journal=${j.state ?? "-"} `
+          + `zeroWrite=${res?.zeroWrite === true} zeroClick=${res?.zeroClick === true}`,
+          res?.ok ? "ok" : "bad",
+        );
+        await refresh();
+      };
+    }
+
+    if (els.shadowInspect) {
+      els.shadowInspect.onclick = async () => {
+        setText(els.shadowEvidence, "inspecting…", "warn");
+        let res;
+        try {
+          res = await chrome.runtime.sendMessage({ type: "c2c.shadow.send.inspect" });
+        } catch (e) {
+          res = { ok: false, reason: e?.message || "runtime_error" };
+        }
+        if (!res?.ok) {
+          setText(
+            els.shadowEvidence,
+            `READ ONLY — inspect failed: ${res?.reason || "unknown"}`,
+            "bad",
+          );
+          if (els.shadowControls) {
+            setText(els.shadowControls, "—", "");
+          }
+          if (els.shadowContainers) {
+            setText(els.shadowContainers, "—", "");
+          }
+          return;
+        }
+        const a = res.action || {};
+        const c = res.composer || {};
+        const s = res.safety || {};
+        const se = a.stopEvidence || null;
+        setText(
+          els.shadowEvidence,
+          `READ ONLY — no composer write / no Send | routeExact=${res.routeExact} | editor=${c.editorKind || "?"} composerEvidence=${c.evidence ?? "none"} | empty=${c.textEmpty} | action=${a.kind} evidence=${a.evidence ?? "none"} enabled=${a.enabled} sendButton=${a.hasExactSendButton} | stopSource=${se?.source ?? "none"} stopTestId=${se?.dataTestId ?? "-"} stopAria=${se?.ariaLabel ?? "-"} stopInForm=${se?.insideComposerForm ?? "-"} | gen=${s.generation} safe=${s.safe} | turns=${res.userTurnCount ?? "?"}`,
+          s.safe === true ? "ok" : "warn",
+        );
+        if (els.shadowControls) {
+          els.shadowControls.textContent = formatControlInventory(a.inventory);
+          els.shadowControls.className = "value";
+        }
+        if (els.shadowContainers) {
+          els.shadowContainers.textContent = formatContainerInventory(a.containerInventory);
+          els.shadowContainers.className = "value";
+        }
+      };
+    }
+
+    if (els.writeProbe) {
+      els.writeProbe.onclick = async () => {
+        if (!els.writeProbeResult) return;
+        els.writeProbeResult.textContent = "WRITES COMPOSER — DOES NOT SEND\nprobe running…";
+        els.writeProbeResult.className = "value warn";
+        let res;
+        try {
+          // Fixed probe only — never send arbitrary message payload.
+          res = await chrome.runtime.sendMessage({ type: "c2c.write.probe.request" });
+        } catch (e) {
+          res = { ok: false, reason: e?.message || "runtime_error", retryAllowed: false };
+        }
+        const lines = [
+          "NO SEND PERFORMED — WRITES COMPOSER — DOES NOT SEND",
+          `ok=${res?.ok === true} reason=${res?.reason ?? (res?.ok ? "ok" : "unknown")}`,
+          `mode=${res?.mode ?? "write_probe_no_send"} noSend=${res?.noSend === true || res?.noSendPerformed === true}`,
+          `mutationAttempted=${res?.mutationAttempted === true} wrote=${res?.wrote === true} verified=${res?.verified === true}`,
+          `editor=${res?.editorKind ?? "-"} composerEvidence=${res?.composerEvidence ?? "-"}`,
+          `routeExact=${res?.routeExact === true} documentExact=${res?.documentIdExact === true} generationExact=${res?.generationExact === true}`,
+          `generation=${res?.generation ?? "-"} route=${res?.canonicalRoute ?? "-"}`,
+          `retryAllowed=${res?.retryAllowed === true} journal=${res?.journalState ?? res?.journal?.state ?? "-"}`,
+        ];
+        if (res?.reason === "composer_write_mismatch" || res?.mutationAttempted === true) {
+          const rb = res?.readback;
+          if (rb && typeof rb === "object") {
+            const tc = rb.textContent || {};
+            const it = rb.innerText || {};
+            const ch = rb.childBlocks || {};
+            lines.push(
+              `textContent: len=${tc.length ?? "-"} lf=${tc.newlineCount ?? "-"} exact=${tc.exact === true} noFinalLf=${tc.exactWithoutFinalLf === true}`,
+            );
+            lines.push(
+              `innerText: available=${it.available === true} len=${it.length ?? "-"} lf=${it.newlineCount ?? "-"} exact=${it.exact === true} noFinalLf=${it.exactWithoutFinalLf === true}`,
+            );
+            lines.push(
+              `children: count=${ch.count ?? 0} tags=${(ch.firstTags || []).join(",") || "-"} joinedLfExact=${ch.joinedWithLfExact === true} joinedLfNoFinalLf=${ch.joinedWithLfExactWithoutFinalLf === true}`,
+            );
+            if (rb.canonical) {
+              lines.push(
+                `canonical: representation=${rb.canonical.representation ?? "-"} exact=${rb.canonical.exact === true} ok=${rb.canonical.ok === true}`,
+              );
+            }
+          } else {
+            lines.push("readback: (absent)");
+          }
+        }
+        lines.push("Auto-clear disabled — 请手工清空 composer。");
+        els.writeProbeResult.textContent = lines.join("\n");
+        els.writeProbeResult.className = "value" + (res?.ok === true ? " ok" : " warn");
+      };
+    }
+
+    if (els.sendProbe && els.sendProbeConfirm) {
+      els.sendProbe.disabled = !els.sendProbeConfirm.checked;
+      els.sendProbeConfirm.addEventListener("change", () => {
+        els.sendProbe.disabled = !els.sendProbeConfirm.checked;
+      });
+      els.sendProbe.onclick = async () => {
+        if (!els.sendProbeConfirm.checked || !els.sendProbeResult) return;
+        els.sendProbe.disabled = true;
+        els.sendProbeResult.textContent = "REAL SEND PROBE — sending…";
+        els.sendProbeResult.className = "value warn";
+        let res;
+        try {
+          // Fixed probe only — SW mints attemptId + message. Never supply payload.
+          res = await chrome.runtime.sendMessage({ type: "c2c.send.probe.request" });
+        } catch (e) {
+          res = { ok: false, reason: e?.message || "runtime_error", retryAllowed: false };
+        }
+        const lines = [
+          "REAL SEND PROBE",
+          `ok=${res?.ok === true} reason=${res?.reason ?? (res?.ok ? "ok" : "unknown")}`,
+          `mutationAttempted=${res?.mutationAttempted === true} wrote=${res?.wrote === true} verified=${res?.verified === true}`,
+          `clickAttempted=${res?.clickAttempted === true} clicked=${res?.clicked === true} observed=${res?.observed === true}`,
+          `routeExact=${res?.routeExact === true} documentExact=${res?.documentIdExact === true} generationExact=${res?.generationExact === true}`,
+          `productionJournal=${res?.productionJournal ?? "-"} latch=${res?.latch ?? "-"} retryAllowed=${res?.retryAllowed === true}`,
+          `attemptId=${res?.attemptId ?? "-"}`,
+        ];
+        els.sendProbeResult.textContent = lines.join("\n");
+        els.sendProbeResult.className = "value" + (res?.ok === true ? " ok" : " warn");
+        els.sendProbe.disabled = !els.sendProbeConfirm.checked;
+      };
+    }
+    if (els.sendProbeReset && els.sendProbeResult) {
+      els.sendProbeReset.onclick = async () => {
+        let res;
+        try {
+          res = await chrome.runtime.sendMessage({ type: "c2c.send.probe.reset" });
+        } catch (e) {
+          res = { ok: false, reason: e?.message || "runtime_error" };
+        }
+        els.sendProbeResult.textContent =
+          `REAL SEND PROBE RESET\nok=${res?.ok === true} reason=${res?.reason ?? "-"} latch=${res?.latch ?? "-"}`;
+        els.sendProbeResult.className = "value" + (res?.ok === true ? " ok" : " warn");
+      };
+    }
+
+    if (els.productionSend && els.productionSendConfirm && els.productionSendResult) {
+      els.productionSendConfirm.addEventListener("change", () => {
+        const jState = status?.journal?.state ?? "NONE";
+        const latch = status?.sendProbeLatch ?? "NONE";
+        const inFlight = status?.productionSendInFlight === true;
+        const idleSafe = safety?.safety?.safe === true
+          && safety?.safety?.composer === "empty"
+          && safety?.safety?.generation === "idle";
+        els.productionSend.disabled = !(
+          els.productionSendConfirm.checked
+          && status?.isOwner === true
+          && Boolean(status?.transport?.connected)
+          && jState === "RESERVED"
+          && latch === "NONE"
+          && !inFlight
+          && idleSafe
+        );
+      });
+      els.productionSend.onclick = async () => {
+        if (!els.productionSendConfirm.checked || !els.productionSendResult) return;
+        els.productionSend.disabled = true;
+        els.productionSendResult.textContent = "PRODUCTION SEND — sending reserved feedback…";
+        els.productionSendResult.className = "value warn";
+        let res;
+        try {
+          // Identity/message always from durable SW journal — never supply payload.
+          res = await chrome.runtime.sendMessage({ type: "c2c.production.send.request" });
+        } catch (e) {
+          res = { ok: false, reason: e?.message || "runtime_error", retryAllowed: false };
+        }
+        const lines = [
+          "PRODUCTION SEND",
+          `ok=${res?.ok === true} reason=${res?.reason ?? (res?.ok ? "ok" : "unknown")}`,
+          `journal=${res?.journal?.state ?? res?.productionJournal ?? "-"}`,
+          `eventId=${res?.eventId ?? res?.journal?.eventId ?? "-"}`,
+          `attemptId=${res?.attemptId ?? res?.journal?.attemptId ?? "-"}`,
+          `retryAllowed=${res?.retryAllowed === true} action=${res?.action ?? "-"}`,
+          `zeroWrite=${res?.zeroWrite === true} zeroClick=${res?.zeroClick === true} retryAck=${res?.retryAck === true}`,
+        ];
+        els.productionSendResult.textContent = lines.join("\n");
+        els.productionSendResult.className = "value" + (res?.ok === true ? " ok" : " warn");
+        await refresh();
+      };
+    }
+
+    function formatContainerInventory(inventory) {
+      const header = "READ ONLY — no composer write / no Send";
+      if (!inventory || typeof inventory !== "object") {
+        return `${header}\ncontainerInventory: (absent)`;
+      }
+      const ancestors = Array.isArray(inventory.ancestors) ? inventory.ancestors : [];
+      const controlContainers = Array.isArray(inventory.controlContainers)
+        ? inventory.controlContainers
+        : [];
+      if (ancestors.length === 0 && controlContainers.length === 0) {
+        return `${header}\nancestors: []\ncontrolContainers: []`;
+      }
+      const byDepth = new Map(controlContainers.map((c) => [c.depth, c]));
+      const lines = [];
+      for (const anc of ancestors) {
+        const bits = [
+          `depth=${anc.depth}`,
+          anc.tagName != null ? anc.tagName : "?",
+          anc.id != null ? `id=${anc.id}` : null,
+          anc.dataTestId != null ? `testid=${anc.dataTestId}` : null,
+          anc.role != null ? `role=${anc.role}` : null,
+          anc.className != null ? `class=${anc.className}` : null,
+          `buttons=${anc.descendantButtonCount ?? 0}`,
+        ].filter((x) => x != null);
+        lines.push(bits.join(" "));
+        const container = byDepth.get(anc.depth);
+        if (container) {
+          const btns = Array.isArray(container.buttons) ? container.buttons : [];
+          for (const b of btns) {
+            const bbits = [
+              b.dataTestId != null ? `testid=${b.dataTestId}` : null,
+              b.ariaLabel != null ? `aria=${b.ariaLabel}` : null,
+              b.title != null ? `title=${b.title}` : null,
+              b.type != null ? `type=${b.type}` : null,
+              b.name != null ? `name=${b.name}` : null,
+              b.role != null ? `role=${b.role}` : null,
+              b.className != null ? `class=${b.className}` : null,
+              `disabled=${b.disabled === true}`,
+              b.ariaDisabled != null ? `ariaDisabled=${b.ariaDisabled}` : null,
+              `dist=${b.distanceFromEditor ?? b.ancestorDepth ?? "-"}`,
+              `send=${b.matchesKnownSend === true}`,
+              `slot=${b.matchesKnownActionSlot === true}`,
+              `stop=${b.matchesKnownStop === true}`,
+            ].filter((x) => x != null);
+            lines.push(`  #${b.index}{${bbits.join(", ")}}`);
+          }
+        }
+      }
+      return [
+        header,
+        `ancestors=${ancestors.length}/8 controlContainers=${controlContainers.length}/3`,
+        lines.join("\n"),
+      ].join("\n");
+    }
+
+    function formatControlInventory(inventory) {
+      const header = "READ ONLY — no composer write / no Send";
+      if (!inventory || typeof inventory !== "object") {
+        return `${header}\ninventory: (absent)`;
+      }
+      if (!inventory.formPresent) {
+        return `${header}\nformPresent=false buttonCount=0\nbuttons: []`;
+      }
+      const buttons = Array.isArray(inventory.buttons) ? inventory.buttons : [];
+      const lines = buttons.map((b) => {
+        const bits = [
+          b.dataTestId != null ? `testid=${b.dataTestId}` : null,
+          b.ariaLabel != null ? `aria=${b.ariaLabel}` : null,
+          b.title != null ? `title=${b.title}` : null,
+          b.type != null ? `type=${b.type}` : null,
+          b.name != null ? `name=${b.name}` : null,
+          b.role != null ? `role=${b.role}` : null,
+          b.className != null ? `class=${b.className}` : null,
+          `disabled=${b.disabled === true}`,
+          b.ariaDisabled != null ? `ariaDisabled=${b.ariaDisabled}` : null,
+          `send=${b.matchesKnownSend === true}`,
+          `slot=${b.matchesKnownActionSlot === true}`,
+          `stop=${b.matchesKnownStop === true}`,
+        ].filter((x) => x != null);
+        return `#${b.index}{${bits.join(", ")}}`;
+      });
+      return [
+        header,
+        `formPresent=true buttonCount=${inventory.buttonCount} (dto=${buttons.length}/12)`,
+        lines.length ? lines.join("\n") : "buttons: []",
+      ].join("\n");
+    }
 
     els.clearTransport.onclick = async () => {
       await chrome.runtime.sendMessage({ type: "c2c.transport.clear" });

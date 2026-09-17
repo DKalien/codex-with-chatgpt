@@ -60,12 +60,13 @@ export const feedbackEventSchema = z.object({
   targetBindingId: z.string().regex(UUID).nullable(),
   targetEpoch: z.number().int().nonnegative().nullable(),
   targetPrincipalFingerprint: z.string().regex(HEX32).nullable(),
-  status: z.enum(["queued", "ready", "reserved", "claimed", "observed", "outcome_unknown"]),
+  status: z.enum(["queued", "ready", "reserved", "claimed", "observed", "outcome_unknown", "retired_unknown"]),
   attemptId: z.string().regex(UUID).optional(),
   claimedAt: z.string().datetime().optional(),
   reservationId: z.string().regex(UUID).optional(),
   reservedAt: z.string().datetime().optional(),
   reservedBy: z.string().regex(UUID).optional(),
+  retiredAt: z.string().datetime().optional(),
 }).strict();
 
 export const pairingIntentSchema = z.object({
@@ -553,8 +554,20 @@ export function ackObserved(input: {
       if (event.attemptId === input.attemptId) return event;
       throw new FeedbackError("FEEDBACK_ACK_MISMATCH", "observed 事件 attempt 不匹配");
     }
-    if (event.status !== "claimed" || event.attemptId !== input.attemptId) {
-      throw new FeedbackError("FEEDBACK_ACK_MISMATCH", "ack 身份与 claimed 事件不匹配");
+    // retired_unknown 是人工终态：一旦 retire，后续 ACK 必须拒绝，绝不能 resurrect。
+    if (event.status === "retired_unknown") {
+      throw new FeedbackError("FEEDBACK_ACK_MISMATCH", "retired 事件不可 ACK");
+    }
+    // Late-positive：stale recovery 后的 outcome_unknown 仍可在 exact attempt 下闭环。
+    // ready / reserved / queued 及其它非 claimed/outcome_unknown 状态全部拒绝。
+    const isExactClaimAttempt =
+      event.attemptId === input.attemptId
+      && (event.status === "claimed" || event.status === "outcome_unknown");
+    if (!isExactClaimAttempt) {
+      throw new FeedbackError(
+        "FEEDBACK_ACK_MISMATCH",
+        "ack 身份与 claimed/outcome_unknown 事件不匹配",
+      );
     }
     const next: FeedbackState = {
       ...recovered,
@@ -590,7 +603,9 @@ function requireActiveCompanionBinding(
   return state.binding;
 }
 
-/** ready → reserved；已有 active reserved 时 fence。 */
+const INFLIGHT_FENCE_STATUSES = new Set(["reserved", "claimed", "outcome_unknown"]);
+
+/** ready → reserved；binding 范围内任一 reserved/claimed/outcome_unknown 时 single-flight fence。 */
 export function reserveNext(input: {
   workspaceId: string;
   bindingId: string;
@@ -607,8 +622,12 @@ export function reserveNext(input: {
       writeState(input.workspaceId, stateDir, recovered);
     }
     requireActiveCompanionBinding(recovered, input);
-    if (recovered.events.some((e) => e.status === "reserved")) {
-      throw new FeedbackError("FEEDBACK_RESERVED_FENCE", "已有 active reservation；禁止并发预占");
+    // Companion delivery 严格 single-flight：未解决 reserved/claimed/outcome_unknown 不得越过继续消费 ready。
+    if (recovered.events.some((e) => INFLIGHT_FENCE_STATUSES.has(e.status))) {
+      throw new FeedbackError(
+        "FEEDBACK_INFLIGHT_FENCE",
+        "存在 reserved/claimed/outcome_unknown 事件；禁止并发预占",
+      );
     }
     const ready = recovered.events
       .filter((e) => e.status === "ready")
@@ -760,6 +779,76 @@ export function beginSend(input: {
     };
     writeState(input.workspaceId, stateDir, next);
     return { event: claimed, attemptId };
+  });
+}
+
+/**
+ * outcome_unknown → retired_unknown：人工显式放弃，永不重发。
+ * 不是“证明未发送”，也不是 ACK；仅表示永久退出 single-flight。
+ * 幂等：同 exact event/attempt/reservation/companion 重复 retire 返回现有成功。
+ */
+export function retireOutcomeUnknown(input: {
+  workspaceId: string;
+  bindingId: string;
+  epoch: number;
+  principalFingerprint: string;
+  companionId: string;
+  eventId: string;
+  reservationId: string;
+  attemptId: string;
+  stateDir?: string;
+}): FeedbackEvent {
+  const stateDir = input.stateDir ?? getStateDir();
+  return withFeedbackLock(input.workspaceId, stateDir, (read) => {
+    const previous = requireInitializedState(read(), input.workspaceId);
+    const recovered = recoverStaleInMemory(previous, Date.now());
+    if (recovered !== previous) {
+      writeState(input.workspaceId, stateDir, recovered);
+    }
+    const binding = requireActiveCompanionBinding(recovered, input);
+    const event = recovered.events.find((e) => e.eventId === input.eventId);
+    if (!event) throw new FeedbackError("FEEDBACK_EVENT_NOT_FOUND", "feedback 事件不存在");
+    if (
+      event.targetBindingId !== binding.bindingId
+      || event.targetEpoch !== binding.epoch
+      || event.targetPrincipalFingerprint !== input.principalFingerprint
+    ) {
+      throw new FeedbackError("FEEDBACK_RETIRE_MISMATCH", "retire 目标绑定不匹配");
+    }
+    // Idempotent exact retry.
+    if (event.status === "retired_unknown") {
+      if (
+        event.attemptId === input.attemptId
+        && event.reservationId === input.reservationId
+        && event.reservedBy === input.companionId
+      ) {
+        return event;
+      }
+      throw new FeedbackError("FEEDBACK_RETIRE_MISMATCH", "retired 事件 attempt 不匹配");
+    }
+    if (event.status !== "outcome_unknown") {
+      throw new FeedbackError("FEEDBACK_RETIRE_MISMATCH", "仅 outcome_unknown 事件可 retire");
+    }
+    if (
+      event.attemptId !== input.attemptId
+      || event.reservationId !== input.reservationId
+      || event.reservedBy !== input.companionId
+    ) {
+      throw new FeedbackError("FEEDBACK_RETIRE_MISMATCH", "retire 身份与 outcome_unknown 事件不匹配");
+    }
+    const retiredAt = new Date().toISOString();
+    const retired: FeedbackEvent = {
+      ...event,
+      status: "retired_unknown",
+      retiredAt,
+      updatedAt: retiredAt,
+    };
+    const next: FeedbackState = {
+      ...recovered,
+      events: recovered.events.map((e) => (e.eventId === input.eventId ? retired : e)),
+    };
+    writeState(input.workspaceId, stateDir, next);
+    return retired;
   });
 }
 

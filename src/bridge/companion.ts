@@ -6,6 +6,7 @@ import {
   companionPublicState,
   companionRelease,
   companionReserveNext,
+  companionRetireOutcomeUnknown,
   exchangePairingIntent,
   verifyCompanionCredential,
   type CompanionAuthContext,
@@ -42,6 +43,13 @@ const ackBodySchema = z.object({
   attemptId: z.string().uuid(),
 }).strict();
 
+const retireUnknownBodySchema = z.object({
+  routeCanonical: z.string().min(1).max(512),
+  eventId: z.string().regex(/^[a-f0-9]{32}$/),
+  reservationId: z.string().uuid(),
+  attemptId: z.string().uuid(),
+}).strict();
+
 function sendError(res: Response, error: unknown): void {
   if (error instanceof z.ZodError) {
     res.status(400).json({
@@ -53,7 +61,8 @@ function sendError(res: Response, error: unknown): void {
   if (error instanceof CompanionError || error instanceof FeedbackError) {
     const status = error.code === "COMPANION_REPAIR_BLOCKED"
       ? 409
-      : error.code === "FEEDBACK_RESERVED_FENCE"
+      : error.code === "FEEDBACK_INFLIGHT_FENCE"
+        || error.code === "FEEDBACK_RESERVED_FENCE"
         ? 409
         : error.code === "FEEDBACK_NO_READY_EVENT"
           ? 404
@@ -189,6 +198,8 @@ export function createCompanionRouter(opts: CompanionRouterOptions): Router {
         eventId: result.event.eventId,
         status: result.event.status,
         attemptId: result.attemptId,
+        message: result.message,
+        messageSha256: result.messageSha256,
       });
     } catch (error) {
       sendError(res, error);
@@ -208,6 +219,30 @@ export function createCompanionRouter(opts: CompanionRouterOptions): Router {
         stateDir: opts.stateDir,
       });
       res.json({ eventId: event.eventId, status: event.status });
+    } catch (error) {
+      sendError(res, error);
+    }
+  });
+
+  router.post("/retire-unknown", (req, res) => {
+    try {
+      const ctx = auth(req);
+      const body = retireUnknownBodySchema.parse(req.body);
+      const event = companionRetireOutcomeUnknown({
+        workspaceId: opts.workspaceId,
+        ctx,
+        routeCanonical: body.routeCanonical,
+        eventId: body.eventId,
+        reservationId: body.reservationId,
+        attemptId: body.attemptId,
+        stateDir: opts.stateDir,
+      });
+      res.json({
+        eventId: event.eventId,
+        reservationId: event.reservationId,
+        attemptId: event.attemptId,
+        status: event.status,
+      });
     } catch (error) {
       sendError(res, error);
     }

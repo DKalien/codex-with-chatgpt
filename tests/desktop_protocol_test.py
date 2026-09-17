@@ -741,17 +741,17 @@ class RuntimeTests(unittest.TestCase):
                 pipe.assert_not_called()
 
     def test_audited_runtime_pairs_share_one_profile_and_require_exact_hashes(self):
-        for profile in (h.VERIFIED_RUNTIME, h.VERIFIED_RUNTIME_26_908):
+        for profile in (h.VERIFIED_RUNTIME, h.VERIFIED_RUNTIME_26_908, h.VERIFIED_RUNTIME_26_908_9136):
             with self.subTest(pair=(profile["desktopVersion"], profile["appServerVersion"])), \
                     tempfile.TemporaryDirectory(prefix="c2c-profile-offline-") as directory:
                 root = Path(directory) / f"OpenAI.Codex_{profile['desktopVersion']}_x64" / "app"
                 root.mkdir(parents=True)
                 desktop = root / "ChatGPT.exe"
                 server = root / "codex.exe"
-                if profile is h.VERIFIED_RUNTIME_26_908:
-                    server.write_bytes(b"standalone local buildversion: 0.154.0-alpha.6.2 platform: audited")
-                else:
+                if profile is h.VERIFIED_RUNTIME:
                     server.write_bytes(b"legacy app-server without a provenance marker")
+                else:
+                    server.write_bytes(b"standalone local buildversion: 0.154.0-alpha.6.2 platform: audited")
                 module_hashes = {"fixture.js": hashlib.sha256(b"fixture module").hexdigest()}
                 fixture = {**profile, "appServerSha256": hashlib.sha256(server.read_bytes()).hexdigest(),
                            "moduleHashes": module_hashes}
@@ -767,6 +767,159 @@ class RuntimeTests(unittest.TestCase):
                         "status": "current", "profile": h.VERIFIED_PROFILE,
                     })
                     self.assertEqual(asar.call_count, 2)
+
+    def test_runtime_26_908_9136_exact_combination_is_current(self):
+        profile = h.VERIFIED_RUNTIME_26_908_9136
+        self.assertEqual(profile["desktopVersion"], "26.908.9136.0")
+        self.assertEqual(profile["appServerVersion"], "0.154.0-alpha.6.2")
+        self.assertEqual(profile["appServerSha256"],
+                         "960c111d47afd61669954b9df9e56083e302edbfa3ef6962d81dcc14a30051dc")
+        self.assertEqual(profile["asarHeader"], (4, 2489280, 2489276, 2489269))
+        self.assertEqual(profile["moduleHashes"], {
+            ".vite/build/src-CCXHtyvY.js":
+                "a42da38cbb14b28399f1d54fcf453bffc5e9802663e7e098f187c8378f4c7a40",
+            "webview/assets/app-initial-bcc2ff475eb6.js":
+                "3c15444f96a8d48844258618fe0d4278409e626f0ee563a77d2c669ec669c510",
+        })
+        self.assertIn(profile, h.VERIFIED_PROFILES[h.VERIFIED_PROFILE])
+        # IPC 主模块与已验证 26.908.4834.0 byte-identical；webview bundle 单独固定。
+        self.assertEqual(
+            profile["moduleHashes"][".vite/build/src-CCXHtyvY.js"],
+            h.VERIFIED_RUNTIME_26_908["moduleHashes"][".vite/build/src-CCXHtyvY.js"],
+        )
+        self.assertNotEqual(
+            profile["moduleHashes"]["webview/assets/app-initial-bcc2ff475eb6.js"],
+            h.VERIFIED_RUNTIME_26_908["moduleHashes"]["webview/assets/app-initial-d9bed9d614d8.js"],
+        )
+
+    def test_runtime_26_908_9136_any_single_field_drift_fails_closed(self):
+        base = h.VERIFIED_RUNTIME_26_908_9136
+        with tempfile.TemporaryDirectory(prefix="c2c-9136-drift-") as directory:
+            root = Path(directory) / f"OpenAI.Codex_{base['desktopVersion']}_x64" / "app"
+            root.mkdir(parents=True)
+            desktop = root / "ChatGPT.exe"
+            server = root / "codex.exe"
+            server.write_bytes(b"standalonelocal buildversion: 0.154.0-alpha.6.2\nplatform: audited")
+            server_hash = hashlib.sha256(server.read_bytes()).hexdigest()
+            fixture = {**base, "appServerSha256": server_hash}
+
+            # exact pair + exact hashes → current
+            with patch.dict(h.VERIFIED_PROFILES, {h.VERIFIED_PROFILE: (fixture,)}, clear=True), \
+                    patch.object(h, "_asar_module_hashes", return_value=fixture["moduleHashes"]):
+                self.assertEqual(
+                    h._compatibility_for_paths(str(desktop), str(server))["status"], "current"
+                )
+
+            # wrong desktop version path → pair 不匹配 → unverified
+            wrong_desktop = Path(directory) / "OpenAI.Codex_26.908.4834.0_x64" / "app" / "ChatGPT.exe"
+            wrong_desktop.parent.mkdir(parents=True)
+            with patch.dict(h.VERIFIED_PROFILES, {h.VERIFIED_PROFILE: (fixture,)}, clear=True):
+                result = h._compatibility_for_paths(str(wrong_desktop), str(server))
+            self.assertEqual(result["status"], "unverified")
+            self.assertIsNone(result["profile"])
+
+            # wrong app-server version（静态 marker 写出别的版本）→ pair 不匹配 → unverified
+            server.write_bytes(b"standalonelocal buildversion: 0.153.4\nplatform: audited")
+            with patch.dict(h.VERIFIED_PROFILES, {h.VERIFIED_PROFILE: (fixture,)}, clear=True):
+                result = h._compatibility_for_paths(str(desktop), str(server))
+            self.assertEqual(result["status"], "unverified")
+            self.assertIsNone(result["profile"])
+            server.write_bytes(b"standalonelocal buildversion: 0.154.0-alpha.6.2\nplatform: audited")
+
+            # wrong app-server SHA → pair 版本匹配但 hash 不匹配 → incompatible
+            bad_sha = {**fixture, "appServerSha256": "0" * 64}
+            with patch.dict(h.VERIFIED_PROFILES, {h.VERIFIED_PROFILE: (bad_sha,)}, clear=True), \
+                    patch.object(h, "_asar_module_hashes") as asar:
+                result = h._compatibility_for_paths(str(desktop), str(server))
+            self.assertEqual(result["status"], "incompatible")
+            self.assertEqual(result["profile"], h.VERIFIED_PROFILE)
+            asar.assert_not_called()
+
+            # ASAR header 漂移：写入真实但错误布局的 asar 文件
+            asar = desktop.parent / "resources" / "app.asar"
+            asar.parent.mkdir(parents=True, exist_ok=True)
+            bad_header_bytes = struct.pack("<4I", 4, 64, 60, 16) + b"{}"
+            asar.write_bytes(bad_header_bytes)
+            with patch.dict(h.VERIFIED_PROFILES, {h.VERIFIED_PROFILE: (fixture,)}, clear=True):
+                with self.assertRaises(h.DesktopIpcError) as caught:
+                    h._runtime_version(str(desktop), str(server))
+            self.assertEqual(caught.exception.mismatch, "asar_header_layout")
+
+            # IPC / webview module hash 漂移：按 exact module path 提供错误 hash
+            for label, path, digest in (
+                ("ipc", ".vite/build/src-CCXHtyvY.js", "b" * 64),
+                ("webview", "webview/assets/app-initial-bcc2ff475eb6.js", "c" * 64),
+            ):
+                with self.subTest(module=label):
+                    bad_modules = {**fixture["moduleHashes"], path: digest}
+                    bad = {**fixture, "moduleHashes": bad_modules}
+                    with patch.dict(h.VERIFIED_PROFILES, {h.VERIFIED_PROFILE: (bad,)}, clear=True), \
+                            patch.object(h, "_asar_module_hashes", side_effect=h.DesktopIpcError(
+                                "DESKTOP_VERSION_UNSUPPORTED", "asar_module_sha256"
+                            ) if False else None):
+                        # 直接让 _asar_module_hashes 抛出 module sha 错误语义：
+                        with patch.object(
+                            h, "_asar_module_hashes",
+                            side_effect=h._version_error("asar_module_sha256"),
+                        ):
+                            with self.assertRaises(h.DesktopIpcError) as caught:
+                                h._runtime_version(str(desktop), str(server))
+                    self.assertEqual(caught.exception.mismatch, "asar_module_sha256")
+
+    def test_runtime_26_908_9136_rejects_cross_runtime_mix(self):
+        # 9136 Desktop + 4834 app-server hash：pair 版本可匹配 9136，但 hash 必须 exact。
+        mix_hash = {
+            **h.VERIFIED_RUNTIME_26_908_9136,
+            "appServerSha256": h.VERIFIED_RUNTIME_26_908["appServerSha256"],
+        }
+        with tempfile.TemporaryDirectory(prefix="c2c-9136-mix-") as directory:
+            root9136 = Path(directory) / "OpenAI.Codex_26.908.9136.0_x64" / "app"
+            root9136.mkdir(parents=True)
+            desktop9136 = root9136 / "ChatGPT.exe"
+            server9136 = root9136 / "codex.exe"
+            server9136.write_bytes(b"standalonelocal buildversion: 0.154.0-alpha.6.2\nplatform: audited")
+            with patch.dict(
+                h.VERIFIED_PROFILES,
+                {h.VERIFIED_PROFILE: (mix_hash,)},
+                clear=True,
+            ), patch.object(h, "_asar_module_hashes") as asar:
+                result = h._compatibility_for_paths(str(desktop9136), str(server9136))
+            self.assertEqual(result["status"], "incompatible")
+            self.assertEqual(result["profile"], h.VERIFIED_PROFILE)
+            asar.assert_not_called()
+
+            # 4834 Desktop + 声称 9136 webview hash：pair 版本匹配 4834 后 asar 必须 exact。
+            mix_webview = {
+                **h.VERIFIED_RUNTIME_26_908,
+                "appServerSha256": hashlib.sha256(
+                    b"standalone local buildversion: 0.154.0-alpha.6.2 platform: audited"
+                ).hexdigest(),
+                "moduleHashes": {
+                    ".vite/build/src-CCXHtyvY.js":
+                        h.VERIFIED_RUNTIME_26_908["moduleHashes"][".vite/build/src-CCXHtyvY.js"],
+                    "webview/assets/app-initial-bcc2ff475eb6.js":
+                        h.VERIFIED_RUNTIME_26_908_9136["moduleHashes"][
+                            "webview/assets/app-initial-bcc2ff475eb6.js"
+                        ],
+                },
+            }
+            root4834 = Path(directory) / "OpenAI.Codex_26.908.4834.0_x64" / "app"
+            root4834.mkdir(parents=True)
+            desktop4834 = root4834 / "ChatGPT.exe"
+            server4834 = root4834 / "codex.exe"
+            server4834.write_bytes(b"standalone local buildversion: 0.154.0-alpha.6.2 platform: audited")
+            with patch.dict(
+                h.VERIFIED_PROFILES,
+                {h.VERIFIED_PROFILE: (mix_webview,)},
+                clear=True,
+            ), patch.object(
+                h,
+                "_asar_module_hashes",
+                side_effect=h._version_error("asar_module_sha256"),
+            ):
+                with self.assertRaises(h.DesktopIpcError) as caught:
+                    h._runtime_version(str(desktop4834), str(server4834))
+            self.assertEqual(caught.exception.mismatch, "asar_module_sha256")
 
     def test_unknown_mixed_and_hash_mismatch_are_fail_closed_diagnostics(self):
         with tempfile.TemporaryDirectory(prefix="c2c-compatibility-offline-") as directory:
@@ -802,6 +955,59 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(h._static_file_version(str(binary)), "0.154.0-alpha.6.2")
             binary.write_bytes(marker + b"0.153.4 platform:x\x00" + marker + b"0.154.0-alpha.6.2 platform:y")
             self.assertIsNone(h._static_file_version(str(binary)))
+
+    def test_provenance_parser_accepts_compact_marker_and_fails_closed_on_ambiguity(self):
+        old = b"standalone local buildversion: "
+        new = b"standalonelocal buildversion: "
+        with tempfile.TemporaryDirectory(prefix="c2c-provenance-compact-") as directory:
+            binary = Path(directory) / "codex.exe"
+            # old marker + prerelease + space delimiter
+            binary.write_bytes(b"prefix\x00" + old + b"0.154.0-alpha.6.2 platform: install method: commit:")
+            self.assertEqual(h._static_file_version(str(binary)), "0.154.0-alpha.6.2")
+            # new compact marker + prerelease + space delimiter
+            binary.write_bytes(b"prefix\x00" + new + b"0.154.0-alpha.6.2 platform: install method: commit:")
+            self.assertEqual(h._static_file_version(str(binary)), "0.154.0-alpha.6.2")
+            # new compact marker + prerelease + newline delimiter (real 26.908.9136 shape)
+            binary.write_bytes(b"prefix\x00" + new + b"0.154.0-alpha.6.2\nplatform: install method: commit:")
+            self.assertEqual(h._static_file_version(str(binary)), "0.154.0-alpha.6.2")
+            # old duplicated
+            binary.write_bytes(old + b"0.153.4 platform:x\x00" + old + b"0.154.0-alpha.6.2 platform:y")
+            self.assertIsNone(h._static_file_version(str(binary)))
+            # new duplicated
+            binary.write_bytes(new + b"0.153.4 platform:x\x00" + new + b"0.154.0-alpha.6.2 platform:y")
+            self.assertIsNone(h._static_file_version(str(binary)))
+            # old + new together
+            binary.write_bytes(old + b"0.153.4 platform:x\x00" + new + b"0.154.0-alpha.6.2 platform:y")
+            self.assertIsNone(h._static_file_version(str(binary)))
+            # malformed version
+            binary.write_bytes(new + b"not-a-version platform: x")
+            self.assertIsNone(h._static_file_version(str(binary)))
+            # missing platform delimiter
+            binary.write_bytes(new + b"0.154.0-alpha.6.2 install method: commit:")
+            self.assertIsNone(h._static_file_version(str(binary)))
+            # no marker
+            binary.write_bytes(b"no provenance marker here")
+            self.assertIsNone(h._static_file_version(str(binary)))
+
+    def test_unknown_compact_marker_pair_stays_unverified(self):
+        # 未入册的 Desktop 版本 + compact marker 仍必须 unverified / profile=null。
+        desktop = "OpenAI.Codex_26.908.9999.0_x64/app/ChatGPT.exe"
+        with tempfile.TemporaryDirectory(prefix="c2c-provenance-unverified-") as directory:
+            binary = Path(directory) / "codex.exe"
+            binary.write_bytes(
+                b"x\x00standalonelocal buildversion: 0.154.0-alpha.6.2\nplatform: install method: commit:"
+            )
+            with patch.object(h, "_sha256_file", return_value="960c111d47afd61669954b9df9e56083e302edbfa3ef6962d81dcc14a30051dc"):
+                observed = h._observe_runtime_versions(desktop, str(binary))
+            self.assertEqual(observed["observedDesktopVersion"], "26.908.9999.0")
+            self.assertEqual(observed["observedAppServerVersion"], "0.154.0-alpha.6.2")
+            diagnostic = h._compatibility_for_paths(desktop, str(binary))
+            self.assertEqual(diagnostic, {
+                "observedDesktopVersion": "26.908.9999.0",
+                "observedAppServerVersion": "0.154.0-alpha.6.2",
+                "status": "unverified",
+                "profile": None,
+            })
 
     def test_known_hash_skips_binary_scan_but_unknown_hash_uses_static_evidence(self):
         desktop = f"OpenAI.Codex_{h.VERIFIED_RUNTIME['desktopVersion']}_x64/app/ChatGPT.exe"

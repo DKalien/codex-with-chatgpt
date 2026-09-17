@@ -487,6 +487,176 @@ describe("E1a review-fix", () => {
   });
 });
 
+function patchEventStatus(
+  eventId: string,
+  patch: Partial<FeedbackEvent> & { status: FeedbackEvent["status"] },
+) {
+  const file = feedbackStateFile(workspace.id, stateDir);
+  const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+  raw.events = raw.events.map((e: FeedbackEvent) =>
+    e.eventId === eventId ? { ...e, ...patch, updatedAt: new Date().toISOString() } : e,
+  );
+  fs.writeFileSync(file, JSON.stringify(raw, null, 2));
+}
+
+function claimOneReady(seedId: string) {
+  reconcileFeedbackOutbox(workspace.id, stateDir);
+  seedTrustedReceipt(seedId);
+  reconcileFeedbackOutbox(workspace.id, stateDir);
+  const en = enableReceiver({
+    workspaceId: workspace.id,
+    principal: principalA(),
+    widgetId: "w",
+    stateDir,
+  });
+  const b = en.binding!;
+  const claimed = claimNext({
+    workspaceId: workspace.id,
+    principal: principalA(),
+    bindingId: b.bindingId,
+    epoch: b.epoch,
+    stateDir,
+  });
+  return { binding: b, claimed };
+}
+
+describe("trusted MCP late-positive ACK (ackObserved)", () => {
+  function ack(bindingId: string, epoch: number, eventId: string, attemptId: string) {
+    return ackObserved({
+      workspaceId: workspace.id,
+      principal: principalA(),
+      bindingId,
+      epoch,
+      eventId,
+      attemptId,
+      stateDir,
+    });
+  }
+
+  it("claimed exact → observed", () => {
+    const { binding, claimed } = claimOneReady("late-claimed");
+    const observed = ack(binding.bindingId, binding.epoch, claimed.event.eventId, claimed.attemptId);
+    expect(observed.status).toBe("observed");
+    expect(observed.eventId).toBe(claimed.event.eventId);
+    expect(observed.attemptId).toBe(claimed.attemptId);
+  });
+
+  it("outcome_unknown exact → observed", () => {
+    const { binding, claimed } = claimOneReady("late-unknown");
+    patchEventStatus(claimed.event.eventId, { status: "outcome_unknown" });
+    const observed = ack(binding.bindingId, binding.epoch, claimed.event.eventId, claimed.attemptId);
+    expect(observed.status).toBe("observed");
+  });
+
+  it("stale recovery → outcome_unknown → exact late-positive ACK closes the loop", () => {
+    const { binding, claimed } = claimOneReady("late-stale");
+    const file = feedbackStateFile(workspace.id, stateDir);
+    const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+    raw.events.find((e: FeedbackEvent) => e.eventId === claimed.event.eventId).claimedAt =
+      new Date(Date.now() - 11 * 60_000).toISOString();
+    fs.writeFileSync(file, JSON.stringify(raw, null, 2));
+    reconcileFeedbackOutbox(workspace.id, stateDir);
+    const after = readFeedbackState(workspace.id, stateDir).events.find(
+      (e) => e.eventId === claimed.event.eventId,
+    )!;
+    expect(after.status).toBe("outcome_unknown");
+    const observed = ack(binding.bindingId, binding.epoch, claimed.event.eventId, claimed.attemptId);
+    expect(observed.status).toBe("observed");
+  });
+
+  it("observed same attempt → idempotent; wrong attempt → reject", () => {
+    const { binding, claimed } = claimOneReady("late-idempotent");
+    const first = ack(binding.bindingId, binding.epoch, claimed.event.eventId, claimed.attemptId);
+    expect(first.status).toBe("observed");
+    const again = ack(binding.bindingId, binding.epoch, claimed.event.eventId, claimed.attemptId);
+    expect(again.status).toBe("observed");
+    expect(() =>
+      ack(
+        binding.bindingId,
+        binding.epoch,
+        claimed.event.eventId,
+        "99999999-9999-4999-8999-999999999999",
+      ),
+    ).toThrow(/ACK_MISMATCH|不匹配/i);
+  });
+
+  it("outcome_unknown wrong attempt → reject", () => {
+    const { binding, claimed } = claimOneReady("late-wrong-attempt");
+    patchEventStatus(claimed.event.eventId, { status: "outcome_unknown" });
+    expect(() =>
+      ack(
+        binding.bindingId,
+        binding.epoch,
+        claimed.event.eventId,
+        "99999999-9999-4999-8999-999999999999",
+      ),
+    ).toThrow(/ACK_MISMATCH|不匹配/i);
+  });
+
+  it("wrong binding / epoch / principal / event → reject", () => {
+    const { binding, claimed } = claimOneReady("late-identity");
+    expect(() =>
+      ack("11111111-1111-4111-8111-111111111111", binding.epoch, claimed.event.eventId, claimed.attemptId),
+    ).toThrow(/旧绑定|EPOCH_STALE|失效/i);
+    expect(() =>
+      ack(binding.bindingId, binding.epoch + 1, claimed.event.eventId, claimed.attemptId),
+    ).toThrow(/旧绑定|EPOCH_STALE|失效/i);
+    expect(() =>
+      ackObserved({
+        workspaceId: workspace.id,
+        principal: principalB(),
+        bindingId: binding.bindingId,
+        epoch: binding.epoch,
+        eventId: claimed.event.eventId,
+        attemptId: claimed.attemptId,
+        stateDir,
+      }),
+    ).toThrow(/PRINCIPAL_MISMATCH|不一致/i);
+    expect(() =>
+      ack(binding.bindingId, binding.epoch, "e".repeat(32), claimed.attemptId),
+    ).toThrow(/NOT_FOUND|不存在/i);
+  });
+
+  it("retired_unknown exact → reject, never resurrect", () => {
+    const { binding, claimed } = claimOneReady("late-retired");
+    patchEventStatus(claimed.event.eventId, {
+      status: "retired_unknown",
+      retiredAt: new Date().toISOString(),
+    });
+    expect(() =>
+      ack(binding.bindingId, binding.epoch, claimed.event.eventId, claimed.attemptId),
+    ).toThrow(/ACK_MISMATCH|retired|不可/i);
+    const still = readFeedbackState(workspace.id, stateDir).events.find(
+      (e) => e.eventId === claimed.event.eventId,
+    )!;
+    expect(still.status).toBe("retired_unknown");
+  });
+
+  it("ready / reserved → reject", () => {
+    reconcileFeedbackOutbox(workspace.id, stateDir);
+    seedTrustedReceipt("late-ready");
+    reconcileFeedbackOutbox(workspace.id, stateDir);
+    const en = enableReceiver({
+      workspaceId: workspace.id,
+      principal: principalA(),
+      widgetId: "w",
+      stateDir,
+    });
+    const b = en.binding!;
+    const ready = readFeedbackState(workspace.id, stateDir).events[0]!;
+    expect(ready.status).toBe("ready");
+    expect(() => ack(b.bindingId, b.epoch, ready.eventId, "11111111-1111-4111-8111-111111111111"))
+      .toThrow(/ACK_MISMATCH|不匹配/i);
+
+    patchEventStatus(ready.eventId, {
+      status: "reserved",
+      reservationId: "22222222-2222-4222-8222-222222222222",
+    });
+    expect(() => ack(b.bindingId, b.epoch, ready.eventId, "11111111-1111-4111-8111-111111111111"))
+      .toThrow(/ACK_MISMATCH|不匹配/i);
+  });
+});
+
 describe("MCP production feedback tools", () => {
   it("注册 feedback_* 且无 emit/model_confirm；scope 校验", async () => {
     const server = createMcpServer({ workspace, logger: { info() {}, error() {}, warn() {}, debug() {} } as never });
@@ -504,6 +674,13 @@ describe("MCP production feedback tools", () => {
       "feedback_takeover",
     ]);
     expect(tools.feedback_emit).toBeUndefined();
+    const ackTool = tools.feedback_ack_observed as {
+      description?: string;
+    };
+    expect(ackTool.description).toMatch(/claimed\/outcome_unknown/);
+    expect(ackTool.description).toMatch(/idempotent/);
+    expect(ackTool.description).toMatch(/正观察证据|不判断 UI/);
+    expect(ackTool.description).not.toMatch(/claimed→observed。$/);
     const handler = (tools.feedback_status as { handler: (a: unknown, e: unknown) => Promise<{ isError?: boolean }> }).handler;
     const denied = await handler({}, {
       authInfo: { token: "t", clientId: "c", scopes: ["workspace.read"] },

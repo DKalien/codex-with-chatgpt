@@ -1,8 +1,8 @@
 /**
- * C2C Browser Companion service worker (E1b2 review-fix).
+ * C2C Browser Companion service worker (E1b2 + E1b3d3b production one-shot).
  * All Bridge HTTP + credential storage lives here.
  * Identity always from MessageSender. Secrets never in content script.
- * No begin-send. No Send.
+ * Production Send only via explicit popup request + durable journal CAS.
  */
 
 import {
@@ -23,11 +23,13 @@ import {
   markReserveRequested,
   markReserved,
   markReservationRecovery,
+  markOutcomeUnknown,
   clearJournal,
   evaluateReserveEligibility,
   validateStateIdentity,
   assertNoForbiddenFields,
   journalActive,
+  journalIsSendSide,
   reconcileReservedJournal,
   pairAllowedWithJournal,
   applyStorageProtectionPolicy,
@@ -39,6 +41,39 @@ import {
   markProofUsed,
   journalBlocksTransportMutation,
 } from "./owner-proof.js";
+import {
+  isExtensionInternalSender,
+  buildShadowInspectRequest,
+  validateShadowInspectResponse,
+} from "./shadow-rpc.js";
+import {
+  buildWriteProbeRequest,
+  validateWriteProbeResponse,
+} from "./write-probe.js";
+import {
+  SEND_PROBE_LATCH_KEY,
+  emptySendProbeLatch,
+  parseSendProbeLatch,
+  canStartSendProbe,
+  buildSendProbeExecuteRequest,
+  classifySendProbeRpcResult,
+  executeSendProbeMutationRpc,
+} from "./send-probe.js";
+import {
+  canStartProductionSend,
+  buildProductionSendExecuteRequest,
+  buildProductionRecoverRequest,
+  classifyProductionStartRpcResult,
+  validateProductionJournalCommit,
+  sanitizeInFlightForRecovery,
+  summarizeProductionJournal,
+  buildClaimProof,
+  buildAckProof,
+  reconcileClaimedAgainstServer,
+  commitJournalDurably,
+  findExactObservedEvent,
+  evaluateServerObservedCloseout,
+} from "./production-send.js";
 
 const LOCAL_KEY = "c2c_companion_local_v1";
 const TRANSPORT_KEY = "c2c_companion_transport_v1";
@@ -57,6 +92,16 @@ let ownerProof = null;
 let hydrated = false;
 /** Fail closed if TRUSTED_CONTEXTS cannot be established. */
 let storageProtected = false;
+/** E1b3d2a concurrent write-probe gate (memory only, not production journal). */
+let writeProbeInFlight = false;
+/** E1b3d3a one-shot real Send probe latch (session, independent of production journal). */
+let sendProbeLatch = emptySendProbeLatch();
+let sendProbeInFlight = false;
+/** E1b3d3b concurrent production send gate (memory only; durable truth is journal). */
+let productionSendInFlight = false;
+/** Short-lived SW transition proofs. Bound to current journal identity. Never from CS. */
+let productionClaimProof = null;
+let productionAckProof = null;
 
 const initPromise = (async () => {
   await hydrate();
@@ -100,6 +145,7 @@ async function hydrate() {
     SESSION_OWNER_KEY,
     SESSION_REG_KEY,
     SESSION_EVIDENCE_KEY,
+    SEND_PROBE_LATCH_KEY,
   ]);
   ownerState = {
     schemaVersion: OWNERSHIP_SCHEMA_VERSION,
@@ -112,7 +158,22 @@ async function hydrate() {
   evidence = live[SESSION_EVIDENCE_KEY] && typeof live[SESSION_EVIDENCE_KEY] === "object"
     ? live[SESSION_EVIDENCE_KEY]
     : null;
+  sendProbeLatch = parseSendProbeLatch(live[SEND_PROBE_LATCH_KEY]);
   hydrated = true;
+}
+
+/** Durable latch persist. Fail closed — never swallow storage errors. */
+async function persistSendProbeLatch() {
+  try {
+    if (sendProbeLatch.state === "NONE") {
+      await chrome.storage.session.remove(SEND_PROBE_LATCH_KEY);
+    } else {
+      await chrome.storage.session.set({ [SEND_PROBE_LATCH_KEY]: sendProbeLatch });
+    }
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function persistLocal() {
@@ -196,14 +257,9 @@ function statusPayload(tabId, documentId, extra = {}) {
       ? ownerStatus(ownerState, tabId, documentId)
       : ownerStatus(ownerState, -1, ""),
     transport: safeTransportSummary(),
-    journal: journalActive(journal)
-      ? {
-          state: journal.state,
-          eventId: journal.eventId,
-          reservationId: journal.reservationId,
-          routeCanonical: journal.routeCanonical,
-        }
-      : { state: "NONE" },
+    journal: summarizeProductionJournal(journal),
+    sendProbeLatch: sendProbeLatch.state,
+    productionSendInFlight,
     evidence: evidence
       ? {
           observedAt: evidence.observedAt,
@@ -456,6 +512,9 @@ async function handleFetchState() {
     if (!idCheck.ok) {
       return markAuthStale(idCheck.reason);
     }
+    // Minimal observed proof from the same authenticated /state body only.
+    // Never expose message / credential / principal / reservedBy.
+    const observedLookup = findExactObservedEvent(res.body.events ?? [], journal);
     return {
       ok: true,
       status: {
@@ -465,6 +524,7 @@ async function handleFetchState() {
         outcomeUnknown: res.body.outcomeUnknown,
         inFlight: res.body.inFlight ?? null,
         enabled: res.body.enabled,
+        serverObserved: observedLookup.ok ? observedLookup.observed : null,
       },
     };
   } catch {
@@ -638,6 +698,52 @@ async function handleRecover() {
       return { ok: true, recovered: false, journal: { state: "NONE" } };
     }
   }
+
+  // E1b3d3b: send-side durable states recover through exact-document production runtime.
+  if (journalIsSendSide(journal)) {
+    // Server-observed closeout: trusted ACK already moved server event to observed.
+    // SW clears durable OUTCOME_UNKNOWN only with exact identity proof + inFlight=null.
+    // Zero DOM / ACK / Send / CS recovery.
+    const closeout = evaluateServerObservedCloseout({
+      journal,
+      inFlight,
+      serverObserved: stateRes.status?.serverObserved,
+    });
+    if (journal.state === "OUTCOME_UNKNOWN" && closeout.ok) {
+      const previous = journal;
+      journal = clearJournal();
+      try {
+        await persistJournal();
+      } catch {
+        journal = previous;
+        return {
+          ok: false,
+          reason: "server_observed_persist_failed",
+          recovered: false,
+          action: "block",
+          journal: summarizeProductionJournal(journal),
+          zeroWrite: true,
+          zeroClick: true,
+          ackCalled: false,
+          beginSendCalled: false,
+        };
+      }
+      productionClaimProof = null;
+      productionAckProof = null;
+      return {
+        ok: true,
+        recovered: true,
+        action: "server_observed_clear",
+        journal: summarizeProductionJournal(journal),
+        zeroWrite: true,
+        zeroClick: true,
+        ackCalled: false,
+        beginSendCalled: false,
+      };
+    }
+    return recoverProductionSendSide(inFlight);
+  }
+
   return { ok: true, recovered: false, journal: { state: journal.state }, inFlight };
 }
 
@@ -662,20 +768,22 @@ async function handleMessage(message, sender) {
       ok: true,
       storageProtected,
       transport: safeTransportSummary(),
-      journal: journalActive(journal)
-        ? {
-            state: journal.state,
-            eventId: journal.eventId,
-            reservationId: journal.reservationId,
-            routeCanonical: journal.routeCanonical,
-          }
-        : { state: "NONE" },
+      journal: summarizeProductionJournal(journal),
+      sendProbeLatch: sendProbeLatch.state,
+      productionSendInFlight,
     };
   }
   if (message.type === "c2c.fetch.state") return handleFetchState();
   if (message.type === "c2c.reserve.page") return handleReservePage(sender, message);
   if (message.type === "c2c.release") return handleRelease();
   if (message.type === "c2c.recover") return handleRecover();
+  if (message.type === "c2c.retire.unknown") {
+    // Manual popup-only. Content scripts must never trigger retirement.
+    if (!isExtensionInternalSender(sender)) {
+      return { ok: false, reason: "popup_sender_required" };
+    }
+    return handleRetireUnknown();
+  }
   if (message.type === "c2c.transport.clear") return handleClearTransport();
 
   const identity = resolveSenderDocumentIdentity(sender);
@@ -767,7 +875,1082 @@ async function handleMessage(message, sender) {
     });
   }
 
+  // E1b3d1: popup/internal only (no sender.tab). Document-targeted RPC.
+  if (message.type === "c2c.shadow.send.inspect") {
+    if (!isExtensionInternalSender(sender)) {
+      return { ok: false, reason: "popup_sender_required" };
+    }
+    return handleShadowInspect();
+  }
+
+  // E1b3d2a: popup-only write probe. Fixed message only. Zero Send. No journal.
+  if (message.type === "c2c.write.probe.request") {
+    if (!isExtensionInternalSender(sender)) {
+      return { ok: false, reason: "popup_sender_required" };
+    }
+    // Reject any caller-supplied message payload — fixed probe only.
+    if (message.message != null || message.payload != null) {
+      return { ok: false, reason: "write_probe_payload_forbidden" };
+    }
+    return handleWriteProbe();
+  }
+
+  // E1b3d3a: popup-only one-shot REAL Send probe. SW mints attemptId + message.
+  if (message.type === "c2c.send.probe.request") {
+    if (!isExtensionInternalSender(sender)) {
+      return { ok: false, reason: "popup_sender_required" };
+    }
+    if (
+      message.message != null
+      || message.attemptId != null
+      || message.route != null
+      || message.documentId != null
+      || message.payload != null
+    ) {
+      return { ok: false, reason: "send_probe_payload_forbidden" };
+    }
+    return handleSendProbe();
+  }
+
+  // E1b3d3a: manual reset only when COMPLETED + journal NONE.
+  if (message.type === "c2c.send.probe.reset") {
+    if (!isExtensionInternalSender(sender)) {
+      return { ok: false, reason: "popup_sender_required" };
+    }
+    return handleSendProbeReset();
+  }
+
+  // E1b3d3b: popup-only production one-shot send. Caller never supplies identity/message.
+  if (message.type === "c2c.production.send.request") {
+    if (!isExtensionInternalSender(sender)) {
+      return { ok: false, reason: "popup_sender_required" };
+    }
+    if (
+      message.message != null
+      || message.eventId != null
+      || message.reservationId != null
+      || message.attemptId != null
+      || message.route != null
+      || message.routeCanonical != null
+      || message.documentId != null
+      || message.payload != null
+    ) {
+      return { ok: false, reason: "production_send_payload_forbidden" };
+    }
+    return handleProductionSend();
+  }
+
+  // E1b3d3b CS CAS persist. Exact owner document only.
+  if (message.type === "c2c.production.journal.persist") {
+    return handleProductionJournalPersist(sender, message);
+  }
+
+  // E1b3d3b CS begin-send adapter. SW owns secret + durable identity.
+  if (message.type === "c2c.production.begin.send") {
+    return handleProductionBeginSend(sender, message);
+  }
+
+  // E1b3d3b CS ack adapter.
+  if (message.type === "c2c.production.ack") {
+    return handleProductionAck(sender, message);
+  }
+
   return { ok: false, reason: "unknown_type" };
+}
+
+/**
+ * E1b3d3a explicit one-shot real Send probe.
+ * Durable latch EXECUTION_INTENT before mutation RPC. Journal stays NONE.
+ * RPC throw/null → OUTCOME_UNKNOWN, no retry.
+ */
+async function handleSendProbe() {
+  await initPromise;
+  if (sendProbeInFlight) {
+    return { ok: false, reason: "send_probe_in_flight", retryAllowed: false, latch: sendProbeLatch.state };
+  }
+  sendProbeInFlight = true;
+  try {
+    const gate = requireProtectedTransport();
+    if (!gate.ok) return gate;
+    if (!ownerState.owner) {
+      return { ok: false, reason: "owner_missing" };
+    }
+    const owner = ownerState.owner;
+    const start = canStartSendProbe({
+      owner,
+      transport,
+      journalIsNone: !journalActive(journal),
+      latch: sendProbeLatch,
+    });
+    if (!start.ok) {
+      return {
+        ok: false,
+        reason: start.reason,
+        latchState: start.latchState ?? sendProbeLatch.state,
+        journalState: journal.state ?? "NONE",
+        retryAllowed: false,
+      };
+    }
+
+    const attemptId = crypto.randomUUID();
+    const request = buildSendProbeExecuteRequest(owner, transport, attemptId);
+    if (!request.ok) {
+      return { ok: false, reason: request.reason, retryAllowed: false };
+    }
+
+    // Durable intent BEFORE mutation RPC. Must persist or abort with zero RPC.
+    const prevLatch = sendProbeLatch;
+    const intentLatch = {
+      state: "EXECUTION_INTENT",
+      tabId: owner.tabId,
+      documentId: owner.documentId,
+      canonicalRoute: owner.canonicalRoute,
+      generation: owner.generation,
+      attemptId,
+      createdAt: Date.now(),
+    };
+    const mut = await executeSendProbeMutationRpc({
+      intentLatch,
+      persistLatch: async (latch) => {
+        sendProbeLatch = latch;
+        return persistSendProbeLatch();
+      },
+      invokeRpc: () => chrome.tabs.sendMessage(
+        request.tabId,
+        request.message,
+        request.sendOptions,
+      ),
+    });
+
+    if (mut.reason === "send_probe_latch_persist_failed") {
+      sendProbeLatch = prevLatch;
+      await persistSendProbeLatch();
+      return {
+        ok: false,
+        reason: "send_probe_latch_persist_failed",
+        retryAllowed: false,
+        latch: sendProbeLatch.state,
+        mutationAttempted: false,
+        clickAttempted: false,
+      };
+    }
+
+    if (mut.reason === "send_probe_outcome_unknown" && mut.response == null) {
+      sendProbeLatch = { ...intentLatch, state: "OUTCOME_UNKNOWN" };
+      await persistSendProbeLatch();
+      return {
+        ok: false,
+        reason: "send_probe_outcome_unknown",
+        retryAllowed: false,
+        latch: "OUTCOME_UNKNOWN",
+        attemptId,
+        productionJournal: journal.state ?? "NONE",
+      };
+    }
+
+    if (mut.outcome === "completed" && mut.response) {
+      sendProbeLatch = { ...intentLatch, state: "COMPLETED" };
+      const okPersist = await persistSendProbeLatch();
+      if (!okPersist) {
+        sendProbeLatch = { ...intentLatch, state: "OUTCOME_UNKNOWN" };
+        await persistSendProbeLatch();
+        return {
+          ok: false,
+          reason: "send_probe_latch_persist_failed",
+          retryAllowed: false,
+          latch: "OUTCOME_UNKNOWN",
+          attemptId,
+          productionJournal: journal.state ?? "NONE",
+        };
+      }
+      const response = mut.response;
+      return {
+        ok: true,
+        mode: "send_probe_real",
+        attemptId,
+        mutationAttempted: response.mutationAttempted === true,
+        wrote: response.wrote === true,
+        verified: response.verified === true,
+        clickAttempted: response.clickAttempted === true,
+        clicked: response.clicked === true,
+        observed: response.observed === true,
+        routeExact: true,
+        documentIdExact: true,
+        generationExact: true,
+        productionJournal: journal.state ?? "NONE",
+        latch: "COMPLETED",
+        retryAllowed: false,
+        canonicalRoute: response.canonicalRoute,
+        generation: response.generation,
+      };
+    }
+    if (mut.outcome === "pre_mutation") {
+      sendProbeLatch = emptySendProbeLatch();
+      await persistSendProbeLatch();
+      return {
+        ok: false,
+        reason: mut.reason,
+        retryAllowed: true,
+        latch: "NONE",
+        attemptId,
+        mutationAttempted: false,
+        clickAttempted: false,
+        productionJournal: journal.state ?? "NONE",
+      };
+    }
+    sendProbeLatch = { ...intentLatch, state: "OUTCOME_UNKNOWN" };
+    await persistSendProbeLatch();
+    return {
+      ok: false,
+      reason: mut.reason,
+      retryAllowed: false,
+      latch: "OUTCOME_UNKNOWN",
+      attemptId,
+      mutationAttempted: mut.mutationAttempted === true,
+      clickAttempted: mut.clickAttempted === true,
+      productionJournal: journal.state ?? "NONE",
+    };
+  } finally {
+    sendProbeInFlight = false;
+  }
+}
+
+async function handleSendProbeReset() {
+  await initPromise;
+  if (sendProbeLatch.state !== "COMPLETED") {
+    return {
+      ok: false,
+      reason: "send_probe_latch_not_resettable",
+      latch: sendProbeLatch.state,
+      retryAllowed: false,
+    };
+  }
+  if (journalActive(journal)) {
+    return {
+      ok: false,
+      reason: "send_probe_journal_active",
+      journalState: journal.state ?? null,
+      retryAllowed: false,
+    };
+  }
+  sendProbeLatch = emptySendProbeLatch();
+  await persistSendProbeLatch();
+  return { ok: true, latch: "NONE" };
+}
+
+/**
+ * Read-only shadow inspect via exact owner document RPC.
+ * Side-effect free: no journal change, no begin-send, no ack, no write/click.
+ */
+async function handleShadowInspect() {
+  await initPromise;
+  const gate = requireProtectedTransport();
+  if (!gate.ok) return gate;
+  if (!ownerState.owner) {
+    return { ok: false, reason: "owner_missing" };
+  }
+  const owner = ownerState.owner;
+
+  const request = buildShadowInspectRequest(owner, transport);
+  if (!request.ok) {
+    return { ok: false, reason: request.reason };
+  }
+
+  let response;
+  try {
+    // Exact document targeting: third argument is the delivery options object.
+    response = await chrome.tabs.sendMessage(
+      request.tabId,
+      request.message,
+      request.sendOptions,
+    );
+  } catch {
+    return { ok: false, reason: "no_content_script" };
+  }
+
+  const check = validateShadowInspectResponse(response, owner, transport);
+  if (!check.ok) {
+    return { ok: false, reason: check.reason };
+  }
+
+  // Safe summary only — no DOM nodes / HTML / credentials.
+  return {
+    ok: true,
+    mode: "read_only",
+    routeExact: true,
+    documentIdExact: true,
+    owner: {
+      tabId: owner.tabId,
+      documentId: owner.documentId,
+      canonicalRoute: owner.canonicalRoute,
+      generation: owner.generation ?? null,
+    },
+    composer: response.composer ?? null,
+    action: response.action ?? null,
+    safety: response.safety ?? null,
+    userTurnCount: typeof response.userTurnCount === "number" ? response.userTurnCount : null,
+    observedAt: response.observedAt ?? Date.now(),
+    journalUnchanged: true,
+  };
+}
+
+/**
+ * E1b3d2a write probe via exact owner document RPC.
+ * Fixed WRITE_PROBE_MESSAGE only. Journal must stay NONE. No Send / begin-send / ack.
+ * Mutation RPC failure → write_outcome_unknown, retryAllowed=false, no auto-retry.
+ */
+async function handleWriteProbe() {
+  await initPromise;
+  if (writeProbeInFlight) {
+    return { ok: false, reason: "write_probe_in_flight", retryAllowed: false };
+  }
+  writeProbeInFlight = true;
+  try {
+    const gate = requireProtectedTransport();
+    if (!gate.ok) return gate;
+    if (!ownerState.owner) {
+      return { ok: false, reason: "owner_missing" };
+    }
+    // Production send journal must remain NONE for this diagnostic probe.
+    if (journalActive(journal)) {
+      return {
+        ok: false,
+        reason: "write_probe_journal_active",
+        journalState: journal.state ?? null,
+        retryAllowed: false,
+      };
+    }
+    const owner = ownerState.owner;
+    const request = buildWriteProbeRequest(owner, transport);
+    if (!request.ok) {
+      return { ok: false, reason: request.reason, retryAllowed: false };
+    }
+
+    let response;
+    let rpcThrew = false;
+    try {
+      response = await chrome.tabs.sendMessage(
+        request.tabId,
+        request.message,
+        request.sendOptions,
+      );
+    } catch {
+      rpcThrew = true;
+      response = null;
+    }
+    if (rpcThrew || response == null) {
+      // CS may have already mutated; never auto-retry a mutation RPC.
+      return {
+        ok: false,
+        reason: "write_outcome_unknown",
+        retryAllowed: false,
+        mode: "write_probe_no_send",
+        noSend: true,
+      };
+    }
+
+    const check = validateWriteProbeResponse(response, owner, transport);
+    if (!check.ok) {
+      // Known CS failure OR contract mismatch — never success, never outcome_unknown.
+      return {
+        ok: false,
+        reason: check.reason,
+        wrote: check.wrote === true,
+        verified: check.verified === true,
+        mutationAttempted: check.mutationAttempted === true,
+        readback: check.readback ?? null,
+        mode: "write_probe_no_send",
+        noSend: true,
+        noSendPerformed: true,
+        retryAllowed: false,
+        journalUnchanged: true,
+      };
+    }
+
+    return {
+      ok: true,
+      mode: "write_probe_no_send",
+      routeExact: true,
+      documentIdExact: true,
+      generationExact: true,
+      wrote: response.wrote === true,
+      verified: response.verified === true,
+      mutationAttempted: response.mutationAttempted === true,
+      readback: response.readback ?? null,
+      editorKind: response.editorKind ?? null,
+      composerEvidence: response.composerEvidence ?? null,
+      canonicalRoute: response.canonicalRoute,
+      generation: response.generation,
+      noSend: true,
+      noSendPerformed: true,
+      journalUnchanged: true,
+      journalState: journal.state ?? "NONE",
+      retryAllowed: false,
+      owner: {
+        tabId: owner.tabId,
+        documentId: owner.documentId,
+        canonicalRoute: owner.canonicalRoute,
+        generation: owner.generation ?? null,
+      },
+    };
+  } finally {
+    writeProbeInFlight = false;
+  }
+}
+
+/** Exact-owner document check for CS production RPCs. */
+function requireExactOwnerSender(sender) {
+  const identity = resolveSenderDocumentIdentity(sender);
+  if (!identity.ok) {
+    return { ok: false, reason: identity.reason };
+  }
+  if (
+    !ownerState.owner
+    || !isOwner(ownerState, identity.tabId, identity.documentId)
+  ) {
+    return { ok: false, reason: "not_exact_owner" };
+  }
+  return {
+    ok: true,
+    tabId: identity.tabId,
+    documentId: identity.documentId,
+    owner: ownerState.owner,
+  };
+}
+
+/**
+ * E1b3d3b production journal CAS. SW is the only writer.
+ * CS cannot invent identity; stale expectedPrevious fails closed.
+ */
+async function handleProductionJournalPersist(sender, message) {
+  await initPromise;
+  const ownerCheck = requireExactOwnerSender(sender);
+  if (!ownerCheck.ok) return ownerCheck;
+  const proposed = message?.proposed;
+  const expectedPrevious = message?.expectedPrevious;
+  if (!proposed || typeof proposed !== "object" || !expectedPrevious || typeof expectedPrevious !== "object") {
+    return { ok: false, reason: "production_persist_payload_invalid" };
+  }
+  const check = validateProductionJournalCommit(journal, proposed, expectedPrevious, {
+    claimProof: productionClaimProof,
+    ackProof: productionAckProof,
+  });
+  if (!check.ok) {
+    return { ok: false, reason: check.reason, journal: summarizeProductionJournal(journal) };
+  }
+  // Binding/epoch must still match active transport for send-side states.
+  if (proposed.state !== "NONE" && transport) {
+    if (proposed.bindingId !== transport.bindingId || proposed.epoch !== transport.epoch) {
+      return { ok: false, reason: "binding_mismatch", journal: summarizeProductionJournal(journal) };
+    }
+    if (
+      proposed.routeCanonical
+      && transport.routeCanonical
+      && proposed.routeCanonical !== transport.routeCanonical
+    ) {
+      return { ok: false, reason: "route_mismatch", journal: summarizeProductionJournal(journal) };
+    }
+  }
+  const previousJournal = journal;
+  const committed = await commitJournalDurably({
+    current: previousJournal,
+    proposed,
+    persist: async (next) => {
+      journal = next;
+      await persistJournal();
+    },
+    onDurableSuccess: (next) => {
+      // Consume short-lived proofs only after a successful protected persist.
+      if (next.state === "CLAIMED") {
+        productionClaimProof = null;
+      }
+      if (next.state === "NONE") {
+        productionAckProof = null;
+        productionClaimProof = null;
+      }
+    },
+  });
+  if (!committed.ok) {
+    journal = previousJournal;
+    return {
+      ok: false,
+      reason: committed.reason,
+      error: committed.error,
+      journal: summarizeProductionJournal(journal),
+    };
+  }
+  return { ok: true, journal: summarizeProductionJournal(journal) };
+}
+
+/**
+ * E1b3d3b /begin-send adapter. Credential stays in SW.
+ * Body always from durable journal — never caller-supplied identity.
+ */
+async function handleProductionBeginSend(sender, message) {
+  await initPromise;
+  const ownerCheck = requireExactOwnerSender(sender);
+  if (!ownerCheck.ok) return ownerCheck;
+  const gate = requireProtectedTransport();
+  if (!gate.ok) return gate;
+  if (journal.state !== "SEND_INTENT" || !journal.eventId || !journal.reservationId) {
+    return { ok: false, reason: "journal_not_send_intent", journal: summarizeProductionJournal(journal) };
+  }
+  // Optional identity assertion from CS must exact-match durable journal.
+  if (message?.eventId != null && message.eventId !== journal.eventId) {
+    return { ok: false, reason: "event_id_mismatch" };
+  }
+  if (message?.reservationId != null && message.reservationId !== journal.reservationId) {
+    return { ok: false, reason: "reservation_id_mismatch" };
+  }
+  if (message?.routeCanonical != null && message.routeCanonical !== journal.routeCanonical) {
+    return { ok: false, reason: "route_mismatch" };
+  }
+  if (message?.bindingId != null && message.bindingId !== journal.bindingId) {
+    return { ok: false, reason: "binding_mismatch" };
+  }
+  if (message?.epoch != null && message.epoch !== journal.epoch) {
+    return { ok: false, reason: "epoch_mismatch" };
+  }
+
+  let res;
+  try {
+    res = await fetchCompanion("/begin-send", {
+      method: "POST",
+      body: JSON.stringify({
+        routeCanonical: journal.routeCanonical,
+        eventId: journal.eventId,
+        reservationId: journal.reservationId,
+      }),
+    });
+  } catch {
+    return { ok: false, reason: "network_unreachable", journal: summarizeProductionJournal(journal) };
+  }
+  if (res.status === 401) {
+    return markAuthStale(res.body?.error || "COMPANION_UNAUTHORIZED");
+  }
+  if (res.status === 409) {
+    return {
+      ok: false,
+      reason: res.body?.error || "begin_send_conflict",
+      status: 409,
+      journal: summarizeProductionJournal(journal),
+    };
+  }
+  if (!res.ok) {
+    return {
+      ok: false,
+      reason: res.body?.error || `http_${res.status}`,
+      status: res.status,
+      journal: summarizeProductionJournal(journal),
+    };
+  }
+  assertNoForbiddenFields(res.body);
+  const body = res.body || {};
+  if (
+    body.eventId !== journal.eventId
+    || body.status !== "claimed"
+    || typeof body.attemptId !== "string"
+    || !body.attemptId
+    || typeof body.message !== "string"
+    || !body.message
+    || typeof body.messageSha256 !== "string"
+    || !body.messageSha256
+  ) {
+    return { ok: false, reason: "begin_send_response_invalid", journal: summarizeProductionJournal(journal) };
+  }
+  // Only a fully validated real /begin-send may mint the SEND_INTENT → CLAIMED proof.
+  productionClaimProof = buildClaimProof({
+    eventId: body.eventId,
+    reservationId: journal.reservationId,
+    attemptId: body.attemptId,
+    message: body.message,
+    messageSha256: body.messageSha256,
+  });
+  if (!productionClaimProof) {
+    return { ok: false, reason: "claim_proof_mint_failed", journal: summarizeProductionJournal(journal) };
+  }
+  return {
+    ok: true,
+    eventId: body.eventId,
+    status: body.status,
+    attemptId: body.attemptId,
+    message: body.message,
+    messageSha256: body.messageSha256,
+  };
+}
+
+/**
+ * E1b3d3b /ack adapter. Only from OBSERVED_PENDING_ACK.
+ * Success must prove eventId + status=observed before CS may clear.
+ */
+async function handleProductionAck(sender, message) {
+  await initPromise;
+  const ownerCheck = requireExactOwnerSender(sender);
+  if (!ownerCheck.ok) return ownerCheck;
+  const gate = requireProtectedTransport();
+  if (!gate.ok) return gate;
+  if (journal.state !== "OBSERVED_PENDING_ACK" || !journal.eventId || !journal.attemptId) {
+    return { ok: false, reason: "journal_not_pending_ack", journal: summarizeProductionJournal(journal) };
+  }
+  if (message?.eventId != null && message.eventId !== journal.eventId) {
+    return { ok: false, reason: "event_id_mismatch" };
+  }
+  if (message?.attemptId != null && message.attemptId !== journal.attemptId) {
+    return { ok: false, reason: "attempt_id_mismatch" };
+  }
+  if (message?.reservationId != null && message.reservationId !== journal.reservationId) {
+    return { ok: false, reason: "reservation_id_mismatch" };
+  }
+
+  let res;
+  try {
+    res = await fetchCompanion("/ack", {
+      method: "POST",
+      body: JSON.stringify({
+        routeCanonical: journal.routeCanonical,
+        eventId: journal.eventId,
+        attemptId: journal.attemptId,
+      }),
+    });
+  } catch {
+    return {
+      ok: false,
+      reason: "network_unreachable",
+      retryAck: true,
+      journal: summarizeProductionJournal(journal),
+    };
+  }
+  if (res.status === 401) {
+    return markAuthStale(res.body?.error || "COMPANION_UNAUTHORIZED");
+  }
+  if (!res.ok) {
+    return {
+      ok: false,
+      reason: res.body?.error || `http_${res.status}`,
+      status: res.status,
+      retryAck: true,
+      journal: summarizeProductionJournal(journal),
+    };
+  }
+  assertNoForbiddenFields(res.body);
+  const body = res.body || {};
+  if (body.eventId !== journal.eventId || body.status !== "observed") {
+    return {
+      ok: false,
+      reason: "ack_response_invalid",
+      retryAck: true,
+      journal: summarizeProductionJournal(journal),
+    };
+  }
+  // Only a fully validated real /ack may mint the OBSERVED_PENDING_ACK → NONE proof.
+  productionAckProof = buildAckProof({
+    eventId: body.eventId,
+    attemptId: journal.attemptId,
+    status: body.status,
+  });
+  if (!productionAckProof) {
+    return {
+      ok: false,
+      reason: "ack_proof_mint_failed",
+      retryAck: true,
+      journal: summarizeProductionJournal(journal),
+    };
+  }
+  return { ok: true, eventId: body.eventId, status: body.status };
+}
+
+/**
+ * E1b3d3b explicit production one-shot send.
+ * Preflight happens on CS before SEND_INTENT. SW only dispatches exact-document RPC.
+ * RPC ambiguity uses durable journal — never memory boolean as crash authority.
+ */
+async function handleProductionSend() {
+  await initPromise;
+  if (productionSendInFlight) {
+    return {
+      ok: false,
+      reason: "production_send_in_flight",
+      retryAllowed: false,
+      journal: summarizeProductionJournal(journal),
+    };
+  }
+  productionSendInFlight = true;
+  try {
+    const gate = requireProtectedTransport();
+    if (!gate.ok) return gate;
+    if (!ownerState.owner) {
+      return { ok: false, reason: "owner_missing" };
+    }
+    const owner = ownerState.owner;
+    const start = canStartProductionSend({
+      owner,
+      transport,
+      journal,
+      latch: sendProbeLatch,
+      productionSendInFlight: false,
+      evidence,
+      now: Date.now(),
+    });
+    if (!start.ok) {
+      return {
+        ok: false,
+        reason: start.reason,
+        retryAllowed: false,
+        journal: summarizeProductionJournal(journal),
+        sendProbeLatch: sendProbeLatch.state,
+      };
+    }
+
+    const request = buildProductionSendExecuteRequest(owner, journal);
+    if (!request.ok) {
+      return { ok: false, reason: request.reason, retryAllowed: false };
+    }
+
+    let response = null;
+    let rpcThrew = false;
+    try {
+      response = await chrome.tabs.sendMessage(
+        request.tabId,
+        request.message,
+        request.sendOptions,
+      );
+    } catch {
+      rpcThrew = true;
+      response = null;
+    }
+
+    const classified = classifyProductionStartRpcResult({
+      response: rpcThrew ? null : response,
+      journalAfter: journal,
+    });
+    if (classified.ok && classified.response) {
+      const r = classified.response;
+      return {
+        ok: true,
+        mode: "production_send",
+        eventId: r.eventId ?? journal.eventId,
+        attemptId: r.attemptId ?? null,
+        journal: summarizeProductionJournal(journal),
+        retryAllowed: false,
+        productionJournal: journal.state,
+      };
+    }
+    return {
+      ok: false,
+      reason: classified.reason,
+      retryAllowed: classified.retryAllowed === true,
+      action: classified.action,
+      journal: summarizeProductionJournal(journal),
+      zeroWrite: classified.zeroWrite === true,
+      zeroClick: classified.zeroClick === true,
+      retryAck: classified.retryAck === true,
+      productionJournal: classified.journalState,
+    };
+  } finally {
+    productionSendInFlight = false;
+  }
+}
+
+/**
+ * E1b3d3b recovery: send-side states go through exact-document production recovery.
+ * Server /state is the upper fact for CLAIMED. Post-mutation fence never write/click.
+ */
+async function recoverProductionSendSide(inFlight) {
+  if (!ownerState.owner) {
+    return { ok: false, reason: "owner_missing", journal: summarizeProductionJournal(journal) };
+  }
+  if (productionSendInFlight) {
+    return {
+      ok: false,
+      reason: "production_send_in_flight",
+      journal: summarizeProductionJournal(journal),
+    };
+  }
+  const owner = ownerState.owner;
+  const safeInFlight = sanitizeInFlightForRecovery(inFlight);
+
+  // Local SEND_INTENT + no server inFlight → SW clears itself; never CS generic CAS.
+  if (journal.state === "SEND_INTENT" && !safeInFlight) {
+    journal = clearJournal();
+    await persistJournal();
+    productionClaimProof = null;
+    productionAckProof = null;
+    return { ok: true, recovered: true, journal: summarizeProductionJournal(journal), action: "clear" };
+  }
+
+  // Local SEND_INTENT + server claimed → mint claim proof so CS adopt CAS has real authority.
+  if (
+    journal.state === "SEND_INTENT"
+    && safeInFlight
+    && safeInFlight.status === "claimed"
+    && safeInFlight.eventId === journal.eventId
+    && safeInFlight.reservationId === journal.reservationId
+    && safeInFlight.attemptId
+  ) {
+    productionClaimProof = buildClaimProof({
+      eventId: journal.eventId,
+      reservationId: journal.reservationId,
+      attemptId: safeInFlight.attemptId,
+      message: safeInFlight.message,
+      messageSha256: safeInFlight.messageSha256,
+    });
+    if (!productionClaimProof) {
+      return {
+        ok: false,
+        reason: "claim_proof_mint_failed",
+        journal: summarizeProductionJournal(journal),
+        zeroWrite: true,
+        zeroClick: true,
+      };
+    }
+  }
+
+  // Local CLAIMED: server is upper fact before any CS resume.
+  if (journal.state === "CLAIMED") {
+    const rec = reconcileClaimedAgainstServer(journal, safeInFlight);
+    if (rec.action === "fail_closed" || rec.action === "conflict") {
+      return {
+        ok: false,
+        reason: rec.reason || "claimed_server_conflict",
+        journal: summarizeProductionJournal(journal),
+        zeroWrite: true,
+        zeroClick: true,
+        action: "block",
+      };
+    }
+    if (rec.action === "adopt_outcome_unknown") {
+      try {
+        journal = markOutcomeUnknown(journal, {
+          attemptId: rec.attemptId,
+          message: rec.message,
+          messageSha256: rec.messageSha256,
+        });
+        await persistJournal();
+      } catch {
+        // already outcome unknown or identity mismatch — fail closed
+      }
+      productionClaimProof = null;
+      productionAckProof = null;
+      return {
+        ok: false,
+        reason: "server_outcome_unknown",
+        journal: summarizeProductionJournal(journal),
+        zeroWrite: true,
+        zeroClick: true,
+        action: "block",
+      };
+    }
+    if (rec.action === "resume" && rec.claimProof) {
+      productionClaimProof = rec.claimProof;
+    }
+    if (rec.action === "ack_only") {
+      // Keep journal CLAIMED; CS recover observe path may still find the turn.
+      // No write/click.
+    }
+  }
+
+  const request = buildProductionRecoverRequest(owner, journal, safeInFlight);
+  if (!request.ok) {
+    return { ok: false, reason: request.reason, journal: summarizeProductionJournal(journal) };
+  }
+  productionSendInFlight = true;
+  try {
+    let response = null;
+    try {
+      response = await chrome.tabs.sendMessage(
+        request.tabId,
+        request.message,
+        request.sendOptions,
+      );
+    } catch {
+      response = null;
+    }
+    if (response == null) {
+      return {
+        ok: false,
+        reason: "production_recover_rpc_failed",
+        journal: summarizeProductionJournal(journal),
+        zeroWrite: true,
+        zeroClick: true,
+      };
+    }
+    return {
+      ok: response.ok === true,
+      reason: response.reason,
+      recovered: response.recovered === true,
+      action: response.action,
+      journal: summarizeProductionJournal(journal),
+      retryAck: response.retryAck === true,
+      zeroWrite: response.zeroWrite === true,
+      zeroClick: response.zeroClick === true,
+      diagnostic: response.diagnostic ?? null,
+    };
+  } finally {
+    productionSendInFlight = false;
+  }
+}
+
+/**
+ * Manual-only outcome_unknown retirement. Zero DOM mutation.
+ * Identity always from durable local journal; popup/CS never supply replaceable identity.
+ * Local clear only after exact server retirement success.
+ */
+async function handleRetireUnknown() {
+  await initPromise;
+  const gate = requireProtectedTransport();
+  if (!gate.ok) return gate;
+  if (journal.state !== "OUTCOME_UNKNOWN") {
+    return {
+      ok: false,
+      reason: "journal_not_outcome_unknown",
+      journal: summarizeProductionJournal(journal),
+      zeroWrite: true,
+      zeroClick: true,
+      beginSendCalled: false,
+      ackCalled: false,
+    };
+  }
+  if (!journal.eventId || !journal.reservationId || !journal.attemptId) {
+    return {
+      ok: false,
+      reason: "journal_identity_missing",
+      journal: summarizeProductionJournal(journal),
+      zeroWrite: true,
+      zeroClick: true,
+      beginSendCalled: false,
+      ackCalled: false,
+    };
+  }
+
+  // Confirm server state before mutating.
+  // - exact outcome_unknown → proceed to /retire-unknown
+  // - inFlight=null → server may already be retired_unknown from a prior
+  //   successful retire whose local clear failed; allow idempotent reconcile
+  //   via /retire-unknown. Never clear local journal on null alone.
+  // - any other non-null inFlight → fail closed.
+  const stateRes = await handleFetchState();
+  if (!stateRes.ok) {
+    return {
+      ok: false,
+      reason: stateRes.reason || "state_fetch_failed",
+      journal: summarizeProductionJournal(journal),
+      zeroWrite: true,
+      zeroClick: true,
+      beginSendCalled: false,
+      ackCalled: false,
+    };
+  }
+  const inFlight = stateRes.status?.inFlight ?? null;
+  if (inFlight != null) {
+    if (
+      inFlight.status !== "outcome_unknown"
+      || inFlight.eventId !== journal.eventId
+      || inFlight.reservationId !== journal.reservationId
+      || inFlight.attemptId !== journal.attemptId
+    ) {
+      return {
+        ok: false,
+        reason: "server_inflight_mismatch",
+        journal: summarizeProductionJournal(journal),
+        zeroWrite: true,
+        zeroClick: true,
+        beginSendCalled: false,
+        ackCalled: false,
+      };
+    }
+  }
+  // inFlight === null: fall through to /retire-unknown as idempotent reconcile.
+  // Exact response validation below is the only authority for local clear.
+
+  let res;
+  try {
+    res = await fetchCompanion("/retire-unknown", {
+      method: "POST",
+      body: JSON.stringify({
+        routeCanonical: journal.routeCanonical,
+        eventId: journal.eventId,
+        reservationId: journal.reservationId,
+        attemptId: journal.attemptId,
+      }),
+    });
+  } catch {
+    return {
+      ok: false,
+      reason: "network_unreachable",
+      journal: summarizeProductionJournal(journal),
+      zeroWrite: true,
+      zeroClick: true,
+      beginSendCalled: false,
+      ackCalled: false,
+    };
+  }
+  if (res.status === 401) {
+    return markAuthStale(res.body?.error || "COMPANION_UNAUTHORIZED");
+  }
+  if (!res.ok) {
+    return {
+      ok: false,
+      reason: res.body?.error || `http_${res.status}`,
+      status: res.status,
+      journal: summarizeProductionJournal(journal),
+      zeroWrite: true,
+      zeroClick: true,
+      beginSendCalled: false,
+      ackCalled: false,
+    };
+  }
+  assertNoForbiddenFields(res.body);
+  const body = res.body || {};
+  if (
+    body.eventId !== journal.eventId
+    || body.reservationId !== journal.reservationId
+    || body.attemptId !== journal.attemptId
+    || body.status !== "retired_unknown"
+  ) {
+    return {
+      ok: false,
+      reason: "retire_response_invalid",
+      journal: summarizeProductionJournal(journal),
+      zeroWrite: true,
+      zeroClick: true,
+      beginSendCalled: false,
+      ackCalled: false,
+    };
+  }
+
+  // Server retirement proven. Clear durable local journal. Rollback on persist failure.
+  const previousJournal = journal;
+  try {
+    journal = clearJournal();
+    await persistJournal();
+  } catch (error) {
+    journal = previousJournal;
+    return {
+      ok: false,
+      reason: "journal_persist_failed",
+      error: String(error?.message || error),
+      journal: summarizeProductionJournal(journal),
+      serverRetired: true,
+      zeroWrite: true,
+      zeroClick: true,
+      beginSendCalled: false,
+      ackCalled: false,
+    };
+  }
+  productionClaimProof = null;
+  productionAckProof = null;
+  return {
+    ok: true,
+    retired: true,
+    eventId: previousJournal.eventId,
+    reservationId: previousJournal.reservationId,
+    attemptId: previousJournal.attemptId,
+    journal: summarizeProductionJournal(journal),
+    zeroWrite: true,
+    zeroClick: true,
+    beginSendCalled: false,
+    ackCalled: false,
+  };
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {

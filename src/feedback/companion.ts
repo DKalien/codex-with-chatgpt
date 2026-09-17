@@ -18,11 +18,13 @@ import {
   recoverStaleFeedback,
   releaseReservation,
   reserveNext,
+  retireOutcomeUnknown,
   type CompanionRecord,
   type FeedbackEvent,
   type FeedbackState,
   type PairingIntent,
 } from "./store.js";
+import { productionFeedbackDelivery } from "./message.js";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -286,19 +288,28 @@ export function companionPublicState(input: {
     && e.targetEpoch === input.ctx.epoch
     && e.targetPrincipalFingerprint === input.ctx.principalFingerprint);
   const events = scoped.map((e) => publicCompanionDeliveryEvent(e));
-  // E1b2 crash/recovery: only this companion's in-flight reservation/claim.
+  // E1b2/E1b3a crash/recovery: this companion's reserved / claimed / outcome_unknown.
   // Never expose reservedBy / principal fingerprint / credential material.
+  // retired_unknown 不是 in-flight：永久退出 single-flight。
   const inflightEvent = scoped.find((e) =>
-    (e.status === "reserved" || e.status === "claimed")
+    (e.status === "reserved" || e.status === "claimed" || e.status === "outcome_unknown")
     && e.reservedBy === input.ctx.companionId);
-  const inFlight = inflightEvent
-    ? {
-        eventId: inflightEvent.eventId,
-        status: inflightEvent.status,
-        ...(inflightEvent.reservationId ? { reservationId: inflightEvent.reservationId } : {}),
-        ...(inflightEvent.attemptId ? { attemptId: inflightEvent.attemptId } : {}),
-      }
-    : null;
+  let inFlight: Record<string, unknown> | null = null;
+  if (inflightEvent) {
+    inFlight = {
+      eventId: inflightEvent.eventId,
+      status: inflightEvent.status,
+      ...(inflightEvent.reservationId ? { reservationId: inflightEvent.reservationId } : {}),
+      ...(inflightEvent.attemptId ? { attemptId: inflightEvent.attemptId } : {}),
+    };
+    // claimed / outcome_unknown：提供 deterministic canonical message，extension 无需自行拼装。
+    if ((inflightEvent.status === "claimed" || inflightEvent.status === "outcome_unknown")
+      && inflightEvent.attemptId) {
+      const delivery = productionFeedbackDelivery(inflightEvent);
+      inFlight.message = delivery.message;
+      inFlight.messageSha256 = delivery.messageSha256;
+    }
+  }
   return {
     workspaceId: state.workspaceId,
     bindingId: input.ctx.bindingId,
@@ -310,6 +321,7 @@ export function companionPublicState(input: {
     reserved: scoped.filter((e) => e.status === "reserved").length,
     claimed: scoped.filter((e) => e.status === "claimed").length,
     outcomeUnknown: scoped.filter((e) => e.status === "outcome_unknown").length,
+    retiredUnknown: scoped.filter((e) => e.status === "retired_unknown").length,
     inFlight,
     events,
   };
@@ -354,6 +366,33 @@ export function companionRelease(input: {
   });
 }
 
+/**
+ * outcome_unknown → retired_unknown：人工显式放弃，永不重发。
+ * 身份/binding/epoch/companion 全部来自 credential context，不信任 caller 提交。
+ */
+export function companionRetireOutcomeUnknown(input: {
+  workspaceId: string;
+  ctx: CompanionAuthContext;
+  routeCanonical: string;
+  eventId: string;
+  reservationId: string;
+  attemptId: string;
+  stateDir?: string;
+}): FeedbackEvent {
+  requireRouteMatch(input.ctx, input.routeCanonical);
+  return retireOutcomeUnknown({
+    workspaceId: input.workspaceId,
+    bindingId: input.ctx.bindingId,
+    epoch: input.ctx.epoch,
+    principalFingerprint: input.ctx.principalFingerprint,
+    companionId: input.ctx.companionId,
+    eventId: input.eventId,
+    reservationId: input.reservationId,
+    attemptId: input.attemptId,
+    stateDir: input.stateDir,
+  });
+}
+
 export function companionBeginSend(input: {
   workspaceId: string;
   ctx: CompanionAuthContext;
@@ -361,15 +400,23 @@ export function companionBeginSend(input: {
   eventId: string;
   reservationId: string;
   stateDir?: string;
-}): { event: FeedbackEvent; attemptId: string } {
+}): { event: FeedbackEvent; attemptId: string; message: string; messageSha256: string } {
   requireRouteMatch(input.ctx, input.routeCanonical);
-  return beginSend({
+  const result = beginSend({
     workspaceId: input.workspaceId,
     ...companionAuthInput(input.ctx),
     eventId: input.eventId,
     reservationId: input.reservationId,
     stateDir: input.stateDir,
   });
+  // claimed 已 durable；message 由 server 唯一生成，browser 不得重拼。
+  const delivery = productionFeedbackDelivery(result.event);
+  return {
+    event: result.event,
+    attemptId: result.attemptId,
+    message: delivery.message,
+    messageSha256: delivery.messageSha256,
+  };
 }
 
 export function companionAckObserved(input: {
@@ -393,7 +440,11 @@ export function companionAckObserved(input: {
       throw new FeedbackError("FEEDBACK_ACK_MISMATCH", "ack 目标绑定不匹配");
     }
     // companion 只能 ACK 自己 reservedBy 发起的 attempt；MCP 直接 claim 的事件不可冒充 ACK。
-    if (event.status === "claimed" || event.status === "observed") {
+    if (
+      event.status === "claimed"
+      || event.status === "observed"
+      || event.status === "outcome_unknown"
+    ) {
       if (event.reservedBy !== input.ctx.companionId) {
         throw new FeedbackError(
           "FEEDBACK_ACK_MISMATCH",
@@ -405,7 +456,15 @@ export function companionAckObserved(input: {
       if (event.attemptId === input.attemptId) return { state, result: event };
       throw new FeedbackError("FEEDBACK_ACK_MISMATCH", "observed 事件 attempt 不匹配");
     }
-    if (event.status !== "claimed" || event.attemptId !== input.attemptId) {
+    // Late positive ACK：outcome_unknown 仅在 exact attempt 归属下闭环；禁止 outcome_unknown → claimed/ready。
+    // retired_unknown 是人工终态：一旦 retire，后续 ACK 必须拒绝。
+    if (event.status === "retired_unknown") {
+      throw new FeedbackError("FEEDBACK_ACK_MISMATCH", "retired 事件不可 ACK");
+    }
+    const isExactClaimAttempt =
+      event.attemptId === input.attemptId
+      && (event.status === "claimed" || event.status === "outcome_unknown");
+    if (!isExactClaimAttempt) {
       throw new FeedbackError("FEEDBACK_ACK_MISMATCH", "ack 身份与 claimed 事件不匹配");
     }
     const observed: FeedbackEvent = {

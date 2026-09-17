@@ -323,13 +323,16 @@ describe("owner proof + journal mutation guards (E1b2 review-fix)", () => {
       markReserveRequested(emptyJournal(), { routeCanonical: ROUTE, bindingId: "b", epoch: 1 }),
     )).toBe(true);
     expect(journalBlocksTransportMutation(
-      markReserved(emptyJournal(), {
-        eventId: "e".repeat(32),
-        reservationId: "r",
-        routeCanonical: ROUTE,
-        bindingId: "b",
-        epoch: 1,
-      }),
+      markReserved(
+        markReserveRequested(emptyJournal(), { routeCanonical: ROUTE, bindingId: "b", epoch: 1 }),
+        {
+          eventId: "e".repeat(32),
+          reservationId: "r",
+          routeCanonical: ROUTE,
+          bindingId: "b",
+          epoch: 1,
+        },
+      ),
     )).toBe(true);
     expect(journalBlocksTransportMutation(
       markReservationRecovery(
@@ -340,9 +343,11 @@ describe("owner proof + journal mutation guards (E1b2 review-fix)", () => {
     expect(journalBlocksTransportMutation(clearJournal())).toBe(false);
   });
 
-  it("source contains no reserve.next direct payload path and no begin-send", () => {
+  it("source contains no reserve.next direct payload path; production send is gated", () => {
     const sw = fs.readFileSync(path.join(projectRoot, "browser-companion", "service-worker.js"), "utf8");
-    expect(sw).not.toMatch(/\/begin-send/);
+    // E1b3d3b: SW owns production /begin-send after explicit popup gate.
+    expect(sw).toMatch(/c2c\.production\.send\.request/);
+    expect(sw).toMatch(/production_send_payload_forbidden/);
     expect(sw).not.toMatch(/c2c\.reserve\.next/);
     expect(sw).toMatch(/c2c\.reserve\.page/);
     expect(sw).toMatch(/storageProtected/);
@@ -351,13 +356,16 @@ describe("owner proof + journal mutation guards (E1b2 review-fix)", () => {
 });
 
 describe("E1b2 recovery / authStale / storage policy (final closeout)", () => {
-  const reserved = markReserved(emptyJournal(), {
-    eventId: "e".repeat(32),
-    reservationId: "res-1",
-    routeCanonical: ROUTE,
-    bindingId: "b",
-    epoch: 1,
-  });
+  const reserved = markReserved(
+    markReserveRequested(emptyJournal(), { routeCanonical: ROUTE, bindingId: "b", epoch: 1 }),
+    {
+      eventId: "e".repeat(32),
+      reservationId: "res-1",
+      routeCanonical: ROUTE,
+      bindingId: "b",
+      epoch: 1,
+    },
+  );
 
   it("RESERVED + /state no inFlight => clear to NONE", () => {
     const rec = reconcileReservedJournal(reserved, null);
@@ -489,25 +497,107 @@ describe("E1b2 recovery / authStale / storage policy (final closeout)", () => {
   });
 });
 
-describe("extension static safety (E1b2)", () => {
-  it("no /begin-send, no beginSend, no SEND_INTENT in extension sources", () => {
-    const root = path.join(projectRoot, "browser-companion");
+describe("extension static safety (E1b2 + E1b3a)", () => {
+  const root = path.join(projectRoot, "browser-companion");
+
+  function listJsFiles(dir: string): string[] {
     const files: string[] = [];
-    const walk = (dir: string) => {
-      for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-        const p = path.join(dir, e.name);
+    const walk = (d: string) => {
+      for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+        const p = path.join(d, e.name);
         if (e.isDirectory()) walk(p);
         else if (/\.js$/.test(e.name)) files.push(p);
       }
     };
-    walk(root);
+    walk(dir);
+    return files;
+  }
+
+  it("orchestration sources keep CS free of Bridge HTTP / journal authority", () => {
+    // E1b3d3b: SW owns production Bridge HTTP; CS is DI shell only.
+    const cs = fs.readFileSync(path.join(root, "content-script.js"), "utf8");
+    expect(cs).not.toMatch(/\/begin-send/);
+    expect(cs).not.toMatch(/\bbeginSend\s*\(/);
+    expect(cs).not.toMatch(/\/ack\b/);
+    expect(cs).not.toMatch(/SEND_INTENT/);
+    expect(cs).not.toMatch(/COMPOSER_WRITE_INTENT/);
+    expect(cs).not.toMatch(/SEND_DISPATCH_INTENT/);
+    expect(cs).not.toMatch(/dispatchEvent\(\s*new\s+(?:InputEvent|Event)\(/);
+    expect(cs).not.toMatch(/\.click\(\)/);
+    expect(cs).not.toMatch(/form\.submit/);
+    expect(cs).not.toMatch(/requestSubmit/);
+    expect(cs).not.toMatch(/KeyboardEvent/);
+    expect(cs).not.toMatch(/scripting/);
+    expect(cs).not.toMatch(/debugger/);
+    expect(cs).not.toMatch(/nativeMessaging/);
+    expect(cs).not.toMatch(/fetch\(/);
+    expect(cs).not.toMatch(/chrome\.tabs\.sendMessage/);
+
+    const dom = fs.readFileSync(path.join(root, "dom-adapter.js"), "utf8");
+    expect(dom).not.toMatch(/\/begin-send/);
+    expect(dom).not.toMatch(/\bbeginSend\b/);
+    expect(dom).not.toMatch(/\/ack\b/);
+    expect(dom).not.toMatch(/SEND_INTENT/);
+    expect(dom).not.toMatch(/COMPOSER_WRITE_INTENT/);
+    expect(dom).not.toMatch(/SEND_DISPATCH_INTENT/);
+    expect(dom).not.toMatch(/\.click\(\)/);
+
+    const shadow = fs.readFileSync(path.join(root, "shadow-evidence.js"), "utf8");
+    expect(shadow).not.toMatch(/\/begin-send/);
+    expect(shadow).not.toMatch(/\bbeginSend\b/);
+    expect(shadow).not.toMatch(/\/ack\b/);
+    expect(shadow).not.toMatch(/SEND_INTENT/);
+    expect(shadow).not.toMatch(/\.click\(\)/);
+  });
+
+  it("pure journal may define E1b3 states but still has no network/DOM side effects", () => {
+    const journal = fs.readFileSync(path.join(root, "reservation-journal.js"), "utf8");
+    expect(journal).toMatch(/SEND_INTENT/);
+    expect(journal).toMatch(/CLAIMED/);
+    expect(journal).toMatch(/COMPOSER_WRITE_INTENT/);
+    expect(journal).toMatch(/SEND_DISPATCH_INTENT/);
+    expect(journal).toMatch(/OBSERVED_PENDING_ACK/);
+    expect(journal).toMatch(/OUTCOME_UNKNOWN/);
+    expect(journal).toMatch(/reconcileSendJournal/);
+    // Pure module: no fetch, no chrome, no DOM.
+    expect(journal).not.toMatch(/\bfetch\s*\(/);
+    expect(journal).not.toMatch(/chrome\./);
+    expect(journal).not.toMatch(/document\./);
+    expect(journal).not.toMatch(/\/begin-send/);
+    expect(journal).not.toMatch(/\.click\(\)/);
+  });
+
+  it("other extension modules still free of begin-send/ack/SEND_INTENT", () => {
+    const files = listJsFiles(root);
     expect(files.length).toBeGreaterThan(3);
+    // E1b3b/E1b3c/E1b3d3b capability modules may name send/beginSend; runtime-unreachable from classic CS except production classic.
+    const capability = new Set([
+      "reservation-journal.js",
+      "send-adapter.js",
+      "turn-observer.js",
+      "send-orchestrator.js",
+      "production-send.js",
+      "production-send-runtime.js",
+      "production-send-runtime-global.js",
+      "service-worker.js",
+      // E1b3d3b CS production DI shell wires beginSend/persist/ack names to SW RPC only.
+      "content-script.js",
+    ]);
     for (const f of files) {
+      if (capability.has(path.basename(f))) continue;
       const text = fs.readFileSync(f, "utf8");
       expect(text).not.toMatch(/\/begin-send/);
       expect(text).not.toMatch(/\bbeginSend\b/);
       expect(text).not.toMatch(/SEND_INTENT/);
       expect(text).not.toMatch(/\/ack\b/);
     }
+  });
+
+  it("journal send-side recovery never returns second DOM mutation actions", () => {
+    // Structural lock: POST_MUTATION_FENCE_STATES is non-empty and includes COMPOSER_WRITE_INTENT+.
+    const journal = fs.readFileSync(path.join(root, "reservation-journal.js"), "utf8");
+    expect(journal).toMatch(/POST_MUTATION_FENCE_STATES/);
+    expect(journal).toMatch(/retry_begin_send/);
+    expect(journal).toMatch(/post_mutation_fence/);
   });
 });
