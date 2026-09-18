@@ -706,12 +706,13 @@ G 阶段聚焦用户体验与跨设备日常闭环，不再扩展 recovery 状�
 - 本阶段不改 Skill Activation、MCP `workspace_info`、Connector schema、Browser Companion。
 - 路线：G1a 收口 → **G1b** Skill Activation 一次 readiness 只补缺失步骤（不得因 ready_local 跳过 web verification；恢复 Project chat 必须用 thread-aware URL projection，不得复用全局 `session.url`）→ G2 readiness 投影到 `workspace_info` → G3 跨设备从零 E2E。
 
-- **G1a NEXT_EXPECTED_STEP**：G1b — Skill Activation consumes workflow readiness；thread chat URL 须走 bounded thread-aware projection，Skill 不遍历 fingerprint map。
+- **G1a 已合入** `51cbe81`。
 
-### G1b — Skill Activation consumes workflow readiness（本轮，uncommitted）
+### G1b — Skill Activation consumes workflow readiness（已合入）
 
-- `c2c session --json` 新增只读 `threadConversation`（`resolveThreadConversation`）：Project `chatUrl` 仅来自 `projectChats` same_thread；禁止 `session.url` fallback。
-- Activation 第一事实源改为 `c2c workflow status`；`overall`/`nextAction` 直接分流；state-changing 后 bounded reread，禁止循环。
-- `ready_local/reuse` 与 `ready_remote/use_remote` 均不调用 bind-current；仍强制 request-scoped `workspace_info` + actual request `desktopCompatibility` + Connector schema check。
-- `needs_desktop_bind/bind_current` 仅在 web verification 后执行 `desktop bind-current`。
-- 本轮不 commit / push；等待 independent review。
+- `c2c session --json` 只读 `threadConversation`：Project `chatUrl` 仅来自 `projectChats` same_thread；禁止 `session.url` fallback。
+- Activation 第一事实源为 `c2c workflow status`；`overall`/`nextAction` 分流；state-changing 后 bounded reread。
+- `ready_local/reuse` 与 `ready_remote/use_remote` 不调用 bind-current；仍强制 request-scoped verification。
+- Connector migration / Conversation Rebind 成功后 rerun `c2c workflow status`；仅 `nextAction=bind_current` 时才 Desktop bind-current。
+
+- **NEXT_EXPECTED_STEP**：**G2 — readiness projection into workspace_info**。ChatGPT 新对话仅通过 request-scoped `workspace_info` 即可获得 bounded workflow readiness，用户无需手工搬 workspace/thread/binding ID。
