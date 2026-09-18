@@ -78,6 +78,19 @@ function issue(code: ReleaseReferenceIssueCode, source: string, message: string)
   return { code, source, message };
 }
 
+const runtimeFileBaseSchema = z.object({
+  service: z.string().min(1),
+  version: z.string().min(1),
+  workspaceId: z.string().regex(WORKSPACE_ID),
+  workspaceRoot: z.string().refine(path.isAbsolute),
+  pid: z.number().int(),
+  port: z.number().int().min(1).max(65535),
+  adminToken: z.string().min(1),
+  publicUrl: z.string().url().nullable(),
+  startedAt: z.string().datetime(),
+  runtimeBuildId: z.string().optional(),
+}).strict();
+
 const runtimeFileSchema = z.object({
   service: z.string().min(1),
   version: z.string().min(1),
@@ -150,23 +163,50 @@ function collectRuntime(stateDir: string, graph: ReleaseReferenceGraph): void {
         graph.issues.push(issue("runtime_corrupt", source, "runtime 状态非 canonical regular file"));
         continue;
       }
-      const parsed = runtimeFileSchema.parse(JSON.parse(fs.readFileSync(file, "utf8")));
-      if (parsed.workspaceId !== workspaceId) {
+      let rawJson: unknown;
+      try {
+        rawJson = JSON.parse(fs.readFileSync(file, "utf8"));
+      } catch {
+        graph.issues.push(issue("runtime_corrupt", source, "runtime 状态损坏或 JSON 无效"));
+        continue;
+      }
+      const base = runtimeFileBaseSchema.safeParse(rawJson);
+      if (!base.success) {
+        graph.issues.push(issue("runtime_corrupt", source, "runtime 状态 schema 无效"));
+        continue;
+      }
+      if (base.data.workspaceId !== workspaceId) {
         graph.issues.push(issue("runtime_identity_mismatch", source, "runtime 文件名与 workspaceId 不一致"));
         continue;
       }
-      if (new Workspace(parsed.workspaceRoot).id !== workspaceId) {
+      if (new Workspace(base.data.workspaceRoot).id !== workspaceId) {
         graph.issues.push(issue("runtime_identity_mismatch", source, "workspaceRoot 与 workspaceId 不匹配"));
+        continue;
+      }
+      const rb = base.data.runtimeBuildId;
+      if (rb === undefined) {
+        // 字段不存在 = legacy missing；仍 global fail-closed。
+        graph.issues.push(issue("runtime_missing_build_id", source, "runtime 状态缺少 runtimeBuildId"));
+        continue;
+      }
+      if (typeof rb !== "string" || !HEX64.test(rb)) {
+        // "" / null-like / malformed / non-lowercase-hex → corrupt，不是 legacy missing。
+        graph.issues.push(issue("runtime_corrupt", source, "runtimeBuildId malformed"));
+        continue;
+      }
+      const parsed = runtimeFileSchema.safeParse(rawJson);
+      if (!parsed.success) {
+        graph.issues.push(issue("runtime_corrupt", source, "runtime 状态 schema 无效"));
         continue;
       }
       addReference(graph, {
         kind: "runtime",
-        buildId: parsed.runtimeBuildId,
+        buildId: parsed.data.runtimeBuildId,
         source: `runtime:${workspaceId}`,
         workspaceId,
       });
     } catch {
-      graph.issues.push(issue("runtime_corrupt", source, "runtime 状态损坏、schema 无效或缺少 runtimeBuildId"));
+      graph.issues.push(issue("runtime_corrupt", source, "runtime 状态读取失败"));
     }
   }
 }

@@ -89,6 +89,7 @@ import { registerFeedbackProbeCommands } from "./feedback-probe.js";
 import { isWriteProbeEnabled, readWriteProbeStatus, WRITE_PROBE_SCOPE } from "../mcp/write-probe.js";
 import { registerDesktopCommands } from "./desktop.js";
 import { registerWorkflowCommands } from "./workflow.js";
+import { registerRuntimePruneCommands } from "./runtime-prune.js";
 import { rollout } from "../core/rollout.js";
 import { readRuntimeUpgrade } from "../core/upgrade.js";
 import { planGc, gcPlanSummary } from "../core/gc-plan.js";
@@ -195,6 +196,7 @@ ptf.command("run").requiredOption("-w, --workspace <path>").action(async (opts: 
 registerRemoteCommands(program);
 registerDesktopCommands(program);
 registerWorkflowCommands(program);
+registerRuntimePruneCommands(program);
 registerFeedbackProbeCommands(program);
 
 const say = (msg: string): void => {
