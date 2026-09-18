@@ -43,8 +43,24 @@ import {
   findCanonicalUserTurn,
   buildTurnObservationDiagnostic,
   sanitizeObservationDiagnostic,
+  buildMarkerRepresentationDiagnostic,
+  sanitizeMarkerRepresentation,
   TURN_DIAGNOSTIC_LIMITS,
 } from "../browser-companion/turn-observer.js";
+import {
+  hasExactAttemptMarker,
+  findCanonicalUserTurn,
+  buildTurnObservationDiagnostic,
+  sanitizeObservationDiagnostic,
+  buildMarkerRepresentationDiagnostic,
+  sanitizeMarkerRepresentation,
+  TURN_DIAGNOSTIC_LIMITS,
+  collectBoundedDescendants,
+  canonicalTurnBodyMatch,
+  hasExactVisibleBodyDescendant,
+  snapshotUserTurns,
+} from "../browser-companion/turn-observer.js";
+import { normalizeCanonicalDomText } from "../browser-companion/dom-adapter.js";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const companionRoot = path.join(projectRoot, "browser-companion");
@@ -2465,5 +2481,480 @@ describe("E1b3d3b server-observed local closeout", () => {
     expect(js).toMatch(/zeroClick=\$\{/);
     expect(js).toMatch(/journal\.state=\$\{/);
     expect(js).toMatch(/ok=\$\{/);
+  });
+});
+
+describe("E1b3d3b2 marker representation diagnostic", () => {
+  function makeUserNode(opts: {
+    innerText?: string;
+    textContent?: string;
+    children?: unknown[];
+  }) {
+    const children = opts.children ?? [];
+    return {
+      innerText: opts.innerText ?? "",
+      textContent: opts.textContent !== undefined ? opts.textContent : (opts.innerText ?? ""),
+      children,
+      getAttribute: (n: string) => (n === "data-message-author-role" ? "user" : null),
+      querySelector: () => null,
+      closest: () => null,
+    };
+  }
+
+  function docWithNodes(nodes: unknown[]) {
+    return {
+      querySelectorAll: () => nodes,
+    } as never;
+  }
+
+  it("A. parent has extra UI chars, child exact → observed via message-body fallback", () => {
+    // MESSAGE has trailing newline in source; normalize first for fake DOM.
+    const canonical = MESSAGE.replace(/\n+$/, "") + "\n";
+    const child = makeUserNode({ innerText: canonical, textContent: canonical });
+    const parent = makeUserNode({
+      innerText: `${canonical}Copy\nShare`,
+      textContent: `${canonical}Copy\nShare`,
+      children: [child],
+    });
+    const rec = findCanonicalUserTurn(docWithNodes([parent]), {
+      message: canonical,
+      attemptId: ATTEMPT,
+      baseline: [],
+    });
+    expect(rec.ok).toBe(true);
+    const rep = (rec as { diagnostic?: { representation?: Record<string, unknown> } })
+      .diagnostic?.representation;
+    expect(rep).toBeTruthy();
+    expect(rep?.exactInnerTextDescendantCount).toBe(1);
+    expect(rep?.exactTextContentDescendantCount).toBe(1);
+    expect(rep?.markerInnerTextExact).toBe(false);
+    expect(rep?.markerTextContentExact).toBe(false);
+    expect(rep?.markerCandidateNormalizedLength).toBeGreaterThan(0);
+  });
+
+  it("B. innerText mismatch vs textContent exact on parent", () => {
+    const canonical = MESSAGE.replace(/\n+$/, "") + "\n";
+    const node = makeUserNode({
+      innerText: `${canonical}Chrome`,
+      textContent: canonical,
+    });
+    const turns = [
+      { text: normalizeCanonicalDomText(node.innerText), node },
+    ];
+    const rep = buildMarkerRepresentationDiagnostic({
+      message: canonical,
+      attemptId: ATTEMPT,
+      turns,
+    });
+    expect(rep).toBeTruthy();
+    expect(rep?.markerInnerTextExact).toBe(false);
+    expect(rep?.markerTextContentExact).toBe(true);
+  });
+
+  it("C. small char delta → length delta + prefix/suffix counts", () => {
+    const canonical = "AAA\nATTEMPT_ID: 22222222-2222-4222-8222-222222222222\nBBB\n";
+    const withExtra = "AAA\nATTEMPT_ID: 22222222-2222-4222-8222-222222222222\nBBB\nXXX";
+    const node = makeUserNode({ innerText: withExtra, textContent: withExtra });
+    const turns = [{ text: normalizeCanonicalDomText(withExtra), node }];
+    const rep = buildMarkerRepresentationDiagnostic({
+      message: canonical,
+      attemptId: "22222222-2222-4222-8222-222222222222",
+      turns,
+    });
+    expect(rep).toBeTruthy();
+    expect(rep?.innerLengthDelta).toBe(3);
+    expect(rep?.textContentLengthDelta).toBe(3);
+    expect(rep?.innerCommonPrefixLength).toBeGreaterThan(0);
+    expect(rep?.innerCommonSuffixLength).toBe(0);
+  });
+
+  it("D. 0 or >1 marker candidates → representation null (fail closed)", () => {
+    const canonical = MESSAGE.replace(/\n+$/, "") + "\n";
+    const node = makeUserNode({ innerText: "no marker here" });
+    expect(buildMarkerRepresentationDiagnostic({
+      message: canonical,
+      attemptId: ATTEMPT,
+      turns: [{ text: "no marker here", node }],
+    })).toBeNull();
+    const n1 = makeUserNode({ innerText: canonical });
+    const n2 = makeUserNode({ innerText: canonical });
+    expect(buildMarkerRepresentationDiagnostic({
+      message: canonical,
+      attemptId: ATTEMPT,
+      turns: [
+        { text: normalizeCanonicalDomText(canonical), node: n1 },
+        { text: normalizeCanonicalDomText(canonical), node: n2 },
+      ],
+    })).toBeNull();
+  });
+
+  it("E/A-review. >1000 descendants: DOM access hard-capped at 64, not just result array", () => {
+    const canonical = MESSAGE.replace(/\n+$/, "") + "\n";
+    const readIds = new Set<number>();
+    const maxDesc = TURN_DIAGNOSTIC_LIMITS.maxDescendantsScanned;
+    const many = Array.from({ length: 1200 }, (_, i) => ({
+      get innerText() {
+        readIds.add(i);
+        return `child-${i}`;
+      },
+      get textContent() {
+        readIds.add(i);
+        return `child-${i}`;
+      },
+      children: [] as unknown[],
+    }));
+    const parent = makeUserNode({
+      innerText: canonical,
+      textContent: canonical,
+      children: many,
+    });
+    const rep = buildMarkerRepresentationDiagnostic({
+      message: canonical,
+      attemptId: ATTEMPT,
+      turns: [{ text: normalizeCanonicalDomText(canonical), node: parent }],
+    });
+    expect(rep?.descendantScannedCount).toBe(maxDesc);
+    expect(rep?.descendantScannedCount).toBeLessThanOrEqual(64);
+    // Real DOM access bound: node id >= 64 must never be read.
+    expect(readIds.size).toBeGreaterThan(0);
+    expect(readIds.size).toBeLessThanOrEqual(maxDesc);
+    for (const id of readIds) {
+      expect(id).toBeLessThan(maxDesc);
+    }
+    expect(readIds.has(64)).toBe(false);
+    expect(readIds.has(999)).toBe(false);
+  });
+
+  it("B-review. descendant innerText empty + textContent exact → independent counts", () => {
+    const canonical = MESSAGE.replace(/\n+$/, "") + "\n";
+    const child = {
+      get innerText() {
+        return "";
+      },
+      get textContent() {
+        return canonical;
+      },
+      children: [],
+    };
+    const parent = makeUserNode({
+      innerText: `${canonical}Copy`,
+      textContent: `${canonical}Copy`,
+      children: [child],
+    });
+    const rep = buildMarkerRepresentationDiagnostic({
+      message: canonical,
+      attemptId: ATTEMPT,
+      turns: [{ text: normalizeCanonicalDomText(parent.innerText), node: parent }],
+    });
+    expect(rep?.exactInnerTextDescendantCount).toBe(0);
+    expect(rep?.exactTextContentDescendantCount).toBe(1);
+  });
+
+  it("C-review. descendant innerText exact + textContent mismatch → reverse counts", () => {
+    const canonical = MESSAGE.replace(/\n+$/, "") + "\n";
+    const child = {
+      get innerText() {
+        return canonical;
+      },
+      get textContent() {
+        return `${canonical}EXTRA`;
+      },
+      children: [],
+    };
+    const parent = makeUserNode({
+      innerText: `${canonical}Copy`,
+      textContent: `${canonical}Copy`,
+      children: [child],
+    });
+    const rep = buildMarkerRepresentationDiagnostic({
+      message: canonical,
+      attemptId: ATTEMPT,
+      turns: [{ text: normalizeCanonicalDomText(parent.innerText), node: parent }],
+    });
+    expect(rep?.exactInnerTextDescendantCount).toBe(1);
+    expect(rep?.exactTextContentDescendantCount).toBe(0);
+  });
+
+  it("F. sanitizer strips raw text/DOM/credential", () => {
+    const safe = sanitizeMarkerRepresentation({
+      markerCandidateIndex: 0,
+      markerInnerTextExact: false,
+      markerTextContentExact: true,
+      message: MESSAGE,
+      html: "<div>secret</div>",
+      credential: "x",
+      documentId: "d",
+      tabId: 1,
+    });
+    expect(safe).toBeTruthy();
+    expect((safe as Record<string, unknown>).message).toBeUndefined();
+    expect((safe as Record<string, unknown>).html).toBeUndefined();
+    expect((safe as Record<string, unknown>).credential).toBeUndefined();
+    expect(safe?.markerCandidateIndex).toBe(0);
+    expect(safe?.markerTextContentExact).toBe(true);
+    const dump = JSON.stringify(sanitizeObservationDiagnostic({
+      candidateCount: 1,
+      representation: {
+        exactInnerTextDescendantCount: 1,
+        markerInnerTextExact: false,
+        text: MESSAGE,
+        message: MESSAGE,
+      },
+    }));
+    expect(dump).not.toContain(MESSAGE);
+    expect(dump).not.toContain("ATTEMPT_ID");
+  });
+
+  it("G. production recovery zero-mutation contracts unchanged", () => {
+    const sw = fs.readFileSync(path.join(companionRoot, "service-worker.js"), "utf8");
+    const tickStart = sw.indexOf("async function maybeRunAutonomyTick");
+    const tickEnd = sw.indexOf("async function handleProductionSend", tickStart);
+    const tick = sw.slice(tickStart, tickEnd);
+    expect(tick).toMatch(/planAutonomyTick/);
+    expect(tick).not.toMatch(/handleRetireUnknown/);
+    const orch = fs.readFileSync(path.join(companionRoot, "send-orchestrator.js"), "utf8");
+    expect(orch).toMatch(/sanitizeMarkerRepresentationLocal|representation/);
+  });
+
+  it("review. turn-observer uses bounded children BFS, not querySelectorAll(*)", () => {
+    const src = fs.readFileSync(path.join(companionRoot, "turn-observer.js"), "utf8");
+    expect(src).toMatch(/collectBoundedDescendants/);
+    expect(src).toMatch(/maxDescendantsScanned/);
+    // Representation path must not use unbounded selector scan.
+    const start = src.indexOf("export function buildMarkerRepresentationDiagnostic");
+    const end = src.indexOf("export function sanitizeMarkerRepresentation");
+    const body = src.slice(start, end);
+    expect(body).toMatch(/collectBoundedDescendants/);
+    expect(body).not.toMatch(/querySelectorAll\("\*"\)/);
+    expect(body).not.toMatch(/rawInnerTextOf\(d\) \|\| rawTextContentOf/);
+  });
+});
+
+describe("E1b3d3b2 exact message-body observation", () => {
+  const canonical = normalizeCanonicalDomText(MESSAGE);
+
+  function userNode(opts: {
+    innerText?: string;
+    textContent?: string;
+    children?: unknown[];
+    role?: string;
+  }) {
+    return {
+      innerText: opts.innerText ?? "",
+      textContent: opts.textContent !== undefined ? opts.textContent : (opts.innerText ?? ""),
+      children: opts.children ?? [],
+      getAttribute: (n: string) =>
+        n === "data-message-author-role" ? (opts.role ?? "user") : n === "data-testid" ? "conversation-turn" : null,
+      closest: () => null,
+    };
+  }
+
+  function docOf(nodes: unknown[]) {
+    return { querySelectorAll: () => nodes } as never;
+  }
+
+  it("A. parent exact fast path still succeeds", () => {
+    const parent = userNode({ innerText: canonical, textContent: canonical });
+    const rec = findCanonicalUserTurn(docOf([parent]), {
+      message: MESSAGE,
+      attemptId: ATTEMPT,
+      baseline: [],
+    });
+    expect(rec.ok).toBe(true);
+  });
+
+  it("B. live-like parent + 2 exact nested descendants → one turn, not ambiguous", () => {
+    const chrome = `${canonical}Copy`;
+    const child1 = userNode({ innerText: canonical });
+    const child2 = userNode({ innerText: canonical });
+    const parent = userNode({
+      innerText: chrome,
+      textContent: chrome,
+      children: [child1, child2],
+    });
+    const rec = findCanonicalUserTurn(docOf([parent]), {
+      message: MESSAGE,
+      attemptId: ATTEMPT,
+      baseline: [],
+    });
+    expect(rec.ok).toBe(true);
+  });
+
+  it("C. three exact descendants in one user turn still count as one match", () => {
+    const kids = Array.from({ length: 3 }, () => userNode({ innerText: canonical }));
+    const parent = userNode({
+      innerText: `${canonical}UI`,
+      children: kids,
+    });
+    const rec = findCanonicalUserTurn(docOf([parent]), {
+      message: MESSAGE,
+      attemptId: ATTEMPT,
+      baseline: [],
+    });
+    expect(rec.ok).toBe(true);
+  });
+
+  it("D. two different user turns each with exact body → ambiguous", () => {
+    const makeTurn = () => {
+      const child = userNode({ innerText: canonical });
+      return userNode({
+        innerText: `${canonical}UI`,
+        children: [child],
+      });
+    };
+    const rec = findCanonicalUserTurn(docOf([makeTurn(), makeTurn()]), {
+      message: MESSAGE,
+      attemptId: ATTEMPT,
+      baseline: [],
+    });
+    expect(rec.ok).toBe(false);
+    expect(rec.reason).toBe("ambiguous");
+  });
+
+  it("E. descendant textContent exact but innerText not → not_observed", () => {
+    const child = {
+      innerText: "",
+      textContent: canonical,
+      children: [],
+      getAttribute: (n: string) => (n === "data-message-author-role" ? "user" : null),
+    };
+    const parent = userNode({
+      innerText: `${canonical}UI`,
+      textContent: `${canonical}UI`,
+      children: [child],
+    });
+    const rec = findCanonicalUserTurn(docOf([parent]), {
+      message: MESSAGE,
+      attemptId: ATTEMPT,
+      baseline: [],
+    });
+    expect(rec.ok).toBe(false);
+    expect(rec.reason).toBe("not_observed");
+  });
+
+  it("F. parent without exact ATTEMPT marker → not_observed even if child exact", () => {
+    const noMarker = "STATE: EXECUTED\nBODY\n";
+    const child = userNode({ innerText: canonical });
+    const parent = userNode({
+      innerText: `${noMarker}UI`,
+      children: [child],
+    });
+    const rec = findCanonicalUserTurn(docOf([parent]), {
+      message: MESSAGE,
+      attemptId: ATTEMPT,
+      baseline: [],
+    });
+    expect(rec.ok).toBe(false);
+    expect(rec.reason).toBe("not_observed");
+  });
+
+  it("G. exact descendant beyond 64th visit → not_observed, no unbounded scan", () => {
+    const maxDesc = TURN_DIAGNOSTIC_LIMITS.maxDescendantsScanned;
+    const readIds = new Set<number>();
+    const kids = Array.from({ length: 200 }, (_, i) => ({
+      get innerText() {
+        readIds.add(i);
+        return i === maxDesc + 10 ? canonical : `x-${i}`;
+      },
+      get textContent() {
+        readIds.add(i);
+        return i === maxDesc + 10 ? canonical : `x-${i}`;
+      },
+      children: [] as unknown[],
+    }));
+    const parent = userNode({
+      innerText: `${canonical}UI`,
+      children: kids,
+    });
+    // Parent marker is exact (canonical includes ATTEMPT_ID).
+    expect(hasExactAttemptMarker(parent.innerText, ATTEMPT).ok).toBe(true);
+    const rec = findCanonicalUserTurn(docOf([parent]), {
+      message: MESSAGE,
+      attemptId: ATTEMPT,
+      baseline: [],
+    });
+    expect(rec.ok).toBe(false);
+    expect(rec.reason).toBe("not_observed");
+    expect(readIds.has(maxDesc + 10)).toBe(false);
+  });
+
+  it("H. baseline excludes same parent turn identity even with exact descendant", () => {
+    const child = userNode({ innerText: canonical });
+    const parent = userNode({
+      innerText: `${canonical}UI`,
+      children: [child],
+      getAttribute: (n: string) =>
+        n === "data-message-author-role" ? "user" : n === "data-turn-id" ? "turn-1" : null,
+    });
+    const turns = snapshotUserTurns(docOf([parent]));
+    const rec = findCanonicalUserTurn(docOf([parent]), {
+      message: MESSAGE,
+      attemptId: ATTEMPT,
+      baseline: turns,
+    });
+    expect(rec.ok).toBe(false);
+    expect(rec.reason).toBe("not_observed");
+  });
+
+  it("I. assistant turn never succeeds", () => {
+    const child = userNode({ innerText: canonical });
+    const assistant = userNode({
+      innerText: `${canonical}UI`,
+      children: [child],
+      role: "assistant",
+    });
+    const rec = findCanonicalUserTurn(docOf([assistant]), {
+      message: MESSAGE,
+      attemptId: ATTEMPT,
+      baseline: [],
+    });
+    expect(rec.ok).toBe(false);
+  });
+
+  it("J. late-positive recovery: UI chrome parent + exact innerText body → ACK path zero mutation", async () => {
+    const child = userNode({ innerText: canonical });
+    const parent = userNode({
+      innerText: `${canonical}Copy`,
+      children: [child],
+    });
+    const doc = docOf([parent]);
+    const spy = makeSpies({
+      journal: markOutcomeUnknown(claimedJournal(), {}),
+      inFlight: {
+        status: "outcome_unknown",
+        eventId: EVENT_ID,
+        reservationId: RES_ID,
+        attemptId: ATTEMPT,
+        message: MESSAGE,
+        messageSha256: MESSAGE_SHA,
+      },
+      findCanonicalUserTurn: (d: unknown, input: unknown) =>
+        findCanonicalUserTurn(doc, input as never),
+    });
+    const r = await recoverProductionSend(spy);
+    expect(r.ok).toBe(true);
+    expect(r.action).toBe("late_positive_observed_then_acked");
+    expect(spy.calls.write).toBe(0);
+    expect(spy.calls.click).toBe(0);
+    expect(spy.calls.beginSend).toBe(0);
+    expect(spy.calls.ack).toBe(1);
+    expect(spy.journal.state).toBe("NONE");
+    expect(r.zeroWrite).toBe(true);
+    expect(r.zeroClick).toBe(true);
+  });
+
+  it("source stays full-equality: no substring/trim authority", () => {
+    const src = fs.readFileSync(path.join(companionRoot, "turn-observer.js"), "utf8");
+    const bodyStart = src.indexOf("export function canonicalTurnBodyMatch");
+    const bodyEnd = src.indexOf("export function findCanonicalUserTurn");
+    const body = src.slice(bodyStart, bodyEnd);
+    expect(body).toMatch(/turn\.text === want/);
+    expect(body).toMatch(/hasExactAttemptMarker\(turn\.text, attemptId\)/);
+    expect(body).toMatch(/hasExactVisibleBodyDescendant/);
+    expect(body).not.toMatch(/includes\(want\)|startsWith|endsWith|\.trim\(\)/);
+    const findStart = src.indexOf("export function findCanonicalUserTurn");
+    const findBody = src.slice(findStart, findStart + 2000);
+    expect(findBody).toMatch(/canonicalTurnBodyMatch/);
+    expect(findBody).not.toMatch(/includes\(want\)|startsWith\(want\)/);
   });
 });

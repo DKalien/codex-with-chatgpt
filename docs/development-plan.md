@@ -648,3 +648,11 @@ counts 契约兼容。
 - Popup Recover：结构化 `ok/reason/action/zeroWrite/zeroClick/journal.*` + bounded diagnostic（无 message/credential）
 - **Core deployed**：workspace `codex-with-chatgpt` build `6349ad98…`；live server event `observed`
 - 详细终态见 [phase-e-feedback.md](phase-e-feedback.md)
+
+## Phase E1b3d3b2 autonomy + exact message-body observation（2026-09-18，现役 code）
+
+- Autonomy：默认 OFF；shadow 只读；armed 心跳调度 + journal-first recovery + durable cooldown + RESERVED continuation（不二次 reserve）
+- Exact body observation：parent exact 或 parent ATTEMPT + ≤64 descendant **innerText full equality**；无 fuzzy/textContent authority
+- Bounded diagnostics：heartbeat / evidence / recovery / DOM representation（allowlist，无 raw text/credential）
+- Live ARMED E2E 曾自动发送成功；当前 extension 收口待 review + Reload
+- 详见 [phase-e-feedback.md](phase-e-feedback.md)

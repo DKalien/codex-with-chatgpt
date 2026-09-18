@@ -74,6 +74,21 @@ import {
   findExactObservedEvent,
   evaluateServerObservedCloseout,
 } from "./production-send.js";
+import {
+  AUTONOMY_STORAGE_KEY,
+  AUTONOMY_PRODUCTION_COOLDOWN_MS,
+  emptyAutonomyPolicy,
+  parseAutonomyPolicy,
+  autonomySummary,
+  policyIdentityExact,
+  disarmOnIdentityChange,
+  withProductionAttemptStamp,
+  planAutonomyTick,
+  isExactOwnerHeartbeat,
+  buildHeartbeatSafetySnapshot,
+  buildEvaluatedEvidenceSnapshot,
+  sanitizeRecoveryResult,
+} from "./autonomy.js";
 
 const LOCAL_KEY = "c2c_companion_local_v1";
 const TRANSPORT_KEY = "c2c_companion_transport_v1";
@@ -102,6 +117,20 @@ let productionSendInFlight = false;
 /** Short-lived SW transition proofs. Bound to current journal identity. Never from CS. */
 let productionClaimProof = null;
 let productionAckProof = null;
+/** E1b3d3b2 autonomy policy (durable local). Default OFF. */
+let autonomyPolicy = emptyAutonomyPolicy();
+/** Memory concurrency gate for autonomous ticks. */
+let autonomyTickInFlight = false;
+let lastAutonomyTickAt = null;
+let lastAutonomyDecision = null;
+let lastAutonomyReason = null;
+/** Memory-only shadow diagnostics. Never a security authority. */
+let lastHeartbeatAt = null;
+let lastHeartbeatOwnerExact = false;
+let lastHeartbeatSafety = null;
+let lastEvaluatedEvidence = null;
+let lastRecoveryAt = null;
+let lastRecoveryResult = null;
 
 const initPromise = (async () => {
   await hydrate();
@@ -120,7 +149,12 @@ async function restrictStorageLocal() {
 async function hydrate() {
   if (hydrated) return;
   storageProtected = await restrictStorageLocal();
-  const stored = await chrome.storage.local.get([LOCAL_KEY, TRANSPORT_KEY, JOURNAL_KEY]);
+  const stored = await chrome.storage.local.get([
+    LOCAL_KEY,
+    TRANSPORT_KEY,
+    JOURNAL_KEY,
+    AUTONOMY_STORAGE_KEY,
+  ]);
   const row = stored[LOCAL_KEY];
   localState = row && typeof row === "object"
     ? {
@@ -140,6 +174,19 @@ async function hydrate() {
 
   const j = stored[JOURNAL_KEY];
   journal = j && typeof j === "object" && typeof j.state === "string" ? j : emptyJournal();
+
+  // Default OFF. Never auto-arm on hydrate/pair/bind.
+  autonomyPolicy = parseAutonomyPolicy(stored[AUTONOMY_STORAGE_KEY]);
+  const disarmed = disarmOnIdentityChange(autonomyPolicy, transport);
+  if (disarmed.changed) {
+    // Memory OFF first; persist fault still leaves scheduler off.
+    autonomyPolicy = emptyAutonomyPolicy();
+    try {
+      await chrome.storage.local.set({ [AUTONOMY_STORAGE_KEY]: autonomyPolicy });
+    } catch {
+      // stay OFF in memory
+    }
+  }
 
   const live = await chrome.storage.session.get([
     SESSION_OWNER_KEY,
@@ -195,6 +242,53 @@ async function persistTransport() {
 
 async function persistJournal() {
   await chrome.storage.local.set({ [JOURNAL_KEY]: journal });
+}
+
+async function persistAutonomyPolicy() {
+  await chrome.storage.local.set({ [AUTONOMY_STORAGE_KEY]: autonomyPolicy });
+}
+
+/**
+ * Durable-first policy commit. Memory authority changes only after persist success.
+ * Persist failure keeps previous policy (never in-memory ARMED on failed arm).
+ */
+async function commitAutonomyPolicy(proposed) {
+  const previous = autonomyPolicy;
+  try {
+    await chrome.storage.local.set({ [AUTONOMY_STORAGE_KEY]: proposed });
+  } catch (error) {
+    return {
+      ok: false,
+      reason: "autonomy_persist_failed",
+      error: String(error?.message || error),
+      policy: previous,
+    };
+  }
+  autonomyPolicy = proposed;
+  return { ok: true, policy: autonomyPolicy };
+}
+
+/**
+ * Immediate in-memory OFF (scheduler fail closed). Persist after.
+ * Persist fault still leaves memory OFF and is reported.
+ */
+async function forceAutonomyOff(reason) {
+  const previous = autonomyPolicy;
+  autonomyPolicy = emptyAutonomyPolicy();
+  lastAutonomyDecision = "off";
+  lastAutonomyReason = reason || "disarmed";
+  try {
+    await chrome.storage.local.set({ [AUTONOMY_STORAGE_KEY]: autonomyPolicy });
+  } catch (error) {
+    return {
+      ok: false,
+      reason: "autonomy_persist_failed",
+      error: String(error?.message || error),
+      policy: autonomyPolicy,
+      previousMode: previous.mode,
+    };
+  }
+  return { ok: true, policy: autonomyPolicy, reason: lastAutonomyReason };
 }
 
 async function persistSessionOwnership() {
@@ -260,6 +354,19 @@ function statusPayload(tabId, documentId, extra = {}) {
     journal: summarizeProductionJournal(journal),
     sendProbeLatch: sendProbeLatch.state,
     productionSendInFlight,
+    autonomy: autonomySummary(autonomyPolicy, {
+      identityExact: policyIdentityExact(autonomyPolicy, transport),
+      tickInFlight: autonomyTickInFlight,
+      lastTickAt: lastAutonomyTickAt,
+      lastDecision: lastAutonomyDecision,
+      lastReason: lastAutonomyReason,
+      lastHeartbeatAt,
+      lastHeartbeatOwnerExact,
+      lastHeartbeatSafety,
+      lastEvaluatedEvidence,
+      lastRecoveryAt,
+      lastRecoveryResult,
+    }),
     evidence: evidence
       ? {
           observedAt: evidence.observedAt,
@@ -313,6 +420,7 @@ async function unbindAll() {
   };
   evidence = null;
   ownerProof = null;
+  await forceAutonomyOff("unbind");
   await persistLocal();
   await persistSessionOwnership();
   return statusPayload(-1, null);
@@ -485,6 +593,10 @@ async function handlePair(message) {
       authStale: false,
     };
     localState = { ...localState, paired: true, targetRoute: routeCanonical };
+    const disarmed = disarmOnIdentityChange(autonomyPolicy, transport);
+    if (disarmed.changed) {
+      await forceAutonomyOff("identity_disarm");
+    }
     await persistTransport();
     await persistLocal();
     return { ok: true, transport: safeTransportSummary() };
@@ -752,6 +864,7 @@ async function handleClearTransport() {
     return { ok: false, reason: "journal_active", journalState: journal.state };
   }
   transport = null;
+  await forceAutonomyOff("transport_clear");
   await persistTransport();
   return { ok: true, journal: { state: journal.state } };
 }
@@ -774,7 +887,13 @@ async function handleMessage(message, sender) {
     };
   }
   if (message.type === "c2c.fetch.state") return handleFetchState();
-  if (message.type === "c2c.reserve.page") return handleReservePage(sender, message);
+  if (message.type === "c2c.reserve.page") {
+    // Manual reserve competes with autonomy — block while ARMED.
+    if (parseAutonomyPolicy(autonomyPolicy).mode === "armed") {
+      return { ok: false, reason: "autonomy_armed" };
+    }
+    return handleReservePage(sender, message);
+  }
   if (message.type === "c2c.release") return handleRelease();
   if (message.type === "c2c.recover") return handleRecover();
   if (message.type === "c2c.retire.unknown") {
@@ -839,6 +958,31 @@ async function handleMessage(message, sender) {
       ownerProof = null;
     }
     await persistSessionOwnership();
+    // Only exact owner-document heartbeat may schedule autonomy.
+    if (message.type === "c2c.heartbeat") {
+      const ownerExact = isExactOwnerHeartbeat({
+        identityOk: identity.ok === true,
+        tabId,
+        documentId,
+        canonicalRoute: canonical,
+        owner: ownerState.owner,
+        transportRoute: transport?.routeCanonical ?? null,
+      });
+      // Bounded diagnostic for every heartbeat, including foreign ones.
+      lastHeartbeatAt = Date.now();
+      lastHeartbeatOwnerExact = ownerExact === true;
+      lastHeartbeatSafety = buildHeartbeatSafetySnapshot(message.safety);
+      if (ownerExact) {
+        void maybeRunAutonomyTick({
+          sender,
+          message,
+          identityOk: identity.ok === true,
+          tabId,
+          documentId,
+          canonicalRoute: canonical,
+        });
+      }
+    }
     return statusPayload(tabId ?? -1, documentId, {
       canonicalRoute: canonical,
       documentIdAvailable: Boolean(documentId),
@@ -937,7 +1081,81 @@ async function handleMessage(message, sender) {
     ) {
       return { ok: false, reason: "production_send_payload_forbidden" };
     }
+    // Manual send competes with autonomy scheduler — block while ARMED.
+    if (parseAutonomyPolicy(autonomyPolicy).mode === "armed") {
+      return { ok: false, reason: "autonomy_armed" };
+    }
     return handleProductionSend();
+  }
+
+  // E1b3d3b2 autonomy controls. Identity always from SW transport + bound owner.
+  if (
+    message.type === "c2c.autonomy.enable.shadow"
+    || message.type === "c2c.autonomy.arm"
+    || message.type === "c2c.autonomy.disable"
+  ) {
+    if (!isExtensionInternalSender(sender)) {
+      return { ok: false, reason: "popup_sender_required" };
+    }
+    if (
+      message.message != null
+      || message.eventId != null
+      || message.reservationId != null
+      || message.attemptId != null
+      || message.route != null
+      || message.routeCanonical != null
+      || message.documentId != null
+      || message.bindingId != null
+      || message.epoch != null
+      || message.payload != null
+    ) {
+      return { ok: false, reason: "autonomy_payload_forbidden" };
+    }
+    if (message.type === "c2c.autonomy.disable") {
+      const off = await forceAutonomyOff("manual_disable");
+      return {
+        ok: off.ok === true,
+        mode: "off",
+        policy: autonomyPolicy,
+        reason: off.ok === true ? undefined : (off.reason || "autonomy_persist_failed"),
+        persistenceFault: off.ok === true ? undefined : (off.reason || "autonomy_persist_failed"),
+        journal: summarizeProductionJournal(journal),
+      };
+    }
+    if (!storageProtected) return { ok: false, reason: "storage_unprotected" };
+    if (!transport || transport.authStale) return { ok: false, reason: "transport_invalid" };
+    if (!ownerState.owner) return { ok: false, reason: "not_exact_owner" };
+    if (ownerState.owner.canonicalRoute !== transport.routeCanonical) {
+      return { ok: false, reason: "owner_route_mismatch" };
+    }
+    const mode = message.type === "c2c.autonomy.arm" ? "armed" : "shadow";
+    const previousMode = parseAutonomyPolicy(autonomyPolicy).mode;
+    const proposed = {
+      schemaVersion: 1,
+      mode,
+      bindingId: transport.bindingId,
+      epoch: transport.epoch,
+      routeCanonical: transport.routeCanonical,
+      armedAt: Date.now(),
+      lastProductionAttemptAt: autonomyPolicy.lastProductionAttemptAt,
+    };
+    const commit = await commitAutonomyPolicy(proposed);
+    if (!commit.ok) {
+      return {
+        ok: false,
+        reason: commit.reason || "autonomy_persist_failed",
+        error: commit.error,
+        mode: previousMode,
+        policy: autonomyPolicy,
+        journal: summarizeProductionJournal(journal),
+      };
+    }
+    return {
+      ok: true,
+      mode: autonomyPolicy.mode,
+      policy: autonomyPolicy,
+      journal: summarizeProductionJournal(journal),
+    };
   }
 
   // E1b3d3b CS CAS persist. Exact owner document only.
@@ -1557,6 +1775,231 @@ async function handleProductionAck(sender, message) {
     };
   }
   return { ok: true, eventId: body.eventId, status: body.status };
+}
+
+/**
+ * E1b3d3b2 autonomous tick. Exact-owner heartbeat only. Default OFF.
+ * Journal-first recovery. One event max per tick. Never auto-retire.
+ */
+async function maybeRunAutonomyTick(ctx = {}) {
+  if (autonomyTickInFlight) return;
+  if (parseAutonomyPolicy(autonomyPolicy).mode === "off") return;
+  autonomyTickInFlight = true;
+  try {
+    await initPromise;
+
+    // Re-validate exact owner heartbeat at execution time (not just comments).
+    const hb = isExactOwnerHeartbeat({
+      identityOk: ctx.identityOk !== false,
+      tabId: ctx.tabId,
+      documentId: ctx.documentId,
+      canonicalRoute: ctx.canonicalRoute,
+      owner: ownerState.owner,
+      transportRoute: transport?.routeCanonical ?? null,
+    });
+    if (!hb || !ownerState.owner) {
+      lastAutonomyTickAt = Date.now();
+      lastAutonomyDecision = "gate_failed";
+      lastAutonomyReason = "not_exact_owner_heartbeat";
+      return;
+    }
+
+    const disarmed = disarmOnIdentityChange(autonomyPolicy, transport);
+    if (disarmed.changed) {
+      // Immediate memory OFF; persist fault still blocks scheduler.
+      const off = await forceAutonomyOff("identity_disarm");
+      if (!off.ok) {
+        lastAutonomyTickAt = Date.now();
+        lastAutonomyDecision = "gate_failed";
+        lastAutonomyReason = off.reason || "autonomy_persist_failed";
+        return;
+      }
+    }
+    if (autonomyPolicy.mode === "off") {
+      lastAutonomyTickAt = Date.now();
+      lastAutonomyDecision = "off";
+      lastAutonomyReason = "disarmed";
+      return;
+    }
+
+    let inFlight = null;
+    let pendingReady = 0;
+    if (journal.state === "NONE") {
+      const stateRes = await handleFetchState();
+      if (!stateRes.ok) {
+        lastAutonomyTickAt = Date.now();
+        lastAutonomyDecision = "gate_failed";
+        lastAutonomyReason = stateRes.reason || "state_fetch_failed";
+        return;
+      }
+      inFlight = stateRes.status.inFlight ?? null;
+      pendingReady = Number(stateRes.status.pendingReady) || 0;
+    }
+
+    // Bounded diagnostic snapshot of evidence the planner will use.
+    // Not a security authority.
+    lastEvaluatedEvidence = buildEvaluatedEvidenceSnapshot({
+      evidence,
+      now: Date.now(),
+      documentExact: Boolean(
+        evidence && ownerState.owner && evidence.documentId === ownerState.owner.documentId,
+      ),
+      routeExact: Boolean(
+        evidence && transport && evidence.canonicalRoute === transport.routeCanonical,
+      ),
+    });
+
+    const plan = planAutonomyTick({
+      policy: autonomyPolicy,
+      storageProtected,
+      transport,
+      owner: ownerState.owner,
+      evidence,
+      journal,
+      sendProbeLatch,
+      productionSendInFlight,
+      autonomyTickInFlight: false,
+      inFlight,
+      pendingReady,
+      now: Date.now(),
+    });
+    lastAutonomyTickAt = Date.now();
+    lastAutonomyDecision = plan.decision;
+    lastAutonomyReason = plan.reason ?? null;
+
+    if (plan.decision === "off" || plan.decision === "gate_failed"
+      || plan.decision === "idle_no_ready" || plan.decision === "cooldown"
+      || plan.decision === "server_inflight_without_local_journal") {
+      return;
+    }
+
+    if (plan.decision === "recovering") {
+      const journalBefore = journal.state;
+      const rec = await handleRecover();
+      const after = journal.state;
+      // Bounded diagnostic only. Never changes recover/ACK/journal semantics.
+      lastRecoveryAt = Date.now();
+      lastRecoveryResult = sanitizeRecoveryResult({
+        ok: rec?.ok === true,
+        reason: rec?.reason ?? null,
+        action: rec?.action ?? null,
+        retryAck: rec?.retryAck === true,
+        journalState: after,
+        diagnostic: rec?.diagnostic ?? null,
+      });
+
+      if (journalBefore === "RESERVED" || after === "RESERVED") {
+        if (after !== "RESERVED") {
+          // Cleared / moved. Same tick must NOT reserve next event.
+          lastAutonomyDecision = after === "NONE" ? "recovered" : "production_blocked";
+          lastAutonomyReason = after === "NONE" ? null : (rec?.reason || "reserved_recover_mismatch");
+          return;
+        }
+        if (parseAutonomyPolicy(autonomyPolicy).mode === "shadow") {
+          // SHADOW: keep existing RESERVED only — never production send.
+          lastAutonomyDecision = "production_blocked";
+          lastAutonomyReason = "shadow_keep_reserved";
+          return;
+        }
+        // ARMED: continue the SAME reserved event. No second reserve. No cooldown.
+        const start = canStartProductionSend({
+          owner: ownerState.owner,
+          transport,
+          journal,
+          latch: sendProbeLatch,
+          productionSendInFlight: false,
+          evidence,
+          now: Date.now(),
+        });
+        if (!start.ok) {
+          lastAutonomyDecision = "production_blocked";
+          lastAutonomyReason = start.reason;
+          return;
+        }
+        lastAutonomyDecision = "production_started";
+        const sendRes = await handleProductionSend();
+        if (sendRes?.ok) {
+          lastAutonomyDecision = "production_completed";
+          lastAutonomyReason = null;
+        } else {
+          lastAutonomyDecision = "production_blocked";
+          lastAutonomyReason = sendRes?.reason || "production_send_failed";
+        }
+        return;
+      }
+
+      if (rec?.ok && after === "NONE") {
+        lastAutonomyDecision = "recovered";
+        return;
+      }
+      if (!rec?.ok) {
+        lastAutonomyDecision = "production_blocked";
+        lastAutonomyReason = rec?.reason || "recover_failed";
+      }
+      return;
+    }
+
+    if (plan.decision !== "would_reserve_and_send") return;
+    if (plan.mode === "shadow") {
+      return;
+    }
+
+    // ARMED production: durable cooldown stamp BEFORE mutation attempts.
+    const sender = ctx.sender;
+    const heartbeatMessage = ctx.message;
+    if (!sender || !heartbeatMessage) {
+      lastAutonomyDecision = "gate_failed";
+      lastAutonomyReason = "heartbeat_sender_missing";
+      return;
+    }
+
+    const stamped = withProductionAttemptStamp(autonomyPolicy, Date.now());
+    const stampCommit = await commitAutonomyPolicy(stamped);
+    if (!stampCommit.ok) {
+      // Persist failure → zero reserve / begin-send / DOM / click.
+      lastAutonomyDecision = "production_blocked";
+      lastAutonomyReason = stampCommit.reason || "autonomy_persist_failed";
+      return;
+    }
+
+    const reserveRes = await handleReservePage(sender, heartbeatMessage);
+    if (!reserveRes?.ok || journal.state !== "RESERVED") {
+      lastAutonomyDecision = "production_blocked";
+      lastAutonomyReason = reserveRes?.reason || "reserve_failed";
+      return;
+    }
+
+    const start = canStartProductionSend({
+      owner: ownerState.owner,
+      transport,
+      journal,
+      latch: sendProbeLatch,
+      productionSendInFlight: false,
+      evidence,
+      now: Date.now(),
+    });
+    if (!start.ok) {
+      lastAutonomyDecision = "production_blocked";
+      lastAutonomyReason = start.reason;
+      return;
+    }
+
+    lastAutonomyDecision = "production_started";
+    const sendRes = await handleProductionSend();
+    if (sendRes?.ok) {
+      lastAutonomyDecision = "production_completed";
+      lastAutonomyReason = null;
+    } else {
+      lastAutonomyDecision = "production_blocked";
+      lastAutonomyReason = sendRes?.reason || "production_send_failed";
+    }
+  } catch {
+    lastAutonomyTickAt = Date.now();
+    lastAutonomyDecision = "gate_failed";
+    lastAutonomyReason = "autonomy_tick_error";
+  } finally {
+    autonomyTickInFlight = false;
+  }
 }
 
 /**

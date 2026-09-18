@@ -756,5 +756,40 @@ ready → reserved → claimed → observed
 | live event `e600aed6ef94…` | server **`observed`**；browser local 预期仍 `OUTCOME_UNKNOWN` 直至 Reload + Recover |
 | 安全边界 | credential 仍 SW-only；zero-Send 运行时（除用户显式 send-click-adapter）；journal NONE 不自动重发 |
 
-门禁：typecheck / build / `pnpm test --maxWorkers=1`（1452 passed）/ `git diff --check` 通过。
+门禁：typecheck / build / `pnpm test --maxWorkers=1 --testTimeout=90000` / `git diff --check` 通过。
+
+---
+
+# Phase E1b3d3b2 autonomous trigger + exact message-body observation
+
+日期：2026-09-18。**现役终态**（extension artifact 已更新；live extension Reload 待 ChatGPT independent review）。
+
+## Autonomy（默认 OFF）
+
+| 项 | 语义 |
+| --- | --- |
+| policy | `c2c_companion_autonomy_v1`：`off` \| `shadow` \| `armed`；identity 变更强制 disarm |
+| trigger | 仅 exact owner-document `c2c.heartbeat`；memory tick gate |
+| SHADOW | 只读：ready>0 时记 `would_reserve_and_send`，零 reserve/send |
+| ARMED | journal-first；同 tick recover 清空后不再 reserve；一 tick 一条；durable 30s cooldown；`RESERVED` continuation 复用 `canStartProductionSend` + `handleProductionSend`（reserve=0） |
+| popup | Enable Shadow / Arm Production（需 confirm checkbox）/ Disable；ARMED 时禁用 manual Reserve/Production Send；Retire 仍 manual-only |
+| 诊断 | bounded：heartbeat safety、evaluated evidence、recovery result + observation diagnostic（无 raw text/credential） |
+
+## Exact message-body observation
+
+- `findCanonicalUserTurn`：parent exact fast path 保留；否则 parent visible text 必须含 exact ATTEMPT，再在 ≤64 descendant 中用 **innerText full equality + exact ATTEMPT** 作为唯一成功 authority。
+- 不放宽 canonical equality；无 substring/trim/textContent authority。
+- Ambiguity 按 **user turn** 计，不按 descendant 数。
+- Representation diagnostic（bounded numbers/booleans）解释 UI chrome vs nested exact body。
+
+## 代码入口（现役）
+
+| 层 | 文件 |
+| --- | --- |
+| autonomy policy / plan tick / recovery sanitizers | `browser-companion/autonomy.js` |
+| SW heartbeat tick / recover closeout / autonomy RPC | `browser-companion/service-worker.js` |
+| exact body observation + bounded descendant BFS | `browser-companion/turn-observer.js` |
+| tests | `tests/e1b3d3b2-autonomy.test.ts` / `tests/e1b3d3b-production-send.test.ts` / `tests/e1b3-dom-capability.test.ts` |
+
+门禁：typecheck / build / `pnpm test --maxWorkers=1 --testTimeout=90000`（1518 passed）/ `git diff --check` 通过。
 

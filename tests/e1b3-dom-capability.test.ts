@@ -15,6 +15,7 @@ import {
   snapshotUserTurns,
   findCanonicalUserTurn,
   hasExactAttemptMarker,
+  buildMarkerRepresentationDiagnostic,
 } from "../browser-companion/turn-observer.js";
 import fs from "node:fs";
 import path from "node:path";
@@ -504,6 +505,53 @@ describe("D. turn observer section structure", () => {
     ]);
     const found = findCanonicalUserTurn(doc, { message: MESSAGE, attemptId: ATTEMPT });
     expect(found.ok).toBe(false);
+  });
+
+  it("10b. parent+child exact canonical → observed via bounded body fallback", () => {
+    const canonical = normalizeCanonicalDomText(MESSAGE);
+    const child = {
+      innerText: canonical,
+      textContent: canonical,
+      children: [] as unknown[],
+      getAttribute: (n: string) => (n === "data-message-author-role" ? "user" : null),
+      querySelector: () => null,
+      closest: () => null,
+    };
+    const parent = {
+      innerText: `${canonical}Copy`,
+      textContent: `${canonical}Copy`,
+      children: [child],
+      getAttribute: (n: string) => (n === "data-message-author-role" ? "user" : null),
+      querySelector: () => null,
+      closest: () => null,
+    };
+    const doc = { querySelectorAll: () => [parent] } as never;
+    const found = findCanonicalUserTurn(doc, { message: MESSAGE, attemptId: ATTEMPT });
+    expect(found.ok).toBe(true);
+    const rep = (found as { diagnostic?: { representation?: Record<string, unknown> } })
+      .diagnostic?.representation;
+    expect(rep?.exactInnerTextDescendantCount).toBe(1);
+    expect(rep?.markerInnerTextExact).toBe(false);
+  });
+
+  it("10c. independent innerText/textContent descendant counts (no fallback)", () => {
+    const canonical = normalizeCanonicalDomText(MESSAGE);
+    const parentText = `${canonical}UI`;
+    const parent = {
+      innerText: parentText,
+      textContent: parentText,
+      children: [
+        { innerText: undefined as unknown as string, textContent: canonical, children: [] },
+      ],
+      getAttribute: (n: string) => (n === "data-message-author-role" ? "user" : null),
+    };
+    const rep = buildMarkerRepresentationDiagnostic({
+      message: MESSAGE,
+      attemptId: ATTEMPT,
+      turns: [{ text: normalizeCanonicalDomText(parentText), node: parent }],
+    });
+    expect(rep?.exactInnerTextDescendantCount).toBe(0);
+    expect(rep?.exactTextContentDescendantCount).toBe(1);
   });
 
   it("10. baseline / ambiguity / exact ATTEMPT still green", () => {

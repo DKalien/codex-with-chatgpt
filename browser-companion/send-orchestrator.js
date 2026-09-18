@@ -37,7 +37,47 @@ const OBSERVATION_DIAGNOSTIC_KEYS = [
   "candidateLengths",
   "firstMismatchIndex",
   "candidates",
+  "representation",
 ];
+
+const MARKER_REPRESENTATION_NUMERIC_KEYS = [
+  "markerCandidateIndex",
+  "markerCandidateNormalizedLength",
+  "markerInnerTextLength",
+  "markerTextContentLength",
+  "targetLineCount",
+  "markerInnerTextLineCount",
+  "markerTextContentLineCount",
+  "innerLengthDelta",
+  "textContentLengthDelta",
+  "innerCommonPrefixLength",
+  "innerCommonSuffixLength",
+  "textCommonPrefixLength",
+  "textCommonSuffixLength",
+  "descendantScannedCount",
+  "exactInnerTextDescendantCount",
+  "exactTextContentDescendantCount",
+  "attemptMarkerDescendantCount",
+];
+
+const MARKER_REPRESENTATION_BOOLEAN_KEYS = [
+  "markerInnerTextExact",
+  "markerTextContentExact",
+  "markerInnerTextAttemptExact",
+  "markerTextContentAttemptExact",
+];
+
+function sanitizeMarkerRepresentationLocal(rep) {
+  if (!rep || typeof rep !== "object") return null;
+  const out = {};
+  for (const key of MARKER_REPRESENTATION_NUMERIC_KEYS) {
+    if (Number.isFinite(rep[key])) out[key] = rep[key];
+  }
+  for (const key of MARKER_REPRESENTATION_BOOLEAN_KEYS) {
+    if (typeof rep[key] === "boolean") out[key] = rep[key];
+  }
+  return Object.keys(out).length ? out : null;
+}
 
 function sanitizeObservationDiagnostic(diagnostic) {
   if (!diagnostic || typeof diagnostic !== "object") return null;
@@ -59,7 +99,14 @@ function sanitizeObservationDiagnostic(diagnostic) {
       }));
       continue;
     }
+    if (key === "representation") {
+      const rep = sanitizeMarkerRepresentationLocal(value);
+      if (rep) out.representation = rep;
+      continue;
+    }
     if (typeof value === "number" && Number.isFinite(value)) {
+      out[key] = value;
+    } else if (typeof value === "boolean") {
       out[key] = value;
     }
   }

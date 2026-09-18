@@ -96,6 +96,19 @@
     <button id="reserve" class="secondary" disabled>Reserve next (E1b2 test)</button>
     <button id="release" class="secondary" disabled>Release reservation</button>
     <button id="recover" class="secondary" disabled>Recover from /state</button>
+    <hr />
+    <div class="note" style="color:#f28b82;font-weight:700;">
+      AUTONOMY — 默认 OFF。SHADOW 只读；ARMED 可按 heartbeat 自动 reserve + production Send。绝不自动 Retire。
+    </div>
+    <pre class="value" id="autonomy-status" style="white-space: pre-wrap; margin: 0; max-height: 140px; overflow: auto;">—</pre>
+    <label class="note" style="display:flex;gap:8px;align-items:flex-start;color:#f28b82;">
+      <input type="checkbox" id="autonomy-arm-confirm" style="margin-top:2px;" />
+      <span>I understand this can automatically send production feedback into this bound ChatGPT conversation.</span>
+    </label>
+    <button id="autonomy-shadow" class="secondary" disabled>Enable Shadow</button>
+    <button id="autonomy-arm" class="secondary" disabled style="background:#c5221f;">Arm Production</button>
+    <button id="autonomy-disable" class="secondary" disabled>Disable Autonomy</button>
+    <hr />
     <div class="note" style="color:#f28b82;font-weight:600;">
       RETIRE UNKNOWN — 永久放弃当前 outcome_unknown 事件，绝不重发，也不是 ACK。
     </div>

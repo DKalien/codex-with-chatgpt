@@ -294,6 +294,7 @@ for (const esmName of [
   "send-orchestrator.js",
   "production-send-runtime.js",
   "production-send.js",
+  "autonomy.js",
 ]) {
   const esmPath = path.join(distCompanion, esmName);
   if (!fs.existsSync(esmPath)) fail(`ESM source missing after copy: ${esmName}`);
@@ -338,6 +339,7 @@ const requiredFiles = [
   "production-send.js",
   "production-send-runtime.js",
   "production-send-runtime-global.js",
+  "autonomy.js",
   "route-esm.js",
   "route-global.js",
   "popup/popup.html",

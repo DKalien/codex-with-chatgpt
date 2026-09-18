@@ -27,6 +27,11 @@
     reserve: document.getElementById("reserve"),
     release: document.getElementById("release"),
     recover: document.getElementById("recover"),
+    autonomyStatus: document.getElementById("autonomy-status"),
+    autonomyArmConfirm: document.getElementById("autonomy-arm-confirm"),
+    autonomyShadow: document.getElementById("autonomy-shadow"),
+    autonomyArm: document.getElementById("autonomy-arm"),
+    autonomyDisable: document.getElementById("autonomy-disable"),
     retireUnknown: document.getElementById("retire-unknown"),
     retireUnknownConfirm: document.getElementById("retire-unknown-confirm"),
     shadowInspect: document.getElementById("shadow-inspect"),
@@ -85,6 +90,28 @@
       lines.push(`diagnostic=${JSON.stringify(safe)}`);
     }
     return lines.join("\n");
+  }
+
+  /** Last known Arm gates from refresh. Change listener recomputes without RPC. */
+  let lastAutonomyArmGates = {
+    hasTransport: false,
+    isOwner: false,
+    storageProtected: false,
+  };
+
+  function updateAutonomyArmEnabled() {
+    if (!els.autonomyArm) return;
+    els.autonomyArm.disabled = !(
+      lastAutonomyArmGates.hasTransport
+      && lastAutonomyArmGates.isOwner
+      && lastAutonomyArmGates.storageProtected
+      && els.autonomyArmConfirm?.checked === true
+    );
+  }
+
+  // Bind once. refresh() must not re-register unbounded listeners.
+  if (els.autonomyArmConfirm) {
+    els.autonomyArmConfirm.addEventListener("change", updateAutonomyArmEnabled);
   }
 
   async function activeTab() {
@@ -240,6 +267,7 @@
 
     const isOwner = status?.isOwner === true;
     const hasTransport = Boolean(transport?.connected);
+    const storageProtected = status?.storageProtected === true;
     const journalState = status?.journal?.state ?? "NONE";
     const sendProbeLatch = status?.sendProbeLatch ?? "NONE";
     const productionInFlight = status?.productionSendInFlight === true;
@@ -264,6 +292,45 @@
     }
     els.clearTransport.disabled = !transport;
 
+    const autonomy = status?.autonomy ?? {};
+    const autonomyMode = autonomy.mode ?? "off";
+    const armed = autonomyMode === "armed";
+    if (els.autonomyStatus) {
+      const hbSafety = autonomy.lastHeartbeatSafety;
+      const ev = autonomy.lastEvaluatedEvidence;
+      els.autonomyStatus.textContent = [
+        `mode=${autonomyMode}`,
+        `bindingId=${transport?.bindingId ?? "-"}`,
+        `epoch=${transport?.epoch ?? "-"}`,
+        `route=${transport?.routeCanonical ?? "-"}`,
+        `identityExact=${autonomy.identityExact === true}`,
+        `tickInFlight=${autonomy.tickInFlight === true}`,
+        `lastDecision=${autonomy.lastDecision ?? "-"}`,
+        `lastReason=${autonomy.lastReason ?? "-"}`,
+        `lastTickAt=${autonomy.lastTickAt ?? "-"}`,
+        `lastProductionAttemptAt=${autonomy.lastProductionAttemptAt ?? "-"}`,
+        `heartbeatAt=${autonomy.lastHeartbeatAt ?? "-"}`,
+        `heartbeatOwnerExact=${autonomy.lastHeartbeatOwnerExact === true}`,
+        `heartbeatSafety=${hbSafety ? `${hbSafety.composer ?? "-"}/${hbSafety.generation ?? "-"}/${hbSafety.safe === true}` : "-"}`,
+        `evaluatedEvidence=${ev ? `${ev.composer ?? "-"}/${ev.generation ?? "-"}/${ev.safe === true} ageMs=${ev.ageMs ?? "-"}` : "-"}`,
+        `recoveryAt=${autonomy.lastRecoveryAt ?? "-"}`,
+        `recovery=${autonomy.lastRecoveryResult ? `ok=${autonomy.lastRecoveryResult.ok === true} reason=${autonomy.lastRecoveryResult.reason ?? "-"} action=${autonomy.lastRecoveryResult.action ?? "-"} retryAck=${autonomy.lastRecoveryResult.retryAck === true} journal=${autonomy.lastRecoveryResult.journalState ?? "-"}` : "-"}`,
+        `recoveryDiagnostic=${autonomy.lastRecoveryResult?.diagnostic ? JSON.stringify(autonomy.lastRecoveryResult.diagnostic) : "-"}`,
+      ].join("\n");
+    }
+    // Manual reserve/send must not race ARMED scheduler.
+    if (els.reserve) {
+      els.reserve.disabled = !hasTransport || !isOwner || armed;
+    }
+    if (els.autonomyShadow) {
+      els.autonomyShadow.disabled = !hasTransport || !isOwner || !storageProtected || armed;
+    }
+    lastAutonomyArmGates = { hasTransport, isOwner, storageProtected };
+    updateAutonomyArmEnabled();
+    if (els.autonomyDisable) {
+      els.autonomyDisable.disabled = autonomyMode === "off";
+    }
+
     if (els.productionStatus) {
       const j = status?.journal ?? { state: "NONE" };
       const lines = [
@@ -280,6 +347,7 @@
     }
 
     if (els.productionSend && els.productionSendConfirm) {
+      const autonomyMode = status?.autonomy?.mode ?? "off";
       const canProduction =
         isOwner
         && hasTransport
@@ -287,6 +355,7 @@
         && sendProbeLatch === "NONE"
         && !productionInFlight
         && pageIdleSafe
+        && autonomyMode !== "armed"
         && els.productionSendConfirm.checked;
       els.productionSend.disabled = !canProduction;
     }
@@ -433,6 +502,29 @@
       setText(els.bridgeState, formatRecoverResult(res), res?.ok ? "ok" : "bad");
       await refresh();
     };
+
+    if (els.autonomyShadow) {
+      els.autonomyShadow.onclick = async () => {
+        const res = await chrome.runtime.sendMessage({ type: "c2c.autonomy.enable.shadow" });
+        setText(els.bridgeState, `shadow ok=${res?.ok === true} mode=${res?.mode ?? "-"} reason=${res?.reason ?? "ok"}`, res?.ok ? "ok" : "bad");
+        await refresh();
+      };
+    }
+    if (els.autonomyArm) {
+      els.autonomyArm.onclick = async () => {
+        if (!els.autonomyArmConfirm?.checked) return;
+        const res = await chrome.runtime.sendMessage({ type: "c2c.autonomy.arm" });
+        setText(els.bridgeState, `arm ok=${res?.ok === true} mode=${res?.mode ?? "-"} reason=${res?.reason ?? "ok"}`, res?.ok ? "ok" : "bad");
+        await refresh();
+      };
+    }
+    if (els.autonomyDisable) {
+      els.autonomyDisable.onclick = async () => {
+        const res = await chrome.runtime.sendMessage({ type: "c2c.autonomy.disable" });
+        setText(els.bridgeState, `autonomy disable ok=${res?.ok === true} journal=${res?.journal?.state ?? "-"}`, res?.ok ? "ok" : "bad");
+        await refresh();
+      };
+    }
 
     if (els.retireUnknown && els.retireUnknownConfirm) {
       els.retireUnknownConfirm.addEventListener("change", () => {
