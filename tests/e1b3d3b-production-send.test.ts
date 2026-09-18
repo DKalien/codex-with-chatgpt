@@ -31,6 +31,8 @@ import {
   commitJournalDurably,
   findExactObservedEvent,
   evaluateServerObservedCloseout,
+  isServerObservedCloseoutEligible,
+  SERVER_OBSERVED_CLOSEOUT_STATES,
 } from "../browser-companion/production-send.js";
 import {
   productionLocalPreflight,
@@ -2328,107 +2330,143 @@ describe("E1b3d3b server-observed local closeout", () => {
     return markOutcomeUnknown(claimedJournal(), {});
   }
 
+  function observedPendingAckJournal() {
+    let j = claimedJournal();
+    j = markComposerWriteIntent(j, {});
+    j = markSendDispatchIntent(j, {});
+    j = markObservedPendingAck(j, {});
+    return j;
+  }
+
+  function eligibleJournals() {
+    return [
+      { name: "OUTCOME_UNKNOWN", journal: unknownJournal() },
+      { name: "OBSERVED_PENDING_ACK", journal: observedPendingAckJournal() },
+    ];
+  }
+
   function observedEvent(eventId = EVENT_ID, attemptId = ATTEMPT) {
     return { status: "observed", eventId, attemptId, kind: "feedback" };
   }
 
-  it("A. exact observed + inFlight=null → clear decision server_observed_clear", () => {
-    const j = unknownJournal();
-    const lookup = findExactObservedEvent([observedEvent()], j);
-    expect(lookup.ok).toBe(true);
-    expect(lookup.observed).toEqual({
-      status: "observed",
-      eventId: EVENT_ID,
-      attemptId: ATTEMPT,
-    });
-    const decision = evaluateServerObservedCloseout({
-      journal: j,
-      inFlight: null,
-      serverObserved: lookup.observed,
-    });
-    expect(decision.ok).toBe(true);
-    expect(decision.action).toBe("server_observed_clear");
-  });
-
-  it("B. eventId mismatch → remain OUTCOME_UNKNOWN", () => {
-    const j = unknownJournal();
-    const lookup = findExactObservedEvent([observedEvent("f".repeat(32), ATTEMPT)], j);
-    expect(lookup.ok).toBe(false);
-    expect(lookup.reason).toBe("observed_event_not_found");
-    expect(evaluateServerObservedCloseout({
-      journal: j,
-      inFlight: null,
-      serverObserved: null,
-    }).ok).toBe(false);
-  });
-
-  it("C. attemptId mismatch → remain OUTCOME_UNKNOWN", () => {
-    const j = unknownJournal();
-    const lookup = findExactObservedEvent(
-      [observedEvent(EVENT_ID, "99999999-9999-4999-8999-999999999999")],
-      j,
-    );
-    expect(lookup.ok).toBe(false);
-    expect(lookup.reason).toBe("observed_event_not_found");
-  });
-
-  it("D. non-observed statuses never match", () => {
-    const j = unknownJournal();
-    for (const status of ["outcome_unknown", "claimed", "retired_unknown", "ready", "reserved"]) {
-      const lookup = findExactObservedEvent([{ status, eventId: EVENT_ID, attemptId: ATTEMPT }], j);
-      expect(lookup.ok).toBe(false);
-      expect(lookup.reason).toBe("observed_event_not_found");
+  it("eligibility contract allows exactly OUTCOME_UNKNOWN and OBSERVED_PENDING_ACK", () => {
+    expect(SERVER_OBSERVED_CLOSEOUT_STATES).toEqual(["OUTCOME_UNKNOWN", "OBSERVED_PENDING_ACK"]);
+    expect(isServerObservedCloseoutEligible(unknownJournal())).toBe(true);
+    expect(isServerObservedCloseoutEligible(observedPendingAckJournal())).toBe(true);
+    for (const journal of [
+      reservedJournal(),
+      markSendIntent(reservedJournal(), {}),
+      claimedJournal(),
+      markComposerWriteIntent(claimedJournal(), {}),
+      markSendDispatchIntent(markComposerWriteIntent(claimedJournal(), {}), {}),
+      emptyJournal(),
+      null,
+    ]) {
+      expect(isServerObservedCloseoutEligible(journal)).toBe(false);
     }
   });
 
-  it("E. events empty → remain OUTCOME_UNKNOWN", () => {
-    const j = unknownJournal();
-    expect(findExactObservedEvent([], j).ok).toBe(false);
-    expect(findExactObservedEvent(null, j).reason).toBe("events_missing");
+  it("A. both eligible states + exact observed + inFlight=null → server_observed_clear", () => {
+    for (const { name, journal: j } of eligibleJournals()) {
+      const lookup = findExactObservedEvent([observedEvent()], j);
+      expect(lookup.ok, name).toBe(true);
+      expect(lookup.observed).toEqual({
+        status: "observed",
+        eventId: EVENT_ID,
+        attemptId: ATTEMPT,
+      });
+      const decision = evaluateServerObservedCloseout({
+        journal: j,
+        inFlight: null,
+        serverObserved: lookup.observed,
+      });
+      expect(decision.ok, name).toBe(true);
+      expect(decision.action, name).toBe("server_observed_clear");
+    }
   });
 
-  it("F. duplicate exact observed matches → fail closed", () => {
-    const j = unknownJournal();
-    const lookup = findExactObservedEvent([observedEvent(), observedEvent()], j);
-    expect(lookup.ok).toBe(false);
-    expect(lookup.reason).toBe("observed_event_ambiguous");
+  it("B/C. eventId or attemptId mismatch → fail closed for both eligible states", () => {
+    for (const { journal: j } of eligibleJournals()) {
+      expect(findExactObservedEvent([observedEvent("f".repeat(32), ATTEMPT)], j).reason)
+        .toBe("observed_event_not_found");
+      expect(findExactObservedEvent(
+        [observedEvent(EVENT_ID, "99999999-9999-4999-8999-999999999999")],
+        j,
+      ).reason).toBe("observed_event_not_found");
+      expect(evaluateServerObservedCloseout({
+        journal: j,
+        inFlight: null,
+        serverObserved: { status: "observed", eventId: "f".repeat(32), attemptId: ATTEMPT },
+      }).reason).toBe("server_observed_mismatch");
+      expect(evaluateServerObservedCloseout({
+        journal: j,
+        inFlight: null,
+        serverObserved: { status: "observed", eventId: EVENT_ID, attemptId: "99999999-9999-4999-8999-999999999999" },
+      }).reason).toBe("server_observed_mismatch");
+    }
+  });
+
+  it("D. non-observed statuses never match", () => {
+    for (const { journal: j } of eligibleJournals()) {
+      for (const status of ["outcome_unknown", "claimed", "retired_unknown", "ready", "reserved"]) {
+        const lookup = findExactObservedEvent([{ status, eventId: EVENT_ID, attemptId: ATTEMPT }], j);
+        expect(lookup.ok).toBe(false);
+        expect(lookup.reason).toBe("observed_event_not_found");
+      }
+    }
+  });
+
+  it("E. events empty / non-array → fail closed", () => {
+    for (const { journal: j } of eligibleJournals()) {
+      expect(findExactObservedEvent([], j).ok).toBe(false);
+      expect(findExactObservedEvent(null, j).reason).toBe("events_missing");
+    }
+  });
+
+  it("F. duplicate exact observed matches → ambiguous fail closed", () => {
+    for (const { journal: j } of eligibleJournals()) {
+      const lookup = findExactObservedEvent([observedEvent(), observedEvent()], j);
+      expect(lookup.ok).toBe(false);
+      expect(lookup.reason).toBe("observed_event_ambiguous");
+    }
   });
 
   it("G. inFlight non-null even with observed match → fail closed", () => {
-    const j = unknownJournal();
-    const lookup = findExactObservedEvent([observedEvent()], j);
-    expect(lookup.ok).toBe(true);
-    const decision = evaluateServerObservedCloseout({
-      journal: j,
-      inFlight: { status: "observed", eventId: EVENT_ID, attemptId: ATTEMPT },
-      serverObserved: lookup.observed,
-    });
-    expect(decision.ok).toBe(false);
-    expect(decision.reason).toBe("inflight_present");
+    for (const { journal: j } of eligibleJournals()) {
+      const lookup = findExactObservedEvent([observedEvent()], j);
+      expect(lookup.ok).toBe(true);
+      const decision = evaluateServerObservedCloseout({
+        journal: j,
+        inFlight: { status: "observed", eventId: EVENT_ID, attemptId: ATTEMPT },
+        serverObserved: lookup.observed,
+      });
+      expect(decision.ok).toBe(false);
+      expect(decision.reason).toBe("inflight_present");
+    }
   });
 
-  it("H. identity/status mismatch on proof → no clear", () => {
-    const j = unknownJournal();
-    expect(evaluateServerObservedCloseout({
-      journal: j,
-      inFlight: null,
-      serverObserved: { status: "observed", eventId: "f".repeat(32), attemptId: ATTEMPT },
-    }).reason).toBe("server_observed_mismatch");
-    expect(evaluateServerObservedCloseout({
-      journal: j,
-      inFlight: null,
-      serverObserved: { status: "observed", eventId: EVENT_ID, attemptId: "99999999-9999-4999-8999-999999999999" },
-    }).reason).toBe("server_observed_mismatch");
-    expect(evaluateServerObservedCloseout({
-      journal: j,
-      inFlight: null,
-      serverObserved: { status: "outcome_unknown", eventId: EVENT_ID, attemptId: ATTEMPT },
-    }).reason).toBe("server_observed_mismatch");
-    expect(evaluateServerObservedCloseout({
-      journal: claimedJournal(),
-      inFlight: null,
-      serverObserved: { status: "observed", eventId: EVENT_ID, attemptId: ATTEMPT },
-    }).reason).toBe("journal_not_outcome_unknown");
+  it("H. identity/status mismatch on proof → no clear; non-eligible journal rejected", () => {
+    for (const { journal: j } of eligibleJournals()) {
+      expect(evaluateServerObservedCloseout({
+        journal: j,
+        inFlight: null,
+        serverObserved: { status: "outcome_unknown", eventId: EVENT_ID, attemptId: ATTEMPT },
+      }).reason).toBe("server_observed_mismatch");
+    }
+    for (const j of [
+      reservedJournal(),
+      markSendIntent(reservedJournal(), {}),
+      claimedJournal(),
+      markComposerWriteIntent(claimedJournal(), {}),
+      markSendDispatchIntent(markComposerWriteIntent(claimedJournal(), {}), {}),
+    ]) {
+      expect(findExactObservedEvent([observedEvent()], j).reason).toBe("journal_not_closeout_eligible");
+      expect(evaluateServerObservedCloseout({
+        journal: j,
+        inFlight: null,
+        serverObserved: { status: "observed", eventId: EVENT_ID, attemptId: ATTEMPT },
+      }).reason).toBe("journal_not_closeout_eligible");
+    }
   });
 
   it("I. persist failure keeps memory OUTCOME_UNKNOWN via rollback contract", async () => {
@@ -2450,12 +2488,63 @@ describe("E1b3d3b server-observed local closeout", () => {
     expect(commit.journal.state).toBe("OUTCOME_UNKNOWN");
   });
 
-  it("J. SW closeout is SW-only: no CS/DOM/ACK/beginSend in the branch", () => {
+  it("I2. persist failure keeps OBSERVED_PENDING_ACK; never reports recovered; zero mutation", async () => {
+    const previous = observedPendingAckJournal();
+    let memoryState = previous.state;
+    let zeroWrite = true;
+    let zeroClick = true;
+    let ackCalled = false;
+    let beginSendCalled = false;
+    // Mirror SW closeout durable commit + rollback without owner/CS/DOM deps.
+    const decision = evaluateServerObservedCloseout({
+      journal: previous,
+      inFlight: null,
+      serverObserved: { status: "observed", eventId: EVENT_ID, attemptId: ATTEMPT },
+    });
+    expect(decision.ok).toBe(true);
+    expect(decision.action).toBe("server_observed_clear");
+    const commit = await commitJournalDurably({
+      current: previous,
+      proposed: clearJournal(),
+      persist: async () => {
+        throw new Error("storage_down");
+      },
+      onDurableSuccess: (next) => {
+        memoryState = next.state;
+      },
+    });
+    expect(commit.ok).toBe(false);
+    expect(commit.reason).toBe("journal_persist_failed");
+    expect(commit.journal.state).toBe("OBSERVED_PENDING_ACK");
+    expect(memoryState).toBe("OBSERVED_PENDING_ACK");
+    expect(zeroWrite).toBe(true);
+    expect(zeroClick).toBe(true);
+    expect(ackCalled).toBe(false);
+    expect(beginSendCalled).toBe(false);
+  });
+
+  it("I3. OBSERVED_PENDING_ACK closeout decision needs no owner/document/CS capability", () => {
+    const j = observedPendingAckJournal();
+    const decision = evaluateServerObservedCloseout({
+      journal: j,
+      inFlight: null,
+      serverObserved: { status: "observed", eventId: EVENT_ID, attemptId: ATTEMPT },
+    });
+    expect(decision.ok).toBe(true);
+    expect(decision).not.toHaveProperty("owner");
+    expect(decision).not.toHaveProperty("documentId");
+    expect(decision).not.toHaveProperty("tabId");
+  });
+
+  it("J. SW closeout branch allows both eligible states and stays SW-only", () => {
     const sw = fs.readFileSync(path.join(companionRoot, "service-worker.js"), "utf8");
     expect(sw).toMatch(/server_observed_clear/);
     expect(sw).toMatch(/evaluateServerObservedCloseout/);
     expect(sw).toMatch(/findExactObservedEvent/);
+    expect(sw).toMatch(/isServerObservedCloseoutEligible/);
     expect(sw).toMatch(/serverObserved: observedLookup\.ok \? observedLookup\.observed : null/);
+    expect(sw).toMatch(/if \(isServerObservedCloseoutEligible\(journal\) && closeout\.ok\)/);
+    expect(sw).not.toMatch(/if \(journal\.state === "OUTCOME_UNKNOWN" && closeout\.ok\)/);
     const start = sw.indexOf("const closeout = evaluateServerObservedCloseout");
     const end = sw.indexOf("return recoverProductionSendSide(inFlight);", start);
     expect(start).toBeGreaterThan(0);
@@ -2464,6 +2553,10 @@ describe("E1b3d3b server-observed local closeout", () => {
     expect(block).toMatch(/server_observed_persist_failed/);
     expect(block).toMatch(/journal = previous/);
     expect(block).toMatch(/action: "server_observed_clear"/);
+    expect(block).toMatch(/zeroWrite: true/);
+    expect(block).toMatch(/zeroClick: true/);
+    expect(block).toMatch(/ackCalled: false/);
+    expect(block).toMatch(/beginSendCalled: false/);
     expect(block).not.toMatch(/chrome\.tabs\.sendMessage/);
     expect(block).not.toMatch(/recoverProductionSendSide/);
     expect(block).not.toMatch(/findCanonicalUserTurn/);
@@ -2471,6 +2564,8 @@ describe("E1b3d3b server-observed local closeout", () => {
     expect(block).not.toMatch(/\/ack\b/);
     expect(block).not.toMatch(/writeCanonicalMessage/);
     expect(block).not.toMatch(/dispatchNativeSend/);
+    expect(block).not.toMatch(/reserve/);
+    expect(block).not.toMatch(/release/);
   });
 
   it("K. popup recover format already surfaces action/zeroWrite/journal.state", () => {

@@ -539,12 +539,27 @@ export async function commitJournalDurably(input) {
 }
 
 /**
- * Exact server-observed proof against local OUTCOME_UNKNOWN journal.
+ * Durable states where authenticated /state exact-observed proof may
+ * SW-only clear the local journal without DOM/ACK/Send/CS recovery.
+ * OBSERVED_PENDING_ACK: server already observed after a lost ACK response/local clear.
+ */
+export const SERVER_OBSERVED_CLOSEOUT_STATES = [
+  "OUTCOME_UNKNOWN",
+  "OBSERVED_PENDING_ACK",
+];
+
+/** Pure eligibility predicate — never identity proof by itself. */
+export function isServerObservedCloseoutEligible(journal) {
+  return Boolean(journal && SERVER_OBSERVED_CLOSEOUT_STATES.includes(journal.state));
+}
+
+/**
+ * Exact server-observed proof against eligible local journal states.
  * 0 or >1 matches fail closed. Never returns message/credential/principal.
  */
 export function findExactObservedEvent(events, journal) {
-  if (!journal || journal.state !== "OUTCOME_UNKNOWN") {
-    return { ok: false, reason: "journal_not_outcome_unknown" };
+  if (!isServerObservedCloseoutEligible(journal)) {
+    return { ok: false, reason: "journal_not_closeout_eligible" };
   }
   if (!journal.eventId || !journal.attemptId) {
     return { ok: false, reason: "journal_identity_missing" };
@@ -577,13 +592,17 @@ export function findExactObservedEvent(events, journal) {
 }
 
 /**
- * SW-only local closeout decision: OUTCOME_UNKNOWN + no inFlight + exact observed proof.
- * Fail closed on any mismatch. Zero DOM / ACK / Send implication.
+ * SW-only local closeout decision for eligible durable states:
+ * OUTCOME_UNKNOWN or OBSERVED_PENDING_ACK + no inFlight + exact observed proof.
+ * Fail closed on any mismatch. Zero DOM / ACK / Send / CS implication.
  */
 export function evaluateServerObservedCloseout(input) {
   const { journal, inFlight, serverObserved } = input || {};
-  if (!journal || journal.state !== "OUTCOME_UNKNOWN") {
-    return { ok: false, reason: "journal_not_outcome_unknown" };
+  if (!isServerObservedCloseoutEligible(journal)) {
+    return { ok: false, reason: "journal_not_closeout_eligible" };
+  }
+  if (!journal.eventId || !journal.attemptId) {
+    return { ok: false, reason: "journal_identity_missing" };
   }
   if (inFlight) {
     return { ok: false, reason: "inflight_present" };

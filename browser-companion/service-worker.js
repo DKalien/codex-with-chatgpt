@@ -73,6 +73,7 @@ import {
   commitJournalDurably,
   findExactObservedEvent,
   evaluateServerObservedCloseout,
+  isServerObservedCloseoutEligible,
 } from "./production-send.js";
 import {
   AUTONOMY_STORAGE_KEY,
@@ -831,14 +832,14 @@ async function handleRecover() {
   // E1b3d3b: send-side durable states recover through exact-document production runtime.
   if (journalIsSendSide(journal)) {
     // Server-observed closeout: trusted ACK already moved server event to observed.
-    // SW clears durable OUTCOME_UNKNOWN only with exact identity proof + inFlight=null.
-    // Zero DOM / ACK / Send / CS recovery.
+    // Eligible durable states (OUTCOME_UNKNOWN | OBSERVED_PENDING_ACK) + exact
+    // identity proof + inFlight=null may SW-only clear. Zero DOM / ACK / Send / CS.
     const closeout = evaluateServerObservedCloseout({
       journal,
       inFlight,
       serverObserved: stateRes.status?.serverObserved,
     });
-    if (journal.state === "OUTCOME_UNKNOWN" && closeout.ok) {
+    if (isServerObservedCloseoutEligible(journal) && closeout.ok) {
       const previous = journal;
       journal = clearJournal();
       try {

@@ -659,8 +659,17 @@ counts 契约兼容。
 
 ## Phase F1 operational hardening（2026-09-18，当前阶段）
 
+### F1a operational readiness health（已合入 `44075ea`）
+
 - 以现役 Browser Companion 的既有 SW status payload 为唯一数据源，新增纯诊断 health summary；不新增控制面或网络 endpoint。
 - health summary 只暴露 mode、identity/owner/storage/transport 门禁、journal phase、in-flight、heartbeat 分桶新鲜度、cooldown 和 allowlisted decision/recovery reason；不含 message/DOM/credential/principal/document/tab/event/attempt 标识。
 - 只读 popup health block 与状态 helper 不改变 reserve、begin-send、ACK、recover、retire 或 native Send 语义；`OUTCOME_UNKNOWN` / `OBSERVED_PENDING_ACK` 始终显示 recovery-required。
 - F1a 门禁：**70 files / 1519 passed / 0 failed**；typecheck / build / `git diff --check` 通过。
-- **NEXT_EXPECTED_STEP**：在不扩展生产发送协议的前提下继续 F1 operational readiness review；历史 `NEXT_EXPECTED_STEP` 仅作收尾记录。
+
+### F1b resilience hardening（本轮，uncommitted）
+
+- Test-first resilience matrix：SW restart hydrate、SEND_INTENT crash recovery、post-mutation fence、OBSERVED_PENDING_ACK、OUTCOME_UNKNOWN、owner loss、route drift、Bridge offline、authStale、durable cooldown、corrupt journal。
+- Independent review 修复：`OBSERVED_PENDING_ACK` 在 authenticated `/state` exact observed + `inFlight=null` 时支持 SW-only local closeout（zero DOM/ACK/Send）；解决 ACK 已成功但 response/local clear 因 crash 丢失后的 restart closeout。自动化入口：`tests/f1-companion-resilience.test.ts`；矩阵与契约见 [phase-f1-operational-hardening.md](phase-f1-operational-hardening.md)。
+- 本轮不扩展 ACK/reserve/Send 协议，不做 rollout / Reload / 生产 event。
+
+- **NEXT_EXPECTED_STEP**：F1b independent review → 决定 commit 与真实 resilience live acceptance；历史 `NEXT_EXPECTED_STEP` 仅作收尾记录。
