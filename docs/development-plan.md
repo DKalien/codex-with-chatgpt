@@ -491,12 +491,12 @@ release maintenance             # 失败 → ok=false，保留 items
 - `tests/gc-plan.test.ts`：21/21（D1 不回归）
 - 完整 Vitest：见收尾
 
-## NEXT_EXPECTED_STEP
+## NEXT_EXPECTED_STEP（历史记录）
 
 历史源码阶段 C/A/D1/D2/B 已完成；其中 A 的 pending/sent 状态机制不等于无 DOM 的生产回流。
 此前部署验收只对应各节记录的 build，不能代表后来所有源码均已在机器收敛。
 
-2026-09-14 Phase E 首轮核验：干净 `main@dcf8db0` 与实时 origin/main 一致；当前源码运行产物、
+以下为历史记录，不能覆盖后续 E1b3/E1b3d3b2 收官事实。2026-09-14 Phase E 首轮核验：干净 `main@dcf8db0` 与实时 origin/main 一致；当前源码运行产物、
 installed/runtime 均为 `30cd260920fc8a2fc44ef00874c7f4a323f14108375d5ed0237807d3ece3051e`，
 完整 release 校验和 128 项内存 emit 比对通过，本地及 named 公网健康。
 但 `upgradePending=true / named_unhealthy` 仍保留，latest finalizer
@@ -654,5 +654,13 @@ counts 契约兼容。
 - Autonomy：默认 OFF；shadow 只读；armed 心跳调度 + journal-first recovery + durable cooldown + RESERVED continuation（不二次 reserve）
 - Exact body observation：parent exact 或 parent ATTEMPT + ≤64 descendant **innerText full equality**；无 fuzzy/textContent authority
 - Bounded diagnostics：heartbeat / evidence / recovery / DOM representation（allowlist，无 raw text/credential）
-- Live ARMED E2E 曾自动发送成功；当前 extension 收口待 review + Reload
+- Live ARMED E2E 已完成：最终 acceptance event 为 `eventId=2c6b1d23641f46c484410c45f9e92d1c`、`attemptId=587c6632-7fa3-487b-a42c-25922952324b`、status=`observed`；Reload、independent review、live ACK closeout 均完成，browser journal=`NONE`、Bridge `inFlight=none`。历史 event（包括 `e600aed6ef94…`）不再执行 Send、Recover、ACK、Retire、Reserve
 - 详见 [phase-e-feedback.md](phase-e-feedback.md)
+
+## Phase F1 operational hardening（2026-09-18，当前阶段）
+
+- 以现役 Browser Companion 的既有 SW status payload 为唯一数据源，新增纯诊断 health summary；不新增控制面或网络 endpoint。
+- health summary 只暴露 mode、identity/owner/storage/transport 门禁、journal phase、in-flight、heartbeat 分桶新鲜度、cooldown 和 allowlisted decision/recovery reason；不含 message/DOM/credential/principal/document/tab/event/attempt 标识。
+- 只读 popup health block 与状态 helper 不改变 reserve、begin-send、ACK、recover、retire 或 native Send 语义；`OUTCOME_UNKNOWN` / `OBSERVED_PENDING_ACK` 始终显示 recovery-required。
+- F1a 门禁：**70 files / 1519 passed / 0 failed**；typecheck / build / `git diff --check` 通过。
+- **NEXT_EXPECTED_STEP**：在不扩展生产发送协议的前提下继续 F1 operational readiness review；历史 `NEXT_EXPECTED_STEP` 仅作收尾记录。

@@ -9,6 +9,142 @@ export const AUTONOMY_PRODUCTION_COOLDOWN_MS = 30_000;
 
 export const AUTONOMY_MODES = ["off", "shadow", "armed"];
 
+const OPERATIONAL_STATES = [
+  "ready",
+  "waiting_owner",
+  "auth_stale",
+  "journal_recovery",
+  "cooldown",
+  "blocked_gate",
+  "off",
+];
+const JOURNAL_PHASES = new Set([
+  "NONE", "RESERVE_REQUESTED", "RESERVED", "RESERVATION_RECOVERY", "SEND_" + "INTENT",
+  "CLAIMED", "COMPOSER_WRITE_INTENT", "SEND_" + "DISPATCH_" + "INTENT", "OBSERVED_PENDING_ACK", "OUTCOME_UNKNOWN",
+]);
+const OPERATIONAL_REASONS = new Set([
+  "recovery_required", "journal_active", "journal_state_unknown", "auth_stale", "owner_unavailable",
+  "storage_unprotected", "transport_missing", "policy_identity_mismatch", "heartbeat_stale",
+  "production_cooldown", "production_send_in_flight", "autonomy_tick_in_flight", "mode_off",
+  "transport_invalid", "owner_missing", "owner_route_mismatch", "evidence_missing",
+  "evidence_document_mismatch", "evidence_route_mismatch", "evidence_unsafe", "evidence_stale",
+  "send_probe_latch_active", "server_inflight_without_local_journal", "shadow_keep_reserved",
+  "reserved_recover_mismatch", "heartbeat_sender_missing", "autonomy_persist_failed", "reserve_failed",
+  "production_send_failed", "not_exact_owner_heartbeat", "state_fetch_failed", "autonomy_tick_error",
+  "recover_failed", "outcome_unknown", "observed_identity_mismatch", "post_mutation_attempt_mismatch",
+  "inflight_mismatch", "claimed_server_conflict", "server_outcome_unknown", "server_inflight_mismatch",
+  "production_recover_rpc_failed", "network_unreachable", "ack_response_invalid", "journal_not_pending_ack",
+  "journal_not_outcome_unknown", "retired_unknown", "unknown_state",
+  "late_positive_identity_mismatch", "late_observed_persist_failed", "post_mutation_fence",
+  "observed_ack_identity_mismatch", "inflight_identity_mismatch", "claim_proof_mint_failed",
+  "server_observed_persist_failed", "adopt_claimed_failed", "adopt_outcome_unknown",
+  "retry_begin_send_failed", "resume_claimed_failed", "begin_send_failed", "ack_failed",
+  "observed_ack_persist_failed", "send_intent_persist_failed", "dispatch_intent_persist_failed",
+  "write_intent_persist_failed", "send_click_threw", "send_ready_wait_threw", "verify_threw",
+  "write_threw", "claimed_payload_validator_missing", "claimed_payload_validator_threw",
+  "journal_not_claimed", "journal_not_send_intent", "journal_not_reserved", "journal_not_active",
+  "claimed_attempt_mismatch", "claimed_inflight_mismatch", "claimed_identity_missing",
+  "claimed_without_server_inflight", "server_observed_mismatch", "server_observed_missing",
+  "server_outcome_unknown", "production_journal_not_cleared", "journal_persist_failed",
+  "ack_proof_mismatch", "ack_proof_missing", "claim_proof_mismatch", "claim_proof_missing",
+  "cas_input_missing", "cas_previous_mismatch", "illegal_transition", "inflight_present",
+  "journal_identity_missing", "events_missing", "observed_event_not_found", "observed_event_ambiguous",
+  "owner_document_invalid", "owner_generation_missing", "binding_mismatch", "composer_not_empty",
+  "generation_not_idle", "journal_active", "journal_missing", "message_missing", "message_sha256_invalid",
+  "not_owner", "document_id_unavailable", "pre_send_identity_missing", "reservation_id_missing",
+  "attempt_id_missing", "transport_identity_missing", "claimed_message_mismatch", "claimed_message_sha_mismatch",
+  "outcome_unknown_attempt_mismatch", "observed_attempt_mismatch", "claimed_identity_mismatch",
+  "retry_ack", "ack_cleared", "late_positive_observed_then_acked", "ambiguous",
+]);
+const OPERATIONAL_ACTIONS = new Set([
+  "noop", "clear", "keep", "conflict", "block", "retry_ack", "server_observed_clear", "recover",
+  "late_positive_observed_then_acked", "ack_cleared", "observed_then_acked", "resumed_claimed",
+  "adopted_claimed_then_continue", "adopt_outcome_unknown", "retried_begin_send", "retry_begin_send",
+  "ack_only", "fail_closed", "resume", "retry", "adopt_claimed", "adopt_claimed_failed",
+  "retry_begin_send_failed", "resume_claimed_failed", "adopted_claimed_failed",
+]);
+
+function boundedReason(value, allowlist) {
+  return typeof value === "string" && allowlist.has(value) ? value : null;
+}
+
+/** Pure, bounded operator diagnostic. Never an authorization decision. */
+export function operationalHealthSummary(input = {}) {
+  const policy = parseAutonomyPolicy(input.policy);
+  const transport = input.transport && typeof input.transport === "object" ? input.transport : {};
+  const journalProvided = input.journalState != null;
+  const journalKnown = !journalProvided || JOURNAL_PHASES.has(input.journalState);
+  const journalState = !journalProvided ? "NONE" : (journalKnown ? input.journalState : "UNKNOWN");
+  const now = Number.isFinite(input.now) ? input.now : Date.now();
+  const heartbeatAt = Number.isFinite(input.lastHeartbeatAt) ? input.lastHeartbeatAt : null;
+  const heartbeatAgeMs = heartbeatAt == null ? null : Math.max(0, now - heartbeatAt);
+  const heartbeatFreshness = heartbeatAgeMs == null ? "never" : heartbeatAgeMs <= 30_000 ? "fresh" : "stale";
+  const tickAt = Number.isFinite(input.lastTickAt) ? input.lastTickAt : null;
+  const tickAgeMs = tickAt == null ? null : Math.max(0, now - tickAt);
+  const tickFreshness = tickAgeMs == null ? "never" : tickAgeMs <= 30_000 ? "fresh" : "stale";
+  const productionSendInFlight = input.productionSendInFlight === true;
+  const autonomyTickInFlight = input.autonomyTickInFlight === true;
+  const identityExact = input.identityExact === true;
+  const ownerAvailable = input.ownerAvailable === true;
+  const storageProtected = input.storageProtected === true;
+  const authStale = transport.authStale === true;
+  const transportPresent = transport.connected === true || isTransportUsable(transport);
+  const cooldownActive = policy.lastProductionAttemptAt != null
+    && now - policy.lastProductionAttemptAt >= 0
+    && now - policy.lastProductionAttemptAt < AUTONOMY_PRODUCTION_COOLDOWN_MS;
+  let state = "ready";
+  let reason = null;
+  if (!journalKnown) {
+    state = "blocked_gate";
+    reason = "journal_state_unknown";
+  } else if (journalState !== "NONE") {
+    state = "journal_recovery";
+    reason = journalState === "OUTCOME_UNKNOWN" || journalState === "OBSERVED_PENDING_ACK"
+      ? "recovery_required" : "journal_active";
+  } else if (policy.mode === "off") {
+    state = "off";
+  } else if (authStale) {
+    state = "auth_stale";
+    reason = "auth_stale";
+  } else if (!ownerAvailable) {
+    state = "waiting_owner";
+    reason = "owner_unavailable";
+  } else if (!storageProtected || !transportPresent || !identityExact || heartbeatFreshness !== "fresh") {
+    state = "blocked_gate";
+    reason = !storageProtected ? "storage_unprotected"
+      : !transportPresent ? "transport_missing"
+        : !identityExact ? "policy_identity_mismatch" : "heartbeat_stale";
+  } else if (cooldownActive) {
+    state = "cooldown";
+    reason = "production_cooldown";
+  } else if (productionSendInFlight || autonomyTickInFlight) {
+    state = "blocked_gate";
+    reason = productionSendInFlight ? "production_send_in_flight" : "autonomy_tick_in_flight";
+  }
+  return {
+    state: OPERATIONAL_STATES.includes(state) ? state : "blocked_gate",
+    mode: policy.mode,
+    identityExact,
+    ownerAvailable,
+    storageProtected,
+    transportPresent,
+    authStale,
+    journalPhase: journalState,
+    productionSendInFlight,
+    autonomyTickInFlight,
+    heartbeatFreshness,
+    heartbeatAgeMs: heartbeatAgeMs == null ? null : Math.min(heartbeatAgeMs, 86_400_000),
+    tickFreshness,
+    tickAgeMs: tickAgeMs == null ? null : Math.min(tickAgeMs, 86_400_000),
+    lastDecision: boundedReason(input.lastDecision, new Set(AUTONOMY_DECISIONS)),
+    lastReason: boundedReason(input.lastReason, OPERATIONAL_REASONS),
+    lastRecoveryAction: boundedReason(input.lastRecoveryAction, OPERATIONAL_ACTIONS),
+    lastRecoveryReason: boundedReason(input.lastRecoveryReason, OPERATIONAL_REASONS),
+    cooldownActive,
+    reason,
+  };
+}
+
 /** Diagnostic only — not a security authority. */
 export const AUTONOMY_DECISIONS = [
   "off",

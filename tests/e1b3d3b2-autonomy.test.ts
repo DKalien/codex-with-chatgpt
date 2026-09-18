@@ -21,6 +21,7 @@ import {
   sanitizeEvaluatedEvidenceSnapshot,
   sanitizeRecoveryDiagnostic,
   sanitizeRecoveryResult,
+  operationalHealthSummary,
 } from "../browser-companion/autonomy.js";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -78,6 +79,70 @@ function baseState(overrides = {}) {
 }
 
 describe("E1b3d3b2 autonomy policy", () => {
+  it("F1a. operational health is bounded and deterministic", () => {
+    const now = 100_000;
+    const base = {
+      policy: armedPolicy({ lastProductionAttemptAt: now - 1_000 }),
+      identityExact: true,
+      ownerAvailable: true,
+      storageProtected: true,
+      transport: { ...TRANSPORT, connected: true },
+      journalState: "NONE",
+      lastHeartbeatAt: now - 100,
+      lastTickAt: now - 200,
+      now,
+    };
+    expect(operationalHealthSummary(base).state).toBe("cooldown");
+    expect(operationalHealthSummary({ ...base, journalState: "RESERVED" }).state)
+      .toBe("journal_recovery");
+    expect(operationalHealthSummary({ ...base, journalState: "OUTCOME_UNKNOWN" }).reason)
+      .toBe("recovery_required");
+    expect(operationalHealthSummary({ ...base, policy: emptyAutonomyPolicy(), journalState: "OUTCOME_UNKNOWN" }).state)
+      .toBe("journal_recovery");
+    expect(operationalHealthSummary({ ...base, policy: emptyAutonomyPolicy(), journalState: "OBSERVED_PENDING_ACK" }).reason)
+      .toBe("recovery_required");
+    expect(operationalHealthSummary({ ...base, policy: emptyAutonomyPolicy(), journalState: "RESERVED" }).reason)
+      .toBe("journal_active");
+    expect(operationalHealthSummary({ ...base, journalState: "credential123" }).state).toBe("blocked_gate");
+    expect(operationalHealthSummary({ ...base, journalState: "credential123" }).journalPhase).toBe("UNKNOWN");
+    expect(operationalHealthSummary({ ...base, transport: { ...TRANSPORT, authStale: true } }).state)
+      .toBe("auth_stale");
+    expect(operationalHealthSummary({ ...base, ownerAvailable: false }).state).toBe("waiting_owner");
+    expect(operationalHealthSummary({ ...base, policy: { ...base.policy, lastProductionAttemptAt: null } }).state)
+      .toBe("ready");
+    expect(operationalHealthSummary(base).tickFreshness).toBe("fresh");
+    const dump = JSON.stringify(operationalHealthSummary({
+      ...base,
+      lastDecision: "credential123",
+      lastRecoveryAction: "credential123",
+      lastRecoveryReason: "credential123",
+    }));
+    expect(dump).not.toContain("documentId");
+    expect(dump).not.toContain("eventId");
+    expect(dump).not.toContain("attemptId");
+    expect(dump).toContain('"lastDecision":null');
+    expect(dump).not.toContain("credential123");
+    expect(operationalHealthSummary({
+      ...base,
+      lastRecoveryAction: "late_positive_observed_then_acked",
+      lastRecoveryReason: "late_positive_identity_mismatch",
+    }).lastRecoveryAction).toBe("late_positive_observed_then_acked");
+    expect(operationalHealthSummary({
+      ...base,
+      lastRecoveryAction: "ack_cleared",
+      lastRecoveryReason: "post_mutation_fence",
+    }).lastRecoveryAction).toBe("ack_cleared");
+    expect(operationalHealthSummary({
+      ...base,
+      lastRecoveryAction: "credential123",
+      lastRecoveryReason: "credential123",
+    }).lastRecoveryAction).toBeNull();
+    expect(operationalHealthSummary({
+      ...base,
+      lastRecoveryAction: "late_positive_observed_then_acked",
+      lastRecoveryReason: "credential123",
+    }).lastRecoveryReason).toBeNull();
+  });
   it("A. default / hydrate parse → OFF", () => {
     expect(emptyAutonomyPolicy().mode).toBe("off");
     expect(parseAutonomyPolicy(undefined).mode).toBe("off");

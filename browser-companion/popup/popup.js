@@ -28,6 +28,7 @@
     release: document.getElementById("release"),
     recover: document.getElementById("recover"),
     autonomyStatus: document.getElementById("autonomy-status"),
+    operationalHealth: document.getElementById("operational-health"),
     autonomyArmConfirm: document.getElementById("autonomy-arm-confirm"),
     autonomyShadow: document.getElementById("autonomy-shadow"),
     autonomyArm: document.getElementById("autonomy-arm"),
@@ -317,6 +318,19 @@
         `recovery=${autonomy.lastRecoveryResult ? `ok=${autonomy.lastRecoveryResult.ok === true} reason=${autonomy.lastRecoveryResult.reason ?? "-"} action=${autonomy.lastRecoveryResult.action ?? "-"} retryAck=${autonomy.lastRecoveryResult.retryAck === true} journal=${autonomy.lastRecoveryResult.journalState ?? "-"}` : "-"}`,
         `recoveryDiagnostic=${autonomy.lastRecoveryResult?.diagnostic ? JSON.stringify(autonomy.lastRecoveryResult.diagnostic) : "-"}`,
       ].join("\n");
+    }
+    if (els.operationalHealth) {
+      const health = status?.operationalHealth;
+      els.operationalHealth.textContent = health ? [
+        `state=${health.state} mode=${health.mode} reason=${health.reason ?? "-"}`,
+        `identityExact=${health.identityExact} ownerAvailable=${health.ownerAvailable} storageProtected=${health.storageProtected}`,
+        `transport=${health.transportPresent} authStale=${health.authStale} journal=${health.journalPhase}`,
+        `productionInFlight=${health.productionSendInFlight} tickInFlight=${health.autonomyTickInFlight}`,
+        `heartbeat=${health.heartbeatFreshness} ageMs=${health.heartbeatAgeMs ?? "-"} tick=${health.tickFreshness} tickAgeMs=${health.tickAgeMs ?? "-"}`,
+        `cooldown=${health.cooldownActive}`,
+        `lastDecision=${health.lastDecision ?? "-"} lastReason=${health.lastReason ?? "-"}`,
+        `recoveryAction=${health.lastRecoveryAction ?? "-"} recoveryReason=${health.lastRecoveryReason ?? "-"}`,
+      ].join("\n") : "—";
     }
     // Manual reserve/send must not race ARMED scheduler.
     if (els.reserve) {

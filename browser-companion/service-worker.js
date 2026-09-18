@@ -88,6 +88,7 @@ import {
   buildHeartbeatSafetySnapshot,
   buildEvaluatedEvidenceSnapshot,
   sanitizeRecoveryResult,
+  operationalHealthSummary,
 } from "./autonomy.js";
 
 const LOCAL_KEY = "c2c_companion_local_v1";
@@ -366,6 +367,22 @@ function statusPayload(tabId, documentId, extra = {}) {
       lastEvaluatedEvidence,
       lastRecoveryAt,
       lastRecoveryResult,
+    }),
+    operationalHealth: operationalHealthSummary({
+      policy: autonomyPolicy,
+      identityExact: policyIdentityExact(autonomyPolicy, transport),
+      ownerAvailable: documentId != null && isOwner(ownerState, tabId, documentId),
+      storageProtected,
+      transport: safeTransportSummary(),
+      journalState: journal?.state,
+      productionSendInFlight,
+      autonomyTickInFlight,
+      lastHeartbeatAt,
+      lastTickAt: lastAutonomyTickAt,
+      lastDecision: lastAutonomyDecision,
+      lastReason: lastAutonomyReason,
+      lastRecoveryAction: lastRecoveryResult?.action,
+      lastRecoveryReason: lastRecoveryResult?.reason,
     }),
     evidence: evidence
       ? {

@@ -752,8 +752,8 @@ ready → reserved → claimed → observed
 | --- | --- |
 | Core trusted late-positive ACK | **deployed** 至 `codex-with-chatgpt`：`runtimeBuildId=installedBuildId=6349ad9887d2…`，`upgradePending=false` |
 | MCP `feedback_ack_observed` 描述 | **live**：`exact claimed/outcome_unknown → observed；observed same-attempt idempotent` |
-| Browser extension | `dist/browser-companion` 已含 latest recover/diagnostics/server-observed；**需用户 Reload 后** 才应用 |
-| live event `e600aed6ef94…` | server **`observed`**；browser local 预期仍 `OUTCOME_UNKNOWN` 直至 Reload + Recover |
+| Browser extension | `dist/browser-companion` 已含 latest recover/diagnostics/server-observed；Reload **已完成** |
+| live event `e600aed6ef94…` | 历史 server **`observed`**；不再执行 Send、Recover、ACK、Retire、Reserve |
 | 安全边界 | credential 仍 SW-only；zero-Send 运行时（除用户显式 send-click-adapter）；journal NONE 不自动重发 |
 
 门禁：typecheck / build / `pnpm test --maxWorkers=1 --testTimeout=90000` / `git diff --check` 通过。
@@ -762,7 +762,7 @@ ready → reserved → claimed → observed
 
 # Phase E1b3d3b2 autonomous trigger + exact message-body observation
 
-日期：2026-09-18。**现役终态**（extension artifact 已更新；live extension Reload 待 ChatGPT independent review）。
+日期：2026-09-18。**现役终态**（extension Reload、independent review、live ACK closeout 均已完成）。
 
 ## Autonomy（默认 OFF）
 
@@ -792,4 +792,12 @@ ready → reserved → claimed → observed
 | tests | `tests/e1b3d3b2-autonomy.test.ts` / `tests/e1b3d3b-production-send.test.ts` / `tests/e1b3-dom-capability.test.ts` |
 
 门禁：typecheck / build / `pnpm test --maxWorkers=1 --testTimeout=90000`（1518 passed）/ `git diff --check` 通过。
+
+## Phase F1a operational readiness（2026-09-18）
+
+E1b3d3b2 的最终 live acceptance 已收口：最终 acceptance event 为 `eventId=2c6b1d23641f46c484410c45f9e92d1c`、`attemptId=587c6632-7fa3-487b-a42c-25922952324b`、status=`observed`；extension Reload 已完成，ChatGPT independent review 已完成，live ACK closeout 已完成，browser journal 为 `NONE`，Bridge `inFlight` 为 `none`。历史 event（包括 `e600aed6ef94…`）不再执行 Send、Recover、ACK、Retire、Reserve。
+
+F1a 只增加现有 SW status payload 的纯、只读 operational health summary 及 popup 展示，不新增 endpoint，不改变 reserve/begin-send/ACK/recover/retire 语义。摘要限于 mode、identity/owner/storage/transport 门禁、journal phase、in-flight、heartbeat 新鲜度分桶、cooldown 与 allowlisted reason；不暴露 message/DOM/credential/principal/document/tab/event/attempt 标识。`OUTCOME_UNKNOWN` 与 `OBSERVED_PENDING_ACK` 始终标记 recovery-required。
+
+门禁：**70 files / 1519 passed / 0 failed**；typecheck / build / `git diff --check` 通过。下一阶段为 F1 operational readiness review，不扩展生产发送协议。
 
