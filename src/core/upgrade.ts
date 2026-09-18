@@ -56,7 +56,7 @@ export function clearPending(workspace: LocalWorkspace): void {
 }
 
 /** 调用点明确选择 status 的 fast 或维护的 full；不以 metadata 冒充运行 build。 */
-export function readRuntimeUpgrade(workspace: LocalWorkspace, runtime: RuntimeState | null, verification: CoreVerification) {
+export function readRuntimeUpgrade(workspace: LocalWorkspace, runtime: Pick<RuntimeState, "runtimeBuildId"> | null, verification: CoreVerification) {
   const installed = getCurrentInstall(undefined, verification);
   const runtimeBuildId = isRuntimeBuildId(runtime?.runtimeBuildId) ? runtime.runtimeBuildId : null;
   const installedBuildId = installed.metadata?.runtimeBuildId ?? null;

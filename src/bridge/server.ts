@@ -21,6 +21,8 @@ import { DEFAULT_HOST, DEFAULT_PORT } from "../config/paths.js";
 import { SERVICE_NAME, VERSION } from "../version.js";
 import { getRuntimeBuildId, isRuntimeBuildId } from "../build-id.js";
 import { writeRuntimeState, clearRuntimeState, type RuntimeState } from "./runtime.js";
+import { readRuntimeUpgrade } from "../core/upgrade.js";
+import { projectRuntimeUpgrade } from "../workflow/request.js";
 
 function tunnelForWorkspace(workspaceId: string, logger: Logger): TunnelProvider {
   const binding = namedTunnelBinding(readTunnelState(workspaceId));
@@ -149,6 +151,18 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     },
     desktopCompatibility: (auth: AuthInfo | undefined) =>
       auth?.token ? authStore.desktopCompatibility(auth.token) : { status: "unknown" },
+    runtimeUpgrade: () => {
+      try {
+        const upgrade = readRuntimeUpgrade(
+          workspace,
+          runtimeBuildId ? { runtimeBuildId } : null,
+          "fast",
+        );
+        return projectRuntimeUpgrade(upgrade);
+      } catch {
+        return "unknown";
+      }
+    },
   }), logger);
   app.all(
     "/mcp",

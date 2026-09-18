@@ -129,7 +129,7 @@ describe("MCP tools over Streamable HTTP", () => {
       expect(names).not.toContain(forbidden);
     }
 
-    expectToolOutputSchema(tools, "workspace_info", ["workspaceId", "workspaceName", "projectType", "git"]);
+    expectToolOutputSchema(tools, "workspace_info", ["workspaceId", "workspaceName", "projectType", "git", "workflow"]);
     expectToolOutputSchema(tools, "list_directory", ["path", "entries", "total", "hasMore"]);
     expectToolOutputSchema(tools, "read_file", ["path", "content", "startLine", "endLine", "nextStartLine"]);
     expectToolOutputSchema(tools, "search_workspace", ["matches", "matchCount", "truncated", "engine"]);
@@ -153,12 +153,40 @@ describe("MCP tools over Streamable HTTP", () => {
 
   it("workspace_info returns identity and project detection", async () => {
     const result = await client.callTool({ name: "workspace_info", arguments: {} });
-    const info = structuredJsonOf<{ workspaceId: string; projectType: string; frameworks: string[]; git: { isRepo: boolean; branch: string } }>(result);
+    const info = structuredJsonOf<{
+      workspaceId: string;
+      projectType: string;
+      frameworks: string[];
+      rootAlias: string;
+      git: { isRepo: boolean; branch: string };
+      desktopCompatibility: { status: string };
+      workflow: {
+        schemaVersion: number;
+        overall: string;
+        nextAction: string;
+        requestContext: { source: string; conversationIdentity: string; remote: string };
+        connection: Record<string, string>;
+        conversation: { chatKnown: boolean; chatBinding: string };
+        desktop: Record<string, unknown>;
+        remote: Record<string, unknown>;
+        blockers: Array<{ code: string }>;
+      };
+    }>(result);
     expect(info.workspaceId).toBe(bridge.workspace.id);
     expect(info.projectType).toBe("node");
     expect(info.frameworks).toContain("React");
     expect(info.git.isRepo).toBe(true);
     expect(info.git.branch).toBe("main");
+    expect(info.rootAlias).toBe("workspace:/");
+    expect(info.workflow.schemaVersion).toBe(1);
+    expect(info.workflow.requestContext.source).toBe("mcp_request");
+    expect(info.workflow.conversation.chatKnown).toBe(false);
+    expect(info.workflow.conversation.chatBinding).toBe("none");
+    expect(info.workflow.connection).toHaveProperty("runtimeUpgrade");
+    expect(info.workflow.desktop).toBeDefined();
+    expect(info.workflow.remote).toBeDefined();
+    expect(typeof info.workflow.overall).toBe("string");
+    expect(typeof info.workflow.nextAction).toBe("string");
   });
 
   it("read_file returns hello.txt", async () => {

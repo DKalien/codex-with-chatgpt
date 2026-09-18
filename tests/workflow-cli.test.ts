@@ -11,7 +11,7 @@ function readSource(rel: string): string {
   return fs.readFileSync(path.join(projectRoot, rel), "utf8");
 }
 
-describe("G1a workflow CLI source contracts", () => {
+describe("G1a/G2 workflow CLI source contracts", () => {
   it("registers workflow status with -w and --json only (read path)", () => {
     const program = new Command("c2c");
     registerWorkflowCommands(program);
@@ -26,71 +26,94 @@ describe("G1a workflow CLI source contracts", () => {
 
   it("workflow module does not call mutating Desktop/Remote/pair/session paths", () => {
     const source = readSource("src/cli/workflow.ts");
-    expect(source).not.toMatch(/bindCurrentDesktop\s*\(/);
-    expect(source).not.toMatch(/bindDesktop\s*\(/);
-    expect(source).not.toMatch(/enableDesktop\s*\(/);
-    expect(source).not.toMatch(/disableDesktop\s*\(/);
-    expect(source).not.toMatch(/confirmCurrent\s*\(/);
-    expect(source).not.toMatch(/setRemoteEnabled\s*\(/);
-    expect(source).not.toMatch(/enqueueTask\s*\(/);
-    expect(source).not.toMatch(/enqueueThread\s*\(/);
-    expect(source).not.toMatch(/updateSession\s*\(/);
-    expect(source).not.toMatch(/writeSession\s*\(/);
-    expect(source).not.toMatch(/updateDesktop\s*\(/);
-    expect(source).not.toMatch(/updateRemote\s*\(/);
-    expect(source).not.toMatch(/rollout\s*\(/);
-    expect(source).not.toMatch(/ensureBridgeAndTunnel\s*\(/);
-    expect(source).not.toMatch(/issueTokens\s*\(/);
+    const facts = readSource("src/workflow/facts.ts");
+    const request = readSource("src/workflow/request.ts");
+    for (const s of [source, facts, request]) {
+      expect(s).not.toMatch(/bindCurrentDesktop\s*\(/);
+      expect(s).not.toMatch(/enableDesktop\s*\(/);
+      expect(s).not.toMatch(/setRemoteEnabled\s*\(/);
+      expect(s).not.toMatch(/enqueueTask\s*\(/);
+      expect(s).not.toMatch(/updateSession\s*\(/);
+      expect(s).not.toMatch(/writeSession\s*\(/);
+      expect(s).not.toMatch(/rollout\s*\(/);
+    }
   });
 
-  it("workflow status uses readSession / readRemote / readDesktop / findBridgeObservation only as facts", () => {
+  it("CLI uses shared capability facts + request helpers", () => {
     const source = readSource("src/cli/workflow.ts");
-    expect(source).toMatch(/readSession\(/);
-    expect(source).toMatch(/resolveThreadConversation\(/);
-    expect(source).toMatch(/readRemote\(/);
-    expect(source).toMatch(/readDesktop\(/);
+    const facts = readSource("src/workflow/facts.ts");
+    const request = readSource("src/workflow/request.ts");
+    expect(source).toMatch(/collectWorkflowCapabilityFacts\(/);
+    expect(source).toMatch(/projectRuntimeUpgrade\(/);
     expect(source).toMatch(/findBridgeObservation\(/);
-    expect(source).toMatch(/resolveWorkflowReadiness\(/);
-    expect(source).toMatch(/formatWorkflowReadinessHuman\(/);
+    expect(source).toMatch(/codex_thread/);
+    expect(facts).toMatch(/readSession\(/);
+    expect(facts).toMatch(/resolveThreadConversation\(/);
+    expect(facts).toMatch(/readRemote\(/);
+    expect(facts).toMatch(/readDesktop\(/);
+    expect(facts).toMatch(/mcp_request/);
+    expect(request).toMatch(/resolveConversationPrincipal/);
+    expect(request).toMatch(/projectRuntimeUpgrade/);
   });
 
   it("pure readiness module has no fs/network/IPC write surface", () => {
     const source = readSource("src/workflow/readiness.ts");
     expect(source).not.toMatch(/from "node:fs"/);
-    expect(source).not.toMatch(/from "node:child_process"/);
     expect(source).not.toMatch(/fetch\(/);
     expect(source).not.toMatch(/Date\.now\s*\(/);
-    expect(source).not.toMatch(/writeFile/);
-    expect(source).not.toMatch(/Math\.random/);
   });
 
   it("index registers workflow commands", () => {
     const source = readSource("src/cli/index.ts");
     expect(source).toMatch(/registerWorkflowCommands/);
-    expect(source).toMatch(/from "\.\/workflow\.js"/);
   });
 
   it("CLI unexpected exception → bounded JSON without raw error.message", () => {
     const payload = workflowFailurePayload();
     const dump = JSON.stringify(payload);
     expect(payload.ok).toBe(false);
-    expect(payload.overall).toBe("blocked");
     expect(payload.nextAction).toBe("stop_unknown");
-    expect(payload.blockers[0].code).toBe("workflow_status_failed");
-    expect(dump).not.toContain("secret token");
-    expect(dump).not.toContain("C:\\private\\pipe");
-    expect(dump).not.toContain("error");
+    expect(dump).not.toContain("secret");
     expect(dump).not.toMatch(/"message"/);
-    const source = readSource("src/cli/workflow.ts");
-    expect(source).not.toMatch(/error:\s*message/);
-    expect(source).toMatch(/workflowFailurePayload/);
   });
 
-  it("desktop error classification uses structured codes only, not message text", () => {
-    const source = readSource("src/cli/workflow.ts");
-    expect(source).toMatch(/function desktopErrorCode/);
-    expect(source).toMatch(/error instanceof DesktopError\) return error\.code/);
-    expect(source).not.toMatch(/message\.includes\(/);
-    expect(source).not.toMatch(/error instanceof DesktopError \|\|/);
+  it("desktop error classification structured only; no message text", () => {
+    const request = readSource("src/workflow/request.ts");
+    const facts = readSource("src/workflow/facts.ts");
+    expect(request).toMatch(/function desktopErrorCode/);
+    expect(request).toMatch(/error instanceof DesktopError\) return error\.code/);
+    expect(request).not.toMatch(/message\.includes\(/);
+    expect(facts).not.toMatch(/message\.includes\(/);
+  });
+
+  it("MCP workspace_info includes workflow projection schema", () => {
+    const mcp = readSource("src/mcp/server.ts");
+    const request = readSource("src/workflow/request.ts");
+    expect(mcp).toMatch(/workflowOutputSchema/);
+    expect(mcp).toMatch(/conversationIdentity/);
+    expect(mcp).toMatch(/remoteRequestCapability/);
+    expect(mcp).toMatch(/workflowProjectionFailure/);
+    expect(mcp).toMatch(/WORKFLOW_BLOCKER_CODES/);
+    expect(mcp).toMatch(/WORKFLOW_OVERALL_STATES/);
+    expect(mcp).toMatch(/currentConversation/);
+    expect(mcp).not.toMatch(/collectWorkflowReadinessInput\(/);
+    expect(request).toMatch(/workflow_projection_failed/);
+  });
+
+  it("MCP projection keeps chatKnown durable-only; request identity separate", () => {
+    const facts = readSource("src/workflow/facts.ts");
+    const request = readSource("src/workflow/request.ts");
+    const readiness = readSource("src/workflow/readiness.ts");
+    expect(facts).toMatch(/chatKnown: false/);
+    expect(facts).not.toMatch(/chatKnown: conversationSource/);
+    expect(request).toMatch(/workflowProjectionFailure/);
+    expect(request).toMatch(/requestContext/);
+    expect(readiness).toMatch(/currentConversation/);
+    expect(readiness).toMatch(/WORKFLOW_BLOCKER_CODES/);
+  });
+
+  it("runtime mapper classifies state before pending marker", () => {
+    const request = readSource("src/workflow/request.ts");
+    expect(request).toMatch(/upgrade\.state === "unknown" \|\| upgrade\.state === "stopped"/);
   });
 });

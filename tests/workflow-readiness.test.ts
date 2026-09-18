@@ -326,6 +326,24 @@ describe("G1a multi-thread projectChats map", () => {
     expect(input.conversation.chatBinding).toBe("same_thread");
     expect(input.conversation.chatKnown).toBe(true);
   });
+  it("requestPolicy.currentConversation allows this-turn work without durable chatKnown", () => {
+    const withoutDurableChat = baseInput({
+      conversation: {
+        mode: "project",
+        projectReady: true,
+        chatKnown: false,
+        chatBinding: "none",
+        checkpoint: "none",
+        sessionCorrupt: false,
+      },
+    });
+    const withRequest = resolveWorkflowReadiness(withoutDurableChat, { currentConversation: "available" });
+    expect(withRequest.overall).toBe("ready_local");
+    expect(withRequest.conversation.chatKnown).toBe(false);
+
+    const withoutRequest = resolveWorkflowReadiness(withoutDurableChat, { currentConversation: "unavailable" });
+    expect(withoutRequest.overall).toBe("needs_conversation");
+  });
 });
 
 describe("G1a resolver + human (kept + review)", () => {

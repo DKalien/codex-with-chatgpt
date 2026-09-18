@@ -690,7 +690,7 @@ counts 契约兼容。
 F1 已完成 Browser Companion 安全底座（operational readiness + recovery resilience）。
 G 阶段聚焦用户体验与跨设备日常闭环，不再扩展 recovery 状态机。
 
-### G1a — Unified Workflow Readiness（本轮，uncommitted）
+### G1a — Unified Workflow Readiness（已合入）
 
 - 新增纯只读工作流 readiness 聚合层：`src/workflow/readiness.ts` + CLI `c2c workflow status -w <workspace> --json`（`src/cli/workflow.ts`）。
 - 输出有限 enum：`overall` / `nextAction` / connection·conversation·desktop·remote 投影 / `blockers`；不输出 threadId、bindingId、credential、raw command。
@@ -715,4 +715,20 @@ G 阶段聚焦用户体验与跨设备日常闭环，不再扩展 recovery 状�
 - `ready_local/reuse` 与 `ready_remote/use_remote` 不调用 bind-current；仍强制 request-scoped verification。
 - Connector migration / Conversation Rebind 成功后 rerun `c2c workflow status`；仅 `nextAction=bind_current` 时才 Desktop bind-current。
 
-- **NEXT_EXPECTED_STEP**：**G2 — readiness projection into workspace_info**。ChatGPT 新对话仅通过 request-scoped `workspace_info` 即可获得 bounded workflow readiness，用户无需手工搬 workspace/thread/binding ID。
+### G2 — readiness projection into workspace_info（已通过 independent review，本轮合入）
+
+- `workspace_info.workflow`：request-scoped bounded projection（`schemaVersion=1`），一次调用返回 workspace identity + connection/conversation/desktop/remote + `overall/nextAction` + `requestContext`。
+- **Request token isolation**：`desktopCompatibility` 与 `authorization` 只来自当前 MCP request token（`ctx.desktopCompatibility(extra.authInfo)` / `requestAuthorization`），不借用机器 AuthStore aggregate；`runtimeUpgrade` 由 Bridge hook 只读投影，不 loopback probe。
+- **Request conversation 与 durable `chatKnown` 分离**：MCP `conversation.chatKnown=false`、`chatBinding="none"`；官方 `_meta["openai/session"]` 只进入 `requestContext.conversationIdentity`；resolver `requestPolicy.currentConversation` 仅决定**本轮**是否可继续，不伪装 Project membership / same_thread durable binding。
+- **Remote request scope gate**：`ready_remote` 前校验当前 request 具备 `codex.read + codex.control`；缺省 → `needs_authorization` + `remote_request_scope_missing|incomplete`。
+- **Full-schema fail-closed fallback**：projection 失败时返回完整 `workflowOutputSchema` shape（`blocked/stop_unknown` + `workflow_projection_failed`），workspace identity 始终可作恢复入口；output schema 字段全部 bounded enum（共享 `readiness.ts` 常量 + `WORKFLOW_BLOCKER_CODES`）。
+- **Connector contract 仍为 v1**（未 bump）；`workspace_info` 保持 readOnly；不自动执行 `nextAction`。
+- 共享层：`src/workflow/facts.ts` + `src/workflow/request.ts`；CLI 仍走 `codex_thread` collector，不传 requestPolicy（G1a parity）。
+- 测试：`tests/workflow-request.test.ts`、`tests/workflow-mcp-projection.test.ts`（HTTP Cases A/B/C + projection failure）、readiness/cli/mcp-integration 更新。
+
+- **G2 已通过 independent review**（full suite 1628 passed）。
+
+- **NEXT_EXPECTED_STEP**：**G3 — cross-device zero-to-end live E2E**。
+  - 路径：新 ChatGPT conversation → 一次 `workspace_info` → 读取 bounded workflow readiness → 选择安全 Desktop/Remote 路径 → Codex 执行 → Browser Companion 自动反馈回当前/已绑定 ChatGPT conversation → ChatGPT independent review → 必要时 revision → DONE。
+  - 全程不要求用户手工搬 workspaceId / threadId / bindingId；不得自动降低任何现有授权、审批、`outcome_unknown` 或 Project ownership 门禁。
+  - **前置约束**：`requestContext.conversationIdentity=available` 仅代表当前 MCP request 有可信 ChatGPT conversation identity；**不等于** Project membership，**不等于** durable same-thread Chat binding。G3 若建立跨 turn / feedback / resume 闭环，必须显式处理 durable conversation ownership，不得把 `currentConversation` 当永久绑定。
