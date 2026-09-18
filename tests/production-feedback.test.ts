@@ -487,6 +487,128 @@ describe("E1a review-fix", () => {
   });
 });
 
+describe("projector claimsDesktopReceipt provenance (live blocker)", () => {
+  const LIVE_CMD = "phase_f1a_operational_readiness_review_fix_20260918_02";
+
+  function appendGeneric(opts: {
+    commandId: string;
+    taskId: string;
+    iteration?: number;
+    desktopReceiptSha256?: string;
+  }) {
+    withExecutionRecordsLock(workspace.id, () => {
+      appendExecutionRecordLocked(workspace.id, {
+        taskId: opts.taskId,
+        iteration: opts.iteration ?? 1,
+        changedFiles: ["x"],
+        tests: "t",
+        exitStatus: "ok",
+        timestamp: new Date().toISOString(),
+        commandId: opts.commandId,
+        ...(opts.desktopReceiptSha256 ? { desktopReceiptSha256: opts.desktopReceiptSha256 } : {}),
+      } as never);
+    });
+  }
+
+  it("accepted delivery + generic record same commandId → skip, cursor advances, no event", () => {
+    reconcileFeedbackOutbox(workspace.id, stateDir);
+    seedDesktopAccepted(LIVE_CMD);
+    appendGeneric({ commandId: LIVE_CMD, taskId: LIVE_CMD, iteration: 1 });
+    const r = reconcileFeedbackOutbox(workspace.id, stateDir);
+    expect(r.projected).toBe(0);
+    expect(r.state.events).toHaveLength(0);
+    expect(r.state.projectionCursor).toBeGreaterThan(0);
+  });
+
+  it("accepted + generic taskId no hash → skip", () => {
+    reconcileFeedbackOutbox(workspace.id, stateDir);
+    seedDesktopAccepted("gen-cmd");
+    appendGeneric({ commandId: "gen-cmd", taskId: "generic_task", iteration: 1 });
+    const r = reconcileFeedbackOutbox(workspace.id, stateDir);
+    expect(r.projected).toBe(0);
+    expect(r.state.events).toHaveLength(0);
+  });
+
+  it("accepted + unrelated generic taskId no hash → skip", () => {
+    reconcileFeedbackOutbox(workspace.id, stateDir);
+    seedDesktopAccepted("unrel-cmd");
+    appendGeneric({ commandId: "other-cmd", taskId: "other_task", iteration: 1 });
+    const r = reconcileFeedbackOutbox(workspace.id, stateDir);
+    expect(r.projected).toBe(0);
+    expect(r.state.events).toHaveLength(0);
+  });
+
+  it("hash present + wrong taskId → conflict", () => {
+    reconcileFeedbackOutbox(workspace.id, stateDir);
+    seedDesktopAccepted("wrong-task");
+    appendGeneric({
+      commandId: "wrong-task",
+      taskId: "not_desktop_wrong-task",
+      iteration: 1,
+      desktopReceiptSha256: "e".repeat(64),
+    });
+    expect(() => reconcileFeedbackOutbox(workspace.id, stateDir)).toThrow(/IDENTITY_CONFLICT|拒绝静默投影|身份不匹配/);
+  });
+
+  it("desktop_ task + wrong commandId (no matching accepted) → conflict", () => {
+    reconcileFeedbackOutbox(workspace.id, stateDir);
+    seedDesktopAccepted("real-cmd");
+    appendGeneric({ commandId: "other-cmd", taskId: "desktop_other-cmd", iteration: 1 });
+    expect(() => reconcileFeedbackOutbox(workspace.id, stateDir)).toThrow(/IDENTITY_CONFLICT|拒绝静默投影/);
+  });
+
+  it("desktop_ task + iteration 2 → conflict", () => {
+    reconcileFeedbackOutbox(workspace.id, stateDir);
+    seedDesktopAccepted("iter2");
+    appendGeneric({
+      commandId: "iter2",
+      taskId: "desktop_iter2",
+      iteration: 2,
+      desktopReceiptSha256: "f".repeat(64),
+    });
+    expect(() => reconcileFeedbackOutbox(workspace.id, stateDir)).toThrow(/IDENTITY_CONFLICT|拒绝静默投影|身份不匹配/);
+  });
+
+  it("trusted receipt → exactly 1 event", () => {
+    reconcileFeedbackOutbox(workspace.id, stateDir);
+    seedTrustedReceipt("ok-receipt");
+    const r = reconcileFeedbackOutbox(workspace.id, stateDir);
+    expect(r.projected).toBe(1);
+    expect(r.state.events).toHaveLength(1);
+    expect(r.state.events[0]!.kind).toBe("C2C_EXECUTED");
+  });
+
+  it("no accepted delivery + hash → conflict", () => {
+    reconcileFeedbackOutbox(workspace.id, stateDir);
+    appendGeneric({
+      commandId: "orphan-hash",
+      taskId: "desktop_orphan-hash",
+      iteration: 1,
+      desktopReceiptSha256: "1".repeat(64),
+    });
+    expect(() => reconcileFeedbackOutbox(workspace.id, stateDir)).toThrow(/IDENTITY_CONFLICT|拒绝静默投影/);
+  });
+
+  it("no accepted delivery + desktop_ task → conflict", () => {
+    reconcileFeedbackOutbox(workspace.id, stateDir);
+    appendGeneric({ commandId: "orphan-task", taskId: "desktop_orphan-task", iteration: 1 });
+    expect(() => reconcileFeedbackOutbox(workspace.id, stateDir)).toThrow(/IDENTITY_CONFLICT|拒绝静默投影/);
+  });
+
+  it("accepted + desktop_<commandId> + iteration 1 + missing receipt hash → conflict", () => {
+    reconcileFeedbackOutbox(workspace.id, stateDir);
+    seedDesktopAccepted("nohash-cmd");
+    appendGeneric({
+      commandId: "nohash-cmd",
+      taskId: "desktop_nohash-cmd",
+      iteration: 1,
+    });
+    expect(() => reconcileFeedbackOutbox(workspace.id, stateDir)).toThrow(
+      /IDENTITY_CONFLICT|拒绝静默投影|身份不匹配|trusted receipt/,
+    );
+  });
+});
+
 function patchEventStatus(
   eventId: string,
   patch: Partial<FeedbackEvent> & { status: FeedbackEvent["status"] },

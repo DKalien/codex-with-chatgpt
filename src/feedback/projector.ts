@@ -27,14 +27,14 @@ function changedFilesSummary(record: StoredExecutionRecord): string[] {
   return [`changedFiles=${record.changedFiles}`];
 }
 
-/** desktop-like：receipt hash / desktop_ task / accepted delivery 任一命中。 */
-function isDesktopLike(record: StoredExecutionRecord, desktop: DesktopState | null): boolean {
+/**
+ * Explicit Desktop receipt provenance only.
+ * Accepted-delivery commandId match alone is NOT provenance — generic `c2c record`
+ * may share commandId; only trusted Desktop writer markers qualify.
+ */
+function claimsDesktopReceipt(record: StoredExecutionRecord): boolean {
   if (record.desktopReceiptSha256) return true;
   if (typeof record.taskId === "string" && record.taskId.startsWith("desktop_")) return true;
-  if (record.commandId
-    && desktop?.deliveries.some((d) => d.commandId === record.commandId && d.deliveryStatus === "accepted")) {
-    return true;
-  }
   return false;
 }
 
@@ -100,8 +100,8 @@ export function reconcileFeedbackOutbox(
   const desktop = readDesktop(workspaceId);
   const newEvents: FeedbackEvent[] = [];
   for (const record of slice) {
-    if (!isDesktopLike(record, desktop)) {
-      // 普通非 Desktop execution record：安全 skip，cursor 随后前进。
+    if (!claimsDesktopReceipt(record)) {
+      // 无 Desktop provenance marker 的普通 record：安全 skip，cursor 随后前进。
       continue;
     }
     assertTrustedDesktopReceipt(record, desktop);
