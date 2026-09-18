@@ -12,7 +12,7 @@ import { Workspace } from "../workspace/manager.js";
 import { findBridgeObservation } from "../bridge/runtime.js";
 import { adminFetch } from "../process/daemon.js";
 import { AuthStore } from "../auth/store.js";
-import { conversationChatKnown, readSession } from "../session/state.js";
+import { readSession, resolveThreadConversation } from "../session/state.js";
 import { readRemote, controllerOnline, RemoteError } from "../remote/store.js";
 import { readDesktop, DesktopError } from "../desktop/store.js";
 import { desktopIpc } from "../desktop/ipc.js";
@@ -222,12 +222,13 @@ export async function collectWorkflowReadinessInput(workspace: Workspace): Promi
   };
   try {
     const session = readSession(workspace.id);
-    const known = conversationChatKnown(session, workspace.id);
+    // Shared safe-URL contract with G1b threadConversation (not binding-only).
+    const thread = resolveThreadConversation(session, workspace.id);
     conversation = {
-      mode: known.mode === "project" || known.mode === "long-chat" ? known.mode : "unknown",
-      projectReady: known.projectReady,
-      chatKnown: known.chatKnown,
-      chatBinding: mapChatBinding(known.chatBinding),
+      mode: thread.mode === "project" || thread.mode === "long-chat" ? thread.mode : "unknown",
+      projectReady: thread.projectReady,
+      chatKnown: thread.reuseChat,
+      chatBinding: mapChatBinding(thread.chatBinding),
       checkpoint: mapCheckpointFromSession(session),
       sessionCorrupt: false,
     };

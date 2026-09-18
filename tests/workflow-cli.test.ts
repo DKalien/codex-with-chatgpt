@@ -46,7 +46,7 @@ describe("G1a workflow CLI source contracts", () => {
   it("workflow status uses readSession / readRemote / readDesktop / findBridgeObservation only as facts", () => {
     const source = readSource("src/cli/workflow.ts");
     expect(source).toMatch(/readSession\(/);
-    expect(source).toMatch(/conversationChatKnown\(/);
+    expect(source).toMatch(/resolveThreadConversation\(/);
     expect(source).toMatch(/readRemote\(/);
     expect(source).toMatch(/readDesktop\(/);
     expect(source).toMatch(/findBridgeObservation\(/);

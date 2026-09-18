@@ -4,6 +4,7 @@ import { randomUUID, createHash } from "node:crypto";
 import { z } from "zod";
 import { ensureDir, getStateDir } from "../config/paths.js";
 import { CONTROL_KINDS } from "./control-protocol.js";
+import { normalizeControlConversationUrl } from "../chatgpt/route.js";
 
 const controlId = z.string().regex(/^[A-Za-z0-9_-]{1,128}$/);
 const messageId = z.string().min(1).max(200).regex(/^[A-Za-z0-9_-]+$/);
@@ -299,7 +300,7 @@ export function projectChatBinding(session: SavedSession | null, workspaceId: st
   return projectChatForCurrentThread(session, workspaceId).binding;
 }
 
-/** Project chatKnown=true only when binding is same_thread. long-chat uses saved chat URL. */
+/** Project chatKnown=true only when same_thread AND URL is a safe conversation route. */
 export function conversationChatKnown(session: SavedSession | null, workspaceId: string): {
   mode: ConversationMode | "unknown";
   chatKnown: boolean;
@@ -308,23 +309,112 @@ export function conversationChatKnown(session: SavedSession | null, workspaceId:
 } {
   const view = resolveConversation(session);
   if (view.mode === "long-chat") {
+    let chatKnown = false;
+    if (view.chatUrl) {
+      try {
+        normalizeControlConversationUrl(view.chatUrl);
+        chatKnown = true;
+      } catch {
+        chatKnown = false;
+      }
+    }
     return {
       mode: "long-chat",
-      chatKnown: Boolean(view.chatUrl),
+      chatKnown,
       chatBinding: "none",
       projectReady: false,
     };
   }
   if (view.mode === "project") {
-    const chatBinding = projectChatBinding(session, workspaceId);
+    const lookup = projectChatForCurrentThread(session, workspaceId);
+    let chatKnown = false;
+    if (lookup.binding === "same_thread" && typeof lookup.url === "string") {
+      try {
+        normalizeControlConversationUrl(lookup.url);
+        chatKnown = true;
+      } catch {
+        chatKnown = false;
+      }
+    }
     return {
       mode: "project",
-      chatKnown: chatBinding === "same_thread",
-      chatBinding,
+      chatKnown,
+      chatBinding: lookup.binding,
       projectReady: view.projectReady,
     };
   }
   return { mode: "unknown", chatKnown: false, chatBinding: "none", projectReady: false };
+}
+
+/**
+ * Thread-aware navigation projection for Skill/CLI.
+ * Project chatUrl ONLY from projectChats same_thread — never session.url fallback.
+ * No raw threadId / fingerprint / projectChats / credentials in output.
+ */
+export interface ThreadConversationProjection {
+  mode: ConversationMode;
+  projectReady: boolean;
+  projectUrl: string | null;
+  connectorName: string | null;
+  chatBinding: ProjectChatBinding;
+  chatUrl: string | null;
+  reuseChat: boolean;
+}
+
+export function resolveThreadConversation(
+  session: SavedSession | null,
+  workspaceId: string,
+): ThreadConversationProjection {
+  const view = resolveConversation(session);
+  const connectorName = session?.connectorName ?? view.connectorName ?? null;
+
+  if (view.mode === "long-chat") {
+    let chatUrl: string | null = view.chatUrl;
+    let reuseChat = Boolean(view.reuseSavedChat && chatUrl);
+    if (chatUrl) {
+      try {
+        chatUrl = normalizeControlConversationUrl(chatUrl);
+      } catch {
+        chatUrl = null;
+        reuseChat = false;
+      }
+    } else {
+      reuseChat = false;
+    }
+    return {
+      mode: "long-chat",
+      projectReady: false,
+      projectUrl: null,
+      connectorName,
+      chatBinding: "none",
+      chatUrl,
+      reuseChat,
+    };
+  }
+
+  const mode: ConversationMode = "project";
+  const chatBinding = projectChatBinding(session, workspaceId);
+  const lookup = projectChatForCurrentThread(session, workspaceId);
+  let chatUrl: string | null = null;
+  let reuseChat = false;
+  if (chatBinding === "same_thread" && lookup.binding === "same_thread" && typeof lookup.url === "string") {
+    try {
+      chatUrl = normalizeControlConversationUrl(lookup.url);
+      reuseChat = true;
+    } catch {
+      chatUrl = null;
+      reuseChat = false;
+    }
+  }
+  return {
+    mode,
+    projectReady: view.mode === "project" ? view.projectReady : false,
+    projectUrl: view.projectUrl,
+    connectorName,
+    chatBinding,
+    chatUrl,
+    reuseChat,
+  };
 }
 
 export interface ConversationView {

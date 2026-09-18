@@ -151,9 +151,10 @@ that close the tab, hide the window, or stall on the settings page.
    - 插件总管: `https://chatgpt.com/plugins`
    - 加插件: `https://chatgpt.com/plugins#settings/Connectors?create-connector=true&redirectAfter=%2Fplugins`
    - 新对话 (long-chat only, and only if no saved chat): `https://chatgpt.com/`
-   - Saved C2C chat: `conversation.chatUrl` / `session.url` (long-chat, or
-     the chat already bound in THIS Codex conversation)
-   - Saved Project collection: `conversation.projectUrl`
+   - Saved C2C chat (long-chat only): `conversation.chatUrl` / `session.url`.
+     Project navigation only: `threadConversation.chatUrl` when `reuseChat===true`.
+     Do not goto `session.url` for Project threads.
+   - Saved Project collection: `threadConversation.projectUrl`
      (`https://chatgpt.com/g/g-p-…/project`)
    Never click Reconnect / Refresh on an existing connector. The old address is
    dead and that page hangs on "This site cannot be reached". When the address
@@ -296,113 +297,160 @@ Speak only of 临时地址 / 固定域名 / 登录 Cloudflare.
 连接/断开和 Desktop bind-current 话术继续走原流程；仅出现示例、引用或开发方案不执行 Activation。
 本流程不启用 Web Control、MCP Remote Control 或 write_probe，不改模型/provider 或审批策略。
 
-1. **识别当前工作区与状态。** 使用当前任务的实际 workspace root，不把 Skill checkout
-   当作目标；无法可靠确定时停止并报告。所有工作区命令显式传 `-w <workspace>`。
-   先运行 `c2c session -w <workspace> --json`、`c2c status -w <workspace> --json`、
-   `c2c tunnel status -w <workspace> --json` 和机器级 `c2c prefs --json`，保留已有
-   session、conversation、checkpoint/taskId；执行 **Daily update check**。
-   `running: false` 或 `session: null` 单独都不表示首次配置：旧连接可能停止或尚未保存聊天。
-   状态 unknown、损坏或 workspace 不匹配时停止，不猜目标、不清空状态。
-   读取 `runtimeUpgrade`；内部 build stale 先执行 **Runtime build upgrade**，再检查 Connector 契约。
-2. **连接分流。** 先遵守 **Connection choice**，再运行
-   `c2c doctor -w <workspace> --json`，严格遵守 **Doctor gate**。
-   doctor 启动已停止的连接后，重新 `c2c status -w <workspace> --json` 读取 `tokenCount`；
-   缺失的授权状态不是零；`tokenCount` 缺失或 unknown 时停止并诊断，不能强制转换为零。
-   本地 endpoint 健康不等于 ChatGPT 已授权；以下分流必须显式核对授权状态。
-   先核对 status 的 `connectorContractVersion === 1`。字段缺失是 legacy/unknown runtime，
-   不能据此判定 Connector 必须迁移：按 **Runtime contract refresh** 刷新后重查；
-   未知的其他版本停止诊断，不降级、不绕过 Desktop 版本/hash 验证。
-   契约版本确认后、进入任何 setup/授权恢复/迁移分支前，`desktopCompatibility` 缺失或
-   status 为 unknown/corrupt 一律停止诊断；即使 tokenCount 为零也不能走首次配置覆盖坏状态。
-   既有 `session.connectorName` 必须与 `chatgptRepair.connectorName` 一致；已有 session
-   却缺失 endpoint（`chatgptRepair.previousMcpUrl` 为 null），或名称冲突时停止并报告
-   需核对原连接，不把 doctor 合成的默认名称当作已绑定 connector，不按显示名称猜测重建。
-   - **New workspace**：`session === null`、`chatgptRepair.previousMcpUrl === null`
-     且 `tokenCount === 0` 时，复用完整 **Workflow: first-time setup**；复用机器级 prefs，
-     已保存的 setupMode 不重问，未选择时仍按原规则逐个等待选择，不默认自动授权。
-   - **Repair**：已配置但连接需要恢复时，复用 **Workflow: repair**；
-     Activation 的旧 Connector 重建必须先判定迁移：若本地 compatibility 为 legacy/incomplete，
-     先进入 **Connector migration**（含 **Legacy named upgrade**），不能先重建 quick Connector。
-     本地授权 current 但 Connector 需要重建时，先只做 **Connector schema check** 的缓存定义诊断，
-     不调用 workspace_info/send、不发送编码协议；此只读诊断不代表 doctor gate 已通过。
-     schema 明确旧/缺失先迁移，unknown 停止核对；只有 current 才继续普通 reconnect。
-     `chatgptRepair.needed` 走 **Workflow: reconnect after address reclaim**，
-     `namedRepair.needed` 走既有登录修复。修复后重新 doctor，gate 未通过不打开聊天。
-     修复连接后重新读取 status，仍按下述授权分支处理，不能直接视为已授权。
-   - **Interrupted first-time setup**：`session === null`、`chatgptRepair.previousMcpUrl != null`
-     且 `tokenCount === 0` → **Authorization resume**，只补缺失的授权和聊天步骤。
-   - **Revoked authorization**：`session != null` 且 `tokenCount === 0`
-     → **Authorization resume**，恢复当前 workspace 授权，不按健康连接直通。
-   - **Authorization resume**：在上述身份一致性和 doctor gate 下，复用当前精确的
-     `chatgptRepair.mcpUrl` / `chatgptRepair.connectorName` 与既有 tunnel/endpoint；
-     地址缺失时停止诊断，不运行 setup、不重建健康 endpoint。需要配对码时运行
-     `c2c pair -w <workspace> --json` 取得新码。复用 first-time setup step 4 的机器级
-     prefs：遵守已保存的 setupMode，auto 使用 step 5 的现有浏览器配置/授权规则，
-     manual 使用 **Guided manual ChatGPT setup**；未选择仍按原规则等待选择。
-     仅配置/授权该精确名称的 workspace connector，保留现有 Delete/create、OAuth、
-     本机确认等规则，不操作其他 workspace。先恢复授权，再进入 step 3 的 Bind Project/
-     原聊天与 workspace_info 校验，不在授权缺失时打开 Project/chat 或发送消息。
-   - **Authorized connection**：只有现有 doctor gate 通过且 `tokenCount > 0` 才可继续。
-     同时检查 `desktopCompatibility.status`：`legacy` / `incomplete` 进入 **Connector migration**；
-     `none` 进入既有 **Authorization resume**（tokenCount 本身不能代替有效授权）；
-     缺字段、`unknown` / `corrupt` 停止诊断，不强制迁移、不清空授权状态。
-     `current` 只表示本地存在一份独立完整的有效授权（包括可刷新 grant），不能代表当前 ChatGPT Connector；
-     还必须核对下方 workspace_info 返回的实际请求授权，不能拼接不同 token/client 的 scopes。
-     access 过期但 refresh grant 有效时沿用现有 OAuth 刷新机制，不能仅因 access 到期重建 Connector。
-     任一 setup/repair/Authorization resume 完成授权后、进入聊天步骤前，重新运行
-     `c2c doctor -w <workspace> --json` 和 `c2c status -w <workspace> --json`；
-     再次要求 doctor gate 通过且 `tokenCount > 0`，否则停止并报告，不能进入
-     workspace_info 或最终 `desktop bind-current`。doctor 若仍要求修复，先按 Repair 处理。
-     从 Activation 调用 first-time setup 时只补齐 steps 1–6 中的缺失步骤：已完成的
-     sandbox-allow、Connection choice、prefs 不重复操作；完成 step 6 后返回 Activation，
-     跳过 setup step 7 的成功报告。setup 或 repair 已完成聊天绑定和 workspace_info 校验时，
-     step 3 只重读/核对恢复状态，跳过已完成的打开聊天、boot、Bind Project 和验证，直接进入 step 4。
-     任何路径都不能跳过 step 4 前的 **Connector schema check** 和迁移后复验。
-3. **恢复与 Project 分流。** 连接 gate 通过后，重新读取 `c2c session -w <workspace> --json`。
-   已有 `session.checkpoint` 或 `session.taskId` 时，优先遵守 **Workflow: coding task**
-   step 1 的 Resume 规则及 **Conversation management** 的 HANDOFF：保留原 task/iteration，
-   不发送新 INIT、不重跑执行、不重复发送 EXECUTED，不因 Activation 清除 checkpoint。
-   没有新的编码目标时只恢复连接/等待状态，不凭入口自行创建开发任务。
-   - `conversation.mode === "project"` 且 `conversation.projectReady === false`：
-     只补现有 **Bind Project**，不重复 setup、配对或创建 connector。
-   - `conversation.mode === "project"` 且 `conversation.projectReady === true`：
-     复用保存的 `conversation.projectUrl` 与当前 workspace connector，不重建 Project、
-     不重写 Project instructions；按 **Conversation management → project** 复用本 thread
-     的聊天，或从该合集创建本 thread 的首个聊天，不能借用其他 thread 的 session.url。
-   - `conversation.mode === "long-chat"`：继续 **long-chat**，复用原聊天，不自动迁移，
-     不询问迁移、不创建 Project。
-   在同一个 iab 聊天按既有 boot/workspace_info 规则校验：使用精确 `connectorName`
-   调用 `workspace_info`，回复必须匹配当前 workspaceName。正在生成或等待旧任务回复时
-   按现有等待规则处理，不插入重复消息。本轮已验证则复用结果；未通过不保存/覆盖 URL。
-   workspace_info 必须返回 `connectorContractVersion === 1` 和实际当前请求的
-   `desktopCompatibility.status === "current"`；legacy/incomplete 进入 **Connector migration**，
-   unknown/corrupt/缺字段停止诊断，不能借用其他客户端的完整 token 通过。该只读检查不调用 send。
-   workspace_info 匹配后执行 **Connector schema check**；只有本地兼容、实际请求授权和网页 schema 均 current
-   才进入 step 4。明确旧/缺失 schema 进入 **Connector migration**，无法读取 schema 则停止诊断。
-   例外：已完成同名迁移后的旧聊天出现 `tool has been disabled` 或仍显示旧 schema，
-   优先 **Conversation Rebind**，不得再次 Connector migration；此明确错误在一般 unknown 分流前处理。
-4. **统一绑定当前 Desktop 会话。** 上述连接、兼容性、schema 与 workspace_info 校验成功后，运行
-   `c2c desktop bind-current -w <workspace> --json`，完全复用下方 **日常 UX：绑定当前 Desktop 会话**。
-   同一身份已 enabled 的 `alreadyEnabled` 直接复用 bindingId；重新启用或新 thread
-   仍等待本机用户确认，不代点、不传绕过参数。上下文 unknown、workspace 不匹配、
-   取消、超时或其他失败均报告未就绪，不猜目标、不回退到显式 bind/enable 绕过检查。
-   遇到 `DESKTOP_VERSION_UNSUPPORTED`，直接报告错误中 `compatibility` 的
-   `observedDesktopVersion`、`observedAppServerVersion`、`status` 和 `profile`；旧运行时
-   未返回诊断时运行 `c2c desktop compatibility --json`，仍无法观察则明确写 unknown。
-   这是本机 Desktop 协议诊断，不是 OAuth `desktopCompatibility`；不能以其中一个替代另一个。
-   未验证版本保持未就绪，不自动添加 profile、放宽版本/hash 或重新授权来绕过。
-   只有返回 `ok: true`、`enabled: true` 且 binding 身份与当前 thread/workspace 核验一致
-   才可标记绑定成功；发送时仍受 idle、owner、审批、OAuth scope 和版本门禁约束。
-5. **Ready。** 能自动完成的步骤自动完成；登录、首次 Project 创建、本机确认及既有
-   首次偏好/连接选择或用户已选择的手动配置，一次只提示一个动作并等待完成。
-   任何未完成步骤只报告当前阻塞，不能提前宣称 Ready。全部成功后只输出：
+用户无需记忆 workspaceId / threadId / bindingId / Project URL / chat URL。
 
-```text
-✓ 当前项目已识别（<workspaceName>）
-✓ ChatGPT 已连接
-✓ 当前 Desktop 会话已绑定，空闲时可接收后续任务
-Ready.
-```
+1. **第一事实源：workflow readiness。** 使用当前任务的实际 workspace root，不把 Skill
+   checkout 当作目标；无法可靠确定时停止并报告。所有工作区命令显式传 `-w <workspace>`。
+   **先运行**：
+
+   ```text
+   c2c workflow status -w <workspace> --json
+   ```
+
+   这是本地 workflow 分流的第一事实源。消费 bounded 字段 `overall` / `nextAction` /
+   connection·conversation·desktop·remote / `blockers`。不要在 workflow status 之前机械执行
+   session + status + tunnel + prefs 四连读。需要连接修复诊断、setupMode 或具体 conversation
+   navigation 时，再延迟读取：
+   `c2c status -w <workspace> --json`、`c2c session -w <workspace> --json`、
+   `c2c tunnel status -w <workspace> --json`、机器级 `c2c prefs --json`。
+   session JSON 使用只读投影 **`threadConversation`**（mode/projectReady/projectUrl/
+   connectorName/chatBinding/chatUrl/reuseChat）；**不得**把 `session.url` 或
+   session.projectChats[] 当作 Project 当前 thread 导航 authority。
+   保留已有 session、conversation、checkpoint/taskId；执行 **Daily update check**。
+   `running: false` 或 `session: null` 单独都不表示首次配置。
+   状态 unknown、损坏或 workspace 不匹配时停止，不猜目标、不清空状态。
+   若 workflow status 读取 `runtimeUpgrade` 显示内部 build stale，先执行
+   **Runtime build upgrade**，再重读 workflow status。
+
+2. **nextAction → Activation 行为。** 不要另造一套判断器；直接消费 G1a 结果。
+   同一 state-changing action 只执行一次：完成后必须重读 `c2c workflow status`；
+   若 `nextAction` 无变化且没有新的可操作事实，停止并报告，禁止 generic while-loop。
+   - **`stop_unknown`**：立即停止。报告 bounded blocker。不得 repair 猜测、清 session、
+     重建 connector、bind-current、切换 Remote。
+   - **`resolve_unconfirmed_delivery`**：立即停止自动流程。沿用现有 Desktop
+     outcome_unknown 人工核对；不得通过 rebind / Remote / 新 commandId 绕过。
+   - **`wait_current_task`**：保持当前任务；不新 INIT、不创建第二条执行。
+   - **`resume_checkpoint`**：优先恢复原任务。读取 `c2c session --json` 的
+     `threadConversation`；已有 `reuseChat=true` 且 `chatUrl` 安全时直接进入该 chat。
+     Project 当前 thread 无 reusable chat 时，打开 `threadConversation.projectUrl`
+     合集，为**当前 Codex thread**建新 Chat，再 HANDOFF 原 checkpoint。
+     不得借用其他 thread 的 session.url / conversation.chatUrl（不能借用其他 thread 的 session.url）。
+     保留 session.checkpoint / session.taskId；Resume 不发送新 INIT、不重跑执行、
+     不重复 EXECUTED，不因 Activation 清除 checkpoint。
+   - **`repair_connection`**：先遵守 **Connection choice**，再运行
+     `c2c doctor -w <workspace> --json`，严格遵守 **Doctor gate**。
+     doctor 启动已停止的连接后，可重读 `c2c status` 读取 `tokenCount`；
+     缺失的授权状态不是零；`tokenCount` 缺失或 unknown 时停止诊断，不能强制转换为零。
+     修复成功后**重新** `c2c workflow status`；不得假设 repair 即 Ready。
+     若同一 repair action 后 `nextAction` 仍完全相同，停止并报告。
+     `chatgptRepair.needed` 走 **Workflow: reconnect after address reclaim**，
+     `namedRepair.needed` 走既有登录修复；gate 未通过不打开聊天。
+   - **`resume_authorization`**：在 identity 一致性与 doctor gate 下复用现有
+     **Authorization resume** / **Workflow: first-time setup** 缺失步骤。
+     运行 `c2c status` 后分流（status 仅作连接诊断事实，不再代替 workflow 分流）：
+     - **New workspace**：`session === null`、`chatgptRepair.previousMcpUrl === null`
+       且 `tokenCount === 0` 时，复用完整 **Workflow: first-time setup**；复用机器级 prefs，
+       已保存的 setupMode 不重问，未选择时仍按原规则逐个等待选择，不默认自动授权。
+     - **Interrupted first-time setup**：`session === null`、`chatgptRepair.previousMcpUrl != null`
+       且 `tokenCount === 0` → **Authorization resume**。
+     - **Revoked authorization**：`session != null` 且 `tokenCount === 0`
+       → **Authorization resume**。
+     授权恢复复用精确 `chatgptRepair.mcpUrl` / `chatgptRepair.connectorName` 与既有
+     tunnel/endpoint；地址缺失时停止，不运行 setup、不重建健康 endpoint。
+     需要配对码时 `c2c pair -w <workspace> --json`。不操作其他 workspace。
+     先恢复授权，再进入 Project/chat 与 workspace_info 校验；不在授权缺失时打开 Project/chat 或发送消息。字段缺失是 legacy/unknown runtime，不能据此判定 Connector 必须迁移：按 **Runtime contract refresh** 刷新后重查；未知版本停止诊断。
+     `desktopCompatibility` 缺失或 unknown/corrupt 停止；`none` 也走授权恢复。
+     setup 只补齐缺失步骤；完成后返回 Activation，**必须重新 doctor gate + `c2c workflow status`**，
+     再按新的 `nextAction` 处理。不得跳过 readiness reread 直接进入旧 step 编号。
+     - **Authorized connection**：只有现有 doctor gate 通过且 `tokenCount > 0` 才可继续。
+       同时检查 `desktopCompatibility.status`：`legacy` / `incomplete` 进入 **Connector migration**；
+       `none` 进入既有 **Authorization resume**；缺字段、`unknown` / `corrupt` 停止诊断。
+       `current` 只表示本机 AuthStore 汇总有效，不能代表当前 ChatGPT Connector；
+       还必须核对 workspace_info 返回的实际请求授权。
+       任何路径都不能跳过 **Connector schema check** 和迁移后复验。
+   - **`bind_project`**：只补现有 **Bind Project**，不重复 setup / pair / connector creation。
+     Project + chat 验证成功并 `session set` 后，重新 `c2c workflow status`。
+   - **`open_project_chat`**：先读 `threadConversation.mode`。
+     - **Project**（无 reusable same-thread Chat）：打开 `threadConversation.projectUrl`，
+       为当前 thread 创建 Chat；boot + `workspace_info` + schema verification；
+       成功后 `c2c session set -w <workspace> --mode project --url <verified-chat>`；
+       现有 session set 会 stamp 当前 thread mapping；再 rerun workflow status。
+     - **long-chat**：继续现有 long-chat new/switch 逻辑；不因 nextAction 名称强制迁移 Project。
+   - **`bind_current`**：仅在当前 ChatGPT conversation 完成 request-scoped verification
+     （workspace_info + actual request desktopCompatibility + Connector schema check）后，
+     运行 `c2c desktop bind-current -w <workspace> --json`，完全复用下方
+     **日常 UX：绑定当前 Desktop 会话**。
+     同一身份已 enabled 的 `alreadyEnabled` 直接复用 bindingId；重新启用或新 thread
+     仍等待本机用户确认，不代点、不传绕过参数。上下文 unknown、workspace 不匹配、
+     取消、超时或其他失败均报告未就绪，不猜目标、不回退到显式 bind/enable 绕过检查。
+     遇到 `DESKTOP_VERSION_UNSUPPORTED`，报告 `observedDesktopVersion`、
+     `observedAppServerVersion`、`status`、`profile`；必要时 `c2c desktop compatibility --json`。
+     这是本机 Desktop 协议诊断，不是 OAuth `desktopCompatibility`；不能以其中一个替代另一个。
+     未验证版本保持未就绪，不自动添加 profile、放宽版本/hash 或重新授权来绕过。
+     只有返回 `ok: true`、`enabled: true` 且 binding 身份与当前 thread/workspace 核验一致
+     才可标记绑定成功。成功后 rerun workflow status；必须最终变为 `ready_local / reuse`
+     才可报告 local Ready。
+   - **`reuse`**：表示 exact Desktop + inspect available 已确认。**不要再次 bind-current**。
+     仍必须在当前 ChatGPT conversation 执行 `workspace_info`、actual request
+     `desktopCompatibility.status === "current"`、**Connector schema check**；通过后才 Ready。
+   - **`use_remote`**：不要 Desktop bind-current。Remote 是当前安全执行路径。
+     仍需在正确 ChatGPT conversation 做 workspace_info + request-scoped
+     desktopCompatibility/schema verification；通过后报告 Remote workflow Ready。
+     不强制建立 Desktop binding。
+
+3. **Doctor gate 与 request-scoped verification。** `workflow status` 回答本地下一步；
+   Doctor 回答连接/tunnel/repair 是否健康。`ready_local` / `ready_remote` **不等于**
+   可跳过 web verification。需要进入 ChatGPT web 操作前执行一次现有 Doctor gate；
+   若 doctor 发生 state-changing repair，repair 后重新 workflow status。
+   纯健康检查不改变 nextAction。G1a 的 `desktopCompatibility=current` 只是本机 AuthStore
+   汇总；Activation 仍必须在真正目标 Chat 中调用 `workspace_info`，要求
+   workspaceId/workspaceName exact match、`connectorContractVersion === 1`、实际请求
+   `desktopCompatibility.status === "current"`，然后 **Connector schema check**。
+   三层（local readiness + actual MCP request + web schema）都满足才 Ready。
+   既有 `session.connectorName` 必须与 `chatgptRepair.connectorName` 一致；已有 session
+   却缺失 endpoint，或名称冲突时停止；不把 doctor 合成的默认名称当作已绑定 connector。
+   Access 过期但 refresh grant 有效时沿用现有 OAuth 刷新，不重建 Connector。
+
+4. **Project / conversation navigation 使用 threadConversation。**
+   - `threadConversation.mode === "project"` 且 `projectReady === false`：
+     只补现有 **Bind Project**，不重复 setup、配对或创建 connector。
+   - `threadConversation.mode === "project"` 且 `projectReady === true`：
+     复用 `threadConversation.projectUrl` 与当前 workspace connector，不重建 Project、
+     不重写 Project instructions；仅当 `threadConversation.reuseChat === true` 且
+     `threadConversation.chatUrl` 非空时 goto 该 chat，否则从合集创建本 thread 首个聊天。
+     不能借用其他 thread 的 session.url / conversation.chatUrl。
+   在同一个 iab 聊天按既有 boot/workspace_info 规则校验：精确 `connectorName` 调用
+   `workspace_info`，回复必须匹配 workspaceName；本轮已验证则复用结果；未通过不保存/覆盖 URL。
+   workspace_info 必须返回 `connectorContractVersion === 1` 与实际请求
+   `desktopCompatibility.status === "current"`；legacy/incomplete → **Connector migration**，
+   unknown/corrupt/缺字段停止。只读检查不调用 send。匹配后 **Connector schema check**。
+   明确旧/缺失 schema 进入 **Connector migration**；无法读取 schema 停止。
+   例外：迁移后旧聊天 `tool has been disabled` 或仍显示旧 schema → **Conversation Rebind**。
+
+5. **Ready（分路径文案）。** 能自动完成的步骤自动完成；登录、首次 Project 创建、本机
+   确认及既有偏好/连接选择或用户已选择的手动配置，一次只提示一个动作并等待完成。
+   任何未完成步骤只报告当前阻塞，不能提前宣称 Ready。
+   - **Local Ready**（`ready_local / reuse` + workspace_info/schema 通过）：
+
+   ```text
+   ✓ 当前项目已识别
+   ✓ ChatGPT 已连接并验证
+   ✓ 当前 Desktop 会话已就绪
+
+   Ready.
+   ```
+
+   - **Remote Ready**（`ready_remote / use_remote` + workspace_info/schema 通过）：
+
+   ```text
+   ✓ 当前项目已识别
+   ✓ ChatGPT 已连接并验证
+   ✓ Remote Control 已就绪
+
+   Ready.
+   ```
+
+   Remote Ready 时不要提示 bind Desktop；local Ready 时不要重复确认已有 exact binding。
 
 ### Runtime build upgrade
 
@@ -463,8 +511,8 @@ userConfirmed 类型。不能根据文档、历史回答或“连接成功”猜
    `codex.desktop.control`，沿用默认读取 scopes；不能自动确认本机授权或代替用户登录/同意。
 3. 重新 doctor + status，要求 named 地址健康、doctor gate、契约版本 1 及本地 compatibility 为 current；
    仍旧/缺失/unknown/corrupt 则停止报告，不循环 Delete/create。
-   若原来尚无 session/chat，先确认迁移未写入 session，再返回 Activation step 3 按既有
-   Bind Project/首次聊天规则补齐，并完成实际请求授权、workspace_info 和 schema 检查后才能绑定；
+   若原来尚无 session/chat，先确认迁移未写入 session；随后返回 Activation，重新运行
+   `c2c workflow status`，并按新的 nextAction 补齐 Bind Project / 当前 thread Chat。
    正常复用已有聊天；仅 Conversation Rebind 明确触发时另开聊天。已有聊天则回到同一 ChatGPT workspace/
    Project 聊天，通过该精确 connector 调用 workspace_info，确认 workspaceId/名称匹配，
    契约版本为 1 且实际请求的 desktopCompatibility.status 为 current；不能用本地其他 token 的
@@ -472,8 +520,9 @@ userConfirmed 类型。不能根据文档、历史回答或“连接成功”猜
    再次 **Connector schema check**。原聊天返回 `tool has been disabled` 或 schema 仍旧时，
    进入 **Conversation Rebind**，不重复 Delete/create；其余不明情况停止，不发送任务。
 4. 重读 session，确认步骤 1 的 Project/session/checkpoint/task/iteration 未变；不匹配停止，
-   不覆盖以“恢复”旧值。Conversation Rebind 成功仅允许 session.url 变为已验证的新聊天 URL。
-   全部验证通过才返回 Activation，继续既有 desktop bind-current 与 Ready。
+   不覆盖以“恢复”旧值。若进入 Conversation Rebind，允许的 session 变化严格以后续 Conversation Rebind 的 thread-aware mutation contract 为准；Project 不以 session.url 作为导航 authority。
+   全部验证通过后返回 Activation，重新运行 `c2c workflow status`，并严格按新的 nextAction 继续；
+   不得默认 bind-current 或直接报告 Ready。
    迁移不授权绑定/enable，不修改 OAuth、本机确认、owner、版本/hash、审批、防重放或 outcome_unknown 门禁。
 
 ### Conversation Rebind
@@ -484,7 +533,7 @@ contract v1、本地 desktopCompatibility current 均通过，而原聊天明确
 普通网络失败、无法读取 schema、未知授权或 workspace mismatch 不满足触发条件，停止诊断。
 
 1. 重读 session，保留 projectUrl、connectorName、checkpoint、taskId、iteration、lastState、
-   conversationMode 及原 session.url 作为核对基准，不清除旧聊天指针。
+   conversationMode 及原 session.url 作为 compatibility 快照（**不是** Project navigation authority）。Project 基准使用 threadConversation.projectUrl / chatBinding / chatUrl。
 2. Project 模式：只在原 `conversation.projectUrl` 的 on-page composer 新建 Chat，
    不创建新 Project、不改 Project instructions、不使用其他 workspace 或全局首页的新聊天。
    long-chat：复用 **Conversation management → long-chat** 的 switch-chat + HANDOFF，保持 long-chat。
@@ -500,10 +549,12 @@ contract v1、本地 desktopCompatibility current 均通过，而原聊天明确
 4. 全部验证通过后，再重读 session 确认基准未被其他操作改变；有变化则停止，不覆盖。
    仅运行 `c2c session set -w <workspace> --url <verified-new-chat-url>`，不带其他状态修改参数，
    不使用 session clear、--clear-checkpoint、--task、--iteration、--mode 或 --project-url。
-   复读核对：只有 session.url（及既有 savedAt 时间戳）更新；projectUrl、connectorName、
+   复读核对：threadConversation.reuseChat===true 且 threadConversation.chatUrl===verified-new-chat-url；同时允许 session.url latest pointer、chatOwnerFingerprint、当前 thread projectChats entry 更新；projectUrl、connectorName、
    checkpoint、taskId、iteration、lastState、conversationMode 和 Project instructions 保持原值。
-   checkpoint 内原 chatUrl 也不重写；后续恢复以已验证的 session.url 为当前聊天入口。
-   成功后返回 Activation 最终 desktop bind-current；原有本机确认和所有发送门禁保持。
+   checkpoint 内原 chatUrl 也不重写；Project 后续恢复以 threadConversation.chatUrl 为当前 thread 导航入口（long-chat 仍用 session.url）。其他 thread 的 projectChats entries 必须保持。
+   成功后返回 Activation，重新运行 `c2c workflow status`，并按新的 nextAction 继续；
+   仅 nextAction=`bind_current` 时才执行 Desktop bind-current。
+   原有本机确认和所有发送门禁保持。
 
 ### Legacy named upgrade
 
@@ -648,10 +699,15 @@ next action:
 
 ## Conversation management
 
-`c2c session -w <ws> --json` → `{ session, conversation }`.
-`conversation.mode` is the only switch. Missing / legacy files with a chat URL
-and no Project stay **long-chat**. Do not ask those users to migrate. If they
-later say they want a Project, run **Bind Project**. A brand-new workspace
+`c2c session -w <ws> --json` → `{ session, conversation, threadConversation }`.
+threadConversation projection 不暴露 projectChats/fingerprint；session payload 为兼容仍可能包含 projectChats，但 Skill **不得读取/遍历** session.projectChats，只能消费 threadConversation。
+Navigation authority:
+- **Project**: only `threadConversation` (`reuseChat` + `chatUrl` from same_thread map;
+  `projectUrl` for collection). Never `session.url` / `conversation.chatUrl` / `session.projectChats`.
+- **long-chat**: `conversation.chatUrl` / `session.url` remain compatible navigation.
+`conversation.mode` is the only long-chat vs project switch for historical files. Missing /
+legacy files with a chat URL and no Project stay **long-chat**. Do not ask those users to
+migrate. If they later say they want a Project, run **Bind Project**. A brand-new workspace
 (no session file) is **project**.
 
 Never match a Project or a chat by display name. Never upload the repo to
@@ -661,8 +717,9 @@ Project sources. Never click 分享 / Share. Do not rename ChatGPT chats.
 
 ONE ChatGPT conversation per workspace. Same as before.
 
-- **Find it**: if `conversation.reuseSavedChat` and `conversation.chatUrl`,
-  `goto` that URL (foreground + markHandoff) and continue there.
+- **Find it**: if `threadConversation.mode === "long-chat"` and `threadConversation.reuseChat`
+  and `threadConversation.chatUrl`, `goto` that URL (foreground + markHandoff) and continue there.
+  Compatible fallback remains `conversation.reuseSavedChat` + `conversation.chatUrl`.
 - **Save it**: after boot + workspace_info, and the reply names this workspace,
   `c2c session set -w <ws> --mode long-chat --url <url> --title "C2C <workspace name>"`.
   If the name does not match, do not overwrite a previously saved URL.
@@ -690,18 +747,20 @@ ONE ChatGPT conversation per workspace. Same as before.
 One ChatGPT Project per workspace. Mapping:
 
 1. Same Codex conversation (this thread still has context) → same ChatGPT
-   chat URL. `goto` that URL directly. Do not open the collection first.
-2. Same workspace, a **new** Codex conversation → new ChatGPT chat from the
-   collection page (`conversation.projectUrl`). Ignore `session.url` unless
-   you already saved it earlier in THIS Codex thread.
+   chat URL from `threadConversation` when `reuseChat === true`. `goto`
+   `threadConversation.chatUrl` directly. Do not open the collection first.
+2. Same workspace, a **new** Codex conversation → new ChatGPT chat from
+   `threadConversation.projectUrl` collection. Ignore `session.url` unless
+   this thread already has `threadConversation.reuseChat === true` (do not
+   use the workspace latest pointer as thread navigation).
 3. Different workspace → different Project and different connector.
 
 **Open a chat in this Codex thread**
 
-- If you already saved a ChatGPT chat URL earlier in THIS Codex conversation:
+- If `threadConversation.reuseChat === true` and `threadConversation.chatUrl`:
   `goto` that URL. Continue. No new chat. No HANDOFF.
   Exception: **Conversation Rebind** after Connector migration verifies a replacement chat before updating the URL.
-- Else if `conversation.projectReady`: `goto` `conversation.projectUrl`.
+- Else if `threadConversation.projectReady`: `goto` `threadConversation.projectUrl`.
   On that page, use the on-page composer (「{项目名}中的新聊天」 / "New chat
   in …"). Do not use the sidebar and do not `goto` `https://chatgpt.com/`.
   Confirm Chat mode (**In-app browser** §7). Boot prompt, then workspace_info

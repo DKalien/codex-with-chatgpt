@@ -267,6 +267,56 @@ describe("G1a multi-thread projectChats map", () => {
     expect(resolveWorkflowReadiness(input).overall).toBe("blocked");
   });
 
+  it("Project invalid chat URL → chatKnown false; pure resolver → needs_conversation", async () => {
+    const workspace = new Workspace(root);
+    const fp = projectChatOwnerFingerprint(workspace.id, THREAD_A);
+    process.env.CODEX_THREAD_ID = THREAD_A;
+    writeSession(workspace.id, mergeSession(null, {
+      conversationMode: "project",
+      projectUrl: PROJECT,
+      url: "https://example.com/not-chatgpt",
+      chatOwnerFingerprint: fp,
+    }));
+    const { resolveThreadConversation, conversationChatKnown } = await import("../src/session/state.js");
+    const thread = resolveThreadConversation(readSession(workspace.id), workspace.id);
+    const known = conversationChatKnown(readSession(workspace.id), workspace.id);
+    expect(thread.chatBinding).toBe("same_thread");
+    expect(thread.reuseChat).toBe(false);
+    expect(thread.chatUrl).toBeNull();
+    expect(known.chatKnown).toBe(false);
+    const input = await collectWorkflowReadinessInput(workspace);
+    expect(input.conversation.chatKnown).toBe(false);
+    expect(input.conversation.chatBinding).toBe("same_thread");
+    // Collector may report needs_connection when Bridge is stopped in this test env.
+    // Safety contract: chatKnown=false never ready_local; with healthy connection → needs_conversation.
+    const synthetic = resolveWorkflowReadiness({
+      ...input,
+      connection: {
+        running: "running",
+        runtimeUpgrade: "current",
+        authorization: "authorized",
+        connectorContract: "current",
+        desktopCompatibility: "current",
+      },
+    });
+    expect(synthetic.overall).toBe("needs_conversation");
+    expect(synthetic.nextAction).toBe("open_project_chat");
+  });
+
+  it("long-chat invalid URL → chatKnown false, not ready reuse", async () => {
+    const workspace = new Workspace(root);
+    writeSession(workspace.id, {
+      savedAt: "2026-01-01T00:00:00.000Z",
+      conversationMode: "long-chat",
+      url: "https://example.com/not-chatgpt",
+    });
+    process.env.CODEX_THREAD_ID = THREAD_A;
+    const input = await collectWorkflowReadinessInput(workspace);
+    expect(input.conversation.chatKnown).toBe(false);
+    const r = resolveWorkflowReadiness(input);
+    expect(r.overall).not.toBe("ready_local");
+  });
+
   it("collector same-thread ready path uses projectChats not session.url alone", async () => {
     const workspace = new Workspace(root);
     saveProjectChat(workspace.id, THREAD_A, CHAT_A);

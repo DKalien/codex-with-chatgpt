@@ -60,6 +60,7 @@ import {
   mergeSession,
   readSession,
   resolveConversation,
+  resolveThreadConversation,
   updateSession,
   projectChatOwnerFingerprint,
   currentCodexThreadId,
@@ -1075,7 +1076,8 @@ session
     const workspace = new Workspace(resolveWorkspace(opts.workspace));
     const saved = readSession(workspace.id);
     const conversation = resolveConversation(saved);
-    if (opts.json) say(JSON.stringify({ ok: true, session: saved, conversation }));
+    const threadConversation = resolveThreadConversation(saved, workspace.id);
+    if (opts.json) say(JSON.stringify({ ok: true, session: saved, conversation, threadConversation }));
     else if (!saved) {
       say("尚未记录 ChatGPT 会话。新仓库默认使用 Project 合集。");
     } else {

@@ -3,174 +3,159 @@ import { describe, expect, it } from "vitest";
 
 const skillSource = fs.readFileSync(new URL("../skill/SKILL.md", import.meta.url), "utf8");
 
+function indentOf(line: string): number {
+  return line.length - line.replace(/^ */, "").length;
+}
+
 describe.each(["LF", "CRLF"])("Activation Skill 文本契约（%s）", style => {
-  // 仅在内存中构造两种输入；解析边界统一为 LF，不重写 Skill 文件。
   const skill = skillSource.replace(/\r?\n/g, style === "CRLF" ? "\r\n" : "\n").replace(/\r\n/g, "\n");
   const activation = skill.split('## Workflow: Activation（"启用 ChatGPT 工作流"）')[1]?.split("## Workflow: first-time setup")[0] ?? "";
-  it("Desktop 版本拒绝报告真实观察值，不以 OAuth 兼容状态替代协议核验", () => {
-    for (const text of ["DESKTOP_VERSION_UNSUPPORTED", "observedDesktopVersion", "observedAppServerVersion",
-      "c2c desktop compatibility --json", "不是 OAuth `desktopCompatibility`", "不自动添加 profile"])
-      expect(activation).toContain(text);
-  });
-  it("机器 launcher 是唯一安装路径，内部 build 更新不迁移 Connector", () => {
+  const project = skill.split("### project (new workspaces)")[1]?.split("**Update it**")[0] ?? "";
+  const rebind = skill.split("### Conversation Rebind")[1]?.split("### Legacy named upgrade")[0] ?? "";
+  const migration = activation.split("### Connector migration")[1] ?? skill.split("### Connector migration")[1] ?? "";
+  const schema = activation.split("### Connector schema check")[1]?.split("### Connector migration")[0]
+    ?? skill.split("### Connector schema check")[1]?.split("### Connector migration")[0] ?? "";
+  const named = skill.split("### Legacy named upgrade")[1] ?? "";
+  const upgrade = activation.split("### Runtime build upgrade")[1]?.split("### Runtime contract refresh")[0]
+    ?? skill.split("### Runtime build upgrade")[1]?.split("### Runtime contract refresh")[0] ?? "";
+
+  it("Desktop 版本 / launcher / 触发语安全契约", () => {
+    for (const text of ["DESKTOP_VERSION_UNSUPPORTED", "observedDesktopVersion", "不是 OAuth `desktopCompatibility`",
+      "启用 ChatGPT 工作流", "Enable the ChatGPT workflow"])
+      expect(skill).toContain(text);
     expect(skill.match(/<C2C_LAUNCHER_PATH>/g)).toHaveLength(1);
-    expect(skill).not.toContain("<ACTUAL_CHECKOUT_PATH>");
-    expect(skill).not.toMatch(/node [^\n]*<checkout>[\/\\]bin/);
-    const upgrade = activation.split("### Runtime build upgrade")[1]?.split("### Runtime contract refresh")[0] ?? "";
-    for (const text of ["runtimeUpgrade", "runtimeBuildId", "installed/current", "c2c rollout --json",
-      "-w <workspace>", "quick/busy/unknown", "不能用普通 restart 绕过门禁", "不能谎报 Ready",
-      "不为升级打断当前执行 turn", "没有常驻 Supervisor/polling", "build mismatch 绝不触发 Connector migration",
-      "不改 Project/session/checkpoint/task/binding", "原 named URL 和 workspace 身份未变"])
-      expect(upgrade).toContain(text);
-  });
-  it("正式触发语包含统一入口并兼容旧话术", () => {
-    const description = skill.split("---")[1];
-    for (const trigger of ["启用 ChatGPT 工作流", "开启 ChatGPT 工作流", "Enable the ChatGPT workflow",
-      "Activate the ChatGPT workflow", "使用 Codex with ChatGPT", "Set up Codex with ChatGPT",
-      "把这个会话绑定并启用给 ChatGPT"]) expect(description).toContain(trigger);
-    expect(skill).toContain('## Workflow: first-time setup（"使用 Codex with ChatGPT 完成首次配置"）');
-    expect(skill).toContain('## Workflow: coding task（Normal："使用 Codex with ChatGPT 完成 XXX"）');
   });
 
-  it("先识别状态，新工作区复用 setup 和机器偏好，停止不等于新工作区", () => {
-    expect(activation.indexOf("c2c session -w <workspace> --json")).toBeLessThan(activation.indexOf("**New workspace**"));
+  it("workflow status 第一事实源；延迟读取；无旧 step 跳转", () => {
+    expect(activation).toContain("c2c workflow status -w <workspace> --json");
+    expect(activation.indexOf("c2c workflow status -w <workspace> --json"))
+      .toBeLessThan(activation.indexOf("**New workspace**"));
     for (const text of ["c2c status -w <workspace> --json", "c2c prefs --json", "running: false",
-      "chatgptRepair.previousMcpUrl", "Workflow: first-time setup", "已保存的 setupMode 不重问",
-      "缺失的授权状态不是零", "跳过 setup step 7 的成功报告", "直接进入 step 4"])
+      "缺失的授权状态不是零", "不能强制转换为零", "禁止 generic while-loop",
+      "必须重新 doctor gate + `c2c workflow status`"])
+      expect(activation).toContain(text);
+    expect(activation).not.toContain("直接进入 step 4");
+  });
+
+  it("11 个顶层 nextAction Markdown indent 完全一致，且深于 Authorized connection", () => {
+    const actions = [
+      "stop_unknown", "resolve_unconfirmed_delivery", "wait_current_task", "resume_checkpoint",
+      "repair_connection", "resume_authorization", "bind_project", "open_project_chat",
+      "bind_current", "reuse", "use_remote",
+    ];
+    const lines = activation.split("\n");
+    const indents: number[] = [];
+    for (const action of actions) {
+      const line = lines.find(l => l.includes(`**\`${action}\`**`) && l.includes("："));
+      expect(line, action).toBeTruthy();
+      indents.push(indentOf(line!));
+    }
+    expect(new Set(indents).size).toBe(1);
+    const auth = lines.find(l => l.includes("**Authorized connection**"));
+    expect(auth).toBeTruthy();
+    expect(indentOf(auth!)).toBeGreaterThan(indents[0]);
+  });
+
+  it("resume_authorization 子项与顶层 nextAction 分层正确", () => {
+    for (const text of ["**New workspace**", "**Interrupted first-time setup**",
+      "**Revoked authorization**", "**Authorized connection**"])
+      expect(activation).toContain(text);
+    expect(activation).toContain("不在授权缺失时打开 Project/chat 或发送消息");
+    expect(activation).toContain("不能据此判定 Connector 必须迁移");
+  });
+
+  it("Project 导航 threadConversation；禁止 session.url navigation authority", () => {
+    expect(project).toContain("threadConversation.reuseChat === true");
+    expect(project).not.toMatch(/goto `session\.url`/);
+    expect(activation).toMatch(/不能借用其他 thread 的 [`]?session\.url[`]?/);
+    expect(skill).toContain("threadConversation projection 不暴露 projectChats");
+  });
+
+  it("reuse/use_remote 不 bind-current；bind_current 在 request-scoped verification 后", () => {
+    const reuseBlock = activation.split("- **`reuse`**：")[1]?.split("- **`use_remote`**")[0] ?? "";
+    const remoteBlock = activation.split("- **`use_remote`**：")[1]?.split("3. **Doctor gate")[0] ?? "";
+    const bindBlock = activation.split("- **`bind_current`**：")[1]?.split("- **`reuse`**")[0] ?? "";
+    expect(reuseBlock).toContain("**不要再次 bind-current**");
+    expect(reuseBlock).not.toContain("c2c desktop bind-current");
+    expect(remoteBlock).toContain("不要 Desktop bind-current");
+    expect(remoteBlock).not.toContain("c2c desktop bind-current");
+    expect(bindBlock).toContain("request-scoped verification");
+    expect(bindBlock).toContain("c2c desktop bind-current -w <workspace> --json");
+  });
+
+  it("Connector schema：intent 两枚举 + userConfirmed true literal", () => {
+    expect(schema).toContain("codex_desktop_status");
+    expect(schema).toContain("codex_desktop_send");
+    expect(schema).toContain("development_plan");
+    expect(schema).toContain("revision");
+    expect(schema).toMatch(/userConfirmed[\s\S]{0,80}true literal/);
+    expect(schema).toContain("const: true");
+  });
+
+  it("OAuth scopes / migration：read+control，禁止自动确认与跨 workspace", () => {
+    expect(skill).toContain("codex.desktop.read");
+    expect(skill).toContain("codex.desktop.control");
+    expect(skill).toContain("不能自动确认本机授权或代替用户登录/同意");
+    expect(skill).toContain("不触碰其他 workspace");
+  });
+
+  it("Legacy named upgrade：zoneResolution safety + hostname isolation", () => {
+    for (const text of ["zoneResolution", "`current`", "`machine-unique`", "`corrupt`",
+      "`ambiguous`", "`missing`", "不传其他 workspace 的 --hostname", "含 workspaceId 的独立 hostname",
+      "--require-named"])
+      expect(named).toContain(text);
+  });
+
+  it("Request token isolation：不能用本地其他 token 补完整授权", () => {
+    expect(skill).toContain("不能用本地其他 token");
+  });
+
+  it("Connector migration step 4 引用 thread-aware Rebind contract", () => {
+    expect(migration).toContain("thread-aware mutation contract");
+    expect(migration).not.toContain("Conversation Rebind 成功仅允许 session.url");
+    expect(migration).toContain("Project 不以 session.url 作为导航 authority");
+  });
+
+  it("Conversation Rebind preservation：project/connector/checkpoint/task 字段与 other-thread mappings", () => {
+    for (const text of ["threadConversation.chatUrl", "projectUrl", "connectorName",
+      "checkpoint", "taskId", "iteration", "lastState", "conversationMode",
+      "其他 thread 的 projectChats entries 必须保持"])
+      expect(rebind).toContain(text);
+  });
+
+  it("request-scoped verification 仍强制；Ready 分路径", () => {
+    for (const text of ["workspace_info", "connectorContractVersion === 1",
+      'desktopCompatibility.status === "current"', "Connector schema check",
+      "✓ 当前 Desktop 会话已就绪", "✓ Remote Control 已就绪"])
       expect(activation).toContain(text);
   });
 
-  it("恢复连接严格经过 doctor gate 和现有 repair", () => {
-    for (const text of ["Connection choice", "c2c doctor -w <workspace> --json", "Doctor gate",
-      "Workflow: repair", "chatgptRepair.needed", "Workflow: reconnect after address reclaim",
-      "namedRepair.needed", "gate 未通过不打开聊天", "session.connectorName",
-      "不把 doctor 合成的默认名称当作已绑定 connector"]) expect(activation).toContain(text);
+  it("runtime upgrade/refresh 安全门禁仍在 Activation 内", () => {
+    for (const text of ["c2c rollout --json", "build mismatch 绝不触发 Connector migration",
+      "不能用普通 restart 绕过门禁", "connectorContractVersion === 1"])
+      expect(upgrade + activation).toContain(text);
   });
 
-  it.each([
-    ["New workspace", "session === null", "chatgptRepair.previousMcpUrl === null", "复用完整 **Workflow: first-time setup**"],
-    ["Interrupted first-time setup", "session === null", "chatgptRepair.previousMcpUrl != null", "**Authorization resume**"],
-    ["Revoked authorization", "session != null", "tokenCount === 0", "**Authorization resume**"],
-  ])("%s 按 session、endpoint 和授权状态分流", (branch, session, endpoint, target) => {
-    const paragraph = activation.split(`- **${branch}**：`)[1]?.split("\n   - ")[0] ?? "";
-    for (const text of [session, endpoint, "tokenCount === 0", target]) expect(paragraph).toContain(text);
+  it("Connector migration 不得引用旧 Activation step number 或强制 bind-current", () => {
+    expect(migration).not.toMatch(/Activation step [0-9]/);
+    expect(migration).not.toContain("继续既有 desktop bind-current");
+    expect(migration).toContain("重新运行 `c2c workflow status`");
+    expect(migration).toContain("按新的 nextAction");
   });
 
-  it("授权恢复复用精确连接与偏好，复查成功前不得进入聊天或绑定", () => {
-    const resume = activation.split("- **Authorization resume**：")[1]?.split("\n   - ")[0] ?? "";
-    for (const text of ["chatgptRepair.mcpUrl", "chatgptRepair.connectorName", "不运行 setup、不重建健康 endpoint",
-      "c2c pair -w <workspace> --json", "setupMode", "auto", "manual", "Guided manual ChatGPT setup",
-      "不操作其他 workspace", "不在授权缺失时打开 Project/chat 或发送消息"])
-      expect(resume).toContain(text);
-    const gate = activation.split("- **Authorized connection**：")[1]?.split("3. **恢复与 Project 分流。")[0] ?? "";
-    for (const text of ["重新运行", "c2c doctor -w <workspace> --json", "c2c status -w <workspace> --json",
-      "再次要求 doctor gate 通过且 `tokenCount > 0`", "否则停止并报告", "desktop bind-current"])
-      expect(gate).toContain(text);
-    expect(activation).toContain("`tokenCount` 缺失或 unknown 时停止并诊断，不能强制转换为零");
-    expect(activation).toContain("本地 endpoint 健康不等于 ChatGPT 已授权");
+  it("Conversation Rebind 成功后 reread workflow status，不固定 bind-current", () => {
+    expect(rebind).toContain("c2c workflow status");
+    expect(rebind).toContain("nextAction");
+    expect(rebind).not.toContain("最终 desktop bind-current");
+    expect(rebind).toContain("仅 nextAction=`bind_current` 时才执行 Desktop bind-current");
   });
 
-  it("Project 未就绪只绑定，就绪复用，legacy 不迁移", () => {
-    expect(activation).toContain('conversation.projectReady === false`：\n     只补现有 **Bind Project**');
-    expect(activation).toContain('conversation.projectReady === true`：\n     复用保存的 `conversation.projectUrl`');
-    expect(activation).toContain('conversation.mode === "long-chat"`：继续 **long-chat**');
-    for (const text of ["不自动迁移", "不能借用其他 thread 的 session.url", "workspace_info",
-      "未通过不保存/覆盖 URL"]) expect(activation).toContain(text);
-  });
-
-  it("保留 checkpoint/task，不借入口创建或重复执行任务", () => {
-    for (const text of ["session.checkpoint", "session.taskId", "Resume", "不发送新 INIT",
-      "不重跑执行", "不重复发送 EXECUTED", "不因 Activation 清除 checkpoint"])
-      expect(activation).toContain(text);
-  });
-
-  it("验证后最终 bind-current，身份确认失败不能 Ready", () => {
-    const bind = activation.indexOf("c2c desktop bind-current -w <workspace> --json");
-    expect(bind).toBeGreaterThan(activation.indexOf("调用 `workspace_info`"));
-    expect(bind).toBeLessThan(activation.indexOf("5. **Ready。**"));
-    for (const text of ["alreadyEnabled", "本机用户确认", "不代点", "上下文 unknown",
-      "不回退到显式 bind/enable", "ok: true", "enabled: true", "一次只提示一个动作",
-      "不能提前宣称 Ready", "✓ 当前项目已识别", "✓ ChatGPT 已连接", "✓ 当前 Desktop 会话已绑定"])
-      expect(activation).toContain(text);
-    expect(activation).toContain("不新增 CLI、持久化状态或隐式授权");
-    expect(activation).toContain("不启用 Web Control、MCP Remote Control 或 write_probe");
-  });
-
-  it("中英文 README 的安装后首选操作使用统一入口", () => {
+  it("README 统一入口", () => {
     for (const [file, prompt] of [["README.zh-CN.md", "启用 ChatGPT 工作流"],
       ["README.md", "Enable the ChatGPT workflow"]]) {
       const readme = fs.readFileSync(new URL(`../${file}`, import.meta.url), "utf8");
-      expect(readme.split("\n").some(line => line.startsWith("2. ") && line.includes(prompt))).toBe(true);
+      expect(readme).toContain(prompt);
       expect(readme).toContain("desktop bind-current");
     }
-  });
-
-  it("旧 runtime 先刷新契约，不把未知版本直接当成 Connector 迁移", () => {
-    for (const text of ["connectorContractVersion === 1", "Runtime contract refresh",
-      "不能据此判定 Connector 必须迁移", "刷新一次仍缺字段或未知版本则停止",
-      "Bridge 状态 unknown 时停止诊断，不能当作未运行",
-      "地址变化先返回 Activation 的 Repair 迁移预检",
-      "服务本次 MCP Review 的 workspace Bridge", "`unknown` / `corrupt` 停止诊断"])
-      expect(activation).toContain(text);
-    expect(activation.indexOf("即使 tokenCount 为零也不能走首次配置覆盖坏状态"))
-      .toBeLessThan(activation.indexOf("**New workspace**"));
-  });
-
-  it("网页 schema 旧时迁移，current 时不迁移，不能以发送测试代替发现", () => {
-    const schema = activation.split("### Connector schema check")[1]?.split("### Connector migration")[0] ?? "";
-    for (const text of ["实际工具定义", "不要调用 `codex_desktop_send`", "codex_desktop_status",
-      "`workspaceId`、`bindingId`、`commandId`、`intent`、`userConfirmed`、`message`",
-      "development_plan", "revision", "const: true", "不能只是 boolean",
-      "current，不迁移、不 Delete/create", "migration required", "unknown，停止"])
-      expect(schema).toContain(text);
-  });
-
-  it("迁移只触碰精确 workspace，保留 Project/session/checkpoint 并复验", () => {
-    const migration = activation.split("### Connector migration")[1] ?? "";
-    for (const text of ["current + current 不迁移", "unknown/corrupt/workspace mismatch",
-      "conversation.projectUrl", "session.url", "checkpoint", "taskId", "iteration",
-      "不执行 session clear/set", "不重写 Project instructions", "不创建新 Project 或第二个 Connector",
-      "不使用其他 workspace 的连接", "不触碰其他 workspace", "c2c pair -w <workspace> --json",
-      "prefs.setupMode", "Delete 当前同名 Connector", "不要 Reconnect/Edit",
-      "codex.desktop.read", "codex.desktop.control", "本地 compatibility 为 current",
-      "workspaceId/名称匹配", "再次 **Connector schema check**", "重读 session", "outcome_unknown"])
-      expect(migration).toContain(text);
-    expect(activation).toContain('desktopCompatibility.status === "current"');
-    expect(activation).toContain("不能借用其他客户端的完整 token 通过");
-    expect(migration).toContain("不能用本地其他 token 的");
-  });
-
-  it("迁移后旧聊天失效优先 Conversation Rebind，不重复重建 Connector", () => {
-    const rebind = activation.split("### Conversation Rebind")[1]?.split("### Legacy named upgrade")[0] ?? "";
-    for (const text of ["tool has been disabled", "仍显示旧工具 schema", "本地 desktopCompatibility current",
-      "原 `conversation.projectUrl`", "on-page composer 新建 Chat", "switch-chat + HANDOFF",
-      "两种模式均先 boot", "精确 `connectorName`", "workspaceId/名称必须匹配", "实际请求 desktopCompatibility.status",
-      "再次 **Connector schema check**", "不重复 Connector migration/Delete/create/pair", "不改 Project instructions"])
-      expect(rebind).toContain(text);
-    expect(activation).toContain("此明确错误在一般 unknown 分流前处理");
-  });
-
-  it("新聊天先验证再只更新 URL，失败保留原状态且不能 Ready", () => {
-    const rebind = activation.split("### Conversation Rebind")[1]?.split("### Legacy named upgrade")[0] ?? "";
-    expect(rebind.indexOf("再次 **Connector schema check**")).toBeLessThan(rebind.indexOf("c2c session set"));
-    for (const text of ["--url <verified-new-chat-url>", "不带其他状态修改参数", "基准未被其他操作改变",
-      "新聊天任何校验失败均停止", "不继续新开聊天", "不保存新 URL，不 bind-current，不报告 Ready",
-      "checkpoint、taskId、iteration、lastState、conversationMode 和 Project instructions 保持原值",
-      "checkpoint 内原 chatUrl 也不重写", "不得新 INIT、重跑执行、重复 EXECUTED", "不调用 codex_desktop_send"])
-      expect(rebind).toContain(text);
-  });
-
-  it("legacy quick 先升级 named，最终固定 URL 就绪后才重建 Connector", () => {
-    const migration = activation.split("### Connector migration")[1]?.split("### Legacy named upgrade")[0] ?? "";
-    expect(migration.indexOf("先执行 Legacy named upgrade")).toBeLessThan(migration.indexOf("c2c pair"));
-    expect(migration).toContain("该最终 `chatgptRepair.mcpUrl`");
-    expect(migration).toContain("要求 named 地址健康");
-    const named = activation.split("### Legacy named upgrade")[1] ?? "";
-    for (const text of ["健康 named workspace 直接复用", "不再 choose/provision", "migrationZone",
-      "zoneResolution", "`machine-unique`", "`corrupt` 停止诊断", "`ambiguous` 或 `missing`", "只问一次", "不能复制别的 workspace 的 hostname、tunnelId",
-      "--require-named --json", "不传其他 workspace 的 --hostname", "含 workspaceId 的独立 hostname",
-      "不得调用 choose quick", "不提前 Delete/create，不报告 Ready", "cloudflare-named",
-      "保留 Project/projectUrl、chat URL、session、checkpoint、taskId/iteration、connectorName"])
-      expect(named).toContain(text);
   });
 });

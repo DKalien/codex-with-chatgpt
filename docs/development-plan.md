@@ -707,3 +707,11 @@ G 阶段聚焦用户体验与跨设备日常闭环，不再扩展 recovery 状�
 - 路线：G1a 收口 → **G1b** Skill Activation 一次 readiness 只补缺失步骤（不得因 ready_local 跳过 web verification；恢复 Project chat 必须用 thread-aware URL projection，不得复用全局 `session.url`）→ G2 readiness 投影到 `workspace_info` → G3 跨设备从零 E2E。
 
 - **G1a NEXT_EXPECTED_STEP**：G1b — Skill Activation consumes workflow readiness；thread chat URL 须走 bounded thread-aware projection，Skill 不遍历 fingerprint map。
+
+### G1b — Skill Activation consumes workflow readiness（本轮，uncommitted）
+
+- `c2c session --json` 新增只读 `threadConversation`（`resolveThreadConversation`）：Project `chatUrl` 仅来自 `projectChats` same_thread；禁止 `session.url` fallback。
+- Activation 第一事实源改为 `c2c workflow status`；`overall`/`nextAction` 直接分流；state-changing 后 bounded reread，禁止循环。
+- `ready_local/reuse` 与 `ready_remote/use_remote` 均不调用 bind-current；仍强制 request-scoped `workspace_info` + actual request `desktopCompatibility` + Connector schema check。
+- `needs_desktop_bind/bind_current` 仅在 web verification 后执行 `desktop bind-current`。
+- 本轮不 commit / push；等待 independent review。
