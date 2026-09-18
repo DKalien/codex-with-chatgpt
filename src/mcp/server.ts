@@ -302,6 +302,8 @@ async function buildWorkspaceInfoWorkflow(
   const result = resolveWorkflowReadiness(input, {
     remoteControl: remoteCap,
     currentConversation: conversationAvailable ? "available" : "unavailable",
+    // MCP request: reuse persisted Desktop binding; no Bridge current-context identity.
+    desktopRoute: "saved_binding",
   });
   return {
     schemaVersion: WORKFLOW_READINESS_SCHEMA_VERSION,

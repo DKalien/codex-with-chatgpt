@@ -9,6 +9,7 @@ import { desktopFile } from "../src/desktop/store.js";
 import { remoteFile } from "../src/remote/store.js";
 import { desktopIpc } from "../src/desktop/ipc.js";
 import { DESKTOP_CONTROL_SCOPE, DESKTOP_READ_SCOPE } from "../src/auth/store.js";
+import { DesktopError } from "../src/desktop/store.js";
 import { workflowOutputSchema } from "../src/mcp/server.js";
 import { cleanup, isolateStateDir, makeTmpDir } from "./helpers.js";
 
@@ -170,18 +171,16 @@ describe("G2 request-scoped workspace_info.workflow over HTTP MCP", () => {
     }
   });
 
-  it("Case B: full Desktop request scopes + exact local binding → ready_local; chatKnown stays false", async () => {
+  it("Case B live-faithful: no current context, saved binding inspect available → ready_local", async () => {
     writeDesktop(bridge.workspace.id);
     writeSession(bridge.workspace.id, mergeSession(null, {
       conversationMode: "project",
       projectUrl: PROJECT,
     }));
-    vi.spyOn(desktopIpc, "currentIdentity").mockResolvedValue({
-      threadId: BINDING_THREAD,
-      hostId: "local",
-      projectId: "p1",
-      title: "t",
-    } as never);
+    // Resident Bridge: no CODEX_THREAD_ID / no current Desktop context.
+    vi.spyOn(desktopIpc, "currentIdentity").mockRejectedValue(
+      new DesktopError("DESKTOP_CURRENT_CONTEXT_INVALID", "no current context"),
+    );
     vi.spyOn(desktopIpc, "inspect").mockResolvedValue({
       threadId: BINDING_THREAD,
       hostId: "local",
@@ -204,6 +203,10 @@ describe("G2 request-scoped workspace_info.workflow over HTTP MCP", () => {
       expect(info.workflow.requestContext.remote).toBe("current");
       expect(info.workflow.conversation.chatKnown).toBe(false);
       expect(info.workflow.conversation.chatBinding).toBe("none");
+      expect(info.workflow.desktop.currentTarget).toBe("unavailable");
+      expect(info.workflow.desktop.bindingAvailability).toBe("available");
+      expect(info.workflow.desktop.configured).toBe(true);
+      expect(info.workflow.desktop.enabled).toBe(true);
       expect(info.workflow.overall).toBe("ready_local");
       expect(info.workflow.nextAction).toBe("reuse");
       expect(workflowOutputSchema.safeParse(info.workflow).success).toBe(true);

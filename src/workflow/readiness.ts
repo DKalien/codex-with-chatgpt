@@ -139,6 +139,15 @@ export const WORKFLOW_BLOCKER_DETAIL_MAX = 64;
 export const WORKFLOW_REQUEST_CONVERSATION_STATES = ["available", "unavailable"] as const;
 export type RequestConversationState = (typeof WORKFLOW_REQUEST_CONVERSATION_STATES)[number];
 
+/**
+ * Desktop readiness route:
+ * - current_context: local CLI — requires currentIdentity === saved binding (exact).
+ * - saved_binding: MCP request — no meaningful Bridge current Desktop thread; reuse
+ *   persisted binding via configured+enabled+inspect availability.
+ */
+export const WORKFLOW_DESKTOP_ROUTES = ["current_context", "saved_binding"] as const;
+export type DesktopRoute = (typeof WORKFLOW_DESKTOP_ROUTES)[number];
+
 export interface WorkflowConnectionProjection {
   running: ConnectionRunning;
   runtimeUpgrade: ConnectionRuntimeUpgrade;
@@ -197,10 +206,13 @@ export interface WorkflowReadinessInput {
 /**
  * Optional request policy for MCP projection; CLI omits for G1a parity.
  * `currentConversation` is this MCP request only — not Project membership, not same_thread.
+ * `desktopRoute` is explicit MCP Desktop route — never inferred from currentConversation.
  */
 export interface WorkflowRequestPolicy {
   remoteControl?: "current" | "incomplete" | "none";
   currentConversation?: RequestConversationState;
+  /** MCP must pass "saved_binding"; CLI omits → current_context exact-identity gate. */
+  desktopRoute?: DesktopRoute;
 }
 
 export interface WorkflowReadinessResult {
@@ -252,7 +264,7 @@ function remoteSafelyReady(remote: WorkflowRemoteProjection): boolean {
 }
 
 /**
- * Local Desktop identity reuse gate.
+ * Local Desktop identity reuse gate (current_context only).
  * ready_local requires fully confirmed delivery inspect (available), not identity alone.
  */
 function desktopLocalReady(desktop: WorkflowDesktopProjection): boolean {
@@ -263,6 +275,23 @@ function desktopLocalReady(desktop: WorkflowDesktopProjection): boolean {
     && desktop.bindingAvailability === "available"
     && !desktop.unresolvedDelivery
   );
+}
+
+/**
+ * MCP saved_binding route: Bridge has no meaningful current Desktop thread.
+ * Reuse the user-confirmed persisted binding via inspect availability; never require exact identity.
+ */
+function desktopSavedBindingReady(desktop: WorkflowDesktopProjection): boolean {
+  return (
+    desktop.configured === true
+    && desktop.enabled === true
+    && desktop.bindingAvailability === "available"
+    && !desktop.unresolvedDelivery
+  );
+}
+
+function desktopRouteOf(requestPolicy?: WorkflowRequestPolicy): DesktopRoute {
+  return requestPolicy?.desktopRoute === "saved_binding" ? "saved_binding" : "current_context";
 }
 
 function conversationReady(conversation: WorkflowConversationProjection): boolean {
@@ -291,10 +320,10 @@ function conversationUsable(
 /**
  * Pure capability resolver.
  *
- * ready_local / reuse ONLY when fully confirmed local execution path:
- * exact current Desktop identity + enabled + bindingAvailability === available + no unresolved delivery.
- * It still does NOT mean ChatGPT Connector request-scoped verification — G1b/G2 must run
- * workspace_info / connector schema checks. Local desktopCompatibility is AuthStore summary only.
+ * ready_local / reuse:
+ * - current_context (CLI): exact current Desktop identity + enabled + inspect available.
+ * - saved_binding (MCP): persisted binding configured+enabled+inspect available; no exact identity.
+ * Never rewrites saved binding. MCP still needs request-scoped authorization/compatibility/conversation gates.
  */
 export function resolveWorkflowReadiness(
   input: WorkflowReadinessInput,
@@ -302,6 +331,7 @@ export function resolveWorkflowReadiness(
 ): WorkflowReadinessResult {
   const blockers: WorkflowBlocker[] = [];
   const { connection, conversation, desktop, remote } = input;
+  const desktopRoute = desktopRouteOf(requestPolicy);
 
   // 1) Local durable security blockers first (independent of Bridge)
   if (conversation.sessionCorrupt) {
@@ -361,7 +391,8 @@ export function resolveWorkflowReadiness(
   }
 
   // 5) Desktop / Remote identity facts after connection is healthy
-  if (desktop.currentTarget === "unknown") {
+  // saved_binding (MCP) has no Bridge current-context identity — do not require currentTarget exact/known.
+  if (desktopRoute === "current_context" && desktop.currentTarget === "unknown") {
     blockers.push({ code: "desktop_target_unknown" });
     return finish(input, "blocked", "stop_unknown", blockers);
   }
@@ -406,11 +437,44 @@ export function resolveWorkflowReadiness(
     return finish(input, "needs_conversation", "open_project_chat", blockers);
   }
 
-  // 8) Fully confirmed local Desktop path only
-  if (desktopLocalReady(desktop)) {
+  // 8) Desktop path — current_context (CLI/local) vs saved_binding (MCP request)
+  const finishUnavailableDesktop = (): WorkflowReadinessResult => {
+    if (remoteSafelyReady(remote)) {
+      const remoteCap = requestPolicy?.remoteControl;
+      if (remoteCap !== undefined && remoteCap !== "current") {
+        blockers.push({
+          code: remoteCap === "none" ? "remote_request_scope_missing" : "remote_request_scope_incomplete",
+        });
+        return finish(input, "needs_authorization", "resume_authorization", blockers);
+      }
+      blockers.push({ code: "desktop_delivery_unavailable" });
+      return finish(input, "ready_remote", "use_remote", blockers);
+    }
+    blockers.push({ code: "desktop_delivery_unavailable" });
+    return finish(input, "blocked", "stop_unknown", blockers);
+  };
+
+  if (desktopRoute === "saved_binding") {
+    // Never require currentTarget === "exact". currentTarget=different is irrelevant here.
+    if (desktopSavedBindingReady(desktop)) {
+      return finish(input, "ready_local", "reuse", []);
+    }
+    if (desktop.configured && desktop.enabled) {
+      if (desktop.bindingAvailability === "busy") {
+        blockers.push({ code: "desktop_binding_busy" });
+        return finish(input, "busy", "wait_current_task", blockers);
+      }
+      if (desktop.bindingAvailability === "unknown") {
+        blockers.push({ code: "desktop_delivery_unknown" });
+        return finish(input, "blocked", "stop_unknown", blockers);
+      }
+      // unavailable → blocked; Remote fallback only when Remote truly ready + request scopes current
+      return finishUnavailableDesktop();
+    }
+    // not configured / not enabled → fall through to remote then bind_current
+  } else if (desktopLocalReady(desktop)) {
     return finish(input, "ready_local", "reuse", []);
-  }
-  if (desktop.currentTarget === "exact" && desktop.enabled && desktop.configured) {
+  } else if (desktop.currentTarget === "exact" && desktop.enabled && desktop.configured) {
     if (desktop.bindingAvailability === "busy") {
       blockers.push({ code: "desktop_binding_busy" });
       return finish(input, "busy", "wait_current_task", blockers);
@@ -420,19 +484,7 @@ export function resolveWorkflowReadiness(
       return finish(input, "blocked", "stop_unknown", blockers);
     }
     // exact + unavailable: try Remote; else blocked (never soft-ready_local)
-    if (remoteSafelyReady(remote)) {
-      const remoteCapExact = requestPolicy?.remoteControl;
-      if (remoteCapExact !== undefined && remoteCapExact !== "current") {
-        blockers.push({
-          code: remoteCapExact === "none" ? "remote_request_scope_missing" : "remote_request_scope_incomplete",
-        });
-        return finish(input, "needs_authorization", "resume_authorization", blockers);
-      }
-      blockers.push({ code: "desktop_delivery_unavailable" });
-      return finish(input, "ready_remote", "use_remote", blockers);
-    }
-    blockers.push({ code: "desktop_delivery_unavailable" });
-    return finish(input, "blocked", "stop_unknown", blockers);
+    return finishUnavailableDesktop();
   }
 
   // 9) Remote safely online/idle
@@ -444,7 +496,13 @@ export function resolveWorkflowReadiness(
       });
       return finish(input, "needs_authorization", "resume_authorization", blockers);
     }
-    if (desktop.configured && desktop.enabled && desktop.currentTarget !== "exact") {
+    if (desktopRoute === "saved_binding") {
+      if (!desktop.configured || !desktop.enabled) {
+        blockers.push({ code: "desktop_not_bound" });
+      } else if (desktop.bindingAvailability !== "available") {
+        blockers.push({ code: "desktop_unavailable", detail: desktop.bindingAvailability });
+      }
+    } else if (desktop.configured && desktop.enabled && desktop.currentTarget !== "exact") {
       blockers.push({ code: "desktop_target_mismatch", detail: desktop.currentTarget });
     } else if (!desktop.configured || !desktop.enabled) {
       blockers.push({ code: "desktop_not_bound" });
@@ -455,6 +513,16 @@ export function resolveWorkflowReadiness(
   }
 
   // 10) otherwise → bind current Desktop
+  if (desktopRoute === "saved_binding") {
+    if (!desktop.configured) {
+      blockers.push({ code: "desktop_bind_required" });
+    } else if (!desktop.enabled) {
+      blockers.push({ code: "desktop_not_enabled" });
+    } else {
+      blockers.push({ code: "desktop_unavailable", detail: desktop.bindingAvailability });
+    }
+    return finish(input, "needs_desktop_bind", "bind_current", blockers);
+  }
   if (desktop.configured && desktop.enabled && desktop.currentTarget === "different") {
     blockers.push({ code: "desktop_target_mismatch", detail: "different" });
   } else if (!desktop.enabled) {

@@ -105,7 +105,12 @@ export function collectConversationFacts(
   };
 }
 
-export async function collectDesktopFacts(workspace: Workspace): Promise<WorkflowDesktopProjection> {
+export async function collectDesktopFacts(
+  workspace: Workspace,
+  conversationSource?: ConversationSource,
+): Promise<WorkflowDesktopProjection> {
+  // MCP request has no meaningful Bridge current Desktop thread — skip currentIdentity().
+  const skipCurrentIdentity = conversationSource?.kind === "mcp_request";
   let desktop: WorkflowDesktopProjection = {
     configured: false,
     enabled: false,
@@ -123,17 +128,22 @@ export async function collectDesktopFacts(workspace: Workspace): Promise<Workflo
 
     if (configured && state?.binding) {
       const binding = state.binding;
-      try {
-        const identity = await desktopIpc.currentIdentity(workspace.root);
-        const same =
-          identity.threadId === binding.threadId
-          && identity.hostId === binding.hostId
-          && identity.projectId === binding.projectId;
-        currentTarget = same ? "exact" : "different";
-      } catch (error) {
-        const code = desktopErrorCode(error);
-        if (code && DESKTOP_CONTEXT_UNAVAILABLE_CODES.has(code)) currentTarget = "unavailable";
-        else currentTarget = "unknown";
+      if (skipCurrentIdentity) {
+        // Not-current-context: do not fake "exact". Readiness uses saved-binding inspect only.
+        currentTarget = "unavailable";
+      } else {
+        try {
+          const identity = await desktopIpc.currentIdentity(workspace.root);
+          const same =
+            identity.threadId === binding.threadId
+            && identity.hostId === binding.hostId
+            && identity.projectId === binding.projectId;
+          currentTarget = same ? "exact" : "different";
+        } catch (error) {
+          const code = desktopErrorCode(error);
+          if (code && DESKTOP_CONTEXT_UNAVAILABLE_CODES.has(code)) currentTarget = "unavailable";
+          else currentTarget = "unknown";
+        }
       }
       try {
         const target = targetInput.parse({
@@ -228,7 +238,7 @@ export async function collectWorkflowCapabilityFacts(
   }
   return {
     conversation,
-    desktop: await collectDesktopFacts(workspace),
+    desktop: await collectDesktopFacts(workspace, conversationSource),
     remote: collectRemoteFacts(workspace),
   };
 }

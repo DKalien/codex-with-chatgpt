@@ -346,6 +346,154 @@ describe("G1a multi-thread projectChats map", () => {
   });
 });
 
+describe("G2 desktopRoute saved_binding vs current_context", () => {
+  function healthyConversation() {
+    return {
+      mode: "project" as const,
+      projectReady: true,
+      chatKnown: false,
+      chatBinding: "none" as const,
+      checkpoint: "none" as const,
+      sessionCorrupt: false,
+    };
+  }
+  function connection() {
+    return {
+      running: "running" as const,
+      runtimeUpgrade: "current" as const,
+      authorization: "authorized" as const,
+      connectorContract: "current" as const,
+      desktopCompatibility: "current" as const,
+    };
+  }
+  function remoteOffline() {
+    return { enabled: false, controller: "offline" as const, activeWork: false, needsReconciliation: false };
+  }
+  function remoteOnline() {
+    return { enabled: true, controller: "online" as const, activeWork: false, needsReconciliation: false };
+  }
+  function desktop(overrides: Partial<WorkflowReadinessInput["desktop"]> = {}): WorkflowReadinessInput["desktop"] {
+    return {
+      configured: true,
+      enabled: true,
+      currentTarget: "unavailable",
+      bindingAvailability: "available",
+      unresolvedDelivery: false,
+      ...overrides,
+    };
+  }
+  function input(desktopFacts: WorkflowReadinessInput["desktop"], remote = remoteOffline()): WorkflowReadinessInput {
+    return {
+      workspaceId: "2582910bf0d2",
+      workspaceName: "ws",
+      connection: connection(),
+      conversation: healthyConversation(),
+      desktop: desktopFacts,
+      remote,
+      now: 1,
+    };
+  }
+
+  it("MCP saved_binding + available → ready_local even without currentTarget exact", () => {
+    const r = resolveWorkflowReadiness(input(desktop()), {
+      desktopRoute: "saved_binding",
+      currentConversation: "available",
+      remoteControl: "current",
+    });
+    expect(r.overall).toBe("ready_local");
+    expect(r.nextAction).toBe("reuse");
+    expect(r.desktop.currentTarget).toBe("unavailable");
+  });
+
+  it("same facts without request policy (CLI current_context) → needs_desktop_bind", () => {
+    const r = resolveWorkflowReadiness(input(desktop()), { currentConversation: "available" });
+    expect(r.overall).toBe("needs_desktop_bind");
+    expect(r.nextAction).toBe("bind_current");
+  });
+
+  it("MCP saved_binding busy → busy/wait_current_task", () => {
+    const r = resolveWorkflowReadiness(
+      input(desktop({ bindingAvailability: "busy" })),
+      { desktopRoute: "saved_binding", currentConversation: "available" },
+    );
+    expect(r.overall).toBe("busy");
+    expect(r.nextAction).toBe("wait_current_task");
+  });
+
+  it("MCP saved_binding unknown → blocked/stop_unknown", () => {
+    const r = resolveWorkflowReadiness(
+      input(desktop({ bindingAvailability: "unknown" })),
+      { desktopRoute: "saved_binding", currentConversation: "available" },
+    );
+    expect(r.overall).toBe("blocked");
+    expect(r.nextAction).toBe("stop_unknown");
+  });
+
+  it("MCP saved_binding unavailable + remote ready + scopes current → ready_remote fallback", () => {
+    const r = resolveWorkflowReadiness(
+      input(desktop({ bindingAvailability: "unavailable" }), remoteOnline()),
+      { desktopRoute: "saved_binding", currentConversation: "available", remoteControl: "current" },
+    );
+    expect(r.overall).toBe("ready_remote");
+    expect(r.nextAction).toBe("use_remote");
+  });
+
+  it("MCP saved_binding unavailable + remote ready without scopes → needs_authorization", () => {
+    const r = resolveWorkflowReadiness(
+      input(desktop({ bindingAvailability: "unavailable" }), remoteOnline()),
+      { desktopRoute: "saved_binding", currentConversation: "available", remoteControl: "none" },
+    );
+    expect(r.overall).toBe("needs_authorization");
+  });
+
+  it("MCP saved_binding unavailable + remote offline → blocked", () => {
+    const r = resolveWorkflowReadiness(
+      input(desktop({ bindingAvailability: "unavailable" }), remoteOffline()),
+      { desktopRoute: "saved_binding", currentConversation: "available" },
+    );
+    expect(r.overall).toBe("blocked");
+  });
+
+  it("unresolved delivery still blocks highest priority on saved_binding route", () => {
+    const r = resolveWorkflowReadiness(
+      input(desktop({ unresolvedDelivery: true })),
+      { desktopRoute: "saved_binding", currentConversation: "available" },
+    );
+    expect(r.overall).toBe("blocked");
+    expect(r.nextAction).toBe("resolve_unconfirmed_delivery");
+  });
+
+  it("configured=false / enabled=false on saved_binding still needs_desktop_bind when no remote", () => {
+    const unconfigured = resolveWorkflowReadiness(
+      input(desktop({ configured: false, enabled: false, bindingAvailability: "unavailable" })),
+      { desktopRoute: "saved_binding", currentConversation: "available" },
+    );
+    expect(unconfigured.overall).toBe("needs_desktop_bind");
+    expect(unconfigured.nextAction).toBe("bind_current");
+
+    const disabled = resolveWorkflowReadiness(
+      input(desktop({ configured: true, enabled: false, bindingAvailability: "unavailable" })),
+      { desktopRoute: "saved_binding", currentConversation: "available" },
+    );
+    expect(disabled.overall).toBe("needs_desktop_bind");
+  });
+
+  it("currentTarget=different does not affect MCP saved_binding; still affects local current_context", () => {
+    const differentAvailable = desktop({ currentTarget: "different", bindingAvailability: "available" });
+    const mcp = resolveWorkflowReadiness(
+      input(differentAvailable),
+      { desktopRoute: "saved_binding", currentConversation: "available" },
+    );
+    expect(mcp.overall).toBe("ready_local");
+
+    const cli = resolveWorkflowReadiness(
+      input(differentAvailable),
+      { currentConversation: "available" },
+    );
+    expect(cli.overall).toBe("needs_desktop_bind");
+  });
+});
+
 describe("G1a resolver + human (kept + review)", () => {
   it("authorization unknown → blocked; missing → needs_authorization; desktopCompatibility none → needs_authorization", () => {
     expect(resolveWorkflowReadiness(baseInput({

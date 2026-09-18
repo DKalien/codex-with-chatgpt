@@ -16,6 +16,7 @@ import { buildWorkspaceInfoWorkflow, workflowOutputSchema } from "../src/mcp/ser
 import { desktopFile } from "../src/desktop/store.js";
 import { remoteFile } from "../src/remote/store.js";
 import { desktopIpc } from "../src/desktop/ipc.js";
+import { DesktopError } from "../src/desktop/store.js";
 import { cleanup, isolateStateDir, makeTmpDir } from "./helpers.js";
 
 const PROJECT = "https://chatgpt.com/g/g-p-6a94399430e08191860ab5364b7748b8/project";
@@ -295,16 +296,13 @@ describe("G2 MCP request capability facts", () => {
     expect(facts.conversation.projectReady).toBe(true);
   });
 
-  it("full Desktop request + exact local desktop can ready_local via currentConversation; read-only token cannot", async () => {
+  it("MCP saved_binding ready_local; CLI current_context still bind_current; read-only cannot", async () => {
     const workspace = new Workspace(root);
     writeDesktop(workspace.id);
     writeSession(workspace.id, mergeSession(null, { conversationMode: "project", projectUrl: PROJECT }));
-    vi.spyOn(desktopIpc, "currentIdentity").mockResolvedValue({
-      threadId: BINDING_THREAD,
-      hostId: "local",
-      projectId: "p1",
-      title: "t",
-    } as never);
+    vi.spyOn(desktopIpc, "currentIdentity").mockRejectedValue(
+      new DesktopError("DESKTOP_CURRENT_CONTEXT_INVALID", "no current context"),
+    );
     vi.spyOn(desktopIpc, "inspect").mockResolvedValue({
       threadId: BINDING_THREAD,
       hostId: "local",
@@ -315,7 +313,7 @@ describe("G2 MCP request capability facts", () => {
       kind: "mcp_request",
       conversationAvailable: true,
     });
-    expect(facts.desktop.currentTarget).toBe("exact");
+    expect(facts.desktop.currentTarget).toBe("unavailable");
     expect(facts.desktop.bindingAvailability).toBe("available");
     expect(facts.conversation.chatKnown).toBe(false);
 
@@ -326,10 +324,21 @@ describe("G2 MCP request capability facts", () => {
       conversation: facts.conversation,
       desktop: facts.desktop,
       remote: { enabled: false, controller: "offline", activeWork: false, needsReconciliation: false },
-    }, { remoteControl: "current", currentConversation: "available" });
+    }, { remoteControl: "current", currentConversation: "available", desktopRoute: "saved_binding" });
     expect(full.overall).toBe("ready_local");
     expect(full.nextAction).toBe("reuse");
     expect(full.conversation.chatKnown).toBe(false);
+    expect(full.desktop.currentTarget).toBe("unavailable");
+
+    const local = resolveWorkflowReadiness({
+      workspaceId: workspace.id,
+      workspaceName: "ws",
+      connection: baseConnection({ desktopCompatibility: "current", authorization: "authorized" }),
+      conversation: facts.conversation,
+      desktop: facts.desktop,
+      remote: { enabled: false, controller: "offline", activeWork: false, needsReconciliation: false },
+    }, { currentConversation: "available" });
+    expect(local.overall).toBe("needs_desktop_bind");
 
     const readOnly = resolveWorkflowReadiness({
       workspaceId: workspace.id,
@@ -338,7 +347,7 @@ describe("G2 MCP request capability facts", () => {
       conversation: facts.conversation,
       desktop: facts.desktop,
       remote: { enabled: false, controller: "offline", activeWork: false, needsReconciliation: false },
-    }, { remoteControl: "none", currentConversation: "available" });
+    }, { remoteControl: "none", currentConversation: "available", desktopRoute: "saved_binding" });
     expect(readOnly.overall).toBe("needs_authorization");
   });
 
