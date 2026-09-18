@@ -684,3 +684,26 @@ counts 契约兼容。
   - **transport identity drift**（bindingId / epoch / transport route 变化 → `disarmOnIdentityChange`）与 **page route drift** 分开，不混测。
   - **B/C** 仍需 future controlled fault injection + dedicated new event + independent review；禁止历史 event。
   - 历史 `NEXT_EXPECTED_STEP` 仅作收尾记录。
+
+## Phase G — Seamless Daily Workflow（2026-09-18，当前阶段）
+
+F1 已完成 Browser Companion 安全底座（operational readiness + recovery resilience）。
+G 阶段聚焦用户体验与跨设备日常闭环，不再扩展 recovery 状态机。
+
+### G1a — Unified Workflow Readiness（本轮，uncommitted）
+
+- 新增纯只读工作流 readiness 聚合层：`src/workflow/readiness.ts` + CLI `c2c workflow status -w <workspace> --json`（`src/cli/workflow.ts`）。
+- 输出有限 enum：`overall` / `nextAction` / connection·conversation·desktop·remote 投影 / `blockers`；不输出 threadId、bindingId、credential、raw command。
+- Fail-closed：`authorization=unknown` / `connectorContract!=current` → `blocked`；`desktopCompatibility=none|legacy|incomplete` → `needs_authorization`。
+- Project chat 使用 thread-scoped **`projectChats[]` map**（domain-separated fingerprint → verified URL，容量 128，满则 fail closed）：同 thread 可恢复自己的 Chat；`session.url` 仅作 latest/legacy 指针，**不是** ownership 真相。
+- Desktop `currentTarget`（currentIdentity）与 `bindingAvailability`（inspect structured code）分离；`desktopErrorCode` 不依赖 `error.message`；identity 变化 → `blocked`。
+- CLI 失败 JSON 仅 bounded code，不透传 `error.message`。
+- **ready_local / reuse** = 本机执行路径已确认：connection ready + conversation ready + exact Desktop identity + binding inspect available + no unresolved delivery。**不等于** MCP request-scoped Connector scopes/schema 已验证（`desktopCompatibility` 仅为本地 AuthStore 汇总；G1b/G2 仍必须做 `workspace_info` + request desktopCompatibility + Connector schema check）。
+- `exact + busy` → `busy`；`exact + unknown/unavailable` → `blocked`（机器 JSON 与 human 同定义，不软 Ready）。
+- Bridge `running=stopped` → `needs_connection/repair_connection`（不因下游 admin facts 缺失误报 corrupt）。
+- `projectChats[]` durable state **strict**：`null`/malformed/duplicate/超容量 → session corrupt fail closed，不 silent-normalize。
+- 测试：`tests/workflow-readiness.test.ts` + `tests/workflow-cli.test.ts` + session fingerprint regression。
+- 本阶段不改 Skill Activation、MCP `workspace_info`、Connector schema、Browser Companion。
+- 路线：G1a 收口 → **G1b** Skill Activation 一次 readiness 只补缺失步骤（不得因 ready_local 跳过 web verification；恢复 Project chat 必须用 thread-aware URL projection，不得复用全局 `session.url`）→ G2 readiness 投影到 `workspace_info` → G3 跨设备从零 E2E。
+
+- **G1a NEXT_EXPECTED_STEP**：G1b — Skill Activation consumes workflow readiness；thread chat URL 须走 bounded thread-aware projection，Skill 不遍历 fingerprint map。

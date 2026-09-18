@@ -1,16 +1,26 @@
 import { afterEach, describe, expect, it } from "vitest";
+import fs from "node:fs";
 import {
   clearChatPointer,
   mergeSession,
   normalizeProjectUrl,
   projectIdFromUrl,
+  projectChatOwnerFingerprint,
+  projectChatBinding,
+  conversationChatKnown,
   readSession,
   resolveConversation,
+  updateSession,
   writeSession,
 } from "../src/session/state.js";
 import { cleanup, makeTmpDir } from "./helpers.js";
 
 const PROJECT = "https://chatgpt.com/g/g-p-6a94399430e08191860ab5364b7748b8/project";
+const CHAT = "https://chatgpt.com/c/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+const CHAT_B = "https://chatgpt.com/c/bbbbbbbb-2222-4222-8222-222222222222";
+const THREAD_A = "11111111-1111-7111-8111-111111111111";
+const THREAD_B = "22222222-2222-7222-8222-222222222222";
+const WS = "sessowner000001";
 
 describe("normalizeProjectUrl", () => {
   it("accepts the collection URL and strips extras", () => {
@@ -242,5 +252,96 @@ describe("clearChatPointer", () => {
     });
     expect(clearChatPointer("def456def456")).toEqual({ cleared: true, keptProject: false });
     expect(readSession("def456def456")).toBeNull();
+  });
+});
+
+describe("project chatOwnerFingerprint + multi-thread map", () => {
+  const dirs: string[] = [];
+  afterEach(() => {
+    for (const dir of dirs) cleanup(dir);
+    dirs.length = 0;
+    delete process.env.CODEX_THREAD_ID;
+    delete process.env.CODEX_SESSION_ID;
+  });
+
+  it("stores fingerprint + map on project url write; preserves on checkpoint", () => {
+    const dir = makeTmpDir("session-chat-owner");
+    dirs.push(dir);
+    process.env.C2C_STATE_DIR = dir;
+    const fpA = projectChatOwnerFingerprint(WS, THREAD_A);
+    const session = mergeSession(null, {
+      conversationMode: "project",
+      projectUrl: PROJECT,
+      url: CHAT,
+      chatOwnerFingerprint: fpA,
+    });
+    expect(session.chatOwnerFingerprint).toBe(fpA);
+    expect(session.projectChats?.find((e) => e.ownerFingerprint === fpA)?.url).toBe(CHAT);
+    const next = mergeSession(session, {
+      taskId: "task_g1a_1",
+      checkpoint: { protocolState: "EXECUTED_SENT", waitingFor: "GPT_REVIEW" },
+    });
+    expect(next.projectChats?.length).toBe(1);
+    writeSession(WS, next);
+    process.env.CODEX_THREAD_ID = THREAD_A;
+    expect(projectChatBinding(readSession(WS), WS)).toBe("same_thread");
+    process.env.CODEX_THREAD_ID = THREAD_B;
+    expect(projectChatBinding(readSession(WS), WS)).toBe("other_thread");
+  });
+
+  it("readSession throws on malformed / duplicate / oversized / null projectChats; update fails closed", () => {
+    const dir = makeTmpDir("session-chat-corrupt");
+    dirs.push(dir);
+    process.env.C2C_STATE_DIR = dir;
+    const sessionPath = `${dir}/sessions/${WS}.json`;
+    fs.mkdirSync(`${dir}/sessions`, { recursive: true });
+
+    const writeRaw = (projectChats: unknown) => {
+      fs.writeFileSync(sessionPath, JSON.stringify({
+        savedAt: "2026-01-01T00:00:00.000Z",
+        conversationMode: "project",
+        projectUrl: PROJECT,
+        url: CHAT,
+        projectChats,
+      }));
+    };
+
+    writeRaw(null);
+    expect(() => readSession(WS)).toThrow();
+
+    writeRaw([{ ownerFingerprint: "bad", url: CHAT }]);
+    expect(() => readSession(WS)).toThrow();
+
+    const fp = projectChatOwnerFingerprint(WS, THREAD_A);
+    writeRaw([{ ownerFingerprint: fp, url: CHAT }, { ownerFingerprint: fp, url: CHAT_B }]);
+    const beforeDup = fs.readFileSync(sessionPath, "utf8");
+    expect(() => readSession(WS)).toThrow();
+    expect(() => updateSession(WS, (prev) => mergeSession(prev, {
+      taskId: "t",
+      checkpoint: { protocolState: "EXECUTED_SENT", waitingFor: "GPT_REVIEW" },
+    }))).toThrow();
+    expect(fs.readFileSync(sessionPath, "utf8")).toBe(beforeDup);
+
+    writeRaw(Array.from({ length: 129 }, (_, i) => ({
+      ownerFingerprint: i.toString(16).padStart(64, "0"),
+      url: `https://chatgpt.com/c/${i}`,
+    })));
+    expect(() => readSession(WS)).toThrow();
+  });
+
+  it("conversationChatKnown is true only for same_thread project chat", () => {
+    const fp = projectChatOwnerFingerprint(WS, THREAD_A);
+    const session = mergeSession(null, {
+      conversationMode: "project",
+      projectUrl: PROJECT,
+      url: CHAT,
+      chatOwnerFingerprint: fp,
+    });
+    process.env.CODEX_THREAD_ID = THREAD_A;
+    expect(conversationChatKnown(session, WS).chatKnown).toBe(true);
+    process.env.CODEX_THREAD_ID = THREAD_B;
+    expect(conversationChatKnown(session, WS).chatKnown).toBe(false);
+    delete process.env.CODEX_THREAD_ID;
+    expect(conversationChatKnown(session, WS).chatKnown).toBe(false);
   });
 });

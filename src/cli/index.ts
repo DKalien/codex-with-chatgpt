@@ -61,6 +61,8 @@ import {
   readSession,
   resolveConversation,
   updateSession,
+  projectChatOwnerFingerprint,
+  currentCodexThreadId,
   PROTOCOL_STATES,
   WAITING_FOR,
   type ConversationMode,
@@ -85,6 +87,7 @@ import { registerRemoteCommands, remoteStatus } from "./remote.js";
 import { registerFeedbackProbeCommands } from "./feedback-probe.js";
 import { isWriteProbeEnabled, readWriteProbeStatus, WRITE_PROBE_SCOPE } from "../mcp/write-probe.js";
 import { registerDesktopCommands } from "./desktop.js";
+import { registerWorkflowCommands } from "./workflow.js";
 import { rollout } from "../core/rollout.js";
 import { readRuntimeUpgrade } from "../core/upgrade.js";
 import { planGc, gcPlanSummary } from "../core/gc-plan.js";
@@ -190,6 +193,7 @@ ptf.command("run").requiredOption("-w, --workspace <path>").action(async (opts: 
 });
 registerRemoteCommands(program);
 registerDesktopCommands(program);
+registerWorkflowCommands(program);
 registerFeedbackProbeCommands(program);
 
 const say = (msg: string): void => {
@@ -1145,6 +1149,14 @@ session
       if (waitingNorm && !WAITING_FOR.includes(waitingNorm as WaitingFor)) {
         throw new Error(`waiting-for must be one of ${WAITING_FOR.join(", ")}`);
       }
+      // Project chat ownership: only stamp fingerprint when saving a chat URL in a valid Codex thread.
+      // Metadata only — never an authorization credential.
+      const isProjectMode = modeRaw === "project"
+        || (modeRaw !== "long-chat" && Boolean(opts.projectUrl || (opts.url && !modeRaw && readSession(workspace.id)?.conversationMode === "project")));
+      const threadId = currentCodexThreadId();
+      const chatOwnerFingerprint = opts.url && isProjectMode && threadId
+        ? projectChatOwnerFingerprint(workspace.id, threadId)
+        : undefined;
       const saved = updateSession(workspace.id, (previous) => mergeSession(previous, {
         url: opts.url,
         title: opts.title,
@@ -1154,6 +1166,7 @@ session
         conversationMode: modeRaw as ConversationMode | undefined,
         projectUrl: opts.projectUrl,
         connectorName: opts.connectorName,
+        chatOwnerFingerprint,
         clearCheckpoint: opts.clearCheckpoint,
         checkpoint: protocolRaw
           ? {
