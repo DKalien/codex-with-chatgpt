@@ -666,10 +666,21 @@ counts 契约兼容。
 - 只读 popup health block 与状态 helper 不改变 reserve、begin-send、ACK、recover、retire 或 native Send 语义；`OUTCOME_UNKNOWN` / `OBSERVED_PENDING_ACK` 始终显示 recovery-required。
 - F1a 门禁：**70 files / 1519 passed / 0 failed**；typecheck / build / `git diff --check` 通过。
 
-### F1b resilience hardening（本轮，uncommitted）
+### F1b resilience hardening（已合入 `90abcfe`）
 
 - Test-first resilience matrix：SW restart hydrate、SEND_INTENT crash recovery、post-mutation fence、OBSERVED_PENDING_ACK、OUTCOME_UNKNOWN、owner loss、route drift、Bridge offline、authStale、durable cooldown、corrupt journal。
-- Independent review 修复：`OBSERVED_PENDING_ACK` 在 authenticated `/state` exact observed + `inFlight=null` 时支持 SW-only local closeout（zero DOM/ACK/Send）；解决 ACK 已成功但 response/local clear 因 crash 丢失后的 restart closeout。自动化入口：`tests/f1-companion-resilience.test.ts`；矩阵与契约见 [phase-f1-operational-hardening.md](phase-f1-operational-hardening.md)。
-- 本轮不扩展 ACK/reserve/Send 协议，不做 rollout / Reload / 生产 event。
+- Independent review 修复并合入：`OBSERVED_PENDING_ACK` 在 authenticated `/state` exact observed + `inFlight=null` 时支持 SW-only local closeout（zero DOM/ACK/Send）；解决 ACK 已成功但 response/local clear 因 crash 丢失后的 restart closeout。自动化入口：`tests/f1-companion-resilience.test.ts`（43 cases）；矩阵与契约见 [phase-f1-operational-hardening.md](phase-f1-operational-hardening.md)。
 
-- **NEXT_EXPECTED_STEP**：F1b independent review → 决定 commit 与真实 resilience live acceptance；历史 `NEXT_EXPECTED_STEP` 仅作收尾记录。
+### F1c live resilience acceptance（2026-09-18，本轮）
+
+- Live preconditions：Bridge running、`pairingActive=false`、runtime current；本会话无 Browser Companion 扩展控制面。
+- Acceptance A/B/C/D 均 **automation-proven / live pending**：未操作历史 event、未创建 production event、未 Reload/rollout；结果与 operator 后续 live 边界见 [phase-f1-operational-hardening.md](phase-f1-operational-hardening.md)。
+- 本轮仅文档，无 production code 变更。
+
+- **NEXT_EXPECTED_STEP**：
+  - **A/D**（owner / route resilience，**不需要** production event）：前提是 **paired + journal `NONE` + Bridge `inFlight=none` + SHADOW-only**。
+  - **A** = reload / document ownership resilience：观察 owner-loss 必须用 **SHADOW**（`mode=off + journal=NONE + owner unavailable` 时 health 为 `off`，不是 `waiting_owner`）；结束恢复 OFF。
+  - **D** = page route drift / ownership invalidation（**SHADOW-only**，禁止 ARMED）：route-change invalidation 清 owner → foreign-route heartbeat 非 exact owner → 不 production tick；返回原 route 不自动继承旧 owner（同 tabId ≠ 同 document）。
+  - **transport identity drift**（bindingId / epoch / transport route 变化 → `disarmOnIdentityChange`）与 **page route drift** 分开，不混测。
+  - **B/C** 仍需 future controlled fault injection + dedicated new event + independent review；禁止历史 event。
+  - 历史 `NEXT_EXPECTED_STEP` 仅作收尾记录。

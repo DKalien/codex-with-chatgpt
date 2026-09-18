@@ -92,22 +92,128 @@
 - 文档：`docs/phase-f1-operational-hardening.md`
 - `docs/development-plan.md` 仅保留阶段摘要并指向本文档
 
-明确不做（等待下一轮 independent review）：
+F1b 已通过 independent review 并合入：
+
+- commit：`90abcfe` `test(companion): harden production recovery resilience`
+- `main == origin/main`
+- 文档 case 数 P3 修正为 **43 cases** 后提交
+
+F1b 合入时明确未做：
 
 - rollout / Reload extension
 - 创建真实 production feedback event
 - Reserve / begin-send / ACK / Recover / Retire
 - 操作历史 event（含 `e600aed6ef94…` 与 final acceptance `2c6b1d23641f46c4…`）
-- F1b commit / push
 
-## 门禁
+## F1c live resilience acceptance
 
-- targeted：`pnpm exec vitest run tests/f1-companion-resilience.test.ts`
-- targeted：`pnpm exec vitest run tests/e1b3d3b-production-send.test.ts`
-- related：`pnpm exec vitest run tests/e1b3d3b2-autonomy.test.ts tests/e1b3d3b-production-send.test.ts tests/e1b3-send-orchestration.test.ts tests/f1-companion-resilience.test.ts`
-- full：`pnpm test --maxWorkers=1 --testTimeout=90000`
-- `pnpm typecheck`
-- `pnpm build`
-- `git diff --check`
+日期：2026-09-18。基线：clean `main@90abcfe`。
+目标：对自动化已证明的 resilience contract 做最小真实环境验收；不重做 happy-path production feedback。
 
-结果见本轮汇报；F1b 在下一轮 review 前保持 uncommitted。
+### Live preconditions（只读观测）
+
+| 项 | 结果 |
+| --- | --- |
+| Bridge | running（workspace `2582910bf0d2` / `codex-with-chatgpt`） |
+| runtimeUpgrade | `state=current`，`upgradePending=false` |
+| pairingActive | **false**（Browser Companion 当前未与 Bridge 建立 live pairing） |
+| controller / remoteControl | offline / false |
+| 本轮操作 | 只读 `c2c status` / machine state；**未** rollout、Reload、Reserve、begin-send、ACK、Recover、Retire |
+| 历史 event | 全部保持原状态；**未** Send / Reserve / Recover / ACK / Retire |
+| 新 production feedback event | **未创建** |
+| Browser Companion 扩展控制面 | 本会话不可控（无法安全执行页面 Reload / SW restart 注入 / popup health 读数） |
+
+### Case 结果
+
+| Case | 计划目标 | 实际执行 | 最终 journal / server inFlight / server status | DOM write / click / beginSend / ACK | 结论 |
+| --- | --- | --- | --- | --- | --- |
+| **A** SW restart / page reload | 在 **SHADOW** 下观察：旧 document owner 失效 → health `waiting_owner` / `owner_unavailable` → **显式 bind 新 document 后，后续 heartbeat 恢复 exact-owner** | **未 live 执行** | n/a（未触碰 journal / server） | **n/a — production path 未执行** | **automation-proven / live pending**：需真实 ChatGPT 页 + extension SW 重启；`mode=off + journal=NONE + owner unavailable` 时 health 为 `off`（journal → OFF → owner 优先级），**不能**用 OFF 期待 `waiting_owner` |
+| **B** Bridge temporary offline | 网络中断不导致 duplicate mutation；恢复后仅 journal-allowed continuation | **未 live 执行故障注入** | n/a | **n/a — production path 未执行** | **automation-proven / live pending**：无法在不影响真实生产发送的前提下安全注入 `/state`/`/reserve` 网络故障；若未来 live，仅允许 **新建专用 event**，且 `COMPOSER_WRITE_INTENT+` 绝不 re-write/re-click，`OUTCOME_UNKNOWN` 绝不 resend |
+| **C** `OBSERVED_PENDING_ACK` server-observed closeout | 新建专用 event：server 已 `observed` + `inFlight=null`，local 仍 `OBSERVED_PENDING_ACK` → SW recover → `NONE` / `action=server_observed_clear`；期望 ACK/beginSend/DOM/CS = 0 | **未 live 执行** | n/a | **n/a — production path 未执行** | **automation-proven / live pending**：真实环境无法在**不篡改 durable journal** 的前提下构造“ACK 成功但 local clear 丢失”；按验收纪律不伪造生产状态。自动化已覆盖 eligible state table + rollback + SW branch zero-mutation contract |
+| **D** page route drift / ownership invalidation | **SHADOW-only**（禁止 ARMED）：切换 conversation → route-change invalidation 清除 owner → foreign-route heartbeat 非 exact owner → 不 production tick；返回原 route 不自动继承旧 owner | **未 live 执行** | n/a | **n/a — production path 未执行** | **automation-proven / live pending**：需真实 ChatGPT conversation 切换 + extension policy 观测；本轮未 Reload / 未 Arm production。**不期待**单纯 page switch 触发 `policy_identity_mismatch` / `disarmOnIdentityChange` |
+
+### 安全边界遵守情况
+
+- 未操作任何历史 event（Send / Reserve / Recover / ACK / Retire / begin-send 均未发生）
+- 未创建新的 production feedback event
+- 未通过 Retire “清理”任何状态
+- 未 rollout / Reload extension / pair 浏览器 / Arm production
+- 未修改 production code（本轮仅 docs）
+- 未记录 credential、secret、raw DOM、raw message
+
+说明：上表 “n/a — production path 未执行” 表示本轮**未进入** live production path，因此**不是**对具体 live case 的 measured 调用计数。
+
+### 尚需 operator 驱动的 live 验收（后续）
+
+#### A / D — owner / route resilience（**不需要** production event）
+
+适用前提：
+
+- 先正常建立 target conversation 的 Companion pairing / ownership（若当前仍 `pairingActive=false`）
+- **journal = `NONE`**，Bridge **`inFlight=none`**
+- 无 pending production acceptance event 被消费
+- 启用 **SHADOW**（观察 owner-loss health 必须用 SHADOW；OFF 只能作为开始/结束安全状态）
+- **不进入 production path**；**不要**为 A/D 创建 feedback event
+
+`operationalHealthSummary` 优先级：active journal → autonomy OFF → auth/owner/gates。
+因此 `mode=off + journal=NONE + owner unavailable` → health=`off`；只有 **SHADOW + journal NONE + owner 失效** 才应看到 `waiting_owner` / `owner_unavailable`。
+
+**A — Reload / document ownership resilience**
+
+1. 健康 target route + pairing + **SHADOW** + journal `NONE`
+2. Reload ChatGPT conversation page
+3. 旧 document 被 ownership invalidation 清除；不应再被视为 exact owner
+4. health 应显示 `waiting_owner` / `owner_unavailable`（SHADOW 下；**不是** OFF 下）
+5. 新 document 的普通 heartbeat / observe **不会自动继承或恢复 owner**（content-script heartbeat 仅为 passive observation；SW heartbeat path 只计算 `isExactOwnerHeartbeat`，不自动 bind）
+6. Operator 必须通过现有**显式 Bind / ownership 流程**（`c2c.bind.request → c2c.bind → bindOwner(...)`）绑定**当前新 document**
+7. Bind 成功后，后续 heartbeat 才能成为 `exact-owner heartbeat`
+8. 此后 health 才恢复正常 SHADOW readiness
+9. 不发生 reserve / beginSend / DOM write / click / ACK
+10. 验收结束恢复 **OFF**
+
+与 D2 使用同一 ownership 事实模型：owner 失效后只能**显式 bind**重建，不存在 heartbeat 自动恢复路径。
+
+**D1 — Page route drift（SHADOW-only）**
+
+1. 健康 target route + **SHADOW** + journal `NONE`
+2. 切到另一个 ChatGPT conversation（page route drift）
+3. `ownership.invalidateOnRouteChange()`：同一 owner document 离开 bound `targetRoute` → `owner → null`
+4. foreign-route heartbeat：`isExactOwnerHeartbeat(...) === false`，不 schedule autonomy tick
+5. health 应表现为 owner unavailable / `waiting_owner`（SHADOW 下）
+6. 不发生 reserve / beginSend / DOM write / click / ACK
+7. **不要**期待单纯 conversation switch 触发 `policy_identity_mismatch` / `disarmOnIdentityChange`：那比较的是 policy vs **transport identity**（bindingId / epoch / transport route），page SPA 切换通常**不会**自动改 transport identity
+
+**D2 — 返回原 target route**
+
+- 返回原 bound conversation 后，**不允许**旧 owner authorization 自动继承
+- 当前 owner 已在 route drift 时失效；必须按现有**显式 bind / ownership 流程**重新建立当前 document 的合法 ownership
+- **同 tabId ≠ 同 document**；不得因 tabId 相同自动恢复旧 document owner
+- 结束恢复 **OFF**
+
+**D3 — Transport identity drift（单独概念，非 page drift）**
+
+仅当 **bindingId / epoch / transport route 实际改变**时，才单独测试 `disarmOnIdentityChange`，并期待 autonomy 被强制 OFF / identity mismatch gate。
+**不要**把 D1 page route drift 与 D3 transport identity drift 混成一个 case。
+
+#### B / C — production-path resilience（需要 future controlled setup）
+
+B/C **不是** A/D 的 SHADOW-only 验收；若未来 live，必须同时满足：
+
+- independent review 同意
+- 可控故障注入或专用 event 流水线
+- **新建专用 acceptance event**（禁止历史 event；一次只允许一个）
+- journal 起点与 server inFlight 明确记录
+- 恢复后只执行 journal 当前允许的 continuation
+- `COMPOSER_WRITE_INTENT+` 绝不 re-write / re-click
+- `OUTCOME_UNKNOWN` 绝不 resend
+- 不得用 Retire “清理测试”
+
+若无法安全注入而不影响真实生产发送 / 不篡改 durable state，则保持 **automation-proven / live pending**。
+
+出现 identity mismatch / ambiguous observation / unexpected active journal / server inFlight 与 local journal 不一致 / unexpected DOM mutation 时立即停止。
+
+### F1c 门禁
+
+- 本轮仅文档变更 → `git diff --check`
+- 无 production code 变更 → 无需重跑 full test / typecheck / build
+- live-fix 代码：本轮无；若有须先 independent review，不自动 commit
