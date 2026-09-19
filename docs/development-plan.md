@@ -657,7 +657,7 @@ counts 契约兼容。
 - Live ARMED E2E 已完成：最终 acceptance event 为 `eventId=2c6b1d23641f46c484410c45f9e92d1c`、`attemptId=587c6632-7fa3-487b-a42c-25922952324b`、status=`observed`；Reload、independent review、live ACK closeout 均完成，browser journal=`NONE`、Bridge `inFlight=none`。历史 event（包括 `e600aed6ef94…`）不再执行 Send、Recover、ACK、Retire、Reserve
 - 详见 [phase-e-feedback.md](phase-e-feedback.md)
 
-## Phase F1 operational hardening（2026-09-18，当前阶段）
+## Phase F1 operational hardening（2026-09-18，已完成；当前阶段为 Phase G）
 
 ### F1a operational readiness health（已合入 `44075ea`）
 
@@ -685,7 +685,7 @@ counts 契约兼容。
   - **B/C** 仍需 future controlled fault injection + dedicated new event + independent review；禁止历史 event。
   - 历史 `NEXT_EXPECTED_STEP` 仅作收尾记录。
 
-## Phase G — Seamless Daily Workflow（2026-09-18，当前阶段）
+## Phase G — Seamless Daily Workflow（2026-09-18~19，当前阶段）
 
 F1 已完成 Browser Companion 安全底座（operational readiness + recovery resilience）。
 G 阶段聚焦用户体验与跨设备日常闭环，不再扩展 recovery 状态机。
@@ -728,7 +728,32 @@ G 阶段聚焦用户体验与跨设备日常闭环，不再扩展 recovery 状�
 
 - **G2 已通过 independent review**（full suite 1628 passed）。
 
-- **NEXT_EXPECTED_STEP**：**G3 — cross-device zero-to-end live E2E**。
-  - 路径：新 ChatGPT conversation → 一次 `workspace_info` → 读取 bounded workflow readiness → 选择安全 Desktop/Remote 路径 → Codex 执行 → Browser Companion 自动反馈回当前/已绑定 ChatGPT conversation → ChatGPT independent review → 必要时 revision → DONE。
-  - 全程不要求用户手工搬 workspaceId / threadId / bindingId；不得自动降低任何现有授权、审批、`outcome_unknown` 或 Project ownership 门禁。
-  - **前置约束**：`requestContext.conversationIdentity=available` 仅代表当前 MCP request 有可信 ChatGPT conversation identity；**不等于** Project membership，**不等于** durable same-thread Chat binding。G3 若建立跨 turn / feedback / resume 闭环，必须显式处理 durable conversation ownership，不得把 `currentConversation` 当永久绑定。
+### G3 — route-principal attestation（2026-09-19，code + Bridge installed；live E2E **pending**）
+
+G3 修复 Browser Companion 误绑错误 ChatGPT conversation 后 production Send 投错 chat 的问题。
+`paired ≠ origin conversation attested`：pair 只注册 credential+route，**reserve/begin-send 要求 route 已验证**。
+
+**现役实现（code committed `84e67e4`…`b961438`；workspace `2582910bf0d2` install `f728012c…`）**
+
+- **Server contract**：pair 铸 pending challenge（`challengeId` + `challengeDigest`，绑定 workspace/binding/epoch/companion/route）；MCP `feedback_companion_route_confirm`（scope `codex.feedback`，principal 仅来自 `openai/session`）。wrong principal **不消费** challenge。
+- **Browser gates**：route `PENDING` 时 Arm / Reserve / production begin-send 均拒绝；authenticated `/state` 为 **唯一** `VERIFIED` 权威；DOM 观察不得写 VERIFIED。
+- **Attestation one-shot Send**：popup 不传 message；SW owns `[C2C_ROUTE_ATTEST]` body；dedicated CS runner；observer 仅 `collectBoundedDescendants`（≤64 BFS）+ `innerText` canonical equality + exact `challengeId` marker；**无 ATTEMPT_ID 语义**、无 production journal。
+- **Durable fence**（`chrome.storage.local`）：`NONE → PAIRING_TRANSITION → ROUTE_ATTEST_DISPATCH → OBSERVED_PENDING_CONFIRM → VERIFIED | OUTCOME_UNKNOWN`；session latch 不够；corrupt fence fail closed；**任何 non-NONE fence（含不同 identity）一律 block**；transport clear 不清 fence；仅 re-pair（新 companionId+challengeId）写 matching `NONE`。
+- **Pair barrier-first**：调 `/pair` 前 durable 写 `PAIRING_TRANSITION`；`prev*` 在改全局前捕获；`TRANSPORT+LOCAL+FENCE` 尽量同一次 `storage.local.set`；4xx 可恢复 prev fence，网络/5xx 保持 barrier；pair **非** success 若 durable commit 失败。
+- **Post-write ready gate**（`b961438`）：write/verify 后按 send-probe 契约 poll——仅 `kind=send` + `enabled` + form `data-testid=send-button` 才 dispatch；`idle` 不是 click target；成功判定为 `click.ok`（生产返回 `clicked:1`）。
+- **Classic packaging**：content_scripts **禁止** ESM `dom-adapter.js` / `turn-observer.js` / `route-attestation*.js`；CS 使用 `dom-adapter-global.js` / `turn-observer-global.js` / `route-attestation-global.js` / `route-attestation-run-global.js`；SW ESM import graph 保留原文件名；`send-probe-run` / `send-click-adapter` classic 为 IIFE + namespaced `__c2c*` 绑定；build fail-fast（manifest 禁 ESM、provider 先于 consumer、`new Function` parse、真实 `import()` dist ESM link 测试）。
+- **Popup Grant Bridge access**（`9dc88d7`）：`chrome.permissions.request` 在 click handler **同步**调用（gesture-first）；Pair 仅 `permissions.contains`，缺权限 `bridge_permission_missing`。
+- **门禁**：最近 full vitest **80 files / 1775 passed**；typecheck / build / `git diff --check`。Extension 需 Edge **Reload** `dist/browser-companion` 才加载新 CS/popup。
+
+**边界（未改 / 不得弱化）**
+
+- production journal / late-positive ACK / autonomy / pair credential / OAuth scope 门禁不变；无自动重发。
+- Fence 实际字段：`companionId + challengeId + routeCanonical + …`（**无** bindingId/epoch）；server challenge digest 已绑 binding/epoch。
+- HTTP authenticated `/state` 可含 attestation message（SW 恢复用）；popup SW payload 仅 `routeAttestationPending`。
+
+- **NEXT_EXPECTED_STEP**：**G3 — cross-device zero-to-end live E2E（未执行）**。
+  - Operator 顺序：**先**只读 `feedback_status` → 新 ChatGPT conversation → pair → route verify（`feedback_companion_route_confirm`）→ Arm → Desktop smoke。
+  - 路径：`workspace_info` → bounded workflow readiness → 安全 Desktop/Remote → Codex 执行 → Companion 反馈回 **已验证** conversation → independent review → DONE。
+  - 不要求用户手工搬 workspaceId / threadId / bindingId；不得自动降低授权、审批、`outcome_unknown` 或 Project ownership 门禁。
+  - **前置约束**：`requestContext.conversationIdentity=available` ≠ Project membership ≠ durable same-thread Chat binding；live 闭环必须依赖 **route attestation VERIFIED**，不得把 `currentConversation` 当永久绑定。
+  - Connector `test_status` 在 commit/install 前仍是旧 G3 smoke；live 前不得虚构 acceptance 结果。

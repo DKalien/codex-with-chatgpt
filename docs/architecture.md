@@ -43,15 +43,15 @@
 | Module | Responsibility |
 | --- | --- |
 | `bridge/` | Express app assembly, loopback-only listener, port fallback, runtime state, admin API |
-| `mcp/` | McpServer with 9 read-only tools, always-discoverable but separately guarded Desktop schemas, and optional Remote actions; stateless Streamable HTTP transport (fresh server per request, JSON responses) |
+| `mcp/` | McpServer with workspace/git/search/session/pairing/feedback/workflow tools (base read-only set + separately guarded Desktop/Remote/feedback schemas); stateless Streamable HTTP transport (fresh server per request, JSON responses) |
 | `desktop/` | Local Desktop binding, version-gated IPC delivery, replay-safe state and delivery status |
 | `auth/` | OAuth 2.1 authorization server: discovery metadata (RFC 8414 + Protected Resource Metadata), dynamic client registration (RFC 7591), authorization-code + PKCE (S256 only), refresh rotation, revocation (RFC 7009). Opaque tokens stored as SHA-256 hashes |
 | `pairing/` | PairingCode lifecycle: CSPRNG generation, TTL, attempt limits, IP rate limit, one-time use |
 | `workspace/` | Canonical-path containment (realpath of deepest existing ancestor), sensitive-file policy, `.c2cignore`, paginated read/list, ripgrep search with Node fallback, git status/diff with pagination |
 | `tunnel/` | `TunnelProvider` interface + Cloudflare Quick and workspace-configured Named Tunnel implementations; business logic is vendor-agnostic |
 | `execution/` | JSONL execution records plus optional sanitized command output (`execution_output`) |
-| `feedback/` | Production feedback outbox + companion transport: pairing/credential, reserve/begin-send/ack/retire, stale → `outcome_unknown`, exact late-positive ACK |
-| `browser-companion/` | MV3 extension sources (packaged to `dist/browser-companion`): SW-only Bridge HTTP, durable send journal, autonomy scheduler (default OFF), popup recover; zero DOM/Send unless explicit production one-shot or armed heartbeat path |
+| `feedback/` | Production feedback outbox + companion transport: pairing/credential, route-principal attestation (challenge → `feedback_companion_route_confirm` → VERIFIED), reserve/begin-send/ack/retire, stale → `outcome_unknown`, exact late-positive ACK |
+| `browser-companion/` | MV3 sources → `dist/browser-companion`: SW-only Bridge HTTP + durable send journal + route-attestation fence; content_scripts use classic `*-global.js` (ESM `dom-adapter`/`turn-observer`/`route-attestation*` stay for SW import graph); autonomy default OFF; zero DOM/Send unless explicit production one-shot or armed heartbeat; production Send requires **route VERIFIED** |
 | `process/` | Daemon spawn/reuse, health probing, graceful shutdown |
 | `core/` | Verified machine install metadata, guarded rollout and per-workspace pending upgrades |
 | `cli/` | `c2c` commands; `--json` everywhere for the Skill |
@@ -76,7 +76,7 @@ latest terminal turn with a complete newest history boundary while idle) records
 the exact command ID and this turn's test/output evidence. Review resolves that record and its
 output ID, never a historical latest test result. See [automatic receipts](desktop-control.md#自动验收记录).
 
-**Production feedback companion**: ChatGPT MCP (trusted principal) enables receiver → one-time pairing → Edge MV3 companion holds scoped credential **only in SW** → named URL `/api/companion/v1` reserve/begin-send/ack. Journal is durable and single-flight; observation timeout becomes `outcome_unknown` (never auto-resend). Late-positive closeout requires exact identity: Companion `/ack` or trusted `feedback_ack_observed` (`claimed|outcome_unknown` + exact attempt → `observed`), SW clear from authenticated `/state` observed proof when `inFlight=null`, or exact message-body DOM observation (parent ATTEMPT + bounded descendant `innerText` equality). Optional autonomy scheduler defaults OFF: shadow is read-only; armed uses exact-owner heartbeat + journal-first recovery + durable cooldown. `retired_unknown` is a manual terminal that never ACKs or resurrects.
+**Production feedback companion**: ChatGPT MCP (trusted principal) enables receiver → one-time pairing → Edge MV3 companion holds scoped credential **only in SW** → **route attestation**: pair mints pending challenge; production `/reserve`/`begin-send` require authenticated `/state` `routeVerification=VERIFIED` via MCP `feedback_companion_route_confirm` (wrong principal does not consume the challenge). Browser durable fence + `PAIRING_TRANSITION` survive restart; non-NONE fence blocks resend until a successful re-pair writes matching NONE. Named URL `/api/companion/v1` reserve/begin-send/ack. Journal is durable and single-flight; observation timeout becomes `outcome_unknown` (never auto-resend). Late-positive closeout requires exact identity: Companion `/ack` or trusted `feedback_ack_observed` (`claimed|outcome_unknown` + exact attempt → `observed`), SW clear from authenticated `/state` observed proof when `inFlight=null`, or exact message-body DOM observation (parent ATTEMPT + bounded descendant `innerText` equality). Route-attestation observer uses the same bounded descendant style but **challengeId** marker only (no ATTEMPT_ID). Optional autonomy scheduler defaults OFF: shadow is read-only; armed uses exact-owner heartbeat + journal-first recovery + durable cooldown. `retired_unknown` is a manual terminal that never ACKs or resurrects.
 
 **Authorization**: 401 with `WWW-Authenticate: resource_metadata=…` →
 `/.well-known/oauth-protected-resource/mcp` → AS metadata → DCR →

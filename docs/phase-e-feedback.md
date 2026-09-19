@@ -745,6 +745,7 @@ ready → reserved → claimed → observed
 | popup structured recover | `browser-companion/popup/popup.js` |
 | server ACK + retire | `src/feedback/store.ts` / `src/feedback/companion.ts` |
 | trusted MCP ACK description | `src/mcp/feedback.ts`（`feedback_ack_observed`） |
+| **route attestation（G3，2026-09-19）** | server `src/feedback/companion.ts` + MCP `feedback_companion_route_confirm`；browser `browser-companion/route-attestation.js` / `route-attestation-run.js`；**production reserve/begin-send 要求 route VERIFIED**；详见 [development-plan.md G3](development-plan.md) |
 
 ## 部署 / live（2026-09-17）
 
@@ -757,6 +758,8 @@ ready → reserved → claimed → observed
 | 安全边界 | credential 仍 SW-only；zero-Send 运行时（除用户显式 send-click-adapter）；journal NONE 不自动重发 |
 
 门禁：typecheck / build / `pnpm test --maxWorkers=1 --testTimeout=90000` / `git diff --check` 通过。
+
+**注（2026-09-19）**：上表部署 build `6349ad98…` 为 E1b3d3 时代证据。之后 G3 route-attestation / classic packaging 已合入并安装至 workspace `2582910bf0d2` 的更新 Core；**不得**把上表当作当前机器 runtime 结论。现役 G3 事实以 [development-plan.md](development-plan.md) 与 `status --json` 为准。
 
 ---
 
@@ -801,3 +804,14 @@ F1a 只增加现有 SW status payload 的纯、只读 operational health summary
 
 门禁：**70 files / 1519 passed / 0 failed**；typecheck / build / `git diff --check` 通过。下一阶段为 F1 operational readiness review，不扩展生产发送协议。
 
+---
+
+# Phase G3 route-principal attestation（2026-09-19，现役 code + Bridge install）
+
+权威事实源：[development-plan.md — G3](development-plan.md)。
+
+- `paired ≠ attested`：production companion reserve/begin-send 要求 authenticated `/state` `routeVerification=VERIFIED`。
+- MCP：`feedback_companion_route_confirm`；wrong principal 不消费 challenge。
+- Browser：durable fence + `PAIRING_TRANSITION`；post-write ready gate 仅 form `send-button`；classic CS `*-global.js` 打包。
+- **live G3 cross-device E2E 未执行**；见 development-plan `NEXT_EXPECTED_STEP`。
+- 历史 phase 文中的 “not deployed / Reload 已完成” 只描述当时轮次，不能当作当前机器 runtime 结论；以 `status --json` 为准。

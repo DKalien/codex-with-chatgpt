@@ -44,13 +44,17 @@ Remote disable 拒绝新调用和消费，正在执行的 turn 需另用 control
 | Log credential leakage | Logger redacts token prefixes, bearer headers, token-like parameters, and pairing-code-shaped strings before writing |
 | Execution output leak | Codex may nominate logs or Remote turn final responses; a local sanitizer redacts tokens, pairing-code-shaped strings and home paths, truncates size, and refuses private-key blocks entirely. Restricted items are listed without a body. Read-only tools cannot run commands; Remote Control and Desktop Control are separate, explicitly authorized paths. |
 | Checkpoint / resume dump | Session checkpoints store short protocol fields only (capped). Resume uses the existing chat or HANDOFF — no new protocol state, no log paste, no re-pairing. |
+| Companion pair ≠ Send authority | Pairing registers credential+route only. Production reserve/begin-send require authenticated `/state` route VERIFIED via `feedback_companion_route_confirm`. Browser durable fence + pair barrier survive restart; non-NONE fence blocks resend until re-pair writes matching NONE. Wrong-principal confirm does not consume the challenge. |
 
 ## Token & scope design
 
 Default scopes: `workspace.read`, `workspace.search`, `git.read`, `execution.read`,
 `offline_access`. Tools enforce scopes individually (`INSUFFICIENT_SCOPE`). When
 `C2C_ENABLE_WRITE_PROBE=1`, an explicit authorization may additionally request the
-separate `probe.write` scope; existing refresh tokens do not gain it.
+separate `probe.write` scope; existing refresh tokens do not gain it. Production
+feedback uses `codex.feedback` (and probe uses `feedback.probe`); companion production
+Send additionally requires Browser route attestation VERIFIED after pairing — pairing
+alone never authorizes DOM Send.
 Access tokens: 1 hour. Refresh tokens: 30 days, rotated. All tokens bound to
 `workspace_id` and `client_id`.
 

@@ -36,7 +36,7 @@ Detailed docs below are in English · 详细中文文档见 **[README.zh-CN.md](
 
 本地 `remote enable` 授权后，另一台设备的 ChatGPT 可通过正式 MCP write action 创建 Codex 线程、
 提交任务并查询状态。独立 Controller 使用官方 app-server，不需要 Desktop 对话或内置浏览器保持打开。
-默认关闭，新增 `codex.control` / `codex.read`，原 9 个只读工具和默认授权不变。
+默认关闭，新增 `codex.control` / `codex.read`；基础只读工具边界不变，feedback/Desktop 独立鉴权。
 操作步骤、持久化与恢复限制见 [Remote Control](docs/remote-control.md)。
 
 ## Experimental Desktop Control · 实验性桌面控制
@@ -133,8 +133,9 @@ The trusted local agent verifies real browser message roles, IDs and explicit
 user intent; the local CLI validates the envelope, protocol, binding and replay
 history. Website claims cannot authenticate themselves. Workspace data never
 authorizes control. DOM mode adds no remote shell, automatic elevation, daemon,
-app-server or Desktop resume injection. Remote Control separately runs a controller. The original **9 read-only
-tools and 5 default OAuth scopes remain unchanged**; the separately gated
+app-server or Desktop resume injection. Remote Control separately runs a controller. The original **9 base
+workspace read-only tools remain**; Desktop/Remote/probe and feedback tools are separately gated. Production
+companion Send additionally requires Browser **route attestation VERIFIED** (not mere pairing). The
 experimental `write_probe` is documented in
 [experimental write probe](docs/experimental-write-probe.md).
 
@@ -323,10 +324,11 @@ Credentials stay in the OS app state directory, not in the project.
 - **Control plane (Computer Use)**: Codex and ChatGPT exchange tiny structured
   `[C2C]` state messages — `INIT → PLAN → EXECUTED → REVIEW → DONE`. No diffs,
   no logs, no file bodies are ever pasted.
-- **Data plane (MCP)**: ChatGPT pulls what it needs itself through 9 default read-only
+- **Data plane (MCP)**: ChatGPT pulls what it needs itself through the base read-only
   tools: `workspace_info`, `list_directory`, `read_file`, `search_workspace`,
   `git_status`, `git_diff`, `test_status`, `execution_summary`,
-  `execution_output`. Explicitly authorized Desktop Control tools and the
+  `execution_output`. Explicitly authorized Desktop Control, production feedback
+  (including companion pairing + `feedback_companion_route_confirm`), and the
   opt-in experimental `write_probe` are separate; see [Desktop Control](docs/desktop-control.md)
   and [its boundary and test procedure](docs/experimental-write-probe.md).
 - **Independent review**: after Codex executes, ChatGPT inspects the actual
@@ -335,10 +337,11 @@ Credentials stay in the OS app state directory, not in the project.
 
 ## Security model (short version)
 
-- **Default read-only by construction**: the original 9 tools only read workspace
+- **Default read-only by construction**: the original base tools only read workspace
   data. The opt-in `write_probe` can overwrite one C2C state record when its
   environment flag and `probe.write` scope are both present; it cannot write
-  workspace files, delete files, run shell commands or commit. No prompt
+  workspace files, delete files, run shell commands or commit. Production
+  companion Send still requires route attestation VERIFIED after pairing. No prompt
   injection can enable those capabilities.
 - **Desktop delivery is separately gated**: `codex_desktop_send` can only send
   confirmed plain task text to one locally bound Desktop thread after the
@@ -388,7 +391,7 @@ Docs: [architecture](docs/architecture.md) · [protocol](docs/protocol.md) ·
 src/
   core/       installed release metadata, safe rollout and pending upgrades
   bridge/     loopback HTTP server, port recovery, admin API
-  mcp/        9 read-only tools, always-discoverable guarded Desktop tools, optional Remote/write probe
+  mcp/        workspace git/search/session/pairing/feedback/workflow tools + guarded Desktop/Remote/feedback schemas
   remote/     durable task queue, controller, official app-server client
   desktop/    local Desktop binding, IPC delivery and replay-safe state
   auth/       OAuth 2.1 (PKCE, DCR, refresh rotation, revocation)

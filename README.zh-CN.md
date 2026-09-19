@@ -180,7 +180,8 @@ DONE 只结束当前任务，仍可等待下一次网页用户的明确委派。
 本地 Agent 从真实网页 role、消息 ID 和最新用户明确委派核对来源；CLI 再验证绑定、
 有效期、格式和防重放。此流程依赖可信的本地 Agent，网页文本或其自称的授权不是身份凭证。
 网页只能提出任务级自然语言，不能直接获得 Shell、文件写入、子代理 API 或额外权限。
-原 **9 个 read-only MCP 工具与 5 个默认 OAuth scopes 完全不变**；独立的实验性
+原 **基础只读 MCP 工具与默认 OAuth scopes 保持只读边界**；Desktop/Remote/feedback/探针仍独立鉴权。
+Production companion Send 还需 Browser **route attestation VERIFIED**（仅有 pairing 不够）。独立的实验性
 `write_probe` 默认关闭，边界和验证步骤见
 [实验性 MCP 写入探针](docs/experimental-write-probe.md)。
 Normal checkpoint 与 webControl 独立；既有 OAuth/Connector/Tunnel 不迁移、不重配。
@@ -290,7 +291,7 @@ Ready.
 - **控制面（Computer Use）**：Codex 与 ChatGPT 之间只交换极小的结构化 `[C2C]`
   状态消息——`INIT → PLAN → EXECUTED → REVIEW → DONE`。绝不粘贴 diff、日志
   或文件内容。
-- **数据面（MCP）**：ChatGPT 缺什么自己拉什么，原有 9 个只读工具：
+- **数据面（MCP）**：ChatGPT 缺什么自己拉什么，基础只读工具：
   `workspace_info`、`list_directory`、`read_file`、`search_workspace`、
   `git_status`、`git_diff`、`test_status`、`execution_summary`、
   `execution_output`。明确授权的 Desktop Control 工具和实验性 `write_probe` 均为独立
@@ -301,7 +302,7 @@ Ready.
 
 ## 安全模型（简版）
 
-- **默认从构造上只读**：原 9 个工具只读取工作区数据。可选的 `write_probe` 只有
+- **默认从构造上只读**：基础只读工具只读取工作区数据。可选的 `write_probe` 只有
   在开启环境变量并取得 `probe.write` scope 时，才会覆盖一条 C2C 状态记录；它不能
   写工作区文件、删除文件、执行 Shell 或提交，提示注入也无法启用这些能力。
 - **Desktop 投递单独受限**：`codex_desktop_send` 只有在取得
@@ -348,7 +349,7 @@ Windows 的 `scripts/dev-install.ps1` 在构建成功后安装 Core 与 Skill；
 src/
   core/       已安装 release 元数据、安全 rollout 与待升级状态
   bridge/     本机回环 HTTP 服务、端口自动恢复、管理 API
-  mcp/        9 个只读工具 + 始终可发现但独立鉴权的 Desktop 工具 + 可选 Remote Control/探针
+  mcp/        工作区只读工具 + 独立鉴权的 Desktop/Remote/feedback 工具 + 可选探针
   remote/     持久队列、Controller、官方 app-server 客户端
   desktop/    本机 Desktop 绑定、IPC 投递和防重放状态
   auth/       OAuth 2.1（PKCE、动态注册、refresh 轮换、吊销）
