@@ -722,8 +722,16 @@ describe("E1b3d3a classic built-artifact execution", () => {
     expect(runnerSrc).not.toMatch(/^\s*export\s/m);
     expect(runnerSrc).not.toMatch(/^\s*import\s/m);
     expect(runnerSrc).toMatch(/async function runRealSendProbe/);
+    expect(runnerSrc).toMatch(/^\(function \(\)/m);
+    expect(runnerSrc).toMatch(/globalThis\.__c2cWriteCanonicalMessage/);
+    expect(runnerSrc).toMatch(/globalThis\.__c2cReadCanonicalComposerText/);
+    expect(runnerSrc).toMatch(/globalThis\.__c2cVerifyCanonicalComposer/);
+    expect(runnerSrc).toMatch(/globalThis\.__c2cResolveMutationCanonicalRoute/);
+    expect(runnerSrc).toMatch(/globalThis\.buildSendProbeMessage/);
+    expect(runnerSrc).not.toMatch(/globalThis\.(writeCanonicalMessage|readCanonicalComposerText|verifyCanonicalComposer)\s*=/);
 
     const sandbox = loadClassic([
+      "route-global.js",
       "dom-adapter.js",
       "turn-observer.js",
       "composer-write-adapter.js",
@@ -733,6 +741,49 @@ describe("E1b3d3a classic built-artifact execution", () => {
     ]);
     expect(typeof sandbox.__c2cRunRealSendProbe).toBe("function");
     expect(typeof sandbox.buildSendProbeMessage).toBe("function");
+    expect(sandbox.writeCanonicalMessage).toBeUndefined();
+  });
+
+  it("classic send-probe runner uses namespaced write deps without ReferenceError", async () => {
+    if (!fs.existsSync(path.join(distCompanion, "send-probe-run.js"))) {
+      expect(true).toBe(true);
+      return;
+    }
+    const sandbox = loadClassic([
+      "route-global.js",
+      "dom-adapter.js",
+      "turn-observer.js",
+      "composer-write-adapter.js",
+      "send-click-adapter.js",
+      "send-probe-message-global.js",
+      "send-probe-run.js",
+    ]);
+    const run = sandbox.__c2cRunRealSendProbe as (
+      doc: unknown,
+      opts: Record<string, unknown>,
+    ) => Promise<{ ok: boolean; reason?: string; wrote?: boolean; verified?: boolean }>;
+    const build = sandbox.buildSendProbeMessage as (id: string) => string;
+    const probeMessage = build(ATTEMPT);
+    const fixture = makeSendDom({ sendReady: false, blocks: [""] });
+    const r = await run(fixture.doc, {
+      probeMessage,
+      attemptId: ATTEMPT,
+      expectedRoute: ROUTE,
+      expectedGeneration: 1,
+      locationHref: ROUTE,
+      parseRoute: sharedParse,
+      getCurrentHref: () => ROUTE,
+      getCurrentGeneration: () => 1,
+      waitMs: noWait,
+      readyTimeoutMs: 150,
+      pollMs: 10,
+    });
+    // Must reach write/verify/read/route-resolve; stop before click (send not ready).
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe("send_button_not_ready");
+    expect(r.wrote).toBe(true);
+    expect(r.verified).toBe(true);
+    expect(fixture.state.clicks).toBe(0);
   });
 
   it("classic runner invalid payload returns send_probe_payload_invalid without ReferenceError", async () => {
@@ -741,6 +792,7 @@ describe("E1b3d3a classic built-artifact execution", () => {
       return;
     }
     const sandbox = loadClassic([
+      "route-global.js",
       "dom-adapter.js",
       "turn-observer.js",
       "composer-write-adapter.js",

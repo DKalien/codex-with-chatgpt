@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { parseChatgptConversationRoute } from "../src/chatgpt/route.js";
 import {
   applyRouteAttestServerVerification,
   applyRouteAttestServerVerificationToFence,
@@ -907,10 +908,323 @@ describe("G3 route attestation browser contract (source)", () => {
     expect(block).toMatch(/normalizeText/);
   });
 
-  it("manifest ships route-attestation scripts", () => {
-    const manifest = fs.readFileSync(path.join(companionRoot, "manifest.json"), "utf8");
-    expect(manifest).toMatch(/route-attestation\.js/);
-    expect(manifest).toMatch(/route-attestation-run\.js/);
+  it("manifest ships classic route-attestation scripts, not ESM content_scripts", () => {
+    const manifest = JSON.parse(fs.readFileSync(path.join(companionRoot, "manifest.json"), "utf8"));
+    const js = (manifest.content_scripts ?? []).flatMap((cs: { js?: string[] }) => cs.js ?? []);
+    expect(js).toContain("route-attestation-global.js");
+    expect(js).toContain("route-attestation-run-global.js");
+    expect(js).not.toContain("route-attestation.js");
+    expect(js).not.toContain("route-attestation-run.js");
+    expect(js).toEqual([
+      "route-global.js",
+      "dom-adapter.js",
+      "turn-observer.js",
+      "shadow-evidence.js",
+      "composer-write-adapter.js",
+      "send-click-adapter.js",
+      "send-probe-message-global.js",
+      "send-probe-run.js",
+      "route-attestation-global.js",
+      "route-attestation-run-global.js",
+      "production-send-runtime-global.js",
+      "content-script.js",
+    ]);
+    // Dependency order: dom/turn before attest-global; write/click before run-global; attest before run.
+    expect(js.indexOf("dom-adapter.js")).toBeLessThan(js.indexOf("route-attestation-global.js"));
+    expect(js.indexOf("turn-observer.js")).toBeLessThan(js.indexOf("route-attestation-global.js"));
+    expect(js.indexOf("composer-write-adapter.js")).toBeLessThan(js.indexOf("route-attestation-run-global.js"));
+    expect(js.indexOf("send-click-adapter.js")).toBeLessThan(js.indexOf("route-attestation-run-global.js"));
+    expect(js.indexOf("route-attestation-global.js")).toBeLessThan(js.indexOf("route-attestation-run-global.js"));
+    expect(js.indexOf("route-attestation-run-global.js")).toBeLessThan(js.indexOf("content-script.js"));
+  });
+
+  it("build script generates classic route-attestation artifacts with fail-fast gates", () => {
+    const build = fs.readFileSync(path.join(projectRoot, "scripts", "build-browser-companion.mjs"), "utf8");
+    expect(build).toMatch(/route-attestation-global\.js/);
+    expect(build).toMatch(/route-attestation-run-global\.js/);
+    expect(build).toMatch(/__c2cRunRouteAttestationSend/);
+    expect(build).toMatch(/must not contain top-level import\/export|must not load ESM route-attestation/);
+    expect(build).toMatch(/must keep ESM exports for SW\/tests/);
+  });
+
+  it("packaged classic chain can load: no import/export; ESM retained for SW/tests", () => {
+    const distCompanion = path.join(projectRoot, "dist", "browser-companion");
+    if (!fs.existsSync(path.join(distCompanion, "manifest.json"))) {
+      expect(true).toBe(true);
+      return;
+    }
+    const distManifest = JSON.parse(fs.readFileSync(path.join(distCompanion, "manifest.json"), "utf8"));
+    const js = (distManifest.content_scripts ?? []).flatMap((cs: { js?: string[] }) => cs.js ?? []);
+    expect(js).not.toContain("route-attestation.js");
+    expect(js).not.toContain("route-attestation-run.js");
+    expect(js).toContain("route-attestation-global.js");
+    expect(js).toContain("route-attestation-run-global.js");
+
+    for (const f of js) {
+      const p = path.join(distCompanion, f);
+      expect(fs.existsSync(p)).toBe(true);
+      const text = fs.readFileSync(p, "utf8");
+      expect(text).not.toMatch(/^\s*import\s/m);
+      expect(text).not.toMatch(/^\s*export\s/m);
+      expect(() => {
+        // eslint-disable-next-line no-new-func
+        new Function(text);
+      }).not.toThrow();
+    }
+
+    const classicRun = fs.readFileSync(path.join(distCompanion, "route-attestation-run-global.js"), "utf8");
+    expect(classicRun).toMatch(/globalThis\.__c2cRunRouteAttestationSend\s*=\s*runRouteAttestationSend/);
+    expect(classicRun).toMatch(/globalThis\.__c2cResolveMutationCanonicalRoute/);
+    expect(classicRun).not.toMatch(/globalThis\.resolveMutationCanonicalRoute\s*=/);
+    const classicAttest = fs.readFileSync(path.join(distCompanion, "route-attestation-global.js"), "utf8");
+    expect(classicAttest).toMatch(/globalThis\.(extractRouteChallengeId|findRouteAttestationUserTurn|isRouteAttestationMessage)/);
+
+    const writeClassic = fs.readFileSync(path.join(distCompanion, "composer-write-adapter.js"), "utf8");
+    expect(writeClassic).toMatch(/globalThis\.__c2cResolveMutationCanonicalRoute\s*=/);
+    expect(writeClassic).not.toMatch(/globalThis\.resolveMutationCanonicalRoute\s*=/);
+
+    const esmAttest = fs.readFileSync(path.join(distCompanion, "route-attestation.js"), "utf8");
+    const esmRun = fs.readFileSync(path.join(distCompanion, "route-attestation-run.js"), "utf8");
+    expect(esmAttest).toMatch(/^export\s/m);
+    expect(esmRun).toMatch(/^export\s/m);
+    expect(esmAttest).toMatch(/export function findRouteAttestationUserTurn/);
+    expect(esmRun).toMatch(/export async function runRouteAttestationSend/);
+
+    const cs = fs.readFileSync(path.join(distCompanion, "content-script.js"), "utf8");
+    expect(cs).toMatch(/c2c\.route\.attest\.execute/);
+    expect(cs).toMatch(/__c2cRunRouteAttestationSend/);
+
+    // Existing production/send-probe classic artifacts remain classic.
+    for (const f of [
+      "send-probe-run.js",
+      "production-send-runtime-global.js",
+      "composer-write-adapter.js",
+      "send-click-adapter.js",
+    ]) {
+      const text = fs.readFileSync(path.join(distCompanion, f), "utf8");
+      expect(text).not.toMatch(/^\s*import\s/m);
+      expect(text).not.toMatch(/^\s*export\s/m);
+    }
+  });
+
+  it("build fails fast when runner deps or namespaced resolveMutation are missing", () => {
+    const build = fs.readFileSync(path.join(projectRoot, "scripts", "build-browser-companion.mjs"), "utf8");
+    expect(build).toMatch(/__c2cResolveMutationCanonicalRoute/);
+    expect(build).toMatch(/must not expose unnamespaced resolveMutationCanonicalRoute/);
+    expect(build).toMatch(/route-attest run dep/);
+    expect(build).toMatch(/send-probe run dep/);
+    expect(build).toMatch(/new Function\(text\)/);
+    expect(build).toMatch(/send-probe-run\.js classic must be wrapped in IIFE/);
+    for (const sym of [
+      "resolveChatGptComposer",
+      "resolveChatGptAction",
+      "normalizeCanonicalDomText",
+      "__c2cReadCanonicalComposerText",
+      "__c2cWriteCanonicalMessage",
+      "__c2cVerifyCanonicalComposer",
+      "__c2cDispatchNativeSend",
+      "__c2cResolveMutationCanonicalRoute",
+      "extractRouteChallengeId",
+      "findRouteAttestationUserTurn",
+      "isRouteAttestationMessage",
+      "snapshotUserTurns",
+      "buildSendProbeMessage",
+    ]) {
+      expect(build).toContain(sym);
+    }
+  });
+
+  it("packaged content-script chain loads in order and exposes attest runtime wiring", async () => {
+    const distCompanion = path.join(projectRoot, "dist", "browser-companion");
+    const distManifestPath = path.join(distCompanion, "manifest.json");
+    if (!fs.existsSync(distManifestPath)) {
+      expect(true).toBe(true);
+      return;
+    }
+    const vm = await import("node:vm");
+    const distManifest = JSON.parse(fs.readFileSync(distManifestPath, "utf8"));
+    const js = (distManifest.content_scripts ?? []).flatMap((cs: { js?: string[] }) => cs.js ?? []);
+
+    const listeners: unknown[] = [];
+    const sandbox: Record<string, unknown> = {
+      console,
+      setTimeout: () => 0,
+      setInterval: () => 0,
+      clearTimeout: () => {},
+      clearInterval: () => {},
+    };
+    const location = { href: "https://chatgpt.com/c/aaaaaaaa-1111-4111-8111-111111111111" };
+    const windowObj: Record<string, unknown> = {
+      addEventListener: () => {},
+    };
+    const documentObj = {
+      hidden: false,
+      addEventListener: () => {},
+      querySelector: () => null,
+      querySelectorAll: () => [],
+    };
+    const chrome = {
+      runtime: {
+        lastError: null,
+        sendMessage: (_msg: unknown, cb?: (r: unknown) => void) => {
+          if (typeof cb === "function") cb({ ok: true });
+        },
+        onMessage: {
+          addListener: (fn: unknown) => {
+            listeners.push(fn);
+          },
+        },
+      },
+    };
+    sandbox.window = windowObj;
+    sandbox.location = location;
+    sandbox.document = documentObj;
+    sandbox.chrome = chrome;
+    sandbox.globalThis = sandbox;
+
+    vm.createContext(sandbox);
+    for (const f of js) {
+      const text = fs.readFileSync(path.join(distCompanion, f), "utf8");
+      expect(() => {
+        // eslint-disable-next-line no-new-func
+        new Function(text);
+      }).not.toThrow();
+      vm.runInContext(text, sandbox, { filename: f });
+    }
+
+    const g = sandbox as Record<string, unknown>;
+    expect(typeof g.__c2cRunRouteAttestationSend).toBe("function");
+    expect(typeof g.__c2cRunRealSendProbe).toBe("function");
+    for (const sym of [
+      "resolveChatGptComposer",
+      "resolveChatGptAction",
+      "normalizeCanonicalDomText",
+      "__c2cReadCanonicalComposerText",
+      "__c2cWriteCanonicalMessage",
+      "__c2cVerifyCanonicalComposer",
+      "__c2cDispatchNativeSend",
+      "__c2cResolveMutationCanonicalRoute",
+      "extractRouteChallengeId",
+      "findRouteAttestationUserTurn",
+      "isRouteAttestationMessage",
+      "snapshotUserTurns",
+      "buildSendProbeMessage",
+    ]) {
+      expect(typeof g[sym], `missing classic global ${sym}`).toBe("function");
+    }
+    expect(g.resolveMutationCanonicalRoute).toBeUndefined();
+    expect(g.writeCanonicalMessage).toBeUndefined();
+    expect(g.readCanonicalComposerText).toBeUndefined();
+    expect(g.verifyCanonicalComposer).toBeUndefined();
+    expect(listeners.length).toBeGreaterThan(0);
+
+    // Exercise packaged classic send-probe runner through write/read/verify/route
+    // without real click/network (send button stays not ready).
+    const buildProbe = g.buildSendProbeMessage as (attemptId: string) => string;
+    const runProbe = g.__c2cRunRealSendProbe as (
+      doc: unknown,
+      opts: Record<string, unknown>,
+    ) => Promise<{ ok: boolean; reason?: string; wrote?: boolean; verified?: boolean; mutationAttempted?: boolean }>;
+    const attemptId = "22222222-2222-4222-8222-222222222222";
+    const probeMessage = buildProbe(attemptId);
+    const route = "https://chatgpt.com/c/aaaaaaaa-1111-4111-8111-111111111111";
+
+    const blocks = [""];
+    const sendBtn = {
+      tagName: "BUTTON",
+      className: "composer-submit-btn composer-submit-button-color",
+      getAttribute: (n: string) =>
+        n === "data-testid" ? "send-button" : n === "type" ? "submit" : n === "aria-label" ? "发送提示词" : null,
+      hasAttribute: (n: string) => n === "data-testid",
+      disabled: false,
+      click: () => {
+        throw new Error("classic smoke must not click");
+      },
+    };
+    const voice = {
+      className: "composer-submit-button-color text-submit-btn-text",
+      getAttribute: (n: string) => (n === "aria-label" ? "启动语音功能" : null),
+      hasAttribute: () => false,
+      disabled: false,
+      click: () => {
+        throw new Error("classic smoke must not click");
+      },
+    };
+    const form = {
+      querySelector(selector: string) {
+        if (selector === 'button[data-testid="send-button"]') return null;
+        if (selector === "button.composer-submit-button-color") return voice;
+        return null;
+      },
+      querySelectorAll(selector: string) {
+        return selector === "button" ? [voice] : [];
+      },
+    };
+    const editor = {
+      tagName: "DIV",
+      id: "prompt-textarea",
+      className: "ProseMirror",
+      getAttribute: (n: string) => (n === "contenteditable" ? "true" : null),
+      hasAttribute: () => false,
+      closest: (s: string) => (s === "form" ? form : null),
+      focus: () => {},
+      get children() {
+        return {
+          length: blocks.length,
+          ...Object.fromEntries(blocks.map((t, i) => [String(i), { tagName: "P", textContent: t }])),
+        };
+      },
+      textContent: blocks.join(""),
+    };
+    const probeDoc = {
+      defaultView: {
+        getSelection: () => ({ removeAllRanges() {}, addRange() {} }),
+        Event: class Event {
+          type: string;
+          bubbles: boolean;
+          constructor(type: string, init: { bubbles?: boolean } = {}) {
+            this.type = type;
+            this.bubbles = Boolean(init.bubbles);
+          }
+        },
+      },
+      createRange: () => ({ selectNodeContents() {} }),
+      execCommand: (_c: string, _u: boolean, v: string) => {
+        blocks.splice(0, blocks.length, ...String(v).split("\n"));
+        return true;
+      },
+      queryCommandSupported: () => true,
+      querySelector(selector: string) {
+        if (selector === "#prompt-textarea" || selector.includes("ProseMirror") || selector.includes("contenteditable")) {
+          return editor;
+        }
+        return null;
+      },
+      querySelectorAll: () => [],
+    };
+
+    const probeResult = await runProbe(probeDoc, {
+      probeMessage,
+      attemptId,
+      expectedRoute: route,
+      expectedGeneration: 1,
+      locationHref: route,
+      parseRoute: (href: string) => parseChatgptConversationRoute(href, {
+        allowQueryOrHash: false,
+        conversationIdPolicy: "uuid",
+      }),
+      getCurrentHref: () => route,
+      getCurrentGeneration: () => 1,
+      waitMs: async () => {},
+      readyTimeoutMs: 200,
+      pollMs: 10,
+    });
+    expect(probeResult.ok).toBe(false);
+    // Far enough to use write/read/verify/route resolve; stop before click.
+    expect(probeResult.reason).toBe("send_button_not_ready");
+    expect(probeResult.mutationAttempted).toBe(true);
+    expect(probeResult.wrote).toBe(true);
+    expect(probeResult.verified).toBe(true);
   });
 });
 

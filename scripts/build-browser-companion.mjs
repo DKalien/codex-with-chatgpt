@@ -105,6 +105,7 @@ fs.writeFileSync(
 ;globalThis.snapshotUserTurns = snapshotUserTurns;
 globalThis.findCanonicalUserTurn = findCanonicalUserTurn;
 globalThis.hasExactAttemptMarker = hasExactAttemptMarker;
+globalThis.collectBoundedDescendants = collectBoundedDescendants;
 `,
   "utf8",
 );
@@ -143,6 +144,7 @@ const writeAdapterBody = stripExports(
     .replace(/^import\s+.*?;\s*$/gm, ""),
 );
 const writeAdapterClassic = `// classic write-only runtime capability (E1b3d2a)
+(function () {
 ${writeProbeSrc
   .replace(/^export\s+const\s+/gm, "const ")
   .replace(/^export\s+function\s+/gm, "function ")}
@@ -153,9 +155,17 @@ globalThis.__c2cVerifyCanonicalComposer = verifyCanonicalComposer;
 globalThis.__c2cReadCanonicalComposerText = readCanonicalComposerText;
 globalThis.__c2cRunWriteProbe = runWriteProbe;
 globalThis.__c2cWriteProbeMessage = WRITE_PROBE_MESSAGE;
+globalThis.__c2cResolveMutationCanonicalRoute = resolveMutationCanonicalRoute;
+})();
 `;
 if (/dispatchNativeSend|\.click\(\)/.test(writeAdapterClassic)) {
   fail("classic composer-write-adapter must not contain dispatchNativeSend or .click()");
+}
+if (/globalThis\.resolveMutationCanonicalRoute\s*=/.test(writeAdapterClassic)) {
+  fail("classic composer-write-adapter must not expose unnamespaced resolveMutationCanonicalRoute");
+}
+if (!/globalThis\.__c2cResolveMutationCanonicalRoute\s*=\s*resolveMutationCanonicalRoute/.test(writeAdapterClassic)) {
+  fail("classic composer-write-adapter must expose __c2cResolveMutationCanonicalRoute");
 }
 fs.writeFileSync(path.join(distCompanion, "composer-write-adapter.js"), writeAdapterClassic, "utf8");
 
@@ -220,15 +230,53 @@ if (/globalThis\.buildSendProbeMessage/.test(probeMessageEsm)) {
 }
 
 const probeRunBody = stripExports(probeRun);
+// IIFE + explicit globalThis bindings: write-adapter classic is IIFE-isolated,
+// so free names like writeCanonicalMessage are no longer classic globals.
 const probeRunClassic = `// classic one-shot send probe runner (E1b3d3a)
+(function () {
+const resolveChatGptComposer = globalThis.resolveChatGptComposer;
+const resolveChatGptAction = globalThis.resolveChatGptAction;
+const normalizeCanonicalDomText = globalThis.normalizeCanonicalDomText;
+const readCanonicalComposerText = globalThis.__c2cReadCanonicalComposerText;
+const writeCanonicalMessage = globalThis.__c2cWriteCanonicalMessage;
+const verifyCanonicalComposer = globalThis.__c2cVerifyCanonicalComposer;
+const dispatchNativeSend = globalThis.__c2cDispatchNativeSend;
+const resolveMutationCanonicalRoute = globalThis.__c2cResolveMutationCanonicalRoute;
+const buildSendProbeMessage = globalThis.buildSendProbeMessage;
 ${probeRunBody}
 ;globalThis.__c2cRunRealSendProbe = runRealSendProbe;
+})();
 `;
 if (/^export\s/m.test(probeRunClassic) || /^import\s/m.test(probeRunClassic)) {
   fail("classic send-probe-run must not contain export/import");
 }
 if (!/function runRealSendProbe|async function runRealSendProbe/.test(probeRunClassic)) {
   fail("classic send-probe-run must define runRealSendProbe");
+}
+if (!/globalThis\.__c2cResolveMutationCanonicalRoute/.test(probeRunClassic)) {
+  fail("classic send-probe-run must bind __c2cResolveMutationCanonicalRoute");
+}
+if (!/globalThis\.__c2cReadCanonicalComposerText/.test(probeRunClassic)) {
+  fail("classic send-probe-run must bind __c2cReadCanonicalComposerText");
+}
+if (!/globalThis\.__c2cWriteCanonicalMessage/.test(probeRunClassic)) {
+  fail("classic send-probe-run must bind __c2cWriteCanonicalMessage");
+}
+if (!/globalThis\.__c2cVerifyCanonicalComposer/.test(probeRunClassic)) {
+  fail("classic send-probe-run must bind __c2cVerifyCanonicalComposer");
+}
+if (!/globalThis\.__c2cDispatchNativeSend/.test(probeRunClassic)) {
+  fail("classic send-probe-run must bind __c2cDispatchNativeSend");
+}
+if (!/globalThis\.buildSendProbeMessage/.test(probeRunClassic)) {
+  fail("classic send-probe-run must bind buildSendProbeMessage");
+}
+if (!/globalThis\.__c2cRunRealSendProbe\s*=\s*runRealSendProbe/.test(probeRunClassic)) {
+  fail("classic send-probe-run must expose __c2cRunRealSendProbe");
+}
+// Must not re-expose unnamespaced write helpers from this IIFE.
+if (/globalThis\.(writeCanonicalMessage|readCanonicalComposerText|verifyCanonicalComposer)\s*=/.test(probeRunClassic)) {
+  fail("classic send-probe-run must not re-expose unnamespaced write helpers");
 }
 fs.writeFileSync(path.join(distCompanion, "send-probe-run.js"), probeRunClassic, "utf8");
 
@@ -288,6 +336,100 @@ fs.writeFileSync(
   "utf8",
 );
 
+// G3: classic route-attestation artifacts for MV3 content_scripts.
+// ESM route-attestation.js / route-attestation-run.js stay intact for SW imports + unit tests.
+function assertClassicArtifact(filePath, label) {
+  const text = fs.readFileSync(filePath, "utf8");
+  if (/^\s*import\s/m.test(text) || /^\s*export\s/m.test(text)) {
+    fail(`${label} must not contain top-level import/export`);
+  }
+  try {
+    // Compile-only classic parse gate — never execute at build time.
+    new Function(text);
+  } catch (e) {
+    fail(`${label} is not parseable as classic JS: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  return text;
+}
+
+const routeAttestSrc = fs.readFileSync(path.join(srcCompanion, "route-attestation.js"), "utf8");
+const routeAttestRunSrc = fs.readFileSync(path.join(srcCompanion, "route-attestation-run.js"), "utf8");
+if (!/export function findRouteAttestationUserTurn/.test(routeAttestSrc)) {
+  fail("route-attestation.js must export findRouteAttestationUserTurn");
+}
+if (!/export async function runRouteAttestationSend/.test(routeAttestRunSrc)) {
+  fail("route-attestation-run.js must export runRouteAttestationSend");
+}
+
+const routeAttestClassic = `// classic route-attestation contract (G3) — protocol semantics unchanged
+(function () {
+const collectBoundedDescendants = globalThis.collectBoundedDescendants;
+const normalizeCanonicalDomText = globalThis.normalizeCanonicalDomText;
+${stripExports(routeAttestSrc)}
+;globalThis.extractRouteChallengeId = extractRouteChallengeId;
+globalThis.findRouteAttestationUserTurn = findRouteAttestationUserTurn;
+globalThis.isRouteAttestationMessage = isRouteAttestationMessage;
+})();
+`;
+fs.writeFileSync(
+  path.join(distCompanion, "route-attestation-global.js"),
+  routeAttestClassic,
+  "utf8",
+);
+assertClassicArtifact(path.join(distCompanion, "route-attestation-global.js"), "route-attestation-global.js");
+
+const routeAttestRunClassic = `// classic route-attestation one-shot runner (G3) — protocol semantics unchanged
+(function () {
+const resolveChatGptComposer = globalThis.resolveChatGptComposer;
+const resolveChatGptAction = globalThis.resolveChatGptAction;
+const normalizeCanonicalDomText = globalThis.normalizeCanonicalDomText;
+const readCanonicalComposerText = globalThis.__c2cReadCanonicalComposerText;
+const writeCanonicalMessage = globalThis.__c2cWriteCanonicalMessage;
+const verifyCanonicalComposer = globalThis.__c2cVerifyCanonicalComposer;
+const dispatchNativeSend = globalThis.__c2cDispatchNativeSend;
+const resolveMutationCanonicalRoute = globalThis.__c2cResolveMutationCanonicalRoute;
+const extractRouteChallengeId = globalThis.extractRouteChallengeId;
+const findRouteAttestationUserTurn = globalThis.findRouteAttestationUserTurn;
+const isRouteAttestationMessage = globalThis.isRouteAttestationMessage;
+${stripExports(routeAttestRunSrc)}
+;globalThis.__c2cRunRouteAttestationSend = runRouteAttestationSend;
+})();
+`;
+fs.writeFileSync(
+  path.join(distCompanion, "route-attestation-run-global.js"),
+  routeAttestRunClassic,
+  "utf8",
+);
+const routeAttestRunClassicText = assertClassicArtifact(
+  path.join(distCompanion, "route-attestation-run-global.js"),
+  "route-attestation-run-global.js",
+);
+if (!/globalThis\.__c2cRunRouteAttestationSend\s*=\s*runRouteAttestationSend/.test(routeAttestRunClassicText)) {
+  fail("classic route-attestation-run-global must expose __c2cRunRouteAttestationSend");
+}
+if (!/function runRouteAttestationSend|async function runRouteAttestationSend/.test(routeAttestRunClassicText)) {
+  fail("classic route-attestation-run-global must define runRouteAttestationSend");
+}
+if (!/globalThis\.__c2cResolveMutationCanonicalRoute/.test(routeAttestRunClassicText)) {
+  fail("classic route-attestation-run-global must bind __c2cResolveMutationCanonicalRoute");
+}
+if (/globalThis\.resolveMutationCanonicalRoute\s*=/.test(routeAttestRunClassicText)) {
+  fail("classic route-attestation-run-global must not expose unnamespaced resolveMutationCanonicalRoute");
+}
+
+// ESM route-attestation artifacts must remain importable for service-worker + unit tests.
+for (const esmName of ["route-attestation.js", "route-attestation-run.js"]) {
+  const esmPath = path.join(distCompanion, esmName);
+  if (!fs.existsSync(esmPath)) fail(`ESM route-attestation artifact missing after copy: ${esmName}`);
+  const esm = fs.readFileSync(esmPath, "utf8");
+  if (!/^export\s/m.test(esm)) {
+    fail(`dist ${esmName} must keep ESM exports for SW/tests`);
+  }
+  if (/globalThis\.__c2cRunRouteAttestationSend\s*=/.test(esm) && esmName === "route-attestation.js") {
+    fail("dist route-attestation.js must not be a classic global script");
+  }
+}
+
 // ESM sources must remain intact for SW imports / unit tests.
 for (const esmName of [
   "reservation-journal.js",
@@ -295,6 +437,8 @@ for (const esmName of [
   "production-send-runtime.js",
   "production-send.js",
   "autonomy.js",
+  "route-attestation.js",
+  "route-attestation-run.js",
 ]) {
   const esmPath = path.join(distCompanion, esmName);
   if (!fs.existsSync(esmPath)) fail(`ESM source missing after copy: ${esmName}`);
@@ -342,11 +486,132 @@ const requiredFiles = [
   "autonomy.js",
   "route-esm.js",
   "route-global.js",
+  "route-attestation.js",
+  "route-attestation-run.js",
+  "route-attestation-global.js",
+  "route-attestation-run-global.js",
   "popup/popup.html",
   "popup/popup.js",
 ];
 for (const f of requiredFiles) {
   if (!fs.existsSync(path.join(distCompanion, f))) fail(`packaged file missing: ${f}`);
+}
+
+// G3 content_scripts packaging: classic only; ESM route-attestation stays off the CS chain.
+const csJs = (manifest.content_scripts ?? []).flatMap((cs) => cs.js ?? []);
+if (csJs.includes("route-attestation.js") || csJs.includes("route-attestation-run.js")) {
+  fail("manifest content_scripts must not load ESM route-attestation.js / route-attestation-run.js");
+}
+if (!csJs.includes("route-attestation-global.js") || !csJs.includes("route-attestation-run-global.js")) {
+  fail("manifest content_scripts must load classic route-attestation-global.js + route-attestation-run-global.js");
+}
+const expectedCsOrder = [
+  "route-global.js",
+  "dom-adapter.js",
+  "turn-observer.js",
+  "shadow-evidence.js",
+  "composer-write-adapter.js",
+  "send-click-adapter.js",
+  "send-probe-message-global.js",
+  "send-probe-run.js",
+  "route-attestation-global.js",
+  "route-attestation-run-global.js",
+  "production-send-runtime-global.js",
+  "content-script.js",
+];
+if (JSON.stringify(csJs) !== JSON.stringify(expectedCsOrder)) {
+  fail(`manifest content_scripts order mismatch: ${JSON.stringify(csJs)}`);
+}
+for (const f of csJs) {
+  const p = path.join(distCompanion, f);
+  if (!fs.existsSync(p)) fail(`content script missing from dist: ${f}`);
+  const text = fs.readFileSync(p, "utf8");
+  if (/^\s*import\s/m.test(text) || /^\s*export\s/m.test(text)) {
+    fail(`content script ${f} is not classic JS (top-level import/export)`);
+  }
+  try {
+    new Function(text);
+  } catch (e) {
+    fail(`content script ${f} failed classic parse: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
+// G3: route-attestation runner runtime deps must be provided by earlier manifest artifacts.
+const routeAttestRunDeps = [
+  { symbol: "resolveChatGptComposer", file: "dom-adapter.js", expose: /globalThis\.resolveChatGptComposer\s*=/ },
+  { symbol: "resolveChatGptAction", file: "dom-adapter.js", expose: /globalThis\.resolveChatGptAction\s*=/ },
+  { symbol: "normalizeCanonicalDomText", file: "dom-adapter.js", expose: /globalThis\.normalizeCanonicalDomText\s*=/ },
+  { symbol: "__c2cReadCanonicalComposerText", file: "composer-write-adapter.js", expose: /globalThis\.__c2cReadCanonicalComposerText\s*=/ },
+  { symbol: "__c2cWriteCanonicalMessage", file: "composer-write-adapter.js", expose: /globalThis\.__c2cWriteCanonicalMessage\s*=/ },
+  { symbol: "__c2cVerifyCanonicalComposer", file: "composer-write-adapter.js", expose: /globalThis\.__c2cVerifyCanonicalComposer\s*=/ },
+  { symbol: "__c2cDispatchNativeSend", file: "send-click-adapter.js", expose: /globalThis\.__c2cDispatchNativeSend\s*=/ },
+  { symbol: "__c2cResolveMutationCanonicalRoute", file: "composer-write-adapter.js", expose: /globalThis\.__c2cResolveMutationCanonicalRoute\s*=/ },
+  { symbol: "extractRouteChallengeId", file: "route-attestation-global.js", expose: /globalThis\.extractRouteChallengeId\s*=/ },
+  { symbol: "findRouteAttestationUserTurn", file: "route-attestation-global.js", expose: /globalThis\.findRouteAttestationUserTurn\s*=/ },
+  { symbol: "isRouteAttestationMessage", file: "route-attestation-global.js", expose: /globalThis\.isRouteAttestationMessage\s*=/ },
+  { symbol: "snapshotUserTurns", file: "turn-observer.js", expose: /globalThis\.snapshotUserTurns\s*=/ },
+];
+const runGlobalIdx = csJs.indexOf("route-attestation-run-global.js");
+if (runGlobalIdx < 0) fail("manifest missing route-attestation-run-global.js");
+for (const dep of routeAttestRunDeps) {
+  const idx = csJs.indexOf(dep.file);
+  if (idx < 0) fail(`route-attest run dep ${dep.symbol}: manifest missing ${dep.file}`);
+  if (idx >= runGlobalIdx) {
+    fail(`route-attest run dep ${dep.symbol}: ${dep.file} must load before route-attestation-run-global.js`);
+  }
+  const providerText = fs.readFileSync(path.join(distCompanion, dep.file), "utf8");
+  if (!dep.expose.test(providerText)) {
+    fail(`route-attest run dep ${dep.symbol}: ${dep.file} does not expose ${dep.expose}`);
+  }
+}
+const writeClassicForDeps = fs.readFileSync(path.join(distCompanion, "composer-write-adapter.js"), "utf8");
+if (/globalThis\.resolveMutationCanonicalRoute\s*=/.test(writeClassicForDeps)) {
+  fail("composer-write-adapter.js must not expose unnamespaced resolveMutationCanonicalRoute");
+}
+
+// send-probe-run classic runtime deps (IIFE bindings after write-adapter isolation).
+const sendProbeRunDeps = [
+  { symbol: "resolveChatGptComposer", file: "dom-adapter.js", expose: /globalThis\.resolveChatGptComposer\s*=/ },
+  { symbol: "resolveChatGptAction", file: "dom-adapter.js", expose: /globalThis\.resolveChatGptAction\s*=/ },
+  { symbol: "normalizeCanonicalDomText", file: "dom-adapter.js", expose: /globalThis\.normalizeCanonicalDomText\s*=/ },
+  { symbol: "__c2cReadCanonicalComposerText", file: "composer-write-adapter.js", expose: /globalThis\.__c2cReadCanonicalComposerText\s*=/ },
+  { symbol: "__c2cWriteCanonicalMessage", file: "composer-write-adapter.js", expose: /globalThis\.__c2cWriteCanonicalMessage\s*=/ },
+  { symbol: "__c2cVerifyCanonicalComposer", file: "composer-write-adapter.js", expose: /globalThis\.__c2cVerifyCanonicalComposer\s*=/ },
+  { symbol: "__c2cDispatchNativeSend", file: "send-click-adapter.js", expose: /globalThis\.__c2cDispatchNativeSend\s*=/ },
+  { symbol: "__c2cResolveMutationCanonicalRoute", file: "composer-write-adapter.js", expose: /globalThis\.__c2cResolveMutationCanonicalRoute\s*=/ },
+  { symbol: "buildSendProbeMessage", file: "send-probe-message-global.js", expose: /globalThis\.buildSendProbeMessage\s*=/ },
+];
+const sendProbeRunIdx = csJs.indexOf("send-probe-run.js");
+if (sendProbeRunIdx < 0) fail("manifest missing send-probe-run.js");
+for (const dep of sendProbeRunDeps) {
+  const idx = csJs.indexOf(dep.file);
+  if (idx < 0) fail(`send-probe run dep ${dep.symbol}: manifest missing ${dep.file}`);
+  if (idx >= sendProbeRunIdx) {
+    fail(`send-probe run dep ${dep.symbol}: ${dep.file} must load before send-probe-run.js`);
+  }
+  const providerText = fs.readFileSync(path.join(distCompanion, dep.file), "utf8");
+  if (!dep.expose.test(providerText)) {
+    fail(`send-probe run dep ${dep.symbol}: ${dep.file} does not expose ${dep.expose}`);
+  }
+}
+const sendProbeRunClassicGate = fs.readFileSync(path.join(distCompanion, "send-probe-run.js"), "utf8");
+for (const bindName of [
+  "globalThis.resolveChatGptComposer",
+  "globalThis.resolveChatGptAction",
+  "globalThis.normalizeCanonicalDomText",
+  "globalThis.__c2cReadCanonicalComposerText",
+  "globalThis.__c2cWriteCanonicalMessage",
+  "globalThis.__c2cVerifyCanonicalComposer",
+  "globalThis.__c2cDispatchNativeSend",
+  "globalThis.__c2cResolveMutationCanonicalRoute",
+  "globalThis.buildSendProbeMessage",
+]) {
+  if (!sendProbeRunClassicGate.includes(bindName)) {
+    fail(`send-probe-run.js must bind ${bindName}`);
+  }
+}
+if (!/^\(function \(\)/.test(sendProbeRunClassicGate.replace(/^\/\/.*\n/, ""))) {
+  fail("send-probe-run.js classic must be wrapped in IIFE");
 }
 
 for (const f of ["ownership.js", "dom-adapter.js", "content-script.js", "service-worker.js", "turn-observer.js", "shadow-evidence.js"]) {
@@ -370,6 +635,12 @@ if (!/c2c\.production\.send\.execute/.test(csSource)) {
 if (!/__c2cRunProductionSend/.test(csSource)) {
   fail("content-script.js must wire __c2cRunProductionSend");
 }
+if (!/c2c\.route\.attest\.execute/.test(csSource)) {
+  fail("content-script.js must handle route attest execute");
+}
+if (!/__c2cRunRouteAttestationSend/.test(csSource)) {
+  fail("content-script.js must wire __c2cRunRouteAttestationSend");
+}
 if (/\.click\(\)/.test(fs.readFileSync(path.join(distCompanion, "composer-write-adapter.js"), "utf8"))) {
   fail("composer-write-adapter.js must not contain .click()");
 }
@@ -380,6 +651,19 @@ if (/dispatchNativeSend|runSendOrchestration|recoverSendOrchestration|\.click\(\
 }
 if (!/globalThis\.__c2cRunWriteProbe/.test(writeClassic)) {
   fail("classic write adapter must expose __c2cRunWriteProbe");
+}
+if (!/globalThis\.__c2cResolveMutationCanonicalRoute\s*=/.test(writeClassic)) {
+  fail("classic composer-write-adapter.js must expose __c2cResolveMutationCanonicalRoute");
+}
+if (/globalThis\.resolveMutationCanonicalRoute\s*=/.test(writeClassic)) {
+  fail("classic composer-write-adapter.js must not expose unnamespaced resolveMutationCanonicalRoute");
+}
+const attestRunClassicGate = fs.readFileSync(
+  path.join(distCompanion, "route-attestation-run-global.js"),
+  "utf8",
+);
+if (!/globalThis\.__c2cResolveMutationCanonicalRoute/.test(attestRunClassicGate)) {
+  fail("route-attestation-run-global.js must consume __c2cResolveMutationCanonicalRoute");
 }
 
 console.log(`browser-companion packaged → ${path.relative(root, distCompanion)}`);

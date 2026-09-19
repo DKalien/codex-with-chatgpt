@@ -1451,14 +1451,16 @@ describe("E1b3d2a runtime packaging gates", () => {
       "send-click-adapter.js",
       "send-probe-message-global.js",
       "send-probe-run.js",
-      "route-attestation.js",
-      "route-attestation-run.js",
+      "route-attestation-global.js",
+      "route-attestation-run-global.js",
       "production-send-runtime-global.js",
       "content-script.js",
     ]);
     expect(js).not.toContain("send-adapter.js");
     expect(js).not.toContain("send-orchestrator.js");
     expect(js).not.toContain("production-send-runtime.js");
+    expect(js).not.toContain("route-attestation.js");
+    expect(js).not.toContain("route-attestation-run.js");
     for (const p of manifest.permissions ?? []) {
       expect(["scripting", "debugger", "nativeMessaging", "webRequest"]).not.toContain(p);
     }
@@ -1472,6 +1474,8 @@ describe("E1b3d2a runtime packaging gates", () => {
     const classic = fs.readFileSync(path.join(distCompanion, "composer-write-adapter.js"), "utf8");
     expect(classic).toMatch(/globalThis\.__c2cRunWriteProbe/);
     expect(classic).toMatch(/WRITE_PROBE_MESSAGE/);
+    expect(classic).toMatch(/globalThis\.__c2cResolveMutationCanonicalRoute\s*=/);
+    expect(classic).not.toMatch(/globalThis\.resolveMutationCanonicalRoute\s*=/);
     expect(classic).not.toMatch(/dispatchNativeSend/);
     expect(classic).not.toMatch(/\.click\(/);
     expect(classic).not.toMatch(/runSendOrchestration/);
@@ -1486,6 +1490,8 @@ describe("E1b3d2a runtime packaging gates", () => {
   it("build script forbids send/click in classic write adapter", () => {
     const build = fs.readFileSync(path.join(projectRoot, "scripts", "build-browser-companion.mjs"), "utf8");
     expect(build).toMatch(/composer-write-adapter\.js/);
+    expect(build).toMatch(/__c2cResolveMutationCanonicalRoute/);
+    expect(build).toMatch(/must not expose unnamespaced resolveMutationCanonicalRoute/);
     expect(build).toMatch(/__c2cRunWriteProbe/);
     expect(build).toMatch(/must stay write-only/);
   });
