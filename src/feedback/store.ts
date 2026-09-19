@@ -15,6 +15,8 @@ export const FEEDBACK_CLAIM_STALE_MS = 10 * 60_000;
 /** reserved 可逆；比 claimed 短，避免长期占位。 */
 export const FEEDBACK_RESERVATION_STALE_MS = 2 * 60_000;
 export const COMPANION_PAIRING_TTL_MS = 10 * 60_000;
+/** Route attestation challenge TTL; pairing ≠ origin conversation authenticated. */
+export const COMPANION_ROUTE_ATTEST_TTL_MS = 10 * 60_000;
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const HEX32 = /^[a-f0-9]{32}$/;
@@ -80,6 +82,16 @@ export const pairingIntentSchema = z.object({
   consumedAt: z.string().datetime().optional(),
 }).strict();
 
+export const routeAttestationSchema = z.object({
+  status: z.enum(["pending", "verified"]),
+  challengeId: z.string().regex(UUID),
+  challengeDigest: z.string().regex(HEX64),
+  routeCanonical: z.string().min(1).max(512),
+  expiresAt: z.string().datetime(),
+  verifiedAt: z.string().datetime().optional(),
+  consumedAt: z.string().datetime().optional(),
+}).strict();
+
 export const companionRecordSchema = z.object({
   version: z.literal(1),
   companionId: z.string().regex(UUID),
@@ -90,6 +102,8 @@ export const companionRecordSchema = z.object({
   routeCanonical: z.string().min(1).max(512),
   pairedAt: z.string().datetime(),
   supersededAt: z.string().datetime().optional(),
+  /** Optional for legacy schema compatibility; missing ⇒ unverified. */
+  routeAttestation: routeAttestationSchema.optional(),
 }).strict();
 
 export const feedbackStateSchema = z.object({
@@ -107,6 +121,55 @@ export type FeedbackEvent = z.infer<typeof feedbackEventSchema>;
 export type FeedbackState = z.infer<typeof feedbackStateSchema>;
 export type PairingIntent = z.infer<typeof pairingIntentSchema>;
 export type CompanionRecord = z.infer<typeof companionRecordSchema>;
+export type RouteAttestation = z.infer<typeof routeAttestationSchema>;
+
+/** Challenge binds workspace+binding+epoch+companion+route; never infer openai/session from URL. */
+export function routeChallengeDigest(input: {
+  workspaceId: string;
+  bindingId: string;
+  epoch: number;
+  companionId: string;
+  routeCanonical: string;
+  challengeId: string;
+}): string {
+  return createHash("sha256").update(JSON.stringify({
+    workspaceId: input.workspaceId,
+    bindingId: input.bindingId,
+    epoch: input.epoch,
+    companionId: input.companionId,
+    routeCanonical: input.routeCanonical,
+    challengeId: input.challengeId,
+  }), "utf8").digest("hex");
+}
+
+/** Fixed attestation body; no credential/principal/secret; browser cannot free-write.
+ * Tool-call instruction carries the actual challengeId/challengeDigest values — never placeholders.
+ */
+export function formatRouteAttestationMessage(challengeId: string, challengeDigest: string): string {
+  return [
+    "[C2C_ROUTE_ATTEST]",
+    `challengeId=${challengeId}`,
+    `challengeDigest=${challengeDigest}`,
+    "",
+    "这是 C2C delivery-route verification，不是新开发任务。",
+    "请在本对话调用 MCP 工具（参数必须与上方两行完全一致）：",
+    `feedback_companion_route_confirm(challengeId=${challengeId}, challengeDigest=${challengeDigest})`,
+  ].join("\n");
+}
+
+/**
+ * Legacy CompanionRecord without routeAttestation is unverified.
+ * verified requires explicit status=verified + verifiedAt + matching route.
+ */
+export function isRouteAttestationVerified(
+  companion: CompanionRecord | null | undefined,
+): boolean {
+  if (!companion || companion.supersededAt) return false;
+  const att = companion.routeAttestation;
+  if (!att) return false;
+  if (att.status !== "verified" || !att.verifiedAt) return false;
+  return att.routeCanonical === companion.routeCanonical;
+}
 
 export function feedbackStateFile(workspaceId: string, stateDir = getStateDir()): string {
   if (!WORKSPACE_ID.test(workspaceId)) {

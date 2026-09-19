@@ -11,7 +11,10 @@ import {
 import {
   beginSend,
   COMPANION_PAIRING_TTL_MS,
+  COMPANION_ROUTE_ATTEST_TTL_MS,
   FeedbackError,
+  formatRouteAttestationMessage,
+  isRouteAttestationVerified,
   mutateCompanionPairing,
   publicCompanionDeliveryEvent,
   readFeedbackState,
@@ -19,10 +22,12 @@ import {
   releaseReservation,
   reserveNext,
   retireOutcomeUnknown,
+  routeChallengeDigest,
   type CompanionRecord,
   type FeedbackEvent,
   type FeedbackState,
   type PairingIntent,
+  type RouteAttestation,
 } from "./store.js";
 import { productionFeedbackDelivery } from "./message.js";
 
@@ -70,10 +75,43 @@ export type CompanionAuthContext = {
   epoch: number;
   principalFingerprint: string;
   routeCanonical: string;
+  /** paired ≠ origin route verified; production progression requires verified. */
+  routeVerified: boolean;
 };
 
 function isActiveCompanion(record: CompanionRecord | null | undefined): record is CompanionRecord {
   return Boolean(record && !record.supersededAt);
+}
+
+function mintRouteChallenge(): { challengeId: string } {
+  return { challengeId: randomUUID() };
+}
+
+/** Server-owned challenge after pair; pairing only registers credential+route. */
+function attachPendingRouteAttestation(
+  companionId: string,
+  bindingId: string,
+  epoch: number,
+  routeCanonical: string,
+  workspaceId: string,
+  nowMs: number,
+): RouteAttestation {
+  const { challengeId } = mintRouteChallenge();
+  const challengeDigest = routeChallengeDigest({
+    workspaceId,
+    bindingId,
+    epoch,
+    companionId,
+    routeCanonical,
+    challengeId,
+  });
+  return {
+    status: "pending",
+    challengeId,
+    challengeDigest,
+    routeCanonical,
+    expiresAt: new Date(nowMs + COMPANION_ROUTE_ATTEST_TTL_MS).toISOString(),
+  };
 }
 
 /**
@@ -162,6 +200,13 @@ export function exchangePairingIntent(input: {
   bindingId: string;
   epoch: number;
   routeCanonical: string;
+  routeVerification: "PENDING" | "VERIFIED";
+  routeAttestation: {
+    challengeId: string;
+    challengeDigest: string;
+    expiresAt: string;
+    message: string;
+  };
 } {
   const stateDir = input.stateDir ?? getStateDir();
   const nowMs = input.nowMs ?? Date.now();
@@ -194,15 +239,25 @@ export function exchangePairingIntent(input: {
     // exchange 仍二次检查：防止 create 后、exchange 前出现 claimed 等 in-flight。
     assertNoInFlightDelivery(state);
     const { credential, credentialHash } = mintCompanionCredential();
+    const companionId = randomUUID();
+    const routeAttestation = attachPendingRouteAttestation(
+      companionId,
+      intent.bindingId,
+      intent.epoch,
+      route,
+      input.workspaceId,
+      nowMs,
+    );
     const companion: CompanionRecord = {
       version: 1,
-      companionId: randomUUID(),
+      companionId,
       bindingId: intent.bindingId,
       epoch: intent.epoch,
       principalFingerprint: intent.principalFingerprint,
       credentialHash,
       routeCanonical: route,
       pairedAt: new Date(nowMs).toISOString(),
+      routeAttestation,
     };
     const nowIso = new Date(nowMs).toISOString();
     // 覆盖写入：旧 companion credential hash 立即失效（re-pair supersede）。
@@ -219,9 +274,131 @@ export function exchangePairingIntent(input: {
         bindingId: companion.bindingId,
         epoch: companion.epoch,
         routeCanonical: companion.routeCanonical,
+        routeVerification: "PENDING" as const,
+        routeAttestation: {
+          challengeId: routeAttestation.challengeId,
+          challengeDigest: routeAttestation.challengeDigest,
+          expiresAt: routeAttestation.expiresAt,
+          message: formatRouteAttestationMessage(
+            routeAttestation.challengeId,
+            routeAttestation.challengeDigest,
+          ),
+        },
       },
     };
   });
+}
+
+/**
+ * Trusted MCP confirm: origin conversation principal proves routeCanonical.
+ * Wrong principal rejects WITHOUT consuming the challenge.
+ */
+export function confirmRouteAttestation(input: {
+  workspaceId: string;
+  principal: ConversationPrincipal;
+  challengeId: string;
+  challengeDigest: string;
+  stateDir?: string;
+  nowMs?: number;
+}): {
+  verified: true;
+  companionId: string;
+  routeCanonical: string;
+  routeVerifiedAt: string;
+} {
+  requireConversationPrincipal(input.principal);
+  const stateDir = input.stateDir ?? getStateDir();
+  const nowMs = input.nowMs ?? Date.now();
+  return mutateCompanionPairing(input.workspaceId, stateDir, (state) => {
+    if (!state.binding || state.binding.status !== "active") {
+      throw new FeedbackError("FEEDBACK_NOT_ENABLED", "production feedback 未启用");
+    }
+    if (state.binding.principalFingerprint !== input.principal.fingerprint) {
+      // 不消费 challenge：真正 originating Chat 仍可完成证明。
+      throw new FeedbackError("FEEDBACK_PRINCIPAL_MISMATCH", "route attestation 主体与 binding 不一致");
+    }
+    const companion = state.companion;
+    if (!isActiveCompanion(companion)) {
+      throw new CompanionError("COMPANION_UNAUTHORIZED", "companion 未配对或已撤销");
+    }
+    if (
+      companion.bindingId !== state.binding.bindingId
+      || companion.epoch !== state.binding.epoch
+      || companion.principalFingerprint !== state.binding.principalFingerprint
+    ) {
+      throw new CompanionError("COMPANION_EPOCH_STALE", "companion 绑定代次已失效");
+    }
+    const att = companion.routeAttestation;
+    if (!att) {
+      throw new CompanionError("ROUTE_ATTESTATION_PENDING", "companion route 尚未验证");
+    }
+    if (att.challengeId !== input.challengeId) {
+      throw new CompanionError("ROUTE_ATTESTATION_INVALID", "challengeId 不匹配");
+    }
+    if (!hashEqual(att.challengeDigest, input.challengeDigest)) {
+      throw new CompanionError("ROUTE_ATTESTATION_INVALID", "challengeDigest 不匹配");
+    }
+    if (att.consumedAt) {
+      throw new CompanionError("ROUTE_ATTESTATION_INVALID", "challenge 已消费");
+    }
+    if (att.status === "verified") {
+      throw new CompanionError("ROUTE_ATTESTATION_INVALID", "challenge 已完成验证");
+    }
+    if (Date.parse(att.expiresAt) <= nowMs) {
+      throw new CompanionError("ROUTE_ATTESTATION_EXPIRED", "route attestation challenge 已过期");
+    }
+    if (att.routeCanonical !== companion.routeCanonical) {
+      throw new CompanionError("ROUTE_ATTESTATION_INVALID", "challenge route 与 companion 不一致");
+    }
+    const expectedDigest = routeChallengeDigest({
+      workspaceId: state.workspaceId,
+      bindingId: companion.bindingId,
+      epoch: companion.epoch,
+      companionId: companion.companionId,
+      routeCanonical: companion.routeCanonical,
+      challengeId: att.challengeId,
+    });
+    if (!hashEqual(expectedDigest, input.challengeDigest)) {
+      throw new CompanionError("ROUTE_ATTESTATION_INVALID", "challengeDigest 与绑定事实不匹配");
+    }
+    const routeVerifiedAt = new Date(nowMs).toISOString();
+    const verifiedAtt = {
+      ...att,
+      status: "verified" as const,
+      verifiedAt: routeVerifiedAt,
+      consumedAt: routeVerifiedAt,
+    };
+    return {
+      state: {
+        ...state,
+        companion: { ...companion, routeAttestation: verifiedAtt },
+      },
+      result: {
+        verified: true as const,
+        companionId: companion.companionId,
+        routeCanonical: companion.routeCanonical,
+        routeVerifiedAt,
+      },
+    };
+  });
+}
+
+function assertRouteVerifiedForProduction(
+  workspaceId: string,
+  ctx: CompanionAuthContext,
+  stateDir?: string,
+): void {
+  const state = recoverStaleFeedback(workspaceId, stateDir ?? getStateDir());
+  const companion = state.companion;
+  if (!isActiveCompanion(companion) || companion.companionId !== ctx.companionId) {
+    throw new CompanionError("COMPANION_UNAUTHORIZED", "companion 未配对或已撤销");
+  }
+  if (!isRouteAttestationVerified(companion)) {
+    throw new CompanionError(
+      "COMPANION_ROUTE_UNVERIFIED",
+      "delivery route 尚未通过 principal attestation；禁止 production reserve/begin-send",
+    );
+  }
 }
 
 /** 用 credential 校验 companion；binding/epoch 必须仍匹配。 */
@@ -256,6 +433,7 @@ export function verifyCompanionCredential(input: {
     epoch: companion.epoch,
     principalFingerprint: companion.principalFingerprint,
     routeCanonical: companion.routeCanonical,
+    routeVerified: isRouteAttestationVerified(companion),
   };
 }
 
@@ -317,6 +495,24 @@ export function companionPublicState(input: {
     routeCanonical: input.ctx.routeCanonical,
     companionId: input.ctx.companionId,
     enabled: state.binding?.status === "active",
+    routeVerification: input.ctx.routeVerified ? "VERIFIED" as const : "PENDING" as const,
+    productionEligible: input.ctx.routeVerified === true,
+    ...(input.ctx.routeVerified
+      ? {}
+      : (() => {
+          const att = state.companion?.companionId === input.ctx.companionId
+            ? state.companion.routeAttestation
+            : undefined;
+          if (!att || att.status !== "pending") return {};
+          return {
+            routeAttestation: {
+              challengeId: att.challengeId,
+              challengeDigest: att.challengeDigest,
+              expiresAt: att.expiresAt,
+              message: formatRouteAttestationMessage(att.challengeId, att.challengeDigest),
+            },
+          };
+        })()),
     pendingReady: scoped.filter((e) => e.status === "ready").length,
     reserved: scoped.filter((e) => e.status === "reserved").length,
     claimed: scoped.filter((e) => e.status === "claimed").length,
@@ -334,6 +530,8 @@ export function companionReserveNext(input: {
   stateDir?: string;
 }): { delivery: Record<string, unknown>; reservationId: string } {
   requireRouteMatch(input.ctx, input.routeCanonical);
+  // New irreversible progression requires origin-route principal attestation.
+  assertRouteVerifiedForProduction(input.workspaceId, input.ctx, input.stateDir);
   const result = reserveNext({
     workspaceId: input.workspaceId,
     ...companionAuthInput(input.ctx),
@@ -402,6 +600,9 @@ export function companionBeginSend(input: {
   stateDir?: string;
 }): { event: FeedbackEvent; attemptId: string; message: string; messageSha256: string } {
   requireRouteMatch(input.ctx, input.routeCanonical);
+  // Recovery of an existing reservation is still allowed via legacy reserved path only
+  // after verification for NEW begin-send; reserved→claimed is irreversible progression.
+  assertRouteVerifiedForProduction(input.workspaceId, input.ctx, input.stateDir);
   const result = beginSend({
     workspaceId: input.workspaceId,
     ...companionAuthInput(input.ctx),
@@ -522,6 +723,7 @@ export function companionStatusForPrincipal(input: {
           epoch: companion.epoch,
           routeCanonical: companion.routeCanonical,
           pairedAt: companion.pairedAt,
+          routeVerification: isRouteAttestationVerified(companion) ? "VERIFIED" : "PENDING",
         }
       : null,
     pairingIntentActive: Boolean(intent && Date.parse(intent.expiresAt) > Date.now()),

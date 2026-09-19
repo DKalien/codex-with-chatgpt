@@ -60,6 +60,7 @@ function sendError(res: Response, error: unknown): void {
   }
   if (error instanceof CompanionError || error instanceof FeedbackError) {
     const status = error.code === "COMPANION_REPAIR_BLOCKED"
+      || error.code === "COMPANION_ROUTE_UNVERIFIED"
       ? 409
       : error.code === "FEEDBACK_INFLIGHT_FENCE"
         || error.code === "FEEDBACK_RESERVED_FENCE"

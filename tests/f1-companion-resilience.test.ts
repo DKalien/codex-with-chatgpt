@@ -108,6 +108,7 @@ function baseState(overrides: Record<string, unknown> = {}) {
     autonomyTickInFlight: false,
     inFlight: null,
     pendingReady: 1,
+    routeVerified: true,
     now: Date.now(),
     ...overrides,
   };

@@ -27,7 +27,7 @@
         "https://chatgpt.com/*",
         "https://www.chatgpt.com/*"
       ],
-      "js": ["route-global.js", "dom-adapter.js", "turn-observer.js", "shadow-evidence.js", "composer-write-adapter.js", "send-click-adapter.js", "send-probe-message-global.js", "send-probe-run.js", "production-send-runtime-global.js", "content-script.js"],
+      "js": ["route-global.js", "dom-adapter.js", "turn-observer.js", "shadow-evidence.js", "composer-write-adapter.js", "send-click-adapter.js", "send-probe-message-global.js", "send-probe-run.js", "route-attestation.js", "route-attestation-run.js", "production-send-runtime-global.js", "content-script.js"],
       "run_at": "document_idle",
       "all_frames": false
     }

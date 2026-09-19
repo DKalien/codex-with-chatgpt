@@ -20,6 +20,7 @@ import {
 } from "../feedback/store.js";
 import {
   companionStatusForPrincipal,
+  confirmRouteAttestation,
   createPairingIntent,
   revokeCompanion,
 } from "../feedback/companion.js";
@@ -368,6 +369,51 @@ export function registerFeedbackTools(server: McpServer, workspace: Workspace): 
           principal,
         });
         return ok(intent);
+      } catch (error) {
+        return mapError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "feedback_companion_route_confirm",
+    {
+      title: "Confirm companion delivery-route attestation",
+      description:
+        "确认 Browser Companion delivery route 属于当前 MCP request 的 openai/session principal。" +
+        "不接受 principal 参数；错误 principal 拒绝且不消费 challenge。" +
+        "这是 C2C delivery-route verification，不是新开发任务。",
+      inputSchema: {
+        challengeId: z.string().uuid(),
+        challengeDigest: z.string().regex(/^[a-f0-9]{64}$/),
+      },
+      outputSchema: {
+        verified: z.literal(true),
+        companionId: z.string(),
+        routeCanonical: z.string(),
+        routeVerifiedAt: z.string(),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+      _meta: modelVisibleMeta(),
+    },
+    async (args, extra: Extra) => {
+      const denied = requireScope(extra.authInfo, CODEX_FEEDBACK_SCOPE);
+      if (denied) return denied;
+      try {
+        // Principal must come from official openai/session only — never a tool arg.
+        const principal = principalFromExtra(extra);
+        const result = confirmRouteAttestation({
+          workspaceId: workspace.id,
+          principal,
+          challengeId: args.challengeId,
+          challengeDigest: args.challengeDigest,
+        });
+        return ok({
+          verified: true,
+          companionId: result.companionId,
+          routeCanonical: result.routeCanonical,
+          routeVerifiedAt: result.routeVerifiedAt,
+        });
       } catch (error) {
         return mapError(error);
       }

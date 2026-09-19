@@ -1451,6 +1451,8 @@ describe("E1b3d2a runtime packaging gates", () => {
       "send-click-adapter.js",
       "send-probe-message-global.js",
       "send-probe-run.js",
+      "route-attestation.js",
+      "route-attestation-run.js",
       "production-send-runtime-global.js",
       "content-script.js",
     ]);

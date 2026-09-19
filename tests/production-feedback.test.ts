@@ -789,6 +789,7 @@ describe("MCP production feedback tools", () => {
       "feedback_claim_next",
       "feedback_companion_pair",
       "feedback_companion_revoke",
+      "feedback_companion_route_confirm",
       "feedback_companion_status",
       "feedback_enable",
       "feedback_status",
@@ -826,6 +827,7 @@ describe("MCP production feedback tools", () => {
 
     const modelVisible = [
       "feedback_companion_pair",
+      "feedback_companion_route_confirm",
       "feedback_companion_status",
       "feedback_companion_revoke",
       "feedback_status",

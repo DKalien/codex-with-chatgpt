@@ -73,6 +73,7 @@ function baseState(overrides = {}) {
     autonomyTickInFlight: false,
     inFlight: null,
     pendingReady: 1,
+    routeVerified: true,
     now: Date.now(),
     ...overrides,
   };
@@ -170,6 +171,12 @@ describe("E1b3d3b2 autonomy policy", () => {
     expect(plan.mode).toBe("shadow");
   });
 
+  it("routeVerified=false → gate_failed route_unverified even when ready>0", () => {
+    const plan = planAutonomyTick(baseState({ routeVerified: false }));
+    expect(plan.decision).toBe("gate_failed");
+    expect(plan.reason).toBe("route_unverified");
+  });
+
   it("A-real. real internal transport without connected field works", () => {
     expect(TRANSPORT.connected).toBeUndefined();
     expect(isTransportUsable(TRANSPORT)).toBe(true);
@@ -187,6 +194,7 @@ describe("E1b3d3b2 autonomy policy", () => {
       journal: { state: "NONE" },
       sendProbeLatch: "NONE",
       productionSendInFlight: false,
+      routeVerified: true,
       now: Date.now(),
     });
     expect(gates.ok).toBe(true);
@@ -446,13 +454,14 @@ describe("E1b3d3b2 SW / popup static contract", () => {
     expect(sw).toMatch(/c2c\.autonomy\.disable/);
     expect(sw).toMatch(/autonomy_payload_forbidden/);
     const start = sw.indexOf("c2c.autonomy.enable.shadow");
-    const block = sw.slice(start, start + 2200);
+    const block = sw.slice(start, start + 3200);
     expect(block).toMatch(/message\.message != null/);
     expect(block).toMatch(/message\.eventId != null/);
     expect(block).toMatch(/message\.bindingId != null/);
     expect(block).toMatch(/popup_sender_required/);
     expect(block).toMatch(/bindingId: transport\.bindingId/);
     expect(block).toMatch(/routeCanonical: transport\.routeCanonical/);
+    expect(block).toMatch(/route_unverified/);
     expect(block).toMatch(/commitAutonomyPolicy/);
   });
 
@@ -497,6 +506,7 @@ describe("E1b3d3b2 SW / popup static contract", () => {
   it("popup has explicit arm confirm and no payload injection", () => {
     const html = fs.readFileSync(path.join(companionRoot, "popup", "popup.html"), "utf8");
     expect(html).toMatch(/autonomy-arm-confirm/);
+    expect(html).toMatch(/verify-route/);
     expect(html).toMatch(/automatically send production feedback/);
     expect(html).toMatch(/Enable Shadow/);
     expect(html).toMatch(/Arm Production/);
@@ -507,6 +517,8 @@ describe("E1b3d3b2 SW / popup static contract", () => {
     expect(js).toMatch(/c2c\.autonomy\.disable/);
     expect(js).toMatch(/autonomyArmConfirm/);
     expect(js).not.toMatch(/c2c\.autonomy\.arm[^}]*message:/);
+    expect(js).toMatch(/productionEligible === true/);
+    expect(js).toMatch(/c2c\.route\.attest\.send/);
   });
 });
 
@@ -541,7 +553,7 @@ describe("E1b3d3b2 Arm checkbox enable UX", () => {
     if (refreshIdx >= 0) {
       expect(addIdx).toBeLessThan(refreshIdx);
     }
-    expect(js).toMatch(/lastAutonomyArmGates = \{ hasTransport, isOwner, storageProtected \}/);
+    expect(js).toMatch(/lastAutonomyArmGates = \{[\s\S]*hasTransport[\s\S]*isOwner[\s\S]*storageProtected[\s\S]*productionEligible/);
     expect(js).toMatch(/updateAutonomyArmEnabled\(\)/);
   });
 

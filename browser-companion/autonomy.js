@@ -55,6 +55,7 @@ const OPERATIONAL_REASONS = new Set([
   "attempt_id_missing", "transport_identity_missing", "claimed_message_mismatch", "claimed_message_sha_mismatch",
   "outcome_unknown_attempt_mismatch", "observed_attempt_mismatch", "claimed_identity_mismatch",
   "retry_ack", "ack_cleared", "late_positive_observed_then_acked", "ambiguous",
+  "route_unverified",
 ]);
 const OPERATIONAL_ACTIONS = new Set([
   "noop", "clear", "keep", "conflict", "block", "retry_ack", "server_observed_clear", "recover",
@@ -441,6 +442,7 @@ export function evaluateAutonomyGates(input) {
     journal,
     sendProbeLatch,
     productionSendInFlight,
+    routeVerified,
     now = Date.now(),
     maxEvidenceAgeMs = 12_000,
   } = input || {};
@@ -450,6 +452,8 @@ export function evaluateAutonomyGates(input) {
   if (!isTransportUsable(transport)) {
     return failGate("transport_invalid");
   }
+  // Paired ≠ origin conversation route attested. Production reserve requires verified.
+  if (routeVerified !== true) return failGate("route_unverified");
   if (!policyIdentityExact(policy, transport)) {
     return failGate("policy_identity_mismatch");
   }
@@ -497,6 +501,7 @@ export function planAutonomyTick(state) {
     journal,
     sendProbeLatch,
     productionSendInFlight,
+    routeVerified,
     autonomyTickInFlight = false,
     inFlight = null,
     pendingReady = 0,
@@ -585,6 +590,7 @@ export function planAutonomyTick(state) {
     journal,
     sendProbeLatch,
     productionSendInFlight,
+    routeVerified,
     now,
   });
   if (!gates.ok) {

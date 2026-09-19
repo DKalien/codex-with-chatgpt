@@ -275,6 +275,67 @@
       })();
       return true;
     }
+    if (message.type === "c2c.route.attest.execute") {
+      // G3 route attestation: SW-owned fixed message only. No production journal.
+      const attestationMessage = typeof message.attestationMessage === "string" ? message.attestationMessage : "";
+      const expectedRoute = typeof message.expectedRoute === "string" ? message.expectedRoute : "";
+      const expectedGeneration = message.expectedGeneration;
+      if (typeof globalThis.__c2cRunRouteAttestationSend !== "function") {
+        sendResponse({
+          ok: false,
+          reason: "route_attest_capability_missing",
+          mode: "route_attestation_send",
+          mutationAttempted: false,
+          clickAttempted: false,
+          generation,
+        });
+        return false;
+      }
+      void (async () => {
+        let result;
+        try {
+          result = await globalThis.__c2cRunRouteAttestationSend(document, {
+            attestationMessage,
+            expectedRoute,
+            expectedGeneration,
+            locationHref: location.href,
+            getCurrentGeneration: () => generation,
+            snapshotUserTurns:
+              typeof globalThis.snapshotUserTurns === "function"
+                ? (doc) => globalThis.snapshotUserTurns(doc)
+                : undefined,
+            normalizeText:
+              typeof globalThis.normalizeCanonicalDomText === "function"
+                ? (text) => globalThis.normalizeCanonicalDomText(text)
+                : undefined,
+          });
+        } catch {
+          result = {
+            ok: false,
+            reason: "route_attest_error",
+            mutationAttempted: true,
+            clickAttempted: true,
+            clicked: false,
+            observed: false,
+          };
+        }
+        const parsed = parseRoute(location.href);
+        sendResponse({
+          ok: result?.ok === true,
+          mode: "route_attestation_send",
+          reason: result?.ok ? undefined : (result?.reason || "route_attest_failed"),
+          mutationAttempted: result?.mutationAttempted === true,
+          wrote: result?.wrote === true,
+          clickAttempted: result?.clickAttempted === true,
+          clicked: result?.clicked === true,
+          observed: result?.observed === true,
+          canonicalRoute: parsed ? parsed.canonical : null,
+          generation,
+          type: "c2c.route.attest.result",
+        });
+      })();
+      return true;
+    }
     if (message.type === "c2c.production.send.execute") {
       // E1b3d3b: exact-document production one-shot. SW holds journal/secret authority.
       return handleProductionExecute(message, sendResponse);

@@ -20,6 +20,7 @@ import {
   companionReserveNext,
   companionRetireOutcomeUnknown,
   companionStatusForPrincipal,
+  confirmRouteAttestation,
   createPairingIntent,
   exchangePairingIntent,
   normalizeChatgptRoute,
@@ -151,19 +152,29 @@ function setupReadyEvent(commandId = "cmd-1") {
   return state.events.find((e) => e.commandId === commandId)!;
 }
 
-function pairCompanion(route = ROUTE) {
+function pairCompanion(route = ROUTE, opts: { verify?: boolean } = {}) {
   const intent = createPairingIntent({
     workspaceId: workspace.id,
     principal: principalA(),
     stateDir,
   });
-  return exchangePairingIntent({
+  const paired = exchangePairingIntent({
     workspaceId: workspace.id,
     intentId: intent.intentId,
     secret: intent.secret,
     routeCanonical: route,
     stateDir,
   });
+  if (opts.verify !== false) {
+    confirmRouteAttestation({
+      workspaceId: workspace.id,
+      principal: principalA(),
+      challengeId: paired.routeAttestation.challengeId,
+      challengeDigest: paired.routeAttestation.challengeDigest,
+      stateDir,
+    });
+  }
+  return paired;
 }
 
 function expectCode(fn: () => unknown, code: string): void {
@@ -174,6 +185,276 @@ function expectCode(fn: () => unknown, code: string): void {
     expect((e as { code?: string }).code).toBe(code);
   }
 }
+
+describe("G3 route-principal attestation", () => {
+  it("pair route A → pending; reserve blocked; principal B mismatch leaves pending", () => {
+    setupReadyEvent();
+    const paired = pairCompanion(ROUTE, { verify: false });
+    expect(paired.routeVerification).toBe("PENDING");
+    const ctx = verifyCompanionCredential({
+      workspaceId: workspace.id,
+      credential: paired.credential,
+      stateDir,
+    });
+    expect(ctx.routeVerified).toBe(false);
+    expectCode(() => companionReserveNext({
+      workspaceId: workspace.id,
+      ctx,
+      routeCanonical: ROUTE,
+      stateDir,
+    }), "COMPANION_ROUTE_UNVERIFIED");
+    // Wrong conversation principal must not consume challenge
+    expectCode(() => confirmRouteAttestation({
+      workspaceId: workspace.id,
+      principal: principalB(),
+      challengeId: paired.routeAttestation.challengeId,
+      challengeDigest: paired.routeAttestation.challengeDigest,
+      stateDir,
+    }), "FEEDBACK_PRINCIPAL_MISMATCH");
+    const afterWrong = readFeedbackState(workspace.id, stateDir).companion!;
+    expect(afterWrong.routeAttestation?.status).toBe("pending");
+    expect(afterWrong.routeAttestation?.consumedAt).toBeUndefined();
+    expectCode(() => companionReserveNext({
+      workspaceId: workspace.id,
+      ctx,
+      routeCanonical: ROUTE,
+      stateDir,
+    }), "COMPANION_ROUTE_UNVERIFIED");
+  });
+
+  it("same challenge confirmed by A → verified → reserve allowed", () => {
+    setupReadyEvent();
+    const paired = pairCompanion(ROUTE, { verify: false });
+    const confirmed = confirmRouteAttestation({
+      workspaceId: workspace.id,
+      principal: principalA(),
+      challengeId: paired.routeAttestation.challengeId,
+      challengeDigest: paired.routeAttestation.challengeDigest,
+      stateDir,
+    });
+    expect(confirmed.verified).toBe(true);
+    const ctx = verifyCompanionCredential({
+      workspaceId: workspace.id,
+      credential: paired.credential,
+      stateDir,
+    });
+    expect(ctx.routeVerified).toBe(true);
+    const reserved = companionReserveNext({
+      workspaceId: workspace.id,
+      ctx,
+      routeCanonical: ROUTE,
+      stateDir,
+    });
+    expect(reserved.delivery.status).toBe("reserved");
+  });
+
+  it("wrong digest / expired / replayed / wrong companion fail closed", () => {
+    setupReadyEvent("cmd-attest");
+    const paired = pairCompanion(ROUTE, { verify: false });
+    expectCode(() => confirmRouteAttestation({
+      workspaceId: workspace.id,
+      principal: principalA(),
+      challengeId: paired.routeAttestation.challengeId,
+      challengeDigest: "0".repeat(64),
+      stateDir,
+    }), "ROUTE_ATTESTATION_INVALID");
+    expectCode(() => confirmRouteAttestation({
+      workspaceId: workspace.id,
+      principal: principalA(),
+      challengeId: "00000000-0000-4000-8000-000000000000",
+      challengeDigest: paired.routeAttestation.challengeDigest,
+      stateDir,
+    }), "ROUTE_ATTESTATION_INVALID");
+
+    // Expired challenge
+    const expired = pairCompanion(ROUTE, { verify: false });
+    expectCode(() => confirmRouteAttestation({
+      workspaceId: workspace.id,
+      principal: principalA(),
+      challengeId: expired.routeAttestation.challengeId,
+      challengeDigest: expired.routeAttestation.challengeDigest,
+      stateDir,
+      nowMs: Date.parse(expired.routeAttestation.expiresAt) + 1000,
+    }), "ROUTE_ATTESTATION_EXPIRED");
+
+    // Replay after success
+    const okPair = pairCompanion(ROUTE, { verify: false });
+    confirmRouteAttestation({
+      workspaceId: workspace.id,
+      principal: principalA(),
+      challengeId: okPair.routeAttestation.challengeId,
+      challengeDigest: okPair.routeAttestation.challengeDigest,
+      stateDir,
+    });
+    expectCode(() => confirmRouteAttestation({
+      workspaceId: workspace.id,
+      principal: principalA(),
+      challengeId: okPair.routeAttestation.challengeId,
+      challengeDigest: okPair.routeAttestation.challengeDigest,
+      stateDir,
+    }), "ROUTE_ATTESTATION_INVALID");
+  });
+
+  it("re-pair route B → verification must not carry over", () => {
+    setupReadyEvent("cmd-repair-route");
+    const first = pairCompanion(ROUTE);
+    const ctx1 = verifyCompanionCredential({
+      workspaceId: workspace.id,
+      credential: first.credential,
+      stateDir,
+    });
+    expect(ctx1.routeVerified).toBe(true);
+    const second = pairCompanion(ROUTE_B, { verify: false });
+    expect(second.companionId).not.toBe(first.companionId);
+    expect(second.routeVerification).toBe("PENDING");
+    const ctx2 = verifyCompanionCredential({
+      workspaceId: workspace.id,
+      credential: second.credential,
+      stateDir,
+    });
+    expect(ctx2.routeVerified).toBe(false);
+    expectCode(() => companionReserveNext({
+      workspaceId: workspace.id,
+      ctx: ctx2,
+      routeCanonical: ROUTE_B,
+      stateDir,
+    }), "COMPANION_ROUTE_UNVERIFIED");
+  });
+
+  it("takeover epoch 2 invalidates old verification", () => {
+    setupReadyEvent("cmd-takeover-route");
+    const paired = pairCompanion(ROUTE);
+    expect(verifyCompanionCredential({
+      workspaceId: workspace.id,
+      credential: paired.credential,
+      stateDir,
+    }).routeVerified).toBe(true);
+    takeoverReceiver({
+      workspaceId: workspace.id,
+      principal: principalB(),
+      widgetId: "wB",
+      expectedEpoch: 1,
+      stateDir,
+    });
+    try {
+      verifyCompanionCredential({
+        workspaceId: workspace.id,
+        credential: paired.credential,
+        stateDir,
+      });
+      expect.unreachable("old companion invalid after takeover");
+    } catch (e) {
+      expect(["COMPANION_EPOCH_STALE", "COMPANION_UNAUTHORIZED", "FEEDBACK_NOT_ENABLED"])
+        .toContain((e as { code?: string }).code);
+    }
+  });
+
+  it("legacy CompanionRecord without attestation → unverified, no production reserve", () => {
+    setupReadyEvent("cmd-legacy-att");
+    const paired = pairCompanion(ROUTE);
+    // Strip attestation field to simulate legacy on-disk record
+    const file = path.join(stateDir, "feedback", `${workspace.id}.json`);
+    const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+    delete raw.companion.routeAttestation;
+    fs.writeFileSync(file, JSON.stringify(raw, null, 2));
+    const ctx = verifyCompanionCredential({
+      workspaceId: workspace.id,
+      credential: paired.credential,
+      stateDir,
+    });
+    expect(ctx.routeVerified).toBe(false);
+    expectCode(() => companionReserveNext({
+      workspaceId: workspace.id,
+      ctx,
+      routeCanonical: ROUTE,
+      stateDir,
+    }), "COMPANION_ROUTE_UNVERIFIED");
+  });
+
+  it("legacy reserved recovery: release still works; new reserve blocked until verify", () => {
+    setupReadyEvent("cmd-legacy-reserved");
+    const paired = pairCompanion(ROUTE);
+    // Simulate upgrade-time reserved without verifying the new challenge
+    const ctx = verifyCompanionCredential({
+      workspaceId: workspace.id,
+      credential: paired.credential,
+      stateDir,
+    });
+    // Direct store reserve (legacy path used by old in-flight) — then unverify companion
+    const reserved = reserveNext({
+      workspaceId: workspace.id,
+      bindingId: ctx.bindingId,
+      epoch: ctx.epoch,
+      principalFingerprint: ctx.principalFingerprint,
+      companionId: ctx.companionId,
+      stateDir,
+    });
+    // Mark companion attestation back to pending to simulate unverified upgrade state
+    const file = path.join(stateDir, "feedback", `${workspace.id}.json`);
+    const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+    raw.companion.routeAttestation.status = "pending";
+    delete raw.companion.routeAttestation.verifiedAt;
+    delete raw.companion.routeAttestation.consumedAt;
+    fs.writeFileSync(file, JSON.stringify(raw, null, 2));
+    const ctxUnverified = verifyCompanionCredential({
+      workspaceId: workspace.id,
+      credential: paired.credential,
+      stateDir,
+    });
+    expect(ctxUnverified.routeVerified).toBe(false);
+    // Recovery release still allowed
+    const released = companionRelease({
+      workspaceId: workspace.id,
+      ctx: ctxUnverified,
+      routeCanonical: ROUTE,
+      eventId: reserved.event.eventId,
+      reservationId: reserved.reservationId,
+      stateDir,
+    });
+    expect(released.status).toBe("ready");
+    // New reserve still blocked
+    expectCode(() => companionReserveNext({
+      workspaceId: workspace.id,
+      ctx: ctxUnverified,
+      routeCanonical: ROUTE,
+      stateDir,
+    }), "COMPANION_ROUTE_UNVERIFIED");
+  });
+
+  it("MCP confirm tool uses request principal; wrong principal rejected", async () => {
+    setupReadyEvent("cmd-mcp-confirm");
+    const paired = pairCompanion(ROUTE, { verify: false });
+    const { createMcpServer } = await import("../src/mcp/server.js");
+    const server = createMcpServer({ workspace, logger: { info() {}, error() {}, warn() {}, debug() {} } as never });
+    const tools = (server as unknown as {
+      _registeredTools: Record<string, {
+        handler: (a: unknown, e: unknown) => Promise<{ isError?: boolean; content: Array<{ text: string }> }>;
+      }>;
+    })._registeredTools;
+    const handler = tools.feedback_companion_route_confirm.handler;
+    const denied = await handler({
+      challengeId: paired.routeAttestation.challengeId,
+      challengeDigest: paired.routeAttestation.challengeDigest,
+    }, {
+      authInfo: { token: "t", clientId: "client-B", scopes: [CODEX_FEEDBACK_SCOPE] },
+      _meta: { "openai/session": "sess-B" },
+    });
+    expect(denied.isError).toBe(true);
+    const okRes = await handler({
+      challengeId: paired.routeAttestation.challengeId,
+      challengeDigest: paired.routeAttestation.challengeDigest,
+    }, {
+      authInfo: { token: "t", clientId: "client-A", scopes: [CODEX_FEEDBACK_SCOPE] },
+      _meta: { "openai/session": "sess-A" },
+    });
+    expect(okRes.isError).not.toBe(true);
+    expect(ctxRouteVerified()).toBe(true);
+  });
+
+  function ctxRouteVerified(): boolean {
+    return readFeedbackState(workspace.id, stateDir).companion?.routeAttestation?.status === "verified";
+  }
+});
 
 describe("route normalization", () => {
   it("接受 canonical chatgpt.com/c/<uuid>", () => {
@@ -610,23 +891,36 @@ describe("reserved state machine", () => {
       epoch: ctxA.epoch,
       principalFingerprint: ctxA.principalFingerprint,
       routeCanonical: ROUTE,
+      routeVerified: false,
     };
-    expectCode(() => companionBeginSend({
-      workspaceId: workspace.id,
-      ctx: forgedB,
-      routeCanonical: ROUTE,
-      eventId: event.eventId,
-      reservationId: reserved.reservationId,
-      stateDir,
-    }), "FEEDBACK_RESERVATION_MISMATCH");
-    expectCode(() => companionAckObserved({
-      workspaceId: workspace.id,
-      ctx: forgedB,
-      routeCanonical: ROUTE,
-      eventId: event.eventId,
-      attemptId: sentA.attemptId,
-      stateDir,
-    }), "FEEDBACK_ACK_MISMATCH");
+    try {
+      companionBeginSend({
+        workspaceId: workspace.id,
+        ctx: forgedB as never,
+        routeCanonical: ROUTE,
+        eventId: event.eventId,
+        reservationId: reserved.reservationId,
+        stateDir,
+      });
+      expect.unreachable("forged B must fail");
+    } catch (e) {
+      expect(["COMPANION_ROUTE_UNVERIFIED", "COMPANION_UNAUTHORIZED", "FEEDBACK_RESERVATION_MISMATCH"])
+        .toContain((e as { code?: string }).code);
+    }
+    try {
+      companionAckObserved({
+        workspaceId: workspace.id,
+        ctx: forgedB as never,
+        routeCanonical: ROUTE,
+        eventId: event.eventId,
+        attemptId: sentA.attemptId,
+        stateDir,
+      });
+      expect.unreachable("forged B ack must fail");
+    } catch (e) {
+      expect(["COMPANION_ROUTE_UNVERIFIED", "COMPANION_UNAUTHORIZED", "FEEDBACK_ACK_MISMATCH"])
+        .toContain((e as { code?: string }).code);
+    }
   });
 
   it("P1：MCP 直接 claim 的事件 companion 不能冒充 ACK", () => {
@@ -1445,6 +1739,23 @@ describe("public companion HTTP surface", () => {
     const state = await fetchJson("/api/companion/v1/state", { headers: auth });
     expect(state.status).toBe(200);
     expect(state.body.pendingReady).toBe(1);
+    expect(state.body.routeVerification).toBe("PENDING");
+
+    const unverifiedReserve = await fetchJson("/api/companion/v1/reserve", {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({ routeCanonical: ROUTE }),
+    });
+    expect(unverifiedReserve.status).toBe(409);
+    expect(unverifiedReserve.body.error).toBe("COMPANION_ROUTE_UNVERIFIED");
+
+    confirmRouteAttestation({
+      workspaceId: workspace.id,
+      principal: principalA(),
+      challengeId: paired.body.routeAttestation.challengeId,
+      challengeDigest: paired.body.routeAttestation.challengeDigest,
+      stateDir,
+    });
 
     const reserved = await fetchJson("/api/companion/v1/reserve", {
       method: "POST",
@@ -1561,7 +1872,7 @@ describe("public companion HTTP surface", () => {
     expect(badBody.body.error).toBe("COMPANION_VALIDATION");
   });
 
-  async function pairCompanionHttp() {
+  async function pairCompanionHttp(opts: { verify?: boolean } = {}) {
     const intent = createPairingIntent({
       workspaceId: workspace.id,
       principal: principalA(),
@@ -1577,6 +1888,15 @@ describe("public companion HTTP surface", () => {
       }),
     });
     expect(paired.status).toBe(200);
+    if (opts.verify !== false) {
+      confirmRouteAttestation({
+        workspaceId: workspace.id,
+        principal: principalA(),
+        challengeId: paired.body.routeAttestation.challengeId,
+        challengeDigest: paired.body.routeAttestation.challengeDigest,
+        stateDir,
+      });
+    }
     return {
       authorization: `Bearer ${paired.body.credential as string}`,
       "content-type": "application/json",

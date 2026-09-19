@@ -23,6 +23,7 @@
     pairSecret: document.getElementById("pair-secret"),
     pairHint: document.getElementById("pair-hint"),
     pair: document.getElementById("pair"),
+    verifyRoute: document.getElementById("verify-route"),
     fetchState: document.getElementById("fetch-state"),
     reserve: document.getElementById("reserve"),
     release: document.getElementById("release"),
@@ -98,15 +99,38 @@
     hasTransport: false,
     isOwner: false,
     storageProtected: false,
+    productionEligible: false,
+  };
+  let lastRouteVerifyGates = {
+    hasTransport: false,
+    isOwner: false,
+    routeVerification: "PENDING",
+    routeAttestLatch: "NONE",
+    routeAttestFence: "NONE",
   };
 
   function updateAutonomyArmEnabled() {
     if (!els.autonomyArm) return;
+    // ARMED requires authenticated route VERIFIED — never treat "paired" as verified.
     els.autonomyArm.disabled = !(
       lastAutonomyArmGates.hasTransport
       && lastAutonomyArmGates.isOwner
       && lastAutonomyArmGates.storageProtected
+      && lastAutonomyArmGates.productionEligible === true
       && els.autonomyArmConfirm?.checked === true
+    );
+  }
+
+  function updateRouteVerifyEnabled() {
+    if (!els.verifyRoute) return;
+    // Popup never supplies message text; SW owns attestation payload.
+      els.verifyRoute.disabled = !(
+      lastRouteVerifyGates.hasTransport
+      && lastRouteVerifyGates.isOwner
+      && lastRouteVerifyGates.routeVerification === "PENDING"
+      // Session latch AND durable fence must both be NONE. Fence survives browser restart.
+      && lastRouteVerifyGates.routeAttestLatch === "NONE"
+      && lastRouteVerifyGates.routeAttestFence === "NONE"
     );
   }
 
@@ -304,6 +328,8 @@
         `bindingId=${transport?.bindingId ?? "-"}`,
         `epoch=${transport?.epoch ?? "-"}`,
         `route=${transport?.routeCanonical ?? "-"}`,
+        `Route verification: ${transport?.routeVerification === "VERIFIED" ? "VERIFIED" : "PENDING"}`,
+        `Production eligible: ${transport?.productionEligible === true ? "yes" : "no"}`,
         `identityExact=${autonomy.identityExact === true}`,
         `tickInFlight=${autonomy.tickInFlight === true}`,
         `lastDecision=${autonomy.lastDecision ?? "-"}`,
@@ -333,14 +359,30 @@
       ].join("\n") : "—";
     }
     // Manual reserve/send must not race ARMED scheduler.
+    // Reserve also disabled while route is not VERIFIED (server 409 remains authority).
+    const routeVerified = transport?.routeVerification === "VERIFIED"
+      || transport?.productionEligible === true;
     if (els.reserve) {
-      els.reserve.disabled = !hasTransport || !isOwner || armed;
+      els.reserve.disabled = !hasTransport || !isOwner || armed || !routeVerified;
     }
     if (els.autonomyShadow) {
       els.autonomyShadow.disabled = !hasTransport || !isOwner || !storageProtected || armed;
     }
-    lastAutonomyArmGates = { hasTransport, isOwner, storageProtected };
+    lastAutonomyArmGates = {
+      hasTransport,
+      isOwner,
+      storageProtected,
+      productionEligible: routeVerified,
+    };
+    lastRouteVerifyGates = {
+      hasTransport,
+      isOwner,
+      routeVerification: routeVerified ? "VERIFIED" : "PENDING",
+      routeAttestLatch: status?.routeAttestLatch ?? "NONE",
+      routeAttestFence: status?.routeAttestFence ?? "NONE",
+    };
     updateAutonomyArmEnabled();
+    updateRouteVerifyEnabled();
     if (els.autonomyDisable) {
       els.autonomyDisable.disabled = autonomyMode === "off";
     }
@@ -456,8 +498,9 @@
         const failReason = res?.reason
           || (typeof res?.status === "number" ? `http_${res.status}` : "unknown");
         if (res?.ok) {
-          setText(els.transportStatus, "paired", "ok");
-          els.pairHint.textContent = "Pairing 成功。secret 已清空。";
+          setText(els.transportStatus, "paired — Route verification: PENDING", "bad");
+          els.pairHint.textContent =
+            "Pairing 成功。Route verification=PENDING。请在本 conversation 点击 Verify this conversation route；Production eligible=no。secret 已清空。";
           els.pairHint.className = "note ok";
         } else {
           setText(els.transportStatus, `pair 失败: ${failReason}`, "bad");
@@ -471,6 +514,20 @@
         await clearPairingForm({ includeIntent: true });
       }
     };
+
+    if (els.verifyRoute) {
+      els.verifyRoute.onclick = async () => {
+        // Popup MUST NOT supply attestation message text.
+        const res = await chrome.runtime.sendMessage({ type: "c2c.route.attest.send" });
+        setText(
+          els.bridgeState,
+          `route attest ok=${res?.ok === true} observed=${res?.observed === true} `
+          + `serverConfirmed=${res?.serverConfirmed === true} reason=${res?.reason ?? (res?.ok ? "ok" : "-")}`,
+          res?.ok ? "ok" : "bad",
+        );
+        await refresh();
+      };
+    }
 
     els.fetchState.onclick = async () => {
       const res = await chrome.runtime.sendMessage({ type: "c2c.fetch.state" });

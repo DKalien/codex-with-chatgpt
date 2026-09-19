@@ -60,6 +60,32 @@ import {
   executeSendProbeMutationRpc,
 } from "./send-probe.js";
 import {
+  ROUTE_ATTEST_SEND_TYPE,
+  ROUTE_ATTEST_LATCH_KEY,
+  ROUTE_ATTEST_FENCE_KEY,
+  emptyRouteAttestLatch,
+  emptyRouteAttestFence,
+  parseRouteAttestLatch,
+  parseRouteAttestFence,
+  isRouteAttestationMessage,
+  extractRouteChallengeId,
+  validateRouteAttestPopupRequest,
+  canStartRouteAttestSend,
+  buildRouteAttestExecuteRequest,
+  classifyRouteAttestRpcResult,
+  syncTransportRouteVerification,
+  applyRouteAttestServerVerification,
+  applyRouteAttestServerVerificationToFence,
+  shouldPollRouteAttestConfirm,
+  markRouteAttestFenceDispatch,
+  markRouteAttestFenceState,
+  nextRouteAttestFenceAfterPair,
+  markPairingTransitionBarrier,
+  resolvePairFenceAfterSuccess,
+  shouldRestorePairFenceAfterHttpError,
+  reconcileRouteAttestAfterHydrate,
+} from "./route-attestation.js";
+import {
   canStartProductionSend,
   buildProductionSendExecuteRequest,
   buildProductionRecoverRequest,
@@ -114,6 +140,10 @@ let writeProbeInFlight = false;
 /** E1b3d3a one-shot real Send probe latch (session, independent of production journal). */
 let sendProbeLatch = emptySendProbeLatch();
 let sendProbeInFlight = false;
+/** G3 route-attestation session latch (tab/document/generation). Cleared by browser restart. */
+let routeAttestLatch = emptyRouteAttestLatch();
+/** G3 route-attestation durable fence (chrome.storage.local). Survives browser restart. */
+let routeAttestFence = emptyRouteAttestFence();
 /** E1b3d3b concurrent production send gate (memory only; durable truth is journal). */
 let productionSendInFlight = false;
 /** Short-lived SW transition proofs. Bound to current journal identity. Never from CS. */
@@ -156,6 +186,7 @@ async function hydrate() {
     TRANSPORT_KEY,
     JOURNAL_KEY,
     AUTONOMY_STORAGE_KEY,
+    ROUTE_ATTEST_FENCE_KEY,
   ]);
   const row = stored[LOCAL_KEY];
   localState = row && typeof row === "object"
@@ -195,6 +226,7 @@ async function hydrate() {
     SESSION_REG_KEY,
     SESSION_EVIDENCE_KEY,
     SEND_PROBE_LATCH_KEY,
+    ROUTE_ATTEST_LATCH_KEY,
   ]);
   ownerState = {
     schemaVersion: OWNERSHIP_SCHEMA_VERSION,
@@ -208,6 +240,16 @@ async function hydrate() {
     ? live[SESSION_EVIDENCE_KEY]
     : null;
   sendProbeLatch = parseSendProbeLatch(live[SEND_PROBE_LATCH_KEY]);
+  routeAttestLatch = parseRouteAttestLatch(live[ROUTE_ATTEST_LATCH_KEY]);
+  // Durable fence is restart-safe authority. Session latch alone cannot authorize resend.
+  const hydratedFence = parseRouteAttestFence(stored[ROUTE_ATTEST_FENCE_KEY]);
+  const reconciled = reconcileRouteAttestAfterHydrate({
+    fence: hydratedFence,
+    sessionLatch: routeAttestLatch,
+    transport,
+  });
+  routeAttestFence = reconciled.fence;
+  routeAttestLatch = reconciled.sessionLatch;
   hydrated = true;
 }
 
@@ -225,6 +267,59 @@ async function persistSendProbeLatch() {
   }
 }
 
+async function persistRouteAttestLatch() {
+  try {
+    if (routeAttestLatch.state === "NONE") {
+      await chrome.storage.session.remove(ROUTE_ATTEST_LATCH_KEY);
+    } else {
+      await chrome.storage.session.set({ [ROUTE_ATTEST_LATCH_KEY]: routeAttestLatch });
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Durable challenge fence — chrome.storage.local. Fail closed on write error. */
+async function persistRouteAttestFence() {
+  try {
+    if (routeAttestFence.state === "NONE" && !routeAttestFence.challengeId) {
+      await chrome.storage.local.remove(ROUTE_ATTEST_FENCE_KEY);
+    } else {
+      await chrome.storage.local.set({ [ROUTE_ATTEST_FENCE_KEY]: routeAttestFence });
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Persist session latch + durable fence together. Durable must succeed before mutation RPC. */
+async function persistRouteAttestBoth() {
+  const fenceOk = await persistRouteAttestFence();
+  const latchOk = await persistRouteAttestLatch();
+  return fenceOk && latchOk;
+}
+
+/**
+ * Atomic pair durable commit: TRANSPORT + LOCAL + FENCE in one chrome.storage.local.set.
+ * Returns false on any write failure — caller must keep PAIRING_TRANSITION barrier.
+ */
+async function commitPairDurableLocals({ nextTransport, nextLocal, nextFence }) {
+  if (!storageProtected) return false;
+  try {
+    const row = {
+      [LOCAL_KEY]: nextLocal,
+      [ROUTE_ATTEST_FENCE_KEY]: nextFence,
+    };
+    if (nextTransport) row[TRANSPORT_KEY] = nextTransport;
+    await chrome.storage.local.set(row);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function persistLocal() {
   await chrome.storage.local.set({ [LOCAL_KEY]: localState });
 }
@@ -233,13 +328,14 @@ async function persistTransport() {
   if (!storageProtected) {
     // Never write credential without protection.
     await chrome.storage.local.remove(TRANSPORT_KEY);
-    return;
+    return true;
   }
   if (!transport) {
     await chrome.storage.local.remove(TRANSPORT_KEY);
-    return;
+    return true;
   }
   await chrome.storage.local.set({ [TRANSPORT_KEY]: transport });
+  return true;
 }
 
 async function persistJournal() {
@@ -337,6 +433,8 @@ function safeTransportSummary() {
     bindingId: transport.bindingId,
     epoch: transport.epoch,
     routeCanonical: transport.routeCanonical,
+    routeVerification: transport.routeVerification === "VERIFIED" ? "VERIFIED" : "PENDING",
+    productionEligible: transport.routeVerification === "VERIFIED",
     pairedAt: transport.pairedAt,
   };
 }
@@ -355,6 +453,8 @@ function statusPayload(tabId, documentId, extra = {}) {
     transport: safeTransportSummary(),
     journal: summarizeProductionJournal(journal),
     sendProbeLatch: sendProbeLatch.state,
+    routeAttestLatch: routeAttestLatch.state,
+    routeAttestFence: routeAttestFence.state,
     productionSendInFlight,
     autonomy: autonomySummary(autonomyPolicy, {
       identityExact: policyIdentityExact(autonomyPolicy, transport),
@@ -572,8 +672,31 @@ async function handlePair(message) {
   if (typeof message.intentId !== "string" || typeof message.secret !== "string" || !message.secret) {
     return { ok: false, reason: "pairing_input_invalid" };
   }
+
+  // Capture TRUE previous state BEFORE any global mutation or server call.
+  const prevTransport = transport;
+  const prevLocal = localState;
+  const prevFence = routeAttestFence;
+  const prevLatch = routeAttestLatch;
+
+  // Barrier-first: durable PAIRING_TRANSITION before any server mutation.
+  // Blocks all route-attestation DOM Send, including old PENDING challenge.
+  const barrier = markPairingTransitionBarrier(prevFence, Date.now());
+  routeAttestFence = barrier;
+  const barrierOk = await persistRouteAttestFence();
+  if (!barrierOk) {
+    routeAttestFence = prevFence;
+    return {
+      ok: false,
+      reason: "pair_barrier_persist_failed",
+      routeAttestFence: prevFence?.state ?? "NONE",
+      retryAllowed: true,
+    };
+  }
+
+  let res;
   try {
-    const res = await fetch(companionApiUrl(origin, "/pair"), {
+    res = await fetch(companionApiUrl(origin, "/pair"), {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
@@ -583,44 +706,141 @@ async function handlePair(message) {
       }),
       signal: AbortSignal.timeout(15_000),
     });
-    const body = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      return { ok: false, reason: body.error || `http_${res.status}`, status: res.status };
-    }
-    assertNoForbiddenFields(body);
-    if (
-      body.routeCanonical !== routeCanonical
-      || typeof body.credential !== "string"
-      || typeof body.workspaceId !== "string"
-      || typeof body.companionId !== "string"
-      || typeof body.bindingId !== "string"
-      || typeof body.epoch !== "number"
-    ) {
-      return { ok: false, reason: "pair_response_invalid" };
-    }
-    transport = {
-      schemaVersion: 1,
-      bridgeOrigin: origin,
-      workspaceId: body.workspaceId,
-      companionId: body.companionId,
-      bindingId: body.bindingId,
-      epoch: body.epoch,
-      routeCanonical: body.routeCanonical,
-      pairedAt: new Date().toISOString(),
-      credential: body.credential,
-      authStale: false,
-    };
-    localState = { ...localState, paired: true, targetRoute: routeCanonical };
-    const disarmed = disarmOnIdentityChange(autonomyPolicy, transport);
-    if (disarmed.changed) {
-      await forceAutonomyOff("identity_disarm");
-    }
-    await persistTransport();
-    await persistLocal();
-    return { ok: true, transport: safeTransportSummary() };
   } catch {
-    return { ok: false, reason: "network_unreachable" };
+    // Network timeout / connection loss: server may already have superseded companion.
+    // Keep barrier — zero route-attestation DOM Send for old or new challenge.
+    return {
+      ok: false,
+      reason: "pair_outcome_unknown",
+      routeAttestFence: "PAIRING_TRANSITION",
+      retryAllowed: false,
+    };
   }
+
+  let body = {};
+  try {
+    body = await res.json();
+  } catch {
+    body = {};
+  }
+
+  if (!res.ok) {
+    // Clear 4xx: companion contract — request rejected, no pair mutation. Restore prev fence.
+    // 5xx / other: outcome unknown — keep barrier.
+    if (shouldRestorePairFenceAfterHttpError(res.status)) {
+      routeAttestFence = prevFence;
+      await persistRouteAttestFence().catch(() => false);
+      return {
+        ok: false,
+        reason: body.error || `http_${res.status}`,
+        status: res.status,
+        routeAttestFence: prevFence?.state ?? "NONE",
+      };
+    }
+    return {
+      ok: false,
+      reason: body.error || `http_${res.status}`,
+      status: res.status,
+      routeAttestFence: "PAIRING_TRANSITION",
+      retryAllowed: false,
+    };
+  }
+
+  assertNoForbiddenFields(body);
+  if (
+    body.routeCanonical !== routeCanonical
+    || typeof body.credential !== "string"
+    || typeof body.workspaceId !== "string"
+    || typeof body.companionId !== "string"
+    || typeof body.bindingId !== "string"
+    || typeof body.epoch !== "number"
+  ) {
+    // 2xx but invalid body — server may have mutated. Keep barrier.
+    return {
+      ok: false,
+      reason: "pair_response_invalid",
+      routeAttestFence: "PAIRING_TRANSITION",
+      retryAllowed: false,
+    };
+  }
+
+  // Build next* locals — never mutate transport/localState/fence before durable commit.
+  const nextTransport = {
+    schemaVersion: 1,
+    bridgeOrigin: origin,
+    workspaceId: body.workspaceId,
+    companionId: body.companionId,
+    bindingId: body.bindingId,
+    epoch: body.epoch,
+    routeCanonical: body.routeCanonical,
+    pairedAt: new Date().toISOString(),
+    credential: body.credential,
+    authStale: false,
+    routeVerification: body.routeVerification === "VERIFIED" ? "VERIFIED" : "PENDING",
+    routeAttestationMessage: typeof body.routeAttestation?.message === "string"
+      ? body.routeAttestation.message
+      : null,
+    routeAttestationExpiresAt: typeof body.routeAttestation?.expiresAt === "string"
+      ? body.routeAttestation.expiresAt
+      : null,
+  };
+  const nextLocal = { ...prevLocal, paired: true, targetRoute: routeCanonical };
+  const newChallengeId = extractRouteChallengeId(body.routeAttestation?.message);
+  const fenceResolved = resolvePairFenceAfterSuccess({
+    prevFence: barrier,
+    companionId: body.companionId,
+    challengeId: newChallengeId,
+    routeCanonical,
+    now: Date.now(),
+  });
+  let nextFence;
+  if (fenceResolved.ok) {
+    nextFence = fenceResolved.fence;
+  } else {
+    // Missing new identity after 2xx: fail closed OUTCOME_UNKNOWN, never NONE.
+    nextFence = markRouteAttestFenceState(barrier, "OUTCOME_UNKNOWN");
+  }
+  const nextLatch = emptyRouteAttestLatch();
+
+  // Atomic durable commit: TRANSPORT_KEY + LOCAL_KEY + ROUTE_ATTEST_FENCE_KEY.
+  const commitOk = await commitPairDurableLocals({ nextTransport, nextLocal, nextFence });
+  if (!commitOk) {
+    // Keep barrier. Do not switch memory to new transport. Zero DOM Send.
+    transport = prevTransport;
+    localState = prevLocal;
+    routeAttestFence = barrier;
+    routeAttestLatch = prevLatch;
+    try {
+      await persistRouteAttestFence();
+    } catch {
+      // barrier may already be durable from pre-fetch write
+    }
+    return {
+      ok: false,
+      reason: "pair_durable_commit_failed",
+      routeAttestFence: "PAIRING_TRANSITION",
+      retryAllowed: false,
+    };
+  }
+
+  // Durable success — switch memory only now.
+  transport = nextTransport;
+  localState = nextLocal;
+  routeAttestFence = nextFence;
+  routeAttestLatch = nextLatch;
+
+  try {
+    await persistRouteAttestLatch();
+  } catch {
+    // Session latch write failure only multi-blocks; durable fence already NONE/matching.
+  }
+
+  const disarmed = disarmOnIdentityChange(autonomyPolicy, transport);
+  if (disarmed.changed) {
+    await forceAutonomyOff("identity_disarm");
+  }
+
+  return { ok: true, transport: safeTransportSummary() };
 }
 
 async function handleFetchState() {
@@ -642,6 +862,34 @@ async function handleFetchState() {
     if (!idCheck.ok) {
       return markAuthStale(idCheck.reason);
     }
+    // Authenticated /state is the ONLY route-verification authority.
+    const sync = syncTransportRouteVerification(transport, res.body);
+    if (sync.ok) {
+      if (sync.downgraded) {
+        await forceAutonomyOff("route_verification_downgrade");
+      }
+      transport = sync.transport;
+      await persistTransport();
+      // Latch + durable fence terminal only from authenticated /state VERIFIED.
+      const appliedLatch = applyRouteAttestServerVerification(routeAttestLatch, sync.routeVerification);
+      if (appliedLatch.ok && appliedLatch.transitioned) {
+        routeAttestLatch = appliedLatch.latch;
+      }
+      const appliedFence = applyRouteAttestServerVerificationToFence(routeAttestFence, sync.routeVerification, {
+        companionId: transport?.companionId ?? null,
+        challengeId: extractRouteChallengeId(transport?.routeAttestationMessage)
+          ?? routeAttestFence.challengeId,
+      });
+      if (appliedFence.ok && appliedFence.transitioned) {
+        routeAttestFence = appliedFence.fence;
+      }
+      if (
+        (appliedLatch.ok && appliedLatch.transitioned)
+        || (appliedFence.ok && appliedFence.transitioned)
+      ) {
+        await persistRouteAttestBoth();
+      }
+    }
     // Minimal observed proof from the same authenticated /state body only.
     // Never expose message / credential / principal / reservedBy.
     const observedLookup = findExactObservedEvent(res.body.events ?? [], journal);
@@ -655,6 +903,11 @@ async function handleFetchState() {
         inFlight: res.body.inFlight ?? null,
         enabled: res.body.enabled,
         serverObserved: observedLookup.ok ? observedLookup.observed : null,
+        routeVerification: transport?.routeVerification === "VERIFIED" ? "VERIFIED" : "PENDING",
+        productionEligible: transport?.routeVerification === "VERIFIED",
+        // Attestation payload stays SW-only; never expose challenge message on /state.
+        routeAttestationPending: transport?.routeVerification !== "VERIFIED"
+          && isRouteAttestationMessage(transport?.routeAttestationMessage),
       },
     };
   } catch {
@@ -884,7 +1137,14 @@ async function handleClearTransport() {
   transport = null;
   await forceAutonomyOff("transport_clear");
   await persistTransport();
-  return { ok: true, journal: { state: journal.state } };
+  // Durable route-attest fence is NOT cleared here. Transport clear must not
+  // silently authorize the same challenge again; only re-pair with a new
+  // companionId + challengeId may reset the fence.
+  return {
+    ok: true,
+    journal: { state: journal.state },
+    routeAttestFence: routeAttestFence.state,
+  };
 }
 
 async function handleMessage(message, sender) {
@@ -901,10 +1161,161 @@ async function handleMessage(message, sender) {
       transport: safeTransportSummary(),
       journal: summarizeProductionJournal(journal),
       sendProbeLatch: sendProbeLatch.state,
+      routeAttestLatch: routeAttestLatch.state,
+      routeAttestFence: routeAttestFence.state,
       productionSendInFlight,
     };
   }
   if (message.type === "c2c.fetch.state") return handleFetchState();
+
+  // G3 route attestation: popup sends no payload; SW owns server message.
+  if (message.type === ROUTE_ATTEST_SEND_TYPE) {
+    if (!isExtensionInternalSender(sender)) {
+      return { ok: false, reason: "popup_sender_required" };
+    }
+    const payloadCheck = validateRouteAttestPopupRequest(message);
+    if (!payloadCheck.ok) return payloadCheck;
+    const transportGate = requireProtectedTransport();
+    if (!transportGate.ok) return transportGate;
+    const start = canStartRouteAttestSend({
+      owner: ownerState.owner,
+      transport,
+      journal,
+      evidence,
+      productionSendInFlight,
+      autonomyMode: parseAutonomyPolicy(autonomyPolicy).mode,
+      latch: routeAttestLatch,
+      fence: routeAttestFence,
+      companionId: transport?.companionId ?? null,
+      challengeId: extractRouteChallengeId(transport?.routeAttestationMessage),
+    });
+    if (!start.ok) {
+      return {
+        ok: false,
+        reason: start.reason,
+        latchState: routeAttestLatch.state,
+        fenceState: routeAttestFence.state,
+        retryAllowed: false,
+      };
+    }
+    const request = buildRouteAttestExecuteRequest(ownerState.owner, transport);
+    if (!request.ok) return { ok: false, reason: request.reason, retryAllowed: false };
+    const challengeId = request.message.challengeId;
+    const owner = ownerState.owner;
+    const prevLatch = routeAttestLatch;
+    const prevFence = routeAttestFence;
+    const now = Date.now();
+    const intentLatch = {
+      state: "ROUTE_ATTEST_DISPATCH",
+      tabId: owner.tabId,
+      documentId: owner.documentId,
+      canonicalRoute: owner.canonicalRoute,
+      generation: owner.generation,
+      challengeId,
+      challengeExpiresAt: transport.routeAttestationExpiresAt ?? null,
+      createdAt: now,
+    };
+    const intentFence = markRouteAttestFenceDispatch({
+      companionId: transport.companionId ?? null,
+      challengeId,
+      routeCanonical: transport.routeCanonical,
+      challengeExpiresAt: transport.routeAttestationExpiresAt ?? null,
+      now,
+    });
+    // Durable fence FIRST, then session latch — both before any mutation RPC.
+    routeAttestFence = intentFence;
+    routeAttestLatch = intentLatch;
+    const bothOk = await persistRouteAttestBoth();
+    if (!bothOk) {
+      // Fail closed. If durable fence write failed, restore previous and abort RPC.
+      routeAttestLatch = prevLatch;
+      routeAttestFence = prevFence;
+      await persistRouteAttestBoth();
+      return {
+        ok: false,
+        reason: "route_attest_fence_persist_failed",
+        retryAllowed: false,
+        mutationAttempted: false,
+        clickAttempted: false,
+        latchState: routeAttestLatch.state,
+        fenceState: routeAttestFence.state,
+      };
+    }
+
+    let response = null;
+    let rpcLost = false;
+    try {
+      response = await chrome.tabs.sendMessage(request.tabId, request.message, request.sendOptions);
+    } catch {
+      rpcLost = true;
+      response = null;
+    }
+
+    // RPC lost after durable DISPATCH → OUTCOME_UNKNOWN on BOTH stores; same challenge never re-Send.
+    if (rpcLost || response == null) {
+      routeAttestLatch = { ...intentLatch, state: "OUTCOME_UNKNOWN" };
+      routeAttestFence = markRouteAttestFenceState(intentFence, "OUTCOME_UNKNOWN");
+      await persistRouteAttestBoth();
+      return {
+        ok: false,
+        reason: "route_attest_outcome_unknown",
+        latchState: "OUTCOME_UNKNOWN",
+        fenceState: "OUTCOME_UNKNOWN",
+        retryAllowed: false,
+        mutationAttempted: true,
+        clickAttempted: true,
+      };
+    }
+
+    const classified = classifyRouteAttestRpcResult(response);
+    if (classified.ok && classified.observed) {
+      // Exact USER turn observed. Server VERIFIED still requires authenticated /state.
+      // Local DOM observation NEVER sets VERIFIED on latch or durable fence.
+      routeAttestLatch = { ...intentLatch, state: "OBSERVED_PENDING_CONFIRM" };
+      routeAttestFence = markRouteAttestFenceState(intentFence, "OBSERVED_PENDING_CONFIRM");
+      await persistRouteAttestBoth();
+      const stateRes = await handleFetchState();
+      return {
+        ok: true,
+        observed: true,
+        latchState: routeAttestLatch.state,
+        fenceState: routeAttestFence.state,
+        routeVerification: stateRes?.status?.routeVerification ?? transport.routeVerification,
+        productionEligible: stateRes?.status?.productionEligible === true,
+        serverConfirmed: stateRes?.status?.routeVerification === "VERIFIED",
+        retryAllowed: false,
+      };
+    }
+
+    // Pre-mutation failure before any dispatch can clear latch+fence; after dispatch → OUTCOME_UNKNOWN.
+    if (response.mutationAttempted !== true && response.clickAttempted !== true) {
+      routeAttestLatch = emptyRouteAttestLatch();
+      // Only clear durable fence when nothing was attempted AND this was still DISPATCH.
+      routeAttestFence = emptyRouteAttestFence();
+      await persistRouteAttestBoth();
+      return {
+        ok: false,
+        reason: classified.reason,
+        latchState: "NONE",
+        fenceState: "NONE",
+        retryAllowed: true,
+        mutationAttempted: false,
+        clickAttempted: false,
+      };
+    }
+    routeAttestLatch = { ...intentLatch, state: "OUTCOME_UNKNOWN" };
+    routeAttestFence = markRouteAttestFenceState(intentFence, "OUTCOME_UNKNOWN");
+    await persistRouteAttestBoth();
+    return {
+      ok: false,
+      reason: classified.reason,
+      latchState: "OUTCOME_UNKNOWN",
+      fenceState: "OUTCOME_UNKNOWN",
+      retryAllowed: false,
+      mutationAttempted: response.mutationAttempted === true,
+      clickAttempted: response.clickAttempted === true,
+    };
+  }
   if (message.type === "c2c.reserve.page") {
     // Manual reserve competes with autonomy — block while ARMED.
     if (parseAutonomyPolicy(autonomyPolicy).mode === "armed") {
@@ -990,6 +1401,27 @@ async function handleMessage(message, sender) {
       lastHeartbeatAt = Date.now();
       lastHeartbeatOwnerExact = ownerExact === true;
       lastHeartbeatSafety = buildHeartbeatSafetySnapshot(message.safety);
+      // Route attestation confirmation poll: read-only /state, independent of autonomy.
+      // Bounded by shouldPollRouteAttestConfirm (owner exact + identity + challenge + expiry).
+      if (routeAttestLatch.state === "OBSERVED_PENDING_CONFIRM") {
+        const pollGate = shouldPollRouteAttestConfirm({
+          latch: routeAttestLatch,
+          ownerExact,
+          owner: ownerState.owner,
+          transport,
+          now: Date.now(),
+        });
+        if (pollGate.ok) {
+          try {
+            const attestState = await handleFetchState();
+            if (attestState?.ok && attestState.status?.routeVerification === "VERIFIED") {
+              lastAutonomyReason = "route_attest_server_verified";
+            }
+          } catch {
+            // read-only poll failure must never send/resend
+          }
+        }
+      }
       if (ownerExact) {
         void maybeRunAutonomyTick({
           sender,
@@ -1147,6 +1579,16 @@ async function handleMessage(message, sender) {
       return { ok: false, reason: "owner_route_mismatch" };
     }
     const mode = message.type === "c2c.autonomy.arm" ? "armed" : "shadow";
+    // ARMED production requires authenticated route VERIFIED. Shadow allowed while PENDING.
+    if (mode === "armed" && transport.routeVerification !== "VERIFIED") {
+      return {
+        ok: false,
+        reason: "route_unverified",
+        mode: parseAutonomyPolicy(autonomyPolicy).mode,
+        policy: autonomyPolicy,
+        journal: summarizeProductionJournal(journal),
+      };
+    }
     const previousMode = parseAutonomyPolicy(autonomyPolicy).mode;
     const proposed = {
       schemaVersion: 1,
@@ -1842,6 +2284,7 @@ async function maybeRunAutonomyTick(ctx = {}) {
 
     let inFlight = null;
     let pendingReady = 0;
+    let routeVerified = transport?.routeVerification === "VERIFIED";
     if (journal.state === "NONE") {
       const stateRes = await handleFetchState();
       if (!stateRes.ok) {
@@ -1852,6 +2295,8 @@ async function maybeRunAutonomyTick(ctx = {}) {
       }
       inFlight = stateRes.status.inFlight ?? null;
       pendingReady = Number(stateRes.status.pendingReady) || 0;
+      routeVerified = stateRes.status.routeVerification === "VERIFIED"
+        || stateRes.status.productionEligible === true;
     }
 
     // Bounded diagnostic snapshot of evidence the planner will use.
@@ -1875,6 +2320,7 @@ async function maybeRunAutonomyTick(ctx = {}) {
       evidence,
       journal,
       sendProbeLatch,
+      routeVerified,
       productionSendInFlight,
       autonomyTickInFlight: false,
       inFlight,
