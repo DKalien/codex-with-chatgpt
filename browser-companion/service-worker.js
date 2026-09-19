@@ -124,6 +124,8 @@ const JOURNAL_KEY = "c2c_companion_journal_v1";
 const SESSION_OWNER_KEY = "c2c_companion_owner_v1";
 const SESSION_REG_KEY = "c2c_companion_registry_v1";
 const SESSION_EVIDENCE_KEY = "c2c_companion_evidence_v1";
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const isUuid = (value) => typeof value === "string" && UUID.test(value);
 
 let localState = { schemaVersion: 1, targetRoute: null, paired: false };
 let ownerState = emptyOwnerState();
@@ -435,6 +437,7 @@ function safeTransportSummary() {
     routeCanonical: transport.routeCanonical,
     routeVerification: transport.routeVerification === "VERIFIED" ? "VERIFIED" : "PENDING",
     productionEligible: transport.routeVerification === "VERIFIED",
+    rebindPending: transport.rebindPending === true,
     pairedAt: transport.pairedAt,
   };
 }
@@ -843,11 +846,255 @@ async function handlePair(message) {
   return { ok: true, transport: safeTransportSummary() };
 }
 
+async function handleRebindStart(message) {
+  if (!storageProtected) return { ok: false, reason: "storage_unprotected" };
+  if (!transport?.bridgeOrigin || !transport?.credential) {
+    return { ok: false, reason: "transport_missing" };
+  }
+  if (!pairAllowedWithJournal(journal, false)) {
+    return { ok: false, reason: "journal_active" };
+  }
+  if (!ownerState.owner) return { ok: false, reason: "not_exact_owner" };
+  const routeCanonical = ownerState.owner.canonicalRoute;
+  const proofCheck = consumeOwnerProof(ownerProof, {
+    tabId: ownerState.owner.tabId,
+    documentId: ownerState.owner.documentId,
+    routeCanonical,
+  });
+  if (!proofCheck.ok) return { ok: false, reason: proofCheck.reason };
+  if (message.ownerProofId !== ownerProof.id) {
+    return { ok: false, reason: "owner_proof_mismatch" };
+  }
+  ownerProof = markProofUsed(ownerProof);
+  const prevTransport = transport;
+  const prevLocal = localState;
+  const prevFence = routeAttestFence;
+  const prevLatch = routeAttestLatch;
+  const barrier = markPairingTransitionBarrier(prevFence, Date.now());
+  routeAttestFence = barrier;
+  if (!await persistRouteAttestFence()) {
+    routeAttestFence = prevFence;
+    return { ok: false, reason: "rebind_barrier_persist_failed", retryAllowed: true };
+  }
+
+  let res;
+  try {
+    res = await fetch(companionApiUrl(prevTransport.bridgeOrigin, "/rebind/init"), {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${prevTransport.credential}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ routeCanonical }),
+      signal: AbortSignal.timeout(15_000),
+    });
+  } catch {
+    return {
+      ok: false,
+      reason: "rebind_init_outcome_unknown",
+      routeAttestFence: "PAIRING_TRANSITION",
+      retryAllowed: false,
+    };
+  }
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    if (shouldRestorePairFenceAfterHttpError(res.status)) {
+      routeAttestFence = prevFence;
+      await persistRouteAttestFence().catch(() => false);
+    }
+    return {
+      ok: false,
+      reason: body.error || `http_${res.status}`,
+      status: res.status,
+      routeAttestFence: res.status >= 400 && res.status < 500
+        ? prevFence?.state ?? "NONE"
+        : "PAIRING_TRANSITION",
+      retryAllowed: res.status >= 400 && res.status < 500,
+    };
+  }
+  assertNoForbiddenFields(body);
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return {
+      ok: false,
+      reason: "rebind_init_response_invalid",
+      routeAttestFence: "PAIRING_TRANSITION",
+      retryAllowed: false,
+    };
+  }
+  const challengeId = extractRouteChallengeId(body.routeAttestation?.message);
+  const responseIdentityValid = typeof prevTransport.workspaceId === "string"
+    && prevTransport.workspaceId.length > 0
+    && body.workspaceId === prevTransport.workspaceId
+    && typeof routeCanonical === "string"
+    && routeCanonical.length > 0
+    && body.routeCanonical === routeCanonical
+    && Number.isInteger(prevTransport.epoch)
+    && prevTransport.epoch >= 0
+    && Number.isInteger(body.epoch)
+    && body.epoch >= 0
+    && body.epoch === prevTransport.epoch + 1
+    && isUuid(prevTransport.companionId)
+    && isUuid(body.companionId)
+    && body.companionId !== prevTransport.companionId
+    && isUuid(prevTransport.bindingId)
+    && isUuid(body.bindingId)
+    && body.bindingId !== prevTransport.bindingId
+    && isUuid(body.routeAttestation?.challengeId)
+    && body.routeAttestation.challengeId === challengeId
+    && typeof body.routeAttestation?.message === "string";
+  if (!responseIdentityValid) {
+    return {
+      ok: false,
+      reason: "rebind_init_response_invalid",
+      routeAttestFence: "PAIRING_TRANSITION",
+      retryAllowed: false,
+    };
+  }
+  const fenceResolved = resolvePairFenceAfterSuccess({
+    prevFence: barrier,
+    companionId: body.companionId,
+    challengeId,
+    routeCanonical,
+    now: Date.now(),
+  });
+  if (!fenceResolved.ok) {
+    routeAttestFence = markRouteAttestFenceState(barrier, "OUTCOME_UNKNOWN");
+    await persistRouteAttestFence().catch(() => false);
+    return {
+      ok: false,
+      reason: "rebind_init_response_invalid",
+      routeAttestFence: "OUTCOME_UNKNOWN",
+      retryAllowed: false,
+    };
+  }
+  const nextFence = fenceResolved.fence;
+  const nextTransport = {
+    ...prevTransport,
+    workspaceId: body.workspaceId,
+    companionId: body.companionId,
+    bindingId: body.bindingId,
+    epoch: body.epoch,
+    routeCanonical,
+    pairedAt: new Date().toISOString(),
+    authStale: false,
+    routeVerification: "PENDING",
+    routeAttestationMessage: body.routeAttestation.message,
+    routeAttestationExpiresAt: typeof body.routeAttestation.expiresAt === "string"
+      ? body.routeAttestation.expiresAt
+      : null,
+    rebindPending: true,
+  };
+  const nextLocal = { ...prevLocal, paired: true, targetRoute: routeCanonical };
+  if (!await commitPairDurableLocals({ nextTransport, nextLocal, nextFence })) {
+    transport = prevTransport;
+    localState = prevLocal;
+    routeAttestFence = barrier;
+    routeAttestLatch = prevLatch;
+    await persistRouteAttestFence().catch(() => false);
+    return {
+      ok: false,
+      reason: "rebind_init_durable_commit_failed",
+      routeAttestFence: "PAIRING_TRANSITION",
+      retryAllowed: false,
+    };
+  }
+  transport = nextTransport;
+  localState = nextLocal;
+  routeAttestFence = nextFence;
+  routeAttestLatch = emptyRouteAttestLatch();
+  await persistRouteAttestLatch().catch(() => false);
+  await forceAutonomyOff("identity_disarm");
+  return { ok: true, transport: safeTransportSummary() };
+}
+
+async function handleRebindComplete() {
+  if (!storageProtected) return { ok: false, reason: "storage_unprotected" };
+  if (!transport?.rebindPending || !transport.bridgeOrigin || !transport.credential) {
+    return { ok: false, reason: "rebind_not_pending" };
+  }
+  if (!pairAllowedWithJournal(journal, false)) {
+    return { ok: false, reason: "journal_active" };
+  }
+  if (!ownerState.owner || ownerState.owner.canonicalRoute !== transport.routeCanonical) {
+    return { ok: false, reason: "not_exact_owner" };
+  }
+  const challengeId = extractRouteChallengeId(transport.routeAttestationMessage);
+  if (!challengeId) return { ok: false, reason: "rebind_challenge_missing", retryAllowed: false };
+  let res;
+  try {
+    res = await fetch(companionApiUrl(transport.bridgeOrigin, "/rebind/complete"), {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${transport.credential}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ challengeId, routeCanonical: transport.routeCanonical }),
+      signal: AbortSignal.timeout(15_000),
+    });
+  } catch {
+    routeAttestFence = markRouteAttestFenceState(routeAttestFence, "OUTCOME_UNKNOWN");
+    await persistRouteAttestFence().catch(() => false);
+    return { ok: false, reason: "rebind_complete_outcome_unknown", retryAllowed: false };
+  }
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    if (res.status >= 500) {
+      routeAttestFence = markRouteAttestFenceState(routeAttestFence, "OUTCOME_UNKNOWN");
+      await persistRouteAttestFence().catch(() => false);
+    }
+    return {
+      ok: false,
+      reason: body.error || `http_${res.status}`,
+      status: res.status,
+      retryAllowed: res.status === 409 && body.error === "COMPANION_REBIND_NOT_CONFIRMED",
+    };
+  }
+  assertNoForbiddenFields(body);
+  if (body.workspaceId !== transport.workspaceId
+    || body.companionId !== transport.companionId
+    || body.bindingId !== transport.bindingId
+    || body.epoch !== transport.epoch
+    || body.routeCanonical !== transport.routeCanonical
+    || typeof body.credential !== "string") {
+    routeAttestFence = markRouteAttestFenceState(routeAttestFence, "OUTCOME_UNKNOWN");
+    await persistRouteAttestFence().catch(() => false);
+    return { ok: false, reason: "rebind_complete_response_invalid", retryAllowed: false };
+  }
+  const nextTransport = {
+    ...transport,
+    credential: body.credential,
+    authStale: false,
+    routeVerification: "PENDING",
+    rebindPending: false,
+  };
+  if (!await commitPairDurableLocals({
+    nextTransport,
+    nextLocal: localState,
+    nextFence: routeAttestFence,
+  })) {
+    routeAttestFence = markRouteAttestFenceState(routeAttestFence, "OUTCOME_UNKNOWN");
+    await persistRouteAttestFence().catch(() => false);
+    return { ok: false, reason: "rebind_complete_durable_commit_failed", retryAllowed: false };
+  }
+  transport = nextTransport;
+  const stateRes = await handleFetchState();
+  return {
+    ok: stateRes?.ok === true && stateRes?.status?.routeVerification === "VERIFIED",
+    reason: stateRes?.ok ? undefined : stateRes?.reason,
+    routeVerification: stateRes?.status?.routeVerification ?? "PENDING",
+    productionEligible: stateRes?.status?.productionEligible === true,
+    retryAllowed: false,
+  };
+}
+
 async function handleFetchState() {
   const gate = requireProtectedTransport();
   if (!gate.ok) return gate;
   try {
     const res = await fetchCompanion("/state", { method: "GET" });
+    if (res.status === 401 && transport?.rebindPending === true) {
+      return { ok: false, reason: "rebind_pending", authStale: false };
+    }
     if (res.status === 401) {
       return markAuthStale(res.body?.error || "COMPANION_UNAUTHORIZED");
     }
@@ -1154,6 +1401,14 @@ async function handleMessage(message, sender) {
   if (message.type === "c2c.unbind") return unbindAll();
   if (message.type === "c2c.owner-proof.request") return handleMintOwnerProof(sender, message);
   if (message.type === "c2c.pair") return handlePair(message);
+  if (message.type === "c2c.rebind.start") {
+    if (!isExtensionInternalSender(sender)) return { ok: false, reason: "popup_sender_required" };
+    return handleRebindStart(message);
+  }
+  if (message.type === "c2c.rebind.complete") {
+    if (!isExtensionInternalSender(sender)) return { ok: false, reason: "popup_sender_required" };
+    return handleRebindComplete();
+  }
   if (message.type === "c2c.transport.status") {
     return {
       ok: true,

@@ -32,3 +32,10 @@ it("Desktop Review 精确查 commandId/outputId，缺记录不引用历史 test_
     "本轮验收记录缺失", "`test_status` 当本轮证据", "不能引用历史测试为本轮通过"])
     expect(review).toContain(text);
 });
+
+it("outcome_unknown 仅允许本机严格对账恢复 receipt identity", () => {
+  for (const text of ["desktop reconcile-unknown", "canonical history", "`exhausted`", "UTF-8 bytes/SHA-256",
+    "0 个候选保持 unknown", "多个候选", "outcome_unknown -> accepted + turnId",
+    "不写 execution receipt", "后续 turn", "不能代记"])
+    expect(skill).toContain(text);
+});

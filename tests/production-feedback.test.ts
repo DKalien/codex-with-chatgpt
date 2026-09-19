@@ -786,6 +786,7 @@ describe("MCP production feedback tools", () => {
     const names = Object.keys(tools).filter((k) => k.startsWith("feedback_"));
     expect(names.sort()).toEqual([
       "feedback_ack_observed",
+      "feedback_bootstrap_status",
       "feedback_claim_next",
       "feedback_companion_pair",
       "feedback_companion_revoke",
@@ -826,6 +827,7 @@ describe("MCP production feedback tools", () => {
     })._registeredTools ?? {};
 
     const modelVisible = [
+      "feedback_bootstrap_status",
       "feedback_companion_pair",
       "feedback_companion_route_confirm",
       "feedback_companion_status",

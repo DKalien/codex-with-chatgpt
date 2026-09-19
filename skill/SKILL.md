@@ -1007,9 +1007,15 @@ C2C 状态复用现有 `getStateDir`，持久化 OAuth `clientId`、`bindingId`�
 相同，按 `DESKTOP_COMMAND_CONFLICT` 拒绝，并引导先用 `status` 查看原记录。
 
 `outcome_unknown` 表示消息可能已经执行。不要重发、不要换 `commandId`、不要重新绑定绕过；
-该结果会阻断整个 workspace（包括新绑定）的后续投递，MVP 没有自动恢复或恢复接口，必须
-停下由本机用户人工核对。`disable`/重新绑定不能撤回已越过提交点的在途请求，状态必须如实
-保留；不能把它伪称未发送。
+该结果会阻断整个 workspace（包括新绑定）的后续投递，必须停下由本机用户人工核对。
+只有本机用户可显式运行
+`c2c desktop reconcile-unknown -w <workspace> --command-id <id> --json`：它要求 exact
+workspace/binding/thread、完整且最新边界为 `exhausted` 的 canonical history、完整
+`C2C_DESKTOP_TASK` envelope（含 exact intent/message）及 message UTF-8 bytes/SHA-256，并且只能
+找到一个合法真实 UUID turnId；0 个候选保持 unknown，多个候选、历史不完整或任何身份漂移均
+fail closed。成功也只执行 `outcome_unknown -> accepted + turnId`，不写 execution receipt、不表示
+任务成功；后续 `record-result` 仍必须处于原 accepted turn 的 exact current result context，后续 turn
+不能代记。`disable`/重新绑定不能撤回已越过提交点的在途请求，状态必须如实保留；不能把它伪称未发送。
 
 发送前重新核验 Desktop 进程、端点、owner、project、workspace 和版本；Desktop 重启后重新
 发现，不能永久信任旧 PID。已知 idle/start 内部协议在检查和发送之间没有原子 CAS，目标可能

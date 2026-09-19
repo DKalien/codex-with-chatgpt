@@ -106,6 +106,31 @@ export const companionRecordSchema = z.object({
   routeAttestation: routeAttestationSchema.optional(),
 }).strict();
 
+export const companionRebindIntentSchema = z.object({
+  version: z.literal(1),
+  companionId: z.string().regex(UUID),
+  previousBindingId: z.string().regex(UUID),
+  previousEpoch: z.number().int().nonnegative(),
+  bindingId: z.string().regex(UUID),
+  epoch: z.number().int().nonnegative(),
+  principalFingerprint: z.string().regex(HEX32),
+  routeCanonical: z.string().min(1).max(512),
+  initiatedAt: z.string().datetime(),
+  expiresAt: z.string().datetime(),
+  confirmedAt: z.string().datetime().optional(),
+  consumedAt: z.string().datetime().optional(),
+  routeAttestation: routeAttestationSchema,
+}).strict();
+
+export const companionRebindPredecessorSchema = z.object({
+  version: z.literal(1),
+  companionId: z.string().regex(UUID),
+  previousBindingId: z.string().regex(UUID),
+  previousEpoch: z.number().int().nonnegative(),
+  bindingId: z.string().regex(UUID),
+  epoch: z.number().int().nonnegative(),
+}).strict();
+
 export const feedbackStateSchema = z.object({
   version: z.literal(1),
   workspaceId: z.string().regex(WORKSPACE_ID),
@@ -114,6 +139,8 @@ export const feedbackStateSchema = z.object({
   events: z.array(feedbackEventSchema).max(10000),
   pairingIntent: pairingIntentSchema.nullable().default(null),
   companion: companionRecordSchema.nullable().default(null),
+  rebindIntent: companionRebindIntentSchema.nullable().default(null),
+  rebindPredecessor: companionRebindPredecessorSchema.nullable().default(null),
 }).strict();
 
 export type FeedbackBinding = z.infer<typeof feedbackBindingSchema>;
@@ -122,6 +149,7 @@ export type FeedbackState = z.infer<typeof feedbackStateSchema>;
 export type PairingIntent = z.infer<typeof pairingIntentSchema>;
 export type CompanionRecord = z.infer<typeof companionRecordSchema>;
 export type RouteAttestation = z.infer<typeof routeAttestationSchema>;
+export type CompanionRebindIntent = z.infer<typeof companionRebindIntentSchema>;
 
 /** Challenge binds workspace+binding+epoch+companion+route; never infer openai/session from URL. */
 export function routeChallengeDigest(input: {
@@ -187,6 +215,8 @@ function emptyState(workspaceId: string, projectionCursor = 0): FeedbackState {
     events: [],
     pairingIntent: null,
     companion: null,
+    rebindIntent: null,
+    rebindPredecessor: null,
   };
 }
 
@@ -327,7 +357,7 @@ function recoverStaleReserved(state: FeedbackState, nowMs: number): FeedbackStat
   return changed ? { ...state, events } : state;
 }
 
-function recoverStaleInMemory(state: FeedbackState, nowMs: number): FeedbackState {
+export function recoverStaleInMemory(state: FeedbackState, nowMs: number): FeedbackState {
   return recoverStaleReserved(recoverStaleClaimed(state, nowMs), nowMs);
 }
 
@@ -392,6 +422,8 @@ export function enableReceiver(input: {
     const next: FeedbackState = {
       ...recovered,
       binding,
+      rebindIntent: null,
+      rebindPredecessor: null,
       events: recovered.events.map((event) =>
         event.status === "queued" || event.status === "ready"
           ? {
@@ -454,6 +486,21 @@ export function takeoverReceiver(input: {
     const next: FeedbackState = {
       ...recovered,
       binding,
+      rebindIntent: null,
+      rebindPredecessor: recovered.companion
+        && !recovered.companion.supersededAt
+        && recovered.companion.bindingId === previous.binding.bindingId
+        && recovered.companion.epoch === previous.binding.epoch
+        && recovered.companion.principalFingerprint === previous.binding.principalFingerprint
+        ? {
+            version: 1,
+            companionId: recovered.companion.companionId,
+            previousBindingId: previous.binding.bindingId,
+            previousEpoch: previous.binding.epoch,
+            bindingId: binding.bindingId,
+            epoch: binding.epoch,
+          }
+        : null,
       events: recovered.events.map((event) =>
         event.status === "queued" || event.status === "ready"
           ? {

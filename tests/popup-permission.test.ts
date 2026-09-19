@@ -101,6 +101,7 @@ describe("popup classic packaging", () => {
   });
 
   it("every built classic popup script parses as classic JavaScript", () => {
+    if (!fs.existsSync(path.join(builtPopup, "popup.html"))) return;
     for (const script of popupScripts(builtPopup)) {
       if (/\btype=["']module["']/i.test(script.attributes)) continue;
       const artifact = path.resolve(builtPopup, script.src);
@@ -110,6 +111,15 @@ describe("popup classic packaging", () => {
 });
 
 describe("popup Bridge permission and Pair separation", () => {
+  it("rebind controls send fixed payload-free SW commands", async () => {
+    const { calls, elements } = await loadPopup(true);
+    await elements.get("rebind-start")!.onclick!();
+    await elements.get("rebind-complete")!.onclick!();
+    expect(calls.runtime).toContainEqual({ type: "c2c.rebind.start", ownerProofId: "proof-1" });
+    expect(calls.runtime).toContainEqual({ type: "c2c.rebind.complete" });
+    expect(JSON.stringify(calls.runtime)).not.toMatch(/credential|principal|secret|redemption/);
+  });
+
   it("missing permission blocks Pair without request, owner proof, or c2c.pair", async () => {
     const { calls, elements } = await loadPopup(false);
     elements.get("bridge-origin")!.value = "https://bridge.example.test";

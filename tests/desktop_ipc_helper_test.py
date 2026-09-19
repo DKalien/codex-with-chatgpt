@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import sys
+import copy
+import hashlib
 import io
 import json
 import os
@@ -46,6 +48,90 @@ class DesktopIpcHelperTests(unittest.TestCase):
             "turns": [{"turnId": "01a00000-0000-7000-8000-000000000011", "status": "completed"}],
             "environments": [{"cwd": TARGET["workspaceRoot"]}],
         }
+
+    def reconcile_fixture(self, *, message: str = "只读 Desktop 任务", turn_id: str = "01a00000-0000-7000-8000-000000000011",
+                          **envelope_overrides: object) -> tuple[dict[str, object], dict[str, object]]:
+        envelope = {
+            "type": "C2C_DESKTOP_TASK", "version": 1, "workspaceId": "workspace_test",
+            "commandId": "command_test", "intent": "development_plan", "message": message,
+            **envelope_overrides,
+        }
+        text = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+        state = self.valid_state()
+        state.pop("turns")
+        state["turnHistory"] = {"kind": "canonical", "history": {
+            "islands": [{"entries": [{"value": "turn-1"}], "newerBoundary": {"status": "exhausted"}}],
+            "entitiesByKey": {"turn-1": {"turnId": turn_id, "status": "completed",
+                                           "params": {"input": [{"type": "text", "text": text, "text_elements": []}]},
+                                           "items": [{"type": "userMessage",
+                                                      "content": [{"type": "text", "text": text,
+                                                                   "text_elements": []}]}]}},
+        }}
+        expected = {"workspaceId": "workspace_test", "commandId": "command_test", "intent": "development_plan",
+                    "messageBytes": len(message.encode("utf-8")),
+                    "messageSha256": hashlib.sha256(message.encode("utf-8")).hexdigest()}
+        return state, expected
+
+    def test_reconcile_unknown_requires_one_exact_envelope_and_hash(self) -> None:
+        state, expected = self.reconcile_fixture()
+        self.assertEqual(helper._reconcile_turn_ids(state, expected), ["01a00000-0000-7000-8000-000000000011"])
+        for name, overrides in {
+            "wrong_command": {"commandId": "other_command"},
+            "wrong_workspace": {"workspaceId": "other_workspace"},
+            "wrong_intent": {"intent": "revision"},
+        }.items():
+            with self.subTest(name=name):
+                changed, same_expected = self.reconcile_fixture(**overrides)
+                self.assertEqual(helper._reconcile_turn_ids(changed, same_expected), [])
+
+        wrong_hash = dict(expected, messageSha256="0" * 64)
+        self.assertEqual(helper._reconcile_turn_ids(state, wrong_hash), [])
+        wrong_body, _ = self.reconcile_fixture(message="不同正文")
+        self.assertEqual(helper._reconcile_turn_ids(wrong_body, expected), [])
+
+    def test_reconcile_unknown_rejects_truncated_duplicate_and_invalid_turn(self) -> None:
+        state, expected = self.reconcile_fixture()
+        entity = state["turnHistory"]["history"]["entitiesByKey"]["turn-1"]  # type: ignore[index]
+        entity["params"]["input"][0]["text"] = '{"type":"C2C_DESKTOP_TASK"}'  # type: ignore[index]
+        entity["items"][0]["content"] = entity["params"]["input"]  # type: ignore[index]
+        self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: helper._reconcile_turn_ids(state, expected))
+
+        state, expected = self.reconcile_fixture()
+        entity = state["turnHistory"]["history"]["entitiesByKey"]["turn-1"]  # type: ignore[index]
+        entity["params"]["input"][0]["text"] = '{"type":"C2C_DESKTOP_TASK","type":"C2C_DESKTOP_TASK"}'  # type: ignore[index]
+        entity["items"][0]["content"] = entity["params"]["input"]  # type: ignore[index]
+        self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: helper._reconcile_turn_ids(state, expected))
+
+        state, expected = self.reconcile_fixture()
+        history = state["turnHistory"]["history"]  # type: ignore[index]
+        history["islands"].append({"entries": [{"value": "turn-2"}], "newerBoundary": {"status": "exhausted"}})  # type: ignore[index]
+        history["entitiesByKey"]["turn-2"] = copy.deepcopy(history["entitiesByKey"]["turn-1"])  # type: ignore[index]
+        history["entitiesByKey"]["turn-2"]["turnId"] = "01a00000-0000-7000-8000-000000000012"  # type: ignore[index]
+        self.assertEqual(helper._reconcile_turn_ids(state, expected), [
+            "01a00000-0000-7000-8000-000000000011",
+            "01a00000-0000-7000-8000-000000000012",
+        ])
+
+        invalid, expected = self.reconcile_fixture(turn_id="not-a-uuid")
+        self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: helper._reconcile_turn_ids(invalid, expected))
+
+        mismatched, expected = self.reconcile_fixture()
+        entity = mismatched["turnHistory"]["history"]["entitiesByKey"]["turn-1"]  # type: ignore[index]
+        entity["items"][0]["content"][0]["text"] = "different rendered input"  # type: ignore[index]
+        self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: helper._reconcile_turn_ids(mismatched, expected))
+
+    def test_reconcile_unknown_requires_canonical_complete_history_and_exact_thread_root(self) -> None:
+        state, expected = self.reconcile_fixture()
+        flat = self.valid_state()
+        self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: helper._reconcile_turn_ids(flat, expected))
+        incomplete = copy.deepcopy(state)
+        incomplete["turnHistory"]["history"]["islands"][-1]["newerBoundary"]["status"] = "loading"  # type: ignore[index]
+        self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: helper._reconcile_turn_ids(incomplete, expected))
+
+        wrong_thread = dict(state, id="01a00000-0000-7000-8000-000000000099")
+        self.assert_code("DESKTOP_TARGET_NOT_FOUND", lambda: helper._validate_state(wrong_thread, TARGET, OWNER, allow_active=True))
+        wrong_root = dict(state, cwd=r"D:\other-workspace")
+        self.assert_code("DESKTOP_PROJECT_MISMATCH", lambda: helper._validate_state(wrong_root, TARGET, OWNER, allow_active=True))
 
     def test_target_accepts_uuidv7_and_rejects_extra_fields(self) -> None:
         self.assertEqual(helper._target(dict(TARGET)), TARGET)

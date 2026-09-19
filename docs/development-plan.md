@@ -728,7 +728,7 @@ G 阶段聚焦用户体验与跨设备日常闭环，不再扩展 recovery 状�
 
 - **G2 已通过 independent review**（full suite 1628 passed）。
 
-### G3 — route-principal attestation（2026-09-19，code + Bridge installed；live E2E **pending**）
+### G3 — route-principal attestation（2026-09-19，live E2E **PASS**）
 
 G3 修复 Browser Companion 误绑错误 ChatGPT conversation 后 production Send 投错 chat 的问题。
 `paired ≠ origin conversation attested`：pair 只注册 credential+route，**reserve/begin-send 要求 route 已验证**。
@@ -751,9 +751,20 @@ G3 修复 Browser Companion 误绑错误 ChatGPT conversation 后 production Sen
 - Fence 实际字段：`companionId + challengeId + routeCanonical + …`（**无** bindingId/epoch）；server challenge digest 已绑 binding/epoch。
 - HTTP authenticated `/state` 可含 attestation message（SW 恢复用）；popup SW payload 仅 `routeAttestationPending`。
 
-- **NEXT_EXPECTED_STEP**：**G3 — cross-device zero-to-end live E2E（未执行）**。
+- **G3 live acceptance：PASS（2026-09-19）**。跨设备 Desktop smoke 与 route-principal attestation 闭环已完成；后续实现不得把旧的 `live E2E pending` 当作当前状态。
+- **NEXT_EXPECTED_STEP**：**G4 — new-Chat bounded bootstrap + same-browser rebind**。
   - Operator 顺序：**先**只读 `feedback_status` → 新 ChatGPT conversation → pair → route verify（`feedback_companion_route_confirm`）→ Arm → Desktop smoke。
   - 路径：`workspace_info` → bounded workflow readiness → 安全 Desktop/Remote → Codex 执行 → Companion 反馈回 **已验证** conversation → independent review → DONE。
   - 不要求用户手工搬 workspaceId / threadId / bindingId；不得自动降低授权、审批、`outcome_unknown` 或 Project ownership 门禁。
   - **前置约束**：`requestContext.conversationIdentity=available` ≠ Project membership ≠ durable same-thread Chat binding；live 闭环必须依赖 **route attestation VERIFIED**，不得把 `currentConversation` 当永久绑定。
-  - Connector `test_status` 在 commit/install 前仍是旧 G3 smoke；live 前不得虚构 acceptance 结果。
+  - 历史 Connector `test_status` 不得替代本次 live acceptance；后续仍以现役 runtime/status 为准。
+
+### G4a + G4b — bounded bootstrap / same-browser rebind（2026-09-19，implementation ready for review）
+
+- MCP `feedback_bootstrap_status` 只根据当前 request 的 `openai/session` principal 投影有限状态：`DISABLED`、`OWNED_VERIFIED`、`OWNED_NEEDS_BROWSER_REBIND`、`FOREIGN_SAFE_TO_TAKEOVER`、`BLOCKED_INFLIGHT`。仅 foreign-safe 返回 takeover 所需 `expectedEpoch + widgetId`；不返回 principal、credential、secret 或 hash。
+- `reserved / claimed / outcome_unknown` 一律 `BLOCKED_INFLIGHT`；takeover 的 `expectedEpoch` CAS 与原有 in-flight fence 不变。
+- takeover 后 predecessor credential 对 `/state`、`/reserve`、`/begin-send`、`/ack`、retire 等 production API 继续无效；它只可访问 `/rebind/init` 与 `/rebind/complete`。
+- `/rebind/init` 仅接受同 workspace 的 immediate predecessor、exact successor epoch、无 in-flight 状态；创建持久化、TTL、one-shot challenge，不授予 production authority。
+- current Chat 仍通过现役 `feedback_companion_route_confirm` 完成 request-scoped principal attestation；wrong principal 不消费 challenge。确认后 `/rebind/complete` 才旋转 fresh credential；Browser 再以 authenticated `/state` 取得唯一 `VERIFIED` 权威。
+- Browser SW 复用既有 route-attestation runner、session latch 与 durable fence；init 前 barrier-first，网络/5xx/storage ambiguity 进入 fail-closed fence，不自动重发。autonomy 默认 OFF，identity 变化强制 disarm。
+- cold `feedback_companion_pair` fallback 保留；未增加 manifest permission、自动 Arm、Connect & Arm 或第二套 DOM runner。

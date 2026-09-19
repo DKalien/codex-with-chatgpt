@@ -48,6 +48,22 @@ export interface DesktopResultContext extends DesktopTargetInfo {
   resultTurnStatus: DesktopResultTurnStatus;
 }
 
+export interface DesktopUnknownReconcileExpectation {
+  workspaceId: string;
+  commandId: string;
+  intent: "development_plan" | "revision";
+  messageBytes: number;
+  messageSha256: string;
+}
+
+export interface DesktopUnknownReconcileObservation {
+  threadId: string;
+  hostId: "local";
+  projectId: string;
+  workspaceRoot: string;
+  candidates: string[];
+}
+
 export interface DesktopIpcConnection {
   send(message: string): Promise<{ threadId: string; turnId: string }>;
   close(): void;
@@ -112,6 +128,7 @@ const SAFE_CODES = new Set([
   "DESKTOP_MESSAGE_TOO_LARGE",
   "DESKTOP_CURRENT_CONTEXT_INVALID",
   "DESKTOP_CONFIRMATION_CANCELLED",
+  "DESKTOP_RECONCILIATION_CONFLICT",
 ]);
 
 const COMPATIBILITY_VERSION = /^\d+\.\d+\.\d+(?:\.\d+)?(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?(?:\+[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?$/;
@@ -149,6 +166,7 @@ const ERROR_MESSAGES: Record<string, string> = {
   DESKTOP_MESSAGE_TOO_LARGE: "消息超过 64 KiB UTF-8 上限；拒绝投递，不截断。",
   DESKTOP_CURRENT_CONTEXT_INVALID: "无法确认当前 Desktop 会话身份或来源；未绑定或启用。",
   DESKTOP_CONFIRMATION_CANCELLED: "本机确认被取消或未完成；未绑定或启用。",
+  DESKTOP_RECONCILIATION_CONFLICT: "Desktop 历史无法唯一核对；未恢复结果或修改投递状态。",
 };
 
 function messageFor(code: string, fallback = "DESKTOP_INTERNAL_ERROR"): string {
@@ -296,6 +314,33 @@ function validateResultContext(value: unknown, target: DesktopTarget): DesktopRe
     throw error("DESKTOP_STATE_UNAVAILABLE");
   }
   return { ...info, resultTurnId: input.resultTurnId, resultTurnStatus: input.resultTurnStatus as DesktopResultTurnStatus };
+}
+
+function validateUnknownReconcileExpectation(value: DesktopUnknownReconcileExpectation): DesktopUnknownReconcileExpectation {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw error("DESKTOP_INVALID_REQUEST");
+  const keys = Object.keys(value).sort();
+  if (keys.join(",") !== ["commandId", "intent", "messageBytes", "messageSha256", "workspaceId"].join(",")) {
+    throw error("DESKTOP_INVALID_REQUEST");
+  }
+  if (!/^[A-Za-z0-9_-]{1,128}$/u.test(value.workspaceId) || !/^[A-Za-z0-9_-]{1,128}$/u.test(value.commandId) ||
+      !["development_plan", "revision"].includes(value.intent) ||
+      !Number.isSafeInteger(value.messageBytes) || value.messageBytes < 1 || value.messageBytes > MAX_MESSAGE_BYTES ||
+      !/^[a-f0-9]{64}$/u.test(value.messageSha256)) {
+    throw error("DESKTOP_INVALID_REQUEST");
+  }
+  return { ...value };
+}
+
+function validateUnknownReconcileObservation(value: unknown, target: DesktopTarget): DesktopUnknownReconcileObservation {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw error("DESKTOP_PROTOCOL_ERROR");
+  const input = value as Partial<DesktopUnknownReconcileObservation>;
+  const candidates = input.candidates;
+  if (input.threadId !== target.threadId || input.hostId !== target.hostId || input.projectId !== target.projectId ||
+      input.workspaceRoot !== target.workspaceRoot || !Array.isArray(candidates) || candidates.length > 10_000 ||
+      !candidates.every(candidate => isUuid(candidate))) {
+    throw error("DESKTOP_RECONCILIATION_CONFLICT");
+  }
+  return { ...target, hostId: "local", candidates: [...candidates] };
 }
 
 function normalizePath(value: string): string {
@@ -502,6 +547,19 @@ export class DesktopIpcClient {
 
   async confirmCurrent(workspaceRoot: string): Promise<DesktopTargetInfo> {
     return this.currentOperation("current_confirm", workspaceRoot);
+  }
+
+  async reconcileUnknown(
+    rawTarget: DesktopTarget,
+    rawExpectation: DesktopUnknownReconcileExpectation,
+  ): Promise<DesktopUnknownReconcileObservation> {
+    const target = validateTarget(rawTarget);
+    const expectation = validateUnknownReconcileExpectation(rawExpectation);
+    const session = this.open();
+    try {
+      const value = await session.request("reconcile_unknown", { target, expectation });
+      return validateUnknownReconcileObservation(value, target);
+    } finally { session.close(); }
   }
 
   private async currentOperation(operation: string, workspaceRoot: string,

@@ -25,6 +25,8 @@
     pairSecret: document.getElementById("pair-secret"),
     pairHint: document.getElementById("pair-hint"),
     pair: document.getElementById("pair"),
+    rebindStart: document.getElementById("rebind-start"),
+    rebindComplete: document.getElementById("rebind-complete"),
     verifyRoute: document.getElementById("verify-route"),
     fetchState: document.getElementById("fetch-state"),
     reserve: document.getElementById("reserve"),
@@ -275,7 +277,9 @@
     }
 
     const transport = status?.transport ?? null;
-    if (transport?.connected) {
+    if (transport?.rebindPending) {
+      setText(els.transportStatus, "rebind pending — verify route, confirm in ChatGPT, then complete", "warn");
+    } else if (transport?.connected) {
       setText(
         els.transportStatus,
         `connected origin=${transport.bridgeOrigin} companion=${transport.companionId}`,
@@ -304,6 +308,12 @@
 
     els.bind.disabled = !parsed || !tab?.id;
     els.pair.disabled = !isOwner;
+    if (els.rebindStart) {
+      els.rebindStart.disabled = !isOwner || !transport?.bridgeOrigin || transport?.rebindPending === true;
+    }
+    if (els.rebindComplete) {
+      els.rebindComplete.disabled = !isOwner || transport?.rebindPending !== true;
+    }
     els.applyPairJson.disabled = false;
     els.fetchState.disabled = !hasTransport;
     els.reserve.disabled = !hasTransport || !isOwner;
@@ -563,6 +573,43 @@
           els.bridgeState,
           `route attest ok=${res?.ok === true} observed=${res?.observed === true} `
           + `serverConfirmed=${res?.serverConfirmed === true} reason=${res?.reason ?? (res?.ok ? "ok" : "-")}`,
+          res?.ok ? "ok" : "bad",
+        );
+        await refresh();
+      };
+    }
+
+    if (els.rebindStart) {
+      els.rebindStart.onclick = async () => {
+        const tabNow = await activeTab();
+        if (!tabNow?.id) return;
+        let proof = null;
+        try {
+          proof = await chrome.tabs.sendMessage(tabNow.id, { type: "c2c.owner-proof.request" });
+        } catch { /* ignore */ }
+        const res = proof?.ok && proof.proof?.id
+          ? await chrome.runtime.sendMessage({
+              type: "c2c.rebind.start",
+              ownerProofId: proof.proof.id,
+            })
+          : { ok: false, reason: proof?.reason || "owner_proof_missing" };
+        setText(
+          els.bridgeState,
+          res?.ok ? "rebind challenge ready" : `rebind start 失败: ${res?.reason || "unknown"}`,
+          res?.ok ? "ok" : "bad",
+        );
+        await refresh();
+      };
+    }
+
+    if (els.rebindComplete) {
+      els.rebindComplete.onclick = async () => {
+        const res = await chrome.runtime.sendMessage({ type: "c2c.rebind.complete" });
+        setText(
+          els.bridgeState,
+          res?.ok
+            ? "rebind complete — Route verification: VERIFIED"
+            : `rebind complete 失败: ${res?.reason || "unknown"}`,
           res?.ok ? "ok" : "bad",
         );
         await refresh();

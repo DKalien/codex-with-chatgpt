@@ -15,14 +15,17 @@ import {
 import {
   companionAckObserved,
   companionBeginSend,
+  companionBootstrapReadiness,
   companionPublicState,
   companionRelease,
   companionReserveNext,
   companionRetireOutcomeUnknown,
   companionStatusForPrincipal,
+  completeCompanionRebind,
   confirmRouteAttestation,
   createPairingIntent,
   exchangePairingIntent,
+  initiateCompanionRebind,
   normalizeChatgptRoute,
   revokeCompanion,
   verifyCompanionCredential,
@@ -454,6 +457,329 @@ describe("G3 route-principal attestation", () => {
   function ctxRouteVerified(): boolean {
     return readFeedbackState(workspace.id, stateDir).companion?.routeAttestation?.status === "verified";
   }
+});
+
+describe("G4 bootstrap readiness and same-browser rebind", () => {
+  it("MCP bootstrap tool derives ownership from request-scoped principal", async () => {
+    reconcileFeedbackOutbox(workspace.id, stateDir);
+    enableReceiver({ workspaceId: workspace.id, principal: principalA(), widgetId: "widget-A", stateDir });
+    const { createMcpServer } = await import("../src/mcp/server.js");
+    const server = createMcpServer({ workspace, logger: { info() {}, error() {}, warn() {}, debug() {} } as never });
+    const handler = (server as unknown as {
+      _registeredTools: Record<string, {
+        handler: (a: unknown, e: unknown) => Promise<{ structuredContent?: Record<string, unknown> }>;
+        annotations?: { readOnlyHint?: boolean };
+      }>;
+    })._registeredTools.feedback_bootstrap_status.handler;
+    expect((server as unknown as {
+      _registeredTools: Record<string, { annotations?: { readOnlyHint?: boolean } }>;
+    })._registeredTools.feedback_bootstrap_status.annotations?.readOnlyHint).toBe(true);
+    const foreign = await handler({}, {
+      authInfo: { token: "t", clientId: "client-B", scopes: [CODEX_FEEDBACK_SCOPE] },
+      _meta: { "openai/session": "sess-B" },
+    });
+    expect(foreign.structuredContent).toMatchObject({
+      state: "FOREIGN_SAFE_TO_TAKEOVER",
+      expectedEpoch: 1,
+      widgetId: "widget-A",
+    });
+    expect(JSON.stringify(foreign.structuredContent)).not.toContain(principalA().fingerprint);
+  });
+
+  it("bootstrap readiness projects stale events in memory without changing state bytes", async () => {
+    setupReadyEvent("g4-bootstrap-readonly-stale");
+    const paired = pairCompanion();
+    const ctx = verifyCompanionCredential({ workspaceId: workspace.id, credential: paired.credential, stateDir });
+    companionReserveNext({ workspaceId: workspace.id, ctx, routeCanonical: ROUTE, stateDir });
+    const stateFile = path.join(stateDir, "feedback", `${workspace.id}.json`);
+    const stale = JSON.parse(fs.readFileSync(stateFile, "utf8")) as {
+      events: Array<{ status: string; reservedAt?: string }>;
+    };
+    stale.events[0]!.reservedAt = new Date(Date.now() - FEEDBACK_RESERVATION_STALE_MS - 1_000).toISOString();
+    fs.writeFileSync(stateFile, JSON.stringify(stale, null, 2));
+    const before = fs.readFileSync(stateFile);
+
+    const { createMcpServer } = await import("../src/mcp/server.js");
+    const server = createMcpServer({ workspace, logger: { info() {}, error() {}, warn() {}, debug() {} } as never });
+    const handler = (server as unknown as {
+      _registeredTools: Record<string, {
+        handler: (a: unknown, e: unknown) => Promise<{ structuredContent?: Record<string, unknown> }>;
+      }>;
+    })._registeredTools.feedback_bootstrap_status.handler;
+    const readiness = await handler({}, {
+      authInfo: { token: "t", clientId: "client-A", scopes: [CODEX_FEEDBACK_SCOPE] },
+      _meta: { "openai/session": "sess-A" },
+    });
+
+    expect(readiness.structuredContent).toMatchObject({ state: "OWNED_VERIFIED", inFlightStatus: null });
+    expect(fs.readFileSync(stateFile)).toEqual(before);
+    expect(JSON.parse(fs.readFileSync(stateFile, "utf8")).events[0].status).toBe("reserved");
+  });
+
+  it("projects disabled, foreign takeover, owned stale, owned verified and blocked states", () => {
+    reconcileFeedbackOutbox(workspace.id, stateDir);
+    expect(companionBootstrapReadiness({ workspaceId: workspace.id, principal: principalA(), stateDir }))
+      .toMatchObject({ state: "DISABLED", ownsBinding: false });
+
+    enableReceiver({ workspaceId: workspace.id, principal: principalA(), widgetId: "widget-A", stateDir });
+    expect(companionBootstrapReadiness({ workspaceId: workspace.id, principal: principalB(), stateDir }))
+      .toMatchObject({
+        state: "FOREIGN_SAFE_TO_TAKEOVER",
+        ownsBinding: false,
+        expectedEpoch: 1,
+        widgetId: "widget-A",
+      });
+    expect(companionBootstrapReadiness({ workspaceId: workspace.id, principal: principalA(), stateDir }))
+      .toMatchObject({
+        state: "OWNED_NEEDS_BROWSER_REBIND",
+        companionPresent: false,
+        routeVerification: "NONE",
+      });
+
+    const paired = pairCompanion();
+    expect(companionBootstrapReadiness({ workspaceId: workspace.id, principal: principalA(), stateDir }))
+      .toMatchObject({ state: "OWNED_VERIFIED", routeVerification: "VERIFIED" });
+    const ctx = verifyCompanionCredential({ workspaceId: workspace.id, credential: paired.credential, stateDir });
+    setupReadyEvent("g4-blocked");
+    companionReserveNext({ workspaceId: workspace.id, ctx, routeCanonical: ROUTE, stateDir });
+    expect(companionBootstrapReadiness({ workspaceId: workspace.id, principal: principalB(), stateDir }))
+      .toMatchObject({ state: "BLOCKED_INFLIGHT", inFlightStatus: "reserved" });
+    const stateFile = path.join(stateDir, "feedback", `${workspace.id}.json`);
+    const claimed = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+    claimed.events[0].status = "claimed";
+    claimed.events[0].attemptId = "33333333-3333-4333-8333-333333333333";
+    claimed.events[0].claimedAt = new Date().toISOString();
+    fs.writeFileSync(stateFile, JSON.stringify(claimed, null, 2));
+    expect(companionBootstrapReadiness({ workspaceId: workspace.id, principal: principalB(), stateDir }))
+      .toMatchObject({ state: "BLOCKED_INFLIGHT", inFlightStatus: "claimed" });
+    claimed.events[0].status = "outcome_unknown";
+    fs.writeFileSync(stateFile, JSON.stringify(claimed, null, 2));
+    expect(companionBootstrapReadiness({ workspaceId: workspace.id, principal: principalB(), stateDir }))
+      .toMatchObject({ state: "BLOCKED_INFLIGHT", inFlightStatus: "outcome_unknown" });
+  });
+
+  it("immediate successor rebind requires current principal confirmation and rotates credential", () => {
+    setupReadyEvent("g4-rebind");
+    const old = pairCompanion();
+    takeoverReceiver({
+      workspaceId: workspace.id,
+      principal: principalB(),
+      widgetId: "widget-B",
+      expectedEpoch: old.epoch,
+      stateDir,
+    });
+    expectCode(() => verifyCompanionCredential({
+      workspaceId: workspace.id,
+      credential: old.credential,
+      stateDir,
+    }), "COMPANION_EPOCH_STALE");
+
+    const started = initiateCompanionRebind({
+      workspaceId: workspace.id,
+      credential: old.credential,
+      routeCanonical: ROUTE_B,
+      stateDir,
+    });
+    const persisted = fs.readFileSync(path.join(stateDir, "feedback", `${workspace.id}.json`), "utf8");
+    expect(persisted).not.toContain(old.credential);
+    expectCode(() => confirmRouteAttestation({
+      workspaceId: workspace.id,
+      principal: principalA(),
+      challengeId: started.routeAttestation.challengeId,
+      challengeDigest: started.routeAttestation.challengeDigest,
+      stateDir,
+    }), "FEEDBACK_PRINCIPAL_MISMATCH");
+    expectCode(() => completeCompanionRebind({
+      workspaceId: workspace.id,
+      credential: old.credential,
+      challengeId: started.routeAttestation.challengeId,
+      routeCanonical: ROUTE_B,
+      stateDir,
+    }), "COMPANION_REBIND_NOT_CONFIRMED");
+
+    confirmRouteAttestation({
+      workspaceId: workspace.id,
+      principal: principalB(),
+      challengeId: started.routeAttestation.challengeId,
+      challengeDigest: started.routeAttestation.challengeDigest,
+      stateDir,
+    });
+    const completed = completeCompanionRebind({
+      workspaceId: workspace.id,
+      credential: old.credential,
+      challengeId: started.routeAttestation.challengeId,
+      routeCanonical: ROUTE_B,
+      stateDir,
+    });
+    const current = verifyCompanionCredential({
+      workspaceId: workspace.id,
+      credential: completed.credential,
+      stateDir,
+    });
+    expect(current).toMatchObject({ epoch: old.epoch + 1, routeCanonical: ROUTE_B, routeVerified: true });
+    expectCode(() => verifyCompanionCredential({
+      workspaceId: workspace.id,
+      credential: old.credential,
+      stateDir,
+    }), "COMPANION_UNAUTHORIZED");
+  });
+
+  it("rebind readiness treats only unconsumed, unexpired intents as active", () => {
+    setupReadyEvent("g4-rebind-lifecycle");
+    const old = pairCompanion();
+    takeoverReceiver({
+      workspaceId: workspace.id,
+      principal: principalB(),
+      widgetId: "widget-B",
+      expectedEpoch: old.epoch,
+      stateDir,
+    });
+
+    const readiness = () => companionBootstrapReadiness({
+      workspaceId: workspace.id,
+      principal: principalB(),
+      stateDir,
+    });
+    const stateFile = path.join(stateDir, "feedback", `${workspace.id}.json`);
+    const expireIntent = () => {
+      const state = JSON.parse(fs.readFileSync(stateFile, "utf8")) as {
+        rebindIntent: { expiresAt: string; routeAttestation: { expiresAt: string } };
+      };
+      const expiredAt = new Date(Date.now() - 1_000).toISOString();
+      state.rebindIntent.expiresAt = expiredAt;
+      state.rebindIntent.routeAttestation.expiresAt = expiredAt;
+      fs.writeFileSync(stateFile, JSON.stringify(state, null, 2));
+    };
+
+    expect(readiness()).toMatchObject({
+      state: "OWNED_NEEDS_BROWSER_REBIND",
+      rebindAvailable: true,
+      rebindState: "NONE",
+    });
+
+    const pending = initiateCompanionRebind({
+      workspaceId: workspace.id,
+      credential: old.credential,
+      routeCanonical: ROUTE_B,
+      stateDir,
+    });
+    expect(readiness()).toMatchObject({ rebindAvailable: false, rebindState: "PENDING" });
+
+    expireIntent();
+    expect(readiness()).toMatchObject({ rebindAvailable: true, rebindState: "NONE" });
+
+    const retryAfterPendingExpiry = initiateCompanionRebind({
+      workspaceId: workspace.id,
+      credential: old.credential,
+      routeCanonical: ROUTE_B,
+      stateDir,
+    });
+    expect(retryAfterPendingExpiry.routeAttestation.challengeId)
+      .not.toBe(pending.routeAttestation.challengeId);
+    confirmRouteAttestation({
+      workspaceId: workspace.id,
+      principal: principalB(),
+      challengeId: retryAfterPendingExpiry.routeAttestation.challengeId,
+      challengeDigest: retryAfterPendingExpiry.routeAttestation.challengeDigest,
+      stateDir,
+    });
+    expect(readiness()).toMatchObject({ rebindAvailable: false, rebindState: "CONFIRMED" });
+
+    const consumed = JSON.parse(fs.readFileSync(stateFile, "utf8")) as { rebindIntent: { consumedAt?: string } };
+    consumed.rebindIntent.consumedAt = new Date().toISOString();
+    fs.writeFileSync(stateFile, JSON.stringify(consumed, null, 2));
+    expect(readiness()).toMatchObject({ rebindAvailable: true, rebindState: "NONE" });
+
+    expireIntent();
+    expect(readiness()).toMatchObject({ rebindAvailable: true, rebindState: "NONE" });
+
+    const retryAfterConfirmedExpiry = initiateCompanionRebind({
+      workspaceId: workspace.id,
+      credential: old.credential,
+      routeCanonical: ROUTE_B,
+      stateDir,
+    });
+    confirmRouteAttestation({
+      workspaceId: workspace.id,
+      principal: principalB(),
+      challengeId: retryAfterConfirmedExpiry.routeAttestation.challengeId,
+      challengeDigest: retryAfterConfirmedExpiry.routeAttestation.challengeDigest,
+      stateDir,
+    });
+    const completed = completeCompanionRebind({
+      workspaceId: workspace.id,
+      credential: old.credential,
+      challengeId: retryAfterConfirmedExpiry.routeAttestation.challengeId,
+      routeCanonical: ROUTE_B,
+      stateDir,
+    });
+    expect(completed.routeVerification).toBe("VERIFIED");
+    expect(readiness()).toMatchObject({
+      state: "OWNED_VERIFIED",
+      companionPresent: true,
+      routeVerification: "VERIFIED",
+      rebindAvailable: false,
+      rebindState: "NONE",
+    });
+    const stored = readFeedbackState(workspace.id, stateDir);
+    expect(stored.rebindIntent?.consumedAt).toBeDefined();
+    expect(stored.rebindPredecessor).toBeNull();
+  });
+
+  it("rebind rejects non-successor and duplicate initiation", () => {
+    setupReadyEvent("g4-rebind-guards");
+    const old = pairCompanion();
+    expectCode(() => initiateCompanionRebind({
+      workspaceId: workspace.id,
+      credential: old.credential,
+      routeCanonical: ROUTE_B,
+      stateDir,
+    }), "COMPANION_REBIND_NOT_SUCCESSOR");
+    takeoverReceiver({
+      workspaceId: workspace.id,
+      principal: principalB(),
+      widgetId: "widget-B",
+      expectedEpoch: old.epoch,
+      stateDir,
+    });
+    initiateCompanionRebind({
+      workspaceId: workspace.id,
+      credential: old.credential,
+      routeCanonical: ROUTE_B,
+      stateDir,
+    });
+    expectCode(() => initiateCompanionRebind({
+      workspaceId: workspace.id,
+      credential: old.credential,
+      routeCanonical: ROUTE_B,
+      stateDir,
+    }), "COMPANION_REBIND_ALREADY_INITIATED");
+  });
+
+  it("rebind init fails closed when current binding has claimed work", () => {
+    setupReadyEvent("g4-rebind-inflight");
+    const old = pairCompanion();
+    const taken = takeoverReceiver({
+      workspaceId: workspace.id,
+      principal: principalB(),
+      widgetId: "widget-B",
+      expectedEpoch: old.epoch,
+      stateDir,
+    }).state.binding!;
+    claimNext({
+      workspaceId: workspace.id,
+      principal: principalB(),
+      bindingId: taken.bindingId,
+      epoch: taken.epoch,
+      stateDir,
+    });
+    expectCode(() => initiateCompanionRebind({
+      workspaceId: workspace.id,
+      credential: old.credential,
+      routeCanonical: ROUTE_B,
+      stateDir,
+    }), "COMPANION_REPAIR_BLOCKED");
+  });
 });
 
 describe("route normalization", () => {
@@ -1870,6 +2196,97 @@ describe("public companion HTTP surface", () => {
     });
     expect(badBody.status).toBe(400);
     expect(badBody.body.error).toBe("COMPANION_VALIDATION");
+  });
+
+  it("takeover 后旧 credential 仅可完成 immediate-successor rebind", async () => {
+    await enableAndSeed();
+    const pairIntent = createPairingIntent({
+      workspaceId: workspace.id,
+      principal: principalA(),
+      stateDir,
+    });
+    const paired = await fetchJson("/api/companion/v1/pair", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        intentId: pairIntent.intentId,
+        secret: pairIntent.secret,
+        routeCanonical: ROUTE,
+      }),
+    });
+    expect(paired.status).toBe(200);
+    confirmRouteAttestation({
+      workspaceId: workspace.id,
+      principal: principalA(),
+      challengeId: paired.body.routeAttestation.challengeId,
+      challengeDigest: paired.body.routeAttestation.challengeDigest,
+      stateDir,
+    });
+    takeoverReceiver({
+      workspaceId: workspace.id,
+      principal: principalB(),
+      widgetId: "widget-B",
+      expectedEpoch: paired.body.epoch,
+      stateDir,
+    });
+    const oldAuth = {
+      authorization: `Bearer ${paired.body.credential as string}`,
+      "content-type": "application/json",
+    };
+    expect((await fetchJson("/api/companion/v1/state", { headers: oldAuth })).status).toBe(401);
+    expect((await fetchJson("/api/companion/v1/reserve", {
+      method: "POST",
+      headers: oldAuth,
+      body: JSON.stringify({ routeCanonical: ROUTE_B }),
+    })).status).toBe(401);
+
+    const started = await fetchJson("/api/companion/v1/rebind/init", {
+      method: "POST",
+      headers: oldAuth,
+      body: JSON.stringify({ routeCanonical: ROUTE_B }),
+    });
+    expect(started.status).toBe(200);
+    expect(started.body.routeVerification).toBe("PENDING");
+    expectCode(() => confirmRouteAttestation({
+      workspaceId: workspace.id,
+      principal: principalA(),
+      challengeId: started.body.routeAttestation.challengeId,
+      challengeDigest: started.body.routeAttestation.challengeDigest,
+      stateDir,
+    }), "FEEDBACK_PRINCIPAL_MISMATCH");
+    const premature = await fetchJson("/api/companion/v1/rebind/complete", {
+      method: "POST",
+      headers: oldAuth,
+      body: JSON.stringify({
+        challengeId: started.body.routeAttestation.challengeId,
+        routeCanonical: ROUTE_B,
+      }),
+    });
+    expect(premature.status).toBe(409);
+    expect(premature.body.error).toBe("COMPANION_REBIND_NOT_CONFIRMED");
+
+    confirmRouteAttestation({
+      workspaceId: workspace.id,
+      principal: principalB(),
+      challengeId: started.body.routeAttestation.challengeId,
+      challengeDigest: started.body.routeAttestation.challengeDigest,
+      stateDir,
+    });
+    const completed = await fetchJson("/api/companion/v1/rebind/complete", {
+      method: "POST",
+      headers: oldAuth,
+      body: JSON.stringify({
+        challengeId: started.body.routeAttestation.challengeId,
+        routeCanonical: ROUTE_B,
+      }),
+    });
+    expect(completed.status).toBe(200);
+    expect(completed.body.routeVerification).toBe("VERIFIED");
+    const newAuth = { authorization: `Bearer ${completed.body.credential as string}` };
+    const current = await fetchJson("/api/companion/v1/state", { headers: newAuth });
+    expect(current.status).toBe(200);
+    expect(current.body.routeVerification).toBe("VERIFIED");
+    expect((await fetchJson("/api/companion/v1/state", { headers: oldAuth })).status).toBe(401);
   });
 
   async function pairCompanionHttp(opts: { verify?: boolean } = {}) {

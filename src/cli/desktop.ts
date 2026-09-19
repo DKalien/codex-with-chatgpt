@@ -5,6 +5,7 @@ import { bindCurrentDesktop, bindDesktop, desktopStatus, disableDesktop, enableD
 import { desktopCompatibilityFromError, desktopIpc, DESKTOP_IPC_ERROR_MESSAGES } from "../desktop/ipc.js";
 import { DesktopError, targetInput } from "../desktop/store.js";
 import { recordDesktopResult } from "../desktop/result.js";
+import { reconcileUnknownDesktopDelivery } from "../desktop/unknown-reconciliation.js";
 import { LegacyReconciliationError, listLegacyReconciliations, reconcileLegacyAccepted } from "../desktop/legacy-reconciliation.js";
 import { retireLegacyAccepted } from "../desktop/legacy-retirement.js";
 import { abandonHistoricalAccepted, previewAbandonment } from "../desktop/abandonment.js";
@@ -31,6 +32,8 @@ const SAFE_CLI_ERROR_MESSAGES: Record<string, string> = {
   DESKTOP_DISABLED: "本机 Desktop Control 未启用或已撤权。",
   DESKTOP_BINDING_MISMATCH: "bindingId 已失效；不能自动切换到新的投递目标。",
   DESKTOP_WRONG_WORKSPACE: "当前工作区与保存的绑定根目录不一致。",
+  DESKTOP_RECONCILIATION_NOT_ELIGIBLE: "该 Desktop outcome_unknown delivery 不满足严格对账条件。",
+  DESKTOP_RECONCILIATION_CONFLICT: "Desktop 历史无法唯一核对；未恢复结果或修改投递状态。",
   LEGACY_RECONCILIATION_INVALID: "legacy accepted reconciliation 的 commandId 无效。",
   LEGACY_RECONCILIATION_NOT_ELIGIBLE: "该历史 Desktop delivery 不满足严格 legacy reconciliation 条件。",
   LEGACY_RECONCILIATION_CONFLICT: "legacy reconciliation 事实存在冲突；未覆盖原证据。",
@@ -151,6 +154,24 @@ export function registerDesktopCommands(program: Command): void {
         const code = error instanceof DesktopError ? error.code : "DESKTOP_RESULT_INVALID";
         const message = error instanceof DesktopError ? error.message : "执行结果记录失败；未确认验收闭环完成。";
         print({ ok: false, error: code, message }, opts.json, message);
+        process.exitCode = 1;
+      }
+    });
+
+  desktop.command("reconcile-unknown")
+    .description("严格核对唯一真实 Desktop turn 并恢复 outcome_unknown 投递")
+    .option("-w, --workspace <path>", "workspace 根目录")
+    .requiredOption("--command-id <id>", "要核对的 outcome_unknown commandId")
+    .option("--json", "输出机器可读结果", false)
+    .action(async (opts: { workspace?: string; commandId: string; json: boolean }) => {
+      try {
+        const result = await reconcileUnknownDesktopDelivery(new Workspace(workspaceRoot(opts.workspace)), opts.commandId);
+        print({ ok: true, ...result }, opts.json,
+          result.status === "accepted" ? `已恢复唯一真实 Desktop turn（${result.turnId}）；未写入 execution receipt。` :
+            "未找到唯一匹配的 Desktop turn；仍保持 outcome_unknown，未写入 execution receipt。");
+      } catch (error) {
+        const failure = safeCliError(error, "DESKTOP_RECONCILIATION_NOT_ELIGIBLE", "Desktop outcome_unknown 对账失败；未修改投递状态或 execution receipt。" );
+        print({ ok: false, error: failure.code, message: failure.message }, opts.json, failure.message);
         process.exitCode = 1;
       }
     });

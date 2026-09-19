@@ -813,5 +813,12 @@ F1a 只增加现有 SW status payload 的纯、只读 operational health summary
 - `paired ≠ attested`：production companion reserve/begin-send 要求 authenticated `/state` `routeVerification=VERIFIED`。
 - MCP：`feedback_companion_route_confirm`；wrong principal 不消费 challenge。
 - Browser：durable fence + `PAIRING_TRANSITION`；post-write ready gate 仅 form `send-button`；classic CS `*-global.js` 打包。
-- **live G3 cross-device E2E 未执行**；见 development-plan `NEXT_EXPECTED_STEP`。
+- **G3 live cross-device acceptance 已于 2026-09-19 PASS**；旧的 `pending` 记录为历史状态。
 - 历史 phase 文中的 “not deployed / Reload 已完成” 只描述当时轮次，不能当作当前机器 runtime 结论；以 `status --json` 为准。
+
+## Phase G4a + G4b bounded bootstrap / same-browser rebind
+
+- `feedback_bootstrap_status` 提供 request-scoped、bounded readiness；foreign-safe 仅暴露 takeover 的 `expectedEpoch + widgetId`，in-flight 状态 fail closed。
+- takeover 后旧 credential 对所有 production API 仍无效；仅 immediate predecessor 可在无 `reserved / claimed / outcome_unknown` 时启动窄 `/rebind`。
+- rebind challenge 持久化且 TTL/one-shot；当前 Chat 的 MCP principal 仍须确认。wrong principal 不消费 challenge，成功后才旋转 fresh credential。
+- Browser 复用 G3 route-attestation runner/fence；authenticated `/state` 仍是唯一 VERIFIED authority。无 auto Arm、无 auto Retire、无协议发送状态机变化。

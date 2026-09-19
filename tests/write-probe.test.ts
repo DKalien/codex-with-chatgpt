@@ -13,6 +13,7 @@ const BASE_TOOL_NAMES = [
   "execution_output",
   "execution_summary",
   "feedback_ack_observed",
+  "feedback_bootstrap_status",
   "feedback_claim_next",
   "feedback_companion_pair",
   "feedback_companion_revoke",
@@ -34,6 +35,7 @@ const BASE_TOOL_NAMES = [
 const NON_READONLY_BASE = new Set([
   "codex_desktop_send",
   "feedback_ack_observed",
+  "feedback_bootstrap_status",
   "feedback_claim_next",
   "feedback_companion_pair",
   "feedback_companion_revoke",

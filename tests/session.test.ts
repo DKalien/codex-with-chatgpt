@@ -220,6 +220,8 @@ describe("clearChatPointer", () => {
     const dir = makeTmpDir("session-clear");
     dirs.push(dir);
     process.env.C2C_STATE_DIR = dir;
+    delete process.env.CODEX_THREAD_ID;
+    delete process.env.CODEX_SESSION_ID;
     writeSession("abc123abc123", {
       conversationMode: "project",
       projectUrl: PROJECT,
@@ -284,8 +286,10 @@ describe("project chatOwnerFingerprint + multi-thread map", () => {
     expect(next.projectChats?.length).toBe(1);
     writeSession(WS, next);
     process.env.CODEX_THREAD_ID = THREAD_A;
+    process.env.CODEX_SESSION_ID = THREAD_A;
     expect(projectChatBinding(readSession(WS), WS)).toBe("same_thread");
     process.env.CODEX_THREAD_ID = THREAD_B;
+    process.env.CODEX_SESSION_ID = THREAD_B;
     expect(projectChatBinding(readSession(WS), WS)).toBe("other_thread");
   });
 

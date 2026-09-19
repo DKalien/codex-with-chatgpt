@@ -104,7 +104,7 @@ describe("Desktop MCP 与本地接口", () => {
   it("未绑定时注册 Desktop 工具并安全返回状态，绑定后 disabled 仍只开放状态查询", async () => {
     const unbound = await clientFor([DESKTOP_READ_SCOPE]);
     const unboundTools = (await unbound.listTools()).tools;
-    expect(unboundTools).toHaveLength(21);
+    expect(unboundTools).toHaveLength(22);
     const unboundSend = unboundTools.find(tool => tool.name === "codex_desktop_send")!;
     expect(unboundSend.inputSchema.required).toEqual(expect.arrayContaining(["intent", "userConfirmed", "message", "bindingId", "commandId", "workspaceId"]));
     expect(unboundSend.inputSchema.properties?.intent).toMatchObject({ enum: ["development_plan", "revision"] });
@@ -251,7 +251,7 @@ describe("Desktop MCP 与本地接口", () => {
     const program = new Command();
     registerDesktopCommands(program);
     const desktop = program.commands.find(command => command.name() === "desktop");
-    expect(desktop?.commands.map(command => command.name())).toEqual(["record-result", "legacy-reconcile", "legacy-retire", "abandon", "bind-current", "bind", "enable", "disable", "status", "history", "compatibility"]);
+    expect(desktop?.commands.map(command => command.name())).toEqual(["record-result", "reconcile-unknown", "legacy-reconcile", "legacy-retire", "abandon", "bind-current", "bind", "enable", "disable", "status", "history", "compatibility"]);
     expect(desktop?.commands.find(command => command.name() === "enable")?.options.map(option => option.long)).toContain("--accept-desktop-permissions");
     expect(desktop?.commands.find(command => command.name() === "legacy-reconcile")?.options.map(option => option.long)).toEqual([
       "--workspace", "--command-id", "--list", "--json",

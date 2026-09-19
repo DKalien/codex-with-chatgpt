@@ -19,6 +19,7 @@ import {
   takeoverReceiver,
 } from "../feedback/store.js";
 import {
+  companionBootstrapReadiness,
   companionStatusForPrincipal,
   confirmRouteAttestation,
   createPairingIntent,
@@ -129,6 +130,45 @@ function modelVisibleMeta(extra?: Record<string, unknown>): Record<string, unkno
  * status/claim 前 reconcile，恢复 crash gap。
  */
 export function registerFeedbackTools(server: McpServer, workspace: Workspace): void {
+  server.registerTool(
+    "feedback_bootstrap_status",
+    {
+      title: "Feedback bootstrap readiness",
+      description: "一次读取当前 Chat 的 bounded feedback bootstrap 状态；不返回 principal、credential、secret 或 hash。",
+      inputSchema: {},
+      outputSchema: {
+        workspaceId: z.string(),
+        state: z.enum([
+          "DISABLED",
+          "OWNED_VERIFIED",
+          "OWNED_NEEDS_BROWSER_REBIND",
+          "FOREIGN_SAFE_TO_TAKEOVER",
+          "BLOCKED_INFLIGHT",
+        ]),
+        ownsBinding: z.boolean(),
+        inFlightStatus: z.enum(["reserved", "claimed", "outcome_unknown"]).nullable(),
+        expectedEpoch: z.number().optional(),
+        widgetId: z.string().optional(),
+        companionPresent: z.boolean().optional(),
+        routeVerification: z.enum(["NONE", "PENDING", "VERIFIED"]).optional(),
+        rebindAvailable: z.boolean().optional(),
+        rebindState: z.enum(["NONE", "PENDING", "CONFIRMED"]).optional(),
+      },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      _meta: modelVisibleMeta(),
+    },
+    async (_args, extra: Extra) => {
+      const denied = requireScope(extra.authInfo, CODEX_FEEDBACK_SCOPE);
+      if (denied) return denied;
+      try {
+        const principal = principalFromExtra(extra);
+        return ok(companionBootstrapReadiness({ workspaceId: workspace.id, principal }));
+      } catch (error) {
+        return mapError(error);
+      }
+    },
+  );
+
   server.registerTool(
     "feedback_status",
     {

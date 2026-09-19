@@ -86,6 +86,7 @@ describe("MCP tools over Streamable HTTP", () => {
       "execution_output",
       "execution_summary",
       "feedback_ack_observed",
+      "feedback_bootstrap_status",
       "feedback_claim_next",
       "feedback_companion_pair",
       "feedback_companion_revoke",
@@ -123,6 +124,7 @@ describe("MCP tools over Streamable HTTP", () => {
     expect(desktopSend.inputSchema.properties?.userConfirmed).toMatchObject({ const: true });
     expect(desktopSend.inputSchema.additionalProperties).toBe(false);
     expect(tools.find((tool) => tool.name === "codex_desktop_status")?.annotations?.readOnlyHint).toBe(true);
+    expect(tools.find((tool) => tool.name === "feedback_bootstrap_status")?.annotations?.readOnlyHint).toBe(true);
     expect(SUPPORTED_SCOPES).toEqual([
       "workspace.read", "workspace.search", "git.read", "execution.read", "offline_access",
     ]);

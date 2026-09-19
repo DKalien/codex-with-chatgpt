@@ -829,6 +829,27 @@ describe("route-attestation heartbeat poll + server convergence", () => {
 });
 
 describe("G3 route attestation browser contract (source)", () => {
+  it("G4 rebind reuses the durable attestation fence and never persists a new plaintext secret", () => {
+    const sw = fs.readFileSync(path.join(companionRoot, "service-worker.js"), "utf8");
+    const start = sw.slice(
+      sw.indexOf("async function handleRebindStart"),
+      sw.indexOf("async function handleRebindComplete"),
+    );
+    const complete = sw.slice(
+      sw.indexOf("async function handleRebindComplete"),
+      sw.indexOf("async function handleFetchState"),
+    );
+    expect(start).toMatch(/markPairingTransitionBarrier/);
+    expect(start.indexOf("persistRouteAttestFence")).toBeLessThan(start.indexOf('"\/rebind\/init"'));
+    expect(start).toMatch(/resolvePairFenceAfterSuccess/);
+    expect(start).toMatch(/commitPairDurableLocals/);
+    expect(complete).toMatch(/"\/rebind\/complete"/);
+    expect(complete).toMatch(/commitPairDurableLocals/);
+    expect(complete).toMatch(/handleFetchState/);
+    expect(complete).toMatch(/OUTCOME_UNKNOWN/);
+    expect(sw).not.toMatch(/rebindRedemption|redemption/);
+  });
+
   it("popup.html contains Verify this conversation route control", () => {
     const html = fs.readFileSync(path.join(companionRoot, "popup", "popup.html"), "utf8");
     expect(html).toMatch(/verify-route/);

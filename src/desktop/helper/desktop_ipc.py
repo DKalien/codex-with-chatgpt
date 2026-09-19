@@ -1,7 +1,7 @@
 """Codex Desktop Control 的受控 Windows IPC helper。
 
 这个程序只接受 stdin 上的固定操作：``inspect``、``prepare``、``send``、
-``compatibility``、``current_identity``、``current_confirm``、``current_execution`` 和
+``reconcile_unknown``、``compatibility``、``current_identity``、``current_confirm``、``current_execution`` 和
 ``current_result_context``。其中 ``current_*`` 只接受
 顶层 ``workspaceRoot``，从继承的当前 Agent 环境解析 thread/project/host；
 它不会接受 stdin 提供的目标身份，也不会执行 stdin 提供的命令或启动
@@ -148,6 +148,7 @@ ERROR_MESSAGES = {
     "DESKTOP_PYTHON_UNSUPPORTED": "运行 Desktop IPC helper 需要 Python 3.11 或更高版本；没有发送消息。",
     "DESKTOP_CURRENT_CONTEXT_INVALID": "当前 Codex 上下文或 Desktop 会话身份无法安全确认；没有发送消息。",
     "DESKTOP_CONFIRMATION_CANCELLED": "本机确认被取消或未完成；没有发送消息。",
+    "DESKTOP_RECONCILIATION_CONFLICT": "Desktop 历史无法唯一核对；未恢复结果或修改投递状态。",
 }
 
 CONFIRMATION_CAPTION = "确认绑定当前 Codex Desktop 会话"
@@ -1337,6 +1338,125 @@ def _turns(state: dict[str, Any]) -> list[dict[str, Any]]:
     return turns
 
 
+def _reconcile_expectation(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {"workspaceId", "commandId", "intent", "messageBytes", "messageSha256"}:
+        raise _error("DESKTOP_INVALID_REQUEST")
+    for key in ("workspaceId", "commandId"):
+        item = value.get(key)
+        if not isinstance(item, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", item):
+            raise _error("DESKTOP_INVALID_REQUEST")
+    if value.get("intent") not in {"development_plan", "revision"}:
+        raise _error("DESKTOP_INVALID_REQUEST")
+    if (type(value.get("messageBytes")) is not int or not 0 < value["messageBytes"] <= MAX_MESSAGE_BYTES or
+            not isinstance(value.get("messageSha256"), str) or
+            re.fullmatch(r"[a-f0-9]{64}", value["messageSha256"]) is None):
+        raise _error("DESKTOP_INVALID_REQUEST")
+    return dict(value)
+
+
+def _turn_text_for_reconciliation(turn: dict[str, Any]) -> str | None:
+    params = turn.get("params")
+    raw_input = params.get("input") if isinstance(params, dict) else None
+    items = turn.get("items")
+    if not isinstance(raw_input, list) or len(raw_input) != 1 or not isinstance(items, list):
+        raise _error("DESKTOP_STATE_UNAVAILABLE")
+    user_messages = [item for item in items if isinstance(item, dict) and item.get("type") == "userMessage"]
+    if len(user_messages) != 1 or user_messages[0].get("content") != raw_input:
+        raise _error("DESKTOP_STATE_UNAVAILABLE")
+    item = raw_input[0]
+    if (not isinstance(item, dict) or set(item) != {"type", "text", "text_elements"}
+            or item.get("type") != "text" or item.get("text_elements") != []):
+        raise _error("DESKTOP_STATE_UNAVAILABLE")
+    text = item.get("text")
+    if not isinstance(text, str):
+        raise _error("DESKTOP_STATE_UNAVAILABLE")
+    try:
+        text.encode("utf-8", "strict")
+    except UnicodeEncodeError:
+        raise _error("DESKTOP_STATE_UNAVAILABLE")
+    return text
+
+
+def _strict_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
+
+
+def _reconcile_turn_ids(state: dict[str, Any], expectation: dict[str, Any]) -> list[str]:
+    expected_keys = {"type", "version", "workspaceId", "commandId", "intent", "message"}
+    candidates: list[str] = []
+    # reconciliation 只接受 canonical、已 exhaust 的完整历史；flat turns
+    # 没有完整性边界，不能证明“零候选”是真实零候选。
+    for turn in _complete_result_turns(state):
+        text = _turn_text_for_reconciliation(turn)
+        if text is None:
+            continue
+        stripped = text.lstrip()
+        try:
+            envelope = json.loads(text, object_pairs_hook=_strict_json_object)
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+            # 普通 user text 不是候选；但一个以 JSON object 开头的截断 envelope
+            # 不能被当成“没有找到”，必须保持 fail-closed。
+            if stripped.startswith("{"):
+                raise _error("DESKTOP_STATE_UNAVAILABLE")
+            continue
+        if not isinstance(envelope, dict) or envelope.get("type") != "C2C_DESKTOP_TASK":
+            continue
+        if set(envelope) != expected_keys or not isinstance(envelope.get("message"), str):
+            raise _error("DESKTOP_STATE_UNAVAILABLE")
+        if envelope.get("version") != 1:
+            continue
+        message = envelope["message"]
+        try:
+            message_bytes = len(message.encode("utf-8", "strict"))
+            message_sha256 = hashlib.sha256(message.encode("utf-8", "strict")).hexdigest()
+        except UnicodeEncodeError:
+            raise _error("DESKTOP_STATE_UNAVAILABLE")
+        if (envelope.get("workspaceId") != expectation["workspaceId"] or
+                envelope.get("commandId") != expectation["commandId"] or
+                envelope.get("intent") != expectation["intent"] or
+                message_bytes != expectation["messageBytes"] or
+                message_sha256 != expectation["messageSha256"]):
+            continue
+        turn_id = _uuid(turn.get("turnId"))
+        if turn_id is None:
+            raise _error("DESKTOP_STATE_UNAVAILABLE")
+        candidates.append(turn_id)
+    return candidates
+
+
+def _reconcile_unknown(target: dict[str, str], expectation_value: Any) -> dict[str, Any]:
+    target = _target(target)
+    expectation = _reconcile_expectation(expectation_value)
+    session, _ = _prepare(target, allow_active=True)
+    try:
+        before = session.client.current_state()
+        if before is None or session.client.snapshot_age() > MAX_OBSERVATION_AGE_SECONDS:
+            raise _error("DESKTOP_STATE_UNAVAILABLE")
+        _validate_state(before, target, session.client.owner or "", allow_active=True)
+        before_candidates = _reconcile_turn_ids(before, expectation)
+        _verify_runtime(session.pipe, target, session.runtime)
+        after = session.client.snapshot()
+        _validate_state(after, target, session.client.owner or "", allow_active=True)
+        after_candidates = _reconcile_turn_ids(after, expectation)
+        _verify_runtime(session.pipe, target, session.runtime)
+        if before_candidates != after_candidates:
+            raise _error("DESKTOP_RECONCILIATION_CONFLICT")
+        return {
+            "threadId": target["threadId"],
+            "hostId": target["hostId"],
+            "projectId": target["projectId"],
+            "workspaceRoot": target["workspaceRoot"],
+            "candidates": after_candidates,
+        }
+    finally:
+        session.close()
+
+
 def _validate_state(state: dict[str, Any], target: dict[str, str], owner: str, *, allow_active: bool = False) -> None:
     if state.get("id") != target["threadId"] or state.get("hostId") != target["hostId"]:
         raise _error("DESKTOP_TARGET_NOT_FOUND")
@@ -1712,7 +1832,7 @@ def _main() -> int:
         request: Any = None
         try:
             request = json.loads(raw.decode("utf-8", "strict"))
-            if not isinstance(request, dict) or set(request) - {"id", "op", "target", "message", "workspaceRoot"}:
+            if not isinstance(request, dict) or set(request) - {"id", "op", "target", "expectation", "message", "workspaceRoot"}:
                 raise _error("DESKTOP_INVALID_REQUEST")
             request_id = request.get("id")
             op = request.get("op")
@@ -1724,6 +1844,11 @@ def _main() -> int:
                 session, info = _prepare(target)
                 session.close()
                 _reply({"id": request_id, "ok": True, "value": info})
+            elif op == "reconcile_unknown":
+                if set(request) != {"id", "op", "target", "expectation"} or prepared is not None:
+                    raise _error("DESKTOP_INVALID_REQUEST")
+                _reply({"id": request_id, "ok": True,
+                        "value": _reconcile_unknown(request.get("target"), request.get("expectation"))})
             elif op == "compatibility":
                 if set(request) != {"id", "op"} or prepared is not None:
                     raise _error("DESKTOP_INVALID_REQUEST")

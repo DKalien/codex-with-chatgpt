@@ -18,12 +18,14 @@ import {
   mutateCompanionPairing,
   publicCompanionDeliveryEvent,
   readFeedbackState,
+  recoverStaleInMemory,
   recoverStaleFeedback,
   releaseReservation,
   reserveNext,
   retireOutcomeUnknown,
   routeChallengeDigest,
   type CompanionRecord,
+  type CompanionRebindIntent,
   type FeedbackEvent,
   type FeedbackState,
   type PairingIntent,
@@ -135,6 +137,15 @@ function companionMatchesBinding(
   return companion.bindingId === binding.bindingId
     && companion.epoch === binding.epoch
     && companion.principalFingerprint === binding.principalFingerprint;
+}
+
+function isActiveRebindIntent(
+  intent: CompanionRebindIntent | null | undefined,
+  nowMs: number,
+): intent is CompanionRebindIntent {
+  if (!intent || intent.consumedAt) return false;
+  const expiresAt = Date.parse(intent.expiresAt);
+  return Number.isFinite(expiresAt) && expiresAt > nowMs;
 }
 
 /**
@@ -266,6 +277,8 @@ export function exchangePairingIntent(input: {
         ...state,
         pairingIntent: { ...intent, consumedAt: nowIso },
         companion,
+        rebindIntent: null,
+        rebindPredecessor: null,
       },
       result: {
         companionId: companion.companionId,
@@ -284,6 +297,187 @@ export function exchangePairingIntent(input: {
             routeAttestation.challengeDigest,
           ),
         },
+      },
+    };
+  });
+}
+
+export function initiateCompanionRebind(input: {
+  workspaceId: string;
+  credential: string;
+  routeCanonical: string;
+  stateDir?: string;
+  nowMs?: number;
+}): {
+  companionId: string;
+  workspaceId: string;
+  bindingId: string;
+  epoch: number;
+  routeCanonical: string;
+  routeVerification: "PENDING";
+  routeAttestation: {
+    challengeId: string;
+    challengeDigest: string;
+    expiresAt: string;
+    message: string;
+  };
+} {
+  const stateDir = input.stateDir ?? getStateDir();
+  const nowMs = input.nowMs ?? Date.now();
+  const route = normalizeChatgptRoute(input.routeCanonical);
+  return mutateCompanionPairing(input.workspaceId, stateDir, (state) => {
+    if (!state.binding || state.binding.status !== "active") {
+      throw new FeedbackError("FEEDBACK_NOT_ENABLED", "production feedback 未启用");
+    }
+    const predecessor = state.companion;
+    const eligibility = state.rebindPredecessor;
+    if (!isActiveCompanion(predecessor)
+      || !hashEqual(predecessor.credentialHash, sha256Hex(input.credential))) {
+      throw new CompanionError("COMPANION_UNAUTHORIZED", "旧 companion credential 无效");
+    }
+    if (!eligibility
+      || eligibility.companionId !== predecessor.companionId
+      || eligibility.previousBindingId !== predecessor.bindingId
+      || eligibility.previousEpoch !== predecessor.epoch
+      || eligibility.bindingId !== state.binding.bindingId
+      || eligibility.epoch !== state.binding.epoch
+      || state.binding.epoch !== predecessor.epoch + 1
+      || state.binding.bindingId === predecessor.bindingId) {
+      throw new CompanionError("COMPANION_REBIND_NOT_SUCCESSOR", "仅允许立即下一代 binding rebind");
+    }
+    if (isActiveRebindIntent(state.rebindIntent, nowMs)) {
+      throw new CompanionError("COMPANION_REBIND_ALREADY_INITIATED", "旧 companion 的 rebind 已启动");
+    }
+    assertNoInFlightDelivery(state);
+    const companionId = randomUUID();
+    const routeAttestation = attachPendingRouteAttestation(
+      companionId,
+      state.binding.bindingId,
+      state.binding.epoch,
+      route,
+      input.workspaceId,
+      nowMs,
+    );
+    const intent: CompanionRebindIntent = {
+      version: 1,
+      companionId,
+      previousBindingId: predecessor.bindingId,
+      previousEpoch: predecessor.epoch,
+      bindingId: state.binding.bindingId,
+      epoch: state.binding.epoch,
+      principalFingerprint: state.binding.principalFingerprint,
+      routeCanonical: route,
+      initiatedAt: new Date(nowMs).toISOString(),
+      expiresAt: routeAttestation.expiresAt,
+      routeAttestation,
+    };
+    return {
+      state: { ...state, rebindIntent: intent },
+      result: {
+        companionId,
+        workspaceId: input.workspaceId,
+        bindingId: intent.bindingId,
+        epoch: intent.epoch,
+        routeCanonical: route,
+        routeVerification: "PENDING" as const,
+        routeAttestation: {
+          challengeId: routeAttestation.challengeId,
+          challengeDigest: routeAttestation.challengeDigest,
+          expiresAt: routeAttestation.expiresAt,
+          message: formatRouteAttestationMessage(
+            routeAttestation.challengeId,
+            routeAttestation.challengeDigest,
+          ),
+        },
+      },
+    };
+  });
+}
+
+export function completeCompanionRebind(input: {
+  workspaceId: string;
+  credential: string;
+  challengeId: string;
+  routeCanonical: string;
+  stateDir?: string;
+  nowMs?: number;
+}): {
+  companionId: string;
+  credential: string;
+  workspaceId: string;
+  bindingId: string;
+  epoch: number;
+  routeCanonical: string;
+  routeVerification: "VERIFIED";
+} {
+  const stateDir = input.stateDir ?? getStateDir();
+  const nowMs = input.nowMs ?? Date.now();
+  const route = normalizeChatgptRoute(input.routeCanonical);
+  return mutateCompanionPairing(input.workspaceId, stateDir, (state) => {
+    const predecessor = state.companion;
+    const eligibility = state.rebindPredecessor;
+    const intent = state.rebindIntent;
+    if (!isActiveCompanion(predecessor)
+      || !hashEqual(predecessor.credentialHash, sha256Hex(input.credential))) {
+      throw new CompanionError("COMPANION_UNAUTHORIZED", "旧 companion credential 无效");
+    }
+    if (!intent || intent.consumedAt) {
+      throw new CompanionError("COMPANION_REBIND_INVALID", "rebind intent 不存在或已消费");
+    }
+    if (Date.parse(intent.expiresAt) <= nowMs) {
+      throw new CompanionError("COMPANION_REBIND_EXPIRED", "rebind intent 已过期");
+    }
+    if (intent.routeAttestation.challengeId !== input.challengeId
+      || intent.routeCanonical !== route) {
+      throw new CompanionError("COMPANION_REBIND_INVALID", "rebind completion 身份不匹配");
+    }
+    if (!intent.confirmedAt || intent.routeAttestation.status !== "verified") {
+      throw new CompanionError("COMPANION_REBIND_NOT_CONFIRMED", "当前 Chat 尚未完成 route attestation");
+    }
+    if (!eligibility
+      || eligibility.companionId !== predecessor.companionId
+      || eligibility.previousBindingId !== intent.previousBindingId
+      || eligibility.previousEpoch !== intent.previousEpoch
+      || eligibility.bindingId !== intent.bindingId
+      || eligibility.epoch !== intent.epoch
+      || !state.binding || state.binding.status !== "active"
+      || state.binding.bindingId !== intent.bindingId
+      || state.binding.epoch !== intent.epoch
+      || state.binding.principalFingerprint !== intent.principalFingerprint
+      || predecessor.bindingId !== intent.previousBindingId
+      || predecessor.epoch !== intent.previousEpoch
+      || state.binding.epoch !== predecessor.epoch + 1) {
+      throw new CompanionError("COMPANION_REBIND_NOT_SUCCESSOR", "rebind binding 已变化");
+    }
+    assertNoInFlightDelivery(state);
+    const { credential, credentialHash } = mintCompanionCredential();
+    const nowIso = new Date(nowMs).toISOString();
+    const companion: CompanionRecord = {
+      version: 1,
+      companionId: intent.companionId,
+      bindingId: intent.bindingId,
+      epoch: intent.epoch,
+      principalFingerprint: intent.principalFingerprint,
+      credentialHash,
+      routeCanonical: intent.routeCanonical,
+      pairedAt: nowIso,
+      routeAttestation: intent.routeAttestation,
+    };
+    return {
+      state: {
+        ...state,
+        companion,
+        rebindIntent: { ...intent, consumedAt: nowIso },
+        rebindPredecessor: null,
+      },
+      result: {
+        companionId: companion.companionId,
+        credential,
+        workspaceId: input.workspaceId,
+        bindingId: companion.bindingId,
+        epoch: companion.epoch,
+        routeCanonical: companion.routeCanonical,
+        routeVerification: "VERIFIED" as const,
       },
     };
   });
@@ -316,6 +510,59 @@ export function confirmRouteAttestation(input: {
     if (state.binding.principalFingerprint !== input.principal.fingerprint) {
       // 不消费 challenge：真正 originating Chat 仍可完成证明。
       throw new FeedbackError("FEEDBACK_PRINCIPAL_MISMATCH", "route attestation 主体与 binding 不一致");
+    }
+    const rebind = state.rebindIntent;
+    if (rebind?.routeAttestation.challengeId === input.challengeId) {
+      const att = rebind.routeAttestation;
+      if (!hashEqual(att.challengeDigest, input.challengeDigest)) {
+        throw new CompanionError("ROUTE_ATTESTATION_INVALID", "challengeDigest 不匹配");
+      }
+      if (rebind.consumedAt || rebind.confirmedAt || att.status === "verified" || att.consumedAt) {
+        throw new CompanionError("ROUTE_ATTESTATION_INVALID", "challenge 已消费");
+      }
+      if (Date.parse(rebind.expiresAt) <= nowMs || Date.parse(att.expiresAt) <= nowMs) {
+        throw new CompanionError("ROUTE_ATTESTATION_EXPIRED", "route attestation challenge 已过期");
+      }
+      if (state.binding.bindingId !== rebind.bindingId
+        || state.binding.epoch !== rebind.epoch
+        || state.binding.principalFingerprint !== rebind.principalFingerprint
+        || att.routeCanonical !== rebind.routeCanonical) {
+        throw new CompanionError("ROUTE_ATTESTATION_INVALID", "rebind challenge 与当前 binding 不一致");
+      }
+      const expectedDigest = routeChallengeDigest({
+        workspaceId: state.workspaceId,
+        bindingId: rebind.bindingId,
+        epoch: rebind.epoch,
+        companionId: rebind.companionId,
+        routeCanonical: rebind.routeCanonical,
+        challengeId: att.challengeId,
+      });
+      if (!hashEqual(expectedDigest, input.challengeDigest)) {
+        throw new CompanionError("ROUTE_ATTESTATION_INVALID", "challengeDigest 与 rebind 事实不匹配");
+      }
+      const routeVerifiedAt = new Date(nowMs).toISOString();
+      const verifiedAtt: RouteAttestation = {
+        ...att,
+        status: "verified",
+        verifiedAt: routeVerifiedAt,
+        consumedAt: routeVerifiedAt,
+      };
+      return {
+        state: {
+          ...state,
+          rebindIntent: {
+            ...rebind,
+            confirmedAt: routeVerifiedAt,
+            routeAttestation: verifiedAtt,
+          },
+        },
+        result: {
+          verified: true as const,
+          companionId: rebind.companionId,
+          routeCanonical: rebind.routeCanonical,
+          routeVerifiedAt,
+        },
+      };
     }
     const companion = state.companion;
     if (!isActiveCompanion(companion)) {
@@ -730,6 +977,93 @@ export function companionStatusForPrincipal(input: {
   };
 }
 
+/** Trusted bounded projection for new-Chat bootstrap decisions. */
+export function companionBootstrapReadiness(input: {
+  workspaceId: string;
+  principal: ConversationPrincipal;
+  stateDir?: string;
+}): Record<string, unknown> {
+  requireConversationPrincipal(input.principal);
+  const stateDir = input.stateDir ?? getStateDir();
+  let state: FeedbackState;
+  try {
+    state = recoverStaleInMemory(readFeedbackState(input.workspaceId, stateDir), Date.now());
+  } catch (error) {
+    if (error instanceof FeedbackError && error.code === "FEEDBACK_STATE_UNINITIALIZED") {
+      return {
+        workspaceId: input.workspaceId,
+        state: "DISABLED",
+        ownsBinding: false,
+        inFlightStatus: null,
+      };
+    }
+    throw error;
+  }
+  const binding = state.binding?.status === "active" ? state.binding : null;
+  if (!binding) {
+    return {
+      workspaceId: state.workspaceId,
+      state: "DISABLED",
+      ownsBinding: false,
+      inFlightStatus: null,
+    };
+  }
+  const ownsBinding = binding.principalFingerprint === input.principal.fingerprint;
+  const inFlightStatus = state.events.some((event) => event.status === "outcome_unknown")
+    ? "outcome_unknown"
+    : state.events.some((event) => event.status === "claimed")
+      ? "claimed"
+      : state.events.some((event) => event.status === "reserved")
+        ? "reserved"
+        : null;
+  if (inFlightStatus) {
+    return {
+      workspaceId: state.workspaceId,
+      state: "BLOCKED_INFLIGHT",
+      ownsBinding,
+      inFlightStatus,
+    };
+  }
+  const currentCompanion = isActiveCompanion(state.companion)
+    && companionMatchesBinding(state.companion, binding)
+    ? state.companion
+    : null;
+  if (ownsBinding) {
+    const predecessorAvailable = isActiveCompanion(state.companion)
+      && state.rebindPredecessor?.companionId === state.companion.companionId
+      && state.rebindPredecessor.bindingId === binding.bindingId
+      && state.rebindPredecessor.epoch === binding.epoch;
+    const nowMs = Date.now();
+    const activeRebind = isActiveRebindIntent(state.rebindIntent, nowMs)
+      ? state.rebindIntent
+      : null;
+    return {
+      workspaceId: state.workspaceId,
+      state: currentCompanion && isRouteAttestationVerified(currentCompanion)
+        ? "OWNED_VERIFIED"
+        : "OWNED_NEEDS_BROWSER_REBIND",
+      ownsBinding: true,
+      inFlightStatus: null,
+      companionPresent: Boolean(currentCompanion),
+      routeVerification: currentCompanion
+        ? (isRouteAttestationVerified(currentCompanion) ? "VERIFIED" : "PENDING")
+        : "NONE",
+      rebindAvailable: predecessorAvailable && !activeRebind,
+      rebindState: activeRebind
+        ? (activeRebind.confirmedAt ? "CONFIRMED" : "PENDING")
+        : "NONE",
+    };
+  }
+  return {
+    workspaceId: state.workspaceId,
+    state: "FOREIGN_SAFE_TO_TAKEOVER",
+    ownsBinding: false,
+    inFlightStatus: null,
+    expectedEpoch: binding.epoch,
+    widgetId: binding.widgetId,
+  };
+}
+
 /** Trusted：撤销 companion 与未消费 intent。 */
 export function revokeCompanion(input: {
   workspaceId: string;
@@ -755,7 +1089,7 @@ export function revokeCompanion(input: {
       ? { ...state.pairingIntent, consumedAt: nowIso }
       : state.pairingIntent;
     return {
-      state: { ...state, companion, pairingIntent: intent },
+      state: { ...state, companion, pairingIntent: intent, rebindPredecessor: null, rebindIntent: null },
       result: { revoked: hadActive },
     };
   });

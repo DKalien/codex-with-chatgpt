@@ -284,10 +284,10 @@ it("真实 MCP 传输校验 scopes、本地授权及工作区；默认包含九�
   const payload = (r: any) => JSON.parse(r.content[0].text);
   try {
     const read = await connect(["workspace.read"]);
-    expect((await read.listTools()).tools).toHaveLength(21);
+    expect((await read.listTools()).tools).toHaveLength(22);
     ready();
     const tools = (await read.listTools()).tools;
-    expect(tools).toHaveLength(25);
+    expect(tools).toHaveLength(26);
     expect(tools.find(t => t.name === "codex_submit_task")!.annotations!.readOnlyHint).toBe(false);
     expect(tools.some(t => t.name === "write_probe")).toBe(false);
     const args = { workspaceId: workspace.id, requestId: "req" };
@@ -298,8 +298,8 @@ it("真实 MCP 传输校验 scopes、本地授权及工作区；默认包含九�
     expect(payload(await write.callTool({ name: "codex_thread_status", arguments: args })).requestId).toBe("req");
     expect((await read.listTools()).tools.filter(t => !t.name.startsWith("codex_") && !t.name.startsWith("feedback_")).every(t => t.annotations!.readOnlyHint)).toBe(true);
     setRemoteEnabled(workspace, false);
-    expect((await write.listTools()).tools).toHaveLength(21);
+    expect((await write.listTools()).tools).toHaveLength(22);
     fs.writeFileSync(remoteFile(workspace.id), "broken");
-    expect((await read.listTools()).tools).toHaveLength(21);
+    expect((await read.listTools()).tools).toHaveLength(22);
   } finally { for (const client of clients) await client.close(); await bridge.close(); }
 });

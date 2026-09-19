@@ -7,7 +7,9 @@ import {
   companionRelease,
   companionReserveNext,
   companionRetireOutcomeUnknown,
+  completeCompanionRebind,
   exchangePairingIntent,
+  initiateCompanionRebind,
   verifyCompanionCredential,
   type CompanionAuthContext,
 } from "../feedback/companion.js";
@@ -22,6 +24,11 @@ const pairBodySchema = z.object({
 }).strict();
 
 const routeBodySchema = z.object({
+  routeCanonical: z.string().min(1).max(512),
+}).strict();
+
+const rebindCompleteBodySchema = z.object({
+  challengeId: z.string().uuid(),
   routeCanonical: z.string().min(1).max(512),
 }).strict();
 
@@ -61,6 +68,9 @@ function sendError(res: Response, error: unknown): void {
   if (error instanceof CompanionError || error instanceof FeedbackError) {
     const status = error.code === "COMPANION_REPAIR_BLOCKED"
       || error.code === "COMPANION_ROUTE_UNVERIFIED"
+      || error.code === "COMPANION_REBIND_NOT_CONFIRMED"
+      || error.code === "COMPANION_REBIND_NOT_SUCCESSOR"
+      || error.code === "COMPANION_REBIND_ALREADY_INITIATED"
       ? 409
       : error.code === "FEEDBACK_INFLIGHT_FENCE"
         || error.code === "FEEDBACK_RESERVED_FENCE"
@@ -71,6 +81,8 @@ function sendError(res: Response, error: unknown): void {
             ? 503
             : error.code === "COMPANION_UNAUTHORIZED"
               || error.code === "COMPANION_EPOCH_STALE"
+              || error.code === "COMPANION_REBIND_INVALID"
+              || error.code === "COMPANION_REBIND_EXPIRED"
               || error.code.startsWith("PAIRING_")
               ? 401
               : 400;
@@ -123,6 +135,43 @@ export function createCompanionRouter(opts: CompanionRouterOptions): Router {
         stateDir: opts.stateDir,
       });
       res.json(result);
+    } catch (error) {
+      sendError(res, error);
+    }
+  });
+
+  router.post("/rebind/init", (req, res) => {
+    try {
+      const credential = bearerCredential(req);
+      if (!credential) {
+        throw new CompanionError("COMPANION_UNAUTHORIZED", "缺少旧 companion credential");
+      }
+      const body = routeBodySchema.parse(req.body);
+      res.json(initiateCompanionRebind({
+        workspaceId: opts.workspaceId,
+        credential,
+        routeCanonical: body.routeCanonical,
+        stateDir: opts.stateDir,
+      }));
+    } catch (error) {
+      sendError(res, error);
+    }
+  });
+
+  router.post("/rebind/complete", (req, res) => {
+    try {
+      const credential = bearerCredential(req);
+      if (!credential) {
+        throw new CompanionError("COMPANION_UNAUTHORIZED", "缺少旧 companion credential");
+      }
+      const body = rebindCompleteBodySchema.parse(req.body);
+      res.json(completeCompanionRebind({
+        workspaceId: opts.workspaceId,
+        credential,
+        challengeId: body.challengeId,
+        routeCanonical: body.routeCanonical,
+        stateDir: opts.stateDir,
+      }));
     } catch (error) {
       sendError(res, error);
     }
