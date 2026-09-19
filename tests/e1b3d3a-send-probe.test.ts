@@ -732,8 +732,8 @@ describe("E1b3d3a classic built-artifact execution", () => {
 
     const sandbox = loadClassic([
       "route-global.js",
-      "dom-adapter.js",
-      "turn-observer.js",
+      "dom-adapter-global.js",
+      "turn-observer-global.js",
       "composer-write-adapter.js",
       "send-click-adapter.js",
       "send-probe-message-global.js",
@@ -751,8 +751,8 @@ describe("E1b3d3a classic built-artifact execution", () => {
     }
     const sandbox = loadClassic([
       "route-global.js",
-      "dom-adapter.js",
-      "turn-observer.js",
+      "dom-adapter-global.js",
+      "turn-observer-global.js",
       "composer-write-adapter.js",
       "send-click-adapter.js",
       "send-probe-message-global.js",
@@ -793,8 +793,8 @@ describe("E1b3d3a classic built-artifact execution", () => {
     }
     const sandbox = loadClassic([
       "route-global.js",
-      "dom-adapter.js",
-      "turn-observer.js",
+      "dom-adapter-global.js",
+      "turn-observer-global.js",
       "composer-write-adapter.js",
       "send-click-adapter.js",
       "send-probe-message-global.js",
@@ -842,6 +842,19 @@ describe("E1b3d3a classic built-artifact execution", () => {
 });
 
 describe("E1b3d3a runtime packaging", () => {
+  function loadClassicPackaged(files: string[]) {
+    const sandbox: Record<string, unknown> = { console };
+    sandbox.globalThis = sandbox;
+    vm.createContext(sandbox);
+    for (const f of files) {
+      const p = path.join(distCompanion, f);
+      if (!fs.existsSync(p)) continue;
+      const src = fs.readFileSync(p, "utf8");
+      vm.runInContext(src, sandbox, { filename: f });
+    }
+    return sandbox;
+  }
+
   it("manifest loads send-click-adapter, not orchestrator", () => {
     const manifest = JSON.parse(fs.readFileSync(path.join(companionRoot, "manifest.json"), "utf8"));
     const js = (manifest.content_scripts ?? []).flatMap((cs: { js?: string[] }) => cs.js ?? []);
@@ -882,15 +895,101 @@ describe("E1b3d3a runtime packaging", () => {
     expect(src).toMatch(/dispatchNativeSend/);
   });
 
-  it("classic click adapter exposes dispatch; probe runner exposes runRealSendProbe", () => {
+  it("classic click adapter IIFE binds namespaced deps; probe runner exposes runRealSendProbe", () => {
     if (!fs.existsSync(path.join(distCompanion, "send-click-adapter.js"))) {
       expect(true).toBe(true);
       return;
     }
     const classic = fs.readFileSync(path.join(distCompanion, "send-click-adapter.js"), "utf8");
     expect(classic).toMatch(/globalThis\.__c2cDispatchNativeSend/);
+    expect(classic).toMatch(/^\(function \(\)/m);
+    expect(classic).toMatch(/globalThis\.__c2cReadCanonicalComposerText/);
+    expect(classic).toMatch(/globalThis\.resolveChatGptComposer/);
+    expect(classic).toMatch(/globalThis\.resolveChatGptAction/);
+    expect(classic).toMatch(/globalThis\.normalizeCanonicalDomText/);
+    expect(classic).not.toMatch(/globalThis\.readCanonicalComposerText\s*=/);
     const runner = fs.readFileSync(path.join(distCompanion, "send-probe-run.js"), "utf8");
     expect(runner).toMatch(/globalThis\.__c2cRunRealSendProbe/);
+    const build = fs.readFileSync(path.join(projectRoot, "scripts", "build-browser-companion.mjs"), "utf8");
+    expect(build).toMatch(/send-click dep/);
+    expect(build).toMatch(/send-click-adapter\.js classic must be wrapped in IIFE/);
+    expect(build).toMatch(/must not expose unnamespaced readCanonicalComposerText/);
+  });
+
+  it("built classic __c2cDispatchNativeSend click count without ReferenceError", () => {
+    if (!fs.existsSync(path.join(distCompanion, "send-click-adapter.js"))) {
+      expect(true).toBe(true);
+      return;
+    }
+    const sandbox = loadClassicPackaged([
+      "route-global.js",
+      "dom-adapter-global.js",
+      "turn-observer-global.js",
+      "composer-write-adapter.js",
+      "send-click-adapter.js",
+    ]);
+    const dispatch = sandbox.__c2cDispatchNativeSend as (
+      doc: unknown,
+      message: string,
+      opts?: Record<string, unknown>,
+    ) => { ok: boolean; reason?: string; clicked?: number };
+    expect(typeof dispatch).toBe("function");
+    expect(sandbox.readCanonicalComposerText).toBeUndefined();
+
+    const MESSAGE = "hello exact composer";
+    let clicks = 0;
+    const sendBtn = {
+      tagName: "BUTTON",
+      getAttribute: (n: string) =>
+        n === "data-testid" ? "send-button" : n === "type" ? "submit" : n === "aria-label" ? "发送提示词" : null,
+      hasAttribute: (n: string) => n === "data-testid",
+      disabled: false,
+      click() {
+        clicks += 1;
+      },
+    };
+    const form = {
+      querySelector(selector: string) {
+        if (selector === 'button[data-testid="send-button"]') return sendBtn;
+        if (selector === "button.composer-submit-button-color") return sendBtn;
+        return null;
+      },
+      querySelectorAll(selector: string) {
+        return selector === "button" ? [sendBtn] : [];
+      },
+    };
+    const editor: Record<string, unknown> = {
+      tagName: "DIV",
+      id: "prompt-textarea",
+      className: "ProseMirror",
+      getAttribute: (n: string) => (n === "contenteditable" ? "true" : null),
+      hasAttribute: () => false,
+      closest: (s: string) => (s === "form" ? form : null),
+      focus: () => {},
+      children: { length: 1, 0: { tagName: "P", textContent: MESSAGE } },
+      textContent: MESSAGE,
+    };
+    const doc = {
+      querySelector(selector: string) {
+        if (selector === "#prompt-textarea" || selector.includes("ProseMirror") || selector.includes("contenteditable")) {
+          return editor;
+        }
+        return null;
+      },
+      querySelectorAll: () => [],
+    };
+
+    clicks = 0;
+    const good = dispatch(doc, MESSAGE, { routeValid: true });
+    expect(good.ok).toBe(true);
+    expect(good.clicked).toBe(1);
+    expect(clicks).toBe(1);
+
+    clicks = 0;
+    const bad = dispatch(doc, `${MESSAGE}!`, { routeValid: true });
+    expect(bad.ok).toBe(false);
+    expect(bad.reason).toBe("composer_text_mismatch");
+    expect(clicks).toBe(0);
   });
 
   it("dispatchNativeSend still one-shot exact fence", () => {

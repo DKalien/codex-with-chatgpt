@@ -1444,8 +1444,8 @@ describe("E1b3d2a runtime packaging gates", () => {
     const js = (manifest.content_scripts ?? []).flatMap((cs: { js?: string[] }) => cs.js ?? []);
     expect(js).toEqual([
       "route-global.js",
-      "dom-adapter.js",
-      "turn-observer.js",
+      "dom-adapter-global.js",
+      "turn-observer-global.js",
       "shadow-evidence.js",
       "composer-write-adapter.js",
       "send-click-adapter.js",
@@ -1461,6 +1461,10 @@ describe("E1b3d2a runtime packaging gates", () => {
     expect(js).not.toContain("production-send-runtime.js");
     expect(js).not.toContain("route-attestation.js");
     expect(js).not.toContain("route-attestation-run.js");
+    expect(js).not.toContain("dom-adapter.js");
+    expect(js).not.toContain("turn-observer.js");
+    expect(js).toContain("dom-adapter-global.js");
+    expect(js).toContain("turn-observer-global.js");
     for (const p of manifest.permissions ?? []) {
       expect(["scripting", "debugger", "nativeMessaging", "webRequest"]).not.toContain(p);
     }

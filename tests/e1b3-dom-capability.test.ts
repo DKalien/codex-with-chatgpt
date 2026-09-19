@@ -600,7 +600,7 @@ describe("E. contenteditable primitives (real Edge confirmed, strategy unchanged
 });
 
 describe("runtime unreachability (E1b3b safety gate)", () => {
-  it("manifest does not load send-adapter or turn-observer", () => {
+  it("manifest does not load send-adapter or ESM turn-observer", () => {
     const manifest = JSON.parse(
       fs.readFileSync(path.join(companionRoot, "manifest.json"), "utf8"),
     );
@@ -608,8 +608,11 @@ describe("runtime unreachability (E1b3b safety gate)", () => {
       .flatMap((cs: { js?: string[] }) => cs.js ?? []);
     expect(js).not.toContain("send-adapter.js");
     expect(js).not.toContain("send-orchestrator.js");
-    // E1b3d1: read-only turn-observer is allowed for shadow inspect.
-    expect(js).toContain("turn-observer.js");
+    // E1b3d1: classic read-only turn-observer-global is allowed for shadow inspect.
+    expect(js).toContain("turn-observer-global.js");
+    expect(js).not.toContain("turn-observer.js");
+    expect(js).not.toContain("dom-adapter.js");
+    expect(js).toContain("dom-adapter-global.js");
     expect(js).toContain("shadow-evidence.js");
     for (const p of manifest.permissions ?? []) {
       expect(["scripting", "debugger", "nativeMessaging", "webRequest"]).not.toContain(p);

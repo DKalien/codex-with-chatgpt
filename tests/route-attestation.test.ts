@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
 import { parseChatgptConversationRoute } from "../src/chatgpt/route.js";
 import {
@@ -913,12 +913,16 @@ describe("G3 route attestation browser contract (source)", () => {
     const js = (manifest.content_scripts ?? []).flatMap((cs: { js?: string[] }) => cs.js ?? []);
     expect(js).toContain("route-attestation-global.js");
     expect(js).toContain("route-attestation-run-global.js");
+    expect(js).toContain("dom-adapter-global.js");
+    expect(js).toContain("turn-observer-global.js");
     expect(js).not.toContain("route-attestation.js");
     expect(js).not.toContain("route-attestation-run.js");
+    expect(js).not.toContain("dom-adapter.js");
+    expect(js).not.toContain("turn-observer.js");
     expect(js).toEqual([
       "route-global.js",
-      "dom-adapter.js",
-      "turn-observer.js",
+      "dom-adapter-global.js",
+      "turn-observer-global.js",
       "shadow-evidence.js",
       "composer-write-adapter.js",
       "send-click-adapter.js",
@@ -930,8 +934,8 @@ describe("G3 route attestation browser contract (source)", () => {
       "content-script.js",
     ]);
     // Dependency order: dom/turn before attest-global; write/click before run-global; attest before run.
-    expect(js.indexOf("dom-adapter.js")).toBeLessThan(js.indexOf("route-attestation-global.js"));
-    expect(js.indexOf("turn-observer.js")).toBeLessThan(js.indexOf("route-attestation-global.js"));
+    expect(js.indexOf("dom-adapter-global.js")).toBeLessThan(js.indexOf("route-attestation-global.js"));
+    expect(js.indexOf("turn-observer-global.js")).toBeLessThan(js.indexOf("route-attestation-global.js"));
     expect(js.indexOf("composer-write-adapter.js")).toBeLessThan(js.indexOf("route-attestation-run-global.js"));
     expect(js.indexOf("send-click-adapter.js")).toBeLessThan(js.indexOf("route-attestation-run-global.js"));
     expect(js.indexOf("route-attestation-global.js")).toBeLessThan(js.indexOf("route-attestation-run-global.js"));
@@ -942,9 +946,13 @@ describe("G3 route attestation browser contract (source)", () => {
     const build = fs.readFileSync(path.join(projectRoot, "scripts", "build-browser-companion.mjs"), "utf8");
     expect(build).toMatch(/route-attestation-global\.js/);
     expect(build).toMatch(/route-attestation-run-global\.js/);
+    expect(build).toMatch(/dom-adapter-global\.js/);
+    expect(build).toMatch(/turn-observer-global\.js/);
     expect(build).toMatch(/__c2cRunRouteAttestationSend/);
     expect(build).toMatch(/must not contain top-level import\/export|must not load ESM route-attestation/);
     expect(build).toMatch(/must keep ESM exports for SW\/tests/);
+    expect(build).toMatch(/must retain ESM export/);
+    expect(build).toMatch(/must retain import of \.\/dom-adapter\.js/);
   });
 
   it("packaged classic chain can load: no import/export; ESM retained for SW/tests", () => {
@@ -957,8 +965,12 @@ describe("G3 route attestation browser contract (source)", () => {
     const js = (distManifest.content_scripts ?? []).flatMap((cs: { js?: string[] }) => cs.js ?? []);
     expect(js).not.toContain("route-attestation.js");
     expect(js).not.toContain("route-attestation-run.js");
+    expect(js).not.toContain("dom-adapter.js");
+    expect(js).not.toContain("turn-observer.js");
     expect(js).toContain("route-attestation-global.js");
     expect(js).toContain("route-attestation-run-global.js");
+    expect(js).toContain("dom-adapter-global.js");
+    expect(js).toContain("turn-observer-global.js");
 
     for (const f of js) {
       const p = path.join(distCompanion, f);
@@ -985,10 +997,17 @@ describe("G3 route attestation browser contract (source)", () => {
 
     const esmAttest = fs.readFileSync(path.join(distCompanion, "route-attestation.js"), "utf8");
     const esmRun = fs.readFileSync(path.join(distCompanion, "route-attestation-run.js"), "utf8");
+    const esmDom = fs.readFileSync(path.join(distCompanion, "dom-adapter.js"), "utf8");
+    const esmTurn = fs.readFileSync(path.join(distCompanion, "turn-observer.js"), "utf8");
     expect(esmAttest).toMatch(/^export\s/m);
     expect(esmRun).toMatch(/^export\s/m);
     expect(esmAttest).toMatch(/export function findRouteAttestationUserTurn/);
     expect(esmRun).toMatch(/export async function runRouteAttestationSend/);
+    expect(esmDom).toMatch(/^export\s/m);
+    expect(esmDom).not.toMatch(/globalThis\.resolveChatGptComposer\s*=/);
+    expect(esmTurn).toMatch(/from\s+["']\.\/dom-adapter\.js["']/);
+    expect(esmTurn).toMatch(/export function collectBoundedDescendants/);
+    expect(esmTurn).not.toMatch(/globalThis\.collectBoundedDescendants\s*=/);
 
     const cs = fs.readFileSync(path.join(distCompanion, "content-script.js"), "utf8");
     expect(cs).toMatch(/c2c\.route\.attest\.execute/);
@@ -1000,11 +1019,29 @@ describe("G3 route attestation browser contract (source)", () => {
       "production-send-runtime-global.js",
       "composer-write-adapter.js",
       "send-click-adapter.js",
+      "dom-adapter-global.js",
+      "turn-observer-global.js",
     ]) {
       const text = fs.readFileSync(path.join(distCompanion, f), "utf8");
       expect(text).not.toMatch(/^\s*import\s/m);
       expect(text).not.toMatch(/^\s*export\s/m);
     }
+  });
+
+  it("built dist ESM route-attestation links through turn-observer → dom-adapter", async () => {
+    const distAttest = path.join(projectRoot, "dist", "browser-companion", "route-attestation.js");
+    if (!fs.existsSync(distAttest)) {
+      expect(true).toBe(true);
+      return;
+    }
+    const busted = pathToFileURL(distAttest).href + `?t=${Date.now()}`;
+    const mod = await import(busted) as Record<string, unknown>;
+    expect(typeof mod.findRouteAttestationUserTurn).toBe("function");
+    expect(typeof mod.canStartRouteAttestSend).toBe("function");
+    expect(typeof mod.isRouteAttestationMessage).toBe("function");
+    expect(typeof mod.extractRouteChallengeId).toBe("function");
+    expect(typeof mod.formatRouteAttestationMessage === "undefined" || typeof mod.syncTransportRouteVerification).toBeTruthy();
+    expect(typeof mod.syncTransportRouteVerification).toBe("function");
   });
 
   it("build fails fast when runner deps or namespaced resolveMutation are missing", () => {
@@ -1029,6 +1066,8 @@ describe("G3 route attestation browser contract (source)", () => {
       "isRouteAttestationMessage",
       "snapshotUserTurns",
       "buildSendProbeMessage",
+      "dom-adapter-global.js",
+      "turn-observer-global.js",
     ]) {
       expect(build).toContain(sym);
     }

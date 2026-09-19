@@ -75,8 +75,9 @@ fs.rmSync(distCompanion, { recursive: true, force: true });
 copyDir(srcCompanion, distCompanion);
 
 const domAdapter = fs.readFileSync(path.join(srcCompanion, "dom-adapter.js"), "utf8");
+// Classic CS artifact only. ESM dist/dom-adapter.js stays intact for service-worker imports.
 fs.writeFileSync(
-  path.join(distCompanion, "dom-adapter.js"),
+  path.join(distCompanion, "dom-adapter-global.js"),
   stripExports(domAdapter) + `
 ;globalThis.observeChatGptSafety = observeChatGptSafety;
 globalThis.fakeDom = fakeDom;
@@ -93,14 +94,13 @@ globalThis.summarizeStopButtonEvidence = summarizeStopButtonEvidence;
   "utf8",
 );
 
-// E1b3d1: package turn-observer as classic script with READ-ONLY exports only.
-// writeCanonicalMessage / dispatchNativeSend are never packaged into this classic file.
+// E1b3d1: classic CS turn-observer (READ-ONLY). ESM dist/turn-observer.js stays intact for SW.
 const turnObserver = fs.readFileSync(path.join(srcCompanion, "turn-observer.js"), "utf8");
 if (/writeCanonicalMessage|dispatchNativeSend|\.click\(\)/.test(turnObserver)) {
   fail("turn-observer.js must stay read-only (no write/dispatch/click)");
 }
 fs.writeFileSync(
-  path.join(distCompanion, "turn-observer.js"),
+  path.join(distCompanion, "turn-observer-global.js"),
   stripExports(turnObserver.replace(/^import\s+.*?;\s*$/gm, "")) + `
 ;globalThis.snapshotUserTurns = snapshotUserTurns;
 globalThis.findCanonicalUserTurn = findCanonicalUserTurn;
@@ -178,18 +178,44 @@ if (/execCommand|writeCanonicalMessage|chrome\.tabs|chrome\.runtime|fetch\(|begi
 if (!/\.click\(\)/.test(clickCode)) {
   fail("send-click-adapter.js must contain the single runtime .click()");
 }
-const sendProbeSrc = fs.readFileSync(path.join(srcCompanion, "send-probe.js"), "utf8");
 const clickBody = stripExports(
   clickAdapter
     .replace(/^import\s+[\s\S]*?from\s+"[^"]+";\s*$/gm, "")
     .replace(/^import\s+.*?;\s*$/gm, ""),
 );
+// IIFE + explicit namespaced bindings: write-adapter classic is IIFE-isolated,
+// so free names like readCanonicalComposerText are not classic globals.
 const clickClassic = `// classic runtime click capability (E1b3d3a)
+(function () {
+const resolveChatGptComposer = globalThis.resolveChatGptComposer;
+const resolveChatGptAction = globalThis.resolveChatGptAction;
+const normalizeCanonicalDomText = globalThis.normalizeCanonicalDomText;
+const readCanonicalComposerText = globalThis.__c2cReadCanonicalComposerText;
 ${clickBody}
 ;globalThis.__c2cDispatchNativeSend = dispatchNativeSend;
+})();
 `;
 if (/\.click\(\)/.test(clickClassic) === false) {
   fail("classic send-click-adapter must retain .click()");
+}
+if (!/^\(function \(\)/.test(clickClassic.replace(/^\/\/.*\n/, ""))) {
+  fail("classic send-click-adapter must be wrapped in IIFE");
+}
+for (const bindName of [
+  "globalThis.resolveChatGptComposer",
+  "globalThis.resolveChatGptAction",
+  "globalThis.normalizeCanonicalDomText",
+  "globalThis.__c2cReadCanonicalComposerText",
+]) {
+  if (!clickClassic.includes(bindName)) {
+    fail(`classic send-click-adapter must bind ${bindName}`);
+  }
+}
+if (!/globalThis\.__c2cDispatchNativeSend\s*=\s*dispatchNativeSend/.test(clickClassic)) {
+  fail("classic send-click-adapter must expose __c2cDispatchNativeSend");
+}
+if (/globalThis\.readCanonicalComposerText\s*=/.test(clickClassic)) {
+  fail("classic send-click-adapter must not expose unnamespaced readCanonicalComposerText");
 }
 fs.writeFileSync(path.join(distCompanion, "send-click-adapter.js"), clickClassic, "utf8");
 
@@ -469,8 +495,12 @@ const requiredFiles = [
   "service-worker.js",
   "content-script.js",
   "ownership.js",
+  // ESM artifacts (SW import graph)
   "dom-adapter.js",
   "turn-observer.js",
+  // classic CS artifacts
+  "dom-adapter-global.js",
+  "turn-observer-global.js",
   "shadow-evidence.js",
   "shadow-rpc.js",
   "composer-write-adapter.js",
@@ -497,18 +527,71 @@ for (const f of requiredFiles) {
   if (!fs.existsSync(path.join(distCompanion, f))) fail(`packaged file missing: ${f}`);
 }
 
-// G3 content_scripts packaging: classic only; ESM route-attestation stays off the CS chain.
-const csJs = (manifest.content_scripts ?? []).flatMap((cs) => cs.js ?? []);
-if (csJs.includes("route-attestation.js") || csJs.includes("route-attestation-run.js")) {
-  fail("manifest content_scripts must not load ESM route-attestation.js / route-attestation-run.js");
+// ESM preserve gates: SW module graph must keep import/export semantics.
+const distDomEsm = fs.readFileSync(path.join(distCompanion, "dom-adapter.js"), "utf8");
+if (!/^export\s/m.test(distDomEsm)) {
+  fail("dist dom-adapter.js must retain ESM export (service-worker / route-attestation import)");
 }
-if (!csJs.includes("route-attestation-global.js") || !csJs.includes("route-attestation-run-global.js")) {
-  fail("manifest content_scripts must load classic route-attestation-global.js + route-attestation-run-global.js");
+if (/globalThis\.resolveChatGptComposer\s*=/.test(distDomEsm)) {
+  fail("dist dom-adapter.js must not contain generated globalThis classic footer");
+}
+const distTurnEsm = fs.readFileSync(path.join(distCompanion, "turn-observer.js"), "utf8");
+if (!/from\s+["']\.\/dom-adapter\.js["']/.test(distTurnEsm)) {
+  fail("dist turn-observer.js must retain import of ./dom-adapter.js");
+}
+if (!/^export\s/m.test(distTurnEsm)) {
+  fail("dist turn-observer.js must retain ESM exports");
+}
+if (!/export function collectBoundedDescendants/.test(distTurnEsm)) {
+  fail("dist turn-observer.js must retain export function collectBoundedDescendants");
+}
+if (/globalThis\.collectBoundedDescendants\s*=/.test(distTurnEsm)) {
+  fail("dist turn-observer.js must not contain generated globalThis classic footer");
+}
+const distDomGlobal = fs.readFileSync(path.join(distCompanion, "dom-adapter-global.js"), "utf8");
+if (/^\s*import\s/m.test(distDomGlobal) || /^\s*export\s/m.test(distDomGlobal)) {
+  fail("dom-adapter-global.js must be classic (no top-level import/export)");
+}
+if (!/globalThis\.resolveChatGptComposer\s*=/.test(distDomGlobal)) {
+  fail("dom-adapter-global.js must expose resolveChatGptComposer");
+}
+const distTurnGlobal = fs.readFileSync(path.join(distCompanion, "turn-observer-global.js"), "utf8");
+if (/^\s*import\s/m.test(distTurnGlobal) || /^\s*export\s/m.test(distTurnGlobal)) {
+  fail("turn-observer-global.js must be classic (no top-level import/export)");
+}
+if (!/globalThis\.collectBoundedDescendants\s*=/.test(distTurnGlobal)) {
+  fail("turn-observer-global.js must expose collectBoundedDescendants");
+}
+if (!/globalThis\.snapshotUserTurns\s*=/.test(distTurnGlobal)) {
+  fail("turn-observer-global.js must expose snapshotUserTurns");
+}
+
+// G3 content_scripts packaging: classic only; ESM SW modules stay off the CS chain.
+const csJs = (manifest.content_scripts ?? []).flatMap((cs) => cs.js ?? []);
+for (const bannedCs of [
+  "route-attestation.js",
+  "route-attestation-run.js",
+  "dom-adapter.js",
+  "turn-observer.js",
+]) {
+  if (csJs.includes(bannedCs)) {
+    fail(`manifest content_scripts must not load ESM ${bannedCs}`);
+  }
+}
+for (const requiredCs of [
+  "route-attestation-global.js",
+  "route-attestation-run-global.js",
+  "dom-adapter-global.js",
+  "turn-observer-global.js",
+]) {
+  if (!csJs.includes(requiredCs)) {
+    fail(`manifest content_scripts must load classic ${requiredCs}`);
+  }
 }
 const expectedCsOrder = [
   "route-global.js",
-  "dom-adapter.js",
-  "turn-observer.js",
+  "dom-adapter-global.js",
+  "turn-observer-global.js",
   "shadow-evidence.js",
   "composer-write-adapter.js",
   "send-click-adapter.js",
@@ -538,9 +621,9 @@ for (const f of csJs) {
 
 // G3: route-attestation runner runtime deps must be provided by earlier manifest artifacts.
 const routeAttestRunDeps = [
-  { symbol: "resolveChatGptComposer", file: "dom-adapter.js", expose: /globalThis\.resolveChatGptComposer\s*=/ },
-  { symbol: "resolveChatGptAction", file: "dom-adapter.js", expose: /globalThis\.resolveChatGptAction\s*=/ },
-  { symbol: "normalizeCanonicalDomText", file: "dom-adapter.js", expose: /globalThis\.normalizeCanonicalDomText\s*=/ },
+  { symbol: "resolveChatGptComposer", file: "dom-adapter-global.js", expose: /globalThis\.resolveChatGptComposer\s*=/ },
+  { symbol: "resolveChatGptAction", file: "dom-adapter-global.js", expose: /globalThis\.resolveChatGptAction\s*=/ },
+  { symbol: "normalizeCanonicalDomText", file: "dom-adapter-global.js", expose: /globalThis\.normalizeCanonicalDomText\s*=/ },
   { symbol: "__c2cReadCanonicalComposerText", file: "composer-write-adapter.js", expose: /globalThis\.__c2cReadCanonicalComposerText\s*=/ },
   { symbol: "__c2cWriteCanonicalMessage", file: "composer-write-adapter.js", expose: /globalThis\.__c2cWriteCanonicalMessage\s*=/ },
   { symbol: "__c2cVerifyCanonicalComposer", file: "composer-write-adapter.js", expose: /globalThis\.__c2cVerifyCanonicalComposer\s*=/ },
@@ -549,7 +632,7 @@ const routeAttestRunDeps = [
   { symbol: "extractRouteChallengeId", file: "route-attestation-global.js", expose: /globalThis\.extractRouteChallengeId\s*=/ },
   { symbol: "findRouteAttestationUserTurn", file: "route-attestation-global.js", expose: /globalThis\.findRouteAttestationUserTurn\s*=/ },
   { symbol: "isRouteAttestationMessage", file: "route-attestation-global.js", expose: /globalThis\.isRouteAttestationMessage\s*=/ },
-  { symbol: "snapshotUserTurns", file: "turn-observer.js", expose: /globalThis\.snapshotUserTurns\s*=/ },
+  { symbol: "snapshotUserTurns", file: "turn-observer-global.js", expose: /globalThis\.snapshotUserTurns\s*=/ },
 ];
 const runGlobalIdx = csJs.indexOf("route-attestation-run-global.js");
 if (runGlobalIdx < 0) fail("manifest missing route-attestation-run-global.js");
@@ -571,9 +654,9 @@ if (/globalThis\.resolveMutationCanonicalRoute\s*=/.test(writeClassicForDeps)) {
 
 // send-probe-run classic runtime deps (IIFE bindings after write-adapter isolation).
 const sendProbeRunDeps = [
-  { symbol: "resolveChatGptComposer", file: "dom-adapter.js", expose: /globalThis\.resolveChatGptComposer\s*=/ },
-  { symbol: "resolveChatGptAction", file: "dom-adapter.js", expose: /globalThis\.resolveChatGptAction\s*=/ },
-  { symbol: "normalizeCanonicalDomText", file: "dom-adapter.js", expose: /globalThis\.normalizeCanonicalDomText\s*=/ },
+  { symbol: "resolveChatGptComposer", file: "dom-adapter-global.js", expose: /globalThis\.resolveChatGptComposer\s*=/ },
+  { symbol: "resolveChatGptAction", file: "dom-adapter-global.js", expose: /globalThis\.resolveChatGptAction\s*=/ },
+  { symbol: "normalizeCanonicalDomText", file: "dom-adapter-global.js", expose: /globalThis\.normalizeCanonicalDomText\s*=/ },
   { symbol: "__c2cReadCanonicalComposerText", file: "composer-write-adapter.js", expose: /globalThis\.__c2cReadCanonicalComposerText\s*=/ },
   { symbol: "__c2cWriteCanonicalMessage", file: "composer-write-adapter.js", expose: /globalThis\.__c2cWriteCanonicalMessage\s*=/ },
   { symbol: "__c2cVerifyCanonicalComposer", file: "composer-write-adapter.js", expose: /globalThis\.__c2cVerifyCanonicalComposer\s*=/ },
@@ -614,7 +697,48 @@ if (!/^\(function \(\)/.test(sendProbeRunClassicGate.replace(/^\/\/.*\n/, ""))) 
   fail("send-probe-run.js classic must be wrapped in IIFE");
 }
 
-for (const f of ["ownership.js", "dom-adapter.js", "content-script.js", "service-worker.js", "turn-observer.js", "shadow-evidence.js"]) {
+// send-click-adapter classic: IIFE + namespaced write/DOM deps; providers must precede it.
+const clickIdx = csJs.indexOf("send-click-adapter.js");
+if (clickIdx < 0) fail("manifest missing send-click-adapter.js");
+const sendClickDeps = [
+  { symbol: "resolveChatGptComposer", file: "dom-adapter-global.js", expose: /globalThis\.resolveChatGptComposer\s*=/ },
+  { symbol: "resolveChatGptAction", file: "dom-adapter-global.js", expose: /globalThis\.resolveChatGptAction\s*=/ },
+  { symbol: "normalizeCanonicalDomText", file: "dom-adapter-global.js", expose: /globalThis\.normalizeCanonicalDomText\s*=/ },
+  { symbol: "__c2cReadCanonicalComposerText", file: "composer-write-adapter.js", expose: /globalThis\.__c2cReadCanonicalComposerText\s*=/ },
+];
+for (const dep of sendClickDeps) {
+  const idx = csJs.indexOf(dep.file);
+  if (idx < 0) fail(`send-click dep ${dep.symbol}: manifest missing ${dep.file}`);
+  if (idx >= clickIdx) {
+    fail(`send-click dep ${dep.symbol}: ${dep.file} must load before send-click-adapter.js`);
+  }
+  const providerText = fs.readFileSync(path.join(distCompanion, dep.file), "utf8");
+  if (!dep.expose.test(providerText)) {
+    fail(`send-click dep ${dep.symbol}: ${dep.file} does not expose ${dep.expose}`);
+  }
+}
+const clickClassicGate = fs.readFileSync(path.join(distCompanion, "send-click-adapter.js"), "utf8");
+if (!/^\(function \(\)/.test(clickClassicGate.replace(/^\/\/.*\n/, ""))) {
+  fail("send-click-adapter.js classic must be wrapped in IIFE");
+}
+for (const bindName of [
+  "globalThis.resolveChatGptComposer",
+  "globalThis.resolveChatGptAction",
+  "globalThis.normalizeCanonicalDomText",
+  "globalThis.__c2cReadCanonicalComposerText",
+]) {
+  if (!clickClassicGate.includes(bindName)) {
+    fail(`send-click-adapter.js must bind ${bindName}`);
+  }
+}
+if (!/globalThis\.__c2cDispatchNativeSend\s*=/.test(clickClassicGate)) {
+  fail("send-click-adapter.js must expose __c2cDispatchNativeSend");
+}
+if (/globalThis\.readCanonicalComposerText\s*=/.test(clickClassicGate)) {
+  fail("send-click-adapter.js must not expose unnamespaced readCanonicalComposerText");
+}
+
+for (const f of ["ownership.js", "dom-adapter-global.js", "content-script.js", "service-worker.js", "turn-observer-global.js", "shadow-evidence.js", "dom-adapter.js", "turn-observer.js", "route-attestation.js"]) {
   const text = fs.readFileSync(path.join(distCompanion, f), "utf8");
   if (/require\(["']node:/.test(text) || /from ["']node:/.test(text)) {
     fail(`${f} must not use Node-only imports`);

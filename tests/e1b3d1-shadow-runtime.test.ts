@@ -1794,7 +1794,9 @@ describe("E1b3d1 packaging + runtime safety gates", () => {
   it("manifest loads read-only capability only", () => {
     const manifest = JSON.parse(fs.readFileSync(path.join(companionRoot, "manifest.json"), "utf8"));
     const js = (manifest.content_scripts ?? []).flatMap((cs: { js?: string[] }) => cs.js ?? []);
-    expect(js).toContain("turn-observer.js");
+    expect(js).toContain("turn-observer-global.js");
+    expect(js).not.toContain("turn-observer.js");
+    expect(js).not.toContain("dom-adapter.js");
     expect(js).toContain("shadow-evidence.js");
     expect(js).not.toContain("send-adapter.js");
     expect(js).not.toContain("send-orchestrator.js");
@@ -1873,7 +1875,7 @@ describe("E1b3d1 packaging + runtime safety gates", () => {
     expect(cs).not.toMatch(/\.click\(\)/);
     const shadow = fs.readFileSync(path.join(distCompanion, "shadow-evidence.js"), "utf8");
     expect(shadow).not.toMatch(/writeCanonicalMessage|dispatchNativeSend|\.click\(\)/);
-    const dom = fs.readFileSync(path.join(distCompanion, "dom-adapter.js"), "utf8");
+    const dom = fs.readFileSync(path.join(distCompanion, "dom-adapter-global.js"), "utf8");
     expect(dom).toMatch(/inspectActiveComposerControls/);
     expect(dom).toMatch(/globalThis\.inspectActiveComposerControls/);
     expect(dom).toMatch(/inspectComposerContainerInventory/);
@@ -1881,6 +1883,10 @@ describe("E1b3d1 packaging + runtime safety gates", () => {
     expect(dom).toMatch(/isExcludedEmbeddedEditor/);
     expect(dom).toMatch(/globalThis\.isExcludedEmbeddedEditor/);
     expect(dom).not.toMatch(/writeCanonicalMessage|dispatchNativeSend|\.click\(\)/);
+    // ESM SW artifact must not carry classic footer.
+    const domEsm = fs.readFileSync(path.join(distCompanion, "dom-adapter.js"), "utf8");
+    expect(domEsm).toMatch(/^export\s/m);
+    expect(domEsm).not.toMatch(/globalThis\.resolveChatGptComposer\s*=/);
   });
 
   it("dom-adapter inventory source stays read-only and privacy-capped", () => {

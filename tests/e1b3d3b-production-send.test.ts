@@ -1975,8 +1975,8 @@ describe("E1b3d3b packaging regression", () => {
     const context = vm.createContext(sandbox);
     const loadOrder = [
       "route-global.js",
-      "dom-adapter.js",
-      "turn-observer.js",
+      "dom-adapter-global.js",
+      "turn-observer-global.js",
       "shadow-evidence.js",
       "composer-write-adapter.js",
       "send-click-adapter.js",
@@ -2009,8 +2009,8 @@ describe("E1b3d3b packaging regression", () => {
     const context = vm.createContext(sandbox);
     const loadOrder = [
       "route-global.js",
-      "dom-adapter.js",
-      "turn-observer.js",
+      "dom-adapter-global.js",
+      "turn-observer-global.js",
       "composer-write-adapter.js",
       "send-click-adapter.js",
       "production-send-runtime-global.js",

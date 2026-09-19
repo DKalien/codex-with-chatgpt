@@ -29,8 +29,8 @@
       ],
       "js": [
         "route-global.js",
-        "dom-adapter.js",
-        "turn-observer.js",
+        "dom-adapter-global.js",
+        "turn-observer-global.js",
         "shadow-evidence.js",
         "composer-write-adapter.js",
         "send-click-adapter.js",
