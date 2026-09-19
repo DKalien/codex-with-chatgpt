@@ -64,24 +64,47 @@ async function runWithDom(opts) {
   const writeAdapter = await import("../browser-companion/composer-write-adapter.js");
   const clickAdapter = await import("../browser-companion/send-click-adapter.js");
   const writeProbe = await import("../browser-companion/write-probe.js");
+  const { normalizeCanonicalDomText } = await import("../browser-companion/dom-adapter.js");
 
   const editor = { __editor: true };
+  const sendBtn = {
+    getAttribute: (n) => (n === "data-testid" ? "send-button" : null),
+  };
+  let wrote = false;
+  let clicks = 0;
+  // Lifecycle: preflight idle (no click target) → after write, send-button.
+  // Override via opts.actions / opts.postWriteAction / opts.textAfterWrite.
+  const postWriteAction = opts.postWriteAction
+    ?? { kind: "send", enabled: true, button: sendBtn, evidence: "form_send_button" };
+  const preflightAction = opts.preflightAction ?? { kind: "idle", enabled: true, button: null };
   vi.spyOn(domAdapter, "resolveChatGptComposer").mockReturnValue({ editor });
-  vi.spyOn(domAdapter, "resolveChatGptAction").mockReturnValue({ kind: "idle", enabled: true });
+  vi.spyOn(domAdapter, "resolveChatGptAction").mockImplementation(() => {
+    if (opts.actionSequence && opts.actionSequence.length) {
+      return opts.actionSequence.shift();
+    }
+    return wrote ? postWriteAction : preflightAction;
+  });
   vi.spyOn(writeProbe, "resolveMutationCanonicalRoute").mockReturnValue({ ok: true, canonical: ROUTE });
-  vi.spyOn(writeAdapter, "readCanonicalComposerText").mockReturnValue({ ok: true, text: "" });
+  vi.spyOn(writeAdapter, "readCanonicalComposerText").mockImplementation(() => {
+    if (opts.readAfterWrite) return opts.readAfterWrite(wrote);
+    return { ok: true, text: wrote ? (opts.textAfterWrite ?? normalizeCanonicalDomText(ATTEST)) : "" };
+  });
   vi.spyOn(writeAdapter, "writeCanonicalMessage").mockImplementation(() => {
+    wrote = true;
     if (opts.onWrite) opts.onWrite();
     return { ok: true, wrote: true, mutationAttempted: true };
   });
   vi.spyOn(writeAdapter, "verifyCanonicalComposer").mockReturnValue({ ok: true });
   vi.spyOn(clickAdapter, "dispatchNativeSend").mockImplementation(async () => {
+    clicks += 1;
     if (opts.onClick) opts.onClick();
-    return { ok: true, clicked: true, reason: undefined };
+    // Production dispatchNativeSend returns ok + clicked:1 (not boolean true).
+    return opts.clickResult ?? { ok: true, clicked: 1, reason: undefined };
   });
 
   try {
-    return await runRouteAttestationSend(makeDoc(), opts.runner);
+    const result = await runRouteAttestationSend(makeDoc(), opts.runner);
+    return { ...result, __clicks: clicks };
   } finally {
     vi.restoreAllMocks();
   }
@@ -120,6 +143,87 @@ function evidenceFixture() {
 }
 
 describe("route-attestation runner exact observation", () => {
+  it("A. positive lifecycle: idle preflight → write → send-button → one click → observed", async () => {
+    const result = await runWithDom({
+      onWrite: () => {},
+      onClick: () => {},
+      runner: okDomDeps({
+        turnsAfterClick: [{ id: "t1", text: ATTEST }],
+      }),
+    });
+    expect(result.ok).toBe(true);
+    expect(result.observed).toBe(true);
+    expect(result.clicked).toBe(true);
+    expect(result.__clicks).toBe(1);
+  });
+
+  it("B. post-write remains idle → timeout send_not_ready, zero click", async () => {
+    const result = await runWithDom({
+      postWriteAction: { kind: "idle", enabled: true, button: null },
+      runner: okDomDeps({
+        turnsAfterClick: [{ id: "t1", text: ATTEST }],
+        readyTimeoutMs: 200,
+      }),
+    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("route_attest_send_not_ready");
+    expect(result.__clicks).toBe(0);
+    expect(result.clicked).toBe(false);
+  });
+
+  it("C. post-write disabled send → timeout, zero click", async () => {
+    const sendBtn = { getAttribute: (n) => (n === "data-testid" ? "send-button" : null) };
+    const result = await runWithDom({
+      postWriteAction: { kind: "send", enabled: false, button: sendBtn },
+      runner: okDomDeps({
+        turnsAfterClick: [{ id: "t1", text: ATTEST }],
+        readyTimeoutMs: 200,
+      }),
+    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("route_attest_send_not_ready");
+    expect(result.__clicks).toBe(0);
+  });
+
+  it("D. composer text drifts after write → composer_text_mismatch, zero click", async () => {
+    const sendBtn = { getAttribute: (n) => (n === "data-testid" ? "send-button" : null) };
+    const result = await runWithDom({
+      postWriteAction: { kind: "send", enabled: true, button: sendBtn },
+      textAfterWrite: "drifted composer body",
+      runner: okDomDeps({ turnsAfterClick: [{ id: "t1", text: ATTEST }] }),
+    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("composer_text_mismatch");
+    expect(result.__clicks).toBe(0);
+  });
+
+  it("E. route/generation drift after write → fail closed, zero click", async () => {
+    const sendBtn = { getAttribute: (n) => (n === "data-testid" ? "send-button" : null) };
+    let drift = false;
+    const deps = okDomDeps({ turnsAfterClick: [{ id: "t1", text: ATTEST }] });
+    deps.getCurrentGeneration = () => (drift ? 99 : 3);
+    const result = await runWithDom({
+      onWrite: () => {
+        drift = true;
+      },
+      postWriteAction: { kind: "send", enabled: true, button: sendBtn },
+      runner: deps,
+    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("route_attest_generation_mismatch");
+    expect(result.__clicks).toBe(0);
+  });
+
+  it("stop after write → generation_active, zero click", async () => {
+    const result = await runWithDom({
+      postWriteAction: { kind: "stop", enabled: true, button: { getAttribute: () => "stop-button" } },
+      runner: okDomDeps({ turnsAfterClick: [{ id: "t1", text: ATTEST }] }),
+    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("generation_active");
+    expect(result.__clicks).toBe(0);
+  });
+
   it("observer ok:false / missing challenge marker → never observed", async () => {
     const result = await runWithDom({
       onWrite: () => {},

@@ -1267,6 +1267,167 @@ describe("G3 route attestation browser contract (source)", () => {
   });
 });
 
+describe("classic route-attestation post-write send-ready lifecycle", () => {
+  it("F. classic runner idle→send after write; exactly one click; observed", async () => {
+    const distCompanion = path.join(projectRoot, "dist", "browser-companion");
+    if (!fs.existsSync(path.join(distCompanion, "manifest.json"))) {
+      expect(true).toBe(true);
+      return;
+    }
+    const vm = await import("node:vm");
+    const distManifest = JSON.parse(fs.readFileSync(path.join(distCompanion, "manifest.json"), "utf8"));
+    const js = (distManifest.content_scripts ?? []).flatMap((cs: { js?: string[] }) => cs.js ?? []);
+    const sandbox: Record<string, unknown> = {
+      console,
+      setTimeout: () => 0,
+      setInterval: () => 0,
+      clearTimeout: () => {},
+      clearInterval: () => {},
+      location: { href: "https://chatgpt.com/c/aaaaaaaa-1111-4111-8111-111111111111" },
+      window: { addEventListener: () => {} },
+      document: { hidden: false, addEventListener: () => {}, querySelector: () => null, querySelectorAll: () => [] },
+      chrome: {
+        runtime: {
+          lastError: null,
+          sendMessage: (_m: unknown, cb?: (r: unknown) => void) => {
+            if (typeof cb === "function") cb({ ok: true });
+          },
+          onMessage: { addListener: () => {} },
+        },
+      },
+    };
+    sandbox.globalThis = sandbox;
+    vm.createContext(sandbox);
+    for (const f of js) {
+      const text = fs.readFileSync(path.join(distCompanion, f), "utf8");
+      vm.runInContext(text, sandbox, { filename: f });
+    }
+
+    const g = sandbox as Record<string, unknown>;
+    const runAttest = g.__c2cRunRouteAttestationSend as (
+      doc: unknown,
+      opts: Record<string, unknown>,
+    ) => Promise<{
+      ok: boolean; reason?: string; clicked?: boolean; observed?: boolean; wrote?: boolean;
+    }>;
+    expect(typeof runAttest).toBe("function");
+
+    const message = ATTEST;
+    const route = ROUTE;
+    const blocks = [""];
+    let sendReady = false;
+    let clicks = 0;
+    const userTurns: unknown[] = [];
+
+    const sendBtn = {
+      tagName: "BUTTON",
+      getAttribute: (n: string) =>
+        n === "data-testid" ? "send-button" : n === "type" ? "submit" : n === "aria-label" ? "发送提示词" : null,
+      hasAttribute: (n: string) => n === "data-testid",
+      disabled: false,
+      click() {
+        clicks += 1;
+        userTurns.push({
+          id: "user-attest",
+          text: message,
+          node: { children: [{ innerText: message }] },
+        });
+      },
+    };
+    const voice = {
+      className: "composer-submit-button-color text-submit-btn-text",
+      getAttribute: (n: string) => (n === "aria-label" ? "启动语音功能" : null),
+      hasAttribute: () => false,
+      disabled: false,
+      click: () => {
+        throw new Error("voice must not be clicked");
+      },
+    };
+    const form = {
+      querySelector(selector: string) {
+        if (selector === 'button[data-testid="send-button"]') return sendReady ? sendBtn : null;
+        if (selector === "button.composer-submit-button-color") return sendReady ? sendBtn : voice;
+        return null;
+      },
+      querySelectorAll(selector: string) {
+        return selector === "button" ? (sendReady ? [sendBtn] : [voice]) : [];
+      },
+    };
+    const editor = {
+      tagName: "DIV",
+      id: "prompt-textarea",
+      className: "ProseMirror",
+      getAttribute: (n: string) => (n === "contenteditable" ? "true" : null),
+      hasAttribute: () => false,
+      closest: (s: string) => (s === "form" ? form : null),
+      focus: () => {},
+      get children() {
+        return {
+          length: blocks.length,
+          ...Object.fromEntries(blocks.map((t, i) => [String(i), { tagName: "P", textContent: t }])),
+        };
+      },
+      textContent: blocks.join(""),
+    };
+    const doc = {
+      defaultView: {
+        getSelection: () => ({ removeAllRanges() {}, addRange() {} }),
+        Event: class Event {
+          type: string;
+          bubbles: boolean;
+          constructor(type: string, init: { bubbles?: boolean } = {}) {
+            this.type = type;
+            this.bubbles = Boolean(init.bubbles);
+          }
+        },
+      },
+      createRange: () => ({ selectNodeContents() {} }),
+      execCommand: (_c: string, _u: boolean, v: string) => {
+        blocks.splice(0, blocks.length, ...String(v).split("\n"));
+        // ChatGPT surfaces send-button only after composer has content.
+        sendReady = true;
+        return true;
+      },
+      queryCommandSupported: () => true,
+      querySelector(selector: string) {
+        if (selector === "#prompt-textarea" || selector.includes("ProseMirror") || selector.includes("contenteditable")) {
+          return editor;
+        }
+        return null;
+      },
+      querySelectorAll: () => [],
+    };
+
+    let snap = 0;
+    const result = await runAttest(doc, {
+      attestationMessage: message,
+      expectedRoute: route,
+      expectedGeneration: 1,
+      locationHref: route,
+      parseRoute: (href: string) => parseChatgptConversationRoute(href, {
+        allowQueryOrHash: false,
+        conversationIdPolicy: "uuid",
+      }),
+      getCurrentHref: () => route,
+      getCurrentGeneration: () => 1,
+      waitMs: async () => {},
+      readyTimeoutMs: 500,
+      observeTimeoutMs: 300,
+      pollMs: 10,
+      snapshotUserTurns: () => {
+        snap += 1;
+        return snap === 1 ? [] : userTurns.slice();
+      },
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.wrote).toBe(true);
+    expect(result.clicked).toBe(true);
+    expect(result.observed).toBe(true);
+    expect(clicks).toBe(1);
+  });
+});
+
 describe("route observer has no querySelectorAll fallback", () => {
   function makeDescendant(innerText: string) {
     return { innerText };

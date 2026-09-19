@@ -131,28 +131,91 @@ export async function runRouteAttestationSend(doc, opts = {}) {
     };
   }
 
+  // Send-ready poll (send-probe contract): live route + generation + exact text.
+  // idle = generation idle / NOT a click target; only form send-button is dispatchable.
   const deadline = now() + readyTimeoutMs;
+  const pollMs = typeof opts.pollMs === "number" ? opts.pollMs : 50;
   for (;;) {
-    if (!generationOk() || !routeOk()) {
-      return { ...base, ok: false, reason: "route_attest_identity_lost", mutationAttempted: true, wrote: true, verified: true };
+    if (!generationOk()) {
+      return {
+        ...base,
+        ok: false,
+        reason: "route_attest_generation_mismatch",
+        mutationAttempted: true,
+        wrote: true,
+        verified: true,
+      };
+    }
+    if (!routeOk()) {
+      return {
+        ...base,
+        ok: false,
+        reason: "route_attest_identity_lost",
+        mutationAttempted: true,
+        wrote: true,
+        verified: true,
+      };
     }
     const { editor } = resolveChatGptComposer(doc);
     if (!editor) {
-      return { ...base, ok: false, reason: "composer_missing", mutationAttempted: true, wrote: true, verified: true };
+      return {
+        ...base,
+        ok: false,
+        reason: "composer_missing",
+        mutationAttempted: true,
+        wrote: true,
+        verified: true,
+      };
+    }
+    const read = readCanonicalComposerText(editor);
+    if (!read.ok || read.text !== normalizeText(attestationMessage)) {
+      return {
+        ...base,
+        ok: false,
+        reason: read.ok ? "composer_text_mismatch" : read.reason,
+        mutationAttempted: true,
+        wrote: true,
+        verified: true,
+      };
     }
     const action = resolveChatGptAction(doc, editor);
-    if (action.kind === "idle" && action.enabled === true) break;
-    if (now() >= deadline) {
-      return { ...base, ok: false, reason: "route_attest_send_not_ready", mutationAttempted: true, wrote: true, verified: true };
+    if (action.kind === "stop") {
+      return {
+        ...base,
+        ok: false,
+        reason: "generation_active",
+        mutationAttempted: true,
+        wrote: true,
+        verified: true,
+      };
     }
-    await waitMs(50);
+    if (
+      action.kind === "send"
+      && action.enabled === true
+      && action.button?.getAttribute?.("data-testid") === "send-button"
+    ) {
+      break;
+    }
+    // idle / unknown / disabled send: keep polling until timeout.
+    if (now() >= deadline) {
+      return {
+        ...base,
+        ok: false,
+        reason: "route_attest_send_not_ready",
+        mutationAttempted: true,
+        wrote: true,
+        verified: true,
+      };
+    }
+    await waitMs(pollMs);
   }
 
   const click = await dispatchNativeSend(doc, attestationMessage, {
     routeValid: true,
     mutationGuard: () => routeOk() && generationOk(),
   });
-  if (!click || click.clicked !== true) {
+  // send-probe contract: success is click.ok (dispatch returns clicked: 1).
+  if (!click || click.ok !== true) {
     // Ambiguous or failed click — fail closed, no auto-retry.
     return {
       ...base,
