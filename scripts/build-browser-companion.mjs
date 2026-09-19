@@ -5,6 +5,7 @@
  */
 import fs from "node:fs";
 import path from "node:path";
+import vm from "node:vm";
 import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -525,6 +526,31 @@ const requiredFiles = [
 ];
 for (const f of requiredFiles) {
   if (!fs.existsSync(path.join(distCompanion, f))) fail(`packaged file missing: ${f}`);
+}
+
+const popupHtml = fs.readFileSync(path.join(distCompanion, "popup", "popup.html"), "utf8");
+const popupScripts = [...popupHtml.matchAll(/<script\b([^>]*)><\/script>/gi)]
+  .map(([, attributes]) => ({
+    attributes,
+    src: /\bsrc=["']([^"']+)["']/i.exec(attributes)?.[1] ?? null,
+  }));
+for (const bannedPopupScript of ["dom-adapter.js", "turn-observer.js", "route-attestation.js", "route-attestation-run.js"]) {
+  if (popupScripts.some(({ src }) => src?.split(/[\\/]/).pop() === bannedPopupScript)) {
+    fail(`popup.html must not load ESM artifact as classic script: ${bannedPopupScript}`);
+  }
+}
+for (const { attributes, src } of popupScripts) {
+  if (/\btype=["']module["']/i.test(attributes)) continue;
+  if (!src) fail("popup classic script must reference a packaged artifact");
+  const artifact = path.resolve(distCompanion, "popup", src);
+  if (!artifact.startsWith(`${distCompanion}${path.sep}`) || !fs.existsSync(artifact)) {
+    fail(`popup classic script missing or outside package: ${src}`);
+  }
+  try {
+    new vm.Script(fs.readFileSync(artifact, "utf8"), { filename: src });
+  } catch (error) {
+    fail(`popup classic script contains unsupported syntax (${src}): ${error.message}`);
+  }
 }
 
 // ESM preserve gates: SW module graph must keep import/export semantics.

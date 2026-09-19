@@ -17,6 +17,8 @@
     unbind: document.getElementById("unbind"),
     transportStatus: document.getElementById("transport-status"),
     bridgeOrigin: document.getElementById("bridge-origin"),
+    grantBridgeAccess: document.getElementById("grant-bridge-access"),
+    bridgePermissionStatus: document.getElementById("bridge-permission-status"),
     pairJson: document.getElementById("pair-json"),
     applyPairJson: document.getElementById("apply-pair-json"),
     intentId: document.getElementById("intent-id"),
@@ -213,14 +215,14 @@
     return { intentId, secret };
   }
 
-  async function requestBridgePermission(origin) {
-    try {
-      const url = new URL(origin);
-      const pattern = `${url.protocol}//${url.hostname}/*`;
-      return await chrome.permissions.request({ origins: [pattern] });
-    } catch {
-      return false;
+  function bridgePermission(origin) {
+    const url = new URL((origin ?? "").trim());
+    const loopback = ["127.0.0.1", "localhost", "[::1]", "::1"].includes(url.hostname.toLowerCase());
+    if (url.username || url.password || url.search || url.hash || (url.pathname && url.pathname !== "/")
+      || (url.protocol !== "https:" && !(url.protocol === "http:" && loopback))) {
+      throw new Error("bridge_origin_invalid");
     }
+    return { origin: url.origin, pattern: `${url.origin}/*` };
   }
 
   async function refresh() {
@@ -454,6 +456,36 @@
       els.pairHint.className = "note ok";
     };
 
+    els.grantBridgeAccess.onclick = async () => {
+      let permission;
+      try {
+        permission = bridgePermission(els.bridgeOrigin.value);
+      } catch {
+        setText(els.bridgePermissionStatus, "bridge_origin_invalid", "bad");
+        return;
+      }
+
+      const query = { origins: [permission.pattern] };
+      // Invoke while the click user-gesture is still live.
+      // Never await storage / contains / tabs / runtime before this call.
+      const grantPromise = chrome.permissions.request(query);
+
+      let granted = false;
+      try {
+        granted = await grantPromise;
+      } catch {
+        granted = false;
+      }
+
+      if (granted) {
+        await saveBridgeOrigin(permission.origin);
+        els.bridgeOrigin.value = permission.origin;
+        setText(els.bridgePermissionStatus, "Bridge access granted", "ok");
+      } else {
+        setText(els.bridgePermissionStatus, "Bridge access denied", "bad");
+      }
+    };
+
     els.pair.onclick = async () => {
       const origin = els.bridgeOrigin.value.trim();
       const intentId = els.intentId.value.trim();
@@ -463,12 +495,20 @@
         return;
       }
       if (!tab?.id) return;
-      await saveBridgeOrigin(origin);
-      await saveIntentSession(intentId);
       try {
-        const granted = await requestBridgePermission(origin);
+        let permission;
+        try {
+          permission = bridgePermission(origin);
+        } catch {
+          setText(els.transportStatus, "bridge_origin_invalid", "bad");
+          return;
+        }
+        await saveBridgeOrigin(permission.origin);
+        await saveIntentSession(intentId);
+        els.bridgeOrigin.value = permission.origin;
+        const granted = await chrome.permissions.contains({ origins: [permission.pattern] });
         if (!granted) {
-          setText(els.transportStatus, "未授予 Bridge origin 权限；transport 禁用", "bad");
+          setText(els.transportStatus, "bridge_permission_missing", "bad");
           return;
         }
         const tabNow = await activeTab();
@@ -488,7 +528,7 @@
         }
         const res = await chrome.runtime.sendMessage({
           type: "c2c.pair",
-          bridgeOrigin: origin,
+          bridgeOrigin: permission.origin,
           intentId,
           secret,
           ownerProofId: proof.proof.id,

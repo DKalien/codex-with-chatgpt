@@ -77,6 +77,8 @@
       <div class="label">Bridge origin（持久保存；非 secret；仅 HTTPS / 开发 loopback）</div>
       <input id="bridge-origin" placeholder="https://c2c-codex-with-chatgpt.devworklink.com" autocomplete="off" />
     </div>
+    <button id="grant-bridge-access" class="secondary">Grant Bridge access</button>
+    <div class="note" id="bridge-permission-status">Bridge access 未检查</div>
     <div class="row">
       <div class="label">Paste pairing JSON（一次粘贴 feedback_companion_pair 整段输出）</div>
       <textarea id="pair-json" rows="4" placeholder='{"intentId":"...","secret":"c2c_pair_...","expiresAt":"...","bindingId":"...","epoch":1}'></textarea>
@@ -184,7 +186,6 @@
     </div>
   </main>
   <script src="../route-global.js"></script>
-  <script src="../dom-adapter.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>

@@ -436,7 +436,7 @@ describe("E1b2 recovery / authStale / storage policy (final closeout)", () => {
     );
     // pair result must be applied after refresh so reason is not overwritten
     const pairIdx = popup.indexOf('els.pair.onclick');
-    const pairBody = popup.slice(pairIdx, pairIdx + 2200);
+    const pairBody = popup.slice(pairIdx, popup.indexOf('if (els.verifyRoute)', pairIdx));
     const refreshIdx = pairBody.indexOf("await refresh()");
     const failIdx = pairBody.indexOf("pair 失败");
     expect(refreshIdx).toBeGreaterThan(-1);
