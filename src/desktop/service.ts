@@ -5,6 +5,8 @@ import { isTrustedDesktopReceipt, readExecutionRecordsStrict } from "../executio
 import { desktopIpc, DESKTOP_IPC_ERROR_MESSAGES, validateDesktopWireMessage } from "./ipc.js";
 import { DesktopError, desktopId, publicDelivery, readDesktop, sendInput, targetInput, updateDesktop,
   type DesktopBinding, type DesktopDelivery, type DesktopState } from "./store.js";
+import { unresolvedOutcomeUnknownCommandIds, isOutcomeUnknownAdministrativelyResolved, assertNoOutcomeResolutionForCommand } from "./outcome-resolution.js";
+import { withEvidenceLock } from "./legacy-reconciliation.js";
 
 type LocalWorkspace = Pick<Workspace, "id" | "root">;
 const POST_RESULT_SETTLE_TIMEOUT_MS = 30_000;
@@ -63,11 +65,11 @@ export function disableDesktop(workspace: LocalWorkspace): void {
 
 /** 本地快捷路径：无 target 参数、无免确认标志；网页 MCP 不注册此操作。 */
 export async function bindCurrentDesktop(workspace: LocalWorkspace) {
-  assertNoUncertainDelivery(checked(workspace, readDesktop(workspace.id)));
+  assertNoUncertainDelivery(workspace, checked(workspace, readDesktop(workspace.id)));
   const observed = await desktopIpc.currentIdentity(workspace.root);
   const selected = targetInput.parse({ threadId: observed.threadId, hostId: observed.hostId, projectId: observed.projectId });
   const snapshot = checked(workspace, readDesktop(workspace.id));
-  assertNoUncertainDelivery(snapshot);
+  assertNoUncertainDelivery(workspace, snapshot);
   const sameTarget = snapshot.binding && snapshot.binding.threadId === selected.threadId &&
     snapshot.binding.hostId === selected.hostId && snapshot.binding.projectId === selected.projectId;
   if (sameTarget && snapshot.enabled) return { alreadyEnabled: true, enabled: true, binding: snapshot.binding! };
@@ -79,7 +81,7 @@ export async function bindCurrentDesktop(workspace: LocalWorkspace) {
     throw new DesktopError("DESKTOP_BINDING_CHANGED", "确认期间目标身份发生变化；未绑定或启用，请重新操作。");
   return updateDesktop(workspace.id, previous => {
     const state = checked(workspace, previous);
-    assertNoUncertainDelivery(state);
+    assertNoUncertainDelivery(workspace, state);
     // revision 同样捕获 disable→enable 或重复 disable 的 ABA，不能使用确认前的旧授权快照。
     if ((state.revision ?? 0) !== (snapshot.revision ?? 0))
       throw new DesktopError("DESKTOP_BINDING_CHANGED", "确认期间本机状态发生变化；未覆盖撤权或重新绑定，请重新操作。");
@@ -109,8 +111,8 @@ function desktopTaskEnvelope(input: z.infer<typeof sendInput>): string {
   });
 }
 
-function assertNoUncertainDelivery(state: DesktopState) {
-  if (state.deliveries.some(item => item.deliveryStatus === "outcome_unknown"))
+function assertNoUncertainDelivery(workspace: LocalWorkspace, state: DesktopState) {
+  if (unresolvedOutcomeUnknownCommandIds(workspace, state).size > 0)
     throw new DesktopError("DESKTOP_OUTCOME_UNRESOLVED", "已有结果不明的投递；不要更换 commandId 或重新绑定绕过，须在 Desktop 人工核对。");
   if (state.deliveries.length >= 10000)
     throw new DesktopError("DESKTOP_HISTORY_FULL", "投递历史容量已满；保留 ID，须人工迁移后继续。");
@@ -130,7 +132,7 @@ function receiptBackedTail(workspace: LocalWorkspace, binding: DesktopBinding, a
   const state = readDesktop(workspace.id);
   if (!state || state.workspaceRoot !== workspace.root || !state.enabled ||
       !state.binding || state.binding.bindingId !== binding.bindingId ||
-      state.deliveries.some(item => item.deliveryStatus === "outcome_unknown")) return false;
+      unresolvedOutcomeUnknownCommandIds(workspace, state).size > 0) return false;
   const deliveries = state.deliveries.filter(item => item.bindingId === binding.bindingId &&
     item.threadId === binding.threadId && item.deliveryStatus === "accepted" && item.turnId === active.activeTurnId);
   if (deliveries.length !== 1) return false;
@@ -163,7 +165,7 @@ async function prepareWithPostResultSettle(
       await sleep(Math.min(pollMs, Math.max(0, deadline - now())));
       authorize();
       const state = authorized(workspace, readDesktop(workspace.id), binding.bindingId);
-      assertNoUncertainDelivery(state);
+      assertNoUncertainDelivery(workspace, state);
       try {
         return await desktopIpc.prepare(target(workspace, binding));
       } catch (retryFailure) {
@@ -192,7 +194,7 @@ export async function sendDesktop(workspace: LocalWorkspace, raw: z.infer<typeof
   const prior = replay(snapshot, input, clientId, digest);
   if (prior) return publicDelivery(prior);
   const wireMessage = validateDesktopWireMessage(desktopTaskEnvelope(input));
-  assertNoUncertainDelivery(snapshot);
+  assertNoUncertainDelivery(workspace, snapshot);
   const connection = await prepareWithPostResultSettle(workspace, snapshot.binding, authorize, settleOptions);
   try {
     // 不跨 IPC 预检持锁；提交点前在短锁内重新读取授权和绑定，防止旧快照越过撤权。
@@ -202,7 +204,7 @@ export async function sendDesktop(workspace: LocalWorkspace, raw: z.infer<typeof
       const state = authorized(workspace, previous, input.bindingId);
       const existing = replay(state, input, clientId, digest);
       if (existing) return { state, result: { record: existing, attempt: false } };
-      assertNoUncertainDelivery(state);
+      assertNoUncertainDelivery(workspace, state);
       const now = new Date().toISOString();
       const record: DesktopDelivery = { commandId: input.commandId, clientId, bindingId: input.bindingId,
         intent: input.intent,
@@ -226,29 +228,31 @@ export async function sendDesktop(workspace: LocalWorkspace, raw: z.infer<typeof
       // 上面的 fsync/原子替换是本地提交点。此后 disable 不能撤回在途消息，任何不明结果均不重发。
       const receipt = z.object({ threadId: z.string().uuid(), turnId: z.string().uuid() }).strict().parse(await connection.send(wireMessage));
       if (receipt.threadId !== committed.record.threadId) throw new Error("wrong receipt target");
-      const accepted = updateDesktop(workspace.id, previous => {
+      const accepted = withEvidenceLock(workspace.id, () => updateDesktop(workspace.id, previous => {
         const state = checked(workspace, previous);
         const record = replay(state, input, clientId, digest);
         if (!record || record.threadId !== receipt.threadId || record.deliveryStatus !== "outcome_unknown" ||
           state.deliveries.some(item => item.turnId === receipt.turnId))
           throw new Error("delivery history changed");
+        assertNoOutcomeResolutionForCommand(workspace.id, input.commandId);
         record.deliveryStatus = "accepted"; record.turnId = receipt.turnId; record.updatedAt = new Date().toISOString();
         return { state, result: record };
-      });
+      }));
       return publicDelivery(accepted);
     } catch (failure) {
       // 只信受控适配器明确确认尚未进入 start 的白名单错误；任意 IPC 写入后异常均是 unknown。
       if (failure instanceof DesktopError && (failure as DesktopError & { notSent?: boolean }).notSent === true &&
         DESKTOP_IPC_ERROR_MESSAGES[failure.code] && !["DESKTOP_OUTCOME_UNKNOWN", "DESKTOP_PROTOCOL_ERROR", "DESKTOP_IPC_REJECTED"].includes(failure.code)) {
         try {
-          const rejected = updateDesktop(workspace.id, previous => {
+          const rejected = withEvidenceLock(workspace.id, () => updateDesktop(workspace.id, previous => {
             const state = checked(workspace, previous);
             const record = replay(state, input, clientId, digest);
             if (!record || record.deliveryStatus !== "outcome_unknown") throw new Error("delivery history changed");
+            assertNoOutcomeResolutionForCommand(workspace.id, input.commandId);
             record.deliveryStatus = "rejected"; record.errorCode = failure.code;
             record.errorMessage = DESKTOP_IPC_ERROR_MESSAGES[failure.code]; record.updatedAt = new Date().toISOString();
             return { state, result: record };
-          });
+          }));
           return publicDelivery(rejected);
         } catch { /* 拒绝结果无法落盘，继续保留 unknown；不重发 */ }
       }
@@ -277,7 +281,10 @@ export async function desktopStatus(workspace: LocalWorkspace, commandId?: strin
     state = latest;
   }
   const delivery = commandId ? state.deliveries.find(item => item.commandId === commandId) : undefined;
+  const unresolved = unresolvedOutcomeUnknownCommandIds(workspace, state);
+  const resolutionStatus = delivery && delivery.deliveryStatus === "outcome_unknown" &&
+    isOutcomeUnknownAdministrativelyResolved(workspace, delivery.commandId) ? "administratively_resolved" as const : undefined;
   return { workspaceId: workspace.id, enabled: state.enabled, binding: state.binding, availability,
-    unresolvedDelivery: state.deliveries.some(item => item.deliveryStatus === "outcome_unknown"),
-    delivery: delivery ? publicDelivery(delivery) : null };
+    unresolvedDelivery: unresolved.size > 0,
+    delivery: delivery ? { ...publicDelivery(delivery), ...(resolutionStatus ? { resolutionStatus } : {}) } : null };
 }

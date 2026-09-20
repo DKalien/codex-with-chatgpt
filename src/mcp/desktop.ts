@@ -24,6 +24,7 @@ const deliveryOutputSchema = z.object({
   threadId: z.string().uuid(),
   turnId: z.string().uuid().optional(),
   deliveryStatus: z.enum(["outcome_unknown", "accepted", "rejected"]),
+  resolutionStatus: z.literal("administratively_resolved").optional(),
   error: z.string().optional(),
   createdAt: z.string(),
   updatedAt: z.string(),

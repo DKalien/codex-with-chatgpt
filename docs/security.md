@@ -156,12 +156,15 @@ ID；必要的 `bindingId`、`threadId` 和 `turnId` 等投递元数据可以返
 状态查询、日志或 `execution_summary`。跨进程锁和原子写保证同 client、
 同 ID、同参数重放返回原记录，`intent` 或其他参数冲突时拒绝；实际发送前先保存“可能已发送”。回执超时、
 断线、崩溃或落盘不明返回 `outcome_unknown`，不自动重发，也不能换 `commandId` 绕过；
-整个 workspace（包括重新绑定后的目标）的后续投递暂停，必须由本机用户人工核对。本机显式
+整个 workspace（包括重新绑定后的目标）的后续投递暂停，必须由本机用户人工核对。除非本机用户
+完成独立且两阶段确认的行政 resolution，否则不能解除等待；resolution 也不改写 raw delivery。
+本机显式
 `desktop reconcile-unknown` 仅在 exact workspace/binding/thread、完整且最新边界为 `exhausted`
 的 canonical history、完整 envelope/message bytes/SHA-256 与唯一真实 UUID turnId 全部匹配时，
 允许 `outcome_unknown -> accepted + turnId`；0 个候选保持 unknown，多个候选、历史不完整或身份漂移
 均 fail closed。它不写 execution receipt、不表示任务成功，后续 turn 也不能代原 accepted turn 运行
-`record-result`。这个机制防止重复尝试，不宣称网络上的 exactly-once。`disable` 或重新绑定不能撤回
+`record-result`。行政 resolution 只让 workflow/rollout 停止等待，不能把结果称为 accepted、完成或成功。
+这个机制防止重复尝试，不宣称网络上的 exactly-once。`disable` 或重新绑定不能撤回
 已越过提交点的在途消息。
 
 状态 `revision` 可选；旧记录读取时默认 `0`，读取不迁移或回填。只有正常写入才递增

@@ -789,7 +789,7 @@ G3 修复 Browser Companion 误绑错误 ChatGPT conversation 后 production Sen
 - Pair/Rebind/Complete/Clear 共用 SW transport mutation gate，防止异步 Bridge 返回覆盖更新后的 transport。Browser restart 只允许 exact owner 对 durable `DONE + OBSERVED_PENDING_CONFIRM` 做只读 `/state` 收敛，不重复 complete 或 DOM Send。
 - 无 eligible predecessor 时返回 bounded `cold_pair_required`，继续使用现有手工 cold-pair fallback。Bridge permission 缺失时明确返回 `bridge_permission_missing`；Connect 不请求 permission、不 Arm、不触发 production feedback 操作。
 
-### P0.6 — Desktop capacity-retry continuation receipt ownership（已实现，待独立 Review）
+### P0.6 — Desktop capacity-retry continuation receipt ownership（已实现并完成独立 Review）
 
 - forensic 已确认本机平台的原始 accepted failed turn 后继为零 canonical user input、
   `params.turnTrigger=capacity_retry_automatic` 的机器生成 turn；没有普通 continuation 文本。
@@ -803,3 +803,15 @@ G3 修复 Browser Companion 误绑错误 ChatGPT conversation 后 production Sen
 - `outcome_unknown` 仍只恢复原始 envelope 的 accepted origin；P0.5 的 receipt-backed busy-tail settle
   仍只服务新 send，两者不改变彼此的 fail-closed 语义。P0.6 不新增 MCP 工具、不公开链内部、
   不重发 Desktop task、不产生第二条 receipt。
+
+### P0.6a — outcome_unknown 行政 resolution（已实现并完成独立 Review）
+
+- 增加显式 `desktop resolve-unknown --command-id` 两阶段入口：preview 只读，confirm 只写独立
+  resolution 证据；不修改原始 delivery，不补 turnId，不写 execution receipt/output，也不把结果
+  解释为成功。
+- resolution 证据绑定精确 workspace、commandId、delivery 摘要与 confirmationSha256，并与
+  trusted receipt、reconciliation、retirement、abandonment 及重复 resolution 做冲突检查；Desktop
+  IPC/canonical history 不可用时仍可安全执行，损坏或漂移一律 fail-closed。
+- 原始 `outcome_unknown` 保持不变；history 用 `resolved_unknown`、status 用
+  `administratively_resolved`，workflow/rollout 仅对有严格匹配证据的 unknown 解除阻塞，其他
+  unknown 继续阻断。原有 reconcile、self-reconcile、P0.5/P0.6 和 commandId 防重放语义不变。

@@ -12,6 +12,8 @@ import {
   type DesktopDelivery,
   type DesktopState,
 } from "./store.js";
+import { assertNoOutcomeResolutionForCommand } from "./outcome-resolution.js";
+import { withEvidenceLock } from "./legacy-reconciliation.js";
 
 export interface UnknownReconciliationWorkspace {
   id: string;
@@ -74,6 +76,17 @@ function sameDelivery(left: DesktopDelivery, right: DesktopDelivery): boolean {
     left.turnId === right.turnId;
 }
 
+function assertNoAdministrativeResolution(workspaceId: string, commandId: string): void {
+  try {
+    assertNoOutcomeResolutionForCommand(workspaceId, commandId);
+  } catch (error) {
+    if (error instanceof DesktopError && error.code.startsWith("DESKTOP_OUTCOME_RESOLUTION_")) {
+      return fail("DESKTOP_RECONCILIATION_CONFLICT", "该 commandId 已有独立行政 resolution；拒绝改写原 outcome_unknown delivery。");
+    }
+    throw error;
+  }
+}
+
 /**
  * 只把 Desktop 独立观察到的唯一真实 turn 补回 unknown delivery；不写 execution receipt。
  * 任何身份漂移、重复候选或已有终态都保持 fail-closed。
@@ -96,6 +109,7 @@ export async function reconcileUnknownDesktopDelivery(
   if (!delivery || delivery.deliveryStatus !== "outcome_unknown" || delivery.turnId !== undefined || delivery.intent === undefined) {
     return fail("DESKTOP_RECONCILIATION_NOT_ELIGIBLE", "仅允许带完整 intent 的 outcome_unknown delivery；未修改投递状态。");
   }
+  assertNoAdministrativeResolution(workspace.id, commandId);
   const target = checkedTarget(snapshot, workspace, delivery);
   const observation = await desktopIpc.reconcileUnknown(target, {
     workspaceId: workspace.id,
@@ -115,27 +129,28 @@ export async function reconcileUnknownDesktopDelivery(
   if (options.expectedTurnId !== undefined && turnId !== options.expectedTurnId) {
     return { status: "unresolved", commandId, deliveryStatus: "outcome_unknown" };
   }
-  const accepted = updateDesktop(workspace.id, current => {
-    if (!current || current.workspaceRoot !== workspace.root || (current.revision ?? 0) !== (snapshot.revision ?? 0)) {
-      return fail("DESKTOP_RECONCILIATION_CONFLICT", "对账期间 Desktop workspace 状态发生变化；未修改投递状态。");
-    }
-    const currentDelivery = current.deliveries.find(item => item.commandId === commandId);
-    if (!currentDelivery || !sameDelivery(currentDelivery, delivery) || currentDelivery.deliveryStatus !== "outcome_unknown") {
-      return fail("DESKTOP_RECONCILIATION_CONFLICT", "对账期间 delivery 或 binding 发生变化；未修改投递状态。");
-    }
-    const currentTarget = checkedTarget(current, workspace, currentDelivery);
-    if (!sameObservation(observation, currentTarget) ||
-        (options.expectedTurnId !== undefined && turnId !== options.expectedTurnId) ||
-        current.deliveries.some(item => item.turnId === turnId)) {
-      return fail("DESKTOP_RECONCILIATION_CONFLICT", "对账结果与当前 binding 或投递历史不一致；未修改投递状态。");
-    }
-    currentDelivery.deliveryStatus = "accepted";
-    currentDelivery.turnId = turnId;
-    currentDelivery.updatedAt = new Date().toISOString();
-    return {
-      state: current,
-      result: { status: "accepted" as const, commandId, deliveryStatus: "accepted" as const, turnId },
-    };
-  });
+  const accepted = withEvidenceLock(workspace.id, () => updateDesktop(workspace.id, current => {
+      if (!current || current.workspaceRoot !== workspace.root || (current.revision ?? 0) !== (snapshot.revision ?? 0)) {
+        return fail("DESKTOP_RECONCILIATION_CONFLICT", "对账期间 Desktop workspace 状态发生变化；未修改投递状态。");
+      }
+      const currentDelivery = current.deliveries.find(item => item.commandId === commandId);
+      if (!currentDelivery || !sameDelivery(currentDelivery, delivery) || currentDelivery.deliveryStatus !== "outcome_unknown") {
+        return fail("DESKTOP_RECONCILIATION_CONFLICT", "对账期间 delivery 或 binding 发生变化；未修改投递状态。");
+      }
+      assertNoAdministrativeResolution(workspace.id, commandId);
+      const currentTarget = checkedTarget(current, workspace, currentDelivery);
+      if (!sameObservation(observation, currentTarget) ||
+          (options.expectedTurnId !== undefined && turnId !== options.expectedTurnId) ||
+          current.deliveries.some(item => item.turnId === turnId)) {
+        return fail("DESKTOP_RECONCILIATION_CONFLICT", "对账结果与当前 binding 或投递历史不一致；未修改投递状态。");
+      }
+      currentDelivery.deliveryStatus = "accepted";
+      currentDelivery.turnId = turnId;
+      currentDelivery.updatedAt = new Date().toISOString();
+      return {
+        state: current,
+        result: { status: "accepted" as const, commandId, deliveryStatus: "accepted" as const, turnId },
+      };
+    }));
   return accepted;
 }

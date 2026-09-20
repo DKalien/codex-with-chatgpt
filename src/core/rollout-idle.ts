@@ -10,6 +10,7 @@ import { desktopIpc } from "../desktop/ipc.js";
 import { readDesktop } from "../desktop/store.js";
 import { readRemote } from "../remote/store.js";
 import { desktopHistory } from "../desktop/history.js";
+import { unresolvedOutcomeUnknownCommandIds } from "../desktop/outcome-resolution.js";
 import { readTunnelState, isNamedTunnelReady } from "../tunnel/state.js";
 import { UpgradeReason } from "./upgrade.js";
 
@@ -100,7 +101,7 @@ export async function assessRolloutIdle(
   try {
     const before = readDesktop(workspace.id);
     if (before && before.workspaceRoot !== workspace.root) blockers.push({ kind: "desktop_unknown" });
-    if (before?.deliveries.some(item => item.deliveryStatus === "outcome_unknown")) {
+    if (unresolvedOutcomeUnknownCommandIds(workspace, before).size > 0) {
       // 与原 idle() 一致：unresolved 全局阻塞，不再 inspect。
       blockers.push({ kind: "desktop_unresolved" });
     } else {

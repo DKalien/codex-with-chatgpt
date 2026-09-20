@@ -52,7 +52,9 @@ receipt 机制上线前的旧 accepted delivery 如果旧 thread 已无法安全
 `commandId`，再显式运行 `c2c desktop legacy-reconcile -w <workspace> --command-id <id> --json`。
 它只核对缺失 `intent` 的历史 delivery，并要求唯一终态 execution record、对应 output index
 元数据和晚于 accepted 时间的本机事实；证据写入独立本机存储，失败、冲突或损坏时不覆盖既有证据。
-含 `intent` 的当前/未来 delivery、普通 `c2c record`、缺 output 或 `outcome_unknown` 仍不能通过。
+含 `intent` 的当前/未来 delivery、普通 `c2c record`、缺 output 仍不能通过；raw
+`outcome_unknown` 仍不能冒充完成，只有独立的 `resolve-unknown` 行政证据才能让 workflow/rollout
+停止等待，且不会生成 receipt 或成功结论。
 
 ### "Bridge 未运行"
 `c2c start` (or let doctor do it). Bridge logs:

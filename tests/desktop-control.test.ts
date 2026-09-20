@@ -7,6 +7,7 @@ import { pathToFileURL } from "node:url";
 import { desktopIpc } from "../src/desktop/ipc.js";
 import { bindDesktop, desktopStatus, disableDesktop, enableDesktop, sendDesktop } from "../src/desktop/service.js";
 import { desktopFile, DesktopError, MAX_MESSAGE_BYTES, readDesktop, sendInput, updateDesktop } from "../src/desktop/store.js";
+import { previewOutcomeResolution, readOutcomeResolutions, resolveOutcomeUnknown } from "../src/desktop/outcome-resolution.js";
 import { cleanup, isolateStateDir } from "./helpers.js";
 
 let dir: string;
@@ -16,6 +17,12 @@ let bindingId: string;
 let send: ReturnType<typeof vi.fn>;
 let close: ReturnType<typeof vi.fn>;
 const input = (overrides = {}) => ({ intent: "development_plan" as const, userConfirmed: true as const, workspaceId: workspace.id, bindingId, commandId: "command_1", message: "中文计划\n\n```ts\nconst x = '你好';\n```", ...overrides });
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>(resolvePromise => { resolve = resolvePromise; });
+  return { promise, resolve };
+}
 
 beforeEach(async () => {
   dir = isolateStateDir();
@@ -72,6 +79,80 @@ describe("Desktop 持久化投递", () => {
     expect(desktopIpc.currentExecution).not.toHaveBeenCalled();
     expect(desktopIpc.inspectActiveExecution).toHaveBeenCalled();
     expect(readDesktop(workspace.id)?.deliveries.filter(item => item.commandId === "next_command")).toHaveLength(1);
+  });
+
+  it("已解决的 unknown 不阻断 receipt-backed busy-tail settle", async () => {
+    enableDesktop(workspace, bindingId);
+    send.mockRejectedValueOnce(new Error("结果不明"));
+    expect((await sendDesktop(workspace, input({ commandId: "resolved_unknown" }), "client")).deliveryStatus).toBe("outcome_unknown");
+    const preview = previewOutcomeResolution(workspace, "resolved_unknown");
+    expect(resolveOutcomeUnknown(workspace, "resolved_unknown", preview.confirmationSha256).status).toBe("resolved_unknown");
+
+    const activeTurnId = "01a00000-0000-7000-8000-000000000002";
+    seedReceiptBackedTail(activeTurnId);
+    const active = { ...target, workspaceRoot: workspace.root, cwd: workspace.root, title: "tail", runtimeStatus: "active", activeTurnId };
+    vi.mocked(desktopIpc.inspectActiveExecution).mockResolvedValue(active as never);
+    vi.mocked(desktopIpc.prepare)
+      .mockRejectedValueOnce(new DesktopError("DESKTOP_BUSY", "busy"))
+      .mockImplementationOnce(async () => ({ send, close }));
+    send.mockClear();
+
+    const result = await sendDesktop(workspace, input({ commandId: "next_after_resolution" }), "client", () => {}, {
+      timeoutMs: 100, pollMs: 1, sleep: async () => {}, now: (() => { let value = 0; return () => value += 10; })(),
+    });
+    expect(result.deliveryStatus).toBe("accepted");
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(readDesktop(workspace.id)?.deliveries.find(item => item.commandId === "resolved_unknown")?.deliveryStatus).toBe("outcome_unknown");
+  });
+
+  it("行政 resolution 与 send receipt 交错时不接受原投递", async () => {
+    enableDesktop(workspace, bindingId);
+    const started = deferred<void>();
+    const release = deferred<{ threadId: string; turnId: string }>();
+    const commandId = "resolution_vs_receipt";
+    send.mockImplementation(async () => {
+      started.resolve();
+      return release.promise;
+    });
+    const sending = sendDesktop(workspace, input({ commandId }), "client");
+    await started.promise;
+
+    const preview = previewOutcomeResolution(workspace, commandId);
+    resolveOutcomeUnknown(workspace, commandId, preview.confirmationSha256);
+    const turnId = randomUUID();
+    release.resolve({ threadId: target.threadId, turnId });
+
+    const result = await sending;
+    expect(result.deliveryStatus).toBe("outcome_unknown");
+    expect(readDesktop(workspace.id)?.deliveries.find(item => item.commandId === commandId)).toMatchObject({ deliveryStatus: "outcome_unknown" });
+    expect(readDesktop(workspace.id)?.deliveries.find(item => item.commandId === commandId)).not.toHaveProperty("turnId");
+    expect(readOutcomeResolutions(workspace.id)).toHaveLength(1);
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it("行政 resolution 与可确定 rejected 交错时不改写原投递", async () => {
+    enableDesktop(workspace, bindingId);
+    const started = deferred<void>();
+    const release = deferred<void>();
+    const commandId = "resolution_vs_rejected";
+    send.mockImplementation(async () => {
+      started.resolve();
+      await release.promise;
+      throw Object.assign(new DesktopError("DESKTOP_BUSY", "底层正文不应出现在响应"), { notSent: true });
+    });
+    const sending = sendDesktop(workspace, input({ commandId }), "client");
+    await started.promise;
+
+    const preview = previewOutcomeResolution(workspace, commandId);
+    resolveOutcomeUnknown(workspace, commandId, preview.confirmationSha256);
+    release.resolve();
+
+    const result = await sending;
+    expect(result.deliveryStatus).toBe("outcome_unknown");
+    expect(readDesktop(workspace.id)?.deliveries.find(item => item.commandId === commandId)).toMatchObject({ deliveryStatus: "outcome_unknown" });
+    expect(readDesktop(workspace.id)?.deliveries.find(item => item.commandId === commandId)).not.toHaveProperty("errorCode");
+    expect(readOutcomeResolutions(workspace.id)).toHaveLength(1);
+    expect(send).toHaveBeenCalledTimes(1);
   });
 
   it("unrelated busy 不等待且不创建 delivery/send", async () => {

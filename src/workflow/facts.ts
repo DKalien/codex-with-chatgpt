@@ -8,6 +8,7 @@ import { readRemote, controllerOnline, RemoteError } from "../remote/store.js";
 import { readDesktop, DesktopError } from "../desktop/store.js";
 import { desktopIpc } from "../desktop/ipc.js";
 import { targetInput } from "../desktop/store.js";
+import { unresolvedOutcomeUnknownCommandIds } from "../desktop/outcome-resolution.js";
 import {
   mapCheckpointFromSession,
   desktopErrorCode,
@@ -122,7 +123,7 @@ export async function collectDesktopFacts(
     const state = readDesktop(workspace.id);
     const configured = Boolean(state?.binding);
     const enabled = state?.enabled === true;
-    const unresolvedDelivery = Boolean(state?.deliveries.some((item) => item.deliveryStatus === "outcome_unknown"));
+    const unresolvedDelivery = unresolvedOutcomeUnknownCommandIds(workspace, state).size > 0;
     let currentTarget: WorkflowDesktopProjection["currentTarget"] = "unavailable";
     let bindingAvailability: WorkflowDesktopProjection["bindingAvailability"] = state?.binding ? "unknown" : "unavailable";
 
@@ -180,7 +181,7 @@ export async function collectDesktopFacts(
         enabled: false,
         currentTarget: "unknown",
         bindingAvailability: "unknown",
-        unresolvedDelivery: false,
+        unresolvedDelivery: true,
       };
     }
   }

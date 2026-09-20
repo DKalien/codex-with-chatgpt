@@ -10,6 +10,7 @@ import { LegacyReconciliationError, listLegacyReconciliations, reconcileLegacyAc
 import { retireLegacyAccepted } from "../desktop/legacy-retirement.js";
 import { abandonHistoricalAccepted, previewAbandonment } from "../desktop/abandonment.js";
 import { listDesktopHistory } from "../desktop/history.js";
+import { previewOutcomeResolution, resolveOutcomeUnknown } from "../desktop/outcome-resolution.js";
 
 const say = (message: string): void => { process.stdout.write(`${message}\n`); };
 
@@ -67,6 +68,14 @@ const SAFE_CLI_ERROR_MESSAGES: Record<string, string> = {
   DESKTOP_ABANDONMENT_BUSY: "abandonment 写锁繁忙；请稍后重试。",
   DESKTOP_HISTORY_CONFLICT: "Desktop 历史存在冲突；未修改状态。",
   DESKTOP_HISTORY_CORRUPT: "Desktop 历史损坏或不完整；未修改状态。",
+  DESKTOP_OUTCOME_RESOLUTION_INVALID: "行政 resolution 参数无效；未修改状态。",
+  DESKTOP_OUTCOME_RESOLUTION_NOT_ELIGIBLE: "指定 Desktop 投递不满足行政 resolution 条件；未修改原 delivery。",
+  DESKTOP_OUTCOME_RESOLUTION_CONFLICT: "行政 resolution 事实存在冲突；未覆盖原证据或 delivery。",
+  DESKTOP_OUTCOME_RESOLUTION_CONFIRMATION_INVALID: "confirmation 摘要必须是 64 位小写十六进制值；未修改状态。",
+  DESKTOP_OUTCOME_RESOLUTION_CONFIRMATION_MISMATCH: "confirmation 摘要不匹配；未修改状态。",
+  DESKTOP_OUTCOME_RESOLUTION_STORE_CORRUPT: "行政 resolution 证据存储损坏；保留原文件并人工核对。",
+  DESKTOP_OUTCOME_RESOLUTION_STORE_WRITE: "行政 resolution 证据提交失败；保留原文件并人工核对。",
+  DESKTOP_OUTCOME_RESOLUTION_BUSY: "行政 resolution/reconciliation 写锁繁忙；请稍后重试。",
 };
 
 const ABANDONMENT_NOTICE = "仅停止等待，不代表完成/成功";
@@ -106,6 +115,13 @@ function safeCliError(error: unknown, fallbackCode: string, fallbackMessage: str
 function compatibilityMessage(message: string, compatibility?: ReturnType<typeof desktopCompatibilityFromError>): string {
   if (!compatibility) return message;
   return `${message} Desktop：${compatibility.observedDesktopVersion ?? "unknown"}；app-server：${compatibility.observedAppServerVersion ?? "unknown"}；profile：${compatibility.profile ?? "unknown"}。`;
+}
+
+function parseOutcomeResolutionConfirmation(value?: string): string | undefined {
+  if (value !== undefined && !/^[a-f0-9]{64}$/u.test(value)) {
+    throw new DesktopError("DESKTOP_OUTCOME_RESOLUTION_CONFIRMATION_INVALID", "confirmation 摘要必须是 64 位小写十六进制值。" );
+  }
+  return value;
 }
 
 function compatibilityAuditMessage(audit: Awaited<ReturnType<typeof desktopIpc.compatibilityAudit>>): string {
@@ -255,6 +271,31 @@ export function registerDesktopCommands(program: Command): void {
         print({ ok: true, ...result }, opts.json, `已写入 abandonment 证据；${ABANDONMENT_NOTICE}`);
       } catch (error) {
         const failure = safeCliError(error, "DESKTOP_ABANDONMENT_FAILED", "abandonment 操作失败；未覆盖原证据。" );
+        print({ ok: false, error: failure.code, message: failure.message }, opts.json, failure.message);
+        process.exitCode = 1;
+      }
+    });
+
+  desktop.command("resolve-unknown")
+    .description("为明确的 outcome_unknown 投递写入独立行政 resolution 证据；不修改原 delivery")
+    .option("-w, --workspace <path>", "workspace 根目录")
+    .requiredOption("--command-id <id>", "要解决的唯一 outcome_unknown commandId")
+    .option("--confirm <sha256>", "preview 返回的 64 位 confirmationSha256；省略则只读预览")
+    .option("--json", "输出机器可读结果", false)
+    .action((opts: { workspace?: string; commandId: string; confirm?: string; json: boolean }) => {
+      try {
+        const confirmationSha256 = parseOutcomeResolutionConfirmation(opts.confirm);
+        const workspace = new Workspace(workspaceRoot(opts.workspace));
+        if (confirmationSha256 === undefined) {
+          const preview = previewOutcomeResolution(workspace, opts.commandId);
+          print({ ok: true, ...preview }, opts.json,
+            `${preview.notice}\ncommandId: ${preview.commandId}\n--confirm ${preview.confirmationSha256}`);
+          return;
+        }
+        const result = resolveOutcomeUnknown(workspace, opts.commandId, confirmationSha256);
+        print({ ok: true, ...result }, opts.json, `${result.notice} 行政 resolution 状态：${result.status}。`);
+      } catch (error) {
+        const failure = safeCliError(error, "DESKTOP_OUTCOME_RESOLUTION_INVALID", "行政 resolution 失败；未修改原 delivery 或 execution receipt。" );
         print({ ok: false, error: failure.code, message: failure.message }, opts.json, failure.message);
         process.exitCode = 1;
       }

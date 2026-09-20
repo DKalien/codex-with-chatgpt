@@ -151,7 +151,7 @@ launcher 校验并执行机器目录中的不可变 release（含独立依赖）
 重新构建或移动 checkout 不会提前启用新代码，只有成功安装并原子切换 current 后才使用新版。
 并发 rollout 未取得机器锁时只报告 `rollout_busy`，不会回写虚假的 pending。
 本机 `rollout --json` 只重启已认证且健康的 named workspace，保持固定 URL；quick 不自动重启。
-当前执行 turn、Desktop busy/approval/unresolved outcome、Remote active/uncertain/queued、配对中或
+当前执行 turn、Desktop busy/approval/未解决 outcome、Remote active/uncertain/queued、配对中或
 身份未知均跳过，绝不为了升级打断任务。原 binding/enable、版本/hash、owner、审批、replay 和
 outcome_unknown 门禁保持。`status/doctor --json` 的 `runtimeUpgrade` 报告安装/运行 build 与 pending。
 第一阶段没有常驻 Supervisor；当前 Review Bridge 按 active 跳过，后续空闲时再受控 rollout。
@@ -214,7 +214,8 @@ accepted 未被相应处置时不能借用该豁免。list 以 `retired` 表示�
 ### 显式行政停止等待
 
 `desktop history -w <workspace> --json` 只读列出 accepted 的 `commandId` 与
-`receipted / reconciled / retired / abandoned / unresolved` 状态。它与 rollout 共用严格证据
+`receipted / reconciled / retired / abandoned / unresolved` 状态，并列出 raw
+`outcome_unknown` 的 `unresolved / resolved_unknown` 行。它与 rollout 共用严格证据
 判定，不返回消息正文；损坏或双证据拒绝读取，不把错误当作已解决。
 
 对于本机用户明确决定不再等待的历史 accepted，可以使用独立的行政 abandonment：
@@ -235,8 +236,33 @@ c2c desktop abandon -w <workspace> --command-ids <相同精确列表> --confirm 
 同时提交；双证据、损坏、部分写入不覆盖或清理。
 
 行政决定只停止等待列出的旧 commandId。因此它们所在的旧 thread 之后恢复 active，也不撤销
-这一决定；当前 binding 仍始终实时检查，新 commandId 仍正常检查，outcome_unknown 仍全局阻塞。
+这一决定；当前 binding 仍始终实时检查，新 commandId 仍正常检查，未被行政 resolution 覆盖的
+outcome_unknown 仍全局阻塞。
 rollout 从不自动生成 abandonment，active/inProgress 时仍禁止重启 Bridge。
+
+### outcome_unknown 的行政 resolution（不改写投递）
+
+严格 Desktop reconciliation 需要可用的 canonical history；当该 IPC/历史长期不可用时，
+本机用户可以针对一个明确的 `outcome_unknown` commandId 使用独立的两阶段行政 resolution：
+
+```text
+c2c desktop resolve-unknown -w <workspace> --command-id <id> --json
+c2c desktop resolve-unknown -w <workspace> --command-id <id> --confirm <上一步 confirmationSha256> --json
+```
+
+第一条只读预览并返回确定摘要；第二条在重新读取 workspace、delivery 和既有 receipt/
+reconciliation/retirement/abandonment 证据后，原子写入独立本机证据。提示语明确说明：
+“仅停止等待并接受结果不明；不代表已投递、已接受、已完成或成功”。它绝不修改 Desktop
+delivery、补 turnId、写 execution receipt/output、推断任务成功或使相同 commandId 可重发。
+重复确认仅在事实完全一致时返回 `already_resolved_unknown`；错误摘要、错误 workspace/command、
+非 unknown、损坏/重复/冲突证据均 fail-closed。
+
+原始 delivery 仍保持 `outcome_unknown`。`desktop status` 可在该 delivery 下显示
+`resolutionStatus=administratively_resolved`，`desktop history` 显示独立的
+`resolved_unknown`；它们都不是 accepted/reconciled/receipted。workflow 的
+`unresolvedDelivery` 以及 rollout-idle 只忽略有严格匹配证据的 unknown，任何剩余 unknown
+仍阻断；解析证据本身损坏或与 delivery 漂移也阻断。该入口不调用 Desktop IPC，因而可用于
+解除“无法核对且不能安全重发”的等待死锁。
 
 ## 旧 Connector 兼容检测与迁移
 
@@ -301,7 +327,10 @@ prepare 成功前持久化新 delivery。该同步等待必须保持在有效的
 投递只等待有界的接受回执。收到真实 `threadId`/`turnId` 后返回
 `deliveryStatus=accepted`；不要等待 Codex 完成，也不要把接受回执写成执行完成记录。
 回执超时、断线或落盘不明时返回 `outcome_unknown`，提醒不要重发。结果不明期间整个
-workspace（包括重新绑定后的目标）暂停后续投递，不能换一个 `commandId` 或重新绑定绕过它。
+workspace（包括重新绑定后的目标）暂停后续投递，不能换一个 `commandId` 或重新绑定绕过它；只有本机
+用户完成严格的行政 resolution 后，workflow/rollout 才可停止等待该项，raw delivery 仍是
+`outcome_unknown`；该 commandId 永远不能重发或被改写成成功。只要其他门禁均满足，
+后续新的、经过授权的 Desktop command 仍可继续发送。
 当本次 Desktop result turn 仍可由当前进程精确确认时，`record-result` 会先对自己的
 `outcome_unknown` delivery 执行一次有界、严格的 self-reconcile：它要求与手动核对相同的
 exact workspace/binding/thread 一致、Desktop canonical history 最新边界完整且为 `exhausted`、唯一真实
@@ -332,8 +361,9 @@ canonical island，不能把 island 边界当作连续 successor。successor 的
 不创建后台队列、不重发原任务。P0.5 只负责新 send 的 receipt-backed busy-tail settle；
 P0.6 只负责判断哪个 native continuation tip 可以写入旧 command 的唯一 receipt，二者独立。
 
-已存在的 `outcome_unknown` 仍只按原始 C2C envelope 的严格 reconciliation 处理；只有恢复为
-accepted origin 后，才允许进入 P0.6 continuation ownership。已有 trusted receipt 仍按原有
+已存在的 `outcome_unknown` 仍按原始 C2C envelope 的严格 reconciliation 处理；行政 resolution
+只允许在 IPC/历史不可用时独立停止等待，不能恢复为 accepted，也不能进入 P0.6 continuation ownership。
+只有严格 reconciliation 恢复为 accepted origin 后，才允许进入 P0.6 continuation ownership。已有 trusted receipt 仍按原有
 digest/idempotency 规则只读恢复，不能生成第二条 execution record。
 若最后重检明确证明尚未进入 IPC start（例如刚变忙或出现审批），保存 `rejected` 与明确错误，
 同 ID 重放仍返回该拒绝记录。处理原因后只能由用户明确发起新请求；不会排队或自动重试。
