@@ -18,6 +18,7 @@ import { listExecutionOutputs, MAX_OUTPUT_RECORDS, saveExecutionOutput } from ".
 import { reconcileLegacyAccepted, legacyReconciliationFile } from "../src/desktop/legacy-reconciliation.js";
 import { retireLegacyAccepted } from "../src/desktop/legacy-retirement.js";
 import { previewAbandonment, abandonHistoricalAccepted } from "../src/desktop/abandonment.js";
+import { previewOutcomeResolution, resolveOutcomeUnknown } from "../src/desktop/outcome-resolution.js";
 import { listDesktopHistory } from "../src/desktop/history.js";
 import { SERVICE_NAME, VERSION } from "../src/version.js";
 import { Workspace } from "../src/workspace/manager.js";
@@ -991,6 +992,61 @@ describe("core rollout", () => {
 
     const summary = await rollout();
 
+    expect(resultFor(summary, context.workspace.id)).toMatchObject({ status: "pending", reason: "desktop_unresolved" });
+    expect(vi.mocked(desktopIpc.inspect)).not.toHaveBeenCalled();
+    expect(vi.mocked(daemon.restartBridge)).not.toHaveBeenCalled();
+  });
+
+  it.each(["retirement", "abandonment"] as const)("已 resolution 的 outcome_unknown 允许 %s 后 rollout 升级", async kind => {
+    const context = addContext(`resolved-${kind}`);
+    makeAfter(context);
+    seedDesktopRebound(context);
+    addOutcomeUnknown(context);
+    const resolution = previewOutcomeResolution(context.workspace, "unknown-command");
+    expect(resolveOutcomeUnknown(context.workspace, "unknown-command", resolution.confirmationSha256).status)
+      .toBe("resolved_unknown");
+
+    if (kind === "retirement") {
+      mockReboundInspect();
+      await expect(retireLegacyAccepted(context.workspace, reboundCommandId)).resolves.toMatchObject({ status: "retired" });
+    } else {
+      vi.stubEnv("CODEX_THREAD_ID", threadId);
+      vi.spyOn(desktopIpc, "currentResultContext").mockResolvedValue({
+        threadId, hostId: "local", projectId: "rollout-project", workspaceRoot: context.workspace.root,
+        title: "maintenance", cwd: context.workspace.root, runtimeStatus: "active",
+        resultTurnId: randomUUID(), resultTurnStatus: "inProgress",
+      } as never);
+      const preview = previewAbandonment(context.workspace, [reboundCommandId]);
+      await expect(abandonHistoricalAccepted(context.workspace, [reboundCommandId], preview.confirmationSha256))
+        .resolves.toMatchObject({ status: "abandoned" });
+      mockReboundInspect();
+    }
+
+    expect(listDesktopHistory(context.workspace)).toContainEqual({ commandId: "unknown-command", status: "resolved_unknown" });
+    expect(listDesktopHistory(context.workspace)).toContainEqual({
+      commandId: reboundCommandId, status: kind === "retirement" ? "retired" : "abandoned",
+    });
+    const summary = await rollout();
+    expect(resultFor(summary, context.workspace.id)).toMatchObject({ status: "upgraded" });
+    expect(vi.mocked(daemon.restartBridge)).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["retirement", "abandonment"] as const)("未 resolution 的 outcome_unknown 阻断 %s 和 rollout", async kind => {
+    const context = addContext(`unresolved-${kind}`);
+    makeAfter(context);
+    seedDesktopRebound(context);
+    addOutcomeUnknown(context);
+
+    if (kind === "retirement") {
+      await expect(retireLegacyAccepted(context.workspace, reboundCommandId)).rejects.toMatchObject({
+        code: "LEGACY_RETIREMENT_NOT_ELIGIBLE",
+      });
+    } else {
+      expect(() => previewAbandonment(context.workspace, [reboundCommandId])).toThrowError(expect.objectContaining({
+        code: "DESKTOP_ABANDONMENT_NOT_ELIGIBLE",
+      }));
+    }
+    const summary = await rollout();
     expect(resultFor(summary, context.workspace.id)).toMatchObject({ status: "pending", reason: "desktop_unresolved" });
     expect(vi.mocked(desktopIpc.inspect)).not.toHaveBeenCalled();
     expect(vi.mocked(daemon.restartBridge)).not.toHaveBeenCalled();

@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { desktopIpc } from "../src/desktop/ipc.js";
 import { legacyReconciliationFile } from "../src/desktop/legacy-reconciliation.js";
 import { legacyRetirementFile } from "../src/desktop/legacy-retirement.js";
+import { previewOutcomeResolution, resolveOutcomeUnknown } from "../src/desktop/outcome-resolution.js";
 import {
   abandonHistoricalAccepted,
   abandonmentFile,
@@ -251,6 +252,41 @@ describe("desktop abandonment", () => {
     expect(() => previewAbandonment(workspace, ["a_waiting"])).toThrowError(
       expect.objectContaining({ code: "DESKTOP_ABANDONMENT_CONFLICT" }),
     );
+  });
+
+  it("已完成行政 resolution 的 outcome_unknown 不阻断 abandonment", async () => {
+    seedDeliveries();
+    updateDesktop(workspace.id, state => ({
+      state: { ...state!, deliveries: [...state!.deliveries, delivery("unknown_waiting", turnA, {
+        turnId: undefined,
+        deliveryStatus: "outcome_unknown" as const,
+      })] },
+      result: undefined,
+    }));
+    const resolutionPreview = previewOutcomeResolution(workspace, "unknown_waiting");
+    expect(resolveOutcomeUnknown(workspace, "unknown_waiting", resolutionPreview.confirmationSha256)).toMatchObject({
+      status: "resolved_unknown",
+      commandId: "unknown_waiting",
+    });
+
+    const preview = previewAbandonment(workspace, ["a_waiting"]);
+    await expect(abandonHistoricalAccepted(workspace, preview.commandIds, preview.confirmationSha256))
+      .resolves.toMatchObject({ status: "abandoned", commandIds: ["a_waiting"] });
+    expect(getAbandonedCommandIds(workspace)).toEqual(new Set(["a_waiting"]));
+  });
+
+  it("abandonment 先持久化后再解决独立 unknown 仍保持 abandoned", async () => {
+    seedDeliveries();
+    const preview = previewAbandonment(workspace, ["a_waiting"]);
+    await expect(abandonHistoricalAccepted(workspace, preview.commandIds, preview.confirmationSha256))
+      .resolves.toMatchObject({ status: "abandoned", commandIds: ["a_waiting"] });
+    updateDesktop(workspace.id, state => ({ state: { ...state!, deliveries: [...state!.deliveries, {
+      ...state!.deliveries[0]!, commandId: "unknown-after-abandonment", turnId: undefined,
+      deliveryStatus: "outcome_unknown" as const,
+    }] }, result: undefined }));
+    const resolutionPreview = previewOutcomeResolution(workspace, "unknown-after-abandonment");
+    resolveOutcomeUnknown(workspace, "unknown-after-abandonment", resolutionPreview.confirmationSha256);
+    expect(getAbandonedCommandIds(workspace)).toEqual(new Set(["a_waiting"]));
   });
 
   it.each(["reconciliation", "retirement"] as const)("已有 %s 证据时拒绝 abandonment", kind => {

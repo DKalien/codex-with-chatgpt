@@ -14,6 +14,7 @@ import {
 } from "../src/desktop/legacy-retirement.js";
 import { DesktopError, updateDesktop } from "../src/desktop/store.js";
 import { reconcileLegacyAccepted, legacyReconciliationFile, listLegacyReconciliations, getReconciledLegacyCommandIds } from "../src/desktop/legacy-reconciliation.js";
+import { previewOutcomeResolution, resolveOutcomeUnknown } from "../src/desktop/outcome-resolution.js";
 import { registerDesktopCommands } from "../src/cli/desktop.js";
 import { Workspace } from "../src/workspace/manager.js";
 import { cleanup, makeTmpDir } from "./helpers.js";
@@ -435,6 +436,42 @@ describe("legacy accepted retirement", () => {
     }));
     await expect(retireLegacyAccepted(workspace, commandId)).rejects.toMatchObject({ code: "LEGACY_RETIREMENT_NOT_ELIGIBLE" });
     expect(desktopIpc.inspect).not.toHaveBeenCalled();
+  });
+
+  it("已完成行政 resolution 的 outcome_unknown 不阻断 legacy retirement", async () => {
+    seedDelivery();
+    updateDesktop(workspace.id, state => ({
+      state: {
+        ...state!,
+        deliveries: [...state!.deliveries, {
+          ...state!.deliveries[0]!,
+          commandId: "unknown-command",
+          turnId: undefined,
+          deliveryStatus: "outcome_unknown" as const,
+        }],
+      },
+      result: undefined,
+    }));
+    const preview = previewOutcomeResolution(workspace, "unknown-command");
+    expect(resolveOutcomeUnknown(workspace, "unknown-command", preview.confirmationSha256)).toMatchObject({
+      status: "resolved_unknown",
+      commandId: "unknown-command",
+    });
+
+    await expect(retireLegacyAccepted(workspace, commandId)).resolves.toEqual({ status: "retired", commandId });
+    expect(getRetiredLegacyCommandIds(workspace)).toEqual(new Set([commandId]));
+  });
+
+  it("legacy retirement 先持久化后再解决独立 unknown 仍保持 retired", async () => {
+    seedDelivery();
+    await expect(retireLegacyAccepted(workspace, commandId)).resolves.toEqual({ status: "retired", commandId });
+    updateDesktop(workspace.id, state => ({ state: { ...state!, deliveries: [...state!.deliveries, {
+      ...state!.deliveries[0]!, commandId: "unknown-after-retirement", turnId: undefined,
+      deliveryStatus: "outcome_unknown" as const,
+    }] }, result: undefined }));
+    const preview = previewOutcomeResolution(workspace, "unknown-after-retirement");
+    resolveOutcomeUnknown(workspace, "unknown-after-retirement", preview.confirmationSha256);
+    expect(getRetiredLegacyCommandIds(workspace)).toEqual(new Set([commandId]));
   });
 
   it("rejects a missing binding before any IPC", async () => {

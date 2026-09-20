@@ -20,6 +20,7 @@ import {
 } from "./store.js";
 import { readLegacyReconciliations, withEvidenceLock, type LegacyReconciliationEvidence } from "./legacy-reconciliation.js";
 import { readLegacyRetirements, type LegacyRetirementEvidence } from "./legacy-retirement.js";
+import { unresolvedOutcomeUnknownCommandIds } from "./outcome-resolution.js";
 
 const uuid = z.string().uuid();
 const sha256 = z.string().regex(/^[a-f0-9]{64}$/);
@@ -404,7 +405,7 @@ function currentDeliveries(snapshot: Snapshot, workspace: AbandonmentWorkspace, 
   if (!desktop || desktop.workspaceRoot !== workspace.root) {
     return notEligible("没有与当前 workspace 一致的 Desktop 状态；拒绝 abandonment。");
   }
-  if (desktop.deliveries.some(item => item.deliveryStatus === "outcome_unknown")) {
+  if (unresolvedOutcomeUnknownCommandIds(workspace, desktop).size > 0) {
     return notEligible("存在 outcome_unknown Desktop 投递；拒绝 abandonment。");
   }
   const binding = desktop.binding;
@@ -729,7 +730,7 @@ export function getAbandonedCommandIds(workspaceRaw: AbandonmentWorkspace): Set<
   if (!snapshot.desktop || snapshot.desktop.workspaceRoot !== workspace.root) {
     return conflict("abandonment 证据与当前 workspace 不一致；拒绝忽略冲突。");
   }
-  if (snapshot.desktop.deliveries.some(item => item.deliveryStatus === "outcome_unknown")) {
+  if (unresolvedOutcomeUnknownCommandIds(workspace, snapshot.desktop).size > 0) {
     return conflict("存在 outcome_unknown Desktop 投递；拒绝使用 abandonment 证据。");
   }
   const binding = snapshot.desktop.binding;

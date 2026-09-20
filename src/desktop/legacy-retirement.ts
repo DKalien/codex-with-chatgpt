@@ -19,6 +19,7 @@ import {
 } from "./store.js";
 import { readLegacyReconciliations, withEvidenceLock } from "./legacy-reconciliation.js";
 import { readAbandonedCommandIds } from "./abandonment.js";
+import { unresolvedOutcomeUnknownCommandIds } from "./outcome-resolution.js";
 
 const uuid = z.string().uuid();
 const canonicalTimestamp = z.string().refine(value => {
@@ -295,7 +296,7 @@ function eligibleFacts(
   if (!desktop || desktop.workspaceRoot !== workspace.root) {
     return notEligible("没有与当前 workspace 一致的 Desktop 状态；拒绝 legacy retirement。");
   }
-  if (desktop.deliveries.some(item => item.deliveryStatus === "outcome_unknown")) {
+  if (unresolvedOutcomeUnknownCommandIds(workspace, desktop).size > 0) {
     return notEligible("存在 outcome_unknown Desktop 投递；拒绝 legacy retirement。");
   }
   const binding = desktop.binding;
