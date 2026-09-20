@@ -1761,6 +1761,26 @@ def _current_execution(workspace_root: Any) -> dict[str, Any]:
         session.close()
 
 
+def _inspect_active_execution(target: dict[str, str]) -> dict[str, Any]:
+    session, _ = _prepare(target, allow_active=True)
+    try:
+        session.client.drain(0.1)
+        state = session.client.current_state()
+        if state is None or session.client.snapshot_age() > MAX_OBSERVATION_AGE_SECONDS:
+            raise _error("DESKTOP_STATE_UNAVAILABLE")
+        _validate_state(state, target, session.client.owner or "", allow_active=True)
+        _verify_runtime(session.pipe, target, session.runtime)
+        if session.client.snapshot_age() > MAX_OBSERVATION_AGE_SECONDS:
+            raise _error("DESKTOP_STATE_UNAVAILABLE")
+        active_turn_id = _active_turn_id(state)
+        return {
+            **_public_info(state, target, session.runtime, session.client),
+            "activeTurnId": active_turn_id,
+        }
+    finally:
+        session.close()
+
+
 def _current_result_context(workspace_root: Any) -> dict[str, Any]:
     target = _current_target(workspace_root)
     session, _ = _prepare(target, allow_active=True, require_runner_ancestor=True)
@@ -1853,6 +1873,11 @@ def _main() -> int:
                 if set(request) != {"id", "op"} or prepared is not None:
                     raise _error("DESKTOP_INVALID_REQUEST")
                 _reply({"id": request_id, "ok": True, "value": _compatibility()})
+            elif op == "inspect_active_execution":
+                if set(request) != {"id", "op", "target"} or prepared is not None:
+                    raise _error("DESKTOP_INVALID_REQUEST")
+                target = _target(request.get("target"))
+                _reply({"id": request_id, "ok": True, "value": _inspect_active_execution(target)})
             elif op in {"current_identity", "current_confirm", "current_execution", "current_result_context"}:
                 if set(request) != {"id", "op", "workspaceRoot"} or prepared is not None:
                     raise _error("DESKTOP_INVALID_REQUEST")

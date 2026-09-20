@@ -291,8 +291,12 @@ Desktop 行为；本功能不承诺抵御已经获授权客户端。
 
 发送同时要求有效 OAuth `codex.desktop.control`、本机 `desktop enable` 和匹配的当前
 `bindingId`。目标忙、待审批、没有 owner、Desktop 离线、项目或 workspace 不匹配、
-提权或版本不兼容时零发送，并返回明确的失败原因；第一版没有“等空闲后自动发送”的
-隐藏队列。
+提权或版本不兼容时零发送，并返回明确的失败原因。若初始忙碌可严格证明是同一绑定、同一
+thread 的 active turn，且该 turn 已有唯一匹配的 accepted delivery 和可信 execution receipt，
+发送可同步等待最多 30 秒、约每秒复核一次；只重试 prepare，不创建后台队列，也不会在
+prepare 成功前持久化新 delivery。该同步等待必须保持在有效的外层 tool/request budget 内。
+无 receipt、无关或改变的 active turn、持续忙碌及超时保持 `DESKTOP_BUSY`；授权、绑定、
+未决状态或非 busy 预检错误则立即返回其原有精确错误。两类停止都保证零发送且不创建新 delivery。
 
 投递只等待有界的接受回执。收到真实 `threadId`/`turnId` 后返回
 `deliveryStatus=accepted`；不要等待 Codex 完成，也不要把接受回执写成执行完成记录。

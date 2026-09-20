@@ -1,11 +1,21 @@
 import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 import type { Workspace } from "../workspace/manager.js";
+import { isTrustedDesktopReceipt, readExecutionRecordsStrict } from "../execution/records.js";
 import { desktopIpc, DESKTOP_IPC_ERROR_MESSAGES, validateDesktopWireMessage } from "./ipc.js";
 import { DesktopError, desktopId, publicDelivery, readDesktop, sendInput, targetInput, updateDesktop,
   type DesktopBinding, type DesktopDelivery, type DesktopState } from "./store.js";
 
 type LocalWorkspace = Pick<Workspace, "id" | "root">;
+const POST_RESULT_SETTLE_TIMEOUT_MS = 30_000;
+const POST_RESULT_SETTLE_POLL_MS = 1_000;
+// 同步且有界；必须始终短于有效的外层 tool/request budget，不得演变为后台续跑或队列。
+interface PostResultSettleOptions {
+  now?: () => number;
+  sleep?: (milliseconds: number) => Promise<void>;
+  timeoutMs?: number;
+  pollMs?: number;
+}
 function initial(workspace: LocalWorkspace): DesktopState {
   return { version: 1, workspaceId: workspace.id, workspaceRoot: workspace.root, enabled: false, binding: null, deliveries: [] };
 }
@@ -106,8 +116,73 @@ function assertNoUncertainDelivery(state: DesktopState) {
     throw new DesktopError("DESKTOP_HISTORY_FULL", "投递历史容量已满；保留 ID，须人工迁移后继续。");
 }
 
+function sameTarget(left: DesktopTargetInfoLike, right: ReturnType<typeof target>): boolean {
+  return left.threadId === right.threadId && left.hostId === right.hostId &&
+    left.projectId === right.projectId && left.workspaceRoot === right.workspaceRoot;
+}
+
+type DesktopTargetInfoLike = ReturnType<typeof target> & { runtimeStatus?: string; activeTurnId: string };
+
+function receiptBackedTail(workspace: LocalWorkspace, binding: DesktopBinding, active: DesktopTargetInfoLike): boolean {
+  if (!sameTarget(active, target(workspace, binding))) return false;
+  let records;
+  try { records = readExecutionRecordsStrict(workspace.id); } catch { return false; }
+  const state = readDesktop(workspace.id);
+  if (!state || state.workspaceRoot !== workspace.root || !state.enabled ||
+      !state.binding || state.binding.bindingId !== binding.bindingId ||
+      state.deliveries.some(item => item.deliveryStatus === "outcome_unknown")) return false;
+  const deliveries = state.deliveries.filter(item => item.bindingId === binding.bindingId &&
+    item.threadId === binding.threadId && item.deliveryStatus === "accepted" && item.turnId === active.activeTurnId);
+  if (deliveries.length !== 1) return false;
+  const delivery = deliveries[0];
+  const matches = records.filter(record => record.commandId === delivery.commandId || record.taskId === `desktop_${delivery.commandId}`);
+  return matches.length === 1 && isTrustedDesktopReceipt(matches[0], delivery.commandId);
+}
+
+async function prepareWithPostResultSettle(
+  workspace: LocalWorkspace,
+  binding: DesktopBinding,
+  authorize: () => void,
+  options: PostResultSettleOptions = {},
+): Promise<Awaited<ReturnType<typeof desktopIpc.prepare>>> {
+  try {
+    return await desktopIpc.prepare(target(workspace, binding));
+  } catch (failure) {
+    if (!(failure instanceof DesktopError) || failure.code !== "DESKTOP_BUSY") throw failure;
+    let active: DesktopTargetInfoLike;
+    try { active = await desktopIpc.inspectActiveExecution(target(workspace, binding)) as DesktopTargetInfoLike; }
+    catch { throw failure; }
+    if (!receiptBackedTail(workspace, binding, active)) throw failure;
+
+    const now = options.now ?? Date.now;
+    const sleep = options.sleep ?? ((milliseconds: number) => new Promise<void>(resolve => setTimeout(resolve, milliseconds)));
+    const timeoutMs = options.timeoutMs ?? POST_RESULT_SETTLE_TIMEOUT_MS;
+    const pollMs = options.pollMs ?? POST_RESULT_SETTLE_POLL_MS;
+    const deadline = now() + timeoutMs;
+    while (now() < deadline) {
+      await sleep(Math.min(pollMs, Math.max(0, deadline - now())));
+      authorize();
+      const state = authorized(workspace, readDesktop(workspace.id), binding.bindingId);
+      assertNoUncertainDelivery(state);
+      try {
+        return await desktopIpc.prepare(target(workspace, binding));
+      } catch (retryFailure) {
+        if (!(retryFailure instanceof DesktopError) || retryFailure.code !== "DESKTOP_BUSY") throw retryFailure;
+      }
+      let current: DesktopTargetInfoLike;
+      try { current = await desktopIpc.inspectActiveExecution(target(workspace, binding)) as DesktopTargetInfoLike; }
+      catch (error) {
+        if (error instanceof DesktopError && error.code === "DESKTOP_BUSY") throw error;
+        throw error;
+      }
+      if (!receiptBackedTail(workspace, binding, current) || current.activeTurnId !== active.activeTurnId) throw failure;
+    }
+    throw failure;
+  }
+}
+
 export async function sendDesktop(workspace: LocalWorkspace, raw: z.infer<typeof sendInput>, clientId: string,
-  authorize: () => void = () => {}): Promise<ReturnType<typeof publicDelivery>> {
+  authorize: () => void = () => {}, settleOptions?: PostResultSettleOptions): Promise<ReturnType<typeof publicDelivery>> {
   const input = sendInput.parse(raw);
   if (input.workspaceId !== workspace.id) throw new DesktopError("DESKTOP_WRONG_WORKSPACE", "请求工作区不匹配。");
   if (!clientId || clientId.length > 256) throw new DesktopError("INSUFFICIENT_SCOPE", "缺少有效的 OAuth 客户端身份。");
@@ -118,7 +193,7 @@ export async function sendDesktop(workspace: LocalWorkspace, raw: z.infer<typeof
   if (prior) return publicDelivery(prior);
   const wireMessage = validateDesktopWireMessage(desktopTaskEnvelope(input));
   assertNoUncertainDelivery(snapshot);
-  const connection = await desktopIpc.prepare(target(workspace, snapshot.binding));
+  const connection = await prepareWithPostResultSettle(workspace, snapshot.binding, authorize, settleOptions);
   try {
     // 不跨 IPC 预检持锁；提交点前在短锁内重新读取授权和绑定，防止旧快照越过撤权。
     let committed: { record: DesktopDelivery; attempt: boolean };

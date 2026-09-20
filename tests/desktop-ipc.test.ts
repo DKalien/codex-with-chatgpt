@@ -144,6 +144,41 @@ describe("Desktop IPC wrapper（fake helper）", () => {
     } finally { vi.unstubAllEnvs(); }
   });
 
+  it("inspectActiveExecution 使用显式 target，不依赖 CODEX_THREAD_ID 或 runner ancestry", async () => {
+    vi.stubEnv("CODEX_THREAD_ID", "");
+    const activeTurnId = "01a00000-0000-7000-8000-000000000003";
+    const fake = fakeSpawner(request => request.op === "inspect_active_execution"
+      ? { ok: true, value: { ...target, title: "目标 active 会话", cwd: target.workspaceRoot, runtimeStatus: "active", activeTurnId } }
+      : { ok: true, value: { ...target, title: "Fake Desktop 会话", cwd: target.workspaceRoot, runtimeStatus: "idle" } });
+    const result = await makeClient(fake.spawnImpl).inspectActiveExecution(target);
+    expect(result).toMatchObject({ ...target, runtimeStatus: "active", activeTurnId });
+    expect(fake.requests).toHaveLength(1);
+    expect(fake.requests[0]).toMatchObject({ op: "inspect_active_execution", target });
+    expect(Object.keys(fake.requests[0]).sort()).toEqual(["id", "op", "target"]);
+  });
+
+  it("inspectActiveExecution 严格拒绝无效 active turn、idle 和错目标响应", async () => {
+    const activeTurnId = "01a00000-0000-7000-8000-000000000003";
+    for (const value of [
+      { ...target, title: "active", cwd: target.workspaceRoot, runtimeStatus: "active" },
+      { ...target, title: "active", cwd: target.workspaceRoot, runtimeStatus: "active", activeTurnId: "not-a-uuid" },
+      { ...target, title: "idle", cwd: target.workspaceRoot, runtimeStatus: "idle", activeTurnId },
+    ]) {
+      const fake = fakeSpawner(() => ({ ok: true, value }));
+      await expect(makeClient(fake.spawnImpl).inspectActiveExecution(target))
+        .rejects.toMatchObject({ code: "DESKTOP_STATE_UNAVAILABLE" });
+    }
+    for (const value of [
+      { ...target, threadId: randomUUID(), title: "wrong", cwd: target.workspaceRoot, runtimeStatus: "active", activeTurnId },
+      { ...target, projectId: "wrong_project", title: "wrong", cwd: target.workspaceRoot, runtimeStatus: "active", activeTurnId },
+      { ...target, workspaceRoot: "D:\\python\\other", title: "wrong", cwd: "D:\\python\\other", runtimeStatus: "active", activeTurnId },
+    ]) {
+      const fake = fakeSpawner(() => ({ ok: true, value }));
+      await expect(makeClient(fake.spawnImpl).inspectActiveExecution(target))
+        .rejects.toMatchObject({ code: "DESKTOP_TARGET_NOT_FOUND" });
+    }
+  });
+
   it("currentResultContext 只传workspace，支持 active exact 与 idle terminal exact", async () => {
     vi.stubEnv("CODEX_THREAD_ID", target.threadId); vi.stubEnv("CODEX_SESSION_ID", target.threadId);
     const resultTurnId = "01a00000-0000-7000-8000-000000000003";

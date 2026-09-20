@@ -541,6 +541,16 @@ export class DesktopIpcClient {
     return this.currentOperation("current_execution", workspaceRoot, validateExecutionInfo) as Promise<DesktopExecutionInfo>;
   }
 
+  /** Target-scoped active-turn observation for the Bridge server; no runner context required. */
+  async inspectActiveExecution(rawTarget: DesktopTarget): Promise<DesktopExecutionInfo> {
+    const target = validateTarget(rawTarget);
+    const session = this.open();
+    try {
+      const value = await session.request("inspect_active_execution", { target });
+      return validateExecutionInfo(value, target);
+    } finally { session.close(); }
+  }
+
   async currentResultContext(workspaceRoot: string): Promise<DesktopResultContext> {
     return this.currentOperation("current_result_context", workspaceRoot, validateResultContext) as Promise<DesktopResultContext>;
   }

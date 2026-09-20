@@ -209,6 +209,80 @@ class DesktopIpcHelperTests(unittest.TestCase):
         helper._validate_state(state, TARGET, OWNER, allow_active=True)
         self.assert_code("DESKTOP_BUSY", lambda: helper._validate_state(state, TARGET, OWNER))
 
+    def test_inspect_active_execution_is_target_scoped_and_bounded(self) -> None:
+        state = self.valid_state()
+        state["title"] = "目标 active 会话"
+        state["threadRuntimeStatus"] = {"type": "active"}
+        state["turns"] = [{"turnId": "01a00000-0000-0000-0000-000000000011", "status": "inProgress"}]
+
+        class Client:
+            owner = OWNER
+
+            def __init__(self, value: dict[str, object]) -> None:
+                self.value = value
+
+            def drain(self, _seconds: float) -> None:
+                pass
+
+            def current_state(self) -> dict[str, object]:
+                return self.value
+
+            def snapshot_age(self) -> float:
+                return 0.0
+
+        class Session:
+            pipe = Mock()
+            runtime: dict[str, object] = {"desktopVersion": "26.903.9818.0", "appServerVersion": "0.153.4"}
+
+            def __init__(self, value: dict[str, object]) -> None:
+                self.client = Client(value)
+
+            def close(self) -> None:
+                pass
+
+        with patch.object(helper, "_prepare", return_value=(Session(state), {})) as prepare, \
+                patch.object(helper, "_verify_runtime"):
+            result = helper._inspect_active_execution(TARGET)
+        prepare.assert_called_once_with(TARGET, allow_active=True)
+        self.assertEqual(result["activeTurnId"], "01a00000-0000-0000-0000-000000000011")
+        self.assertEqual(set(result) - {"threadId", "hostId", "projectId", "workspaceRoot", "title", "cwd",
+                                        "workspaceKind", "resumeState", "runtimeStatus", "activeTurnId",
+                                        "requestsCount", "desktopVersion", "appServerVersion", "profile",
+                                        "ownerClientId"}, set())
+        self.assertNotIn("message", result)
+        self.assertNotIn("history", result)
+
+        idle = copy.deepcopy(state)
+        idle["threadRuntimeStatus"] = {"type": "idle"}
+        idle["turns"] = [{"turnId": "01a00000-0000-0000-0000-000000000011", "status": "completed"}]
+        with patch.object(helper, "_prepare", return_value=(Session(idle), {})), \
+                patch.object(helper, "_verify_runtime"):
+            self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: helper._inspect_active_execution(TARGET))
+
+        cases = {
+            "multiple_active": [{"turnId": "01a00000-0000-0000-0000-000000000011", "status": "inProgress"},
+                                {"turnId": "01a00000-0000-0000-0000-000000000012", "status": "inProgress"}],
+            "malformed_active": [{"turnId": "not-a-uuid", "status": "inProgress"}],
+        }
+        for name, turns in cases.items():
+            broken = copy.deepcopy(state)
+            broken["turns"] = turns
+            with self.subTest(case=name), patch.object(helper, "_prepare", return_value=(Session(broken), {})), \
+                    patch.object(helper, "_verify_runtime"):
+                self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: helper._inspect_active_execution(TARGET))
+
+        for name, changes, code in [
+            ("wrong_thread", {"id": "01a00000-0000-0000-0000-000000000099"}, "DESKTOP_TARGET_NOT_FOUND"),
+            ("wrong_host", {"hostId": "remote"}, "DESKTOP_TARGET_NOT_FOUND"),
+            ("wrong_root", {"cwd": r"D:\\python\\other", "environments": [{"cwd": r"D:\\python\\other"}]}, "DESKTOP_PROJECT_MISMATCH"),
+            ("wrong_project_kind", {"workspaceKind": "remote"}, "DESKTOP_PROJECT_MISMATCH"),
+        ]:
+            broken = copy.deepcopy(state)
+            broken.update(changes)
+            with self.subTest(case=name), patch.object(helper, "_prepare", return_value=(Session(broken), {})), \
+                    patch.object(helper, "_verify_runtime"):
+                self.assert_code(code, lambda: helper._inspect_active_execution(TARGET))
+
     def test_current_runner_must_be_a_descendant_of_verified_app_server(self) -> None:
         with patch.object(helper, "_process_parent_ids", return_value={123: 101}), \
                 patch.object(helper.os, "getpid", return_value=123):
