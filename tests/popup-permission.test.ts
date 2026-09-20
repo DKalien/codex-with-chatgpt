@@ -27,7 +27,7 @@ async function loadPopup(permissionGranted: boolean, requestGranted?: boolean) {
   }]));
   const calls = {
     contains: [] as unknown[], request: [] as unknown[], ownerProof: 0,
-    runtime: [] as unknown[], storage: [] as unknown[],
+    runtime: [] as unknown[], storage: [] as unknown[], page: [] as unknown[],
   };
   const requestResult = requestGranted ?? permissionGranted;
   const chrome = {
@@ -47,6 +47,10 @@ async function loadPopup(permissionGranted: boolean, requestGranted?: boolean) {
         if (message.type === "c2c.owner-proof.request") {
           calls.ownerProof += 1;
           return { ok: true, proof: { id: "proof-1" } };
+        }
+        if (message.type === "c2c.connect.request") {
+          calls.page.push(message);
+          return { ok: true, state: "AWAITING_CONFIRMATION" };
         }
         return { ok: true };
       },
@@ -111,6 +115,26 @@ describe("popup classic packaging", () => {
 });
 
 describe("popup Bridge permission and Pair separation", () => {
+  it("Connect uses one fixed content-script request and no popup identity or owner proof", async () => {
+    const { calls, elements } = await loadPopup(true);
+    elements.get("bridge-origin")!.value = "https://bridge.example.test";
+    await elements.get("connect-chat")!.onclick!();
+    expect(calls.contains).toEqual([{ origins: ["https://bridge.example.test/*"] }]);
+    expect(calls.page).toEqual([{ type: "c2c.connect.request" }]);
+    expect(calls.ownerProof).toBe(0);
+    expect(calls.runtime).toEqual([]);
+    expect(JSON.stringify(calls.page)).not.toMatch(/route|document|tab|credential|principal|secret/);
+  });
+
+  it("Connect reports missing Bridge permission before contacting the page", async () => {
+    const { calls, elements } = await loadPopup(false);
+    elements.get("bridge-origin")!.value = "https://bridge.example.test";
+    await elements.get("connect-chat")!.onclick!();
+    expect(calls.page).toEqual([]);
+    expect(calls.request).toEqual([]);
+    expect(elements.get("connect-status")!.textContent).toBe("bridge_permission_missing");
+  });
+
   it("rebind controls send fixed payload-free SW commands", async () => {
     const { calls, elements } = await loadPopup(true);
     await elements.get("rebind-start")!.onclick!();

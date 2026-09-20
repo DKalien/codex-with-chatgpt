@@ -2282,11 +2282,196 @@ describe("public companion HTTP surface", () => {
     });
     expect(completed.status).toBe(200);
     expect(completed.body.routeVerification).toBe("VERIFIED");
+    expect(completed.body.challengeId).toBe(started.body.routeAttestation.challengeId);
     const newAuth = { authorization: `Bearer ${completed.body.credential as string}` };
     const current = await fetchJson("/api/companion/v1/state", { headers: newAuth });
     expect(current.status).toBe(200);
     expect(current.body.routeVerification).toBe("VERIFIED");
     expect((await fetchJson("/api/companion/v1/state", { headers: oldAuth })).status).toBe(401);
+  });
+
+  it("rebind status 只读返回 bounded state，并在完成后拒绝旧 credential", async () => {
+    await enableAndSeed();
+    const pairIntent = createPairingIntent({
+      workspaceId: workspace.id,
+      principal: principalA(),
+      stateDir,
+    });
+    const paired = await fetchJson("/api/companion/v1/pair", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        intentId: pairIntent.intentId,
+        secret: pairIntent.secret,
+        routeCanonical: ROUTE,
+      }),
+    });
+    expect(paired.status).toBe(200);
+    confirmRouteAttestation({
+      workspaceId: workspace.id,
+      principal: principalA(),
+      challengeId: paired.body.routeAttestation.challengeId,
+      challengeDigest: paired.body.routeAttestation.challengeDigest,
+      stateDir,
+    });
+    takeoverReceiver({
+      workspaceId: workspace.id,
+      principal: principalB(),
+      widgetId: "widget-B",
+      expectedEpoch: paired.body.epoch,
+      stateDir,
+    });
+    const oldAuth = {
+      authorization: `Bearer ${paired.body.credential as string}`,
+      "content-type": "application/json",
+    };
+    const started = await fetchJson("/api/companion/v1/rebind/init", {
+      method: "POST",
+      headers: oldAuth,
+      body: JSON.stringify({ routeCanonical: ROUTE_B }),
+    });
+    expect(started.status).toBe(200);
+    const challengeId = started.body.routeAttestation.challengeId as string;
+    const statusPath = (route: string, challenge: string) =>
+      `/api/companion/v1/rebind/status?routeCanonical=${encodeURIComponent(route)}&challengeId=${encodeURIComponent(challenge)}`;
+    const stateFile = path.join(stateDir, "feedback", `${workspace.id}.json`);
+    const beforePending = fs.readFileSync(stateFile);
+    const pending = await fetchJson(statusPath(ROUTE_B, challengeId), { headers: oldAuth });
+    expect(pending.status).toBe(200);
+    expect(pending.body).toEqual({
+      state: "PENDING",
+      workspaceId: workspace.id,
+      bindingId: started.body.bindingId,
+      epoch: started.body.epoch,
+      companionId: started.body.companionId,
+      routeCanonical: ROUTE_B,
+      challengeId,
+    });
+    expect(fs.readFileSync(stateFile)).toEqual(beforePending);
+    expect(Object.keys(pending.body).sort()).toEqual([
+      "bindingId",
+      "challengeId",
+      "companionId",
+      "epoch",
+      "routeCanonical",
+      "state",
+      "workspaceId",
+    ].sort());
+
+    expect((await fetchJson(statusPath(ROUTE_B, challengeId), {
+      headers: { authorization: "Bearer c2c_comp_wrong" },
+    })).status).toBe(401);
+    expect((await fetchJson(statusPath(ROUTE_B, challengeId))).status).toBe(401);
+    expect((await fetchJson(statusPath(ROUTE, challengeId), { headers: oldAuth })).status).toBe(401);
+    expect((await fetchJson(statusPath(ROUTE_B, "33333333-3333-4333-8333-333333333333"), {
+      headers: oldAuth,
+    })).status).toBe(401);
+    expect((await fetchJson(`/api/companion/v1/rebind/status?challengeId=${challengeId}`, {
+      headers: oldAuth,
+    })).status).toBe(400);
+
+    confirmRouteAttestation({
+      workspaceId: workspace.id,
+      principal: principalB(),
+      challengeId,
+      challengeDigest: started.body.routeAttestation.challengeDigest,
+      stateDir,
+    });
+    const beforeConfirmed = fs.readFileSync(stateFile);
+    const confirmed = await fetchJson(statusPath(ROUTE_B, challengeId), { headers: oldAuth });
+    expect(confirmed.status).toBe(200);
+    expect(confirmed.body.state).toBe("CONFIRMED");
+    expect(fs.readFileSync(stateFile)).toEqual(beforeConfirmed);
+
+    const expiredState = JSON.parse(fs.readFileSync(stateFile, "utf8")) as {
+      rebindIntent: { expiresAt: string; routeAttestation: { expiresAt: string } };
+    };
+    const expiredAt = new Date(Date.now() - 1_000).toISOString();
+    expiredState.rebindIntent.expiresAt = expiredAt;
+    expiredState.rebindIntent.routeAttestation.expiresAt = expiredAt;
+    fs.writeFileSync(stateFile, JSON.stringify(expiredState, null, 2));
+    const expired = await fetchJson(statusPath(ROUTE_B, challengeId), { headers: oldAuth });
+    expect(expired.status).toBe(200);
+    expect(expired.body.state).toBe("EXPIRED");
+
+    const retry = await fetchJson("/api/companion/v1/rebind/init", {
+      method: "POST",
+      headers: oldAuth,
+      body: JSON.stringify({ routeCanonical: ROUTE_B }),
+    });
+    expect(retry.status).toBe(200);
+    const retryChallengeId = retry.body.routeAttestation.challengeId as string;
+    confirmRouteAttestation({
+      workspaceId: workspace.id,
+      principal: principalB(),
+      challengeId: retryChallengeId,
+      challengeDigest: retry.body.routeAttestation.challengeDigest,
+      stateDir,
+    });
+    const completed = await fetchJson("/api/companion/v1/rebind/complete", {
+      method: "POST",
+      headers: oldAuth,
+      body: JSON.stringify({ challengeId: retryChallengeId, routeCanonical: ROUTE_B }),
+    });
+    expect(completed.status).toBe(200);
+    expect(completed.body.challengeId).toBe(retryChallengeId);
+    expect((await fetchJson(statusPath(ROUTE_B, retryChallengeId), { headers: oldAuth })).status).toBe(401);
+    expect((await fetchJson("/api/companion/v1/rebind/complete", {
+      method: "POST",
+      headers: oldAuth,
+      body: JSON.stringify({ challengeId: retryChallengeId, routeCanonical: ROUTE_B }),
+    })).status).toBe(401);
+  });
+
+  it("rebind status 在 confirmed 后发现 in-flight 时 fail closed", async () => {
+    setupReadyEvent("cmd-rebind-race");
+    const paired = pairCompanion(ROUTE, { verify: false });
+    confirmRouteAttestation({
+      workspaceId: workspace.id,
+      principal: principalA(),
+      challengeId: paired.routeAttestation.challengeId,
+      challengeDigest: paired.routeAttestation.challengeDigest,
+      stateDir,
+    });
+    takeoverReceiver({
+      workspaceId: workspace.id,
+      principal: principalB(),
+      widgetId: "widget-race",
+      expectedEpoch: paired.epoch,
+      stateDir,
+    });
+    const oldAuth = {
+      authorization: `Bearer ${paired.credential as string}`,
+      "content-type": "application/json",
+    };
+    const started = await fetchJson("/api/companion/v1/rebind/init", {
+      method: "POST",
+      headers: oldAuth,
+      body: JSON.stringify({ routeCanonical: ROUTE_B }),
+    });
+    expect(started.status).toBe(200);
+    const challengeId = started.body.routeAttestation.challengeId as string;
+    confirmRouteAttestation({
+      workspaceId: workspace.id,
+      principal: principalB(),
+      challengeId,
+      challengeDigest: started.body.routeAttestation.challengeDigest,
+      stateDir,
+    });
+
+    const stateFile = path.join(stateDir, "feedback", `${workspace.id}.json`);
+    const current = JSON.parse(fs.readFileSync(stateFile, "utf8")) as {
+      events: Array<{ status: string }>;
+    };
+    current.events[0]!.status = "outcome_unknown";
+    fs.writeFileSync(stateFile, JSON.stringify(current, null, 2));
+
+    const blocked = await fetchJson(
+      `/api/companion/v1/rebind/status?routeCanonical=${encodeURIComponent(ROUTE_B)}&challengeId=${encodeURIComponent(challengeId)}`,
+      { headers: oldAuth },
+    );
+    expect(blocked.status).toBe(409);
+    expect(blocked.body.error).toBe("COMPANION_REPAIR_BLOCKED");
   });
 
   async function pairCompanionHttp(opts: { verify?: boolean } = {}) {

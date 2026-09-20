@@ -394,6 +394,86 @@ export function initiateCompanionRebind(input: {
   });
 }
 
+/** 只读查询 active predecessor 的 immediate-successor rebind 状态。 */
+export function companionRebindStatus(input: {
+  workspaceId: string;
+  credential: string;
+  routeCanonical: string;
+  challengeId: string;
+  stateDir?: string;
+  nowMs?: number;
+}): {
+  state: "PENDING" | "CONFIRMED" | "EXPIRED";
+  workspaceId: string;
+  bindingId: string;
+  epoch: number;
+  companionId: string;
+  routeCanonical: string;
+  challengeId: string;
+} {
+  const route = normalizeChatgptRoute(input.routeCanonical);
+  const state = readFeedbackState(input.workspaceId, input.stateDir ?? getStateDir());
+  const predecessor = state.companion;
+  const binding = state.binding;
+  const eligibility = state.rebindPredecessor;
+  const intent = state.rebindIntent;
+  const unauthorized = (): never => {
+    throw new CompanionError("COMPANION_UNAUTHORIZED", "旧 companion credential 或 rebind 身份无效");
+  };
+
+  if (!isActiveCompanion(predecessor)
+    || !hashEqual(predecessor.credentialHash, sha256Hex(input.credential))) {
+    return unauthorized();
+  }
+  if (!binding || binding.status !== "active" || !eligibility || !intent || intent.consumedAt) {
+    return unauthorized();
+  }
+  if (binding.bindingId !== intent.bindingId
+    || binding.epoch !== intent.epoch
+    || binding.principalFingerprint !== intent.principalFingerprint
+    || predecessor.bindingId !== intent.previousBindingId
+    || predecessor.epoch !== intent.previousEpoch
+    || binding.epoch !== predecessor.epoch + 1
+    || binding.bindingId === predecessor.bindingId
+    || eligibility.companionId !== predecessor.companionId
+    || eligibility.previousBindingId !== predecessor.bindingId
+    || eligibility.previousEpoch !== predecessor.epoch
+    || eligibility.bindingId !== binding.bindingId
+    || eligibility.epoch !== binding.epoch
+    || intent.routeCanonical !== route
+    || intent.routeAttestation.routeCanonical !== intent.routeCanonical
+    || intent.routeAttestation.challengeId !== input.challengeId
+    || !hashEqual(intent.routeAttestation.challengeDigest, routeChallengeDigest({
+      workspaceId: state.workspaceId,
+      bindingId: intent.bindingId,
+      epoch: intent.epoch,
+      companionId: intent.companionId,
+      routeCanonical: intent.routeCanonical,
+      challengeId: intent.routeAttestation.challengeId,
+    }))) {
+    return unauthorized();
+  }
+
+  assertNoInFlightDelivery(state);
+
+  const nowMs = input.nowMs ?? Date.now();
+  const expired = Date.parse(intent.expiresAt) <= nowMs
+    || Date.parse(intent.routeAttestation.expiresAt) <= nowMs;
+  return {
+    state: expired
+      ? "EXPIRED"
+      : intent.confirmedAt && intent.routeAttestation.status === "verified"
+        ? "CONFIRMED"
+        : "PENDING",
+    workspaceId: state.workspaceId,
+    bindingId: binding.bindingId,
+    epoch: binding.epoch,
+    companionId: intent.companionId,
+    routeCanonical: intent.routeCanonical,
+    challengeId: intent.routeAttestation.challengeId,
+  };
+}
+
 export function completeCompanionRebind(input: {
   workspaceId: string;
   credential: string;
@@ -408,6 +488,7 @@ export function completeCompanionRebind(input: {
   bindingId: string;
   epoch: number;
   routeCanonical: string;
+  challengeId: string;
   routeVerification: "VERIFIED";
 } {
   const stateDir = input.stateDir ?? getStateDir();
@@ -477,6 +558,7 @@ export function completeCompanionRebind(input: {
         bindingId: companion.bindingId,
         epoch: companion.epoch,
         routeCanonical: companion.routeCanonical,
+        challengeId: intent.routeAttestation.challengeId,
         routeVerification: "VERIFIED" as const,
       },
     };

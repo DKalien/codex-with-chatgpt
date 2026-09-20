@@ -752,14 +752,14 @@ G3 修复 Browser Companion 误绑错误 ChatGPT conversation 后 production Sen
 - HTTP authenticated `/state` 可含 attestation message（SW 恢复用）；popup SW payload 仅 `routeAttestationPending`。
 
 - **G3 live acceptance：PASS（2026-09-19）**。跨设备 Desktop smoke 与 route-principal attestation 闭环已完成；后续实现不得把旧的 `live E2E pending` 当作当前状态。
-- **NEXT_EXPECTED_STEP**：**G4 — new-Chat bounded bootstrap + same-browser rebind**。
-  - Operator 顺序：**先**只读 `feedback_status` → 新 ChatGPT conversation → pair → route verify（`feedback_companion_route_confirm`）→ Arm → Desktop smoke。
+- **NEXT_EXPECTED_STEP**：**G4c independent review；通过后再安排 deploy/live acceptance**。
+  - Normal same-browser 顺序：缺少 host permission 时先点一次 **Grant Bridge access** → 点一次 **Connect this Chat** → 当前 Chat 通过 `feedback_companion_route_confirm` 完成 principal proof。Browser 不再需要第二次 Bind/Rebind/Verify/Complete 点击。
   - 路径：`workspace_info` → bounded workflow readiness → 安全 Desktop/Remote → Codex 执行 → Companion 反馈回 **已验证** conversation → independent review → DONE。
   - 不要求用户手工搬 workspaceId / threadId / bindingId；不得自动降低授权、审批、`outcome_unknown` 或 Project ownership 门禁。
   - **前置约束**：`requestContext.conversationIdentity=available` ≠ Project membership ≠ durable same-thread Chat binding；live 闭环必须依赖 **route attestation VERIFIED**，不得把 `currentConversation` 当永久绑定。
   - 历史 Connector `test_status` 不得替代本次 live acceptance；后续仍以现役 runtime/status 为准。
 
-### G4a + G4b — bounded bootstrap / same-browser rebind（2026-09-19，implementation ready for review）
+### G4a + G4b — bounded bootstrap / same-browser rebind（2026-09-20，landed at `22fb917`）
 
 - MCP `feedback_bootstrap_status` 只根据当前 request 的 `openai/session` principal 投影有限状态：`DISABLED`、`OWNED_VERIFIED`、`OWNED_NEEDS_BROWSER_REBIND`、`FOREIGN_SAFE_TO_TAKEOVER`、`BLOCKED_INFLIGHT`。仅 foreign-safe 返回 takeover 所需 `expectedEpoch + widgetId`；不返回 principal、credential、secret 或 hash。
 - `reserved / claimed / outcome_unknown` 一律 `BLOCKED_INFLIGHT`；takeover 的 `expectedEpoch` CAS 与原有 in-flight fence 不变。
@@ -768,3 +768,13 @@ G3 修复 Browser Companion 误绑错误 ChatGPT conversation 后 production Sen
 - current Chat 仍通过现役 `feedback_companion_route_confirm` 完成 request-scoped principal attestation；wrong principal 不消费 challenge。确认后 `/rebind/complete` 才旋转 fresh credential；Browser 再以 authenticated `/state` 取得唯一 `VERIFIED` 权威。
 - Browser SW 复用既有 route-attestation runner、session latch 与 durable fence；init 前 barrier-first，网络/5xx/storage ambiguity 进入 fail-closed fence，不自动重发。autonomy 默认 OFF，identity 变化强制 disarm。
 - cold `feedback_companion_pair` fallback 保留；未增加 manifest permission、自动 Arm、Connect & Arm 或第二套 DOM runner。
+
+### G4c — Connect this Chat（2026-09-20，implementation ready for review）
+
+- Popup 的主操作只向当前 tab content script 发送固定 `c2c.connect.request`；content script 再把当前 bounded observation 转给 SW。tab/document/route 权威始终来自真实 `MessageSender` 与 canonical route parser，不接受 popup 提供 identity。
+- 同浏览器 immediate-successor rebind 复用 G4b `/rebind/init` 和 G3 one-shot route-attestation runner/fence。新增只读、bounded `/rebind/status`；只有 exact predecessor credential + active binding/epoch/route/challenge 才可读取 `PENDING | CONFIRMED | EXPIRED`。
+- Browser durable connect fence 为 `NONE -> ATTEST_REQUESTED -> COMPLETE_REQUESTED -> DONE`，任何网络、5xx、malformed/mismatched 2xx 或 durable commit ambiguity 收敛到 `OUTCOME_UNKNOWN`，不自动重发 attestation 或 `/rebind/complete`。
+- Connect 入口先 durable persist autonomy `OFF`；OFF 写入失败时保持内存 OFF 并返回 `autonomy_persist_failed`，不报告 CONNECTED、不启动 route Send 或 complete。已证明无 mutation 的 complete `COMPANION_REPAIR_BLOCKED` / `COMPANION_REBIND_NOT_CONFIRMED` 只回滚到 `ATTEST_REQUESTED`，等待后续 heartbeat 重新读取 status；其余错误仍进入 `OUTCOME_UNKNOWN`。
+- current Chat 的 request-scoped MCP principal confirmation 仍是必需步骤；wrong principal 不消费 challenge。确认后 exact owner heartbeat 最多发起一次 `/rebind/complete`，fresh credential 安装后 authenticated `/state` 仍是 `VERIFIED` 唯一权威。
+- Pair/Rebind/Complete/Clear 共用 SW transport mutation gate，防止异步 Bridge 返回覆盖更新后的 transport。Browser restart 只允许 exact owner 对 durable `DONE + OBSERVED_PENDING_CONFIRM` 做只读 `/state` 收敛，不重复 complete 或 DOM Send。
+- 无 eligible predecessor 时返回 bounded `cold_pair_required`，继续使用现有手工 cold-pair fallback。Bridge permission 缺失时明确返回 `bridge_permission_missing`；Connect 不请求 permission、不 Arm、不触发 production feedback 操作。

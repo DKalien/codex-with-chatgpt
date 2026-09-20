@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const ROUTE = "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111";
+const OLD_ROUTE = "https://chatgpt.com/c/77777777-7777-4777-8777-777777777777";
 const WORKSPACE = "workspace-g4-rebind";
 const OLD_COMPANION = "11111111-1111-4111-8111-111111111111";
 const OLD_BINDING = "22222222-2222-4222-8222-222222222222";
@@ -15,8 +16,10 @@ const FENCE_KEY = "c2c_route_attest_fence_v1";
 const OWNER_KEY = "c2c_companion_owner_v1";
 const REGISTRY_KEY = "c2c_companion_registry_v1";
 const EVIDENCE_KEY = "c2c_companion_evidence_v1";
+const CONNECT_KEY = "c2c_companion_connect_flow_v1";
+const AUTONOMY_KEY = "c2c_companion_autonomy_v1";
 
-function storageArea(initial: Record<string, unknown>) {
+function storageArea(initial: Record<string, unknown>, failAutonomyPersist = false) {
   const values = new Map(Object.entries(initial));
   return {
     values,
@@ -26,6 +29,9 @@ function storageArea(initial: Record<string, unknown>) {
       return Object.fromEntries(list.map(key => [key, values.get(key)]));
     },
     async set(row: Record<string, unknown>) {
+      if (failAutonomyPersist && Object.hasOwn(row, AUTONOMY_KEY)) {
+        throw new Error("autonomy storage unavailable");
+      }
       for (const [key, value] of Object.entries(row)) values.set(key, value);
     },
     async remove(keys: string | string[]) {
@@ -91,17 +97,41 @@ function initialState() {
   };
 }
 
-async function loadWorker(body: Record<string, unknown>) {
+async function loadWorker(body: Record<string, unknown>, opts: {
+  oldRoute?: string;
+  noTransport?: boolean;
+  transport?: Record<string, unknown>;
+  connectFlow?: Record<string, unknown>;
+  routeFence?: Record<string, unknown>;
+  failAutonomyPersist?: boolean;
+  autonomyPolicy?: Record<string, unknown>;
+  fetch?: (url: unknown, init?: unknown) => Promise<unknown>;
+  tabsSendMessage?: (tabId: number, message: Record<string, unknown>) => Promise<unknown>;
+} = {}) {
   const initial = initialState();
-  const local = storageArea(initial.local);
+  if (opts.oldRoute) {
+    initial.transport.routeCanonical = opts.oldRoute;
+    initial.local[LOCAL_KEY] = { schemaVersion: 1, targetRoute: opts.oldRoute, paired: true };
+  }
+  if (opts.noTransport) {
+    delete initial.local[TRANSPORT_KEY];
+  }
+  if (opts.transport) {
+    initial.transport = { ...initial.transport, ...opts.transport };
+    initial.local[TRANSPORT_KEY] = initial.transport;
+  }
+  if (opts.connectFlow) initial.local[CONNECT_KEY] = opts.connectFlow;
+  if (opts.routeFence) initial.local[FENCE_KEY] = opts.routeFence;
+  if (opts.autonomyPolicy) initial.local[AUTONOMY_KEY] = opts.autonomyPolicy;
+  const local = storageArea(initial.local, opts.failAutonomyPersist === true);
   const session = storageArea(initial.session);
   let messageListener: ((message: unknown, sender: unknown, sendResponse: (response: unknown) => void) => unknown) | null = null;
-  const tabsSendMessage = vi.fn(async () => ({ ok: true }));
-  const fetchMock = vi.fn(async () => ({
+  const tabsSendMessage = vi.fn(opts.tabsSendMessage ?? (async () => ({ ok: true })));
+  const fetchMock = vi.fn(opts.fetch ?? (async () => ({
     ok: true,
     status: 200,
     async json() { return body; },
-  }));
+  })));
   const chrome = {
     storage: { local, session },
     runtime: {
@@ -113,6 +143,7 @@ async function loadWorker(body: Record<string, unknown>) {
       onRemoved: { addListener() {} },
       sendMessage: tabsSendMessage,
     },
+    permissions: { contains: async () => true },
   };
   vi.stubGlobal("chrome", chrome);
   vi.stubGlobal("fetch", fetchMock);
@@ -134,6 +165,501 @@ async function loadWorker(body: Record<string, unknown>) {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+});
+
+describe("G4c one-click connect orchestration", () => {
+  function jsonResponse(status: number, body: Record<string, unknown>) {
+    return {
+      ok: status >= 200 && status < 300,
+      status,
+      async json() { return body; },
+    };
+  }
+
+  function completedBody(overrides: Record<string, unknown> = {}) {
+    return {
+      workspaceId: WORKSPACE,
+      companionId: NEW_COMPANION,
+      bindingId: NEW_BINDING,
+      epoch: OLD_EPOCH + 1,
+      routeCanonical: ROUTE,
+      routeVerification: "VERIFIED",
+      challengeId: CHALLENGE,
+      credential: "c2c_comp_fresh-companion-credential",
+      ...overrides,
+    };
+  }
+
+  function verifiedState(overrides: Record<string, unknown> = {}) {
+    return {
+      workspaceId: WORKSPACE,
+      companionId: NEW_COMPANION,
+      bindingId: NEW_BINDING,
+      epoch: OLD_EPOCH + 1,
+      routeCanonical: ROUTE,
+      routeVerification: "VERIFIED",
+      productionEligible: true,
+      enabled: true,
+      pendingReady: 0,
+      reserved: 0,
+      claimed: 0,
+      outcomeUnknown: 0,
+      inFlight: null,
+      events: [],
+      ...overrides,
+    };
+  }
+
+  it("binds the real sender, sends attestation once, then heartbeat completes once", async () => {
+    const urls: string[] = [];
+    const worker = await loadWorker(responseBody(), {
+      oldRoute: OLD_ROUTE,
+      tabsSendMessage: async (_tabId, message) => message.type === "c2c.route.attest.execute"
+        ? { ok: true, observed: true, mutationAttempted: true, clickAttempted: true }
+        : { ok: true },
+      fetch: async (url) => {
+        const value = String(url);
+        urls.push(value);
+        if (value.includes("/rebind/init")) return jsonResponse(200, responseBody());
+        if (value.includes("/rebind/status")) return jsonResponse(200, {
+          workspaceId: WORKSPACE,
+          companionId: NEW_COMPANION,
+          bindingId: NEW_BINDING,
+          epoch: OLD_EPOCH + 1,
+          routeCanonical: ROUTE,
+          challengeId: CHALLENGE,
+          state: "CONFIRMED",
+        });
+        if (value.includes("/rebind/complete")) return jsonResponse(200, completedBody());
+        if (value.endsWith("/state")) {
+          const completed = urls.some(item => item.includes("/rebind/complete"));
+          return completed
+            ? jsonResponse(200, verifiedState())
+            : jsonResponse(401, { error: "COMPANION_EPOCH_STALE" });
+        }
+        throw new Error(`unexpected URL ${value}`);
+      },
+    });
+    const sender = { tab: { id: 7 }, documentId: "document-g4-rebind", frameId: 0, url: ROUTE };
+    const safety = { composer: "empty", generation: "idle", safe: true };
+    const connected = await worker.send({ type: "c2c.connect.page", generation: 1, safety }, sender) as {
+      ok: boolean; state?: string;
+    };
+    expect(connected).toMatchObject({ ok: true, state: "AWAITING_CONFIRMATION" });
+    expect(worker.tabsSendMessage).toHaveBeenCalledTimes(1);
+    expect(urls.filter(url => url.includes("/rebind/init"))).toHaveLength(1);
+    const duplicate = await worker.send({
+      type: "c2c.connect.page", generation: 1, safety,
+    }, sender) as Record<string, unknown>;
+    expect(duplicate).toMatchObject({ ok: false, reason: "connect_active", retryAllowed: false });
+    expect(urls.filter(url => url.includes("/rebind/init"))).toHaveLength(1);
+    expect(worker.tabsSendMessage).toHaveBeenCalledTimes(1);
+
+    await worker.send({ type: "c2c.heartbeat", generation: 1, safety }, sender);
+    await worker.send({ type: "c2c.heartbeat", generation: 1, safety }, sender);
+    expect(urls.filter(url => url.includes("/rebind/complete"))).toHaveLength(1);
+    expect(worker.tabsSendMessage).toHaveBeenCalledTimes(1);
+    expect(worker.local.values.get(TRANSPORT_KEY)).toMatchObject({
+      credential: "c2c_comp_fresh-companion-credential",
+      routeVerification: "VERIFIED",
+      rebindPending: false,
+    });
+    expect(worker.local.values.get(CONNECT_KEY)).toMatchObject({ state: "DONE", challengeId: CHALLENGE });
+    const status = await worker.send({
+      type: "c2c.status.page", href: ROUTE, generation: 1, safety,
+    }, sender) as Record<string, any>;
+    expect(status.connectState).toBe("DONE");
+    expect(status.autonomy.mode).toBe("off");
+  });
+
+  it("holds the mutation gate across route attestation RPC and persistence", async () => {
+    let releaseAttestation!: (value: unknown) => void;
+    const pendingAttestation = new Promise(resolve => { releaseAttestation = resolve; });
+    const worker = await loadWorker(responseBody(), {
+      oldRoute: OLD_ROUTE,
+      tabsSendMessage: async () => pendingAttestation,
+      fetch: async (url) => {
+        const value = String(url);
+        if (value.includes("/rebind/init")) return jsonResponse(200, responseBody());
+        if (value.endsWith("/state")) return jsonResponse(401, { error: "COMPANION_EPOCH_STALE" });
+        throw new Error(`unexpected URL ${value}`);
+      },
+    });
+    const sender = { tab: { id: 7 }, documentId: "document-g4-rebind", frameId: 0, url: ROUTE };
+    const connect = worker.send({
+      type: "c2c.connect.page",
+      generation: 1,
+      safety: { composer: "empty", generation: "idle", safe: true },
+    }, sender);
+    await vi.waitFor(() => expect(worker.tabsSendMessage).toHaveBeenCalledTimes(1));
+
+    expect(await worker.send({
+      type: "c2c.pair",
+      bridgeOrigin: "https://bridge.example.test",
+      intentId: "intent",
+      secret: "secret",
+      ownerProofId: "unused",
+    })).toMatchObject({ reason: "transport_mutation_in_flight" });
+    expect(await worker.send({ type: "c2c.transport.clear" })).toMatchObject({
+      reason: "transport_mutation_in_flight",
+    });
+
+    releaseAttestation({
+      ok: true,
+      observed: true,
+      mutationAttempted: true,
+      clickAttempted: true,
+    });
+    expect(await connect).toMatchObject({ ok: true, state: "AWAITING_CONFIRMATION" });
+  });
+
+  it("fails closed when Connect cannot durably persist Autonomy OFF", async () => {
+    const worker = await loadWorker(responseBody(), {
+      transport: { routeVerification: "VERIFIED" },
+      failAutonomyPersist: true,
+      autonomyPolicy: {
+        mode: "armed",
+        bindingId: OLD_BINDING,
+        epoch: OLD_EPOCH,
+        routeCanonical: ROUTE,
+        armedAt: Date.now(),
+      },
+    });
+    const sender = { tab: { id: 7 }, documentId: "document-g4-rebind", frameId: 0, url: ROUTE };
+    const result = await worker.send({
+      type: "c2c.connect.page",
+      generation: 1,
+      safety: { composer: "empty", generation: "idle", safe: true },
+    }, sender);
+    expect(result).toMatchObject({ ok: false, reason: "autonomy_persist_failed", autonomy: "off" });
+    expect(worker.tabsSendMessage).not.toHaveBeenCalled();
+    expect(worker.local.values.get(CONNECT_KEY)).toBeUndefined();
+  });
+
+  it("rolls back a proven pre-dispatch attestation failure for a later explicit Connect", async () => {
+    const worker = await loadWorker(responseBody(), {
+      oldRoute: OLD_ROUTE,
+      tabsSendMessage: async () => ({ ok: true }),
+      fetch: async (url) => String(url).includes("/rebind/init")
+        ? {
+            ok: true,
+            status: 200,
+            async json() { return responseBody(); },
+          }
+        : {
+            ok: false,
+            status: 401,
+            async json() { return { error: "COMPANION_EPOCH_STALE" }; },
+          },
+    });
+    const sender = { tab: { id: 7 }, documentId: "document-g4-rebind", frameId: 0, url: ROUTE };
+    const unsafe = await worker.send({
+      type: "c2c.connect.page",
+      generation: 1,
+      safety: { composer: "filled", generation: "idle", safe: false },
+    }, sender) as Record<string, unknown>;
+    expect(unsafe).toMatchObject({ ok: false, state: "NONE", retryAllowed: true });
+    expect(worker.local.values.get(CONNECT_KEY)).toMatchObject({ state: "NONE" });
+    expect(worker.tabsSendMessage).not.toHaveBeenCalled();
+
+    await worker.send({
+      type: "c2c.connect.page",
+      generation: 1,
+      safety: { composer: "empty", generation: "idle", safe: true },
+    }, sender);
+    expect(worker.tabsSendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["COMPANION_REPAIR_BLOCKED", "COMPANION_REBIND_NOT_CONFIRMED"])(
+    "%s rolls completion back without same-heartbeat retry",
+    async (errorCode) => {
+      const urls: string[] = [];
+      const worker = await loadWorker(responseBody(), {
+        transport: {
+          workspaceId: WORKSPACE,
+          companionId: NEW_COMPANION,
+          bindingId: NEW_BINDING,
+          epoch: OLD_EPOCH + 1,
+          routeCanonical: ROUTE,
+          rebindPending: true,
+          routeAttestationMessage: `[C2C_ROUTE_ATTEST]\nchallengeId=${CHALLENGE}`,
+          routeAttestationExpiresAt: "2099-01-01T00:00:00.000Z",
+        },
+        connectFlow: {
+          state: "ATTEST_REQUESTED",
+          workspaceId: WORKSPACE,
+          bindingId: NEW_BINDING,
+          epoch: OLD_EPOCH + 1,
+          companionId: NEW_COMPANION,
+          routeCanonical: ROUTE,
+          challengeId: CHALLENGE,
+          updatedAt: Date.now(),
+        },
+        routeFence: {
+          state: "OBSERVED_PENDING_CONFIRM",
+          companionId: NEW_COMPANION,
+          challengeId: CHALLENGE,
+          routeCanonical: ROUTE,
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+        },
+        fetch: async (url) => {
+          const value = String(url);
+          urls.push(value);
+          if (value.includes("/rebind/status")) {
+            return {
+              ok: true,
+              status: 200,
+              async json() {
+                return {
+                  workspaceId: WORKSPACE,
+                  companionId: NEW_COMPANION,
+                  bindingId: NEW_BINDING,
+                  epoch: OLD_EPOCH + 1,
+                  routeCanonical: ROUTE,
+                  challengeId: CHALLENGE,
+                  state: urls.filter(item => item.includes("/rebind/status")).length === 1
+                    ? "CONFIRMED" : "PENDING",
+                };
+              },
+            };
+          }
+          if (value.includes("/rebind/complete")) {
+            return {
+              ok: false,
+              status: 409,
+              async json() { return { error: errorCode }; },
+            };
+          }
+          throw new Error(`unexpected URL ${value}`);
+        },
+      });
+      const sender = { tab: { id: 7 }, documentId: "document-g4-rebind", frameId: 0, url: ROUTE };
+      const heartbeat = {
+        type: "c2c.heartbeat",
+        generation: 1,
+        safety: { composer: "empty", generation: "idle", safe: true },
+      };
+      await worker.send(heartbeat, sender);
+      expect(worker.local.values.get(CONNECT_KEY)).toMatchObject({ state: "ATTEST_REQUESTED" });
+      expect(urls.filter(item => item.includes("/rebind/complete"))).toHaveLength(1);
+      await worker.send(heartbeat, sender);
+      expect(urls.filter(item => item.includes("/rebind/complete"))).toHaveLength(1);
+      expect(urls.filter(item => item.includes("/rebind/status"))).toHaveLength(2);
+    },
+  );
+
+  it("is idempotent for exact VERIFIED state with zero route DOM Send", async () => {
+    const worker = await loadWorker(responseBody(), {
+      transport: { routeVerification: "VERIFIED" },
+      fetch: async (url) => String(url).endsWith("/state")
+        ? jsonResponse(200, verifiedState({
+            companionId: OLD_COMPANION,
+            bindingId: OLD_BINDING,
+            epoch: OLD_EPOCH,
+          }))
+        : Promise.reject(new Error(`unexpected URL ${String(url)}`)),
+    });
+    const sender = { tab: { id: 7 }, documentId: "document-g4-rebind", frameId: 0, url: ROUTE };
+    const result = await worker.send({
+      type: "c2c.connect.page",
+      generation: 1,
+      safety: { composer: "empty", generation: "idle", safe: true },
+    }, sender);
+    expect(result).toMatchObject({ ok: true, state: "CONNECTED", routeVerification: "VERIFIED" });
+    expect(worker.tabsSendMessage).not.toHaveBeenCalled();
+    expect(worker.fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns bounded cold_pair_required with no transport and rejects popup authority", async () => {
+    const worker = await loadWorker(responseBody(), { noTransport: true });
+    const sender = { tab: { id: 7 }, documentId: "document-g4-rebind", frameId: 0, url: ROUTE };
+    const result = await worker.send({
+      type: "c2c.connect.page",
+      generation: 1,
+      safety: { composer: "empty", generation: "idle", safe: true },
+    }, sender);
+    expect(result).toMatchObject({ ok: false, reason: "cold_pair_required" });
+    expect(await worker.send({
+      type: "c2c.connect.page",
+      routeCanonical: ROUTE,
+      tabId: 7,
+      documentId: "document-g4-rebind",
+    }, {})).toMatchObject({ ok: false, reason: "no_tab" });
+    expect(worker.fetchMock).not.toHaveBeenCalled();
+    expect(worker.tabsSendMessage).not.toHaveBeenCalled();
+  });
+
+  it("complete timeout becomes durable OUTCOME_UNKNOWN and heartbeat never retries", async () => {
+    const urls: string[] = [];
+    const worker = await loadWorker(responseBody(), {
+      oldRoute: OLD_ROUTE,
+      tabsSendMessage: async () => ({
+        ok: true, observed: true, mutationAttempted: true, clickAttempted: true,
+      }),
+      fetch: async (url) => {
+        const value = String(url);
+        urls.push(value);
+        if (value.includes("/rebind/init")) return jsonResponse(200, responseBody());
+        if (value.includes("/rebind/status")) return jsonResponse(200, {
+          workspaceId: WORKSPACE,
+          companionId: NEW_COMPANION,
+          bindingId: NEW_BINDING,
+          epoch: OLD_EPOCH + 1,
+          routeCanonical: ROUTE,
+          challengeId: CHALLENGE,
+          state: "CONFIRMED",
+        });
+        if (value.includes("/rebind/complete")) throw new Error("timeout");
+        if (value.endsWith("/state")) return jsonResponse(401, { error: "COMPANION_EPOCH_STALE" });
+        throw new Error(`unexpected URL ${value}`);
+      },
+    });
+    const sender = { tab: { id: 7 }, documentId: "document-g4-rebind", frameId: 0, url: ROUTE };
+    const safety = { composer: "empty", generation: "idle", safe: true };
+    await worker.send({ type: "c2c.connect.page", generation: 1, safety }, sender);
+    await worker.send({ type: "c2c.heartbeat", generation: 1, safety }, sender);
+    await worker.send({ type: "c2c.heartbeat", generation: 1, safety }, sender);
+    expect(urls.filter(url => url.includes("/rebind/complete"))).toHaveLength(1);
+    expect(worker.local.values.get(CONNECT_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN" });
+    expect(worker.local.values.get(TRANSPORT_KEY)).toMatchObject({ credential: "old-companion-credential" });
+  });
+
+  it("identity-mismatched complete 2xx becomes OUTCOME_UNKNOWN without credential switch", async () => {
+    const urls: string[] = [];
+    const worker = await loadWorker(responseBody(), {
+      oldRoute: OLD_ROUTE,
+      tabsSendMessage: async () => ({
+        ok: true, observed: true, mutationAttempted: true, clickAttempted: true,
+      }),
+      fetch: async (url) => {
+        const value = String(url);
+        urls.push(value);
+        if (value.includes("/rebind/init")) return jsonResponse(200, responseBody());
+        if (value.includes("/rebind/status")) return jsonResponse(200, {
+          workspaceId: WORKSPACE,
+          companionId: NEW_COMPANION,
+          bindingId: NEW_BINDING,
+          epoch: OLD_EPOCH + 1,
+          routeCanonical: ROUTE,
+          challengeId: CHALLENGE,
+          state: "CONFIRMED",
+        });
+        if (value.includes("/rebind/complete")) {
+          return jsonResponse(200, completedBody({ challengeId: "66666666-6666-4666-8666-666666666666" }));
+        }
+        if (value.endsWith("/state")) return jsonResponse(401, { error: "COMPANION_EPOCH_STALE" });
+        throw new Error(`unexpected URL ${value}`);
+      },
+    });
+    const sender = { tab: { id: 7 }, documentId: "document-g4-rebind", frameId: 0, url: ROUTE };
+    const safety = { composer: "empty", generation: "idle", safe: true };
+    await worker.send({ type: "c2c.connect.page", generation: 1, safety }, sender);
+    await worker.send({ type: "c2c.heartbeat", generation: 1, safety }, sender);
+    await worker.send({ type: "c2c.heartbeat", generation: 1, safety }, sender);
+    expect(urls.filter(url => url.includes("/rebind/complete"))).toHaveLength(1);
+    expect(worker.local.values.get(CONNECT_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN" });
+    expect(worker.local.values.get(TRANSPORT_KEY)).toMatchObject({ credential: "old-companion-credential" });
+  });
+
+  it.each(["ATTEST_REQUESTED", "COMPLETE_REQUESTED", "OUTCOME_UNKNOWN"])(
+    "restart in %s never resends attestation or complete",
+    async (state) => {
+      const flow = {
+        state,
+        workspaceId: WORKSPACE,
+        bindingId: NEW_BINDING,
+        epoch: OLD_EPOCH + 1,
+        companionId: NEW_COMPANION,
+        routeCanonical: ROUTE,
+        challengeId: CHALLENGE,
+        updatedAt: Date.now(),
+      };
+      const worker = await loadWorker(responseBody(), {
+        transport: {
+          workspaceId: WORKSPACE,
+          companionId: NEW_COMPANION,
+          bindingId: NEW_BINDING,
+          epoch: OLD_EPOCH + 1,
+          routeCanonical: ROUTE,
+          rebindPending: true,
+          routeAttestationMessage: `[C2C_ROUTE_ATTEST]\nchallengeId=${CHALLENGE}`,
+          routeAttestationExpiresAt: "2099-01-01T00:00:00.000Z",
+        },
+        connectFlow: flow,
+        routeFence: {
+          state: state === "ATTEST_REQUESTED" ? "ROUTE_ATTEST_DISPATCH" : "OBSERVED_PENDING_CONFIRM",
+          companionId: NEW_COMPANION,
+          challengeId: CHALLENGE,
+          routeCanonical: ROUTE,
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+        },
+        fetch: async () => { throw new Error("restart fence must not fetch"); },
+        tabsSendMessage: async () => { throw new Error("restart fence must not send"); },
+      });
+      const sender = { tab: { id: 7 }, documentId: "document-g4-rebind", frameId: 0, url: ROUTE };
+      const safety = { composer: "empty", generation: "idle", safe: true };
+      await worker.send({ type: "c2c.heartbeat", generation: 1, safety }, sender);
+      expect(worker.fetchMock).not.toHaveBeenCalled();
+      expect(worker.tabsSendMessage).not.toHaveBeenCalled();
+      expect(worker.local.values.get(CONNECT_KEY)).toMatchObject({ state });
+    },
+  );
+
+  it("restart after durable DONE only polls state and converges VERIFIED", async () => {
+    const urls: string[] = [];
+    const flow = {
+      state: "DONE",
+      workspaceId: WORKSPACE,
+      bindingId: NEW_BINDING,
+      epoch: OLD_EPOCH + 1,
+      companionId: NEW_COMPANION,
+      routeCanonical: ROUTE,
+      challengeId: CHALLENGE,
+      updatedAt: Date.now(),
+    };
+    const worker = await loadWorker(responseBody(), {
+      transport: {
+        workspaceId: WORKSPACE,
+        companionId: NEW_COMPANION,
+        bindingId: NEW_BINDING,
+        epoch: OLD_EPOCH + 1,
+        credential: "c2c_comp_fresh-companion-credential",
+        routeCanonical: ROUTE,
+        routeVerification: "PENDING",
+        rebindPending: false,
+        routeAttestationMessage: `[C2C_ROUTE_ATTEST]\nchallengeId=${CHALLENGE}`,
+      },
+      connectFlow: flow,
+      routeFence: {
+        state: "OBSERVED_PENDING_CONFIRM",
+        companionId: NEW_COMPANION,
+        challengeId: CHALLENGE,
+        routeCanonical: ROUTE,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      },
+      fetch: async (url) => {
+        urls.push(String(url));
+        return jsonResponse(200, verifiedState());
+      },
+      tabsSendMessage: async () => { throw new Error("DONE restart must not send"); },
+    });
+    const sender = { tab: { id: 7 }, documentId: "document-g4-rebind", frameId: 0, url: ROUTE };
+    await worker.send({
+      type: "c2c.heartbeat",
+      generation: 1,
+      safety: { composer: "empty", generation: "idle", safe: true },
+    }, sender);
+
+    expect(urls).toHaveLength(1);
+    expect(urls[0]).toMatch(/\/state$/);
+    expect(urls[0]).not.toContain("/rebind/complete");
+    expect(worker.tabsSendMessage).not.toHaveBeenCalled();
+    expect(worker.local.values.get(TRANSPORT_KEY)).toMatchObject({ routeVerification: "VERIFIED" });
+    expect(worker.local.values.get(CONNECT_KEY)).toMatchObject({ state: "DONE" });
+  });
 });
 
 describe("G4 Browser rebind init response identity gate", () => {
@@ -208,5 +734,39 @@ describe("G4 Browser rebind init response identity gate", () => {
       epoch: OLD_EPOCH,
     });
     expect(status.routeAttestFence).toBe("PAIRING_TRANSITION");
+  });
+
+  it("rejects Pair while rebind init is in flight", async () => {
+    let releaseInit!: (value: unknown) => void;
+    const pendingInit = new Promise(resolve => { releaseInit = resolve; });
+    const worker = await loadWorker(responseBody(), {
+      fetch: async () => pendingInit,
+    });
+    const rebind = worker.send(
+      { type: "c2c.rebind.start", ownerProofId: worker.proofId },
+      {},
+    );
+    await vi.waitFor(() => expect(worker.fetchMock).toHaveBeenCalledTimes(1));
+
+    const pair = await worker.send({
+      type: "c2c.pair",
+      bridgeOrigin: "https://bridge.example.test",
+      intentId: "intent",
+      secret: "secret",
+      ownerProofId: "unused",
+    });
+    expect(pair).toMatchObject({
+      ok: false,
+      reason: "transport_mutation_in_flight",
+      retryAllowed: true,
+    });
+    expect(worker.fetchMock).toHaveBeenCalledTimes(1);
+
+    releaseInit({
+      ok: true,
+      status: 200,
+      async json() { return responseBody(); },
+    });
+    expect(await rebind).toMatchObject({ ok: true });
   });
 });

@@ -7,6 +7,7 @@ import {
   companionRelease,
   companionReserveNext,
   companionRetireOutcomeUnknown,
+  companionRebindStatus,
   completeCompanionRebind,
   exchangePairingIntent,
   initiateCompanionRebind,
@@ -30,6 +31,11 @@ const routeBodySchema = z.object({
 const rebindCompleteBodySchema = z.object({
   challengeId: z.string().uuid(),
   routeCanonical: z.string().min(1).max(512),
+}).strict();
+
+const rebindStatusQuerySchema = z.object({
+  routeCanonical: z.string().min(1).max(512),
+  challengeId: z.string().uuid(),
 }).strict();
 
 const releaseBodySchema = z.object({
@@ -170,6 +176,25 @@ export function createCompanionRouter(opts: CompanionRouterOptions): Router {
         credential,
         challengeId: body.challengeId,
         routeCanonical: body.routeCanonical,
+        stateDir: opts.stateDir,
+      }));
+    } catch (error) {
+      sendError(res, error);
+    }
+  });
+
+  router.get("/rebind/status", (req, res) => {
+    try {
+      const credential = bearerCredential(req);
+      if (!credential) {
+        throw new CompanionError("COMPANION_UNAUTHORIZED", "缺少旧 companion credential");
+      }
+      const query = rebindStatusQuerySchema.parse(req.query);
+      res.json(companionRebindStatus({
+        workspaceId: opts.workspaceId,
+        credential,
+        routeCanonical: query.routeCanonical,
+        challengeId: query.challengeId,
         stateDir: opts.stateDir,
       }));
     } catch (error) {

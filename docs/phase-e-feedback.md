@@ -822,3 +822,14 @@ F1a 只增加现有 SW status payload 的纯、只读 operational health summary
 - takeover 后旧 credential 对所有 production API 仍无效；仅 immediate predecessor 可在无 `reserved / claimed / outcome_unknown` 时启动窄 `/rebind`。
 - rebind challenge 持久化且 TTL/one-shot；当前 Chat 的 MCP principal 仍须确认。wrong principal 不消费 challenge，成功后才旋转 fresh credential。
 - Browser 复用 G3 route-attestation runner/fence；authenticated `/state` 仍是唯一 VERIFIED authority。无 auto Arm、无 auto Retire、无协议发送状态机变化。
+
+## Phase G4c Connect this Chat
+
+- Popup 单一主操作 `Connect this Chat` 通过固定 content-script request 进入 SW；SW 只信任真实 `MessageSender` 的 tab/document/route，并将当前 document 绑定为 exact owner。
+- eligible predecessor 继续只用于窄 rebind surface。新增 authenticated `GET /rebind/status`，只读返回 exact challenge 的 `PENDING | CONFIRMED | EXPIRED` 与 bounded identity；不返回 principal、credential、secret、hash 或 production payload。
+- durable connect fence：`NONE -> ATTEST_REQUESTED -> COMPLETE_REQUESTED -> DONE`，ambiguous 结果进入 `OUTCOME_UNKNOWN`。route attestation 仍由 G3 runner/fence one-shot 执行；restart、重复 Connect 或 heartbeat 不得重发 DOM Send 或重复 `/rebind/complete`。
+- Connect 开始时必须把 autonomy `OFF` durable persist 成功；写入失败保持内存 OFF 并 fail closed。若 route runner 明确证明没有 mutation/click 且 durable fence/latch 仍为 `NONE`，则清除本轮 `ATTEST_REQUESTED`，允许下一次显式 Connect 重试同一 challenge；任何可能 mutation 的结果仍永久进入 `OUTCOME_UNKNOWN`。
+- current Chat 必须继续调用 MCP `feedback_companion_route_confirm`。确认后 exact owner heartbeat 才能观察 `CONFIRMED` 并 fenced complete；fresh credential exact-match durable commit 后，authenticated `/state` 才能把 route 收敛为 `VERIFIED`。
+- `/rebind/status` 在读取前再次检查 `reserved / claimed / outcome_unknown`；发现 in-flight 返回 bounded `409 COMPANION_REPAIR_BLOCKED`。complete 仅对服务端明确在 mint 前拒绝的 `COMPANION_REPAIR_BLOCKED` / `COMPANION_REBIND_NOT_CONFIRMED` 回滚到 `ATTEST_REQUESTED`，其他网络、5xx、malformed、identity mismatch 或 commit ambiguity 均不重试并保持 `OUTCOME_UNKNOWN`。
+- Pair/Rebind/Complete/Clear 串行化，避免并发 transport 回写。正常同浏览器路径只剩一次 Connect 点击；若 Chrome host permission 未授予，仍需先独立 Grant。无 predecessor 时保留 cold pair fallback。
+- G4c 不改变 autonomy/production 协议：autonomy 仍 OFF，identity 变化仍 disarm；Connect 不 reserve、begin-send、ACK、Recover、Retire 或 Arm。

@@ -141,6 +141,14 @@
       });
       return true;
     }
+    if (message.type === "c2c.connect.request") {
+      // Fixed popup request. Route/document/tab authority comes from this CS MessageSender.
+      const msg = buildObserveMessage();
+      void sendToWorker({ ...msg, type: "c2c.connect.page" }).then((response) => {
+        sendResponse(response);
+      });
+      return true;
+    }
     if (message.type === "c2c.owner-proof.request") {
       // Carry current route/safety so SW can atomically refresh before mint.
       void sendToWorker({ ...buildObserveMessage(), type: "c2c.owner-proof.request" }).then((response) => {

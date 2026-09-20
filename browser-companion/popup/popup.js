@@ -13,6 +13,8 @@
     pageRoute: document.getElementById("page-route"),
     ownerStatus: document.getElementById("owner-status"),
     domSafety: document.getElementById("dom-safety"),
+    connectChat: document.getElementById("connect-chat"),
+    connectStatus: document.getElementById("connect-status"),
     bind: document.getElementById("bind"),
     unbind: document.getElementById("unbind"),
     transportStatus: document.getElementById("transport-status"),
@@ -307,6 +309,7 @@
       && safety?.safety?.generation === "idle";
 
     els.bind.disabled = !parsed || !tab?.id;
+    if (els.connectChat) els.connectChat.disabled = !parsed || !tab?.id;
     els.pair.disabled = !isOwner;
     if (els.rebindStart) {
       els.rebindStart.disabled = !isOwner || !transport?.bridgeOrigin || transport?.rebindPending === true;
@@ -426,6 +429,46 @@
         && autonomyMode !== "armed"
         && els.productionSendConfirm.checked;
       els.productionSend.disabled = !canProduction;
+    }
+
+    if (els.connectChat) {
+      els.connectChat.onclick = async () => {
+        if (!tab?.id || !parsed) return;
+        const origin = els.bridgeOrigin.value.trim();
+        if (origin) {
+          let permission;
+          try {
+            permission = bridgePermission(origin);
+          } catch {
+            setText(els.connectStatus, "bridge_origin_invalid", "bad");
+            return;
+          }
+          const granted = await chrome.permissions.contains({ origins: [permission.pattern] });
+          if (!granted) {
+            setText(els.connectStatus, "bridge_permission_missing", "bad");
+            return;
+          }
+        }
+        const tabNow = await activeTab();
+        if (!tabNow?.id || tabNow.id !== tab.id) {
+          setText(els.connectStatus, "tab_changed", "bad");
+          return;
+        }
+        let res;
+        try {
+          // Fixed command only. Content script forwards real MessageSender identity.
+          res = await chrome.tabs.sendMessage(tabNow.id, { type: "c2c.connect.request" });
+        } catch {
+          res = { ok: false, reason: "content_script_unavailable" };
+        }
+        const text = res?.ok
+          ? (res.state === "CONNECTED"
+              ? "Connected — Route verification: VERIFIED — Autonomy OFF"
+              : "Route attestation sent once — awaiting Chat confirmation")
+          : res?.reason || "connect_failed";
+        setText(els.connectStatus, text, res?.ok ? "ok" : "bad");
+        await refresh();
+      };
     }
 
     els.bind.onclick = async () => {

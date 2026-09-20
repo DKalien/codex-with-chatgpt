@@ -117,6 +117,16 @@ import {
   sanitizeRecoveryResult,
   operationalHealthSummary,
 } from "./autonomy.js";
+import {
+  CONNECT_FLOW_KEY,
+  emptyConnectFlow,
+  parseConnectFlow,
+  connectFlowIdentity,
+  connectFlowMatches,
+  beginConnectAttestation,
+  requestConnectCompletion,
+  finishConnectFlow,
+} from "./connect-flow.js";
 
 const LOCAL_KEY = "c2c_companion_local_v1";
 const TRANSPORT_KEY = "c2c_companion_transport_v1";
@@ -146,6 +156,10 @@ let sendProbeInFlight = false;
 let routeAttestLatch = emptyRouteAttestLatch();
 /** G3 route-attestation durable fence (chrome.storage.local). Survives browser restart. */
 let routeAttestFence = emptyRouteAttestFence();
+/** G4c one-click orchestration fence (durable local). */
+let connectFlow = emptyConnectFlow();
+let connectInFlight = false;
+let transportMutationInFlight = false;
 /** E1b3d3b concurrent production send gate (memory only; durable truth is journal). */
 let productionSendInFlight = false;
 /** Short-lived SW transition proofs. Bound to current journal identity. Never from CS. */
@@ -170,6 +184,18 @@ const initPromise = (async () => {
   await hydrate();
 })();
 
+async function runTransportMutation(operation) {
+  if (transportMutationInFlight) {
+    return { ok: false, reason: "transport_mutation_in_flight", retryAllowed: true };
+  }
+  transportMutationInFlight = true;
+  try {
+    return await operation();
+  } finally {
+    transportMutationInFlight = false;
+  }
+}
+
 async function restrictStorageLocal() {
   try {
     if (!chrome.storage?.local?.setAccessLevel) return false;
@@ -189,6 +215,7 @@ async function hydrate() {
     JOURNAL_KEY,
     AUTONOMY_STORAGE_KEY,
     ROUTE_ATTEST_FENCE_KEY,
+    CONNECT_FLOW_KEY,
   ]);
   const row = stored[LOCAL_KEY];
   localState = row && typeof row === "object"
@@ -252,6 +279,7 @@ async function hydrate() {
   });
   routeAttestFence = reconciled.fence;
   routeAttestLatch = reconciled.sessionLatch;
+  connectFlow = parseConnectFlow(stored[CONNECT_FLOW_KEY]);
   hydrated = true;
 }
 
@@ -307,7 +335,7 @@ async function persistRouteAttestBoth() {
  * Atomic pair durable commit: TRANSPORT + LOCAL + FENCE in one chrome.storage.local.set.
  * Returns false on any write failure — caller must keep PAIRING_TRANSITION barrier.
  */
-async function commitPairDurableLocals({ nextTransport, nextLocal, nextFence }) {
+async function commitPairDurableLocals({ nextTransport, nextLocal, nextFence, nextConnectFlow }) {
   if (!storageProtected) return false;
   try {
     const row = {
@@ -315,7 +343,29 @@ async function commitPairDurableLocals({ nextTransport, nextLocal, nextFence }) 
       [ROUTE_ATTEST_FENCE_KEY]: nextFence,
     };
     if (nextTransport) row[TRANSPORT_KEY] = nextTransport;
+    if (nextConnectFlow) row[CONNECT_FLOW_KEY] = nextConnectFlow;
     await chrome.storage.local.set(row);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function persistConnectFlow() {
+  try {
+    await chrome.storage.local.set({ [CONNECT_FLOW_KEY]: connectFlow });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function persistConnectAndRouteFence() {
+  try {
+    await chrome.storage.local.set({
+      [CONNECT_FLOW_KEY]: connectFlow,
+      [ROUTE_ATTEST_FENCE_KEY]: routeAttestFence,
+    });
     return true;
   } catch {
     return false;
@@ -438,6 +488,7 @@ function safeTransportSummary() {
     routeVerification: transport.routeVerification === "VERIFIED" ? "VERIFIED" : "PENDING",
     productionEligible: transport.routeVerification === "VERIFIED",
     rebindPending: transport.rebindPending === true,
+    connectState: connectFlow.state,
     pairedAt: transport.pairedAt,
   };
 }
@@ -458,6 +509,7 @@ function statusPayload(tabId, documentId, extra = {}) {
     sendProbeLatch: sendProbeLatch.state,
     routeAttestLatch: routeAttestLatch.state,
     routeAttestFence: routeAttestFence.state,
+    connectState: connectFlow.state,
     productionSendInFlight,
     autonomy: autonomySummary(autonomyPolicy, {
       identityExact: policyIdentityExact(autonomyPolicy, transport),
@@ -681,6 +733,7 @@ async function handlePair(message) {
   const prevLocal = localState;
   const prevFence = routeAttestFence;
   const prevLatch = routeAttestLatch;
+  const prevConnectFlow = connectFlow;
 
   // Barrier-first: durable PAIRING_TRANSITION before any server mutation.
   // Blocks all route-attestation DOM Send, including old PENDING challenge.
@@ -804,15 +857,22 @@ async function handlePair(message) {
     nextFence = markRouteAttestFenceState(barrier, "OUTCOME_UNKNOWN");
   }
   const nextLatch = emptyRouteAttestLatch();
+  const nextConnectFlow = emptyConnectFlow();
 
   // Atomic durable commit: TRANSPORT_KEY + LOCAL_KEY + ROUTE_ATTEST_FENCE_KEY.
-  const commitOk = await commitPairDurableLocals({ nextTransport, nextLocal, nextFence });
+  const commitOk = await commitPairDurableLocals({
+    nextTransport,
+    nextLocal,
+    nextFence,
+    nextConnectFlow,
+  });
   if (!commitOk) {
     // Keep barrier. Do not switch memory to new transport. Zero DOM Send.
     transport = prevTransport;
     localState = prevLocal;
     routeAttestFence = barrier;
     routeAttestLatch = prevLatch;
+    connectFlow = prevConnectFlow;
     try {
       await persistRouteAttestFence();
     } catch {
@@ -831,6 +891,7 @@ async function handlePair(message) {
   localState = nextLocal;
   routeAttestFence = nextFence;
   routeAttestLatch = nextLatch;
+  connectFlow = nextConnectFlow;
 
   try {
     await persistRouteAttestLatch();
@@ -856,6 +917,7 @@ async function handleRebindStart(message) {
   }
   if (!ownerState.owner) return { ok: false, reason: "not_exact_owner" };
   const routeCanonical = ownerState.owner.canonicalRoute;
+  const ownerAtStart = { ...ownerState.owner };
   const proofCheck = consumeOwnerProof(ownerProof, {
     tabId: ownerState.owner.tabId,
     documentId: ownerState.owner.documentId,
@@ -910,6 +972,18 @@ async function handleRebindStart(message) {
         ? prevFence?.state ?? "NONE"
         : "PAIRING_TRANSITION",
       retryAllowed: res.status >= 400 && res.status < 500,
+    };
+  }
+  if (!isOwner(ownerState, ownerAtStart.tabId, ownerAtStart.documentId)
+    || ownerState.owner?.canonicalRoute !== ownerAtStart.canonicalRoute
+    || ownerState.owner?.generation !== ownerAtStart.generation) {
+    routeAttestFence = markRouteAttestFenceState(barrier, "OUTCOME_UNKNOWN");
+    await persistRouteAttestFence().catch(() => false);
+    return {
+      ok: false,
+      reason: "owner_identity_changed",
+      routeAttestFence: "OUTCOME_UNKNOWN",
+      retryAllowed: false,
     };
   }
   assertNoForbiddenFields(body);
@@ -1007,7 +1081,7 @@ async function handleRebindStart(message) {
   return { ok: true, transport: safeTransportSummary() };
 }
 
-async function handleRebindComplete() {
+async function handleRebindComplete({ managed = false } = {}) {
   if (!storageProtected) return { ok: false, reason: "storage_unprotected" };
   if (!transport?.rebindPending || !transport.bridgeOrigin || !transport.credential) {
     return { ok: false, reason: "rebind_not_pending" };
@@ -1020,6 +1094,15 @@ async function handleRebindComplete() {
   }
   const challengeId = extractRouteChallengeId(transport.routeAttestationMessage);
   if (!challengeId) return { ok: false, reason: "rebind_challenge_missing", retryAllowed: false };
+  const identity = connectFlowIdentity(transport);
+  if (managed) {
+    if (!identity || !connectFlowMatches(connectFlow, identity)
+      || connectFlow.state !== "COMPLETE_REQUESTED") {
+      return { ok: false, reason: "connect_completion_not_requested", retryAllowed: false };
+    }
+  } else if (["ATTEST_REQUESTED", "COMPLETE_REQUESTED", "OUTCOME_UNKNOWN"].includes(connectFlow.state)) {
+    return { ok: false, reason: "connect_managed", retryAllowed: false };
+  }
   let res;
   try {
     res = await fetch(companionApiUrl(transport.bridgeOrigin, "/rebind/complete"), {
@@ -1033,20 +1116,39 @@ async function handleRebindComplete() {
     });
   } catch {
     routeAttestFence = markRouteAttestFenceState(routeAttestFence, "OUTCOME_UNKNOWN");
-    await persistRouteAttestFence().catch(() => false);
+    if (identity) connectFlow = finishConnectFlow(connectFlow, identity, "OUTCOME_UNKNOWN");
+    await persistConnectAndRouteFence().catch(() => false);
     return { ok: false, reason: "rebind_complete_outcome_unknown", retryAllowed: false };
   }
   const body = await res.json().catch(() => ({}));
   if (!res.ok) {
-    if (res.status >= 500) {
+    const deterministicNoMutation = managed
+      && ["COMPANION_REPAIR_BLOCKED", "COMPANION_REBIND_NOT_CONFIRMED"].includes(body.error);
+    if (deterministicNoMutation && identity) {
+      connectFlow = { ...connectFlow, state: "ATTEST_REQUESTED", updatedAt: Date.now() };
+      if (!await persistConnectFlow()) {
+        connectFlow = finishConnectFlow(connectFlow, identity, "OUTCOME_UNKNOWN");
+        await persistConnectFlow().catch(() => false);
+        return { ok: false, reason: "connect_completion_fence_persist_failed", retryAllowed: false };
+      }
+      return {
+        ok: false,
+        reason: body.error,
+        status: res.status,
+        state: "ATTEST_REQUESTED",
+        retryAllowed: true,
+      };
+    }
+    if (managed || res.status >= 500) {
       routeAttestFence = markRouteAttestFenceState(routeAttestFence, "OUTCOME_UNKNOWN");
-      await persistRouteAttestFence().catch(() => false);
+      if (identity) connectFlow = finishConnectFlow(connectFlow, identity, "OUTCOME_UNKNOWN");
+      await persistConnectAndRouteFence().catch(() => false);
     }
     return {
       ok: false,
       reason: body.error || `http_${res.status}`,
       status: res.status,
-      retryAllowed: res.status === 409 && body.error === "COMPANION_REBIND_NOT_CONFIRMED",
+      retryAllowed: !managed && res.status === 409 && body.error === "COMPANION_REBIND_NOT_CONFIRMED",
     };
   }
   assertNoForbiddenFields(body);
@@ -1055,9 +1157,13 @@ async function handleRebindComplete() {
     || body.bindingId !== transport.bindingId
     || body.epoch !== transport.epoch
     || body.routeCanonical !== transport.routeCanonical
-    || typeof body.credential !== "string") {
+    || body.challengeId !== challengeId
+    || typeof body.credential !== "string"
+    || !body.credential.startsWith("c2c_comp_")
+    || body.credential.length > 256) {
     routeAttestFence = markRouteAttestFenceState(routeAttestFence, "OUTCOME_UNKNOWN");
-    await persistRouteAttestFence().catch(() => false);
+    if (identity) connectFlow = finishConnectFlow(connectFlow, identity, "OUTCOME_UNKNOWN");
+    await persistConnectAndRouteFence().catch(() => false);
     return { ok: false, reason: "rebind_complete_response_invalid", retryAllowed: false };
   }
   const nextTransport = {
@@ -1067,16 +1173,23 @@ async function handleRebindComplete() {
     routeVerification: "PENDING",
     rebindPending: false,
   };
+  const nextConnectFlow = identity
+    ? finishConnectFlow(connectFlow, identity, "DONE")
+    : connectFlow;
   if (!await commitPairDurableLocals({
     nextTransport,
     nextLocal: localState,
     nextFence: routeAttestFence,
+    nextConnectFlow,
   })) {
     routeAttestFence = markRouteAttestFenceState(routeAttestFence, "OUTCOME_UNKNOWN");
-    await persistRouteAttestFence().catch(() => false);
+    if (identity) connectFlow = finishConnectFlow(connectFlow, identity, "OUTCOME_UNKNOWN");
+    await persistConnectAndRouteFence().catch(() => false);
     return { ok: false, reason: "rebind_complete_durable_commit_failed", retryAllowed: false };
   }
   transport = nextTransport;
+  connectFlow = nextConnectFlow;
+  await forceAutonomyOff("identity_disarm");
   const stateRes = await handleFetchState();
   return {
     ok: stateRes?.ok === true && stateRes?.status?.routeVerification === "VERIFIED",
@@ -1085,6 +1198,211 @@ async function handleRebindComplete() {
     productionEligible: stateRes?.status?.productionEligible === true,
     retryAllowed: false,
   };
+}
+
+async function fetchRebindStatus(identity) {
+  let res;
+  try {
+    const query = `?routeCanonical=${encodeURIComponent(identity.routeCanonical)}`
+      + `&challengeId=${encodeURIComponent(identity.challengeId)}`;
+    res = await fetchCompanion(`/rebind/status${query}`, { method: "GET" });
+  } catch {
+    return { ok: false, reason: "rebind_status_unreachable" };
+  }
+  if (!res.ok) {
+    return { ok: false, reason: res.body?.error || `http_${res.status}`, status: res.status };
+  }
+  assertNoForbiddenFields(res.body);
+  const body = res.body || {};
+  const valid = Object.keys(body).sort().join(",")
+      === "bindingId,challengeId,companionId,epoch,routeCanonical,state,workspaceId"
+    && body.workspaceId === identity.workspaceId
+    && body.bindingId === identity.bindingId
+    && body.epoch === identity.epoch
+    && body.companionId === identity.companionId
+    && body.routeCanonical === identity.routeCanonical
+    && body.challengeId === identity.challengeId
+    && ["PENDING", "CONFIRMED", "EXPIRED"].includes(body.state);
+  return valid
+    ? { ok: true, state: body.state }
+    : { ok: false, reason: "rebind_status_response_invalid" };
+}
+
+async function maybeCompleteConnectedRebind(ownerExact) {
+  if (ownerExact !== true || !transport?.rebindPending) return { ok: false, reason: "not_pending" };
+  const identity = connectFlowIdentity(transport);
+  if (!identity || !connectFlowMatches(connectFlow, identity)
+    || connectFlow.state !== "ATTEST_REQUESTED") {
+    return { ok: false, reason: "connect_not_pollable" };
+  }
+  if (routeAttestFence.state !== "OBSERVED_PENDING_CONFIRM") {
+    return { ok: false, reason: "attestation_not_observed" };
+  }
+  const status = await fetchRebindStatus(identity);
+  if (!status.ok || status.state !== "CONFIRMED") return status;
+
+  const requested = requestConnectCompletion(connectFlow, identity);
+  if (!requested.ok) return requested;
+  connectFlow = requested.flow;
+  if (!await persistConnectFlow()) {
+    connectFlow = finishConnectFlow(connectFlow, identity, "OUTCOME_UNKNOWN");
+    await persistConnectFlow().catch(() => false);
+    return { ok: false, reason: "connect_completion_fence_persist_failed", retryAllowed: false };
+  }
+  return handleRebindComplete({ managed: true });
+}
+
+async function handleConnectPage(sender, message) {
+  if (connectInFlight) return { ok: false, reason: "connect_in_flight", retryAllowed: false };
+  connectInFlight = true;
+  try {
+    if (!storageProtected) return { ok: false, reason: "storage_unprotected" };
+    if (!pairAllowedWithJournal(journal, transport?.authStale === true)) {
+      return { ok: false, reason: "journal_active" };
+    }
+    const autonomyOff = await forceAutonomyOff("connect");
+    if (!autonomyOff.ok) {
+      return { ok: false, reason: "autonomy_persist_failed", autonomy: "off", retryAllowed: true };
+    }
+    const identity = resolveSenderDocumentIdentity(sender);
+    if (!identity.ok) return { ok: false, reason: identity.reason };
+    const parsed = parseRouteSafe(sender?.url ?? "");
+    if (!parsed) return { ok: false, reason: "invalid_route" };
+    const canonicalRoute = parsed.canonical;
+    const generation = Number.isFinite(message?.generation) ? Number(message.generation) : 1;
+    const bound = bindOwner(ownerState, {
+      tabId: identity.tabId,
+      documentId: identity.documentId,
+      canonicalRoute,
+      generation,
+      frameId: 0,
+      lastSeen: Date.now(),
+    }, canonicalRoute);
+    if (!bound.ok) return { ok: false, reason: bound.reason };
+    ownerState = bound.state;
+    localState = { ...localState, targetRoute: canonicalRoute, paired: true };
+    evidence = message?.safety && typeof message.safety === "object"
+      ? {
+          tabId: identity.tabId,
+          documentId: identity.documentId,
+          canonicalRoute,
+          observedAt: Date.now(),
+          composer: message.safety.composer,
+          generation: message.safety.generation,
+          safe: message.safety.safe === true,
+        }
+      : null;
+    await persistLocal();
+    await persistSessionOwnership();
+    if (!transport?.bridgeOrigin || !transport?.credential) {
+      return { ok: false, reason: "cold_pair_required" };
+    }
+    let permission;
+    try {
+      const origin = parseBridgeOrigin(transport.bridgeOrigin, { allowLoopbackHttp: true });
+      permission = await chrome.permissions?.contains?.({ origins: [`${origin}/*`] });
+    } catch {
+      permission = false;
+    }
+    if (permission !== true) return { ok: false, reason: "bridge_permission_missing" };
+
+    let currentPairPending = false;
+    if (!transport.rebindPending && transport.routeCanonical === canonicalRoute) {
+      const current = await handleFetchState();
+      if (current?.ok && current.status?.routeVerification === "VERIFIED") {
+        return { ok: true, state: "CONNECTED", routeVerification: "VERIFIED", autonomy: "off" };
+      }
+      currentPairPending = current?.ok === true
+        && current.status?.routeVerification === "PENDING";
+      if (current?.ok !== true && current?.authStale !== true) {
+        return { ok: false, reason: current?.reason || "state_unavailable" };
+      }
+    }
+
+    if (!transport.rebindPending && !currentPairPending) {
+      ownerProof = mintOwnerProof({
+        tabId: identity.tabId,
+        documentId: identity.documentId,
+        routeCanonical: canonicalRoute,
+      });
+      const started = await handleRebindStart({ ownerProofId: ownerProof.id });
+      if (!started.ok) {
+        const coldPair = [
+          "COMPANION_UNAUTHORIZED",
+          "COMPANION_EPOCH_STALE",
+          "COMPANION_REBIND_NOT_SUCCESSOR",
+        ].includes(started.reason);
+        return { ...started, reason: coldPair ? "cold_pair_required" : started.reason };
+      }
+    }
+
+    if (!ownerState.owner
+      || !isOwner(ownerState, identity.tabId, identity.documentId)
+      || ownerState.owner.canonicalRoute !== canonicalRoute
+      || transport.routeCanonical !== canonicalRoute) {
+      return { ok: false, reason: "owner_identity_changed", retryAllowed: false };
+    }
+    const flowIdentity = connectFlowIdentity(transport);
+    const begun = beginConnectAttestation(connectFlow, flowIdentity);
+    if (!begun.ok) {
+      return {
+        ok: begun.reason === "already_connected",
+        reason: begun.reason,
+        state: connectFlow.state,
+        retryAllowed: false,
+      };
+    }
+    connectFlow = begun.flow;
+    if (!await persistConnectFlow()) {
+      connectFlow = finishConnectFlow(connectFlow, flowIdentity, "OUTCOME_UNKNOWN");
+      await persistConnectFlow().catch(() => false);
+      return { ok: false, reason: "connect_fence_persist_failed", retryAllowed: false };
+    }
+
+    const attested = await handleMessage(
+      { type: ROUTE_ATTEST_SEND_TYPE },
+      {},
+      { transportMutationHeld: true },
+    );
+    if (!attested?.ok) {
+      const noMutation = attested?.mutationAttempted !== true
+        && attested?.clickAttempted !== true
+        && routeAttestLatch.state === "NONE"
+        && routeAttestFence.state === "NONE";
+      if (noMutation) {
+        connectFlow = emptyConnectFlow();
+        if (!await persistConnectFlow()) {
+          connectFlow = finishConnectFlow(connectFlow, flowIdentity, "OUTCOME_UNKNOWN");
+          await persistConnectFlow().catch(() => false);
+          return { ok: false, reason: "connect_fence_persist_failed", retryAllowed: false };
+        }
+        return { ...attested, state: "NONE", retryAllowed: true };
+      }
+      if (attested?.mutationAttempted === true
+        || attested?.clickAttempted === true
+        || attested?.fenceState === "OUTCOME_UNKNOWN") {
+        connectFlow = finishConnectFlow(connectFlow, flowIdentity, "OUTCOME_UNKNOWN");
+        await persistConnectFlow().catch(() => false);
+      }
+      return { ...attested, state: connectFlow.state };
+    }
+    if (attested.serverConfirmed === true) {
+      connectFlow = finishConnectFlow(connectFlow, flowIdentity, "DONE");
+      if (!await persistConnectFlow()) {
+        connectFlow = finishConnectFlow(connectFlow, flowIdentity, "OUTCOME_UNKNOWN");
+        await persistConnectFlow().catch(() => false);
+        return { ok: false, reason: "connect_done_persist_failed", retryAllowed: false };
+      }
+    }
+    return {
+      ok: true,
+      state: attested.serverConfirmed === true ? "CONNECTED" : "AWAITING_CONFIRMATION",
+      routeVerification: attested.routeVerification,
+      autonomy: "off",
+    };
+  } finally {
+    connectInFlight = false;
+  }
 }
 
 async function handleFetchState() {
@@ -1394,20 +1712,20 @@ async function handleClearTransport() {
   };
 }
 
-async function handleMessage(message, sender) {
+async function handleMessage(message, sender, { transportMutationHeld = false } = {}) {
   await initPromise;
   if (!message || typeof message !== "object") return { ok: false, reason: "bad_message" };
 
   if (message.type === "c2c.unbind") return unbindAll();
   if (message.type === "c2c.owner-proof.request") return handleMintOwnerProof(sender, message);
-  if (message.type === "c2c.pair") return handlePair(message);
+  if (message.type === "c2c.pair") return runTransportMutation(() => handlePair(message));
   if (message.type === "c2c.rebind.start") {
     if (!isExtensionInternalSender(sender)) return { ok: false, reason: "popup_sender_required" };
-    return handleRebindStart(message);
+    return runTransportMutation(() => handleRebindStart(message));
   }
   if (message.type === "c2c.rebind.complete") {
     if (!isExtensionInternalSender(sender)) return { ok: false, reason: "popup_sender_required" };
-    return handleRebindComplete();
+    return runTransportMutation(() => handleRebindComplete());
   }
   if (message.type === "c2c.transport.status") {
     return {
@@ -1425,6 +1743,9 @@ async function handleMessage(message, sender) {
 
   // G3 route attestation: popup sends no payload; SW owns server message.
   if (message.type === ROUTE_ATTEST_SEND_TYPE) {
+    if (!transportMutationHeld) {
+      return runTransportMutation(() => handleMessage(message, sender, { transportMutationHeld: true }));
+    }
     if (!isExtensionInternalSender(sender)) {
       return { ok: false, reason: "popup_sender_required" };
     }
@@ -1587,7 +1908,12 @@ async function handleMessage(message, sender) {
     }
     return handleRetireUnknown();
   }
-  if (message.type === "c2c.transport.clear") return handleClearTransport();
+  if (message.type === "c2c.transport.clear") {
+    return runTransportMutation(() => handleClearTransport());
+  }
+  if (message.type === "c2c.connect.page") {
+    return runTransportMutation(() => handleConnectPage(sender, message));
+  }
 
   const identity = resolveSenderDocumentIdentity(sender);
   const tabId =
@@ -1658,22 +1984,47 @@ async function handleMessage(message, sender) {
       lastHeartbeatSafety = buildHeartbeatSafetySnapshot(message.safety);
       // Route attestation confirmation poll: read-only /state, independent of autonomy.
       // Bounded by shouldPollRouteAttestConfirm (owner exact + identity + challenge + expiry).
-      if (routeAttestLatch.state === "OBSERVED_PENDING_CONFIRM") {
-        const pollGate = shouldPollRouteAttestConfirm({
-          latch: routeAttestLatch,
-          ownerExact,
-          owner: ownerState.owner,
-          transport,
-          now: Date.now(),
-        });
-        if (pollGate.ok) {
+      if (routeAttestLatch.state === "OBSERVED_PENDING_CONFIRM"
+        || routeAttestFence.state === "OBSERVED_PENDING_CONFIRM") {
+        const flowIdentity = connectFlowIdentity(transport);
+        if (transport?.rebindPending === true
+          && connectFlow.state === "ATTEST_REQUESTED"
+          && flowIdentity
+          && connectFlowMatches(connectFlow, flowIdentity)) {
           try {
-            const attestState = await handleFetchState();
-            if (attestState?.ok && attestState.status?.routeVerification === "VERIFIED") {
-              lastAutonomyReason = "route_attest_server_verified";
-            }
+            const completed = await runTransportMutation(
+              () => maybeCompleteConnectedRebind(ownerExact),
+            );
+            if (completed?.ok) lastAutonomyReason = "connect_rebind_verified";
           } catch {
-            // read-only poll failure must never send/resend
+            // Read-only status or fenced completion failure never resends attestation/complete.
+          }
+        } else {
+          const pollGate = shouldPollRouteAttestConfirm({
+            latch: routeAttestLatch,
+            ownerExact,
+            owner: ownerState.owner,
+            transport,
+            now: Date.now(),
+          });
+          const restartSafeConnectPoll = ownerExact === true
+            && ["ATTEST_REQUESTED", "DONE"].includes(connectFlow.state)
+            && flowIdentity
+            && connectFlowMatches(connectFlow, flowIdentity)
+            && routeAttestFence.state === "OBSERVED_PENDING_CONFIRM";
+          if (pollGate.ok || restartSafeConnectPoll) {
+            try {
+              const attestState = await handleFetchState();
+              if (attestState?.ok && attestState.status?.routeVerification === "VERIFIED") {
+                lastAutonomyReason = "route_attest_server_verified";
+                if (restartSafeConnectPoll || connectFlow.state === "ATTEST_REQUESTED") {
+                  connectFlow = finishConnectFlow(connectFlow, flowIdentity, "DONE");
+                  await persistConnectFlow();
+                }
+              }
+            } catch {
+              // read-only poll failure must never send/resend
+            }
           }
         }
       }
