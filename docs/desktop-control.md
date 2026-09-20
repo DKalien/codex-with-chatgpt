@@ -297,15 +297,18 @@ Desktop 行为；本功能不承诺抵御已经获授权客户端。
 投递只等待有界的接受回执。收到真实 `threadId`/`turnId` 后返回
 `deliveryStatus=accepted`；不要等待 Codex 完成，也不要把接受回执写成执行完成记录。
 回执超时、断线或落盘不明时返回 `outcome_unknown`，提醒不要重发。结果不明期间整个
-workspace（包括重新绑定后的目标）暂停后续投递，必须由本机用户人工核对；不能换一个
-`commandId` 或重新绑定绕过它，也不会自动恢复。本机用户可显式运行
-`c2c desktop reconcile-unknown -w <workspace> --command-id <id> --json`，但它只在 exact
-workspace/binding/thread 一致、Desktop canonical history 最新边界完整且为 `exhausted`、唯一真实
+workspace（包括重新绑定后的目标）暂停后续投递，不能换一个 `commandId` 或重新绑定绕过它。
+当本次 Desktop result turn 仍可由当前进程精确确认时，`record-result` 会先对自己的
+`outcome_unknown` delivery 执行一次有界、严格的 self-reconcile：它要求与手动核对相同的
+exact workspace/binding/thread 一致、Desktop canonical history 最新边界完整且为 `exhausted`、唯一真实
 turn 的完整 `C2C_DESKTOP_TASK` envelope 与原 delivery 的 workspaceId/commandId/intent/message
-完全一致，且 message UTF-8 bytes/SHA-256 相符时，将 `outcome_unknown` 恢复为
-`accepted + exact turnId`。0 个候选保持 unknown；多个候选、malformed/truncated history 或核对期间
-身份/状态漂移均 fail closed。该操作不写 execution receipt、不表示任务成功；后续 `record-result`
-仍须通过原 accepted turn 的 exact current result-context，后续 turn 不能代记。
+完全一致，且 message UTF-8 bytes/SHA-256 相符，并且唯一候选必须等于当前 `resultTurnId` 时，才将
+`outcome_unknown` 恢复为 `accepted + exact turnId` 并继续写入本次 receipt。0 个候选、多个候选、
+malformed/truncated history、wrong turn、当前 context 漂移或核对期间身份/状态漂移均 fail closed；
+不会写 output/record，也不会把后续 turn 当成当前结果，更不会重发 Desktop task 或凭空发明执行事实。
+没有可用当前 result turn 时，本机用户仍可显式运行
+`c2c desktop reconcile-unknown -w <workspace> --command-id <id> --json`；它只恢复唯一真实
+turn，不写 execution receipt，是 advanced fallback。手动核对未提供 expected turn 时保持原行为。
 若最后重检明确证明尚未进入 IPC start（例如刚变忙或出现审批），保存 `rejected` 与明确错误，
 同 ID 重放仍返回该拒绝记录。处理原因后只能由用户明确发起新请求；不会排队或自动重试。
 任何进入 start 后的断线、部分写入或回执异常都不能归为这种“确定未发送”。

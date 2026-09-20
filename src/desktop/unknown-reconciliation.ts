@@ -25,6 +25,10 @@ export interface UnknownReconciliationResult {
   turnId?: string;
 }
 
+export interface UnknownReconciliationOptions {
+  expectedTurnId?: string;
+}
+
 const workspaceInput = z.object({ id: desktopId, root: z.string().min(1) }).strict();
 const uuid = z.string().uuid();
 
@@ -77,9 +81,13 @@ function sameDelivery(left: DesktopDelivery, right: DesktopDelivery): boolean {
 export async function reconcileUnknownDesktopDelivery(
   workspaceRaw: UnknownReconciliationWorkspace,
   commandId: string,
+  options: UnknownReconciliationOptions = {},
 ): Promise<UnknownReconciliationResult> {
   const workspace = workspaceInput.parse({ id: workspaceRaw.id, root: workspaceRaw.root });
   desktopId.parse(commandId);
+  if (options.expectedTurnId !== undefined && !strictUuid(options.expectedTurnId)) {
+    return fail("DESKTOP_RECONCILIATION_CONFLICT", "expected result turn 无法严格核验；未修改投递状态。");
+  }
   const snapshot = readDesktop(workspace.id);
   if (!snapshot || snapshot.workspaceRoot !== workspace.root) {
     return fail("DESKTOP_RECONCILIATION_NOT_ELIGIBLE", "当前 workspace 没有可核对的 Desktop 状态；未修改投递状态。");
@@ -104,6 +112,9 @@ export async function reconcileUnknownDesktopDelivery(
     return fail("DESKTOP_RECONCILIATION_CONFLICT", "Desktop 历史存在多个精确候选；拒绝猜测或修改投递状态。");
   }
   const turnId = candidates[0];
+  if (options.expectedTurnId !== undefined && turnId !== options.expectedTurnId) {
+    return { status: "unresolved", commandId, deliveryStatus: "outcome_unknown" };
+  }
   const accepted = updateDesktop(workspace.id, current => {
     if (!current || current.workspaceRoot !== workspace.root || (current.revision ?? 0) !== (snapshot.revision ?? 0)) {
       return fail("DESKTOP_RECONCILIATION_CONFLICT", "对账期间 Desktop workspace 状态发生变化；未修改投递状态。");
@@ -113,7 +124,9 @@ export async function reconcileUnknownDesktopDelivery(
       return fail("DESKTOP_RECONCILIATION_CONFLICT", "对账期间 delivery 或 binding 发生变化；未修改投递状态。");
     }
     const currentTarget = checkedTarget(current, workspace, currentDelivery);
-    if (!sameObservation(observation, currentTarget) || current.deliveries.some(item => item.turnId === turnId)) {
+    if (!sameObservation(observation, currentTarget) ||
+        (options.expectedTurnId !== undefined && turnId !== options.expectedTurnId) ||
+        current.deliveries.some(item => item.turnId === turnId)) {
       return fail("DESKTOP_RECONCILIATION_CONFLICT", "对账结果与当前 binding 或投递历史不一致；未修改投递状态。");
     }
     currentDelivery.deliveryStatus = "accepted";

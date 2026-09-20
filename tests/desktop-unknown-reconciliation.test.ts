@@ -95,6 +95,17 @@ describe("Desktop outcome_unknown reconciliation", () => {
     expect(listExecutionOutputs(workspace.id)).toEqual([]);
   });
 
+  it("expectedTurnId 不匹配时保持 outcome_unknown 且不修改状态", async () => {
+    seedDelivery();
+    const before = fs.readFileSync(desktopFile(workspace.id), "utf8");
+    vi.spyOn(desktopIpc, "reconcileUnknown").mockResolvedValue(observation([turnId]));
+
+    await expect(reconcileUnknownDesktopDelivery(workspace, commandId, { expectedTurnId: secondTurnId }))
+      .resolves.toMatchObject({ status: "unresolved", deliveryStatus: "outcome_unknown" });
+    expect(fs.readFileSync(desktopFile(workspace.id), "utf8")).toBe(before);
+    expect(readDesktop(workspace.id)?.deliveries[0].deliveryStatus).toBe("outcome_unknown");
+  });
+
   it("恢复 accepted 后仍由 record-result 的 exact result context 门禁决定", async () => {
     seedDelivery();
     vi.spyOn(desktopIpc, "reconcileUnknown").mockResolvedValue(observation([turnId]));

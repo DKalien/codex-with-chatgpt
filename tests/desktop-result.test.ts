@@ -7,7 +7,7 @@ import { listExecutionOutputs, readExecutionOutput, saveExecutionOutput } from "
 import { appendExecutionRecord, readExecutionRecords } from "../src/execution/records.js";
 import { desktopIpc, type DesktopResultContext } from "../src/desktop/ipc.js";
 import { recordDesktopResult, type DesktopResultInput } from "../src/desktop/result.js";
-import { DesktopError, desktopFile } from "../src/desktop/store.js";
+import { DesktopError, desktopFile, readDesktop, updateDesktop } from "../src/desktop/store.js";
 import { cleanup, isolateStateDir } from "./helpers.js";
 
 const workspace = { id: "desktop_result_test", root: process.cwd() };
@@ -53,6 +53,7 @@ function delivery(overrides: DeliveryOverride = {}) {
     messageSha256: "a".repeat(64),
     messageBytes: 10,
     deliveryStatus: status,
+    intent: "development_plan",
     createdAt: "2026-09-12T00:00:00.000Z",
     updatedAt: "2026-09-12T00:00:00.000Z",
   } as Record<string, unknown>;
@@ -145,6 +146,131 @@ afterEach(() => {
 });
 
 describe("Desktop execution result", () => {
+  it("accepted exact delivery 走现有 receipt 路径且不调用 reconciliation", async () => {
+    writeDesktopState();
+    const reconcile = vi.spyOn(desktopIpc, "reconcileUnknown");
+
+    await expect(recordDesktopResult(workspace, input())).resolves.toMatchObject({
+      record: { commandId },
+    });
+    expect(reconcile).not.toHaveBeenCalled();
+  });
+
+  it("outcome_unknown 在当前 Desktop turn 唯一匹配时一次调用自助恢复并记录 receipt", async () => {
+    writeDesktopState({ deliveries: [delivery({ deliveryStatus: "outcome_unknown" })] });
+    const reconcile = vi.spyOn(desktopIpc, "reconcileUnknown").mockResolvedValue({
+      threadId,
+      hostId: "local",
+      projectId: "desktop_result_project",
+      workspaceRoot: workspace.root,
+      candidates: [turnId],
+    });
+
+    const result = await recordDesktopResult(workspace, input());
+
+    expect(result.record.commandId).toBe(commandId);
+    expect(reconcile).toHaveBeenCalledTimes(1);
+    expect(readExecutionRecords(workspace.id)).toHaveLength(1);
+    expect(listExecutionOutputs(workspace.id)).toHaveLength(1);
+    expect(readDesktop(workspace.id)).toMatchObject({
+      deliveries: [{ deliveryStatus: "accepted", turnId }],
+    });
+  });
+
+  it("outcome_unknown 的唯一候选不是当前 result turn 时不恢复也不写 receipt", async () => {
+    writeDesktopState({ deliveries: [delivery({ deliveryStatus: "outcome_unknown" })] });
+    vi.spyOn(desktopIpc, "reconcileUnknown").mockResolvedValue({
+      threadId,
+      hostId: "local",
+      projectId: "desktop_result_project",
+      workspaceRoot: workspace.root,
+      candidates: ["00000000-0000-4000-8000-000000000104"],
+    });
+    const before = fs.readFileSync(desktopFile(workspace.id), "utf8");
+
+    await expect(recordDesktopResult(workspace, input())).rejects.toMatchObject({ code: "DESKTOP_RESULT_THREAD" });
+
+    expect(fs.readFileSync(desktopFile(workspace.id), "utf8")).toBe(before);
+    expect(readExecutionRecords(workspace.id)).toEqual([]);
+    expect(listExecutionOutputs(workspace.id)).toEqual([]);
+  });
+
+  it.each([
+    ["zero", []],
+    ["multiple", [turnId, "00000000-0000-4000-8000-000000000104"]],
+    ["malformed", ["not-a-uuid"]],
+  ] as const)("self-reconcile %s candidates 保持 unknown 且不写 receipt", async (_name, candidates) => {
+    writeDesktopState({ deliveries: [delivery({ deliveryStatus: "outcome_unknown" })] });
+    vi.spyOn(desktopIpc, "reconcileUnknown").mockResolvedValue({
+      threadId,
+      hostId: "local",
+      projectId: "desktop_result_project",
+      workspaceRoot: workspace.root,
+      candidates: [...candidates],
+    });
+    const before = fs.readFileSync(desktopFile(workspace.id), "utf8");
+
+    await expect(recordDesktopResult(workspace, input())).rejects.toThrow();
+
+    expect(fs.readFileSync(desktopFile(workspace.id), "utf8")).toBe(before);
+    expect(readDesktop(workspace.id)?.deliveries[0].deliveryStatus).toBe("outcome_unknown");
+    expect(readExecutionRecords(workspace.id)).toEqual([]);
+    expect(listExecutionOutputs(workspace.id)).toEqual([]);
+  });
+
+  it.each([
+    ["CODEX_THREAD_ID 错误", () => { process.env.CODEX_THREAD_ID = otherThreadId; }],
+    ["workspaceRoot 错误", () => vi.mocked(desktopIpc.currentResultContext).mockResolvedValue(validResultContext({ workspaceRoot: path.join(workspace.root, "other") }))],
+    ["resultTurnId 缺失", () => vi.mocked(desktopIpc.currentResultContext).mockResolvedValue(validResultContext({ resultTurnId: undefined as unknown as string }))],
+    ["runtime/result 不一致", () => vi.mocked(desktopIpc.currentResultContext).mockResolvedValue(validResultContext({ runtimeStatus: "idle", resultTurnStatus: "inProgress" }))],
+  ] as const)("outcome_unknown 的 %s 在 reconciliation 前 fail closed", async (_name, setup) => {
+    writeDesktopState({ deliveries: [delivery({ deliveryStatus: "outcome_unknown" })] });
+    const reconcile = vi.spyOn(desktopIpc, "reconcileUnknown");
+    setup();
+
+    await expect(recordDesktopResult(workspace, input())).rejects.toThrow();
+
+    expect(reconcile).not.toHaveBeenCalled();
+    expect(readDesktop(workspace.id)?.deliveries[0].deliveryStatus).toBe("outcome_unknown");
+    expect(readExecutionRecords(workspace.id)).toEqual([]);
+    expect(listExecutionOutputs(workspace.id)).toEqual([]);
+  });
+
+  it("reconciliation 后 current result turn 漂移时不写 receipt，后续 turn 也不能代写", async () => {
+    writeDesktopState({ deliveries: [delivery({ deliveryStatus: "outcome_unknown" })] });
+    vi.spyOn(desktopIpc, "reconcileUnknown").mockResolvedValue({
+      threadId,
+      hostId: "local",
+      projectId: "desktop_result_project",
+      workspaceRoot: workspace.root,
+      candidates: [turnId],
+    });
+    vi.mocked(desktopIpc.currentResultContext)
+      .mockResolvedValueOnce(validResultContext())
+      .mockResolvedValue(validResultContext({ resultTurnId: "00000000-0000-4000-8000-000000000104" }));
+
+    await expect(recordDesktopResult(workspace, input())).rejects.toMatchObject({ code: "DESKTOP_RESULT_CURRENT_EXECUTION" });
+    expect(readDesktop(workspace.id)?.deliveries[0]).toMatchObject({ deliveryStatus: "accepted", turnId });
+    expect(readExecutionRecords(workspace.id)).toEqual([]);
+    expect(listExecutionOutputs(workspace.id)).toEqual([]);
+    await expect(recordDesktopResult(workspace, input())).rejects.toMatchObject({ code: "DESKTOP_RESULT_CURRENT_EXECUTION" });
+    expect(readExecutionRecords(workspace.id)).toEqual([]);
+  });
+
+  it("reconciliation 期间 binding 漂移时保持 unknown 且不写 receipt", async () => {
+    writeDesktopState({ deliveries: [delivery({ deliveryStatus: "outcome_unknown" })] });
+    vi.spyOn(desktopIpc, "reconcileUnknown").mockImplementation(async target => {
+      const current = readDesktop(workspace.id)!;
+      const nextBinding = { ...current.binding!, bindingId: "00000000-0000-4000-8000-000000000103" };
+      updateDesktop(workspace.id, state => ({ state: { ...state!, binding: nextBinding }, result: undefined }));
+      return { ...target, candidates: [turnId] };
+    });
+
+    await expect(recordDesktopResult(workspace, input())).rejects.toMatchObject({ code: "DESKTOP_RECONCILIATION_CONFLICT" });
+    expect(readDesktop(workspace.id)?.deliveries[0].deliveryStatus).toBe("outcome_unknown");
+    expect(readExecutionRecords(workspace.id)).toEqual([]);
+    expect(listExecutionOutputs(workspace.id)).toEqual([]);
+  });
   it("按 commandId 和 accepted thread 记录结果，disabled 或重绑后仍可收尾", async () => {
     writeDesktopState({ enabled: false, binding: {
       threadId: otherThreadId,

@@ -14,6 +14,7 @@ import {
   readDesktop,
   type DesktopDelivery,
 } from "./store.js";
+import { reconcileUnknownDesktopDelivery } from "./unknown-reconciliation.js";
 
 export interface DesktopResultWorkspace {
   id: string;
@@ -62,7 +63,7 @@ function currentThreadId(): string {
   return value!;
 }
 
-function assertDesktopResultContext(workspace: DesktopResultWorkspace, commandId: string, threadId: string): DesktopDelivery {
+function readDesktopResultDelivery(workspace: DesktopResultWorkspace, commandId: string, threadId: string): DesktopDelivery {
   const state = readDesktop(workspace.id);
   if (!state) {
     throw new DesktopResultError("DESKTOP_RESULT_STATE", "当前工作区没有 Desktop 授权历史；拒绝记录执行结果。");
@@ -70,11 +71,19 @@ function assertDesktopResultContext(workspace: DesktopResultWorkspace, commandId
   if (state.workspaceRoot !== workspace.root) {
     throw new DesktopResultError("DESKTOP_WRONG_WORKSPACE", "当前工作区根目录与 Desktop 状态不一致；拒绝记录执行结果。");
   }
-  const accepted = state.deliveries.find(item => item.commandId === commandId && item.deliveryStatus === "accepted" && item.threadId === threadId);
-  if (!accepted) {
+  const delivery = state.deliveries.find(item => item.commandId === commandId && item.threadId === threadId);
+  if (!delivery) {
     throw new DesktopResultError("DESKTOP_RESULT_THREAD", "没有与当前 commandId 和 CODEX_THREAD_ID 匹配的 accepted Desktop 投递；拒绝记录执行结果。");
   }
-  return accepted;
+  return delivery;
+}
+
+function assertDesktopResultContext(workspace: DesktopResultWorkspace, commandId: string, threadId: string): DesktopDelivery {
+  const delivery = readDesktopResultDelivery(workspace, commandId, threadId);
+  if (delivery.deliveryStatus !== "accepted") {
+    throw new DesktopResultError("DESKTOP_RESULT_THREAD", "没有与当前 commandId 和 CODEX_THREAD_ID 匹配的 accepted Desktop 投递；拒绝记录执行结果。");
+  }
+  return delivery;
 }
 
 function strictUuid(value: unknown): value is string {
@@ -84,7 +93,15 @@ function strictUuid(value: unknown): value is string {
 async function assertCurrentResultContext(
   workspace: DesktopResultWorkspace,
   accepted: DesktopDelivery,
-): Promise<void> {
+): Promise<DesktopResultContext> {
+  const context = await readCurrentResultContext(workspace, accepted.threadId);
+  if (context.threadId !== accepted.threadId || context.resultTurnId !== accepted.turnId) {
+    throw new DesktopResultError("DESKTOP_RESULT_CURRENT_EXECUTION", "当前 Desktop result context 与 accepted 投递的 thread、workspace 或 turn 不一致；拒绝记录执行结果。");
+  }
+  return context;
+}
+
+async function readCurrentResultContext(workspace: DesktopResultWorkspace, expectedThreadId: string): Promise<DesktopResultContext> {
   let current: unknown;
   for (let attempt = 1; attempt <= RESULT_CONTEXT_ATTEMPTS; attempt += 1) {
     try {
@@ -105,11 +122,12 @@ async function assertCurrentResultContext(
   if (!context || typeof context !== "object" || Array.isArray(context) ||
       !strictUuid(context.threadId) || !strictUuid(context.resultTurnId) ||
       context.workspaceRoot !== workspace.root ||
-      context.threadId !== accepted.threadId || context.resultTurnId !== accepted.turnId ||
+      context.threadId !== expectedThreadId ||
       (context.runtimeStatus === "idle" && !terminal) ||
       ((context.runtimeStatus === "active" || context.runtimeStatus === "inProgress") && context.resultTurnStatus !== "inProgress")) {
     throw new DesktopResultError("DESKTOP_RESULT_CURRENT_EXECUTION", "当前 Desktop result context 与 accepted 投递的 thread、workspace 或 turn 不一致；拒绝记录执行结果。");
   }
+  return context as DesktopResultContext;
 }
 
 function canonicalInput(input: DesktopResultInput): string {
@@ -187,7 +205,22 @@ export async function recordDesktopResult(
   const workspace = workspaceInput.parse(workspaceRaw);
   const input = desktopResultInput.parse(rawInput);
   const threadId = currentThreadId();
-  const accepted = assertDesktopResultContext(workspace, input.commandId, threadId);
+  const initial = readDesktopResultDelivery(workspace, input.commandId, threadId);
+  let accepted: DesktopDelivery;
+  if (initial.deliveryStatus === "accepted") {
+    accepted = initial;
+  } else if (initial.deliveryStatus === "outcome_unknown" && initial.intent !== undefined) {
+    const current = await readCurrentResultContext(workspace, threadId);
+    const reconciled = await reconcileUnknownDesktopDelivery(workspace, input.commandId, {
+      expectedTurnId: current.resultTurnId,
+    });
+    if (reconciled.status !== "accepted" || reconciled.turnId !== current.resultTurnId) {
+      throw new DesktopResultError("DESKTOP_RESULT_THREAD", "当前 Desktop result turn 没有唯一精确的 canonical history 候选；未记录执行结果。");
+    }
+    accepted = assertDesktopResultContext(workspace, input.commandId, threadId);
+  } else {
+    accepted = assertDesktopResultContext(workspace, input.commandId, threadId);
+  }
 
   const taskId = `desktop_${input.commandId}`;
   const digest = receiptHash(input);

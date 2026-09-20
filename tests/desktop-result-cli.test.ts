@@ -8,7 +8,7 @@ import { desktopIpc } from "../src/desktop/ipc.js";
 import { listExecutionOutputs, readExecutionOutput } from "../src/execution/output.js";
 import { readExecutionRecords } from "../src/execution/records.js";
 import { Workspace } from "../src/workspace/manager.js";
-import { desktopFile, updateDesktop } from "../src/desktop/store.js";
+import { desktopFile, readDesktop, updateDesktop } from "../src/desktop/store.js";
 import { cleanup, makeTmpDir } from "./helpers.js";
 
 const threadId = "01a00000-0000-7000-8000-000000000001";
@@ -59,6 +59,7 @@ function seedAcceptedDelivery(): void {
         bindingId,
         threadId,
         turnId: acceptedTurnId,
+        intent: "development_plan" as const,
         messageSha256: "0".repeat(64),
         messageBytes: 1,
         deliveryStatus: "accepted" as const,
@@ -68,6 +69,15 @@ function seedAcceptedDelivery(): void {
     },
     result: undefined,
   }));
+}
+
+function seedUnknownDelivery(): void {
+  updateDesktop(workspace.id, current => {
+    if (!current) throw new Error("Desktop fixture missing");
+    const delivery = { ...current.deliveries[0], deliveryStatus: "outcome_unknown" as const };
+    delete delivery.turnId;
+    return { state: { ...current, deliveries: [delivery] }, result: undefined };
+  });
 }
 
 function currentResultContext(resultTurnId?: string): Record<string, unknown> {
@@ -166,6 +176,27 @@ describe("desktop record-result CLI", () => {
       outputId: expect.any(Number),
     });
     expect(fs.existsSync(sentinel)).toBe(false);
+  });
+
+  it("outcome_unknown 当前 turn 一次 CLI 调用完成严格 self-reconcile 和 receipt", async () => {
+    seedUnknownDelivery();
+    const reconcile = vi.spyOn(desktopIpc, "reconcileUnknown").mockResolvedValue({
+      threadId,
+      hostId: "local",
+      projectId: "desktop_result_project",
+      workspaceRoot: root,
+      candidates: [acceptedTurnId],
+    });
+
+    const result = await runRecord(["--output", "self-reconcile output"]);
+    const payload = json(result.stdout);
+
+    expect(result.exitCode).toBe(0);
+    expect(payload).toMatchObject({ ok: true, record: { commandId, outputId: expect.any(Number) } });
+    expect(reconcile).toHaveBeenCalledTimes(1);
+    expect(readExecutionRecords(workspace.id)).toHaveLength(1);
+    expect(listExecutionOutputs(workspace.id)).toHaveLength(1);
+    expect(readDesktop(workspace.id)?.deliveries[0]).toMatchObject({ deliveryStatus: "accepted", turnId: acceptedTurnId });
   });
 
   it("错误线程拒绝记录，隐藏命令不出现在 help", async () => {
