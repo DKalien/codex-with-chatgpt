@@ -138,6 +138,32 @@ it("CLI compatibility JSON 只读诊断，接受 workspace 参数但不初始化
   expect(bytes()).toBeNull();
 });
 
+it("CLI compatibility --audit 只读审计，选择独立方法且不初始化状态", async () => {
+  const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+  const audit = {
+    observedDesktopVersion: "26.908.9136.0",
+    observedAppServerVersion: "0.154.0-alpha.6.2",
+    status: "current" as const,
+    profile: "desktop-ipc-v1",
+    classification: "current" as const,
+    appServerSha256: "a".repeat(64),
+    asarHeader: [4, 2489280, 2489276, 2489269] as [number, number, number, number],
+    candidateProfile: "desktop-ipc-v1",
+    modules: [
+      { role: "ipc-main" as const, path: ".vite/build/src-test.js", sha256: "b".repeat(64) },
+      { role: "webview-bootstrap" as const, path: "webview/assets/app-initial-test.js", sha256: "c".repeat(64) },
+    ],
+  };
+  vi.spyOn(desktopIpc, "compatibilityAudit").mockResolvedValue(audit);
+  const compatibility = vi.spyOn(desktopIpc, "compatibility");
+  const program = new Command().exitOverride(); registerDesktopCommands(program);
+  await program.parseAsync(["node", "c2c", "desktop", "compatibility", "--audit", "-w", workspace.root, "--json"]);
+  expect(JSON.parse(String(out.mock.calls[0][0]))).toEqual({ ok: true, ...audit });
+  expect(desktopIpc.compatibilityAudit).toHaveBeenCalledOnce();
+  expect(compatibility).not.toHaveBeenCalled();
+  expect(bytes()).toBeNull();
+});
+
 it("CLI bind-current 错误只输出安全 compatibility 投影", async () => {
   const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
   const failure = new DesktopError("DESKTOP_VERSION_UNSUPPORTED", "secret token pipe");

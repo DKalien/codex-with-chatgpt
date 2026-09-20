@@ -1128,5 +1128,235 @@ class RuntimeTests(unittest.TestCase):
                 self.assertEqual(caught.exception.mismatch, "runtime_pair_unverified")
 
 
+class CatalogAuditTests(unittest.TestCase):
+    def test_catalog_loader_is_strict_and_bounded(self):
+        catalog = json.loads(Path(h.PROFILE_CATALOG_PATH).read_text(encoding="utf-8"))
+        with tempfile.TemporaryDirectory(prefix="c2c-catalog-guard-") as directory:
+            path = Path(directory) / "profiles.json"
+
+            def load(value):
+                path.write_text(json.dumps(value), encoding="utf-8")
+                return h._load_catalog(path)
+
+            self.assertEqual(set(h._load_catalog()), {h.VERIFIED_PROFILE})
+            for name, broken in {
+                "schema": {**catalog, "schemaVersion": 2},
+                "root_extra": {**catalog, "extra": True},
+                "profiles_missing": {"schemaVersion": 1},
+                "profile_extra": {**catalog, "profiles": [{**catalog["profiles"][0], "extra": True}]},
+                "profile_duplicate": {**catalog, "profiles": catalog["profiles"] * 2},
+                "runtime_missing": {**catalog, "profiles": [{**catalog["profiles"][0], "runtimes": [
+                    {key: value for key, value in catalog["profiles"][0]["runtimes"][0].items()
+                     if key != "appServerVersion"}]}]},
+                "bad_version": {**catalog, "profiles": [{**catalog["profiles"][0], "runtimes": [
+                    {**catalog["profiles"][0]["runtimes"][0], "desktopVersion": "26.*"}]}]},
+                "version_duplicate": {**catalog, "profiles": [{**catalog["profiles"][0], "runtimes":
+                    catalog["profiles"][0]["runtimes"] + [catalog["profiles"][0]["runtimes"][0]]}]},
+                "bad_hash": {**catalog, "profiles": [{**catalog["profiles"][0], "runtimes": [
+                    {**catalog["profiles"][0]["runtimes"][0], "appServerSha256": "x" * 64}]}]},
+                "bad_role": {**catalog, "profiles": [{**catalog["profiles"][0], "runtimes": [
+                    {**catalog["profiles"][0]["runtimes"][0], "modules": [
+                        {**catalog["profiles"][0]["runtimes"][0]["modules"][0], "role": "ipc"},
+                        catalog["profiles"][0]["runtimes"][0]["modules"][1]]}]}]},
+                "duplicate_role": {**catalog, "profiles": [{**catalog["profiles"][0], "runtimes": [
+                    {**catalog["profiles"][0]["runtimes"][0], "modules": [
+                        catalog["profiles"][0]["runtimes"][0]["modules"][0],
+                        {**catalog["profiles"][0]["runtimes"][0]["modules"][0],
+                         "path": ".vite/build/src-other.js"}]}]}]},
+                "bad_path": {**catalog, "profiles": [{**catalog["profiles"][0], "runtimes": [
+                    {**catalog["profiles"][0]["runtimes"][0], "modules": [
+                        {**catalog["profiles"][0]["runtimes"][0]["modules"][0], "path": "../secret.js"},
+                        catalog["profiles"][0]["runtimes"][0]["modules"][1]]}]}]},
+            }.items():
+                with self.subTest(name=name), self.assertRaises(h._CatalogError):
+                    load(broken)
+            path.write_text('{"schemaVersion":1,"schemaVersion":1,"profiles":[]}', encoding="utf-8")
+            with self.assertRaises(h._CatalogError):
+                h._load_catalog(path)
+            with self.assertRaises(h._CatalogError):
+                h._load_catalog(Path(directory) / "missing.json")
+        with patch.dict(h.VERIFIED_PROFILES, {}, clear=True), \
+                patch.object(h, "_observe_runtime_versions", return_value={
+                    "observedDesktopVersion": "26.908.9136.0",
+                    "observedAppServerVersion": "0.154.0-alpha.6.2",
+                    "appServerSha256": "a" * 64,
+                }):
+            self.assertNotEqual(h._compatibility_for_paths("desktop", "server")["status"], "current")
+
+    def test_audit_current_candidate_drift_ambiguity_and_malformed_asar(self):
+        current = {"observedDesktopVersion": h.VERIFIED_RUNTIME_26_908_9136["desktopVersion"],
+                   "observedAppServerVersion": h.VERIFIED_RUNTIME_26_908_9136["appServerVersion"],
+                   "appServerSha256": h.VERIFIED_RUNTIME_26_908_9136["appServerSha256"]}
+        with patch.object(h, "_observe_runtime_versions", return_value=current), \
+                patch.object(h, "_checked_runtime"):
+            result = h._compatibility_audit_for_paths("desktop", "server")
+        self.assertEqual(result["classification"], "current")
+        self.assertEqual(result["candidateProfile"], h.VERIFIED_PROFILE)
+        self.assertNotIn("candidateRuntime", result)
+        self.assertEqual({module["role"] for module in result["modules"]}, {"ipc-main", "webview-bootstrap"})
+
+        ipc_hash = "a" * 64
+        row = {"desktopVersion": "26.908.4834.0", "appServerVersion": "0.154.0-alpha.6.2",
+               "appServerSha256": "0" * 64, "asarHeader": [4, 100, 96, 89], "modules": [
+                   {"role": "ipc-main", "path": ".vite/build/src-trusted.js", "sha256": ipc_hash},
+                   {"role": "webview-bootstrap", "path": "webview/assets/app-initial-old.js", "sha256": "c" * 64}]}
+        observed = {"observedDesktopVersion": "99.1.1.1", "observedAppServerVersion": row["appServerVersion"],
+                    "appServerSha256": "b" * 64}
+        modules = {"ipc-main": [{"role": "ipc-main", "path": ".vite/build/src-new.js", "sha256": ipc_hash}],
+                   "webview-bootstrap": [{"role": "webview-bootstrap", "path": "webview/assets/app-initial-new.js",
+                                           "sha256": "d" * 64}]}
+        with patch.dict(h.VERIFIED_PROFILES, {h.VERIFIED_PROFILE: (row,)}, clear=True), \
+                patch.object(h, "_observe_runtime_versions", return_value=observed), \
+                patch.object(h, "_asar_audit_modules", return_value=([4, 100, 96, 89], modules)):
+            self.assertEqual(h._compatibility_for_paths("desktop", "server")["status"], "unverified")
+            candidate = h._compatibility_audit_for_paths("desktop", "server")
+            self.assertEqual(candidate["classification"], "same_protocol_candidate")
+            self.assertEqual(candidate["candidateRuntime"]["desktopVersion"], "99.1.1.1")
+            self.assertEqual(candidate["candidateRuntime"]["appServerSha256"], "b" * 64)
+            with patch.object(h, "_observe_runtime_versions", return_value={
+                    **observed, "observedDesktopVersion": "99.1.1"}):
+                invalid_candidate = h._compatibility_audit_for_paths("desktop", "server")
+            self.assertNotIn("candidateRuntime", invalid_candidate)
+            bad = {**modules, "ipc-main": [{"role": "ipc-main", "path": ".vite/build/src-new.js", "sha256": "e" * 64}]}
+            with patch.object(h, "_asar_audit_modules", return_value=([4, 100, 96, 89], bad)):
+                self.assertEqual(h._compatibility_audit_for_paths("desktop", "server")["classification"],
+                                 "protocol_drift_or_unknown")
+            many = {**modules, "ipc-main": [modules["ipc-main"][0],
+                {**modules["ipc-main"][0], "path": ".vite/build/src-second.js"}]}
+            with patch.object(h, "_asar_audit_modules", return_value=([4, 100, 96, 89], many)):
+                self.assertEqual(h._compatibility_audit_for_paths("desktop", "server")["classification"],
+                                 "ambiguous")
+            with patch.object(h, "_asar_audit_modules", side_effect=h._AsarAuditError("bad")):
+                self.assertEqual(h._compatibility_audit_for_paths("desktop", "server")["classification"],
+                                 "protocol_drift_or_unknown")
+            no_webview = {**modules, "webview-bootstrap": []}
+            with patch.object(h, "_asar_audit_modules", return_value=([4, 100, 96, 89], no_webview)):
+                self.assertEqual(h._compatibility_audit_for_paths("desktop", "server")["classification"],
+                                 "protocol_drift_or_unknown")
+            many_webview = {**modules, "webview-bootstrap": [modules["webview-bootstrap"][0],
+                {**modules["webview-bootstrap"][0], "path": "webview/assets/app-initial-second.js"}]}
+            with patch.object(h, "_asar_audit_modules", return_value=([4, 100, 96, 89], many_webview)):
+                self.assertEqual(h._compatibility_audit_for_paths("desktop", "server")["classification"],
+                                 "ambiguous")
+            with patch.object(h, "_observe_runtime_versions", return_value={**observed,
+                    "observedAppServerVersion": "9.9.9"}):
+                self.assertEqual(h._compatibility_audit_for_paths("desktop", "server")["classification"],
+                                 "protocol_drift_or_unknown")
+            with patch.object(h, "_observe_runtime_versions", return_value={**observed,
+                    "appServerSha256": None}):
+                unavailable = h._compatibility_audit_for_paths("desktop", "server")
+                self.assertEqual(unavailable["classification"], "unavailable")
+                self.assertNotIn("candidateRuntime", unavailable)
+
+    def test_audit_asar_malformed_and_oversized_headers_fail_closed(self):
+        with tempfile.TemporaryDirectory(prefix="c2c-audit-asar-") as directory:
+            desktop = Path(directory) / "OpenAI.Codex_99.1.1.1_x64" / "app" / "ChatGPT.exe"
+            asar = desktop.parent / "resources" / "app.asar"
+            asar.parent.mkdir(parents=True)
+            for name, raw in {
+                "truncated": b"short",
+                "oversized_header": struct.pack("<4I", 4, h._MAX_ASAR_HEADER_BYTES + 1,
+                                                  h._MAX_ASAR_HEADER_BYTES - 3,
+                                                  h._MAX_ASAR_HEADER_BYTES - 10),
+                "ambiguous_layout": struct.pack("<4I", 4, 100, 95, 89) + b"{}",
+            }.items():
+                with self.subTest(name=name):
+                    asar.write_bytes(raw)
+                    with self.assertRaises(h._AsarAuditError):
+                        h._asar_audit_modules(str(desktop))
+
+    def test_audit_asar_budget_overlap_and_normal_candidates(self):
+        def write_asar(path, modules):
+            tree = {"files": {}}
+            for module_path, offset, data in modules:
+                node = tree
+                parts = module_path.split("/")
+                for part in parts[:-1]:
+                    node = node.setdefault("files", {}).setdefault(part, {})
+                node.setdefault("files", {})[parts[-1]] = {"offset": str(offset), "size": len(data)}
+            raw_tree = json.dumps(tree, separators=(",", ":")).encode()
+            json_size = max(256, len(raw_tree))
+            layout = [4, json_size + 11, json_size + 7, json_size]
+            raw_tree += b" " * (json_size - len(raw_tree))
+            body = bytearray(max(offset + len(data) for _, offset, data in modules))
+            for _, offset, data in modules:
+                body[offset:offset + len(data)] = data
+            gap = b"\0" * (8 + layout[1] - 16 - len(raw_tree))
+            path.write_bytes(struct.pack("<4I", *layout) + raw_tree + gap + body)
+            return layout
+
+        with tempfile.TemporaryDirectory(prefix="c2c-audit-asar-budget-") as directory:
+            desktop = Path(directory) / "OpenAI.Codex_99.1.1.1_x64" / "app" / "ChatGPT.exe"
+            asar = desktop.parent / "resources" / "app.asar"
+            asar.parent.mkdir(parents=True)
+            normal = [
+                (".vite/build/src-a.js", 0, b"ipc"),
+                ("webview/assets/app-initial-a.js", 3, b"web"),
+            ]
+            layout = write_asar(asar, normal)
+            observed_layout, candidates = h._asar_audit_modules(str(desktop))
+            self.assertEqual(observed_layout, layout)
+            self.assertEqual({module["path"] for items in candidates.values() for module in items},
+                             {module_path for module_path, _, _ in normal})
+
+            too_many = [
+                (".vite/build/src-a.js", 0, b"a"),
+                ("webview/assets/app-initial-a.js", 1, b"b"),
+            ]
+            write_asar(asar, too_many)
+            with patch.object(h, "_MAX_ASAR_AUDIT_CANDIDATES", 1), \
+                    self.assertRaises(h._AsarAuditError):
+                h._asar_audit_modules(str(desktop))
+
+            too_many_per_role = [
+                (".vite/build/src-a.js", 0, b"a"),
+                (".vite/build/src-b.js", 1, b"b"),
+            ]
+            write_asar(asar, too_many_per_role)
+            with patch.object(h, "_MAX_ASAR_AUDIT_CANDIDATES_PER_ROLE", 1), \
+                    self.assertRaises(h._AsarAuditError):
+                h._asar_audit_modules(str(desktop))
+
+            cumulative = [
+                (".vite/build/src-a.js", 0, b"ab"),
+                ("webview/assets/app-initial-a.js", 2, b"cd"),
+            ]
+            write_asar(asar, cumulative)
+            with patch.object(h, "_MAX_ASAR_AUDIT_MODULE_BYTES", 3), \
+                    self.assertRaises(h._AsarAuditError):
+                h._asar_audit_modules(str(desktop))
+
+            overlap = [
+                (".vite/build/src-a.js", 0, b"abc"),
+                ("webview/assets/app-initial-a.js", 1, b"bc"),
+            ]
+            write_asar(asar, overlap)
+            with self.assertRaises(h._AsarAuditError):
+                h._asar_audit_modules(str(desktop))
+
+    def test_legacy_runtime_lookup_and_asar_hashes_require_explicit_profile(self):
+        runtimes = h.VERIFIED_PROFILES[h.VERIFIED_PROFILE]
+        with patch.dict(h.VERIFIED_PROFILES, {h.VERIFIED_PROFILE: tuple(reversed(runtimes))}, clear=True):
+            self.assertEqual(h._legacy_runtime_for_pair("26.903.9818.0", "0.153.4"), runtimes[0])
+            self.assertEqual(h._legacy_runtime_for_pair("26.908.9136.0", "0.154.0-alpha.6.2"), runtimes[2])
+        with self.assertRaises(TypeError):
+            h._asar_module_hashes("desktop")
+
+    def test_audit_process_pair_and_operation_are_read_only(self):
+        with patch.object(h, "_query_standard_token") as token, patch.object(h, "_runtime_process_pairs", return_value=[]):
+            self.assertEqual(h._compatibility_audit()["classification"], "unavailable")
+            token.assert_called_once_with()
+        with patch.object(h, "_query_standard_token"), patch.object(h, "_runtime_process_pairs", return_value=[("a", "b"), ("c", "d")]):
+            self.assertEqual(h._compatibility_audit()["classification"], "ambiguous")
+        request = {"id": CLIENT, "op": "compatibility_audit"}
+        source = SimpleNamespace(buffer=io.BytesIO(h._json_bytes(request) + b"\n"))
+        output = SimpleNamespace(buffer=io.BytesIO())
+        with patch.object(h, "_compatibility_audit", return_value=h._audit_result()), \
+                patch.object(h, "_Pipe") as pipe, patch.object(sys, "stdin", source), patch.object(sys, "stdout", output):
+            h._main()
+        self.assertEqual(json.loads(output.buffer.getvalue())["value"]["classification"], "unavailable")
+        pipe.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

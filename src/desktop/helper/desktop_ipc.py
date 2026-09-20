@@ -1,7 +1,7 @@
 """Codex Desktop Control 的受控 Windows IPC helper。
 
 这个程序只接受 stdin 上的固定操作：``inspect``、``prepare``、``send``、
-``reconcile_unknown``、``compatibility``、``current_identity``、``current_confirm``、``current_execution`` 和
+``reconcile_unknown``、``compatibility``、``compatibility_audit``、``current_identity``、``current_confirm``、``current_execution`` 和
 ``current_result_context``。其中 ``current_*`` 只接受
 顶层 ``workspaceRoot``，从继承的当前 Agent 环境解析 thread/project/host；
 它不会接受 stdin 提供的目标身份，也不会执行 stdin 提供的命令或启动
@@ -43,55 +43,200 @@ SNAPSHOT_TIMEOUT_SECONDS = 5.0
 SEND_TIMEOUT_SECONDS = 30.0
 MAX_OBSERVATION_AGE_SECONDS = 2.0
 MIN_PYTHON_VERSION = (3, 11)
-
-# 整组固定证据：output 21/22 的普通权限 PoC；见 docs/desktop-control.md。
-# 版本与 hash 整组匹配；新组合的只读协议审计见 docs/desktop-control.md。
-VERIFIED_PROFILE = "desktop-ipc-v1"
-VERIFIED_RUNTIME = {
-    "desktopVersion": "26.903.9818.0",
-    "appServerVersion": "0.153.4",
-    "appServerSha256": "3d6ca7085c932b62ef4ee4877e92f15b050fb94b2eb8e6c10a346a06248c6004",
-    "asarHeader": (4, 2441036, 2441032, 2441025),
-    "moduleHashes": {
-        ".vite/build/src-B6LqG3ek.js": "9a1d9737c526cbba0e18e5ffc3b9371ef055318e7eabb7584b082fbcdb24472e",
-        "webview/assets/app-initial-f094ef01c64d.js": "364622097d1440b55bcd85b1068245a773f5821f4fd6c1e2de73e5789487c75a",
-    },
-}
-VERIFIED_RUNTIME_26_908 = {
-    "desktopVersion": "26.908.4834.0",
-    "appServerVersion": "0.154.0-alpha.6.2",
-    "appServerSha256": "081e4de4be8e38fac6ed4d95e3b1a0b9f6d31c090ddc36e1696b349fe406f575",
-    "asarHeader": (4, 2489280, 2489276, 2489269),
-    "moduleHashes": {
-        ".vite/build/src-CCXHtyvY.js": "a42da38cbb14b28399f1d54fcf453bffc5e9802663e7e098f187c8378f4c7a40",
-        "webview/assets/app-initial-d9bed9d614d8.js": "7c3a89e7e224f76031b45a88f72af8cd60f0c3d47aac9ca34b2c70e11dfe9867",
-    },
-}
-# 2026-09-17 只读静态审计：IPC 主模块与 26.908.4834.0 byte-identical；
-# webview bundle 与 app-server hash 变化，因此仍按 exact 组合单独固定，不放宽到版本范围。
-VERIFIED_RUNTIME_26_908_9136 = {
-    "desktopVersion": "26.908.9136.0",
-    "appServerVersion": "0.154.0-alpha.6.2",
-    "appServerSha256": "960c111d47afd61669954b9df9e56083e302edbfa3ef6962d81dcc14a30051dc",
-    "asarHeader": (4, 2489280, 2489276, 2489269),
-    "moduleHashes": {
-        ".vite/build/src-CCXHtyvY.js": "a42da38cbb14b28399f1d54fcf453bffc5e9802663e7e098f187c8378f4c7a40",
-        "webview/assets/app-initial-bcc2ff475eb6.js": "3c15444f96a8d48844258618fe0d4278409e626f0ee563a77d2c669ec669c510",
-    },
-}
-# 一个 protocol profile 可以包含多个经过独立审计的精确运行时组合。
-VERIFIED_PROFILES = {
-    VERIFIED_PROFILE: (VERIFIED_RUNTIME, VERIFIED_RUNTIME_26_908, VERIFIED_RUNTIME_26_908_9136)
-}
-
 COMPATIBILITY_STATUSES = {"current", "unverified", "incompatible"}
+COMPATIBILITY_AUDIT_CLASSIFICATIONS = {
+    "current", "same_protocol_candidate", "protocol_drift_or_unknown", "ambiguous", "unavailable"
+}
 _VERSION_PATTERN = re.compile(
     r"\d+\.\d+\.\d+(?:\.\d+)?(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?(?:\+[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?"
 )
+_DESKTOP_VERSION_PATTERN = re.compile(r"\d+\.\d+\.\d+\.\d+")
+_PROFILE_NAME_PATTERN = re.compile(r"desktop-ipc-v[1-9][0-9]*")
+_SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+_MODULE_PATH_PATTERNS = {
+    "ipc-main": re.compile(r"^\.vite/build/src-[A-Za-z0-9_-]+\.js$"),
+    "webview-bootstrap": re.compile(r"^webview/assets/app-initial-[A-Za-z0-9_-]+\.js$"),
+}
+
+PROFILE_CATALOG_PATH = Path(__file__).with_name("desktop_profiles.json")
+_CATALOG_MAX_BYTES = 512 * 1024
+_CATALOG_MAX_PROFILES = 32
+_CATALOG_MAX_RUNTIMES = 128
+_CATALOG_MAX_MODULES = 2
+_CATALOG_MAX_STRING = 256
+_MAX_ASAR_HEADER_BYTES = 64 * 1024 * 1024
+_MAX_ASAR_FILE_BYTES = 2 * 1024 * 1024 * 1024
+_MAX_ASAR_TREE_NODES = 100_000
+_MAX_ASAR_DEPTH = 64
+_MAX_ASAR_MODULE_BYTES = 64 * 1024 * 1024
+_MAX_ASAR_AUDIT_CANDIDATES = 16
+_MAX_ASAR_AUDIT_CANDIDATES_PER_ROLE = 8
+_MAX_ASAR_AUDIT_MODULE_BYTES = 128 * 1024 * 1024
+
+
+class _CatalogError(ValueError):
+    pass
 
 
 def _safe_version(value: Any) -> str | None:
     return value if isinstance(value, str) and len(value) <= 64 and _VERSION_PATTERN.fullmatch(value) else None
+
+
+def _catalog_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise _CatalogError("duplicate catalog key")
+        result[key] = value
+    return result
+
+
+def _catalog_keys(value: Any, expected: set[str]) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != expected:
+        raise _CatalogError("catalog object keys")
+    return value
+
+
+def _catalog_string(value: Any, *, pattern: re.Pattern[str] | None = None) -> str:
+    if not isinstance(value, str) or not 0 < len(value) <= _CATALOG_MAX_STRING or "\x00" in value:
+        raise _CatalogError("catalog string")
+    if pattern is not None and pattern.fullmatch(value) is None:
+        raise _CatalogError("catalog string format")
+    return value
+
+
+def _catalog_version(value: Any, *, desktop: bool = False) -> str:
+    text = _catalog_string(value)
+    if _VERSION_PATTERN.fullmatch(text) is None or (desktop and _DESKTOP_VERSION_PATTERN.fullmatch(text) is None):
+        raise _CatalogError("catalog version")
+    return text
+
+
+def _catalog_hash(value: Any) -> str:
+    return _catalog_string(value, pattern=_SHA256_PATTERN)
+
+
+def _catalog_asar_header(value: Any) -> tuple[int, int, int, int]:
+    if not isinstance(value, list) or len(value) != 4:
+        raise _CatalogError("catalog asar header")
+    if any(type(item) is not int or item < 0 or item > _MAX_ASAR_HEADER_BYTES for item in value):
+        raise _CatalogError("catalog asar header bounds")
+    version, header_size, json_offset, json_size = value
+    if (version != 4 or header_size < 16 or json_size <= 0
+            or header_size != json_offset + 4 or json_offset != json_size + 7):
+        raise _CatalogError("catalog asar header layout")
+    if json_offset > header_size or header_size - json_size > 64:
+        raise _CatalogError("catalog asar header layout")
+    return version, header_size, json_offset, json_size
+
+
+def _catalog_module(value: Any) -> dict[str, str]:
+    module = _catalog_keys(value, {"role", "path", "sha256"})
+    role = _catalog_string(module["role"])
+    pattern = _MODULE_PATH_PATTERNS.get(role)
+    if pattern is None:
+        raise _CatalogError("catalog module role")
+    path = _catalog_string(module["path"])
+    if ("\\" in path or path.startswith("/") or any(part in {"", ".", ".."} for part in path.split("/"))
+            or pattern.fullmatch(path) is None):
+        raise _CatalogError("catalog module path")
+    return {"role": role, "path": path, "sha256": _catalog_hash(module["sha256"])}
+
+
+def _load_catalog(path: str | os.PathLike[str] | None = None) -> dict[str, tuple[dict[str, Any], ...]]:
+    """读取固定 schema 的信任 catalog；任一异常都由调用方按 fail-closed 处理。"""
+    path = PROFILE_CATALOG_PATH if path is None else path
+    try:
+        with open(path, "rb") as stream:
+            raw = stream.read(_CATALOG_MAX_BYTES + 1)
+        if len(raw) > _CATALOG_MAX_BYTES:
+            raise _CatalogError("catalog too large")
+        document = json.loads(raw.decode("utf-8", "strict"), object_pairs_hook=_catalog_object)
+    except _CatalogError:
+        raise
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError, RecursionError) as error:
+        raise _CatalogError("catalog unavailable") from error
+    root = _catalog_keys(document, {"schemaVersion", "profiles"})
+    if type(root["schemaVersion"]) is not int or root["schemaVersion"] != 1:
+        raise _CatalogError("catalog schema")
+    profiles = root["profiles"]
+    if not isinstance(profiles, list) or not 0 < len(profiles) <= _CATALOG_MAX_PROFILES:
+        raise _CatalogError("catalog profiles")
+    result: dict[str, tuple[dict[str, Any], ...]] = {}
+    version_pairs: set[tuple[str, str]] = set()
+    for raw_profile in profiles:
+        profile = _catalog_keys(raw_profile, {"name", "runtimes"})
+        name = _catalog_string(profile["name"], pattern=_PROFILE_NAME_PATTERN)
+        if name in result:
+            raise _CatalogError("duplicate profile")
+        runtimes = profile["runtimes"]
+        if not isinstance(runtimes, list) or not 0 < len(runtimes) <= _CATALOG_MAX_RUNTIMES:
+            raise _CatalogError("catalog runtimes")
+        normalized: list[dict[str, Any]] = []
+        for raw_runtime in runtimes:
+            runtime = _catalog_keys(raw_runtime, {
+                "desktopVersion", "appServerVersion", "appServerSha256", "asarHeader", "modules"
+            })
+            desktop_version = _catalog_version(runtime["desktopVersion"], desktop=True)
+            app_server_version = _catalog_version(runtime["appServerVersion"])
+            pair = (desktop_version, app_server_version)
+            if pair in version_pairs:
+                raise _CatalogError("duplicate runtime version pair")
+            version_pairs.add(pair)
+            modules = runtime["modules"]
+            if not isinstance(modules, list) or len(modules) != _CATALOG_MAX_MODULES:
+                raise _CatalogError("catalog modules")
+            normalized_modules = [_catalog_module(module) for module in modules]
+            roles = [module["role"] for module in normalized_modules]
+            paths = [module["path"] for module in normalized_modules]
+            if set(roles) != set(_MODULE_PATH_PATTERNS) or len(set(roles)) != len(roles) \
+                    or len(set(paths)) != len(paths):
+                raise _CatalogError("duplicate catalog module role/path")
+            normalized.append({
+                "desktopVersion": desktop_version,
+                "appServerVersion": app_server_version,
+                "appServerSha256": _catalog_hash(runtime["appServerSha256"]),
+                "asarHeader": list(_catalog_asar_header(runtime["asarHeader"])),
+                "modules": normalized_modules,
+            })
+        result[name] = tuple(normalized)
+    return result
+
+
+def _legacy_runtime(runtime: dict[str, Any]) -> dict[str, Any]:
+    """保留旧 helper 测试和调用方需要的 moduleHashes 兼容投影。"""
+    value = copy.deepcopy(runtime)
+    modules = value.get("modules")
+    if isinstance(modules, list):
+        value["moduleHashes"] = {module["path"]: module["sha256"] for module in modules}
+    value["asarHeader"] = tuple(value["asarHeader"])
+    return value
+
+
+try:
+    _CATALOG_PROFILES = _load_catalog()
+except _CatalogError:
+    _CATALOG_PROFILES = {}
+
+VERIFIED_PROFILES = {
+    name: tuple(_legacy_runtime(runtime) for runtime in runtimes)
+    for name, runtimes in _CATALOG_PROFILES.items()
+}
+VERIFIED_PROFILE = "desktop-ipc-v1" if "desktop-ipc-v1" in VERIFIED_PROFILES else None
+
+
+def _legacy_runtime_for_pair(desktop_version: str, app_server_version: str) -> dict[str, Any]:
+    for runtimes in VERIFIED_PROFILES.values():
+        for runtime in runtimes:
+            if (runtime.get("desktopVersion"), runtime.get("appServerVersion")) == (
+                    desktop_version, app_server_version):
+                return runtime
+    return {}
+
+
+VERIFIED_RUNTIME = _legacy_runtime_for_pair("26.903.9818.0", "0.153.4")
+VERIFIED_RUNTIME_26_908 = _legacy_runtime_for_pair("26.908.4834.0", "0.154.0-alpha.6.2")
+VERIFIED_RUNTIME_26_908_9136 = _legacy_runtime_for_pair("26.908.9136.0", "0.154.0-alpha.6.2")
 
 
 def _safe_compatibility(value: Any = None) -> dict[str, Any]:
@@ -786,6 +931,48 @@ def _profile_for_pair(desktop_version: str | None, app_server_version: str | Non
     return matches[0] if len(matches) == 1 else None
 
 
+def _runtime_module_rows(runtime: dict[str, Any]) -> list[dict[str, str]]:
+    modules = runtime.get("modules")
+    if isinstance(modules, list):
+        return [module for module in modules if isinstance(module, dict)]
+    hashes = runtime.get("moduleHashes")
+    if not isinstance(hashes, dict):
+        return []
+    rows: list[dict[str, str]] = []
+    for path, digest in hashes.items():
+        if not isinstance(path, str) or not isinstance(digest, str):
+            continue
+        role = next((candidate for candidate, pattern in _MODULE_PATH_PATTERNS.items()
+                     if pattern.fullmatch(path)), None)
+        if role is not None:
+            rows.append({"role": role, "path": path, "sha256": digest})
+    return rows
+
+
+def _runtime_module_hashes(runtime: dict[str, Any]) -> dict[str, str]:
+    hashes = runtime.get("moduleHashes")
+    if isinstance(hashes, dict):
+        return hashes
+    rows = _runtime_module_rows(runtime)
+    return {module["path"]: module["sha256"] for module in rows
+            if isinstance(module.get("path"), str) and isinstance(module.get("sha256"), str)}
+
+
+def _catalog_runtime_projection(runtime: dict[str, Any]) -> dict[str, Any]:
+    """仅返回 catalog runtime 行；不把旧兼容 moduleHashes 泄漏到审计结果。"""
+    modules = _runtime_module_rows(runtime)
+    return {
+        "desktopVersion": runtime.get("desktopVersion"),
+        "appServerVersion": runtime.get("appServerVersion"),
+        "appServerSha256": runtime.get("appServerSha256"),
+        "asarHeader": list(runtime.get("asarHeader", ())),
+        "modules": [
+            {"role": module.get("role"), "path": module.get("path"), "sha256": module.get("sha256")}
+            for module in modules
+        ],
+    }
+
+
 def _sha256_file(path: str) -> str | None:
     try:
         with open(path, "rb") as stream:
@@ -863,8 +1050,7 @@ def _diagnostic_from_observation(observed: dict[str, Any], *, failed: bool = Fal
     })
 
 
-def _asar_module_hashes(desktop_exe: str, profile: dict[str, Any] | None = None) -> dict[str, str]:
-    profile = profile or VERIFIED_RUNTIME
+def _asar_module_hashes(desktop_exe: str, profile: dict[str, Any]) -> dict[str, str]:
     asar = Path(desktop_exe).parent / "resources" / "app.asar"
     try:
         with asar.open("rb") as stream:
@@ -882,7 +1068,7 @@ def _asar_module_hashes(desktop_exe: str, profile: dict[str, Any] | None = None)
                 raise _version_error("asar_header_truncated")
             tree = json.loads(raw_tree.decode("utf-8", "strict"))
             hashes: dict[str, str] = {}
-            for module, expected in profile["moduleHashes"].items():
+            for module, expected in _runtime_module_hashes(profile).items():
                 node: Any = tree
                 for part in module.split("/"):
                     files = node.get("files") if isinstance(node, dict) else None
@@ -922,7 +1108,8 @@ def _checked_runtime(desktop_exe: str, observed: dict[str, Any]) -> dict[str, An
         error.compatibility = diagnostic
         raise
     return {"desktopVersion": profile["desktopVersion"], "appServerVersion": profile["appServerVersion"],
-            "moduleHashes": module_hashes, "profile": name}
+            "appServerSha256": profile.get("appServerSha256"), "asarHeader": profile.get("asarHeader"),
+            "modules": _runtime_module_rows(profile), "moduleHashes": module_hashes, "profile": name}
 
 
 def _runtime_version(desktop_exe: str, app_server_exe: str) -> dict[str, Any]:
@@ -936,6 +1123,330 @@ def _compatibility_for_paths(desktop_exe: str, app_server_exe: str) -> dict[str,
     except DesktopIpcError as error:
         return error.compatibility
     return _safe_compatibility({**observed, "status": "current", "profile": runtime["profile"]})
+
+
+class _AsarAuditError(ValueError):
+    pass
+
+
+def _asar_number(value: Any) -> int:
+    if type(value) is int:
+        number = value
+    elif isinstance(value, str) and value.isascii() and value.isdigit():
+        number = int(value, 10)
+    else:
+        raise _AsarAuditError("asar number")
+    if number < 0:
+        raise _AsarAuditError("asar number bounds")
+    return number
+
+
+def _asar_audit_modules(desktop_exe: str) -> tuple[list[int], dict[str, list[dict[str, str]]]]:
+    """有限读取 ASAR，只保留两个协议候选模块的 role/path/hash。"""
+    asar = Path(desktop_exe).parent / "resources" / "app.asar"
+    candidates: dict[str, list[dict[str, str]]] = {role: [] for role in _MODULE_PATH_PATTERNS}
+    try:
+        with asar.open("rb") as stream:
+            file_size = os.fstat(stream.fileno()).st_size
+            if file_size <= 16 or file_size > _MAX_ASAR_FILE_BYTES:
+                raise _AsarAuditError("asar size")
+            header = stream.read(16)
+            if len(header) != 16:
+                raise _AsarAuditError("asar header")
+            layout = list(struct.unpack("<4I", header))
+            version, header_size, json_offset, json_size = layout
+            if (version != 4 or header_size < 16 or header_size > _MAX_ASAR_HEADER_BYTES
+                    or json_size <= 0 or header_size != json_offset + 4
+                    or json_offset != json_size + 7):
+                raise _AsarAuditError("asar header layout")
+            tree_start = 16
+            tree_end = tree_start + json_size
+            data_start = 8 + header_size
+            if tree_end > file_size or data_start > file_size:
+                raise _AsarAuditError("asar header bounds")
+            stream.seek(tree_start)
+            raw_tree = stream.read(json_size)
+            if len(raw_tree) != json_size:
+                raise _AsarAuditError("asar tree truncated")
+            try:
+                tree = json.loads(raw_tree.decode("utf-8", "strict"), object_pairs_hook=_catalog_object)
+            except (_CatalogError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError, RecursionError) as error:
+                raise _AsarAuditError("asar tree invalid") from error
+            nodes = 0
+            candidate_count = 0
+            candidate_bytes = 0
+            candidate_offsets: list[tuple[int, int]] = []
+
+            def walk(node: Any, prefix: str, depth: int) -> None:
+                nonlocal nodes, candidate_count, candidate_bytes
+                nodes += 1
+                if nodes > _MAX_ASAR_TREE_NODES or depth > _MAX_ASAR_DEPTH or not isinstance(node, dict):
+                    raise _AsarAuditError("asar tree bounds")
+                files = node.get("files")
+                if files is None:
+                    if prefix == "":
+                        raise _AsarAuditError("asar root")
+                    role = next((candidate for candidate, pattern in _MODULE_PATH_PATTERNS.items()
+                                 if pattern.fullmatch(prefix)), None)
+                    if role is None:
+                        return
+                    if node.get("unpacked"):
+                        raise _AsarAuditError("asar unpacked module")
+                    offset = _asar_number(node.get("offset"))
+                    size = _asar_number(node.get("size"))
+                    if size <= 0 or size > _MAX_ASAR_MODULE_BYTES:
+                        raise _AsarAuditError("asar module bounds")
+                    start = data_start + offset
+                    if start < data_start or start > file_size or size > file_size - start:
+                        raise _AsarAuditError("asar module bounds")
+                    if (candidate_count >= _MAX_ASAR_AUDIT_CANDIDATES
+                            or len(candidates[role]) >= _MAX_ASAR_AUDIT_CANDIDATES_PER_ROLE
+                            or candidate_bytes > _MAX_ASAR_AUDIT_MODULE_BYTES - size):
+                        raise _AsarAuditError("asar audit budget")
+                    end = start + size
+                    if any(start < previous_end and previous_start < end
+                           for previous_start, previous_end in candidate_offsets):
+                        raise _AsarAuditError("asar module overlap")
+                    candidate_offsets.append((start, end))
+                    candidate_count += 1
+                    candidate_bytes += size
+                    stream.seek(start)
+                    digest = hashlib.sha256()
+                    remaining = size
+                    while remaining:
+                        chunk = stream.read(min(1024 * 1024, remaining))
+                        if not chunk:
+                            raise _AsarAuditError("asar module truncated")
+                        digest.update(chunk)
+                        remaining -= len(chunk)
+                    candidates[role].append({"role": role, "path": prefix, "sha256": digest.hexdigest()})
+                    return
+                if not isinstance(files, dict) or len(files) > _MAX_ASAR_TREE_NODES:
+                    raise _AsarAuditError("asar files")
+                for name, child in files.items():
+                    if (not isinstance(name, str) or not 0 < len(name) <= _CATALOG_MAX_STRING or "\x00" in name
+                            or "/" in name or "\\" in name or name in {".", ".."}):
+                        raise _AsarAuditError("asar file name")
+                    child_path = f"{prefix}/{name}" if prefix else name
+                    if len(child_path) > _CATALOG_MAX_STRING:
+                        raise _AsarAuditError("asar path bounds")
+                    walk(child, child_path, depth + 1)
+
+            walk(tree, "", 0)
+            return layout, candidates
+    except _AsarAuditError:
+        raise
+    except (OSError, struct.error, ValueError, TypeError) as error:
+        raise _AsarAuditError("asar unavailable") from error
+
+
+def _safe_audit_hash(value: Any) -> str | None:
+    return value if isinstance(value, str) and _SHA256_PATTERN.fullmatch(value) else None
+
+
+def _safe_audit_modules(value: Any) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    result: list[dict[str, str]] = []
+    seen_roles: set[str] = set()
+    seen_paths: set[str] = set()
+    for item in value:
+        if not isinstance(item, dict) or set(item) != {"role", "path", "sha256"}:
+            continue
+        role, path, digest = item["role"], item["path"], item["sha256"]
+        pattern = _MODULE_PATH_PATTERNS.get(role) if isinstance(role, str) else None
+        if (pattern is None or not isinstance(path, str) or pattern.fullmatch(path) is None
+                or path in seen_paths or role in seen_roles or _safe_audit_hash(digest) is None):
+            continue
+        seen_roles.add(role)
+        seen_paths.add(path)
+        result.append({"role": role, "path": path, "sha256": digest})
+    return result
+
+
+def _safe_audit(value: Any = None) -> dict[str, Any]:
+    value = value if isinstance(value, dict) else {}
+    status = value.get("status") if value.get("status") in COMPATIBILITY_STATUSES else "unverified"
+    classification = value.get("classification")
+    if classification not in COMPATIBILITY_AUDIT_CLASSIFICATIONS:
+        classification = "unavailable"
+    profile = value.get("profile") if isinstance(value.get("profile"), str) \
+        and _PROFILE_NAME_PATTERN.fullmatch(value["profile"]) else None
+    candidate_profile = value.get("candidateProfile") if isinstance(value.get("candidateProfile"), str) \
+        and _PROFILE_NAME_PATTERN.fullmatch(value["candidateProfile"]) else None
+    header = value.get("asarHeader")
+    if (not isinstance(header, (list, tuple)) or len(header) != 4
+            or any(type(item) is not int or item < 0 or item > _MAX_ASAR_HEADER_BYTES for item in header)):
+        header = None
+    else:
+        header = list(header)
+    result: dict[str, Any] = {
+        **_safe_compatibility({**value, "status": status, "profile": profile}),
+        "classification": classification,
+        "appServerSha256": _safe_audit_hash(value.get("appServerSha256")),
+        "asarHeader": header,
+        "candidateProfile": candidate_profile,
+        "modules": _safe_audit_modules(value.get("modules")),
+    }
+    candidate_runtime = value.get("candidateRuntime")
+    if isinstance(candidate_runtime, dict) and set(candidate_runtime) == {
+        "desktopVersion", "appServerVersion", "appServerSha256", "asarHeader", "modules"
+    }:
+        runtime = _catalog_runtime_projection(candidate_runtime)
+        if (_safe_version(runtime["desktopVersion"]) is not None
+                and _DESKTOP_VERSION_PATTERN.fullmatch(runtime["desktopVersion"]) is not None
+                and _safe_version(runtime["appServerVersion"]) is not None
+                and _safe_audit_hash(runtime["appServerSha256"]) is not None
+                and isinstance(runtime["asarHeader"], list) and len(runtime["asarHeader"]) == 4
+                and all(type(item) is int and 0 <= item <= _MAX_ASAR_HEADER_BYTES
+                        for item in runtime["asarHeader"])
+                and len(_safe_audit_modules(runtime["modules"])) == 2):
+            runtime["modules"] = _safe_audit_modules(runtime["modules"])
+            result["candidateRuntime"] = runtime
+    return result
+
+
+def _audit_result(observed: dict[str, Any] | None = None, *, status: str = "unverified",
+                  classification: str = "unavailable", profile: str | None = None,
+                  app_server_sha256: str | None = None, asar_header: Any = None,
+                  candidate_profile: str | None = None, modules: Any = None,
+                  candidate_runtime: dict[str, Any] | None = None) -> dict[str, Any]:
+    observed = observed if isinstance(observed, dict) else {}
+    value: dict[str, Any] = {
+        "observedDesktopVersion": observed.get("observedDesktopVersion"),
+        "observedAppServerVersion": observed.get("observedAppServerVersion"),
+        "status": status,
+        "profile": profile,
+        "classification": classification,
+        "appServerSha256": app_server_sha256,
+        "asarHeader": asar_header,
+        "candidateProfile": candidate_profile,
+        "modules": modules if modules is not None else [],
+    }
+    if candidate_runtime is not None:
+        value["candidateRuntime"] = candidate_runtime
+    return _safe_audit(value)
+
+
+def _profiles_for_app_server_version(version: str | None) -> list[tuple[str, tuple[dict[str, Any], ...]]]:
+    if not version:
+        return []
+    return [(name, runtimes) for name, runtimes in VERIFIED_PROFILES.items()
+            if any(runtime.get("appServerVersion") == version for runtime in runtimes)]
+
+
+def _compatibility_audit_for_paths(desktop_exe: str, app_server_exe: str) -> dict[str, Any]:
+    observed = _observe_runtime_versions(desktop_exe, app_server_exe)
+    app_server_sha256 = observed.get("appServerSha256")
+    if (_safe_version(observed.get("observedDesktopVersion")) is None
+            or _safe_version(observed.get("observedAppServerVersion")) is None
+            or _safe_audit_hash(app_server_sha256) is None):
+        return _audit_result(observed, classification="unavailable", app_server_sha256=app_server_sha256)
+    exact = _profile_for_pair(observed.get("observedDesktopVersion"), observed.get("observedAppServerVersion"))
+    if exact is not None:
+        name, profile = exact
+        try:
+            _checked_runtime(desktop_exe, observed)
+        except DesktopIpcError:
+            return _audit_result(observed, status="incompatible", classification="protocol_drift_or_unknown",
+                                 profile=name, candidate_profile=name, app_server_sha256=app_server_sha256)
+        return _audit_result(
+            observed,
+            status="current",
+            classification="current",
+            profile=name,
+            app_server_sha256=app_server_sha256,
+            asar_header=profile.get("asarHeader"),
+            candidate_profile=name,
+            modules=_runtime_module_rows(profile),
+        )
+
+    matches = _profiles_for_app_server_version(observed.get("observedAppServerVersion"))
+    if not matches:
+        return _audit_result(observed, classification="protocol_drift_or_unknown", app_server_sha256=app_server_sha256)
+    known_desktop_versions = {
+        runtime.get("desktopVersion") for runtimes in VERIFIED_PROFILES.values() for runtime in runtimes
+    }
+    if observed.get("observedDesktopVersion") in known_desktop_versions:
+        name = matches[0][0] if len(matches) == 1 else None
+        return _audit_result(observed, classification="protocol_drift_or_unknown", profile=name,
+                             candidate_profile=name, app_server_sha256=app_server_sha256)
+    if len(matches) != 1:
+        return _audit_result(observed, classification="ambiguous", app_server_sha256=app_server_sha256)
+    name, runtimes = matches[0]
+    try:
+        asar_header, candidates = _asar_audit_modules(desktop_exe)
+    except _AsarAuditError:
+        return _audit_result(observed, classification="protocol_drift_or_unknown", candidate_profile=name,
+                             app_server_sha256=app_server_sha256)
+    ipc_candidates = candidates.get("ipc-main", [])
+    webview_candidates = candidates.get("webview-bootstrap", [])
+    if len(webview_candidates) != 1:
+        classification = "ambiguous" if len(webview_candidates) > 1 else "protocol_drift_or_unknown"
+        return _audit_result(observed, classification=classification, candidate_profile=name,
+                             app_server_sha256=app_server_sha256, asar_header=asar_header,
+                             modules=webview_candidates)
+    trusted_hashes = {
+        module.get("sha256")
+        for runtime in runtimes
+        for module in _runtime_module_rows(runtime)
+        if module.get("role") == "ipc-main"
+    }
+    trusted_ipc = [module for module in ipc_candidates if module.get("sha256") in trusted_hashes]
+    if len(trusted_ipc) != 1:
+        classification = "ambiguous" if len(trusted_ipc) > 1 else "protocol_drift_or_unknown"
+        return _audit_result(observed, classification=classification, candidate_profile=name,
+                             app_server_sha256=app_server_sha256, asar_header=asar_header,
+                             modules=[*trusted_ipc, *webview_candidates])
+    modules = [*trusted_ipc, *webview_candidates]
+    candidate_runtime = {
+        "desktopVersion": observed.get("observedDesktopVersion"),
+        "appServerVersion": observed.get("observedAppServerVersion"),
+        "appServerSha256": app_server_sha256,
+        "asarHeader": asar_header,
+        "modules": modules,
+    }
+    return _audit_result(observed, classification="same_protocol_candidate", candidate_profile=name,
+                         app_server_sha256=app_server_sha256, asar_header=asar_header, modules=modules,
+                         candidate_runtime=candidate_runtime)
+
+
+def _runtime_process_pairs() -> list[tuple[str, str]]:
+    """只从现有进程树定位 Desktop/app-server，不启动或连接 app-server。"""
+    rows = _processes()
+    servers = [
+        row for row in rows
+        if row.get("name", "").casefold() == "chatgpt.exe"
+        and type(row.get("pid")) is int and row["pid"] > 0
+        and type(row.get("creation")) is int and row["creation"] > 0
+        and isinstance(row.get("exe"), str) and bool(row["exe"])
+    ]
+    pairs: list[tuple[str, str]] = []
+    for server in servers:
+        children = [
+            row for row in rows
+            if row.get("name", "").casefold() == "codex.exe"
+            and row.get("parentPid") == server["pid"]
+            and type(row.get("pid")) is int and row["pid"] > 0
+            and type(row.get("creation")) is int and row["creation"] > 0
+            and isinstance(row.get("exe"), str) and bool(row["exe"])
+        ]
+        if len(children) == 1:
+            pairs.append((server["exe"], children[0]["exe"]))
+    return pairs
+
+
+def _compatibility_audit() -> dict[str, Any]:
+    _query_standard_token()
+    pairs = _runtime_process_pairs()
+    if len(pairs) == 0:
+        return _audit_result(classification="unavailable")
+    if len(pairs) != 1:
+        return _audit_result(classification="ambiguous")
+    return _compatibility_audit_for_paths(*pairs[0])
+
+
+compatibility_audit = _compatibility_audit
 
 
 def _global_state_path() -> Path:
@@ -1031,26 +1542,7 @@ def _verify_runtime(pipe: _Pipe, target: dict[str, str], expected: dict[str, Any
 
 def _runtime_process_pair() -> tuple[str, str] | None:
     """只从现有进程树定位唯一 Desktop/app-server，不启动或连接 app-server。"""
-    rows = _processes()
-    servers = [
-        row for row in rows
-        if row.get("name", "").casefold() == "chatgpt.exe"
-        and type(row.get("pid")) is int and row["pid"] > 0
-        and type(row.get("creation")) is int and row["creation"] > 0
-        and isinstance(row.get("exe"), str) and bool(row["exe"])
-    ]
-    pairs: list[tuple[str, str]] = []
-    for server in servers:
-        children = [
-            row for row in rows
-            if row.get("name", "").casefold() == "codex.exe"
-            and row.get("parentPid") == server["pid"]
-            and type(row.get("pid")) is int and row["pid"] > 0
-            and type(row.get("creation")) is int and row["creation"] > 0
-            and isinstance(row.get("exe"), str) and bool(row["exe"])
-        ]
-        if len(children) == 1:
-            pairs.append((server["exe"], children[0]["exe"]))
+    pairs = _runtime_process_pairs()
     return pairs[0] if len(pairs) == 1 else None
 
 
@@ -1873,6 +2365,10 @@ def _main() -> int:
                 if set(request) != {"id", "op"} or prepared is not None:
                     raise _error("DESKTOP_INVALID_REQUEST")
                 _reply({"id": request_id, "ok": True, "value": _compatibility()})
+            elif op == "compatibility_audit":
+                if set(request) != {"id", "op"} or prepared is not None:
+                    raise _error("DESKTOP_INVALID_REQUEST")
+                _reply({"id": request_id, "ok": True, "value": _compatibility_audit()})
             elif op == "inspect_active_execution":
                 if set(request) != {"id", "op", "target"} or prepared is not None:
                     raise _error("DESKTOP_INVALID_REQUEST")

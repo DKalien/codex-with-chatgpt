@@ -353,8 +353,11 @@ Desktop `26.908.4834.0` / app-server `0.154.0-alpha.6.2`，以及
 Desktop `26.908.9136.0` / app-server `0.154.0-alpha.6.2`；其他组合仍须重新核验。
 这不是“所有 26.908 都兼容”，而是三个分别固定的 exact runtime。
 
-已验证组合统一保存在 helper 的 `VERIFIED_PROFILES`，每个协议 profile 包含精确运行时组合：Desktop/package 版本、app-server
-二进制 SHA-256、两个协议模块 SHA-256，以及同一安装包的 ASAR 头部布局。2026-09-11
+已验证组合统一保存在随 helper 一起构建的版本化 `desktop_profiles.json` catalog；helper 在加载边界严格校验
+schema、大小、字段、版本、hash、ASAR header、必需模块 role/path 以及所有重复项，再派生内部
+`VERIFIED_PROFILES`。每个协议 profile 只包含精确运行时组合：Desktop/package 版本、app-server
+二进制 SHA-256、两个协议模块 SHA-256，以及同一安装包的 ASAR 头部布局。catalog 缺失或损坏时
+一律 fail closed，不能成为 `current`。2026-09-11
 核验确认 ASAR 头部为 2,441,036 字节；原先 1 MiB 解析上限会误报
 `DESKTOP_VERSION_UNSUPPORTED`。现改为匹配已验证的精确头部布局，仍逐一验证全部哈希，
 未知头部、未知哈希或混合版本继续拒绝。旧组合的 app-server 哈希来自普通权限成功 PoC 的
@@ -365,6 +368,19 @@ Desktop `26.908.9136.0` / app-server `0.154.0-alpha.6.2`；其他组合仍须重
 `current` 表示精确版本组合及全部 profile 哈希通过；`unverified` 表示观察到的组合没有
 已验证 profile；`incompatible` 表示匹配组合的完整性或协议要求不符。无法读取的版本为
 `null`，不能猜成已验证版本。诊断成功不代表 owner、项目、运行态或投递权限通过。
+
+`c2c desktop compatibility --audit --json` 在同一只读进程发现基础上提供有限 candidate auditor，
+不会 bind、enable、连接 IPC、发送消息或修改 workspace/机器状态。未知 Desktop 仅在 app-server
+版本精确命中单一 profile、ASAR 可有限解析、唯一 webview bootstrap 存在，且所有 IPC main 候选中
+恰有一个 SHA-256 与该 profile 已信任模块 byte-identical 时，才返回 `same_protocol_candidate` 和可直接
+审查的 exact `candidateRuntime`；app-server 二进制 hash 可以变化，但候选仍是 `unverified`，绝不自动
+晋升为 `current`。版本变化、IPC hash 变化、缺失、多个命中、ASAR 歧义或运行进程歧义都保持
+`protocol_drift_or_unknown`、`ambiguous` 或 `unavailable`，且不会产生可信运行时。
+
+候选 promotion 必须由人工审查 exact row，加入 source-controlled catalog，完成 catalog/helper/CLI 测试，
+再用 source checkout 做一次只读握手后才可提交、推送；CLI 自身永不改 catalog。正常 compatibility、
+bind/current-context/prepare/send 仍只接受 catalog 中 exact 版本对、app-server SHA、ASAR header 与必需
+模块 path/hash 的全量匹配。wildcard、版本范围及“新版本默认兼容”继续禁止。
 
 `DESKTOP_VERSION_UNSUPPORTED` 保留原错误码，附带同样的安全诊断字段。Activation 应直接
 报告实际观察版本；不要把这里的 Desktop 协议 profile 与 OAuth Connector 的

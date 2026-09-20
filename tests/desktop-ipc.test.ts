@@ -6,6 +6,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   DesktopIpcClient,
   resolveDesktopHelperPath,
+  validateDesktopCompatibilityAudit,
   validateDesktopCompatibility,
   validateDesktopMessage,
   validateDesktopTarget,
@@ -228,7 +229,7 @@ describe("Desktop IPC wrapper（fake helper）", () => {
     };
     const fake = fakeSpawner(request => request.op === "compatibility" ? {
       ok: true,
-      value: { ...expected, token: "secret-token", pipe: "\\\\.\\pipe\\secret" },
+      value: { ...expected, token: "secret-token", pipe: "\\\\.\\pipe\\secret", candidateRuntime: { token: "candidate-secret" } },
     } : { ok: true, value: {} });
     await expect(makeClient(fake.spawnImpl).compatibility()).resolves.toEqual(expected);
     expect(fake.requests).toHaveLength(1);
@@ -247,16 +248,90 @@ describe("Desktop IPC wrapper（fake helper）", () => {
       ok: false,
       code: "DESKTOP_VERSION_UNSUPPORTED",
       notSent: true,
-      compatibility: { ...expected, token: "secret-token", pipe: "\\\\.\\pipe\\secret", rawError: "secret-error" },
+      compatibility: { ...expected, token: "secret-token", pipe: "\\\\.\\pipe\\secret", rawError: "secret-error", candidateRuntime: { token: "candidate-secret" } },
     } : { ok: true, value: {} });
     try {
       await makeClient(fake.spawnImpl).compatibility();
       throw new Error("compatibility 错误未被拒绝");
     } catch (error) {
       expect(error).toMatchObject({ code: "DESKTOP_VERSION_UNSUPPORTED", notSent: true, compatibility: expected });
+      expect((error as { compatibility?: unknown }).compatibility).toEqual(expected);
       expect(error).not.toHaveProperty("token");
       expect(String((error as Error).message)).not.toContain("secret");
     }
+  });
+
+  it("compatibility_audit 独立只发送 id/op，并严格投影 allowlist 字段", async () => {
+    const expected = {
+      observedDesktopVersion: "26.908.9136.0",
+      observedAppServerVersion: "0.154.0-alpha.6.2",
+      status: "current" as const,
+      profile: "desktop-ipc-v1",
+      classification: "current" as const,
+      appServerSha256: "a".repeat(64),
+      asarHeader: [4, 2489280, 2489276, 2489269] as [number, number, number, number],
+      candidateProfile: "desktop-ipc-v1",
+      modules: [
+        { role: "ipc-main" as const, path: ".vite/build/src-CCXHtyvY.js", sha256: "b".repeat(64) },
+        { role: "webview-bootstrap" as const, path: "webview/assets/app-initial-bcc2ff475eb6.js", sha256: "c".repeat(64) },
+      ],
+    };
+    const fake = fakeSpawner(request => request.op === "compatibility_audit" ? {
+      ok: true,
+      value: expected,
+    } : { ok: true, value: {} });
+    await expect(makeClient(fake.spawnImpl).compatibilityAudit()).resolves.toEqual(expected);
+    expect(fake.requests).toHaveLength(1);
+    expect(Object.keys(fake.requests[0]).sort()).toEqual(["id", "op"]);
+    expect(fake.requests[0].op).toBe("compatibility_audit");
+  });
+
+  it("compatibility_audit validator 拒绝 secrets、未知字段和坏模块字段", () => {
+    const base = {
+      observedDesktopVersion: "26.908.9136.0",
+      observedAppServerVersion: "0.154.0-alpha.6.2",
+      status: "current" as const,
+      profile: "desktop-ipc-v1",
+      classification: "current" as const,
+      appServerSha256: "a".repeat(64),
+      asarHeader: [4, 2489280, 2489276, 2489269],
+      candidateProfile: "desktop-ipc-v1",
+      modules: [
+        { role: "ipc-main" as const, path: ".vite/build/src-CCXHtyvY.js", sha256: "b".repeat(64) },
+        { role: "webview-bootstrap" as const, path: "webview/assets/app-initial-test.js", sha256: "c".repeat(64) },
+      ],
+    };
+    expect(validateDesktopCompatibilityAudit(base)).toEqual(base);
+    expect(() => validateDesktopCompatibilityAudit({ ...base, token: "secret-token" })).toThrowError(/无法确认/);
+    expect(() => validateDesktopCompatibilityAudit({ ...base, modules: [{ ...base.modules[0], sha256: "SECRET" }] })).toThrowError(/无法确认/);
+    expect(() => validateDesktopCompatibilityAudit({ ...base, modules: [{ ...base.modules[0], path: "..\\secret.js" }] })).toThrowError(/无法确认/);
+    expect(() => validateDesktopCompatibilityAudit({ ...base, asarHeader: [4, -1, 0, 0] })).toThrowError(/无法确认/);
+    expect(() => validateDesktopCompatibilityAudit({ ...base, candidateRuntime: {
+      desktopVersion: "26.908.9136.0", appServerVersion: "0.154.0-alpha.6.2", appServerSha256: "d".repeat(64),
+      asarHeader: [4, 2489280, 2489276, 2489269], modules: [], token: "secret-token",
+    } })).toThrowError(/无法确认/);
+    const candidate = {
+      ...base,
+      classification: "same_protocol_candidate" as const,
+      status: "unverified" as const,
+      profile: null,
+      candidateRuntime: {
+        desktopVersion: base.observedDesktopVersion,
+        appServerVersion: base.observedAppServerVersion,
+        appServerSha256: base.appServerSha256,
+        asarHeader: base.asarHeader,
+        modules: base.modules,
+      },
+    };
+    expect(validateDesktopCompatibilityAudit(candidate)).toEqual(candidate);
+    expect(() => validateDesktopCompatibilityAudit({ ...candidate, candidateRuntime: {
+      ...candidate.candidateRuntime, desktopVersion: "26.908.9136",
+    } })).toThrowError(/无法确认/);
+    const overLimitHeader = [4, 64 * 1024 * 1024 + 4, 64 * 1024 * 1024, 64 * 1024 * 1024 - 7];
+    expect(() => validateDesktopCompatibilityAudit({ ...base, asarHeader: overLimitHeader })).toThrowError(/无法确认/);
+    expect(() => validateDesktopCompatibilityAudit({ ...candidate, candidateRuntime: {
+      ...candidate.candidateRuntime, asarHeader: overLimitHeader,
+    } })).toThrowError(/无法确认/);
   });
 
   it("拒绝非法版本、profile 和 current 缺失诊断", () => {
@@ -336,15 +411,31 @@ describe("Desktop IPC wrapper（fake helper）", () => {
   });
 
   it("helper 错误缺少 notSent 时，send 仍按结果不明处理", async () => {
+    const compatibility = {
+      observedDesktopVersion: "26.903.9818.0",
+      observedAppServerVersion: "0.153.4",
+      status: "incompatible" as const,
+      profile: "desktop-ipc-v1",
+    };
     const fake = fakeSpawner(request => {
-      if (request.op === "send") return { ok: false, code: "DESKTOP_BUSY" };
+      if (request.op === "send") return {
+        ok: false,
+        code: "DESKTOP_BUSY",
+        compatibility: { ...compatibility, candidateRuntime: { token: "candidate-secret" } },
+      };
       return {
         ok: true,
         value: { ...target, title: "Fake Desktop 会话", cwd: target.workspaceRoot },
       };
     });
     const connection = await makeClient(fake.spawnImpl).prepare(target);
-    await expect(connection.send("执行修订")).rejects.toMatchObject({ code: "DESKTOP_BUSY", notSent: false });
+    try {
+      await connection.send("执行修订");
+      throw new Error("send 错误未被拒绝");
+    } catch (error) {
+      expect(error).toMatchObject({ code: "DESKTOP_BUSY", notSent: false });
+      expect((error as { compatibility?: unknown }).compatibility).toEqual(compatibility);
+    }
     connection.close();
   });
 

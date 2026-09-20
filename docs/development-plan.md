@@ -98,6 +98,16 @@ schema、发布兼容、类型和对应回归应作为同一可运行单元，�
 | 必需门禁 | typecheck、build、git diff --check；未修改 Python helper 时不新增独立 Python 门禁 |
 | 交付 | 当前 commandId 的 exact execution receipt 与本轮可读 output |
 
+## V1 Desktop 版本适配流水线
+
+V1a 将 Desktop exact runtime 信任数据迁入严格校验、随 helper 构建的版本化 catalog，并增加只读
+`desktop compatibility --audit`：它只能生成有限的 `same_protocol_candidate`，不能自动修改 catalog、
+放宽正常 compatibility 或取得生产 send 信任。定向门禁覆盖 catalog schema、ASAR candidate 分类、
+helper/CLI 安全投影与构建产物，完整回归继续覆盖 Desktop control/result/reconcile。
+
+下一阶段 V1b 只考虑自动生成 candidate promotion patch，并由 source checkout 执行只读 handshake；
+review、exact catalog admission 和测试仍是必需步骤，绝不自动授予 production send trust。
+
 ## C0 实际测量（2026-09-13）
 
 开发工具：`scripts/measure-core-release.cjs`，仅以 Node 标准库包装同步 fs API，导出

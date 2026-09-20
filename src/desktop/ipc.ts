@@ -37,6 +37,38 @@ export interface DesktopCompatibility {
   profile: string | null;
 }
 
+export type DesktopCompatibilityAuditClassification =
+  | "current"
+  | "same_protocol_candidate"
+  | "protocol_drift_or_unknown"
+  | "ambiguous"
+  | "unavailable";
+
+export type DesktopCompatibilityAuditModuleRole = "ipc-main" | "webview-bootstrap";
+
+export interface DesktopCompatibilityAuditModule {
+  role: DesktopCompatibilityAuditModuleRole;
+  path: string;
+  sha256: string;
+}
+
+export interface DesktopCompatibilityCandidateRuntime {
+  desktopVersion: string;
+  appServerVersion: string;
+  appServerSha256: string;
+  asarHeader: [number, number, number, number];
+  modules: DesktopCompatibilityAuditModule[];
+}
+
+export interface DesktopCompatibilityAudit extends DesktopCompatibility {
+  classification: DesktopCompatibilityAuditClassification;
+  appServerSha256: string | null;
+  asarHeader: [number, number, number, number] | null;
+  candidateProfile: string | null;
+  modules: DesktopCompatibilityAuditModule[];
+  candidateRuntime?: DesktopCompatibilityCandidateRuntime;
+}
+
 export interface DesktopExecutionInfo extends DesktopTargetInfo {
   activeTurnId: string;
 }
@@ -138,6 +170,17 @@ const COMPATIBILITY_STATUSES = new Set<DesktopCompatibilityStatus>([
   "unverified",
   "incompatible",
 ]);
+const COMPATIBILITY_AUDIT_CLASSIFICATIONS = new Set<DesktopCompatibilityAuditClassification>([
+  "current",
+  "same_protocol_candidate",
+  "protocol_drift_or_unknown",
+  "ambiguous",
+  "unavailable",
+]);
+const COMPATIBILITY_AUDIT_MODULE_ROLES = new Set<DesktopCompatibilityAuditModuleRole>([
+  "ipc-main",
+  "webview-bootstrap",
+]);
 
 const ERROR_MESSAGES: Record<string, string> = {
   DESKTOP_UNSUPPORTED_PLATFORM: "当前平台不支持 Desktop Control。",
@@ -210,6 +253,141 @@ export function validateDesktopCompatibility(value: unknown): DesktopCompatibili
     observedAppServerVersion,
     status: status as DesktopCompatibilityStatus,
     profile,
+  };
+}
+
+const AUDIT_HASH = /^[a-f0-9]{64}$/u;
+const AUDIT_DESKTOP_VERSION = /^\d+\.\d+\.\d+\.\d+$/u;
+const MAX_AUDIT_ASAR_HEADER_BYTES = 64 * 1024 * 1024;
+const AUDIT_MODULE_PATHS: Record<DesktopCompatibilityAuditModuleRole, RegExp> = {
+  "ipc-main": /^\.vite\/build\/src-[A-Za-z0-9_-]+\.js$/u,
+  "webview-bootstrap": /^webview\/assets\/app-initial-[A-Za-z0-9_-]+\.js$/u,
+};
+
+function exactKeys(value: Record<string, unknown>, required: readonly string[], optional: readonly string[] = []): boolean {
+  const allowed = new Set([...required, ...optional]);
+  const keys = Object.keys(value);
+  return keys.length >= required.length && keys.length <= allowed.size && keys.every(key => allowed.has(key)) && required.every(key =>
+    Object.prototype.hasOwnProperty.call(value, key));
+}
+
+function auditHash(value: unknown, nullable: false): string;
+function auditHash(value: unknown, nullable?: true): string | null;
+function auditHash(value: unknown, nullable = true): string | null {
+  if (value === null && nullable) return null;
+  if (typeof value !== "string" || !AUDIT_HASH.test(value)) throw error("DESKTOP_PROTOCOL_ERROR");
+  return value;
+}
+
+function auditAsarHeader(value: unknown, nullable: false): [number, number, number, number];
+function auditAsarHeader(value: unknown, nullable?: true): [number, number, number, number] | null;
+function auditAsarHeader(value: unknown, nullable = true): [number, number, number, number] | null {
+  if (value === null && nullable) return null;
+  if (!Array.isArray(value) || value.length !== 4 || value.some(item =>
+    !Number.isInteger(item) || item < 0 || item > MAX_AUDIT_ASAR_HEADER_BYTES)) {
+    throw error("DESKTOP_PROTOCOL_ERROR");
+  }
+  if (value[0] !== 4 || value[1] !== value[2] + 4 || value[2] !== value[3] + 7) {
+    throw error("DESKTOP_PROTOCOL_ERROR");
+  }
+  return [...value] as [number, number, number, number];
+}
+
+function auditModule(value: unknown): DesktopCompatibilityAuditModule {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw error("DESKTOP_PROTOCOL_ERROR");
+  const input = value as Record<string, unknown>;
+  if (!exactKeys(input, ["role", "path", "sha256"])) throw error("DESKTOP_PROTOCOL_ERROR");
+  const role = input.role;
+  const modulePath = input.path;
+  if (typeof role !== "string" || !COMPATIBILITY_AUDIT_MODULE_ROLES.has(role as DesktopCompatibilityAuditModuleRole) ||
+      typeof modulePath !== "string" || !AUDIT_MODULE_PATHS[role as DesktopCompatibilityAuditModuleRole].test(modulePath)) {
+    throw error("DESKTOP_PROTOCOL_ERROR");
+  }
+  const sha256 = auditHash(input.sha256, false);
+  return { role: role as DesktopCompatibilityAuditModuleRole, path: modulePath, sha256 };
+}
+
+function auditModules(value: unknown): DesktopCompatibilityAuditModule[] {
+  if (!Array.isArray(value) || value.length > 2) throw error("DESKTOP_PROTOCOL_ERROR");
+  const modules = value.map(auditModule);
+  if (new Set(modules.map(module => module.role)).size !== modules.length ||
+      new Set(modules.map(module => module.path)).size !== modules.length) {
+    throw error("DESKTOP_PROTOCOL_ERROR");
+  }
+  return modules;
+}
+
+function auditCandidateRuntime(value: unknown): DesktopCompatibilityCandidateRuntime {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw error("DESKTOP_PROTOCOL_ERROR");
+  const input = value as Record<string, unknown>;
+  if (!exactKeys(input, ["desktopVersion", "appServerVersion", "appServerSha256", "asarHeader", "modules"])) {
+    throw error("DESKTOP_PROTOCOL_ERROR");
+  }
+  const desktopVersion = input.desktopVersion;
+  if (typeof desktopVersion !== "string" || desktopVersion.length > 64 || !AUDIT_DESKTOP_VERSION.test(desktopVersion)) {
+    throw error("DESKTOP_PROTOCOL_ERROR");
+  }
+  const appServerVersion = compatibilityVersion(input.appServerVersion);
+  const appServerSha256 = auditHash(input.appServerSha256, false);
+  const asarHeader = auditAsarHeader(input.asarHeader, false);
+  const modules = auditModules(input.modules);
+  if (!appServerVersion || !asarHeader) throw error("DESKTOP_PROTOCOL_ERROR");
+  return { desktopVersion, appServerVersion, appServerSha256, asarHeader, modules };
+}
+
+export function validateDesktopCompatibilityAudit(value: unknown): DesktopCompatibilityAudit {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw error("DESKTOP_PROTOCOL_ERROR");
+  const input = value as Record<string, unknown>;
+  const required = [
+    "observedDesktopVersion", "observedAppServerVersion", "status", "profile", "classification",
+    "appServerSha256", "asarHeader", "candidateProfile", "modules",
+  ] as const;
+  if (!exactKeys(input, required, ["candidateRuntime"])) throw error("DESKTOP_PROTOCOL_ERROR");
+  const compatibility = validateDesktopCompatibility({
+    observedDesktopVersion: input.observedDesktopVersion,
+    observedAppServerVersion: input.observedAppServerVersion,
+    status: input.status,
+    profile: input.profile,
+  });
+  const classification = input.classification;
+  if (typeof classification !== "string" ||
+      !COMPATIBILITY_AUDIT_CLASSIFICATIONS.has(classification as DesktopCompatibilityAuditClassification)) {
+    throw error("DESKTOP_PROTOCOL_ERROR");
+  }
+  const candidateProfile = compatibilityProfile(input.candidateProfile);
+  const appServerSha256 = auditHash(input.appServerSha256);
+  const asarHeader = auditAsarHeader(input.asarHeader);
+  const modules = auditModules(input.modules);
+  const candidateRuntime = Object.prototype.hasOwnProperty.call(input, "candidateRuntime")
+    ? auditCandidateRuntime(input.candidateRuntime) : undefined;
+  if (classification === "same_protocol_candidate") {
+    if (!candidateRuntime || !candidateProfile || compatibility.status !== "unverified" || compatibility.profile !== null ||
+        !compatibility.observedDesktopVersion || !compatibility.observedAppServerVersion || !appServerSha256 || !asarHeader ||
+        modules.length !== 2 || candidateRuntime.modules.length !== 2 ||
+        new Set(modules.map(module => module.role)).size !== 2 ||
+        candidateRuntime.desktopVersion !== compatibility.observedDesktopVersion ||
+        candidateRuntime.appServerVersion !== compatibility.observedAppServerVersion ||
+        candidateRuntime.appServerSha256 !== appServerSha256 ||
+        JSON.stringify(candidateRuntime.asarHeader) !== JSON.stringify(asarHeader) ||
+        JSON.stringify(candidateRuntime.modules) !== JSON.stringify(modules)) {
+      throw error("DESKTOP_PROTOCOL_ERROR");
+    }
+  } else if (candidateRuntime) {
+    throw error("DESKTOP_PROTOCOL_ERROR");
+  }
+  if (classification === "current" && (compatibility.status !== "current" || !compatibility.profile ||
+      candidateProfile !== compatibility.profile || !appServerSha256 || !asarHeader || modules.length !== 2 ||
+      new Set(modules.map(module => module.role)).size !== 2)) {
+    throw error("DESKTOP_PROTOCOL_ERROR");
+  }
+  return {
+    ...compatibility,
+    classification: classification as DesktopCompatibilityAuditClassification,
+    appServerSha256,
+    asarHeader,
+    candidateProfile,
+    modules,
+    ...(candidateRuntime ? { candidateRuntime } : {}),
   };
 }
 
@@ -528,6 +706,16 @@ export class DesktopIpcClient {
     try {
       const value = await session.request("compatibility", {});
       return validateDesktopCompatibility(value);
+    } finally {
+      session.close();
+    }
+  }
+
+  async compatibilityAudit(): Promise<DesktopCompatibilityAudit> {
+    const session = this.open();
+    try {
+      const value = await session.request("compatibility_audit", {});
+      return validateDesktopCompatibilityAudit(value);
     } finally {
       session.close();
     }

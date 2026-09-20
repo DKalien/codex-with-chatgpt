@@ -108,6 +108,15 @@ function compatibilityMessage(message: string, compatibility?: ReturnType<typeof
   return `${message} Desktop：${compatibility.observedDesktopVersion ?? "unknown"}；app-server：${compatibility.observedAppServerVersion ?? "unknown"}；profile：${compatibility.profile ?? "unknown"}。`;
 }
 
+function compatibilityAuditMessage(audit: Awaited<ReturnType<typeof desktopIpc.compatibilityAudit>>): string {
+  const moduleText = audit.modules.length === 0 ? "无" : audit.modules
+    .map(module => `${module.role}=${module.path}（${module.sha256}）`).join("；");
+  const candidate = audit.candidateRuntime
+    ? `候选运行时：Desktop ${audit.candidateRuntime.desktopVersion}；app-server ${audit.candidateRuntime.appServerVersion}`
+    : "候选运行时：无";
+  return `Desktop 兼容性审计：${audit.status}；分类：${audit.classification}；Desktop：${audit.observedDesktopVersion ?? "unknown"}；app-server：${audit.observedAppServerVersion ?? "unknown"}；profile：${audit.profile ?? "unknown"}；候选 profile：${audit.candidateProfile ?? "unknown"}；app-server SHA-256：${audit.appServerSha256 ?? "unknown"}；ASAR 头：${audit.asarHeader?.join(",") ?? "unknown"}；${candidate}；模块：${moduleText}。`;
+}
+
 export function registerDesktopCommands(program: Command): void {
   const desktop = program.command("desktop").description("管理本机已绑定的 Desktop Control 会话");
 
@@ -344,15 +353,21 @@ export function registerDesktopCommands(program: Command): void {
   desktop.command("compatibility")
     .description("只读诊断本机 Desktop/app-server 兼容性")
     .option("-w, --workspace <path>", "兼容参数；诊断不读取 workspace 状态")
+    .option("--audit", "输出只读兼容性审计详情", false)
     .option("--json", "输出机器可读结果", false)
-    .action(async (opts: { workspace?: string; json: boolean }) => {
+    .action(async (opts: { workspace?: string; audit: boolean; json: boolean }) => {
       try {
-        const compatibility = await desktopIpc.compatibility();
-        const observedDesktopVersion = compatibility.observedDesktopVersion ?? "unknown";
-        const observedAppServerVersion = compatibility.observedAppServerVersion ?? "unknown";
-        const profile = compatibility.profile ?? "unknown";
-        print({ ok: true, ...compatibility }, opts.json,
-          `Desktop 兼容性：${compatibility.status}；Desktop：${observedDesktopVersion}；app-server：${observedAppServerVersion}；profile：${profile}。`);
+        if (opts.audit) {
+          const audit = await desktopIpc.compatibilityAudit();
+          print({ ok: true, ...audit }, opts.json, compatibilityAuditMessage(audit));
+        } else {
+          const compatibility = await desktopIpc.compatibility();
+          const observedDesktopVersion = compatibility.observedDesktopVersion ?? "unknown";
+          const observedAppServerVersion = compatibility.observedAppServerVersion ?? "unknown";
+          const profile = compatibility.profile ?? "unknown";
+          print({ ok: true, ...compatibility }, opts.json,
+            `Desktop 兼容性：${compatibility.status}；Desktop：${observedDesktopVersion}；app-server：${observedAppServerVersion}；profile：${profile}。`);
+        }
       } catch (error) {
         const failure = safeCliError(error, "DESKTOP_IPC_UNAVAILABLE", "无法读取本机 Desktop 兼容性；没有发送消息。");
         print({ ok: false, error: failure.code, message: failure.message,
