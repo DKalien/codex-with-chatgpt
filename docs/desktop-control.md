@@ -313,6 +313,28 @@ malformed/truncated history、wrong turn、当前 context 漂移或核对期间�
 没有可用当前 result turn 时，本机用户仍可显式运行
 `c2c desktop reconcile-unknown -w <workspace> --command-id <id> --json`；它只恢复唯一真实
 turn，不写 execution receipt，是 advanced fallback。手动核对未提供 expected turn 时保持原行为。
+
+### P0.6：capacity-retry continuation receipt ownership
+
+当 accepted delivery 的原始 turn 已结束而 Desktop 产生了机器自动的 capacity retry 时，
+`record-result` 只允许通过一次新的、只读的 current-result ownership attestation 接管结果归属。
+原始 `delivery.turnId` 永远是 immutable origin，不会被后继 turn 覆盖，也不会把后继 turn
+伪装成原始任务的 self-reconcile 候选。
+
+attestation 只接受 canonical、`newerBoundary=exhausted`、turn ID 唯一且身份完全匹配的历史：
+每一跳必须是紧邻 successor，successor 必须没有任何 canonical user input，且
+`params.turnTrigger` 精确等于 `capacity_retry_automatic`；origin 到 result tip 必须位于同一个
+canonical island，不能把 island 边界当作连续 successor。successor 的 item 结构若无法证明为
+字典且无用户输入也会拒绝。任意普通 `failed`、同线程相邻、
+时间接近、summary、普通“continue/resume”文本、未知 trigger、插入新的 C2C/user turn、
+历史不完整或链长超过上限均 fail closed；不把任意 `failed` 自动视为可续接中断。
+服务重启后重新读取并验证整条 bounded chain，不持久化或公开 continuation internals，
+不创建后台队列、不重发原任务。P0.5 只负责新 send 的 receipt-backed busy-tail settle；
+P0.6 只负责判断哪个 native continuation tip 可以写入旧 command 的唯一 receipt，二者独立。
+
+已存在的 `outcome_unknown` 仍只按原始 C2C envelope 的严格 reconciliation 处理；只有恢复为
+accepted origin 后，才允许进入 P0.6 continuation ownership。已有 trusted receipt 仍按原有
+digest/idempotency 规则只读恢复，不能生成第二条 execution record。
 若最后重检明确证明尚未进入 IPC start（例如刚变忙或出现审批），保存 `rejected` 与明确错误，
 同 ID 重放仍返回该拒绝记录。处理原因后只能由用户明确发起新请求；不会排队或自动重试。
 任何进入 start 后的断线、部分写入或回执异常都不能归为这种“确定未发送”。

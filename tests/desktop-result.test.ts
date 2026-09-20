@@ -15,6 +15,9 @@ const threadId = "01a00000-0000-7000-8000-000000000101";
 const otherThreadId = "01a00000-0000-7000-8000-000000000102";
 const bindingId = "00000000-0000-4000-8000-000000000101";
 const turnId = "00000000-0000-4000-8000-000000000102";
+const continuationTurnId = "00000000-0000-4000-8000-000000000103";
+const continuationTurnId2 = "00000000-0000-4000-8000-000000000104";
+const originTurnId = "00000000-0000-4000-8000-000000000105";
 const commandId = "desktop_command_1";
 let stateDir: string;
 let previousThread: string | undefined;
@@ -149,11 +152,81 @@ describe("Desktop execution result", () => {
   it("accepted exact delivery 走现有 receipt 路径且不调用 reconciliation", async () => {
     writeDesktopState();
     const reconcile = vi.spyOn(desktopIpc, "reconcileUnknown");
+    const ownership = vi.spyOn(desktopIpc, "currentResultOwnership");
 
     await expect(recordDesktopResult(workspace, input())).resolves.toMatchObject({
       record: { commandId },
     });
     expect(reconcile).not.toHaveBeenCalled();
+    expect(ownership).not.toHaveBeenCalled();
+  });
+
+  it("accepted origin 在 capacity-retry continuation tip 上只写一条 receipt，且 origin turn 不变", async () => {
+    writeDesktopState({ deliveries: [delivery({ turnId: originTurnId })] });
+    vi.mocked(desktopIpc.currentResultContext).mockResolvedValue(validResultContext({
+      runtimeStatus: "idle", resultTurnId: continuationTurnId, resultTurnStatus: "completed",
+    }));
+    const ownership = vi.spyOn(desktopIpc, "currentResultOwnership").mockResolvedValue({
+      ...validResultContext({ runtimeStatus: "idle", resultTurnId: continuationTurnId, resultTurnStatus: "completed" }),
+      ownership: "native_continuation", originTurnId, chainTurnIds: [originTurnId, continuationTurnId],
+      chainLength: 1, signature: "capacity_retry_automatic",
+    });
+
+    const result = await recordDesktopResult(workspace, input());
+
+    expect(result.record.commandId).toBe(commandId);
+    expect(ownership).toHaveBeenCalledTimes(2);
+    expect(readDesktop(workspace.id)?.deliveries[0]).toMatchObject({ deliveryStatus: "accepted", turnId: originTurnId });
+    expect(readExecutionRecords(workspace.id)).toHaveLength(1);
+    expect(listExecutionOutputs(workspace.id)).toHaveLength(1);
+  });
+
+  it("重复 native continuation chain 在 bounded limit 内可写 receipt", async () => {
+    writeDesktopState({ deliveries: [delivery({ turnId: originTurnId })] });
+    vi.mocked(desktopIpc.currentResultContext).mockResolvedValue(validResultContext({
+      runtimeStatus: "idle", resultTurnId: continuationTurnId2, resultTurnStatus: "completed",
+    }));
+    vi.spyOn(desktopIpc, "currentResultOwnership").mockResolvedValue({
+      ...validResultContext({ runtimeStatus: "idle", resultTurnId: continuationTurnId2, resultTurnStatus: "completed" }),
+      ownership: "native_continuation", originTurnId,
+      chainTurnIds: [originTurnId, continuationTurnId, continuationTurnId2], chainLength: 2,
+      signature: "capacity_retry_automatic",
+    });
+
+    await expect(recordDesktopResult(workspace, input())).resolves.toMatchObject({ record: { commandId } });
+    expect(readExecutionRecords(workspace.id)).toHaveLength(1);
+    expect(readDesktop(workspace.id)?.deliveries[0].turnId).toBe(originTurnId);
+  });
+
+  it("continuation tip 在第二次证明前漂移时不写 output/record", async () => {
+    writeDesktopState({ deliveries: [delivery({ turnId: originTurnId })] });
+    vi.mocked(desktopIpc.currentResultContext)
+      .mockResolvedValueOnce(validResultContext({ runtimeStatus: "idle", resultTurnId: continuationTurnId, resultTurnStatus: "completed" }))
+      .mockResolvedValue(validResultContext({ runtimeStatus: "idle", resultTurnId: continuationTurnId2, resultTurnStatus: "completed" }));
+    vi.spyOn(desktopIpc, "currentResultOwnership").mockResolvedValue({
+      ...validResultContext({ runtimeStatus: "idle", resultTurnId: continuationTurnId, resultTurnStatus: "completed" }),
+      ownership: "native_continuation", originTurnId, chainTurnIds: [originTurnId, continuationTurnId],
+      chainLength: 1, signature: "capacity_retry_automatic",
+    });
+
+    await expect(recordDesktopResult(workspace, input())).rejects.toMatchObject({ code: "DESKTOP_RESULT_CURRENT_EXECUTION" });
+    expect(readExecutionRecords(workspace.id)).toEqual([]);
+    expect(listExecutionOutputs(workspace.id)).toEqual([]);
+    expect(readDesktop(workspace.id)?.deliveries[0].turnId).toBe(originTurnId);
+  });
+
+  it.each(["ordinary successor", "wrong trigger", "user input successor"])("%s 无严格 attestation 时 fail closed", async () => {
+    writeDesktopState({ deliveries: [delivery({ turnId: originTurnId })] });
+    vi.mocked(desktopIpc.currentResultContext).mockResolvedValue(validResultContext({
+      runtimeStatus: "idle", resultTurnId: continuationTurnId, resultTurnStatus: "completed",
+    }));
+    vi.spyOn(desktopIpc, "currentResultOwnership").mockRejectedValue(
+      new DesktopError("DESKTOP_STATE_UNAVAILABLE", "continuation unavailable"),
+    );
+
+    await expect(recordDesktopResult(workspace, input())).rejects.toMatchObject({ code: "DESKTOP_RESULT_CURRENT_EXECUTION" });
+    expect(readExecutionRecords(workspace.id)).toEqual([]);
+    expect(listExecutionOutputs(workspace.id)).toEqual([]);
   });
 
   it("outcome_unknown 在当前 Desktop turn 唯一匹配时一次调用自助恢复并记录 receipt", async () => {

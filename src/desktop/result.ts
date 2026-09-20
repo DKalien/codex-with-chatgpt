@@ -7,7 +7,11 @@ import {
   withExecutionRecordsLockAsync,
   type StoredExecutionRecord,
 } from "../execution/records.js";
-import { desktopIpc, type DesktopResultContext } from "./ipc.js";
+import {
+  desktopIpc,
+  type DesktopResultContext,
+  type DesktopResultOwnership,
+} from "./ipc.js";
 import {
   DesktopError,
   desktopId,
@@ -93,12 +97,52 @@ function strictUuid(value: unknown): value is string {
 async function assertCurrentResultContext(
   workspace: DesktopResultWorkspace,
   accepted: DesktopDelivery,
-): Promise<DesktopResultContext> {
+): Promise<DesktopResultOwnership> {
   const context = await readCurrentResultContext(workspace, accepted.threadId);
-  if (context.threadId !== accepted.threadId || context.resultTurnId !== accepted.turnId) {
-    throw new DesktopResultError("DESKTOP_RESULT_CURRENT_EXECUTION", "当前 Desktop result context 与 accepted 投递的 thread、workspace 或 turn 不一致；拒绝记录执行结果。");
+  if (context.resultTurnId === accepted.turnId) {
+    return {
+      ...context,
+      ownership: "origin",
+      originTurnId: accepted.turnId,
+      chainTurnIds: [accepted.turnId],
+      chainLength: 0,
+      signature: null,
+    };
   }
-  return context;
+  if (!accepted.intent) {
+    throw new DesktopResultError("DESKTOP_RESULT_CURRENT_EXECUTION", "accepted 投递缺少 continuation 所需的 intent；拒绝记录执行结果。");
+  }
+  let ownership: DesktopResultOwnership;
+  try {
+    ownership = await desktopIpc.currentResultOwnership(workspace.root, {
+      workspaceId: workspace.id,
+      commandId: accepted.commandId,
+      intent: accepted.intent,
+      messageBytes: accepted.messageBytes,
+      messageSha256: accepted.messageSha256,
+      originTurnId: accepted.turnId!,
+    });
+  } catch {
+    // 当前 context 已经确认可用；continuation attestation 的任何失败都必须
+    // 保持 current-execution fail-closed，不能被 prior receipt 的 durable
+    // unavailable fallback 吞掉。
+    throw new DesktopResultError("DESKTOP_RESULT_CURRENT_EXECUTION", "无法严格证明当前 Desktop continuation 归属；拒绝记录执行结果。");
+  }
+  if (ownership.ownership !== "native_continuation" ||
+      ownership.threadId !== accepted.threadId || ownership.workspaceRoot !== workspace.root ||
+      ownership.originTurnId !== accepted.turnId || ownership.resultTurnId !== context.resultTurnId ||
+      ownership.chainTurnIds[0] !== accepted.turnId ||
+      ownership.chainTurnIds[ownership.chainTurnIds.length - 1] !== context.resultTurnId) {
+    throw new DesktopResultError("DESKTOP_RESULT_CURRENT_EXECUTION", "当前 Desktop continuation 归属或 result tip 不一致；拒绝记录执行结果。");
+  }
+  return ownership;
+}
+
+function sameOwnership(left: DesktopResultOwnership, right: DesktopResultOwnership): boolean {
+  return left.ownership === right.ownership && left.originTurnId === right.originTurnId &&
+    left.resultTurnId === right.resultTurnId && left.chainLength === right.chainLength &&
+    left.signature === right.signature &&
+    JSON.stringify(left.chainTurnIds) === JSON.stringify(right.chainTurnIds);
 }
 
 async function readCurrentResultContext(workspace: DesktopResultWorkspace, expectedThreadId: string): Promise<DesktopResultContext> {
@@ -193,8 +237,8 @@ function hasPartialOutput(workspaceId: string, taskId: string): boolean {
 /**
  * 记录已由 Desktop 接受的本次结果。
  *
- * 首次写入仍要求新鲜 current result context 与 accepted delivery 的 exact turn 对齐，
- * 不接受后续 turn 冒充。已落盘且 digest 完全一致的终态，在 Desktop context 暂时
+ * 首次写入仍要求新鲜 current result context 与 accepted origin 对齐，或由独立
+ * native continuation attestation 证明后继 tip；不接受任意后续 turn 冒充。已落盘且 digest 完全一致的终态，在 Desktop context 暂时
  * 不可用时可只读恢复——terminal truth 与 UI 窗口解耦，不因此永久丢失。
  * 若 context 可用且指向其他 turn，即使已有 prior 也 fail closed。
  */
@@ -245,7 +289,19 @@ export async function recordDesktopResult(
       return failClosed("DESKTOP_RESULT_PARTIAL", "已有未完成的 Desktop 结果输出但缺少执行记录；拒绝追加或覆盖，请人工核对。");
     }
 
-    await assertCurrentResultContext(workspace, acceptedNow);
+    const firstOwnership = await assertCurrentResultContext(workspace, acceptedNow);
+    if (firstOwnership.ownership === "native_continuation") {
+      // Continuation chain 只在第一次 output/record 写入前再次读取；exact
+      // origin 路径保持原有单次 current-result 校验。
+      const acceptedBeforeWrite = assertDesktopResultContext(workspace, input.commandId, threadId);
+      if (acceptedBeforeWrite.turnId !== acceptedNow.turnId) {
+        return failClosed("DESKTOP_RESULT_THREAD", "accepted Desktop 投递在记录期间发生变化；拒绝写入结果。");
+      }
+      const secondOwnership = await assertCurrentResultContext(workspace, acceptedBeforeWrite);
+      if (!sameOwnership(firstOwnership, secondOwnership)) {
+        return failClosed("DESKTOP_RESULT_CURRENT_EXECUTION", "Desktop continuation 在写入前发生漂移；拒绝写入结果。");
+      }
+    }
     // 输出先提交；若随后记录追加中断，下次会通过 taskId 发现孤立 output 并 fail closed。
     const output = input.output === undefined ? null : saveExecutionOutput(workspace.id, {
       command: input.command ?? `Desktop result ${input.commandId}`,

@@ -80,6 +80,20 @@ export interface DesktopResultContext extends DesktopTargetInfo {
   resultTurnStatus: DesktopResultTurnStatus;
 }
 
+export type DesktopResultOwnershipKind = "origin" | "native_continuation";
+
+export interface DesktopResultOwnershipExpectation extends DesktopUnknownReconcileExpectation {
+  originTurnId: string;
+}
+
+export interface DesktopResultOwnership extends DesktopResultContext {
+  ownership: DesktopResultOwnershipKind;
+  originTurnId: string;
+  chainTurnIds: string[];
+  chainLength: number;
+  signature: "capacity_retry_automatic" | null;
+}
+
 export interface DesktopUnknownReconcileExpectation {
   workspaceId: string;
   commandId: string;
@@ -95,6 +109,8 @@ export interface DesktopUnknownReconcileObservation {
   workspaceRoot: string;
   candidates: string[];
 }
+
+const MAX_RESULT_CONTINUATION_CHAIN = 8;
 
 export interface DesktopIpcConnection {
   send(message: string): Promise<{ threadId: string; turnId: string }>;
@@ -494,6 +510,63 @@ function validateResultContext(value: unknown, target: DesktopTarget): DesktopRe
   return { ...info, resultTurnId: input.resultTurnId, resultTurnStatus: input.resultTurnStatus as DesktopResultTurnStatus };
 }
 
+function validateResultOwnershipExpectation(value: DesktopResultOwnershipExpectation): DesktopResultOwnershipExpectation {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw error("DESKTOP_INVALID_REQUEST");
+  const keys = Object.keys(value).sort();
+  if (keys.join(",") !== ["commandId", "intent", "messageBytes", "messageSha256", "originTurnId", "workspaceId"].join(",")) {
+    throw error("DESKTOP_INVALID_REQUEST");
+  }
+  if (!/^[A-Za-z0-9_-]{1,128}$/u.test(value.workspaceId) || !/^[A-Za-z0-9_-]{1,128}$/u.test(value.commandId) ||
+      !["development_plan", "revision"].includes(value.intent) || !isUuid(value.originTurnId) ||
+      !Number.isSafeInteger(value.messageBytes) || value.messageBytes < 1 || value.messageBytes > MAX_MESSAGE_BYTES ||
+      !/^[a-f0-9]{64}$/u.test(value.messageSha256)) {
+    throw error("DESKTOP_INVALID_REQUEST");
+  }
+  return { ...value };
+}
+
+function validateResultOwnership(value: unknown, target: DesktopTarget): DesktopResultOwnership {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw error("DESKTOP_PROTOCOL_ERROR");
+  const input = value as Record<string, unknown>;
+  const allowed = new Set([
+    "threadId", "hostId", "projectId", "workspaceRoot", "title", "cwd", "workspaceKind", "resumeState",
+    "runtimeStatus", "requestsCount", "desktopVersion", "appServerVersion", "profile", "ownerClientId",
+    "resultTurnId", "resultTurnStatus", "ownership", "originTurnId", "chainTurnIds", "chainLength", "signature",
+  ]);
+  if (Object.keys(input).some(key => !allowed.has(key))) throw error("DESKTOP_PROTOCOL_ERROR");
+  const context = validateResultContext(value, target);
+  const ownership = input.ownership;
+  const originTurnId = input.originTurnId;
+  const chainTurnIds = input.chainTurnIds;
+  const chainLength = input.chainLength;
+  const signature = input.signature;
+  if (ownership !== "origin" && ownership !== "native_continuation") throw error("DESKTOP_PROTOCOL_ERROR");
+  if (!isUuid(originTurnId) || !Array.isArray(chainTurnIds) ||
+      chainTurnIds.length < 1 || chainTurnIds.length > MAX_RESULT_CONTINUATION_CHAIN + 1 ||
+      !chainTurnIds.every(isUuid) || new Set(chainTurnIds).size !== chainTurnIds.length ||
+      typeof chainLength !== "number" || !Number.isSafeInteger(chainLength) ||
+      chainLength < 0 || chainLength > MAX_RESULT_CONTINUATION_CHAIN ||
+      chainLength !== chainTurnIds.length - 1 || chainTurnIds[0] !== originTurnId ||
+      chainTurnIds[chainTurnIds.length - 1] !== context.resultTurnId) {
+    throw error("DESKTOP_PROTOCOL_ERROR");
+  }
+  if (ownership === "origin") {
+    if (chainLength !== 0 || signature !== null || context.resultTurnId !== originTurnId) {
+      throw error("DESKTOP_PROTOCOL_ERROR");
+    }
+  } else if (chainLength < 1 || signature !== "capacity_retry_automatic" || context.resultTurnId === originTurnId) {
+    throw error("DESKTOP_PROTOCOL_ERROR");
+  }
+  return {
+    ...context,
+    ownership,
+    originTurnId,
+    chainTurnIds: [...chainTurnIds],
+    chainLength,
+    signature,
+  };
+}
+
 function validateUnknownReconcileExpectation(value: DesktopUnknownReconcileExpectation): DesktopUnknownReconcileExpectation {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw error("DESKTOP_INVALID_REQUEST");
   const keys = Object.keys(value).sort();
@@ -743,6 +816,17 @@ export class DesktopIpcClient {
     return this.currentOperation("current_result_context", workspaceRoot, validateResultContext) as Promise<DesktopResultContext>;
   }
 
+  /** 当前 result turn 对 accepted origin 的严格归属证明；只读且要求当前 runner 身份。 */
+  async currentResultOwnership(
+    workspaceRoot: string,
+    rawExpectation: DesktopResultOwnershipExpectation,
+  ): Promise<DesktopResultOwnership> {
+    const expectation = validateResultOwnershipExpectation(rawExpectation);
+    const value = await this.currentOperation("current_result_ownership", workspaceRoot, validateResultOwnership, { expectation }) as unknown as DesktopResultOwnership;
+    if (value.originTurnId !== expectation.originTurnId) throw error("DESKTOP_RECONCILIATION_CONFLICT");
+    return value as DesktopResultOwnership;
+  }
+
   async confirmCurrent(workspaceRoot: string): Promise<DesktopTargetInfo> {
     return this.currentOperation("current_confirm", workspaceRoot);
   }
@@ -761,14 +845,15 @@ export class DesktopIpcClient {
   }
 
   private async currentOperation(operation: string, workspaceRoot: string,
-    validate: (value: unknown, target: DesktopTarget) => DesktopTargetInfo = validateInfo): Promise<DesktopTargetInfo> {
+    validate: (value: unknown, target: DesktopTarget) => DesktopTargetInfo = validateInfo,
+    extra: Record<string, unknown> = {}): Promise<DesktopTargetInfo> {
     const threadId = process.env.CODEX_THREAD_ID;
     if (!isUuid(threadId) || (process.env.CODEX_SESSION_ID && process.env.CODEX_SESSION_ID !== threadId) ||
       typeof workspaceRoot !== "string" || !workspaceRoot.trim()) throw error("DESKTOP_CURRENT_CONTEXT_INVALID");
     const session = this.open();
     try {
       // 不传 thread/project/host：helper 从继承的当前 Agent 上下文和 Desktop 映射精确解析。
-      const value = await session.request<DesktopTargetInfo>(operation, { workspaceRoot });
+      const value = await session.request<DesktopTargetInfo>(operation, { workspaceRoot, ...extra });
       const target = validateTarget({ threadId, hostId: "local", projectId: value?.projectId, workspaceRoot });
       return validate(value, target);
     } finally { session.close(); }

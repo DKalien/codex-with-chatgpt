@@ -58,6 +58,7 @@ class DesktopIpcHelperTests(unittest.TestCase):
         }
         text = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
         state = self.valid_state()
+        state["title"] = "synthetic Desktop result"
         state.pop("turns")
         state["turnHistory"] = {"kind": "canonical", "history": {
             "islands": [{"entries": [{"value": "turn-1"}], "newerBoundary": {"status": "exhausted"}}],
@@ -71,6 +72,75 @@ class DesktopIpcHelperTests(unittest.TestCase):
                     "messageBytes": len(message.encode("utf-8")),
                     "messageSha256": hashlib.sha256(message.encode("utf-8")).hexdigest()}
         return state, expected
+
+    def ownership_fixture(self, *, hops: int = 1, trigger: str = "capacity_retry_automatic",
+                          user_input_on_successor: bool = False, exhausted: bool = True) -> tuple[dict[str, object], dict[str, object], list[str]]:
+        message = "synthetic P0.6 origin"
+        envelope = {
+            "type": "C2C_DESKTOP_TASK", "version": 1, "workspaceId": "workspace_test",
+            "commandId": "command_test", "intent": "development_plan", "message": message,
+        }
+        text = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+        ids = [f"01a00000-0000-7000-8000-{index:012d}" for index in range(100, 100 + hops + 1)]
+        turns: dict[str, object] = {}
+        entries: list[dict[str, str]] = []
+        for index, turn_id in enumerate(ids):
+            key = f"turn-{index}"
+            entries.append({"value": key})
+            if index == 0:
+                turns[key] = {
+                    "turnId": turn_id, "status": "failed",
+                    "params": {"threadId": THREAD, "input": [{"type": "text", "text": text, "text_elements": []}]},
+                    "items": [{"type": "userMessage", "content": [{"type": "text", "text": text, "text_elements": []}]}],
+                }
+            else:
+                params: dict[str, object] = {"threadId": THREAD, "turnTrigger": trigger}
+                items: list[dict[str, object]] = [{"type": "agentMessage"}]
+                if user_input_on_successor and index == 1:
+                    params["input"] = [{"type": "text", "text": "ordinary user input", "text_elements": []}]
+                    items = [{"type": "userMessage", "content": params["input"]}]
+                turns[key] = {
+                    "turnId": turn_id, "status": "completed" if index == hops else "failed",
+                    "params": params, "items": items,
+                }
+        state = self.valid_state()
+        state["title"] = "synthetic Desktop result"
+        state["threadRuntimeStatus"] = {"type": "idle"}
+        state.pop("turns")
+        state["turnHistory"] = {"kind": "canonical", "history": {
+            "islands": [{"entries": entries, "newerBoundary": {"status": "exhausted" if exhausted else "loading"}}],
+            "entitiesByKey": turns,
+        }}
+        expected = {
+            "workspaceId": "workspace_test", "commandId": "command_test", "intent": "development_plan",
+            "messageBytes": len(message.encode("utf-8")), "messageSha256": hashlib.sha256(message.encode("utf-8")).hexdigest(),
+            "originTurnId": ids[0],
+        }
+        return state, expected, ids
+
+    def ownership_session(self, state: dict[str, object]):
+        class Client:
+            owner = OWNER
+            snapshot_serial = 1
+
+            def drain(self, _seconds: float) -> None:
+                pass
+
+            def current_state(self) -> dict[str, object]:
+                return state
+
+            def snapshot_age(self) -> float:
+                return 0.0
+
+        class Session:
+            pipe = Mock()
+            runtime: dict[str, object] = {"desktopVersion": "26.903.9818.0", "appServerVersion": "0.153.4"}
+            client = Client()
+
+            def close(self) -> None:
+                pass
+
+        return Session()
 
     def test_reconcile_unknown_requires_one_exact_envelope_and_hash(self) -> None:
         state, expected = self.reconcile_fixture()
@@ -132,6 +202,129 @@ class DesktopIpcHelperTests(unittest.TestCase):
         self.assert_code("DESKTOP_TARGET_NOT_FOUND", lambda: helper._validate_state(wrong_thread, TARGET, OWNER, allow_active=True))
         wrong_root = dict(state, cwd=r"D:\other-workspace")
         self.assert_code("DESKTOP_PROJECT_MISMATCH", lambda: helper._validate_state(wrong_root, TARGET, OWNER, allow_active=True))
+
+    def test_current_result_ownership_accepts_native_capacity_retry_chain(self) -> None:
+        state, expected, ids = self.ownership_fixture()
+        with patch.object(helper, "_current_target", return_value=TARGET), \
+                patch.object(helper, "_prepare", return_value=(self.ownership_session(state), {})) as prepare, \
+                patch.object(helper, "_verify_runtime"), patch.object(helper, "_verify_current_runner_ancestor"):
+            result = helper._current_result_ownership(TARGET["workspaceRoot"], expected)
+        prepare.assert_called_once_with(TARGET, allow_active=True, require_runner_ancestor=True)
+        self.assertEqual(result["ownership"], "native_continuation")
+        self.assertEqual(result["originTurnId"], ids[0])
+        self.assertEqual(result["resultTurnId"], ids[-1])
+        self.assertEqual(result["chainTurnIds"], ids)
+        self.assertEqual(result["chainLength"], 1)
+        self.assertEqual(result["signature"], "capacity_retry_automatic")
+        self.assertNotIn("message", result)
+        self.assertNotIn("history", result)
+
+    def test_current_result_ownership_rejects_cross_island_chain(self) -> None:
+        state, expected, _ = self.ownership_fixture()
+        history = state["turnHistory"]["history"]  # type: ignore[index]
+        history["islands"] = [  # type: ignore[index]
+            {"entries": [{"value": "turn-0"}], "newerBoundary": {"status": "exhausted"}},
+            {"entries": [{"value": "turn-1"}], "newerBoundary": {"status": "exhausted"}},
+        ]
+        with patch.object(helper, "_current_target", return_value=TARGET), \
+                patch.object(helper, "_prepare", return_value=(self.ownership_session(state), {})), \
+                patch.object(helper, "_verify_runtime"), patch.object(helper, "_verify_current_runner_ancestor"):
+            self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: helper._current_result_ownership(TARGET["workspaceRoot"], expected))
+
+    def test_current_result_ownership_allows_unrelated_island_before_same_island_chain(self) -> None:
+        state, expected, ids = self.ownership_fixture()
+        history = state["turnHistory"]["history"]  # type: ignore[index]
+        history["entitiesByKey"]["unrelated"] = {  # type: ignore[index]
+            "turnId": "01a00000-0000-7000-8000-000000000099", "status": "completed", "params": {}, "items": [],
+        }
+        history["islands"] = [  # type: ignore[index]
+            {"entries": [{"value": "unrelated"}], "newerBoundary": {"status": "exhausted"}},
+            {"entries": [{"value": "turn-0"}, {"value": "turn-1"}], "newerBoundary": {"status": "exhausted"}},
+        ]
+        with patch.object(helper, "_current_target", return_value=TARGET), \
+                patch.object(helper, "_prepare", return_value=(self.ownership_session(state), {})), \
+                patch.object(helper, "_verify_runtime"), patch.object(helper, "_verify_current_runner_ancestor"):
+            result = helper._current_result_ownership(TARGET["workspaceRoot"], expected)
+        self.assertEqual(result["chainTurnIds"], ids)
+
+    def test_current_result_ownership_accepts_in_progress_native_tip(self) -> None:
+        state, expected, ids = self.ownership_fixture()
+        state["threadRuntimeStatus"] = {"type": "inProgress"}
+        state["turnHistory"]["history"]["entitiesByKey"]["turn-1"]["status"] = "inProgress"  # type: ignore[index]
+        with patch.object(helper, "_current_target", return_value=TARGET), \
+                patch.object(helper, "_prepare", return_value=(self.ownership_session(state), {})), \
+                patch.object(helper, "_verify_runtime"), patch.object(helper, "_verify_current_runner_ancestor"):
+            result = helper._current_result_ownership(TARGET["workspaceRoot"], expected)
+        self.assertEqual(result["resultTurnId"], ids[-1])
+        self.assertEqual(result["resultTurnStatus"], "inProgress")
+
+    def test_current_result_ownership_keeps_exact_origin_without_chain(self) -> None:
+        state, expected, ids = self.ownership_fixture(hops=0)
+        with patch.object(helper, "_current_target", return_value=TARGET), \
+                patch.object(helper, "_prepare", return_value=(self.ownership_session(state), {})), \
+                patch.object(helper, "_verify_runtime"), patch.object(helper, "_verify_current_runner_ancestor"):
+            result = helper._current_result_ownership(TARGET["workspaceRoot"], expected)
+        self.assertEqual(result["ownership"], "origin")
+        self.assertEqual(result["chainTurnIds"], ids)
+        self.assertEqual(result["chainLength"], 0)
+        self.assertIsNone(result["signature"])
+
+    def test_current_result_ownership_rejects_non_native_or_user_successors(self) -> None:
+        for name, kwargs in {
+            "wrong_trigger": {"trigger": "manual_continue"},
+            "user_input": {"user_input_on_successor": True},
+            "incomplete_history": {"exhausted": False},
+        }.items():
+            with self.subTest(case=name):
+                state, expected, _ = self.ownership_fixture(**kwargs)
+                with patch.object(helper, "_current_target", return_value=TARGET), \
+                        patch.object(helper, "_prepare", return_value=(self.ownership_session(state), {})), \
+                        patch.object(helper, "_verify_runtime"), patch.object(helper, "_verify_current_runner_ancestor"):
+                    self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: helper._current_result_ownership(TARGET["workspaceRoot"], expected))
+
+    def test_current_result_ownership_rejects_malformed_zero_input_proof(self) -> None:
+        for malformed_input in (None, {"type": "text"}, [{"type": "text", "text": "unexpected"}]):
+            state, expected, _ = self.ownership_fixture()
+            successor = state["turnHistory"]["history"]["entitiesByKey"]["turn-1"]  # type: ignore[index]
+            successor["params"]["input"] = malformed_input  # type: ignore[index]
+            with self.subTest(malformed_input=malformed_input), \
+                    patch.object(helper, "_current_target", return_value=TARGET), \
+                    patch.object(helper, "_prepare", return_value=(self.ownership_session(state), {})), \
+                    patch.object(helper, "_verify_runtime"), patch.object(helper, "_verify_current_runner_ancestor"):
+                self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: helper._current_result_ownership(TARGET["workspaceRoot"], expected))
+
+        state, expected, _ = self.ownership_fixture()
+        successor = state["turnHistory"]["history"]["entitiesByKey"]["turn-1"]  # type: ignore[index]
+        successor["items"].append("malformed")  # type: ignore[index]
+        with patch.object(helper, "_current_target", return_value=TARGET), \
+                patch.object(helper, "_prepare", return_value=(self.ownership_session(state), {})), \
+                patch.object(helper, "_verify_runtime"), patch.object(helper, "_verify_current_runner_ancestor"):
+            self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: helper._current_result_ownership(TARGET["workspaceRoot"], expected))
+
+    def test_current_result_ownership_accepts_valid_agent_and_tool_items_without_input(self) -> None:
+        state, expected, ids = self.ownership_fixture()
+        successor = state["turnHistory"]["history"]["entitiesByKey"]["turn-1"]  # type: ignore[index]
+        successor["items"] = [{"type": "agentMessage"}, {"type": "toolResult"}]  # type: ignore[index]
+        with patch.object(helper, "_current_target", return_value=TARGET), \
+                patch.object(helper, "_prepare", return_value=(self.ownership_session(state), {})), \
+                patch.object(helper, "_verify_runtime"), patch.object(helper, "_verify_current_runner_ancestor"):
+            result = helper._current_result_ownership(TARGET["workspaceRoot"], expected)
+        self.assertEqual(result["chainTurnIds"], ids)
+
+    def test_current_result_ownership_supports_bounded_repeated_chain_and_rejects_overflow(self) -> None:
+        state, expected, ids = self.ownership_fixture(hops=3)
+        with patch.object(helper, "_current_target", return_value=TARGET), \
+                patch.object(helper, "_prepare", return_value=(self.ownership_session(state), {})), \
+                patch.object(helper, "_verify_runtime"), patch.object(helper, "_verify_current_runner_ancestor"):
+            result = helper._current_result_ownership(TARGET["workspaceRoot"], expected)
+        self.assertEqual(result["chainTurnIds"], ids)
+        self.assertEqual(result["chainLength"], 3)
+
+        state, expected, _ = self.ownership_fixture(hops=9)
+        with patch.object(helper, "_current_target", return_value=TARGET), \
+                patch.object(helper, "_prepare", return_value=(self.ownership_session(state), {})), \
+                patch.object(helper, "_verify_runtime"), patch.object(helper, "_verify_current_runner_ancestor"):
+            self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: helper._current_result_ownership(TARGET["workspaceRoot"], expected))
 
     def test_target_accepts_uuidv7_and_rejects_extra_fields(self) -> None:
         self.assertEqual(helper._target(dict(TARGET)), TARGET)

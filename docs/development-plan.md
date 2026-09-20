@@ -788,3 +788,18 @@ G3 修复 Browser Companion 误绑错误 ChatGPT conversation 后 production Sen
 - current Chat 的 request-scoped MCP principal confirmation 仍是必需步骤；wrong principal 不消费 challenge。确认后 exact owner heartbeat 最多发起一次 `/rebind/complete`，fresh credential 安装后 authenticated `/state` 仍是 `VERIFIED` 唯一权威。
 - Pair/Rebind/Complete/Clear 共用 SW transport mutation gate，防止异步 Bridge 返回覆盖更新后的 transport。Browser restart 只允许 exact owner 对 durable `DONE + OBSERVED_PENDING_CONFIRM` 做只读 `/state` 收敛，不重复 complete 或 DOM Send。
 - 无 eligible predecessor 时返回 bounded `cold_pair_required`，继续使用现有手工 cold-pair fallback。Bridge permission 缺失时明确返回 `bridge_permission_missing`；Connect 不请求 permission、不 Arm、不触发 production feedback 操作。
+
+### P0.6 — Desktop capacity-retry continuation receipt ownership（已实现，待独立 Review）
+
+- forensic 已确认本机平台的原始 accepted failed turn 后继为零 canonical user input、
+  `params.turnTrigger=capacity_retry_automatic` 的机器生成 turn；没有普通 continuation 文本。
+- P0.6 保持 immutable origin `delivery.turnId`，每次首次写 receipt 重新读取 canonical、完整、
+  newest-boundary exhausted 的历史，并以严格 UUID、同 workspace/thread/project、精确 C2C envelope
+  bytes/SHA、同一 canonical island 内的紧邻 successor 和 bounded chain 证明当前 result tip 的归属；
+  island 边界与无法证明为字典且无用户输入的 successor item 均 fail closed。
+- 任意普通 `failed`、同线程/时间相邻、summary/hash、未知 trigger、插入新的 C2C/user turn、
+  malformed/duplicate/incomplete history 均不可续接；只有明确 allowlisted 的 machine retry relation
+  才能把 predecessor 视为可继续状态。重启不保存或猜测 continuation tip，而是重新 attestation。
+- `outcome_unknown` 仍只恢复原始 envelope 的 accepted origin；P0.5 的 receipt-backed busy-tail settle
+  仍只服务新 send，两者不改变彼此的 fail-closed 语义。P0.6 不新增 MCP 工具、不公开链内部、
+  不重发 Desktop task、不产生第二条 receipt。

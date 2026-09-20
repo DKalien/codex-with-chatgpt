@@ -1,8 +1,8 @@
 """Codex Desktop Control 的受控 Windows IPC helper。
 
 这个程序只接受 stdin 上的固定操作：``inspect``、``prepare``、``send``、
-``reconcile_unknown``、``compatibility``、``compatibility_audit``、``current_identity``、``current_confirm``、``current_execution`` 和
-``current_result_context``。其中 ``current_*`` 只接受
+``reconcile_unknown``、``compatibility``、``compatibility_audit``、``current_identity``、``current_confirm``、``current_execution``、
+``current_result_context`` 和 ``current_result_ownership``。其中 ``current_*`` 只接受
 顶层 ``workspaceRoot``，从继承的当前 Agent 环境解析 thread/project/host；
 它不会接受 stdin 提供的目标身份，也不会执行 stdin 提供的命令或启动
 Desktop、router、app-server。named pipe 帧与请求版本来自
@@ -42,6 +42,7 @@ DISCOVERY_TIMEOUT_SECONDS = 5.0
 SNAPSHOT_TIMEOUT_SECONDS = 5.0
 SEND_TIMEOUT_SECONDS = 30.0
 MAX_OBSERVATION_AGE_SECONDS = 2.0
+MAX_RESULT_OWNERSHIP_CHAIN = 8
 MIN_PYTHON_VERSION = (3, 11)
 COMPATIBILITY_STATUSES = {"current", "unverified", "incompatible"}
 COMPATIBILITY_AUDIT_CLASSIFICATIONS = {
@@ -2210,6 +2211,42 @@ def _complete_result_turns(state: dict[str, Any]) -> list[dict[str, Any]]:
             if key in seen_keys or turn_id is None or turn_id in seen_ids or item.get("status") not in _RESULT_KNOWN_STATUSES: raise _error("DESKTOP_STATE_UNAVAILABLE")
             seen_keys.add(key); seen_ids.add(turn_id); turns.append(item)
     return turns
+
+
+def _ownership_island_turns(state: dict[str, Any], origin_id: str, result_id: str) -> list[dict[str, Any]]:
+    """Return one canonical island for an ownership proof; never bridge islands."""
+    # Reuse the existing strict parser for global canonical completeness,
+    # unique keys/turn IDs, and known statuses before preserving island edges.
+    _complete_result_turns(state)
+    history = state.get("turnHistory")
+    body = history.get("history") if isinstance(history, dict) else None
+    islands = body.get("islands") if isinstance(body, dict) else None
+    entities = body.get("entitiesByKey") if isinstance(body, dict) else None
+    if not isinstance(islands, list) or not isinstance(entities, dict):
+        raise _error("DESKTOP_STATE_UNAVAILABLE")
+    matches: list[list[dict[str, Any]]] = []
+    for island in islands:
+        entries = island.get("entries") if isinstance(island, dict) else None
+        boundary = island.get("newerBoundary") if isinstance(island, dict) else None
+        if not isinstance(entries, list) or not isinstance(boundary, dict):
+            raise _error("DESKTOP_STATE_UNAVAILABLE")
+        island_turns: list[dict[str, Any]] = []
+        for entry in entries:
+            key = entry.get("value") if isinstance(entry, dict) else None
+            item = entities.get(key) if isinstance(key, str) else None
+            if not isinstance(item, dict):
+                raise _error("DESKTOP_STATE_UNAVAILABLE")
+            island_turns.append(item)
+        ids = {turn.get("turnId") for turn in island_turns}
+        if origin_id in ids or result_id in ids:
+            if origin_id not in ids or result_id not in ids or boundary.get("status") != "exhausted":
+                raise _error("DESKTOP_STATE_UNAVAILABLE")
+            matches.append(island_turns)
+    if len(matches) != 1:
+        raise _error("DESKTOP_STATE_UNAVAILABLE")
+    return matches[0]
+
+
 def _result_turn_context(state: dict[str, Any]) -> tuple[str, str]:
     runtime = state.get("threadRuntimeStatus")
     runtime_type = runtime.get("type") if isinstance(runtime, dict) else None
@@ -2309,6 +2346,152 @@ def _current_result_context(workspace_root: Any) -> dict[str, Any]:
         session.close()
 
 
+_NATIVE_CONTINUATION_TRIGGER = "capacity_retry_automatic"
+
+
+def _continuation_expectation(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {
+        "workspaceId", "commandId", "intent", "messageBytes", "messageSha256", "originTurnId"
+    }:
+        raise _error("DESKTOP_INVALID_REQUEST")
+    base = {key: value[key] for key in ("workspaceId", "commandId", "intent", "messageBytes", "messageSha256")}
+    result = _reconcile_expectation(base)
+    origin_turn_id = _uuid(value.get("originTurnId"))
+    if origin_turn_id is None:
+        raise _error("DESKTOP_INVALID_REQUEST")
+    result["originTurnId"] = origin_turn_id
+    return result
+
+
+def _origin_matches_expectation(turn: dict[str, Any], expectation: dict[str, Any], target: dict[str, str]) -> None:
+    text = _turn_text_for_reconciliation(turn)
+    if text is None:
+        raise _error("DESKTOP_STATE_UNAVAILABLE")
+    try:
+        envelope = json.loads(text, object_pairs_hook=_strict_json_object)
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        raise _error("DESKTOP_STATE_UNAVAILABLE")
+    if (not isinstance(envelope, dict) or
+            set(envelope) != {"type", "version", "workspaceId", "commandId", "intent", "message"} or
+            envelope.get("type") != "C2C_DESKTOP_TASK" or envelope.get("version") != 1 or
+            envelope.get("workspaceId") != expectation["workspaceId"] or
+            envelope.get("commandId") != expectation["commandId"] or
+            envelope.get("intent") != expectation["intent"] or
+            not isinstance(envelope.get("message"), str)):
+        raise _error("DESKTOP_STATE_UNAVAILABLE")
+    message = envelope["message"]
+    message_bytes = len(message.encode("utf-8", "strict"))
+    message_sha256 = hashlib.sha256(message.encode("utf-8", "strict")).hexdigest()
+    if message_bytes != expectation["messageBytes"] or message_sha256 != expectation["messageSha256"]:
+        raise _error("DESKTOP_STATE_UNAVAILABLE")
+    params = turn.get("params")
+    if isinstance(params, dict) and params.get("threadId") not in {None, target["threadId"]}:
+        raise _error("DESKTOP_TARGET_NOT_FOUND")
+
+
+def _native_successor(turn: dict[str, Any], target: dict[str, str]) -> None:
+    params = turn.get("params")
+    items = turn.get("items")
+    if not isinstance(params, dict) or not isinstance(items, list):
+        raise _error("DESKTOP_STATE_UNAVAILABLE")
+    raw_input = params.get("input")
+    if params.get("turnTrigger") != _NATIVE_CONTINUATION_TRIGGER or (
+            "input" in params and (not isinstance(raw_input, list) or raw_input)):
+        raise _error("DESKTOP_STATE_UNAVAILABLE")
+    if params.get("threadId") not in {None, target["threadId"]}:
+        raise _error("DESKTOP_TARGET_NOT_FOUND")
+    if any(not isinstance(item, dict) for item in items):
+        raise _error("DESKTOP_STATE_UNAVAILABLE")
+    if any(item.get("type") == "userMessage" for item in items):
+        raise _error("DESKTOP_STATE_UNAVAILABLE")
+
+
+def _current_result_ownership(workspace_root: Any, expectation_value: Any) -> dict[str, Any]:
+    target = _current_target(workspace_root)
+    expectation = _continuation_expectation(expectation_value)
+    session, _ = _prepare(target, allow_active=True, require_runner_ancestor=True)
+    try:
+        session.client.drain(0.1)
+        state = session.client.current_state()
+        if state is None or session.client.snapshot_age() > MAX_OBSERVATION_AGE_SECONDS:
+            raise _error("DESKTOP_STATE_UNAVAILABLE")
+        _validate_state(state, target, session.client.owner or "", allow_active=True)
+        freshness_deadline = time.monotonic() + SNAPSHOT_TIMEOUT_SECONDS
+        _verify_runtime(session.pipe, target, session.runtime)
+        _verify_current_runner_ancestor(session.runtime)
+        if session.client.snapshot_age() > MAX_OBSERVATION_AGE_SECONDS:
+            if time.monotonic() >= freshness_deadline:
+                raise _error("DESKTOP_STATE_UNAVAILABLE")
+            session.pipe.verify_server()
+            previous_serial = session.client.snapshot_serial
+            state = session.client.snapshot()
+            if session.client.snapshot_serial <= previous_serial:
+                raise _error("DESKTOP_STATE_UNAVAILABLE")
+            _verify_runtime(session.pipe, target, session.runtime)
+            _verify_current_runner_ancestor(session.runtime)
+            if time.monotonic() >= freshness_deadline or session.client.snapshot_age() > MAX_OBSERVATION_AGE_SECONDS:
+                raise _error("DESKTOP_STATE_UNAVAILABLE")
+            _validate_state(state, target, session.client.owner or "", allow_active=True)
+
+        all_turns = _complete_result_turns(state)
+        ids = [turn.get("turnId") for turn in all_turns]
+        origin_id = expectation["originTurnId"]
+        origin_indices = [index for index, turn_id in enumerate(ids) if turn_id == origin_id]
+        if len(origin_indices) != 1:
+            raise _error("DESKTOP_STATE_UNAVAILABLE")
+        _origin_matches_expectation(all_turns[origin_indices[0]], expectation, target)
+        result_id, result_status = _result_turn_context(state)
+        turns = _ownership_island_turns(state, origin_id, result_id)
+        ids = [turn.get("turnId") for turn in turns]
+        origin_indices = [index for index, turn_id in enumerate(ids) if turn_id == origin_id]
+        result_indices = [index for index, turn_id in enumerate(ids) if turn_id == result_id]
+        if len(origin_indices) != 1 or len(result_indices) != 1:
+            raise _error("DESKTOP_STATE_UNAVAILABLE")
+        origin_index = origin_indices[0]
+        result_index = result_indices[0]
+        if result_index < origin_index:
+            raise _error("DESKTOP_STATE_UNAVAILABLE")
+        if result_index == origin_index:
+            return {
+                **_public_info(state, target, session.runtime, session.client),
+                "resultTurnId": result_id,
+                "resultTurnStatus": result_status,
+                "ownership": "origin",
+                "originTurnId": origin_id,
+                "chainTurnIds": [origin_id],
+                "chainLength": 0,
+                "signature": None,
+            }
+        chain_length = result_index - origin_index
+        if chain_length > MAX_RESULT_OWNERSHIP_CHAIN:
+            raise _error("DESKTOP_STATE_UNAVAILABLE")
+        chain = [origin_id]
+        for index in range(origin_index, result_index):
+            predecessor = turns[index]
+            successor = turns[index + 1]
+            if predecessor.get("status") not in {"failed", "interrupted"}:
+                raise _error("DESKTOP_STATE_UNAVAILABLE")
+            successor_id = _uuid(successor.get("turnId"))
+            if successor_id is None:
+                raise _error("DESKTOP_STATE_UNAVAILABLE")
+            _native_successor(successor, target)
+            chain.append(successor_id)
+        if chain[-1] != result_id:
+            raise _error("DESKTOP_STATE_UNAVAILABLE")
+        return {
+            **_public_info(state, target, session.runtime, session.client),
+            "resultTurnId": result_id,
+            "resultTurnStatus": result_status,
+            "ownership": "native_continuation",
+            "originTurnId": origin_id,
+            "chainTurnIds": chain,
+            "chainLength": chain_length,
+            "signature": _NATIVE_CONTINUATION_TRIGGER,
+        }
+    finally:
+        session.close()
+
+
 def _current_confirm(workspace_root: Any) -> dict[str, Any]:
     before, before_runtime = _current_identity_checked(workspace_root)
     try:
@@ -2374,6 +2557,11 @@ def _main() -> int:
                     raise _error("DESKTOP_INVALID_REQUEST")
                 target = _target(request.get("target"))
                 _reply({"id": request_id, "ok": True, "value": _inspect_active_execution(target)})
+            elif op == "current_result_ownership":
+                if set(request) != {"id", "op", "workspaceRoot", "expectation"} or prepared is not None:
+                    raise _error("DESKTOP_INVALID_REQUEST")
+                _reply({"id": request_id, "ok": True,
+                        "value": _current_result_ownership(request.get("workspaceRoot"), request.get("expectation"))})
             elif op in {"current_identity", "current_confirm", "current_execution", "current_result_context"}:
                 if set(request) != {"id", "op", "workspaceRoot"} or prepared is not None:
                     raise _error("DESKTOP_INVALID_REQUEST")

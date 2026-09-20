@@ -261,6 +261,45 @@ describe("Desktop IPC wrapper（fake helper）", () => {
     }
   });
 
+  it("currentResultOwnership 只传当前 workspace + exact expectation，并严格验证 native chain", async () => {
+    vi.stubEnv("CODEX_THREAD_ID", target.threadId); vi.stubEnv("CODEX_SESSION_ID", target.threadId);
+    const originTurnId = "01a00000-0000-7000-8000-000000000004";
+    const resultTurnId = "01a00000-0000-7000-8000-000000000005";
+    const expectation = {
+      workspaceId: "workspace_test", commandId: "command_test", intent: "development_plan" as const,
+      messageBytes: 10, messageSha256: "a".repeat(64), originTurnId,
+    };
+    const value = {
+      ...target, title: "结果会话", cwd: target.workspaceRoot, runtimeStatus: "active",
+      resultTurnId, resultTurnStatus: "inProgress", ownership: "native_continuation",
+      originTurnId, chainTurnIds: [originTurnId, resultTurnId], chainLength: 1,
+      signature: "capacity_retry_automatic",
+    };
+    const fake = fakeSpawner(request => request.op === "current_result_ownership"
+      ? { ok: true, value }
+      : { ok: true, value: { ...target, title: "Fake Desktop 会话", cwd: target.workspaceRoot, runtimeStatus: "idle" } });
+    const result = await makeClient(fake.spawnImpl).currentResultOwnership(target.workspaceRoot, expectation);
+    expect(result).toMatchObject({ ownership: "native_continuation", originTurnId, resultTurnId, chainLength: 1 });
+    expect(fake.requests).toHaveLength(1);
+    expect(Object.keys(fake.requests[0]).sort()).toEqual(["expectation", "id", "op", "workspaceRoot"]);
+    expect(fake.requests[0]).toMatchObject({ op: "current_result_ownership", workspaceRoot: target.workspaceRoot, expectation });
+
+    for (const broken of [
+      { ...value, chainTurnIds: [originTurnId], chainLength: 0 },
+      { ...value, signature: "wrong" },
+      { ...value, resultTurnId: randomUUID() },
+      { ...value, runtimeStatus: "idle", resultTurnStatus: "inProgress" },
+      { ...value, threadId: randomUUID() },
+    ]) {
+      const invalid = fakeSpawner(request => request.op === "current_result_ownership"
+        ? { ok: true, value: broken }
+        : { ok: true, value: { ...target, title: "Fake Desktop 会话", cwd: target.workspaceRoot, runtimeStatus: "idle" } });
+      await expect(makeClient(invalid.spawnImpl).currentResultOwnership(target.workspaceRoot, expectation))
+        .rejects.toMatchObject({ code: expect.stringMatching(/DESKTOP_(PROTOCOL_ERROR|STATE_UNAVAILABLE|TARGET_NOT_FOUND|RECONCILIATION_CONFLICT)/) });
+    }
+    vi.unstubAllEnvs();
+  });
+
   it("compatibility_audit 独立只发送 id/op，并严格投影 allowlist 字段", async () => {
     const expected = {
       observedDesktopVersion: "26.908.9136.0",

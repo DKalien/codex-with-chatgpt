@@ -13,6 +13,8 @@ import { cleanup, makeTmpDir } from "./helpers.js";
 
 const threadId = "01a00000-0000-7000-8000-000000000001";
 const commandId = "desktop_result_command";
+const continuationTurnId = "01a00000-0000-7000-8000-000000000003";
+const originTurnId = "01a00000-0000-7000-8000-000000000004";
 let root: string;
 let stateDir: string;
 let workspace: Workspace;
@@ -176,6 +178,32 @@ describe("desktop record-result CLI", () => {
       outputId: expect.any(Number),
     });
     expect(fs.existsSync(sentinel)).toBe(false);
+  });
+
+  it("CLI 在 native continuation tip 上一次写入 receipt，保留 immutable origin turn", async () => {
+    updateDesktop(workspace.id, current => {
+      if (!current) throw new Error("Desktop fixture missing");
+      return {
+        state: { ...current, deliveries: [{ ...current.deliveries[0], turnId: originTurnId }] },
+        result: undefined,
+      };
+    });
+    vi.mocked(desktopIpc.currentResultContext).mockResolvedValue(currentResultContext(continuationTurnId) as never);
+    const ownership = vi.spyOn(desktopIpc, "currentResultOwnership").mockResolvedValue({
+      ...(currentResultContext(continuationTurnId) as never),
+      ownership: "native_continuation", originTurnId,
+      chainTurnIds: [originTurnId, continuationTurnId], chainLength: 1,
+      signature: "capacity_retry_automatic",
+    } as never);
+
+    const result = await runRecord(["--output", "continuation output"]);
+    const payload = json(result.stdout);
+
+    expect(result.exitCode).toBe(0);
+    expect(payload).toMatchObject({ ok: true, record: { commandId, outputId: expect.any(Number) } });
+    expect(ownership).toHaveBeenCalledTimes(2);
+    expect(readDesktop(workspace.id)?.deliveries[0]).toMatchObject({ deliveryStatus: "accepted", turnId: originTurnId });
+    expect(readExecutionRecords(workspace.id)).toHaveLength(1);
   });
 
   it("outcome_unknown 当前 turn 一次 CLI 调用完成严格 self-reconcile 和 receipt", async () => {
