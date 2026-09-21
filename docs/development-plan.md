@@ -763,7 +763,7 @@ G3 修复 Browser Companion 误绑错误 ChatGPT conversation 后 production Sen
 
 - **G3 live acceptance：PASS（2026-09-19）**。跨设备 Desktop smoke 与 route-principal attestation 闭环已完成；后续实现不得把旧的 `live E2E pending` 当作当前状态。
 - **NEXT_EXPECTED_STEP**：**G4c independent review；通过后再安排 deploy/live acceptance**。
-  - Normal same-browser 顺序：缺少 host permission 时先点一次 **Grant Bridge access** → 点一次 **Connect this Chat** → 当前 Chat 通过 `feedback_companion_route_confirm` 完成 principal proof。Browser 不再需要第二次 Bind/Rebind/Verify/Complete 点击。
+  - Normal same-browser 顺序：点一次 **Connect this Chat**；首次使用时在同一点击中请求 host permission（浏览器可能弹授权框）→ 当前 Chat 通过 `feedback_companion_route_confirm` 完成 principal proof。**Grant Bridge access** 保留为连接设置中的 fallback；Browser 不再需要第二次 Bind/Rebind/Verify/Complete 点击。
   - 路径：`workspace_info` → bounded workflow readiness → 安全 Desktop/Remote → Codex 执行 → Companion 反馈回 **已验证** conversation → independent review → DONE。
   - 不要求用户手工搬 workspaceId / threadId / bindingId；不得自动降低授权、审批、`outcome_unknown` 或 Project ownership 门禁。
   - **前置约束**：`requestContext.conversationIdentity=available` ≠ Project membership ≠ durable same-thread Chat binding；live 闭环必须依赖 **route attestation VERIFIED**，不得把 `currentConversation` 当永久绑定。

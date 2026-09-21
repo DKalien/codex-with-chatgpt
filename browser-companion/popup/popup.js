@@ -490,16 +490,25 @@
           try {
             permission = bridgePermission(origin);
           } catch {
-        setText(els.connectStatus, friendlyConnectReason("bridge_origin_invalid"), "bad");
+            setText(els.connectStatus, friendlyConnectReason("bridge_origin_invalid"), "bad");
             setText(els.connectDiagnostic, "bridge_origin_invalid", "bad");
             return;
           }
-          const granted = await chrome.permissions.contains({ origins: [permission.pattern] });
+          // Keep the permission request inside the click user gesture. Do not await
+          // contains or perform any page/storage work before requesting it.
+          let granted = false;
+          try {
+            granted = await chrome.permissions.request({ origins: [permission.pattern] });
+          } catch {
+            granted = false;
+          }
           if (!granted) {
-            setText(els.connectStatus, friendlyConnectReason("bridge_permission_missing"), "bad");
-            setText(els.connectDiagnostic, "bridge_permission_missing", "bad");
+            setText(els.connectStatus, "需要授权连接服务才能继续", "bad");
+            setText(els.connectDiagnostic, "bridge_permission_denied", "bad");
             return;
           }
+          await saveBridgeOrigin(permission.origin);
+          els.bridgeOrigin.value = permission.origin;
         }
         const tabNow = await activeTab();
         if (!tabNow?.id || tabNow.id !== tab.id) {

@@ -831,5 +831,5 @@ F1a 只增加现有 SW status payload 的纯、只读 operational health summary
 - Connect 开始时必须把 autonomy `OFF` durable persist 成功；写入失败保持内存 OFF 并 fail closed。若 route runner 明确证明没有 mutation/click 且 durable fence/latch 仍为 `NONE`，则清除本轮 `ATTEST_REQUESTED`，允许下一次显式 Connect 重试同一 challenge；任何可能 mutation 的结果仍永久进入 `OUTCOME_UNKNOWN`。
 - current Chat 必须继续调用 MCP `feedback_companion_route_confirm`。确认后 exact owner heartbeat 才能观察 `CONFIRMED` 并 fenced complete；fresh credential exact-match durable commit 后，authenticated `/state` 才能把 route 收敛为 `VERIFIED`。
 - `/rebind/status` 在读取前再次检查 `reserved / claimed / outcome_unknown`；发现 in-flight 返回 bounded `409 COMPANION_REPAIR_BLOCKED`。complete 仅对服务端明确在 mint 前拒绝的 `COMPANION_REPAIR_BLOCKED` / `COMPANION_REBIND_NOT_CONFIRMED` 回滚到 `ATTEST_REQUESTED`，其他网络、5xx、malformed、identity mismatch 或 commit ambiguity 均不重试并保持 `OUTCOME_UNKNOWN`。
-- Pair/Rebind/Complete/Clear 串行化，避免并发 transport 回写。正常同浏览器路径只剩一次 Connect 点击；若 Chrome host permission 未授予，仍需先独立 Grant。无 predecessor 时保留 cold pair fallback。
+- Pair/Rebind/Complete/Clear 串行化，避免并发 transport 回写。正常同浏览器路径只剩一次 Connect 点击；首次使用时该点击会触发 Chrome host permission 请求，**Grant Bridge access** 仅作为连接设置中的 fallback。无 predecessor 时保留 cold pair fallback。
 - G4c 不改变 autonomy/production 协议：autonomy 仍 OFF，identity 变化仍 disarm；Connect 不 reserve、begin-send、ACK、Recover、Retire 或 Arm。

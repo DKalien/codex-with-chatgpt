@@ -119,21 +119,35 @@ describe("popup Bridge permission and Pair separation", () => {
     const { calls, elements } = await loadPopup(true);
     elements.get("bridge-origin")!.value = "https://bridge.example.test";
     await elements.get("connect-chat")!.onclick!();
-    expect(calls.contains).toEqual([{ origins: ["https://bridge.example.test/*"] }]);
+    expect(calls.request).toEqual([{ origins: ["https://bridge.example.test/*"] }]);
+    expect(calls.contains).toEqual([]);
     expect(calls.page).toEqual([{ type: "c2c.connect.request" }]);
     expect(calls.ownerProof).toBe(0);
     expect(calls.runtime).toEqual([]);
     expect(JSON.stringify(calls.page)).not.toMatch(/route|document|tab|credential|principal|secret/);
   });
 
-  it("Connect reports missing Bridge permission before contacting the page", async () => {
+  it("Connect reports denied Bridge permission before contacting the page", async () => {
     const { calls, elements } = await loadPopup(false);
     elements.get("bridge-origin")!.value = "https://bridge.example.test";
     await elements.get("connect-chat")!.onclick!();
     expect(calls.page).toEqual([]);
-    expect(calls.request).toEqual([]);
-    expect(elements.get("connect-status")!.textContent).toContain("首次使用需要授权连接服务");
-    expect(elements.get("connect-diagnostic")?.textContent).toBe("bridge_permission_missing");
+    expect(calls.request).toEqual([{ origins: ["https://bridge.example.test/*"] }]);
+    expect(calls.contains).toEqual([]);
+    expect(elements.get("connect-status")!.textContent).toContain("需要授权连接服务才能继续");
+    expect(elements.get("connect-diagnostic")?.textContent).toBe("bridge_permission_denied");
+  });
+
+  it("Connect requests permission synchronously before storage or page work", async () => {
+    const { calls, elements } = await loadPopup(true);
+    elements.get("bridge-origin")!.value = "https://bridge.example.test";
+    const pending = elements.get("connect-chat")!.onclick!();
+    expect(calls.request).toEqual([{ origins: ["https://bridge.example.test/*"] }]);
+    expect(calls.contains).toEqual([]);
+    expect(calls.storage).toEqual([]);
+    expect(calls.page).toEqual([]);
+    await pending;
+    expect(calls.page).toEqual([{ type: "c2c.connect.request" }]);
   });
 
   it("rebind controls send fixed payload-free SW commands", async () => {
