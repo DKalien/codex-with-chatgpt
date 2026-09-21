@@ -7,7 +7,8 @@
     body {
       font: 13px/1.4 system-ui, "Segoe UI", sans-serif;
       margin: 0;
-      min-width: 340px;
+      min-width: 380px;
+      width: 400px;
       background: #0f1115;
       color: #e8eaed;
     }
@@ -47,12 +48,60 @@
     button:disabled { opacity: 0.5; cursor: not-allowed; }
     button.secondary { background: #2a2f3a; }
     .note { color: #9aa0a6; font-size: 11px; }
+    .card, details { border: 1px solid #2a2f3a; border-radius: 8px; padding: 10px; background: #141820; }
+    .card { display: grid; gap: 8px; }
+    .section-title { font-weight: 700; color: #e8eaed; }
+    summary { cursor: pointer; font-weight: 700; color: #d7e3ff; }
+    details > :not(summary) { margin-top: 8px; }
+    button.primary { background: #1a73e8; }
+    button.danger { background: #c5221f; border-color: #ef9a9a; }
     hr { border: 0; border-top: 1px solid #2a2f3a; margin: 4px 0; }
   </style>
 </head>
 <body>
-  <header>C2C Browser Companion（E1b2 transport / reserve）</header>
+  <header><strong>C2C Companion</strong><div class="note">连接当前 ChatGPT 对话与 Codex，并自动接收执行结果。</div></header>
   <main>
+    <section class="card" aria-label="当前连接状态">
+      <div class="section-title">当前状态</div>
+      <div class="row"><div class="label">当前对话</div><div class="value" id="user-connection-status">检查中…</div></div>
+      <div class="row"><div class="label">自动回流</div><div class="value" id="user-autonomy-status">检查中…</div></div>
+      <div class="note" id="user-action-hint">正在检查连接状态…</div>
+    </section>
+    <button id="connect-chat" class="primary">连接当前对话</button>
+    <label class="note" style="display:flex;gap:8px;align-items:flex-start;color:#fdd663;">
+      <input type="checkbox" id="autonomy-arm-confirm" style="margin-top:2px;" />
+      <span>允许 Codex 完成任务后，自动把执行结果发回当前 ChatGPT 对话。</span>
+    </label>
+    <button id="autonomy-arm" class="primary" disabled>开启自动回流</button>
+    <button id="autonomy-disable" class="secondary" disabled>暂停自动回流</button>
+    <div class="note" id="connect-status">自动回流默认关闭。</div>
+
+    <details>
+      <summary>首次使用或连接有问题？</summary>
+      <button id="bind">绑定当前对话</button>
+      <button id="unbind" class="secondary">清除本地目标</button>
+      <div class="row">
+        <div class="label">连接服务地址</div>
+        <input id="bridge-origin" placeholder="https://c2c-codex-with-chatgpt.devworklink.com" autocomplete="off" />
+      </div>
+      <button id="grant-bridge-access" class="secondary">授权连接服务</button>
+      <div class="note" id="bridge-permission-status">连接服务权限未检查</div>
+      <details>
+        <summary>手动配对与连接修复</summary>
+        <div class="row"><div class="label">粘贴配对信息</div><textarea id="pair-json" rows="4" placeholder='{"intentId":"...","secret":"c2c_pair_..."}'></textarea></div>
+        <button id="apply-pair-json" class="secondary">应用配对信息</button>
+        <div class="row"><div class="label">配对 intentId</div><input id="intent-id" placeholder="uuid" autocomplete="off" /></div>
+        <div class="row"><div class="label">一次性配对密钥（仅本次 popup 内存）</div><input id="pair-secret" type="password" placeholder="c2c_pair_..." autocomplete="off" /></div>
+        <div class="note" id="pair-hint">粘贴配对信息后应用，再完成配对。</div>
+        <button id="pair" disabled>配对连接服务</button>
+        <button id="rebind-start" class="secondary" disabled>开始连接修复</button>
+        <button id="rebind-complete" class="secondary" disabled>完成连接修复</button>
+        <button id="verify-route" class="secondary" disabled>验证当前对话</button>
+      </details>
+    </details>
+
+    <details>
+      <summary>高级工具（调试）</summary>
     <div class="row">
       <div class="label">当前页面 route</div>
       <div class="value" id="page-route">检测中…</div>
@@ -65,40 +114,10 @@
       <div class="label">DOM 安全观察（只读）</div>
       <div class="value" id="dom-safety">—</div>
     </div>
-    <button id="connect-chat">Connect this Chat</button>
-    <div class="note" id="connect-status">Autonomy remains OFF.</div>
-    <button id="bind">Bind this conversation tab</button>
-    <button id="unbind" class="secondary">Clear local target</button>
-
-    <hr />
     <div class="row">
       <div class="label">Transport</div>
       <div class="value" id="transport-status">未配对</div>
     </div>
-    <div class="row">
-      <div class="label">Bridge origin（持久保存；非 secret；仅 HTTPS / 开发 loopback）</div>
-      <input id="bridge-origin" placeholder="https://c2c-codex-with-chatgpt.devworklink.com" autocomplete="off" />
-    </div>
-    <button id="grant-bridge-access" class="secondary">Grant Bridge access</button>
-    <div class="note" id="bridge-permission-status">Bridge access 未检查</div>
-    <div class="row">
-      <div class="label">Paste pairing JSON（一次粘贴 feedback_companion_pair 整段输出）</div>
-      <textarea id="pair-json" rows="4" placeholder='{"intentId":"...","secret":"c2c_pair_...","expiresAt":"...","bindingId":"...","epoch":1}'></textarea>
-    </div>
-    <button id="apply-pair-json" class="secondary">Apply pairing JSON（提取 intentId / secret）</button>
-    <div class="row">
-      <div class="label">Pairing intentId（session 临时；浏览器会话结束后消失）</div>
-      <input id="intent-id" placeholder="uuid" autocomplete="off" />
-    </div>
-    <div class="row">
-      <div class="label">One-time pairing secret（仅 popup 内存；不进任何 storage）</div>
-      <input id="pair-secret" type="password" placeholder="c2c_pair_..." autocomplete="off" />
-    </div>
-    <div class="note" id="pair-hint">复制 pairing JSON → 打开扩展 → 粘贴并 Apply → Pair。</div>
-    <button id="pair" disabled>Pair Bridge（仅 exact owner）</button>
-    <button id="rebind-start" class="secondary" disabled>Rebind to this conversation</button>
-    <button id="rebind-complete" class="secondary" disabled>Complete rebind after confirm</button>
-    <button id="verify-route" class="secondary" disabled>Verify this conversation route</button>
     <button id="fetch-state" class="secondary" disabled>GET /state</button>
     <button id="reserve" class="secondary" disabled>Reserve next (E1b2 test)</button>
     <button id="release" class="secondary" disabled>Release reservation</button>
@@ -112,13 +131,7 @@
       <div class="label">Operational health（只读诊断）</div>
       <pre class="value" id="operational-health" style="white-space: pre-wrap; margin: 0; max-height: 180px; overflow: auto;">—</pre>
     </div>
-    <label class="note" style="display:flex;gap:8px;align-items:flex-start;color:#f28b82;">
-      <input type="checkbox" id="autonomy-arm-confirm" style="margin-top:2px;" />
-      <span>I understand this can automatically send production feedback into this bound ChatGPT conversation.</span>
-    </label>
     <button id="autonomy-shadow" class="secondary" disabled>Enable Shadow</button>
-    <button id="autonomy-arm" class="secondary" disabled style="background:#c5221f;">Arm Production</button>
-    <button id="autonomy-disable" class="secondary" disabled>Disable Autonomy</button>
     <hr />
     <div class="note" style="color:#f28b82;font-weight:600;">
       RETIRE UNKNOWN — 永久放弃当前 outcome_unknown 事件，绝不重发，也不是 ACK。
@@ -185,9 +198,14 @@
       <div class="label">Bridge /state</div>
       <div class="value" id="bridge-state">—</div>
     </div>
+    <div class="row">
+      <div class="label">连接技术诊断（高级）</div>
+      <div class="value" id="connect-diagnostic">—</div>
+    </div>
     <div class="note">
       Route 来自已绑定 owner document。不写 composer、不点 Send、不进入不可逆发送边界。
     </div>
+    </details>
   </main>
   <script src="../route-global.js"></script>
   <script src="popup.js"></script>

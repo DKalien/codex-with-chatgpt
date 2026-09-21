@@ -507,10 +507,10 @@ describe("E1b3d3b2 SW / popup static contract", () => {
     const html = fs.readFileSync(path.join(companionRoot, "popup", "popup.html"), "utf8");
     expect(html).toMatch(/autonomy-arm-confirm/);
     expect(html).toMatch(/verify-route/);
-    expect(html).toMatch(/automatically send production feedback/);
+    expect(html).toMatch(/允许 Codex 完成任务后，自动把执行结果发回当前 ChatGPT 对话/);
     expect(html).toMatch(/Enable Shadow/);
-    expect(html).toMatch(/Arm Production/);
-    expect(html).toMatch(/Disable Autonomy/);
+    expect(html).toMatch(/开启自动回流/);
+    expect(html).toMatch(/暂停自动回流/);
     const js = fs.readFileSync(path.join(companionRoot, "popup", "popup.js"), "utf8");
     expect(js).toMatch(/c2c\.autonomy\.enable\.shadow/);
     expect(js).toMatch(/c2c\.autonomy\.arm/);

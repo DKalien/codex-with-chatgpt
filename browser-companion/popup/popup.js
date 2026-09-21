@@ -15,6 +15,9 @@
     domSafety: document.getElementById("dom-safety"),
     connectChat: document.getElementById("connect-chat"),
     connectStatus: document.getElementById("connect-status"),
+    userConnectionStatus: document.getElementById("user-connection-status"),
+    userAutonomyStatus: document.getElementById("user-autonomy-status"),
+    userActionHint: document.getElementById("user-action-hint"),
     bind: document.getElementById("bind"),
     unbind: document.getElementById("unbind"),
     transportStatus: document.getElementById("transport-status"),
@@ -58,11 +61,44 @@
     productionSendResult: document.getElementById("production-send-result"),
     clearTransport: document.getElementById("clear-transport"),
     bridgeState: document.getElementById("bridge-state"),
+    connectDiagnostic: document.getElementById("connect-diagnostic"),
   };
 
   function setText(el, text, cls) {
     el.textContent = text;
     el.className = "value" + (cls ? " " + cls : "");
+  }
+
+  function friendlyConnectState(transport, connectReason) {
+    if (transport?.connected && transport?.routeVerification === "VERIFIED") {
+      return ["当前对话已连接", "ok"];
+    }
+    if (connectReason === "bridge_permission_missing") {
+      return ["需要授权连接服务", "warn"];
+    }
+    if (transport?.rebindPending) {
+      return ["正在等待 ChatGPT 完成确认", "warn"];
+    }
+    if (transport?.connected && transport?.routeVerification !== "VERIFIED") {
+      return ["还差一步完成连接", "warn"];
+    }
+    if (transport?.authStale) return ["连接需要修复", "bad"];
+    return ["可以连接当前对话", "warn"];
+  }
+
+  function friendlyConnectReason(reason) {
+    switch (reason) {
+      case "bridge_origin_invalid":
+        return "连接地址需要检查，请展开连接设置查看详情。";
+      case "bridge_permission_missing":
+        return "首次使用需要授权连接服务，请展开连接设置完成授权。";
+      case "tab_changed":
+        return "当前页面已变化，请重新打开扩展后再试。";
+      case "content_script_unavailable":
+        return "当前页面暂时无法连接，请刷新 ChatGPT 页面后再试。";
+      default:
+        return "连接遇到问题，请展开连接设置查看详情。";
+    }
   }
 
   /** Bounded recover result — no message body / credential / secret. */
@@ -335,6 +371,20 @@
     const autonomy = status?.autonomy ?? {};
     const autonomyMode = autonomy.mode ?? "off";
     const armed = autonomyMode === "armed";
+    const [connectionText, connectionClass] = friendlyConnectState(transport, status?.connectReason);
+    setText(els.userConnectionStatus, connectionText, connectionClass);
+    setText(els.userAutonomyStatus, armed ? "已开启" : "未开启", armed ? "ok" : "warn");
+    setText(
+      els.userActionHint,
+      connectionText === "当前对话已连接"
+      ? (armed ? "执行结果会自动回到当前对话。" : "如需自动回流，请勾选确认后开启。")
+        : (transport?.rebindPending
+          ? "请回到 ChatGPT 完成确认。"
+          : transport?.connected
+            ? "请完成当前对话验证；如未自动出现验证消息，可展开连接设置。"
+            : "点击“连接当前对话”开始使用。遇到问题可展开连接设置。"),
+      connectionClass,
+    );
     if (els.autonomyStatus) {
       const hbSafety = autonomy.lastHeartbeatSafety;
       const ev = autonomy.lastEvaluatedEvidence;
@@ -440,18 +490,21 @@
           try {
             permission = bridgePermission(origin);
           } catch {
-            setText(els.connectStatus, "bridge_origin_invalid", "bad");
+        setText(els.connectStatus, friendlyConnectReason("bridge_origin_invalid"), "bad");
+            setText(els.connectDiagnostic, "bridge_origin_invalid", "bad");
             return;
           }
           const granted = await chrome.permissions.contains({ origins: [permission.pattern] });
           if (!granted) {
-            setText(els.connectStatus, "bridge_permission_missing", "bad");
+            setText(els.connectStatus, friendlyConnectReason("bridge_permission_missing"), "bad");
+            setText(els.connectDiagnostic, "bridge_permission_missing", "bad");
             return;
           }
         }
         const tabNow = await activeTab();
         if (!tabNow?.id || tabNow.id !== tab.id) {
-          setText(els.connectStatus, "tab_changed", "bad");
+          setText(els.connectStatus, friendlyConnectReason("tab_changed"), "bad");
+          setText(els.connectDiagnostic, "tab_changed", "bad");
           return;
         }
         let res;
@@ -461,11 +514,13 @@
         } catch {
           res = { ok: false, reason: "content_script_unavailable" };
         }
+        const reason = res?.ok ? "" : (res?.reason || "connect_failed");
         const text = res?.ok
           ? (res.state === "CONNECTED"
-              ? "Connected — Route verification: VERIFIED — Autonomy OFF"
-              : "Route attestation sent once — awaiting Chat confirmation")
-          : res?.reason || "connect_failed";
+              ? "当前对话已连接"
+              : "已发送连接验证，请回到 ChatGPT 完成确认")
+          : friendlyConnectReason(reason);
+        setText(els.connectDiagnostic, reason || "ok", res?.ok ? "ok" : "bad");
         setText(els.connectStatus, text, res?.ok ? "ok" : "bad");
         await refresh();
       };

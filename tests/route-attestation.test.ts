@@ -850,10 +850,37 @@ describe("G3 route attestation browser contract (source)", () => {
     expect(sw).not.toMatch(/rebindRedemption|redemption/);
   });
 
-  it("popup.html contains Verify this conversation route control", () => {
+  it("popup.html contains the user-facing route verification control", () => {
     const html = fs.readFileSync(path.join(companionRoot, "popup", "popup.html"), "utf8");
+    expect(html.indexOf('id="connect-chat"')).toBeLessThan(html.indexOf("<summary>高级工具（调试）</summary>"));
     expect(html).toMatch(/verify-route/);
-    expect(html).toMatch(/Verify this conversation route/i);
+    expect(html).toMatch(/验证当前对话/);
+  });
+
+  it("popup keeps primary actions before closed advanced tools", () => {
+    const html = fs.readFileSync(path.join(companionRoot, "popup", "popup.html"), "utf8");
+    expect(html.indexOf('id="connect-chat"')).toBeGreaterThan(-1);
+    expect(html.indexOf('id="autonomy-arm"')).toBeLessThan(html.indexOf("<summary>高级工具（调试）</summary>"));
+    expect(html.indexOf('id="autonomy-disable"')).toBeLessThan(html.indexOf("<summary>高级工具（调试）</summary>"));
+    expect(html.indexOf('id="autonomy-arm-confirm"')).toBeLessThan(html.indexOf("<summary>高级工具（调试）</summary>"));
+    expect(html).toMatch(/<details>\s*<summary>高级工具（调试）<\/summary>/);
+    expect(html).toMatch(/id="retire-unknown-confirm"/);
+    expect(html).toMatch(/id="send-probe-confirm"/);
+    expect(html).toMatch(/id="production-send-confirm"/);
+  });
+
+  it("popup maps pending and connect errors to friendly copy while retaining diagnostics", () => {
+    const js = fs.readFileSync(path.join(companionRoot, "popup", "popup.js"), "utf8");
+    const rebindBranch = js.indexOf("transport?.rebindPending");
+    const genericPendingBranch = js.indexOf("transport?.connected && transport?.routeVerification !== \"VERIFIED\"");
+    expect(rebindBranch).toBeGreaterThan(-1);
+    expect(genericPendingBranch).toBeGreaterThan(rebindBranch);
+    expect(js).toMatch(/还差一步完成连接/);
+    expect(js).toMatch(/请完成当前对话验证/);
+    expect(js).toMatch(/首次使用需要授权连接服务/);
+    expect(js).toMatch(/连接遇到问题，请展开连接设置查看详情/);
+    expect(js).toMatch(/connectDiagnostic/);
+    expect(js).not.toMatch(/setText\(els\.connectStatus, reason/);
   });
 
   it("popup.js wires verify RPC without message payload; Arm requires productionEligible; fence gate", () => {

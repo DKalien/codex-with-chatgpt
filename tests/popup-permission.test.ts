@@ -132,7 +132,8 @@ describe("popup Bridge permission and Pair separation", () => {
     await elements.get("connect-chat")!.onclick!();
     expect(calls.page).toEqual([]);
     expect(calls.request).toEqual([]);
-    expect(elements.get("connect-status")!.textContent).toBe("bridge_permission_missing");
+    expect(elements.get("connect-status")!.textContent).toContain("首次使用需要授权连接服务");
+    expect(elements.get("connect-diagnostic")?.textContent).toBe("bridge_permission_missing");
   });
 
   it("rebind controls send fixed payload-free SW commands", async () => {
