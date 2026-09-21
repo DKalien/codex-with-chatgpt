@@ -6,6 +6,7 @@ import {
 } from "../mcp/conversation-principal.js";
 import {
   normalizeChatgptConversationRoute,
+  areChatgptConversationRoutesEquivalent,
   ChatGptRouteError,
 } from "../chatgpt/route.js";
 import {
@@ -768,7 +769,7 @@ export function verifyCompanionCredential(input: {
 
 function requireRouteMatch(ctx: CompanionAuthContext, routeCanonical: string): void {
   const normalized = normalizeChatgptRoute(routeCanonical);
-  if (normalized !== ctx.routeCanonical) {
+  if (!areChatgptConversationRoutesEquivalent(normalized, ctx.routeCanonical)) {
     throw new CompanionError("ROUTE_MISMATCH", "delivery route 与 companion 绑定不一致");
   }
 }

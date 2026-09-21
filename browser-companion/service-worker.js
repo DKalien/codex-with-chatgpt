@@ -16,7 +16,7 @@ import {
   applyObserveOwnership,
   OWNERSHIP_SCHEMA_VERSION,
 } from "./ownership.js";
-import { parseChatgptConversationRoute } from "./route-esm.js";
+import { parseChatgptConversationRoute, areChatgptConversationRoutesEquivalent } from "./route-esm.js";
 import { parseBridgeOrigin, companionApiUrl, BridgeOriginError } from "./bridge-origin.js";
 import {
   emptyJournal,
@@ -670,7 +670,7 @@ async function refreshPageObservation(sender, message) {
       && tabId != null
       && isOwner(ownerState, tabId, documentId)
       && canonical
-      && ownerState.owner?.canonicalRoute === canonical,
+      && areChatgptConversationRoutesEquivalent(ownerState.owner?.canonicalRoute, canonical),
     ),
   };
 }
@@ -804,7 +804,7 @@ async function handlePair(message) {
 
   assertNoForbiddenFields(body);
   if (
-    body.routeCanonical !== routeCanonical
+    !areChatgptConversationRoutesEquivalent(body.routeCanonical, routeCanonical)
     || typeof body.credential !== "string"
     || typeof body.workspaceId !== "string"
     || typeof body.companionId !== "string"
@@ -975,7 +975,7 @@ async function handleRebindStart(message) {
     };
   }
   if (!isOwner(ownerState, ownerAtStart.tabId, ownerAtStart.documentId)
-    || ownerState.owner?.canonicalRoute !== ownerAtStart.canonicalRoute
+    || !areChatgptConversationRoutesEquivalent(ownerState.owner?.canonicalRoute, ownerAtStart.canonicalRoute)
     || ownerState.owner?.generation !== ownerAtStart.generation) {
     routeAttestFence = markRouteAttestFenceState(barrier, "OUTCOME_UNKNOWN");
     await persistRouteAttestFence().catch(() => false);
@@ -1001,7 +1001,7 @@ async function handleRebindStart(message) {
     && body.workspaceId === prevTransport.workspaceId
     && typeof routeCanonical === "string"
     && routeCanonical.length > 0
-    && body.routeCanonical === routeCanonical
+    && areChatgptConversationRoutesEquivalent(body.routeCanonical, routeCanonical)
     && Number.isInteger(prevTransport.epoch)
     && prevTransport.epoch >= 0
     && Number.isInteger(body.epoch)
@@ -1089,7 +1089,7 @@ async function handleRebindComplete({ managed = false } = {}) {
   if (!pairAllowedWithJournal(journal, false)) {
     return { ok: false, reason: "journal_active" };
   }
-  if (!ownerState.owner || ownerState.owner.canonicalRoute !== transport.routeCanonical) {
+  if (!ownerState.owner || !areChatgptConversationRoutesEquivalent(ownerState.owner.canonicalRoute, transport.routeCanonical)) {
     return { ok: false, reason: "not_exact_owner" };
   }
   const challengeId = extractRouteChallengeId(transport.routeAttestationMessage);
@@ -1156,7 +1156,7 @@ async function handleRebindComplete({ managed = false } = {}) {
     || body.companionId !== transport.companionId
     || body.bindingId !== transport.bindingId
     || body.epoch !== transport.epoch
-    || body.routeCanonical !== transport.routeCanonical
+    || !areChatgptConversationRoutesEquivalent(body.routeCanonical, transport.routeCanonical)
     || body.challengeId !== challengeId
     || typeof body.credential !== "string"
     || !body.credential.startsWith("c2c_comp_")
@@ -1220,7 +1220,7 @@ async function fetchRebindStatus(identity) {
     && body.bindingId === identity.bindingId
     && body.epoch === identity.epoch
     && body.companionId === identity.companionId
-    && body.routeCanonical === identity.routeCanonical
+    && areChatgptConversationRoutesEquivalent(body.routeCanonical, identity.routeCanonical)
     && body.challengeId === identity.challengeId
     && ["PENDING", "CONFIRMED", "EXPIRED"].includes(body.state);
   return valid
@@ -1307,7 +1307,7 @@ async function handleConnectPage(sender, message) {
     if (permission !== true) return { ok: false, reason: "bridge_permission_missing" };
 
     let currentPairPending = false;
-    if (!transport.rebindPending && transport.routeCanonical === canonicalRoute) {
+    if (!transport.rebindPending && areChatgptConversationRoutesEquivalent(transport.routeCanonical, canonicalRoute)) {
       const current = await handleFetchState();
       if (current?.ok && current.status?.routeVerification === "VERIFIED") {
         return { ok: true, state: "CONNECTED", routeVerification: "VERIFIED", autonomy: "off" };
@@ -1338,8 +1338,8 @@ async function handleConnectPage(sender, message) {
 
     if (!ownerState.owner
       || !isOwner(ownerState, identity.tabId, identity.documentId)
-      || ownerState.owner.canonicalRoute !== canonicalRoute
-      || transport.routeCanonical !== canonicalRoute) {
+      || !areChatgptConversationRoutesEquivalent(ownerState.owner.canonicalRoute, canonicalRoute)
+      || !areChatgptConversationRoutesEquivalent(transport.routeCanonical, canonicalRoute)) {
       return { ok: false, reason: "owner_identity_changed", retryAllowed: false };
     }
     const flowIdentity = connectFlowIdentity(transport);
@@ -2181,7 +2181,7 @@ async function handleMessage(message, sender, { transportMutationHeld = false } 
     if (!storageProtected) return { ok: false, reason: "storage_unprotected" };
     if (!transport || transport.authStale) return { ok: false, reason: "transport_invalid" };
     if (!ownerState.owner) return { ok: false, reason: "not_exact_owner" };
-    if (ownerState.owner.canonicalRoute !== transport.routeCanonical) {
+    if (!areChatgptConversationRoutesEquivalent(ownerState.owner.canonicalRoute, transport.routeCanonical)) {
       return { ok: false, reason: "owner_route_mismatch" };
     }
     const mode = message.type === "c2c.autonomy.arm" ? "armed" : "shadow";
@@ -2630,7 +2630,7 @@ async function handleProductionJournalPersist(sender, message) {
     if (
       proposed.routeCanonical
       && transport.routeCanonical
-      && proposed.routeCanonical !== transport.routeCanonical
+      && !areChatgptConversationRoutesEquivalent(proposed.routeCanonical, transport.routeCanonical)
     ) {
       return { ok: false, reason: "route_mismatch", journal: summarizeProductionJournal(journal) };
     }
@@ -2686,7 +2686,7 @@ async function handleProductionBeginSend(sender, message) {
   if (message?.reservationId != null && message.reservationId !== journal.reservationId) {
     return { ok: false, reason: "reservation_id_mismatch" };
   }
-  if (message?.routeCanonical != null && message.routeCanonical !== journal.routeCanonical) {
+  if (message?.routeCanonical != null && !areChatgptConversationRoutesEquivalent(message.routeCanonical, journal.routeCanonical)) {
     return { ok: false, reason: "route_mismatch" };
   }
   if (message?.bindingId != null && message.bindingId !== journal.bindingId) {
@@ -2914,7 +2914,7 @@ async function maybeRunAutonomyTick(ctx = {}) {
         evidence && ownerState.owner && evidence.documentId === ownerState.owner.documentId,
       ),
       routeExact: Boolean(
-        evidence && transport && evidence.canonicalRoute === transport.routeCanonical,
+        evidence && transport && areChatgptConversationRoutesEquivalent(evidence.canonicalRoute, transport.routeCanonical),
       ),
     });
 

@@ -1,3 +1,5 @@
+import { areChatgptConversationRoutesEquivalent } from "./route-esm.js";
+
 /** Durable G4c connect/rebind fence. Browser-safe and side-effect free. */
 
 export const CONNECT_FLOW_KEY = "c2c_companion_connect_flow_v1";
@@ -83,7 +85,7 @@ export function connectFlowMatches(flow, identity) {
     && flow.bindingId === identity.bindingId
     && flow.epoch === identity.epoch
     && flow.companionId === identity.companionId
-    && flow.routeCanonical === identity.routeCanonical
+    && areChatgptConversationRoutesEquivalent(flow.routeCanonical, identity.routeCanonical)
     && flow.challengeId === identity.challengeId,
   );
 }

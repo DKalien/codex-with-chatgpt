@@ -40,7 +40,7 @@ import {
 } from "../src/execution/records.js";
 import { updateDesktop } from "../src/desktop/store.js";
 import { Workspace } from "../src/workspace/manager.js";
-import { CODEX_FEEDBACK_SCOPE } from "../src/feedback/store.js";
+import { CODEX_FEEDBACK_SCOPE, routeChallengeDigest } from "../src/feedback/store.js";
 import { cleanup, isolateStateDir, makeTmpDir } from "./helpers.js";
 import {
   clearJournal,
@@ -61,6 +61,8 @@ let workspace: Workspace;
 
 const ROUTE = "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111";
 const ROUTE_B = "https://chatgpt.com/c/22222222-2222-4222-8222-222222222222";
+const PROJECT_ROUTE = "https://chatgpt.com/g/g-p-6aa296e634348191b441d56fdab23b7b/c/11111111-1111-4111-8111-111111111111";
+const PROJECT_ROUTE_ALIAS = "https://chatgpt.com/g/g-p-6aa296e634348191b441d56fdab23b7b-codex-with-chatgpt/c/11111111-1111-4111-8111-111111111111";
 
 beforeEach(() => {
   stateDir = isolateStateDir();
@@ -2164,6 +2166,143 @@ describe("public companion HTTP surface", () => {
       body: JSON.stringify({ routeCanonical: ROUTE_B }),
     });
     expect(badRoute.status).toBe(400);
+  });
+
+  it("Project route alias 在 pair/state/写操作间保持 canonical compatibility", async () => {
+    await enableAndSeed();
+    const intent = createPairingIntent({
+      workspaceId: workspace.id,
+      principal: principalA(),
+      stateDir,
+    });
+    const paired = await fetchJson("/api/companion/v1/pair", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        intentId: intent.intentId,
+        secret: intent.secret,
+        routeCanonical: PROJECT_ROUTE_ALIAS,
+      }),
+    });
+    expect(paired.status).toBe(200);
+    expect(paired.body.routeCanonical).toBe(PROJECT_ROUTE);
+    const credential = paired.body.credential as string;
+    const auth = { authorization: `Bearer ${credential}`, "content-type": "application/json" };
+
+    const state = await fetchJson("/api/companion/v1/state", { headers: auth });
+    expect(state.status).toBe(200);
+    expect(state.body.routeCanonical).toBe(PROJECT_ROUTE);
+
+    confirmRouteAttestation({
+      workspaceId: workspace.id,
+      principal: principalA(),
+      challengeId: paired.body.routeAttestation.challengeId,
+      challengeDigest: paired.body.routeAttestation.challengeDigest,
+      stateDir,
+    });
+
+    const reserved = await fetchJson("/api/companion/v1/reserve", {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({ routeCanonical: PROJECT_ROUTE_ALIAS }),
+    });
+    expect(reserved.status).toBe(200);
+    const eventId = reserved.body.delivery.eventId as string;
+    const reservationId = reserved.body.reservationId as string;
+
+    const sent = await fetchJson("/api/companion/v1/begin-send", {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({
+        routeCanonical: PROJECT_ROUTE_ALIAS,
+        eventId,
+        reservationId,
+      }),
+    });
+    expect(sent.status).toBe(200);
+    const acked = await fetchJson("/api/companion/v1/ack", {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({
+        routeCanonical: PROJECT_ROUTE_ALIAS,
+        eventId,
+        attemptId: sent.body.attemptId,
+      }),
+    });
+    expect(acked.status).toBe(200);
+    expect(acked.body.status).toBe("observed");
+
+    const differentProject = await fetchJson("/api/companion/v1/reserve", {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({
+        routeCanonical: "https://chatgpt.com/g/g-p-7bb307f745459292c552e67efbc34c8c-codex-with-chatgpt/c/11111111-1111-4111-8111-111111111111",
+      }),
+    });
+    expect(differentProject.status).toBe(400);
+    expect(differentProject.body.error).toBe("ROUTE_MISMATCH");
+  });
+
+  it("legacy slug persisted companion accepts bare Project route without rewriting attestation", async () => {
+    await enableAndSeed();
+    const intent = createPairingIntent({
+      workspaceId: workspace.id,
+      principal: principalA(),
+      stateDir,
+    });
+    const paired = await fetchJson("/api/companion/v1/pair", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        intentId: intent.intentId,
+        secret: intent.secret,
+        routeCanonical: PROJECT_ROUTE_ALIAS,
+      }),
+    });
+    expect(paired.status).toBe(200);
+    const credential = paired.body.credential as string;
+    const auth = { authorization: `Bearer ${credential}`, "content-type": "application/json" };
+    confirmRouteAttestation({
+      workspaceId: workspace.id,
+      principal: principalA(),
+      challengeId: paired.body.routeAttestation.challengeId,
+      challengeDigest: paired.body.routeAttestation.challengeDigest,
+      stateDir,
+    });
+
+    const file = path.join(stateDir, "feedback", `${workspace.id}.json`);
+    const raw = JSON.parse(fs.readFileSync(file, "utf8")) as {
+      companion: {
+        bindingId: string;
+        epoch: number;
+        companionId: string;
+        routeCanonical: string;
+        routeAttestation: { challengeId: string; [key: string]: unknown };
+        [key: string]: unknown;
+      };
+      [key: string]: unknown;
+    };
+    raw.companion.routeCanonical = PROJECT_ROUTE_ALIAS;
+    raw.companion.routeAttestation.routeCanonical = PROJECT_ROUTE_ALIAS;
+    raw.companion.routeAttestation.challengeDigest = routeChallengeDigest({
+      workspaceId: workspace.id,
+      bindingId: raw.companion.bindingId,
+      epoch: raw.companion.epoch,
+      companionId: raw.companion.companionId,
+      routeCanonical: PROJECT_ROUTE_ALIAS,
+      challengeId: raw.companion.routeAttestation.challengeId,
+    });
+    fs.writeFileSync(file, JSON.stringify(raw, null, 2));
+    const persistedBefore = JSON.stringify(raw.companion);
+
+    const reserved = await fetchJson("/api/companion/v1/reserve", {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({ routeCanonical: PROJECT_ROUTE }),
+    });
+    expect(reserved.status).toBe(200);
+    expect(JSON.stringify(JSON.parse(fs.readFileSync(file, "utf8")).companion))
+      .toBe(persistedBefore);
   });
 
   it("错误 secret pair 失败；无 credential state 401", async () => {

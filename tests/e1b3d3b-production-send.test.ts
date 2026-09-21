@@ -69,6 +69,10 @@ const companionRoot = path.join(projectRoot, "browser-companion");
 const distCompanion = path.join(projectRoot, "dist", "browser-companion");
 
 const ROUTE = "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111";
+const PROJECT = "6aa296e634348191b441d56fdab23b7b";
+const PROJECT_BARE = `https://chatgpt.com/g/g-p-${PROJECT}/c/11111111-1111-4111-8111-111111111111`;
+const PROJECT_SLUG = `https://chatgpt.com/g/g-p-${PROJECT}-codex-with-chatgpt/c/11111111-1111-4111-8111-111111111111`;
+const PROJECT_OTHER = `https://chatgpt.com/g/g-p-${"7".repeat(32)}/c/11111111-1111-4111-8111-111111111111`;
 const EVENT_ID = "e".repeat(32);
 const RES_ID = "11111111-1111-4111-8111-111111111111";
 const ATTEMPT = "22222222-2222-4222-8222-222222222222";
@@ -119,6 +123,17 @@ function claimedJournal() {
     messageSha256: MESSAGE_SHA,
   });
   return j;
+}
+
+function aliasReservedJournal(route: string) {
+  let j = emptyJournal();
+  j = markReserveRequested(j, { routeCanonical: route, bindingId: "b", epoch: 1 });
+  return markReserved(j, { eventId: EVENT_ID, reservationId: RES_ID, routeCanonical: route, bindingId: "b", epoch: 1 });
+}
+
+function aliasClaimedJournal(route: string) {
+  let j = markSendIntent(aliasReservedJournal(route), {});
+  return markClaimed(j, { eventId: EVENT_ID, reservationId: RES_ID, attemptId: ATTEMPT, message: MESSAGE, messageSha256: MESSAGE_SHA });
 }
 
 function makeSpies(overrides: Record<string, unknown> = {}) {
@@ -454,6 +469,36 @@ describe("E1b3d3b journal CAS", () => {
 });
 
 describe("E1b3d3b production runtime happy path", () => {
+  it("accepts a legacy Project slug journal route with the current bare route", async () => {
+    const spy = makeSpies({
+      journal: aliasReservedJournal(PROJECT_SLUG),
+      expectedRoute: PROJECT_SLUG,
+      getCurrentRoute: () => PROJECT_BARE,
+      routeCanonical: PROJECT_SLUG,
+    });
+    const r = await runProductionSend(spy);
+    expect(r.ok).toBe(true);
+    expect(spy.calls.beginSend).toBe(1);
+    expect(spy.calls.write).toBe(1);
+    expect(spy.calls.click).toBe(1);
+    expect(spy.calls.ack).toBe(1);
+    expect(spy.journal.state).toBe("NONE");
+  });
+
+  it("rejects a different Project route before any production mutation", async () => {
+    const spy = makeSpies({
+      journal: aliasReservedJournal(PROJECT_SLUG),
+      expectedRoute: PROJECT_SLUG,
+      getCurrentRoute: () => PROJECT_OTHER,
+      routeCanonical: PROJECT_SLUG,
+    });
+    const r = await runProductionSend(spy);
+    expect(r.reason).toBe("route_drift");
+    expect(spy.calls.beginSend).toBe(0);
+    expect(spy.calls.write).toBe(0);
+    expect(spy.calls.click).toBe(0);
+  });
+
   it("RESERVED → NONE with exactly one beginSend/write/click/ack", async () => {
     const spy = makeSpies();
     const r = await runProductionSend(spy);
@@ -687,6 +732,33 @@ describe("E1b3d3b production runtime happy path", () => {
 });
 
 describe("E1b3d3b recovery", () => {
+  it("allows CLAIMED recovery across a legacy Project slug alias", async () => {
+    const spy = makeSpies({
+      journal: aliasClaimedJournal(PROJECT_SLUG),
+      expectedRoute: PROJECT_SLUG,
+      getCurrentRoute: () => PROJECT_BARE,
+      routeCanonical: PROJECT_SLUG,
+    });
+    const r = await recoverProductionSend(spy);
+    expect(r.ok).toBe(true);
+    expect(spy.calls.write).toBe(1);
+    expect(spy.calls.click).toBe(1);
+    expect(spy.calls.ack).toBe(1);
+  });
+
+  it("blocks CLAIMED recovery for a different conversation route", async () => {
+    const spy = makeSpies({
+      journal: aliasClaimedJournal(PROJECT_SLUG),
+      expectedRoute: PROJECT_SLUG,
+      getCurrentRoute: () => PROJECT_OTHER,
+      routeCanonical: PROJECT_SLUG,
+    });
+    const r = await recoverProductionSend(spy);
+    expect(r.ok).toBe(false);
+    expect(spy.calls.write).toBe(0);
+    expect(spy.calls.click).toBe(0);
+  });
+
   it("CLAIMED recovery bad marker → zero write/click", async () => {
     const j = markClaimed(markSendIntent(reservedJournal(), {}), {
       eventId: EVENT_ID,

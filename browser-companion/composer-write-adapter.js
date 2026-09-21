@@ -10,6 +10,7 @@ import {
   normalizeCanonicalDomText,
 } from "./dom-adapter.js";
 import { WRITE_PROBE_MESSAGE, resolveMutationCanonicalRoute } from "./write-probe.js";
+import { areChatgptConversationRoutesEquivalent } from "./route-esm.js";
 
 /**
  * @typedef {Object} CapabilityResult
@@ -517,7 +518,7 @@ export function runWriteProbe(doc, opts = {}) {
       ? "write_probe_route_parser_missing"
       : "write_probe_route_drift", { wrote: false, mutationAttempted: false, verified: false });
   }
-  if (initial.canonical !== expectedRoute) {
+  if (initial.canonical !== expectedRoute && !areChatgptConversationRoutesEquivalent(initial.canonical, expectedRoute)) {
     return fail("write_probe_route_drift", { wrote: false, mutationAttempted: false, verified: false });
   }
 
@@ -541,7 +542,7 @@ export function runWriteProbe(doc, opts = {}) {
     hrefNow = href;
   }
   const prewrite = resolveMutationCanonicalRoute(hrefNow, parseRoute);
-  if (!prewrite.ok || prewrite.canonical !== expectedRoute) {
+  if (!prewrite.ok || (prewrite.canonical !== expectedRoute && !areChatgptConversationRoutesEquivalent(prewrite.canonical, expectedRoute))) {
     return fail(prewrite.ok ? "write_probe_route_drift" : prewrite.reason, {
       wrote: false,
       mutationAttempted: false,
@@ -559,7 +560,7 @@ export function runWriteProbe(doc, opts = {}) {
       return false;
     }
     const r = resolveMutationCanonicalRoute(current, parseRoute);
-    return r.ok === true && r.canonical === expectedRoute;
+    return r.ok === true && (r.canonical === expectedRoute || areChatgptConversationRoutesEquivalent(r.canonical, expectedRoute));
   };
 
   const write = writeCanonicalMessage(doc, WRITE_PROBE_MESSAGE, {

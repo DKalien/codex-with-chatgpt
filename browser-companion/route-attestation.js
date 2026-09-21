@@ -1,3 +1,5 @@
+import { areChatgptConversationRoutesEquivalent } from "./route-esm.js";
+
 /**
  * G3 route-principal attestation browser contract (pure, browser-safe).
  * SW owns server-supplied attestation message; popup/content never free-write.
@@ -550,7 +552,7 @@ export function shouldPollRouteAttestConfirm(input = {}) {
   ) {
     return { ok: false, reason: "identity_drift" };
   }
-  if (latch.canonicalRoute && owner.canonicalRoute !== latch.canonicalRoute) {
+  if (latch.canonicalRoute && !areChatgptConversationRoutesEquivalent(owner.canonicalRoute, latch.canonicalRoute)) {
     return { ok: false, reason: "identity_drift" };
   }
   if (transport.routeVerification === "VERIFIED") {
@@ -621,7 +623,7 @@ export function canStartRouteAttestSend(input = {}) {
   if (!transport || typeof transport.routeCanonical !== "string" || !transport.routeCanonical) {
     return { ok: false, reason: "transport_invalid" };
   }
-  if (owner.canonicalRoute !== transport.routeCanonical) {
+  if (!areChatgptConversationRoutesEquivalent(owner.canonicalRoute, transport.routeCanonical)) {
     return { ok: false, reason: "owner_route_mismatch" };
   }
   if (typeof owner.generation !== "number" || !Number.isFinite(owner.generation)) {

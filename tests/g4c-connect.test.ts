@@ -63,4 +63,16 @@ describe("G4c durable connect flow", () => {
     expect(derived).toEqual(identity);
     expect(JSON.stringify(derived)).not.toContain("must-not-enter-flow");
   });
+
+  it("keeps a VERIFIED connect flow connected across strict Project route aliases", () => {
+    const persisted = {
+      ...identity,
+      routeCanonical: "https://chatgpt.com/g/g-p-6aa296e634348191b441d56fdab23b7b-codex-with-chatgpt/c/6aae79f7-d174-83ec-a704-2e3e4c662b47",
+    };
+    const current = {
+      ...identity,
+      routeCanonical: "https://chatgpt.com/g/g-p-6aa296e634348191b441d56fdab23b7b/c/6aae79f7-d174-83ec-a704-2e3e4c662b47",
+    };
+    expect(connectFlowMatches(persisted, current)).toBe(true);
+  });
 });

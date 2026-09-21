@@ -1,3 +1,5 @@
+import { areChatgptConversationRoutesEquivalent } from "./route-esm.js";
+
 /**
  * E1b3d2a fixed write-probe contract (pure helpers).
  * Browser-safe. No DOM mutation, no Chrome API, no journal transitions.
@@ -66,7 +68,7 @@ export function buildWriteProbeRequest(owner, transport) {
   if (transport.authStale) {
     return { ok: false, reason: "auth_stale" };
   }
-  if (owner.canonicalRoute !== transport.routeCanonical) {
+  if (!areChatgptConversationRoutesEquivalent(owner.canonicalRoute, transport.routeCanonical)) {
     return { ok: false, reason: "owner_route_mismatch" };
   }
   if (typeof owner.generation !== "number" || !Number.isFinite(owner.generation)) {
@@ -106,7 +108,7 @@ export function validateWriteProbeResponse(response, owner, transport) {
   }
   const route = transport?.routeCanonical;
   if (!route) return { ok: false, reason: "auth_stale", knownFailure: false };
-  if (response.canonicalRoute !== route) {
+  if (!areChatgptConversationRoutesEquivalent(response.canonicalRoute, route)) {
     return { ok: false, reason: "write_probe_route_mismatch", knownFailure: false };
   }
   if (typeof owner?.generation === "number") {

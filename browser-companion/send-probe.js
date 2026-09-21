@@ -4,6 +4,7 @@
  * Message template lives in send-probe-message.js (single source).
  */
 
+import { areChatgptConversationRoutesEquivalent } from "./route-esm.js";
 export { SEND_PROBE_TOKEN, buildSendProbeMessage } from "./send-probe-message.js";
 import { buildSendProbeMessage } from "./send-probe-message.js";
 
@@ -51,7 +52,7 @@ export function canStartSendProbe({ owner, transport, journalIsNone, latch }) {
   if (!transport || typeof transport.routeCanonical !== "string" || transport.authStale) {
     return { ok: false, reason: "auth_stale" };
   }
-  if (owner.canonicalRoute !== transport.routeCanonical) {
+  if (!areChatgptConversationRoutesEquivalent(owner.canonicalRoute, transport.routeCanonical)) {
     return { ok: false, reason: "owner_route_mismatch" };
   }
   if (typeof owner.generation !== "number" || !Number.isFinite(owner.generation)) {
@@ -122,7 +123,7 @@ export function validateSendProbeCompletedResponse(response, latch) {
   if (response.attemptId !== latch.attemptId) {
     return { ok: false, reason: "send_probe_attempt_mismatch" };
   }
-  if (response.canonicalRoute !== latch.canonicalRoute) {
+  if (!areChatgptConversationRoutesEquivalent(response.canonicalRoute, latch.canonicalRoute)) {
     return { ok: false, reason: "send_probe_route_mismatch" };
   }
   if (

@@ -4,6 +4,8 @@
  * secret never goes through content script.
  */
 
+import { areChatgptConversationRoutesEquivalent } from "./route-esm.js";
+
 export const OWNER_PROOF_TTL_MS = 12_000;
 
 /** @returns {{ id: string, tabId: number, documentId: string, routeCanonical: string, expiresAt: number, used: boolean }} */
@@ -34,7 +36,7 @@ export function consumeOwnerProof(proof, expect) {
   if (proof.tabId !== expect.tabId || proof.documentId !== expect.documentId) {
     return { ok: false, reason: "owner_proof_document_mismatch" };
   }
-  if (proof.routeCanonical !== expect.routeCanonical) {
+  if (!areChatgptConversationRoutesEquivalent(proof.routeCanonical, expect.routeCanonical)) {
     return { ok: false, reason: "owner_proof_route_mismatch" };
   }
   return { ok: true };

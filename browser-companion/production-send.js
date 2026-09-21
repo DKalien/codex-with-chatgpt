@@ -1,3 +1,5 @@
+import { areChatgptConversationRoutesEquivalent } from "./route-esm.js";
+
 /**
  * E1b3d3b production one-shot send contract (pure helpers).
  * Browser-safe. No DOM mutation, no Chrome API, no fetch, no credentials.
@@ -245,7 +247,7 @@ export function canStartProductionSend(input) {
   if (!transport || typeof transport.routeCanonical !== "string" || transport.authStale) {
     return { ok: false, reason: "auth_stale" };
   }
-  if (owner.canonicalRoute !== transport.routeCanonical) {
+  if (!areChatgptConversationRoutesEquivalent(owner.canonicalRoute, transport.routeCanonical)) {
     return { ok: false, reason: "owner_route_mismatch" };
   }
   if (typeof owner.generation !== "number" || !Number.isFinite(owner.generation)) {
@@ -257,7 +259,7 @@ export function canStartProductionSend(input) {
   if (!journal.eventId || !journal.reservationId) {
     return { ok: false, reason: "journal_identity_missing" };
   }
-  if (journal.routeCanonical !== transport.routeCanonical) {
+  if (!areChatgptConversationRoutesEquivalent(journal.routeCanonical, transport.routeCanonical)) {
     return { ok: false, reason: "route_mismatch" };
   }
   if (journal.bindingId !== transport.bindingId || journal.epoch !== transport.epoch) {
@@ -273,7 +275,7 @@ export function canStartProductionSend(input) {
   if (evidence.documentId !== owner.documentId) {
     return { ok: false, reason: "evidence_document_mismatch" };
   }
-  if (evidence.canonicalRoute !== owner.canonicalRoute) {
+  if (!areChatgptConversationRoutesEquivalent(evidence.canonicalRoute, owner.canonicalRoute)) {
     return { ok: false, reason: "evidence_route_mismatch" };
   }
   const age = now - evidence.observedAt;

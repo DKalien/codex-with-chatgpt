@@ -471,6 +471,27 @@ describe("G4c one-click connect orchestration", () => {
     expect(worker.fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it("connects a persisted VERIFIED Project slug transport through the bare page alias", async () => {
+    const slug = "https://chatgpt.com/g/g-p-6aa296e634348191b441d56fdab23b7b-codex-with-chatgpt/c/6aae79f7-d174-83ec-a704-2e3e4c662b47";
+    const bare = "https://chatgpt.com/g/g-p-6aa296e634348191b441d56fdab23b7b/c/6aae79f7-d174-83ec-a704-2e3e4c662b47";
+    const worker = await loadWorker(responseBody({ routeCanonical: slug }), {
+      oldRoute: slug,
+      transport: { routeCanonical: slug, routeVerification: "VERIFIED" },
+      fetch: async (url) => String(url).endsWith("/state")
+        ? jsonResponse(200, verifiedState({ routeCanonical: slug, companionId: OLD_COMPANION, bindingId: OLD_BINDING, epoch: OLD_EPOCH }))
+        : Promise.reject(new Error(`unexpected URL ${String(url)}`)),
+    });
+    const result = await worker.send({
+      type: "c2c.connect.page",
+      generation: 1,
+      safety: { composer: "empty", generation: "idle", safe: true },
+    }, { tab: { id: 7 }, documentId: "document-g4-rebind", frameId: 0, url: bare });
+    expect(result).toMatchObject({ ok: true, state: "CONNECTED", routeVerification: "VERIFIED" });
+    expect(worker.fetchMock.mock.calls.some(([url]) => String(url).includes("/rebind/init"))).toBe(false);
+    expect(worker.tabsSendMessage).not.toHaveBeenCalled();
+    expect(worker.local.values.get(TRANSPORT_KEY)).toMatchObject({ routeCanonical: slug, bindingId: OLD_BINDING, epoch: OLD_EPOCH });
+  });
+
   it("returns bounded cold_pair_required with no transport and rejects popup authority", async () => {
     const worker = await loadWorker(responseBody(), { noTransport: true });
     const sender = { tab: { id: 7 }, documentId: "document-g4-rebind", frameId: 0, url: ROUTE };

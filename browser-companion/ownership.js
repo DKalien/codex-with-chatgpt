@@ -1,3 +1,5 @@
+import { areChatgptConversationRoutesEquivalent } from "./route-esm.js";
+
 /**
  * Pure ownership reducer for Edge/Chromium MV3 companion.
  * Browser-safe: no Chrome APIs, no DOM. Injectable for unit tests.
@@ -105,7 +107,7 @@ export function observeDocument(state, observation, opts = {}) {
   }
   if (owner && sameDocument(owner, nextDoc)) {
     // same document route change invalidates
-    if (owner.canonicalRoute !== nextDoc.canonicalRoute) {
+    if (!areChatgptConversationRoutesEquivalent(owner.canonicalRoute, nextDoc.canonicalRoute)) {
       owner = null;
     } else {
       owner = { ...nextDoc };
@@ -132,7 +134,7 @@ export function bindOwner(state, observation, targetRoute) {
   if (observation.frameId !== undefined && observation.frameId !== 0) {
     return { ok: false, reason: "subframe_forbidden", state };
   }
-  if (observation.canonicalRoute !== targetRoute) {
+  if (!areChatgptConversationRoutesEquivalent(observation.canonicalRoute, targetRoute)) {
     return { ok: false, reason: "route_mismatch", state };
   }
   // second tab does not silently steal: require explicit bind which replaces owner
@@ -248,7 +250,7 @@ export function applyObserveOwnership(state, input) {
       next.owner
       && next.owner.tabId === tabId
       && next.owner.documentId === documentId
-      && next.owner.canonicalRoute !== canonicalRoute
+      && !areChatgptConversationRoutesEquivalent(next.owner.canonicalRoute, canonicalRoute)
     ) {
       next = invalidateOnRouteChange(next, tabId, documentId, canonicalRoute);
     }

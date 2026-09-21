@@ -16,6 +16,7 @@ import {
 } from "./composer-write-adapter.js";
 import { dispatchNativeSend } from "./send-click-adapter.js";
 import { resolveMutationCanonicalRoute } from "./write-probe.js";
+import { areChatgptConversationRoutesEquivalent } from "./route-esm.js";
 import { buildSendProbeMessage } from "./send-probe-message.js";
 
 function sleep(ms) {
@@ -77,7 +78,8 @@ export async function runRealSendProbe(doc, opts = {}) {
 
   const routeOk = () => {
     const r = resolveMutationCanonicalRoute(readHref(), parseRoute);
-    return r.ok === true && r.canonical === expectedRoute;
+    const expected = resolveMutationCanonicalRoute(expectedRoute, parseRoute);
+    return r.ok === true && expected.ok === true && (r.canonical === expected.canonical || areChatgptConversationRoutesEquivalent(r.canonical, expected.canonical));
   };
   const generationOk = () => {
     const g = getCurrentGeneration();

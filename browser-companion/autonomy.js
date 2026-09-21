@@ -1,3 +1,5 @@
+import { areChatgptConversationRoutesEquivalent } from "./route-esm.js";
+
 /**
  * E1b3d3b2 autonomous trigger policy + pure tick planner.
  * Browser-safe. No Chrome API, no DOM, no network, no credentials.
@@ -387,8 +389,8 @@ export function isExactOwnerHeartbeat(input) {
   if (!owner || owner.tabId == null || !owner.documentId) return false;
   if (tabId !== owner.tabId) return false;
   if (documentId !== owner.documentId) return false;
-  if (!canonicalRoute || canonicalRoute !== owner.canonicalRoute) return false;
-  if (transportRoute != null && canonicalRoute !== transportRoute) return false;
+  if (!canonicalRoute || !areChatgptConversationRoutesEquivalent(canonicalRoute, owner.canonicalRoute)) return false;
+  if (transportRoute != null && !areChatgptConversationRoutesEquivalent(canonicalRoute, transportRoute)) return false;
   return true;
 }
 
@@ -400,7 +402,7 @@ export function policyIdentityExact(policy, transport) {
   return (
     p.bindingId === transport.bindingId
     && p.epoch === transport.epoch
-    && p.routeCanonical === transport.routeCanonical
+    && areChatgptConversationRoutesEquivalent(p.routeCanonical, transport.routeCanonical)
   );
 }
 
@@ -416,7 +418,7 @@ export function disarmOnIdentityChange(policy, transport) {
   if (
     p.bindingId !== transport.bindingId
     || p.epoch !== transport.epoch
-    || p.routeCanonical !== transport.routeCanonical
+    || !areChatgptConversationRoutesEquivalent(p.routeCanonical, transport.routeCanonical)
   ) {
     return { policy: emptyAutonomyPolicy(), changed: true };
   }
@@ -460,14 +462,14 @@ export function evaluateAutonomyGates(input) {
   if (!owner || owner.documentId == null || owner.tabId == null) {
     return failGate("owner_missing");
   }
-  if (owner.canonicalRoute !== transport.routeCanonical) {
+  if (!areChatgptConversationRoutesEquivalent(owner.canonicalRoute, transport.routeCanonical)) {
     return failGate("owner_route_mismatch");
   }
   if (!evidence) return failGate("evidence_missing");
   if (evidence.documentId !== owner.documentId) {
     return failGate("evidence_document_mismatch");
   }
-  if (evidence.canonicalRoute !== transport.routeCanonical) {
+  if (!areChatgptConversationRoutesEquivalent(evidence.canonicalRoute, transport.routeCanonical)) {
     return failGate("evidence_route_mismatch");
   }
   if (evidence.safe !== true || evidence.composer !== "empty" || evidence.generation !== "idle") {

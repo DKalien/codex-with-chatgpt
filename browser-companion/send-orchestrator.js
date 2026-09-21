@@ -1,3 +1,5 @@
+import { areChatgptConversationRoutesEquivalent } from "./route-esm.js";
+
 /**
  * E1b3c pure Send orchestration — NOT runtime-loaded.
  * Browser-safe ESM. No Chrome API, no fetch, no storage, no credentials.
@@ -131,7 +133,7 @@ function requireJournalMatches(journal, expected) {
   if (expected.reservationId !== undefined && journal.reservationId !== expected.reservationId) {
     return "reservation_id_mismatch";
   }
-  if (expected.routeCanonical !== undefined && journal.routeCanonical !== expected.routeCanonical) {
+  if (expected.routeCanonical !== undefined && !areChatgptConversationRoutesEquivalent(journal.routeCanonical, expected.routeCanonical)) {
     return "route_mismatch";
   }
   if (expected.bindingId !== undefined && journal.bindingId !== expected.bindingId) {
@@ -219,7 +221,7 @@ function checkRouteFreshness(ctx, journal) {
   if (!current || typeof current !== "string" || current.length === 0) {
     return "route_unavailable";
   }
-  if (current !== journal.routeCanonical) {
+  if (!areChatgptConversationRoutesEquivalent(current, journal.routeCanonical)) {
     return "route_drift";
   }
   return null;

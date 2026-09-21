@@ -26,6 +26,9 @@ export class ChatGptRouteError extends Error {
 const LEGACY_CONVERSATION_ID = /^[A-Za-z0-9_-]{1,128}$/;
 const UUID_CONVERSATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const GPT_ID = /^g-[A-Za-z0-9_-]+$/;
+// ChatGPT Project routes may carry a UI slug after the stable 32-hex project id.
+// Only this observed shape is canonicalized; ordinary g-* routes remain exact.
+const PROJECT_GPT_ID = /^g-p-([0-9a-f]{32})(?:-[A-Za-z0-9_-]+)?$/i;
 const HOSTS = new Set(["chatgpt.com", "www.chatgpt.com"]);
 // /c/<id> or /g/g-<id>/c/<id>
 const PATH_RE = /^\/(?:g\/(g-[A-Za-z0-9_-]+)\/)?c\/([A-Za-z0-9_-]+)\/?$/;
@@ -99,14 +102,16 @@ export function parseChatgptConversationRoute(
   if (gptRaw !== undefined && !GPT_ID.test(gptRaw)) {
     throw new ChatGptRouteError("GPT id 无效");
   }
-  const path = gptRaw
-    ? `/g/${gptRaw}/c/${conversationId}`
+  const projectMatch = gptRaw ? PROJECT_GPT_ID.exec(gptRaw) : undefined;
+  const canonicalGptId = projectMatch ? `g-p-${projectMatch[1]!.toLowerCase()}` : gptRaw;
+  const path = canonicalGptId
+    ? `/g/${canonicalGptId}/c/${conversationId}`
     : `/c/${conversationId}`;
   const canonical = `https://chatgpt.com${path}`;
   return {
     canonical,
     conversationId,
-    ...(gptRaw ? { gptId: gptRaw } : {}),
+    ...(canonicalGptId ? { gptId: canonicalGptId } : {}),
     kind: gptRaw ? "gpt-conversation" : "conversation",
   };
 }
@@ -117,6 +122,15 @@ export function normalizeChatgptConversationRoute(raw: string): string {
     allowQueryOrHash: false,
     conversationIdPolicy: "uuid",
   }).canonical;
+}
+
+/** Strict route identity comparison; invalid routes are never equivalent. */
+export function areChatgptConversationRoutesEquivalent(left: string, right: string): boolean {
+  try {
+    return normalizeChatgptConversationRoute(left) === normalizeChatgptConversationRoute(right);
+  } catch {
+    return false;
+  }
 }
 
 /** Web-control facing: preserve historical query/hash strip + legacy id charset. */

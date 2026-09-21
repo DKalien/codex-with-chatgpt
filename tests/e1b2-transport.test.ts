@@ -178,6 +178,15 @@ describe("reservation journal + eligibility", () => {
     expect(() => assertNoForbiddenFields({ reservedBy: "x" })).toThrow(/forbidden/);
     expect(() => assertNoForbiddenFields({ inFlight: { eventId: "e", reservationId: "r" } })).not.toThrow();
   });
+
+  it("accepts strict equivalent Project route aliases without relaxing identity fields", () => {
+    const slug = "https://chatgpt.com/g/g-p-6aa296e634348191b441d56fdab23b7b-codex-with-chatgpt/c/6aae79f7-d174-83ec-a704-2e3e4c662b47";
+    const bare = "https://chatgpt.com/g/g-p-6aa296e634348191b441d56fdab23b7b/c/6aae79f7-d174-83ec-a704-2e3e4c662b47";
+    const persisted = { workspaceId: "w", bindingId: "b", epoch: 1, companionId: "c", routeCanonical: slug };
+    expect(validateStateIdentity(persisted, { ...persisted, routeCanonical: bare }).ok).toBe(true);
+    expect(validateStateIdentity(persisted, { ...persisted, routeCanonical: bare.replace("6aae79f7", "7aae79f7") }).ok).toBe(false);
+    expect(validateStateIdentity(persisted, { ...persisted, routeCanonical: "not-a-route" }).ok).toBe(false);
+  });
 });
 
 describe("server /state inFlight recovery projection", () => {

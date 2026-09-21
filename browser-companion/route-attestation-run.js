@@ -14,6 +14,7 @@ import {
   writeCanonicalMessage,
   verifyCanonicalComposer,
 } from "./composer-write-adapter.js";
+import { areChatgptConversationRoutesEquivalent } from "./route-esm.js";
 import { dispatchNativeSend } from "./send-click-adapter.js";
 import { resolveMutationCanonicalRoute } from "./write-probe.js";
 import {
@@ -74,7 +75,8 @@ export async function runRouteAttestationSend(doc, opts = {}) {
 
   const routeOk = () => {
     const r = resolveMutationCanonicalRoute(readHref(), parseRoute);
-    return r.ok === true && r.canonical === expectedRoute;
+    const expected = resolveMutationCanonicalRoute(expectedRoute, parseRoute);
+    return r.ok === true && expected.ok === true && (r.canonical === expected.canonical || areChatgptConversationRoutesEquivalent(r.canonical, expected.canonical));
   };
   const generationOk = () => {
     const g = getCurrentGeneration();

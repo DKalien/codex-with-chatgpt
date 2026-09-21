@@ -492,7 +492,7 @@ export function evaluateReserveEligibility(input) {
   }
   if (!isOwner) return { ok: false, reason: "not_owner" };
   if (!documentId) return { ok: false, reason: "document_id_unavailable" };
-  if (!ownerRoute || !pairedRoute || ownerRoute !== pairedRoute) {
+  if (!ownerRoute || !pairedRoute || !areChatgptConversationRoutesEquivalent(ownerRoute, pairedRoute)) {
     return { ok: false, reason: "route_mismatch" };
   }
   if (!evidence || typeof evidence.observedAt !== "number") {
@@ -501,7 +501,7 @@ export function evaluateReserveEligibility(input) {
   if (evidence.documentId !== documentId) {
     return { ok: false, reason: "evidence_document_mismatch" };
   }
-  if (evidence.canonicalRoute !== ownerRoute) {
+  if (!areChatgptConversationRoutesEquivalent(evidence.canonicalRoute, ownerRoute)) {
     return { ok: false, reason: "evidence_route_mismatch" };
   }
   const age = now - evidence.observedAt;
@@ -520,14 +520,20 @@ export function evaluateReserveEligibility(input) {
   return { ok: true, routeCanonical: ownerRoute };
 }
 
+import { areChatgptConversationRoutesEquivalent } from "./route-esm.js";
+
 /** Validate authenticated /state identity vs persisted transport. */
 export function validateStateIdentity(persisted, body) {
   if (!persisted || !body) return { ok: false, reason: "identity_missing" };
   const keys = ["workspaceId", "bindingId", "epoch", "companionId", "routeCanonical"];
   for (const key of keys) {
+    if (key === "routeCanonical") continue;
     if (persisted[key] !== body[key]) {
       return { ok: false, reason: `identity_mismatch:${key}` };
     }
+  }
+  if (!areChatgptConversationRoutesEquivalent(persisted.routeCanonical, body.routeCanonical)) {
+    return { ok: false, reason: "identity_mismatch:routeCanonical" };
   }
   return { ok: true };
 }

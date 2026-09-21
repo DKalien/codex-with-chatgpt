@@ -1,3 +1,5 @@
+import { areChatgptConversationRoutesEquivalent } from "./route-esm.js";
+
 /**
  * E1b3d1 pure shadow RPC contract helpers (SW-only, not content-script).
  * Browser-safe ESM. No Chrome APIs, no DOM, no fetch.
@@ -23,7 +25,7 @@ export function buildShadowInspectRequest(owner, transport) {
   if (transport.authStale) {
     return { ok: false, reason: "auth_stale" };
   }
-  if (owner.canonicalRoute !== transport.routeCanonical) {
+  if (!areChatgptConversationRoutesEquivalent(owner.canonicalRoute, transport.routeCanonical)) {
     return { ok: false, reason: "owner_route_mismatch" };
   }
   return {
@@ -51,10 +53,10 @@ export function validateShadowInspectResponse(response, owner, transport) {
   }
   const route = transport?.routeCanonical;
   if (!route) return { ok: false, reason: "auth_stale" };
-  if (response.canonicalRoute !== route) {
+  if (!areChatgptConversationRoutesEquivalent(response.canonicalRoute, route)) {
     return { ok: false, reason: "shadow_route_mismatch" };
   }
-  if (response.documentCanonicalRoute && response.documentCanonicalRoute !== route) {
+  if (response.documentCanonicalRoute && !areChatgptConversationRoutesEquivalent(response.documentCanonicalRoute, route)) {
     return { ok: false, reason: "shadow_route_mismatch" };
   }
   if (typeof owner?.generation === "number") {

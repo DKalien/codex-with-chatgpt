@@ -27,6 +27,34 @@ describe("ChatGPT route parser", () => {
     expect(parsed.conversationId).toBe(UUID);
   });
 
+  it("canonicalizes observed Project bare-id and slug aliases", () => {
+    const projectId = "6aa296e634348191b441d56fdab23b7b";
+    const bare = `https://chatgpt.com/g/g-p-${projectId}/c/${UUID}`;
+    const slugged = `https://chatgpt.com/g/g-p-${projectId}-codex-with-chatgpt/c/${UUID}`;
+    expect(normalizeChatgptConversationRoute(bare)).toBe(bare);
+    expect(normalizeChatgptConversationRoute(slugged)).toBe(bare);
+    expect(parseChatgptConversationRoute(slugged, { conversationIdPolicy: "uuid" }).gptId)
+      .toBe(`g-p-${projectId}`);
+  });
+
+  it("keeps different Project ids and conversations distinct", () => {
+    const project = "6aa296e634348191b441d56fdab23b7b";
+    const otherProject = "7bb307f745459292c552e67efbc34c8c";
+    const first = `https://chatgpt.com/g/g-p-${project}/c/${UUID}`;
+    expect(normalizeChatgptConversationRoute(`https://chatgpt.com/g/g-p-${otherProject}-slug/c/${UUID}`)).not.toBe(first);
+    expect(normalizeChatgptConversationRoute(`https://chatgpt.com/g/g-p-${project}-slug/c/22222222-2222-4222-8222-222222222222`)).not.toBe(first);
+  });
+
+  it("does not strip suffixes from ordinary g-* routes", () => {
+    const raw = `https://chatgpt.com/g/g-6aa296e634348191b441d56fdab23b7b-codex-with-chatgpt/c/${UUID}`;
+    expect(normalizeChatgptConversationRoute(raw)).toBe(raw);
+  });
+
+  it("does not treat malformed Project-like ids as aliases", () => {
+    const raw = `https://chatgpt.com/g/g-p-6aa296e634348191b441d56fdab23b7-codex-with-chatgpt/c/${UUID}`;
+    expect(normalizeChatgptConversationRoute(raw)).toBe(raw);
+  });
+
   it("rejects malformed host/protocol/path", () => {
     expect(() => normalizeChatgptConversationRoute(`https://chat.openai.com/c/${UUID}`)).toThrow(ChatGptRouteError);
     expect(() => normalizeChatgptConversationRoute(`http://chatgpt.com/c/${UUID}`)).toThrow(ChatGptRouteError);

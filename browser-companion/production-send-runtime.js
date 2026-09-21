@@ -10,6 +10,7 @@ import {
 } from "./send-orchestrator.js";
 import { resolveChatGptAction, resolveChatGptComposer } from "./dom-adapter.js";
 import { readCanonicalComposerText } from "./composer-write-adapter.js";
+import { areChatgptConversationRoutesEquivalent } from "./route-esm.js";
 
 function psFail(reason, extra = {}) {
   return { ok: false, reason, ...extra };
@@ -108,7 +109,7 @@ export function productionLocalPreflight(input) {
   } catch {
     return psFail("route_unavailable");
   }
-  if (route !== expectedRoute) {
+  if (!areChatgptConversationRoutesEquivalent(route, expectedRoute)) {
     return psFail("route_drift");
   }
   let generation;
@@ -214,7 +215,7 @@ function buildFencedCtx(ctx) {
   const routeOk = () => {
     if (typeof getCurrentRoute !== "function") return false;
     try {
-      return getCurrentRoute() === expectedRoute;
+      return areChatgptConversationRoutesEquivalent(getCurrentRoute(), expectedRoute);
     } catch {
       return false;
     }
@@ -392,7 +393,7 @@ export async function recoverProductionSend(ctx) {
           const getCurrentRoute = ctx.getCurrentRoute;
           const getCurrentGeneration = ctx.getCurrentGeneration;
           try {
-            if (getCurrentRoute() !== ctx.expectedRoute) return false;
+            if (!areChatgptConversationRoutesEquivalent(getCurrentRoute(), ctx.expectedRoute)) return false;
             const g = getCurrentGeneration();
             return Number.isFinite(g) && Number(g) === Number(ctx.expectedGeneration);
           } catch {
@@ -402,7 +403,7 @@ export async function recoverProductionSend(ctx) {
         findCanonicalUserTurn: (doc, input = {}) => {
           try {
             if (
-              ctx.getCurrentRoute() !== ctx.expectedRoute
+              !areChatgptConversationRoutesEquivalent(ctx.getCurrentRoute(), ctx.expectedRoute)
               || Number(ctx.getCurrentGeneration()) !== Number(ctx.expectedGeneration)
             ) {
               return { ok: false, reason: "observation_fence_failed" };

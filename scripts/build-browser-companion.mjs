@@ -38,6 +38,7 @@ function toGlobalScript(esm) {
     .replace(/^export\s+const\s+/gm, "const ");
   body += `
 ;globalThis.parseChatgptConversationRoute = parseChatgptConversationRoute;
+globalThis.areChatgptConversationRoutesEquivalent = areChatgptConversationRoutesEquivalent;
 globalThis.normalizeChatgptConversationRoute = normalizeChatgptConversationRoute;
 globalThis.normalizeControlConversationUrl = normalizeControlConversationUrl;
 globalThis.isChatgptConversationRoute = isChatgptConversationRoute;
@@ -146,7 +147,20 @@ const writeAdapterBody = stripExports(
 );
 const writeAdapterClassic = `// classic write-only runtime capability (E1b3d2a)
 (function () {
+const areChatgptConversationRoutesEquivalent = globalThis.areChatgptConversationRoutesEquivalent || ((left, right) => {
+  const resolve = globalThis.__c2cResolveMutationCanonicalRoute;
+  if (typeof resolve === "function") {
+    const parser = globalThis.parseChatgptConversationRoute;
+    const a = resolve(left, parser);
+    const b = resolve(right, parser);
+    return a.ok === true && b.ok === true && a.canonical === b.canonical;
+  }
+  const parser = globalThis.parseChatgptConversationRoute;
+  if (typeof parser !== "function") return false;
+  try { return parser(left, { conversationIdPolicy: "uuid" }).canonical === parser(right, { conversationIdPolicy: "uuid" }).canonical; } catch { return false; }
+});
 ${writeProbeSrc
+  .replace(/^import\s+.*?;\s*$/gm, "")
   .replace(/^export\s+const\s+/gm, "const ")
   .replace(/^export\s+function\s+/gm, "function ")}
 ${writeAdapterBody}
@@ -188,6 +202,11 @@ const clickBody = stripExports(
 // so free names like readCanonicalComposerText are not classic globals.
 const clickClassic = `// classic runtime click capability (E1b3d3a)
 (function () {
+const areChatgptConversationRoutesEquivalent = globalThis.areChatgptConversationRoutesEquivalent || ((left, right) => {
+  const parser = globalThis.parseChatgptConversationRoute;
+  if (typeof parser !== "function") return false;
+  try { return parser(left, { conversationIdPolicy: "uuid" }).canonical === parser(right, { conversationIdPolicy: "uuid" }).canonical; } catch { return false; }
+});
 const resolveChatGptComposer = globalThis.resolveChatGptComposer;
 const resolveChatGptAction = globalThis.resolveChatGptAction;
 const normalizeCanonicalDomText = globalThis.normalizeCanonicalDomText;
@@ -261,6 +280,7 @@ const probeRunBody = stripExports(probeRun);
 // so free names like writeCanonicalMessage are no longer classic globals.
 const probeRunClassic = `// classic one-shot send probe runner (E1b3d3a)
 (function () {
+const areChatgptConversationRoutesEquivalent = globalThis.areChatgptConversationRoutesEquivalent || ((left, right) => { if (left === right) return true; const resolve = globalThis.__c2cResolveMutationCanonicalRoute; const parser = globalThis.parseChatgptConversationRoute; if (typeof resolve !== "function" || typeof parser !== "function") return false; const a = resolve(left, parser), b = resolve(right, parser); return a.ok === true && b.ok === true && a.canonical === b.canonical; });
 const resolveChatGptComposer = globalThis.resolveChatGptComposer;
 const resolveChatGptAction = globalThis.resolveChatGptAction;
 const normalizeCanonicalDomText = globalThis.normalizeCanonicalDomText;
@@ -331,6 +351,11 @@ if (/\.click\(\)/.test(productionRuntimeCode)) {
 }
 const productionClassic = `// classic production one-shot send runtime (E1b3d3b)
 (function () {
+const areChatgptConversationRoutesEquivalent = globalThis.areChatgptConversationRoutesEquivalent || ((left, right) => {
+  const parser = globalThis.parseChatgptConversationRoute;
+  if (typeof parser !== "function") return false;
+  try { return parser(left, { conversationIdPolicy: "uuid" }).canonical === parser(right, { conversationIdPolicy: "uuid" }).canonical; } catch { return false; }
+});
 ${stripExports(reservationJournalSrc)}
 ${stripExports(sendOrchestratorSrc)}
 ${stripExports(productionRuntimeSrc)}
@@ -407,6 +432,11 @@ assertClassicArtifact(path.join(distCompanion, "route-attestation-global.js"), "
 
 const routeAttestRunClassic = `// classic route-attestation one-shot runner (G3) — protocol semantics unchanged
 (function () {
+const areChatgptConversationRoutesEquivalent = globalThis.areChatgptConversationRoutesEquivalent || ((left, right) => {
+  const parser = globalThis.parseChatgptConversationRoute;
+  if (typeof parser !== "function") return false;
+  try { return parser(left, { conversationIdPolicy: "uuid" }).canonical === parser(right, { conversationIdPolicy: "uuid" }).canonical; } catch { return false; }
+});
 const resolveChatGptComposer = globalThis.resolveChatGptComposer;
 const resolveChatGptAction = globalThis.resolveChatGptAction;
 const normalizeCanonicalDomText = globalThis.normalizeCanonicalDomText;
