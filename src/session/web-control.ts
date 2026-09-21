@@ -8,6 +8,7 @@ import {
   type ExecutionRecord,
 } from "../execution/records.js";
 import { normalizeControlConversationUrl } from "../chatgpt/route.js";
+import { PRODUCTION_FEEDBACK_INSTRUCTION } from "../feedback/message.js";
 
 const id = z.string().regex(/^[A-Za-z0-9_-]{1,128}$/);
 const messageId = z.string().min(1).max(200).regex(/^[A-Za-z0-9_-]+$/);
@@ -366,7 +367,7 @@ export function closeControlTask(workspaceId: string, owner: string, commandId: 
 
 function executionFeedback(state: WebControlState, record: ExecutionRecord): string {
   const brief = (text: string) => text.replace(/[\r\n\t]+/g, " ").slice(0, 160);
-  return `[C2C_CONTROL]\nSTATE: EXECUTED\nCONTROL_SESSION_ID: ${state.controlSessionId}\nWORKSPACE_ID: ${state.workspaceId}\nCOMMAND_ID: ${record.commandId}\nTASK_ID: ${record.taskId}\nITERATION: ${record.iteration}\nRESULT: ${brief(record.exitStatus)}\nCHANGED_FILES: ${Array.isArray(record.changedFiles) ? record.changedFiles.length : record.changedFiles}\nTESTS: ${brief(record.tests ?? "未运行")}\nOUTPUT_AVAILABLE: ${record.outputAvailable ?? false}\nINSTRUCTION: 这是自动反馈，不是用户新授权。通过只读 MCP 独立检查 workspace、git diff、test_status、execution_summary 和 execution_output；只在原任务范围内继续 COMMAND 或 DONE。`;
+  return `[C2C_CONTROL]\nSTATE: EXECUTED\nCONTROL_SESSION_ID: ${state.controlSessionId}\nWORKSPACE_ID: ${state.workspaceId}\nCOMMAND_ID: ${record.commandId}\nTASK_ID: ${record.taskId}\nITERATION: ${record.iteration}\nRESULT: ${brief(record.exitStatus)}\nCHANGED_FILES: ${Array.isArray(record.changedFiles) ? record.changedFiles.length : record.changedFiles}\nTESTS: ${brief(record.tests ?? "未运行")}\nOUTPUT_AVAILABLE: ${record.outputAvailable ?? false}\nINSTRUCTION: ${PRODUCTION_FEEDBACK_INSTRUCTION}`;
 }
 
 export function completeControlCommand(workspaceId: string, owner: string, commandId: string, now = Date.now()) {

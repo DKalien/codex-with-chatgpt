@@ -62,6 +62,11 @@ describe("production feedback message formatter", () => {
     expect(message).toContain("TESTS: 2 passed");
     expect(message).toContain("OUTPUT_AVAILABLE: true");
     expect(message).toContain(`INSTRUCTION: ${PRODUCTION_FEEDBACK_INSTRUCTION}`);
+    expect(PRODUCTION_FEEDBACK_INSTRUCTION).toContain("既定项目目标、开发计划或当前 handoff 内继续下一步");
+    expect(PRODUCTION_FEEDBACK_INSTRUCTION).toContain("不是用户新授权");
+    expect(PRODUCTION_FEEDBACK_INSTRUCTION).toContain("需要用户明确授权的动作必须停止并请求授权");
+    expect(PRODUCTION_FEEDBACK_INSTRUCTION).not.toContain("只在原任务范围内继续 COMMAND 或 DONE");
+    expect(PRODUCTION_FEEDBACK_INSTRUCTION).not.toMatch(/[\r\n]/);
     expect(message).not.toContain("principalFingerprint");
     expect(message).not.toContain("reservedBy");
     expect(message).not.toContain("targetBindingId");

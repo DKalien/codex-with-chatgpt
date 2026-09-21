@@ -7,7 +7,7 @@ import type { FeedbackEvent } from "./store.js";
  */
 
 export const PRODUCTION_FEEDBACK_INSTRUCTION =
-  "这是自动反馈，不是用户新授权。通过只读 MCP 独立检查 workspace、git diff、test_status、execution_summary 和 execution_output；只在原任务范围内继续 COMMAND 或 DONE。";
+  "这是自动反馈，不是用户新授权。先通过只读 MCP 独立检查 workspace、git diff、test_status、execution_summary 和 execution_output；当前任务需修复或补测则继续相关 COMMAND，已完成则可在既定项目目标、开发计划或当前 handoff 内继续下一步，无下一步则 DONE；任何需要用户明确授权的动作必须停止并请求授权。";
 
 const MAX_TESTS_CHARS = 200;
 const MAX_CHANGED_FILES_LISTED = 12;

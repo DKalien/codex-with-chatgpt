@@ -27,6 +27,7 @@ import {
   type SavedSession,
 } from "../src/session/state.js";
 import { cleanup, makeTmpDir } from "./helpers.js";
+import { PRODUCTION_FEEDBACK_INSTRUCTION } from "../src/feedback/message.js";
 
 const WORKSPACE_ID = "phase-a-feedback";
 const CHAT_URL = "https://chatgpt.com/c/phase-a-chat";
@@ -307,6 +308,7 @@ describe("feedback pending/sent 状态机", () => {
     const first = recoverControlCommand(WORKSPACE_ID, OWNER, "command-1", NOW + 6);
     const second = recoverControlCommand(WORKSPACE_ID, OWNER, "command-1", NOW + 7);
     expect(first.feedback).toContain("STATE: EXECUTED");
+    expect(first.feedback).toContain(`INSTRUCTION: ${PRODUCTION_FEEDBACK_INSTRUCTION}`);
     expect(second.feedback).toBe(first.feedback);
     expect(second.feedbackMessageId).toBeUndefined();
     expect(listPendingControlFeedback(WORKSPACE_ID, NOW + 8)).toHaveLength(1);
