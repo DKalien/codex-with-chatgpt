@@ -124,7 +124,8 @@ def _catalog_asar_header(value: Any) -> tuple[int, int, int, int]:
         raise _CatalogError("catalog asar header bounds")
     version, header_size, json_offset, json_size = value
     if (version != 4 or header_size < 16 or json_size <= 0
-            or header_size != json_offset + 4 or json_offset != json_size + 7):
+            or header_size != json_offset + 4
+            or json_offset not in {json_size + 7, json_size + 4}):
         raise _CatalogError("catalog asar header layout")
     if json_offset > header_size or header_size - json_size > 64:
         raise _CatalogError("catalog asar header layout")
@@ -238,6 +239,7 @@ def _legacy_runtime_for_pair(desktop_version: str, app_server_version: str) -> d
 VERIFIED_RUNTIME = _legacy_runtime_for_pair("26.903.9818.0", "0.153.4")
 VERIFIED_RUNTIME_26_908 = _legacy_runtime_for_pair("26.908.4834.0", "0.154.0-alpha.6.2")
 VERIFIED_RUNTIME_26_908_9136 = _legacy_runtime_for_pair("26.908.9136.0", "0.154.0-alpha.6.2")
+VERIFIED_RUNTIME_26_915 = _legacy_runtime_for_pair("26.915.4065.0", "0.155.0-alpha.9.2")
 
 
 def _safe_compatibility(value: Any = None) -> dict[str, Any]:
@@ -991,6 +993,7 @@ def _static_file_version(path: str) -> str | None:
     markers = (
         b"standalone local buildversion: ",
         b"standalonelocal buildversion: ",
+        b"standalonenpmbunpnpmvite+brewlocal buildversion: ",
     )
     # Exact delimiters observed in audited binaries (space vs newline before platform).
     delimiters = (
@@ -1158,12 +1161,12 @@ def _asar_audit_modules(desktop_exe: str) -> tuple[list[int], dict[str, list[dic
             version, header_size, json_offset, json_size = layout
             if (version != 4 or header_size < 16 or header_size > _MAX_ASAR_HEADER_BYTES
                     or json_size <= 0 or header_size != json_offset + 4
-                    or json_offset != json_size + 7):
+                    or json_offset not in {json_size + 7, json_size + 4}):
                 raise _AsarAuditError("asar header layout")
             tree_start = 16
             tree_end = tree_start + json_size
             data_start = 8 + header_size
-            if tree_end > file_size or data_start > file_size:
+            if tree_end > data_start or data_start > file_size:
                 raise _AsarAuditError("asar header bounds")
             stream.seek(tree_start)
             raw_tree = stream.read(json_size)
@@ -1213,14 +1216,21 @@ def _asar_audit_modules(desktop_exe: str) -> tuple[list[int], dict[str, list[dic
                     candidate_bytes += size
                     stream.seek(start)
                     digest = hashlib.sha256()
+                    fingerprint_data = bytearray()
                     remaining = size
                     while remaining:
                         chunk = stream.read(min(1024 * 1024, remaining))
                         if not chunk:
                             raise _AsarAuditError("asar module truncated")
                         digest.update(chunk)
+                        if role == "ipc-main":
+                            fingerprint_data.extend(chunk)
                         remaining -= len(chunk)
-                    candidates[role].append({"role": role, "path": prefix, "sha256": digest.hexdigest()})
+                    row = {"role": role, "path": prefix, "sha256": digest.hexdigest()}
+                    if role == "ipc-main":
+                        row["_protocolFingerprint"] = all(marker in fingerprint_data
+                                                           for marker in _AUDIT_IPC_FINGERPRINT)
+                    candidates[role].append(row)
                     return
                 if not isinstance(files, dict) or len(files) > _MAX_ASAR_TREE_NODES:
                     raise _AsarAuditError("asar files")
@@ -1252,7 +1262,9 @@ def _safe_audit_modules(value: Any) -> list[dict[str, str]]:
     seen_roles: set[str] = set()
     seen_paths: set[str] = set()
     for item in value:
-        if not isinstance(item, dict) or set(item) != {"role", "path", "sha256"}:
+        if (not isinstance(item, dict)
+                or set(item) not in ({"role", "path", "sha256"},
+                                     {"role", "path", "sha256", "_protocolFingerprint"})):
             continue
         role, path, digest = item["role"], item["path"], item["sha256"]
         pattern = _MODULE_PATH_PATTERNS.get(role) if isinstance(role, str) else None
@@ -1336,6 +1348,17 @@ def _profiles_for_app_server_version(version: str | None) -> list[tuple[str, tup
             if any(runtime.get("appServerVersion") == version for runtime in runtimes)]
 
 
+_AUDIT_IPC_FINGERPRINT = (
+    b"thread-owner-discovery",
+    b"thread-stream-following-changed",
+    b"thread-follower-start-turn",
+    b"handledByClientId",
+    b"sourceClientId",
+    b"targetClientIds",
+    b"conversationId",
+)
+
+
 def _compatibility_audit_for_paths(desktop_exe: str, app_server_exe: str) -> dict[str, Any]:
     observed = _observe_runtime_versions(desktop_exe, app_server_exe)
     app_server_sha256 = observed.get("appServerSha256")
@@ -1364,7 +1387,19 @@ def _compatibility_audit_for_paths(desktop_exe: str, app_server_exe: str) -> dic
 
     matches = _profiles_for_app_server_version(observed.get("observedAppServerVersion"))
     if not matches:
-        return _audit_result(observed, classification="protocol_drift_or_unknown", app_server_sha256=app_server_sha256)
+        try:
+            asar_header, candidates = _asar_audit_modules(desktop_exe)
+            ipc = [item for item in candidates.get("ipc-main", []) if item.get("_protocolFingerprint") is True]
+            webview = candidates.get("webview-bootstrap", [])
+            modules = [*ipc, *webview] if len(ipc) == 1 and len(webview) == 1 else []
+            classification = "protocol_drift_or_unknown"
+            if len(ipc) > 1 or len(webview) > 1:
+                classification = "ambiguous"
+            return _audit_result(observed, classification=classification, app_server_sha256=app_server_sha256,
+                                 asar_header=asar_header, modules=modules)
+        except _AsarAuditError:
+            return _audit_result(observed, classification="protocol_drift_or_unknown",
+                                 app_server_sha256=app_server_sha256)
     known_desktop_versions = {
         runtime.get("desktopVersion") for runtimes in VERIFIED_PROFILES.values() for runtime in runtimes
     }
@@ -1387,13 +1422,13 @@ def _compatibility_audit_for_paths(desktop_exe: str, app_server_exe: str) -> dic
         return _audit_result(observed, classification=classification, candidate_profile=name,
                              app_server_sha256=app_server_sha256, asar_header=asar_header,
                              modules=webview_candidates)
-    trusted_hashes = {
-        module.get("sha256")
-        for runtime in runtimes
-        for module in _runtime_module_rows(runtime)
-        if module.get("role") == "ipc-main"
-    }
-    trusted_ipc = [module for module in ipc_candidates if module.get("sha256") in trusted_hashes]
+    trusted_ipc = [module for module in ipc_candidates
+                   if module.get("sha256") in {
+                       runtime_module.get("sha256")
+                       for runtime in runtimes
+                       for runtime_module in _runtime_module_rows(runtime)
+                       if runtime_module.get("role") == "ipc-main"
+                   }]
     if len(trusted_ipc) != 1:
         classification = "ambiguous" if len(trusted_ipc) > 1 else "protocol_drift_or_unknown"
         return _audit_result(observed, classification=classification, candidate_profile=name,
@@ -1509,7 +1544,8 @@ def _verify_project(target: dict[str, str]) -> None:
         raise _error("DESKTOP_PROJECT_MISMATCH")
 
 
-def _verify_runtime(pipe: _Pipe, target: dict[str, str], expected: dict[str, Any] | None = None) -> dict[str, Any]:
+def _verify_runtime_identity(pipe: _Pipe, target: dict[str, str], expected: dict[str, Any] | None = None,
+                             *, require_catalog: bool = False) -> dict[str, Any]:
     pipe.verify_server()
     rows = _processes()
     server = next((row for row in rows if row["pid"] == pipe.server_pid), None)
@@ -1521,7 +1557,8 @@ def _verify_runtime(pipe: _Pipe, target: dict[str, str], expected: dict[str, Any
     if len(children) != 1 or not children[0]["exe"] or children[0]["creation"] <= 0:
         raise _error("DESKTOP_PROCESS_CHANGED")
     app_server = children[0]
-    version = _runtime_version(server["exe"], app_server["exe"])
+    version = (_runtime_version(server["exe"], app_server["exe"])
+               if require_catalog else _observe_runtime_versions(server["exe"], app_server["exe"]))
     if expected and (
         expected["desktopPid"] != pipe.server_pid
         or expected["appServerPid"] != app_server["pid"]
@@ -1539,6 +1576,10 @@ def _verify_runtime(pipe: _Pipe, target: dict[str, str], expected: dict[str, Any
         "appServerExe": app_server["exe"],
         "appServerCreation": app_server["creation"],
     }
+
+
+def _verify_runtime(pipe: _Pipe, target: dict[str, str], expected: dict[str, Any] | None = None) -> dict[str, Any]:
+    return _verify_runtime_identity(pipe, target, expected, require_catalog=True)
 
 
 def _runtime_process_pair() -> tuple[str, str] | None:
@@ -1611,6 +1652,8 @@ class _IpcClient:
         self.states: dict[str, tuple[dict[str, Any], int, float]] = {}
         self.snapshot_serial = 0
         self.snapshot_meta: dict[str, tuple[int, float]] = {}
+        self.following_changed_sent = False
+        self.state_change_kind: str | None = None
 
     def _envelope(self, method: str, params: dict[str, Any], target: str | None = None) -> dict[str, Any]:
         if method not in REQUEST_VERSIONS:
@@ -1676,11 +1719,13 @@ class _IpcClient:
             self.snapshot_serial += 1
             self.snapshot_meta[source] = (self.snapshot_serial, now)
             self.states[source] = (copy.deepcopy(state), revision, now)
+            self.state_change_kind = "snapshot"
         elif change_type == "patches" and old:
             revision = change.get("revision")
             if change.get("baseRevision") != old[1] or type(revision) is not int or revision <= old[1] or not isinstance(change.get("patches"), list):
                 raise _error("DESKTOP_STATE_UNAVAILABLE")
             self.states[source] = (_patch_state(old[0], change["patches"]), revision, now)
+            self.state_change_kind = "patches"
 
     def _pump(self, timeout: float) -> None:
         try:
@@ -1771,6 +1816,7 @@ class _IpcClient:
             "targetClientIds": [self.owner],
             "params": {"conversationId": self.thread_id, "hostId": self.host_id, "following": True},
         }))
+        self.following_changed_sent = True
         deadline = time.monotonic() + SNAPSHOT_TIMEOUT_SECONDS
         while self.snapshot_meta.get(self.owner, (0, 0.0))[0] <= previous:
             remaining = deadline - time.monotonic()
@@ -2105,6 +2151,53 @@ def _prepare(target: dict[str, str], *, allow_active: bool = False,
     except (OSError, ValueError, TypeError, KeyError):
         pipe.close()
         raise _error("DESKTOP_INTERNAL_ERROR")
+
+
+def _handshake_audit(workspace_root: Any) -> dict[str, Any]:
+    """只读 live handshake；不要求 catalog trust，也不发送 start-turn。"""
+    target = _current_target(workspace_root)
+    _query_standard_token()
+    pipe = _Pipe()
+    session: _IpcClient | None = None
+    try:
+        before = _verify_runtime_identity(pipe, target, require_catalog=False)
+        audit = _compatibility_audit_for_paths(before["desktopExe"], before["appServerExe"])
+        modules = audit.get("modules", [])
+        if (audit.get("classification") not in {"protocol_drift_or_unknown", "same_protocol_candidate", "current"}
+                or len(modules) != 2
+                or {item.get("role") for item in modules} != {"ipc-main", "webview-bootstrap"}):
+            raise _error("DESKTOP_STATE_UNAVAILABLE")
+        session = _IpcClient(pipe, target["threadId"], target["hostId"])
+        session.initialize()
+        owner = session.discover()
+        state = session.snapshot()
+        if not isinstance(state, dict):
+            raise _error("DESKTOP_STATE_UNAVAILABLE")
+        after = _verify_runtime_identity(pipe, target, before, require_catalog=False)
+        after_audit = _compatibility_audit_for_paths(after["desktopExe"], after["appServerExe"])
+        if (before["desktopPid"] != after["desktopPid"] or before["appServerPid"] != after["appServerPid"]
+                or before["desktopCreation"] != after["desktopCreation"]
+                or before["appServerCreation"] != after["appServerCreation"]
+                or tuple(before.get(key) for key in ("observedDesktopVersion", "observedAppServerVersion", "appServerSha256")) !=
+                   tuple(after.get(key) for key in ("observedDesktopVersion", "observedAppServerVersion", "appServerSha256"))
+                or after_audit.get("modules") != audit.get("modules")
+                or after_audit.get("asarHeader") != audit.get("asarHeader")):
+            raise _error("DESKTOP_PROCESS_CHANGED")
+        return {
+            "processStable": True,
+            "runtimeStable": True,
+            "protocolClassification": audit.get("classification"),
+            "initialize": True,
+            "ownerDiscovery": bool(owner),
+            "followingChangedSent": session.following_changed_sent,
+            "stateReceived": session.state_change_kind in {"snapshot", "patches"},
+            "stateChange": session.state_change_kind,
+        }
+    finally:
+        if session is not None:
+            session.pipe.close()
+        else:
+            pipe.close()
 
 
 def _current_identity_checked(workspace_root: Any) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -2552,6 +2645,10 @@ def _main() -> int:
                 if set(request) != {"id", "op"} or prepared is not None:
                     raise _error("DESKTOP_INVALID_REQUEST")
                 _reply({"id": request_id, "ok": True, "value": _compatibility_audit()})
+            elif op == "handshake_audit":
+                if set(request) != {"id", "op", "workspaceRoot"} or prepared is not None:
+                    raise _error("DESKTOP_INVALID_REQUEST")
+                _reply({"id": request_id, "ok": True, "value": _handshake_audit(request.get("workspaceRoot"))})
             elif op == "inspect_active_execution":
                 if set(request) != {"id", "op", "target"} or prepared is not None:
                     raise _error("DESKTOP_INVALID_REQUEST")

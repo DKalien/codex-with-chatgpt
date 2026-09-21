@@ -476,6 +476,18 @@ parser 仍仅接受 exact accepted markers，歧义一律 fail closed。
 因为 IPC 协议语义未变，该组合复用 `desktop-ipc-v1`，但 desktop/app-server/module
 hash 仍整组单独固定；不接受版本范围、wildcard 或“26.908 默认兼容”。
 
+2026-09-21 精确 promotion Desktop `26.915.4065.0` / app-server `0.155.0-alpha.9.2`：
+app-server SHA-256 为 `bc45017e8239dc150258f69309ced9df6bbcdf5b8e4f346decf780ac0999e226`，
+ASAR header 为 `(4, 4230936, 4230932, 4230928)`，采用已审计的 modern framing
+`json_offset == json_size + 4`。IPC main `.vite/build/src-C3YaUE83.js` SHA-256 为
+`14c8c23e8b8dfa874d3fb5a50d54fb28eccf55fb83232c3ab29cb7c0ef0a0472`，webview
+`webview/assets/app-initial-6c4523b43a11.js` SHA-256 为
+`146b5204b30bd1766f19c0dd5b76f23515a77708ae80bb66ded6469e11431374`。受限 live handshake
+已验证 initialize/owner/following/state 链路，start-turn cross-layer static forensic 也已闭合
+helper request 与 `TurnStartResponse.turn.id` 返回语义，因此仅上述 exact row 复用
+`desktop-ipc-v1`。这不表示其他 `26.915` 或 `0.155` 组合兼容，任一 version/hash/header/module
+漂移仍 fail closed。
+
 Windows 受控 helper 需要 Python 3.11 或更高版本，使用环境变量 `C2C_DESKTOP_PYTHON`
 指定解释器路径，未设置时使用 `python`；它
 只负责必要的标准库 IPC 和身份核验，不要求管理员权限，不借用 renderer/Agent 身份，

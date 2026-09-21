@@ -7,6 +7,7 @@ import {
   DesktopIpcClient,
   resolveDesktopHelperPath,
   validateDesktopCompatibilityAudit,
+  validateDesktopHandshakeAudit,
   validateDesktopCompatibility,
   validateDesktopMessage,
   validateDesktopTarget,
@@ -323,6 +324,22 @@ describe("Desktop IPC wrapper（fake helper）", () => {
     expect(fake.requests).toHaveLength(1);
     expect(Object.keys(fake.requests[0]).sort()).toEqual(["id", "op"]);
     expect(fake.requests[0].op).toBe("compatibility_audit");
+  });
+
+  it("handshake_audit 使用 workspaceRoot request shape 并严格校验 bounded flags", async () => {
+    const expected = {
+      processStable: true, runtimeStable: true, protocolClassification: "protocol_drift_or_unknown" as const,
+      initialize: true, ownerDiscovery: true, followingChangedSent: true, stateReceived: true,
+      stateChange: "snapshot" as const,
+    };
+    const fake = fakeSpawner(request => request.op === "handshake_audit" ? { ok: true, value: expected } : { ok: true, value: {} });
+    await expect(makeClient(fake.spawnImpl).handshakeAudit(target.workspaceRoot)).resolves.toEqual(expected);
+    expect(fake.requests).toHaveLength(1);
+    expect(fake.requests[0]).toMatchObject({ op: "handshake_audit", workspaceRoot: target.workspaceRoot });
+    expect(Object.keys(fake.requests[0]).sort()).toEqual(["id", "op", "workspaceRoot"]);
+    expect(() => validateDesktopHandshakeAudit({ ...expected, extra: true })).toThrowError(/无法确认/);
+    expect(() => validateDesktopHandshakeAudit({ ...expected, ownerDiscovery: false })).toThrowError(/无法确认/);
+    expect(() => validateDesktopHandshakeAudit({ ...expected, protocolClassification: "same_protocol_candidate", stateChange: "bad" })).toThrowError(/无法确认/);
   });
 
   it("compatibility_audit validator 拒绝 secrets、未知字段和坏模块字段", () => {

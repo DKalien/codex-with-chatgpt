@@ -110,6 +110,44 @@ class ProtocolTests(unittest.TestCase):
                          ["initialize", "thread-owner-discovery", "thread-owner-discovery", "thread-follower-start-turn"])
         session.close()
 
+    def test_handshake_audit_is_read_only_bounded_and_never_starts_turn(self):
+        target = self.target
+        identity = {"desktopPid": 100, "appServerPid": 101, "desktopCreation": 10, "appServerCreation": 11,
+                    "desktopExe": "ChatGPT.exe", "appServerExe": "codex.exe",
+                    "observedDesktopVersion": "26.915.4065.0", "observedAppServerVersion": "0.155.0-alpha.9.2",
+                    "appServerSha256": "a" * 64}
+        audit = {"classification": "protocol_drift_or_unknown", "asarHeader": [4, 8, 4, 0],
+                 "modules": [{"role": "ipc-main", "path": ".vite/build/src-main.js", "sha256": "b" * 64},
+                             {"role": "webview-bootstrap", "path": "webview/assets/app-initial-x.js", "sha256": "c" * 64}]}
+        with patch.object(h, "_current_target", return_value=target), \
+                patch.object(h, "_verify_runtime_identity", side_effect=[identity, identity]) as verify, \
+                patch.object(h, "_compatibility_audit_for_paths", return_value=audit), \
+                patch.object(h, "_runtime_version", side_effect=AssertionError("trusted runtime forbidden")), \
+                patch.object(h, "_checked_runtime", side_effect=AssertionError("catalog trust forbidden")):
+            result = h._handshake_audit(target["workspaceRoot"])
+        self.assertEqual(result["stateChange"], "snapshot")
+        self.assertEqual(result["protocolClassification"], "protocol_drift_or_unknown")
+        self.assertEqual(verify.call_args_list[0].kwargs, {"require_catalog": False})
+        self.assertNotIn("thread-follower-start-turn", [frame.get("method") for frame in self.pipe.frames])
+
+    def test_handshake_audit_rejects_identity_or_audit_drift(self):
+        target = self.target
+        base = {"desktopPid": 100, "appServerPid": 101, "desktopCreation": 10, "appServerCreation": 11,
+                "desktopExe": "ChatGPT.exe", "appServerExe": "codex.exe",
+                "observedDesktopVersion": "26.915.4065.0", "observedAppServerVersion": "0.155.0-alpha.9.2",
+                "appServerSha256": "a" * 64}
+        audit = {"classification": "protocol_drift_or_unknown", "asarHeader": [4, 8, 4, 0],
+                 "modules": [{"role": "ipc-main", "path": "a", "sha256": "b" * 64},
+                             {"role": "webview-bootstrap", "path": "b", "sha256": "c" * 64}]}
+        for key in ("desktopPid", "appServerCreation", "observedAppServerVersion", "appServerSha256"):
+            with self.subTest(key=key):
+                changed = {**base, key: (base[key] + 1 if isinstance(base[key], int) else "changed")}
+                with patch.object(h, "_current_target", return_value=target), \
+                        patch.object(h, "_verify_runtime_identity", side_effect=[base, changed]), \
+                        patch.object(h, "_compatibility_audit_for_paths", return_value=audit):
+                    with self.assertRaises(h.DesktopIpcError):
+                        h._handshake_audit(target["workspaceRoot"])
+
     def test_last_check_busy_is_definitely_not_sent(self):
         session, _ = h._prepare(self.target)
         self.pipe.state["threadRuntimeStatus"] = {"type": "active"}
@@ -728,6 +766,14 @@ class ProtocolTests(unittest.TestCase):
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_production_verify_runtime_requires_catalog_identity_path(self):
+        target = {"threadId": THREAD, "hostId": "local", "projectId": "project_test", "workspaceRoot": str(Path.cwd())}
+        pipe = FakePipe(target)
+        with patch.object(h, "_verify_runtime_identity", return_value={"desktopExe": "x"}) as identity:
+            result = h._verify_runtime(pipe, target)
+        identity.assert_called_once_with(pipe, target, None, require_catalog=True)
+        self.assertEqual(result["desktopExe"], "x")
+
     def test_missing_or_ambiguous_runtime_diagnosis_is_unverified_without_ipc(self):
         for rows in ([], [
             {"pid": 1, "name": "ChatGPT.exe", "creation": 1, "exe": "desktop"},
@@ -741,7 +787,8 @@ class RuntimeTests(unittest.TestCase):
                 pipe.assert_not_called()
 
     def test_audited_runtime_pairs_share_one_profile_and_require_exact_hashes(self):
-        for profile in (h.VERIFIED_RUNTIME, h.VERIFIED_RUNTIME_26_908, h.VERIFIED_RUNTIME_26_908_9136):
+        for profile in (h.VERIFIED_RUNTIME, h.VERIFIED_RUNTIME_26_908,
+                        h.VERIFIED_RUNTIME_26_908_9136, h.VERIFIED_RUNTIME_26_915):
             with self.subTest(pair=(profile["desktopVersion"], profile["appServerVersion"])), \
                     tempfile.TemporaryDirectory(prefix="c2c-profile-offline-") as directory:
                 root = Path(directory) / f"OpenAI.Codex_{profile['desktopVersion']}_x64" / "app"
@@ -791,6 +838,99 @@ class RuntimeTests(unittest.TestCase):
             profile["moduleHashes"]["webview/assets/app-initial-bcc2ff475eb6.js"],
             h.VERIFIED_RUNTIME_26_908["moduleHashes"]["webview/assets/app-initial-d9bed9d614d8.js"],
         )
+
+    def test_runtime_26_915_exact_catalog_row_is_current_and_any_drift_fails_closed(self):
+        profile = h.VERIFIED_RUNTIME_26_915
+        self.assertEqual(profile, {
+            "desktopVersion": "26.915.4065.0",
+            "appServerVersion": "0.155.0-alpha.9.2",
+            "appServerSha256": "bc45017e8239dc150258f69309ced9df6bbcdf5b8e4f346decf780ac0999e226",
+            "asarHeader": (4, 4230936, 4230932, 4230928),
+            "modules": [
+                {"role": "ipc-main", "path": ".vite/build/src-C3YaUE83.js",
+                 "sha256": "14c8c23e8b8dfa874d3fb5a50d54fb28eccf55fb83232c3ab29cb7c0ef0a0472"},
+                {"role": "webview-bootstrap", "path": "webview/assets/app-initial-6c4523b43a11.js",
+                 "sha256": "146b5204b30bd1766f19c0dd5b76f23515a77708ae80bb66ded6469e11431374"},
+            ],
+            "moduleHashes": {
+                ".vite/build/src-C3YaUE83.js":
+                    "14c8c23e8b8dfa874d3fb5a50d54fb28eccf55fb83232c3ab29cb7c0ef0a0472",
+                "webview/assets/app-initial-6c4523b43a11.js":
+                    "146b5204b30bd1766f19c0dd5b76f23515a77708ae80bb66ded6469e11431374",
+            },
+        })
+        self.assertIn(profile, h.VERIFIED_PROFILES["desktop-ipc-v1"])
+        observed = {"observedDesktopVersion": profile["desktopVersion"],
+                    "observedAppServerVersion": profile["appServerVersion"],
+                    "appServerSha256": profile["appServerSha256"]}
+        with patch.object(h, "_observe_runtime_versions", return_value=observed), \
+                patch.object(h, "_asar_module_hashes", return_value=profile["moduleHashes"]):
+            self.assertEqual(h._checked_runtime("desktop", observed)["profile"], "desktop-ipc-v1")
+            self.assertEqual(h._compatibility_for_paths("desktop", "server")["status"], "current")
+            self.assertEqual(h._compatibility_audit_for_paths("desktop", "server")["classification"], "current")
+
+        for field, value in (("observedDesktopVersion", "26.915.4065.1"),
+                             ("observedAppServerVersion", "0.155.0-alpha.9.3"),
+                             ("appServerSha256", "0" * 64)):
+            with self.subTest(field=field), self.assertRaises(h.DesktopIpcError):
+                h._checked_runtime("desktop", {**observed, field: value})
+        for mismatch in ("asar_header_layout", "asar_module_sha256"):
+            with self.subTest(mismatch=mismatch), \
+                    patch.object(h, "_asar_module_hashes", side_effect=h._version_error(mismatch)), \
+                    self.assertRaises(h.DesktopIpcError):
+                h._checked_runtime("desktop", observed)
+
+    def test_production_asar_module_hashes_accepts_modern_framing_and_rejects_drift(self):
+        ipc_path = ".vite/build/src-modern.js"
+        webview_path = "webview/assets/app-initial-modern.js"
+        ipc_bytes = b"exact ipc module"
+        webview_bytes = b"exact webview module"
+
+        tree = {"files": {}}
+        offset = 0
+        for module_path, module_bytes in ((ipc_path, ipc_bytes), (webview_path, webview_bytes)):
+            files = tree["files"]
+            parts = module_path.split("/")
+            for part in parts[:-1]:
+                files = files.setdefault(part, {"files": {}})["files"]
+            files[parts[-1]] = {"size": len(module_bytes), "offset": str(offset)}
+            offset += len(module_bytes)
+
+        raw_tree = json.dumps(tree, separators=(",", ":")).encode("utf-8")
+        layout = (4, len(raw_tree) + 8, len(raw_tree) + 4, len(raw_tree))
+        profile = {
+            "asarHeader": layout,
+            "modules": [
+                {"role": "ipc-main", "path": ipc_path,
+                 "sha256": hashlib.sha256(ipc_bytes).hexdigest()},
+                {"role": "webview-bootstrap", "path": webview_path,
+                 "sha256": hashlib.sha256(webview_bytes).hexdigest()},
+            ],
+        }
+
+        with tempfile.TemporaryDirectory(prefix="c2c-modern-asar-") as directory:
+            desktop = Path(directory) / "app" / "ChatGPT.exe"
+            asar = desktop.parent / "resources" / "app.asar"
+            asar.parent.mkdir(parents=True)
+
+            def write_modules(current_ipc, current_webview):
+                asar.write_bytes(
+                    struct.pack("<4I", *layout) + raw_tree + current_ipc + current_webview
+                )
+
+            write_modules(ipc_bytes, webview_bytes)
+            self.assertEqual(h._asar_module_hashes(str(desktop), profile), {
+                ipc_path: hashlib.sha256(ipc_bytes).hexdigest(),
+                webview_path: hashlib.sha256(webview_bytes).hexdigest(),
+            })
+
+            for current_ipc, current_webview in (
+                    (b"X" + ipc_bytes[1:], webview_bytes),
+                    (ipc_bytes, b"X" + webview_bytes[1:])):
+                write_modules(current_ipc, current_webview)
+                with self.assertRaises(h.DesktopIpcError) as raised:
+                    h._asar_module_hashes(str(desktop), profile)
+                self.assertEqual(raised.exception.mismatch, "asar_module_sha256")
 
     def test_runtime_26_908_9136_any_single_field_drift_fails_closed(self):
         base = h.VERIFIED_RUNTIME_26_908_9136
@@ -959,6 +1099,7 @@ class RuntimeTests(unittest.TestCase):
     def test_provenance_parser_accepts_compact_marker_and_fails_closed_on_ambiguity(self):
         old = b"standalone local buildversion: "
         new = b"standalonelocal buildversion: "
+        current = b"standalonenpmbunpnpmvite+brewlocal buildversion: "
         with tempfile.TemporaryDirectory(prefix="c2c-provenance-compact-") as directory:
             binary = Path(directory) / "codex.exe"
             # old marker + prerelease + space delimiter
@@ -970,6 +1111,9 @@ class RuntimeTests(unittest.TestCase):
             # new compact marker + prerelease + newline delimiter (real 26.908.9136 shape)
             binary.write_bytes(b"prefix\x00" + new + b"0.154.0-alpha.6.2\nplatform: install method: commit:")
             self.assertEqual(h._static_file_version(str(binary)), "0.154.0-alpha.6.2")
+            # current 26.915 marker + newline delimiter
+            binary.write_bytes(b"prefix\x00" + current + b"0.155.0-alpha.9.2\nplatform: install method: commit:")
+            self.assertEqual(h._static_file_version(str(binary)), "0.155.0-alpha.9.2")
             # old duplicated
             binary.write_bytes(old + b"0.153.4 platform:x\x00" + old + b"0.154.0-alpha.6.2 platform:y")
             self.assertIsNone(h._static_file_version(str(binary)))
@@ -978,6 +1122,9 @@ class RuntimeTests(unittest.TestCase):
             self.assertIsNone(h._static_file_version(str(binary)))
             # old + new together
             binary.write_bytes(old + b"0.153.4 platform:x\x00" + new + b"0.154.0-alpha.6.2 platform:y")
+            self.assertIsNone(h._static_file_version(str(binary)))
+            # current duplicated
+            binary.write_bytes(current + b"0.155.0-alpha.9.2\nplatform:x\x00" + current + b"0.155.0-alpha.9.2\nplatform:y")
             self.assertIsNone(h._static_file_version(str(binary)))
             # malformed version
             binary.write_bytes(new + b"not-a-version platform: x")
@@ -1078,8 +1225,17 @@ class RuntimeTests(unittest.TestCase):
             h._main()
         self.assertEqual(json.loads(output.buffer.getvalue()),
                          {"id": CLIENT, "ok": False, "code": "DESKTOP_VERSION_UNSUPPORTED", "notSent": True,
-                          "compatibility": {"observedDesktopVersion": None, "observedAppServerVersion": None,
+                         "compatibility": {"observedDesktopVersion": None, "observedAppServerVersion": None,
                                              "status": "unverified", "profile": None}})
+
+    def test_handshake_operation_accepts_only_id_op_workspace_root(self):
+        request = {"id": CLIENT, "op": "handshake_audit", "workspaceRoot": "workspace", "target": {}}
+        source = SimpleNamespace(buffer=io.BytesIO(h._json_bytes(request) + b"\n"))
+        output = SimpleNamespace(buffer=io.BytesIO())
+        with patch.object(sys, "stdin", source), patch.object(sys, "stdout", output):
+            h._main()
+        self.assertEqual(json.loads(output.buffer.getvalue()),
+                         {"id": CLIENT, "ok": False, "code": "DESKTOP_INVALID_REQUEST", "notSent": True})
 
     def test_new_connection_rediscovers_but_inflight_pid_reuse_is_rejected(self):
         target = {"threadId": THREAD, "hostId": "local", "projectId": "project_test", "workspaceRoot": str(Path.cwd())}
@@ -1129,6 +1285,12 @@ class RuntimeTests(unittest.TestCase):
 
 
 class CatalogAuditTests(unittest.TestCase):
+    def test_catalog_asar_header_accepts_only_audited_legacy_and_modern_framing(self):
+        self.assertEqual(h._catalog_asar_header([4, 100, 96, 89]), (4, 100, 96, 89))
+        self.assertEqual(h._catalog_asar_header([4, 97, 93, 89]), (4, 97, 93, 89))
+        with self.assertRaises(h._CatalogError):
+            h._catalog_asar_header([4, 98, 94, 89])
+
     def test_catalog_loader_is_strict_and_bounded(self):
         catalog = json.loads(Path(h.PROFILE_CATALOG_PATH).read_text(encoding="utf-8"))
         with tempfile.TemporaryDirectory(prefix="c2c-catalog-guard-") as directory:
@@ -1248,6 +1410,23 @@ class CatalogAuditTests(unittest.TestCase):
                 self.assertEqual(unavailable["classification"], "unavailable")
                 self.assertNotIn("candidateRuntime", unavailable)
 
+    def test_unknown_app_server_unique_fingerprint_stays_drift_and_sanitizes_modules(self):
+        observed = {"observedDesktopVersion": "26.915.4065.0", "observedAppServerVersion": "0.155.0-alpha.9.3",
+                    "appServerSha256": "a" * 64}
+        modules = {"ipc-main": [{"role": "ipc-main", "path": ".vite/build/src-new.js", "sha256": "b" * 64,
+                                  "_protocolFingerprint": True}],
+                   "webview-bootstrap": [{"role": "webview-bootstrap", "path": "webview/assets/app-initial-new.js",
+                                           "sha256": "c" * 64}]}
+        with patch.object(h, "_observe_runtime_versions", return_value=observed), \
+                patch.object(h, "_asar_audit_modules", return_value=([4, 100, 96, 89], modules)):
+            result = h._compatibility_audit_for_paths("desktop", "server")
+        self.assertEqual(result["classification"], "protocol_drift_or_unknown")
+        self.assertEqual(result["modules"], [
+            {"role": "ipc-main", "path": ".vite/build/src-new.js", "sha256": "b" * 64},
+            {"role": "webview-bootstrap", "path": "webview/assets/app-initial-new.js", "sha256": "c" * 64},
+        ])
+        self.assertNotIn("candidateRuntime", result)
+
     def test_audit_asar_malformed_and_oversized_headers_fail_closed(self):
         with tempfile.TemporaryDirectory(prefix="c2c-audit-asar-") as directory:
             desktop = Path(directory) / "OpenAI.Codex_99.1.1.1_x64" / "app" / "ChatGPT.exe"
@@ -1259,6 +1438,7 @@ class CatalogAuditTests(unittest.TestCase):
                                                   h._MAX_ASAR_HEADER_BYTES - 3,
                                                   h._MAX_ASAR_HEADER_BYTES - 10),
                 "ambiguous_layout": struct.pack("<4I", 4, 100, 95, 89) + b"{}",
+                "third_gap": struct.pack("<4I", 4, 98, 94, 89) + b"{}",
             }.items():
                 with self.subTest(name=name):
                     asar.write_bytes(raw)
@@ -1266,7 +1446,7 @@ class CatalogAuditTests(unittest.TestCase):
                         h._asar_audit_modules(str(desktop))
 
     def test_audit_asar_budget_overlap_and_normal_candidates(self):
-        def write_asar(path, modules):
+        def write_asar(path, modules, *, framing="legacy"):
             tree = {"files": {}}
             for module_path, offset, data in modules:
                 node = tree
@@ -1276,7 +1456,8 @@ class CatalogAuditTests(unittest.TestCase):
                 node.setdefault("files", {})[parts[-1]] = {"offset": str(offset), "size": len(data)}
             raw_tree = json.dumps(tree, separators=(",", ":")).encode()
             json_size = max(256, len(raw_tree))
-            layout = [4, json_size + 11, json_size + 7, json_size]
+            layout = ([4, json_size + 11, json_size + 7, json_size]
+                      if framing == "legacy" else [4, json_size + 8, json_size + 4, json_size])
             raw_tree += b" " * (json_size - len(raw_tree))
             body = bytearray(max(offset + len(data) for _, offset, data in modules))
             for _, offset, data in modules:
@@ -1298,6 +1479,20 @@ class CatalogAuditTests(unittest.TestCase):
             self.assertEqual(observed_layout, layout)
             self.assertEqual({module["path"] for items in candidates.values() for module in items},
                              {module_path for module_path, _, _ in normal})
+            modern_layout = write_asar(asar, normal, framing="modern")
+            self.assertEqual(h._asar_audit_modules(str(desktop))[0], modern_layout)
+            fingerprint = b"thread-owner-discovery thread-stream-following-changed thread-follower-start-turn handledByClientId sourceClientId targetClientIds conversationId"
+            one = [(".vite/build/src-one.js", 0, fingerprint),
+                   ("webview/assets/app-initial-a.js", len(fingerprint), b"web")]
+            write_asar(asar, one, framing="modern")
+            one_candidates = h._asar_audit_modules(str(desktop))[1]["ipc-main"]
+            self.assertEqual([item.get("_protocolFingerprint") for item in one_candidates], [True])
+            many = [(".vite/build/src-one.js", 0, fingerprint),
+                    (".vite/build/src-two.js", len(fingerprint), fingerprint),
+                    ("webview/assets/app-initial-a.js", len(fingerprint) * 2, b"web")]
+            write_asar(asar, many, framing="modern")
+            many_candidates = h._asar_audit_modules(str(desktop))[1]["ipc-main"]
+            self.assertEqual(sum(item.get("_protocolFingerprint") is True for item in many_candidates), 2)
 
             too_many = [
                 (".vite/build/src-a.js", 0, b"a"),

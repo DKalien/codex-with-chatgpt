@@ -69,6 +69,17 @@ export interface DesktopCompatibilityAudit extends DesktopCompatibility {
   candidateRuntime?: DesktopCompatibilityCandidateRuntime;
 }
 
+export interface DesktopHandshakeAudit {
+  processStable: true;
+  runtimeStable: true;
+  protocolClassification: DesktopCompatibilityAuditClassification;
+  initialize: true;
+  ownerDiscovery: true;
+  followingChangedSent: true;
+  stateReceived: true;
+  stateChange: "snapshot" | "patches";
+}
+
 export interface DesktopExecutionInfo extends DesktopTargetInfo {
   activeTurnId: string;
 }
@@ -510,6 +521,22 @@ function validateResultContext(value: unknown, target: DesktopTarget): DesktopRe
   return { ...info, resultTurnId: input.resultTurnId, resultTurnStatus: input.resultTurnStatus as DesktopResultTurnStatus };
 }
 
+export function validateDesktopHandshakeAudit(value: unknown): DesktopHandshakeAudit {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw error("DESKTOP_PROTOCOL_ERROR");
+  const input = value as Record<string, unknown>;
+  const keys = Object.keys(input).sort().join(",");
+  if (keys !== "followingChangedSent,initialize,ownerDiscovery,processStable,protocolClassification,runtimeStable,stateChange,stateReceived") {
+    throw error("DESKTOP_PROTOCOL_ERROR");
+  }
+  if (input.processStable !== true || input.runtimeStable !== true || input.initialize !== true ||
+      input.ownerDiscovery !== true || input.followingChangedSent !== true || input.stateReceived !== true ||
+      (input.stateChange !== "snapshot" && input.stateChange !== "patches") ||
+      !["current", "same_protocol_candidate", "protocol_drift_or_unknown"].includes(input.protocolClassification as string)) {
+    throw error("DESKTOP_PROTOCOL_ERROR");
+  }
+  return input as unknown as DesktopHandshakeAudit;
+}
+
 function validateResultOwnershipExpectation(value: DesktopResultOwnershipExpectation): DesktopResultOwnershipExpectation {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw error("DESKTOP_INVALID_REQUEST");
   const keys = Object.keys(value).sort();
@@ -792,6 +819,15 @@ export class DesktopIpcClient {
     } finally {
       session.close();
     }
+  }
+
+  async handshakeAudit(workspaceRoot: string): Promise<DesktopHandshakeAudit> {
+    if (typeof workspaceRoot !== "string" || !workspaceRoot.trim()) throw error("DESKTOP_INVALID_REQUEST");
+    const session = this.open();
+    try {
+      const value = await session.request("handshake_audit", { workspaceRoot });
+      return validateDesktopHandshakeAudit(value);
+    } finally { session.close(); }
   }
 
   async currentIdentity(workspaceRoot: string): Promise<DesktopTargetInfo> {

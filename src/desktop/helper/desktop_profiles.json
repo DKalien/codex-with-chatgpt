@@ -57,6 +57,24 @@
               "sha256": "3c15444f96a8d48844258618fe0d4278409e626f0ee563a77d2c669ec669c510"
             }
           ]
+        },
+        {
+          "desktopVersion": "26.915.4065.0",
+          "appServerVersion": "0.155.0-alpha.9.2",
+          "appServerSha256": "bc45017e8239dc150258f69309ced9df6bbcdf5b8e4f346decf780ac0999e226",
+          "asarHeader": [4, 4230936, 4230932, 4230928],
+          "modules": [
+            {
+              "role": "ipc-main",
+              "path": ".vite/build/src-C3YaUE83.js",
+              "sha256": "14c8c23e8b8dfa874d3fb5a50d54fb28eccf55fb83232c3ab29cb7c0ef0a0472"
+            },
+            {
+              "role": "webview-bootstrap",
+              "path": "webview/assets/app-initial-6c4523b43a11.js",
+              "sha256": "146b5204b30bd1766f19c0dd5b76f23515a77708ae80bb66ded6469e11431374"
+            }
+          ]
         }
       ]
     }

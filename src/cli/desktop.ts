@@ -393,12 +393,20 @@ export function registerDesktopCommands(program: Command): void {
 
   desktop.command("compatibility")
     .description("只读诊断本机 Desktop/app-server 兼容性")
-    .option("-w, --workspace <path>", "兼容参数；诊断不读取 workspace 状态")
+    .option("-w, --workspace <path>", "审计目标 workspace；handshake 模式读取当前 context")
     .option("--audit", "输出只读兼容性审计详情", false)
+    .option("--handshake-audit", "执行受限只读 IPC handshake 审计", false)
     .option("--json", "输出机器可读结果", false)
-    .action(async (opts: { workspace?: string; audit: boolean; json: boolean }) => {
+    .action(async (opts: { workspace?: string; audit: boolean; handshakeAudit: boolean; json: boolean }) => {
       try {
-        if (opts.audit) {
+        if (opts.audit && opts.handshakeAudit) {
+          throw new DesktopError("DESKTOP_INVALID_REQUEST", "--audit 与 --handshake-audit 不能同时使用。");
+        }
+        if (opts.handshakeAudit) {
+          const result = await desktopIpc.handshakeAudit(new Workspace(workspaceRoot(opts.workspace)).root);
+          print({ ok: true, ...result }, opts.json,
+            `Desktop handshake audit：${result.protocolClassification}；owner=${result.ownerDiscovery}；state=${result.stateChange}。`);
+        } else if (opts.audit) {
           const audit = await desktopIpc.compatibilityAudit();
           print({ ok: true, ...audit }, opts.json, compatibilityAuditMessage(audit));
         } else {

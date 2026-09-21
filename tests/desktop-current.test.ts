@@ -164,6 +164,35 @@ it("CLI compatibility --audit 只读审计，选择独立方法且不初始化�
   expect(bytes()).toBeNull();
 });
 
+it("CLI compatibility --handshake-audit 仅调用 workspace-scoped handshake", async () => {
+  const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+  const result = { processStable: true as const, runtimeStable: true as const,
+    protocolClassification: "current" as const, initialize: true as const, ownerDiscovery: true as const,
+    followingChangedSent: true as const, stateReceived: true as const, stateChange: "snapshot" as const };
+  const handshake = vi.spyOn(desktopIpc, "handshakeAudit").mockResolvedValue(result);
+  const compatibility = vi.spyOn(desktopIpc, "compatibility");
+  const audit = vi.spyOn(desktopIpc, "compatibilityAudit");
+  const program = new Command().exitOverride(); registerDesktopCommands(program);
+  await program.parseAsync(["node", "c2c", "desktop", "compatibility", "--handshake-audit", "-w", workspace.root, "--json"]);
+  expect(JSON.parse(String(out.mock.calls[0][0]))).toEqual({ ok: true, ...result });
+  expect(handshake).toHaveBeenCalledWith(workspace.root);
+  expect(compatibility).not.toHaveBeenCalled();
+  expect(audit).not.toHaveBeenCalled();
+});
+
+it("CLI compatibility 拒绝同时 --audit --handshake-audit 且不调用任何方法", async () => {
+  const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+  const handshake = vi.spyOn(desktopIpc, "handshakeAudit");
+  const compatibility = vi.spyOn(desktopIpc, "compatibility");
+  const audit = vi.spyOn(desktopIpc, "compatibilityAudit");
+  const program = new Command().exitOverride(); registerDesktopCommands(program);
+  await program.parseAsync(["node", "c2c", "desktop", "compatibility", "--audit", "--handshake-audit", "--json"]);
+  expect(JSON.parse(String(out.mock.calls[0][0]))).toMatchObject({ ok: false, error: "DESKTOP_INVALID_REQUEST" });
+  expect(handshake).not.toHaveBeenCalled();
+  expect(compatibility).not.toHaveBeenCalled();
+  expect(audit).not.toHaveBeenCalled();
+});
+
 it("CLI bind-current 错误只输出安全 compatibility 投影", async () => {
   const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
   const failure = new DesktopError("DESKTOP_VERSION_UNSUPPORTED", "secret token pipe");

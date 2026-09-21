@@ -9,10 +9,11 @@ const expectedRuntimePairs = [
   ["26.903.9818.0", "0.153.4"],
   ["26.908.4834.0", "0.154.0-alpha.6.2"],
   ["26.908.9136.0", "0.154.0-alpha.6.2"],
+  ["26.915.4065.0", "0.155.0-alpha.9.2"],
 ];
 
 describe("Desktop helper packaging", () => {
-  it("clean build 后 helper 从相邻 catalog 加载 3 个 exact runtime", () => {
+  it("clean build 后 helper 从相邻 catalog 加载 4 个 exact runtime", () => {
     const dist = path.join(root, "dist");
     const destination = path.join(dist, "desktop", "helper");
     fs.rmSync(dist, { recursive: true, force: true });
