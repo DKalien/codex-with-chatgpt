@@ -3221,6 +3221,7 @@ async function maybeRunAutonomyTick(ctx = {}) {
     lastAutonomyReason = "autonomy_tick_error";
   } finally {
     autonomyTickInFlight = false;
+    void refreshActionIndicator();
   }
 }
 
@@ -3313,6 +3314,7 @@ async function handleProductionSend() {
     };
   } finally {
     productionSendInFlight = false;
+    void refreshActionIndicator();
   }
 }
 
@@ -3452,6 +3454,7 @@ async function recoverProductionSendSide(inFlight) {
     };
   } finally {
     productionSendInFlight = false;
+    void refreshActionIndicator();
   }
 }
 

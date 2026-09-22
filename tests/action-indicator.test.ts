@@ -112,6 +112,23 @@ describe("Browser Companion action indicator", () => {
     });
   });
 
+  it("converges from a transient autonomy tick warning back to C", async () => {
+    const setBadgeText = vi.fn(async () => undefined);
+    const setTitle = vi.fn(async () => undefined);
+    const apply = createCompanionIndicatorApplier({ setBadgeText, setTitle });
+
+    const inFlight = deriveCompanionIndicator(healthy({
+      autonomy: { mode: "armed", identityExact: true, tickInFlight: true },
+    }));
+    const settled = deriveCompanionIndicator(healthy());
+    expect(inFlight).toMatchObject({ severity: "warning", badgeText: "C!", reason: "in_flight" });
+    expect(settled).toMatchObject({ severity: "normal", badgeText: "C", reason: "ready" });
+
+    await apply(inFlight);
+    await apply(settled);
+    expect(setBadgeText.mock.calls.map(([arg]) => arg.text)).toEqual(["C!", "C"]);
+  });
+
   it("never returns raw route, id, credential, secret, or arbitrary error text", () => {
     const result = deriveCompanionIndicator(healthy({
       owner: { available: true, canonicalRoute: "https://chatgpt.com/c/22222222-2222-4222-8222-222222222222" },
@@ -150,5 +167,25 @@ describe("Browser Companion action indicator", () => {
     expect(sw).toMatch(/onStartup\.addListener[\s\S]*refreshActionIndicator/);
     expect(sw).toContain("chrome.permissions?.contains");
     expect(sw).not.toContain("chrome.permissions.request");
+  });
+
+  it("refreshes after each transient in-flight flag is cleared", () => {
+    const sw = fs.readFileSync(path.join(root, "service-worker.js"), "utf8");
+    const tick = sw.slice(
+      sw.indexOf("async function maybeRunAutonomyTick"),
+      sw.indexOf("async function handleProductionSend"),
+    );
+    const send = sw.slice(
+      sw.indexOf("async function handleProductionSend"),
+      sw.indexOf("async function recoverProductionSendSide"),
+    );
+    const recover = sw.slice(
+      sw.indexOf("async function recoverProductionSendSide"),
+      sw.indexOf("async function handleRetireUnknown"),
+    );
+
+    expect(tick).toMatch(/autonomyTickInFlight = false;\s*void refreshActionIndicator\(\);/);
+    expect(send).toMatch(/productionSendInFlight = false;\s*void refreshActionIndicator\(\);/);
+    expect(recover).toMatch(/productionSendInFlight = false;\s*void refreshActionIndicator\(\);/);
   });
 });
