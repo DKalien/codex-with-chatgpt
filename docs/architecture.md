@@ -45,17 +45,30 @@
 | `bridge/` | Express app assembly, loopback-only listener, port fallback, runtime state, admin API |
 | `mcp/` | McpServer with workspace/git/search/session/pairing/feedback/workflow tools (base read-only set + separately guarded Desktop/Remote/feedback schemas); stateless Streamable HTTP transport (fresh server per request, JSON responses) |
 | `desktop/` | Local Desktop binding, version-gated IPC delivery, replay-safe state and delivery status |
+| `executor/` | Executor Core 的有限适配器契约、固定注册表及当前 Codex Desktop adapter |
 | `auth/` | OAuth 2.1 authorization server: discovery metadata (RFC 8414 + Protected Resource Metadata), dynamic client registration (RFC 7591), authorization-code + PKCE (S256 only), refresh rotation, revocation (RFC 7009). Opaque tokens stored as SHA-256 hashes |
 | `pairing/` | PairingCode lifecycle: CSPRNG generation, TTL, attempt limits, IP rate limit, one-time use |
 | `workspace/` | Canonical-path containment (realpath of deepest existing ancestor), sensitive-file policy, `.c2cignore`, paginated read/list, ripgrep search with Node fallback, git status/diff with pagination |
 | `tunnel/` | `TunnelProvider` interface + Cloudflare Quick and workspace-configured Named Tunnel implementations; business logic is vendor-agnostic |
 | `execution/` | JSONL execution records plus optional sanitized command output (`execution_output`) |
 | `feedback/` | Production feedback outbox + companion transport: pairing/credential, route-principal attestation (challenge → `feedback_companion_route_confirm` → VERIFIED), reserve/begin-send/ack/retire, stale → `outcome_unknown`, exact late-positive ACK |
-| `browser-companion/` | MV3 sources → `dist/browser-companion`: SW-only Bridge HTTP + durable send journal + route-attestation fence; content_scripts use classic `*-global.js` (ESM `dom-adapter`/`turn-observer`/`route-attestation*` stay for SW import graph); autonomy default OFF; zero DOM/Send unless explicit production one-shot or armed heartbeat; production Send requires **route VERIFIED** |
+| `browser-companion/` | MV3 sources → `dist/browser-companion`: SW-only Bridge HTTP + durable send journal + route-attestation fence; content_scripts use classic `*-global.js` (ESM `dom-adapter`/`turn-observer`/`route-attestation*` stay for SW import graph); autonomy default OFF; zero DOM/Send unless explicit production one-shot or armed heartbeat; production Send requires **route VERIFIED**；display-only toolbar indicator uses `C/C!/C×`，低频 `alarms` 只做 `/state` discovery |
 | `process/` | Daemon spawn/reuse, health probing, graceful shutdown |
 | `core/` | Verified machine install metadata, guarded rollout and per-workspace pending upgrades |
 | `cli/` | `c2c` commands; `--json` everywhere for the Skill |
 | `config/`, `logger/` | OS-convention state dir, secret-redacting logger |
+
+## Executor Core（H0）
+
+执行链保持清晰分层：ChatGPT 负责规划与 Review → C2C Bridge 负责 executor-agnostic 控制平面 →
+本地 executor adapter 负责连接与投递 → 隔离的 workspace。`src/executor/` 只抽取当前 Desktop
+控制服务已经需要的绑定、身份确认、准备/发送连接和 active 检查，不复制 IPC、状态存储或回执终结器。
+
+- 当前生产 adapter 是 `codex-desktop`（Codex Desktop）；现有 helper 的版本、hash、owner、project、workspace、审批、busy、单次发送和回执门禁仍是唯一权威。
+- Claude Code 是计划中的第一个额外 adapter；H0 只留下扩展接缝，不实现该集成。
+- Mimo Desktop 依赖稳定的本机机器接口；仅 GUI 自动化属于较低信任路径，不能自动继承 Codex 的 trusted receipt 语义。
+- capability metadata 仅供规划/UI 描述，不能授予权限；注册表固定且拒绝未知 executor，不做插件自动发现、PATH/网络探测或动态加载。
+- Browser Companion 与 feedback transport 保持 executor-independent；H0 不新增 generic MCP executor 工具，也不引入第二个 executor。
 
 ## Request lifecycles
 

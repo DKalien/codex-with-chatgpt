@@ -27,6 +27,10 @@ A concurrent `rollout_busy` response performs no state writes; it does not creat
 Do not rebuild a compatible Connector or reauthorize OAuth merely because the Core build differs.
 Do not interrupt an active Review Bridge to clear pending status.
 
+### named rollout 显示 `named_unhealthy`
+
+隧道 `running=true` 或公网 `/health` 返回 HTTP 200 不能单独证明 rollout 安全。命名 tunnel 的 workspace、hostname、publicUrl/provider，以及运行时 PID、startedAt、build identity 必须与本地受认证的 admin/runtime 观察完全一致；任一身份不一致都保持 `named_unhealthy`，不要按旧 PID kill、手工改 pending/finalizer 状态或循环重试。先等待/修复同一 workspace 的身份一致性，再使用稳定 launcher 执行一次 `c2c rollout -w <workspace> --json`。
+
 ## Common situations
 
 ### 普通权限无法停止管理员 Bridge

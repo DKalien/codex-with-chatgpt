@@ -815,3 +815,22 @@ G3 修复 Browser Companion 误绑错误 ChatGPT conversation 后 production Sen
 - 原始 `outcome_unknown` 保持不变；history 用 `resolved_unknown`、status 用
   `administratively_resolved`，workflow/rollout 仅对有严格匹配证据的 unknown 解除阻塞，其他
   unknown 继续阻断。原有 reconcile、self-reconcile、P0.5/P0.6 和 commandId 防重放语义不变。
+
+## H0 — Executor Core foundation（2026-09-23，本轮）
+
+- 新增 `src/executor/` 的有限 contract、固定 registry 和 `CodexDesktopAdapter`。Bridge 的 Desktop 控制服务通过 adapter 处理现有会话绑定、当前身份/本机确认、target inspect、prepare/send connection 及 post-result settle 的 active inspection；IPC/helper、状态存储、授权、审批、replay、`outcome_unknown` 和 trusted receipt 语义不迁移、不弱化。
+- 当前唯一生产 executor 是 `codex-desktop`。Claude Code 作为计划中的第一个额外 adapter，H0 只提供扩展接缝；Mimo Desktop 需先有稳定本机机器接口，GUI-only 自动化是较低信任路径，不自动继承 trusted receipt。
+- capability descriptor 仅是规划/UI 事实，unknown executor ID fail closed；无插件自动发现、PATH/网络探测、动态加载、自动选择或负载均衡。
+- ChatGPT planner/reviewer → C2C executor-agnostic control plane → local adapters → workspace 的分层已写入架构文档。Browser Companion/feedback transport 保持 executor-independent；H0 不新增 generic MCP executor 工具或第二个 executor。
+- 回归新增 `tests/executor-core.test.ts`，覆盖 registry、bounded capabilities、adapter 委托、注入式 Desktop service 绑定/status/send 以及 capability 不得绕过启用门禁；既有 Desktop IPC/control/result/finalizer 测试继续作为语义门禁。
+
+### H0 边界与下一步
+
+H0 不抽象 Codex-specific result classification、terminal fence、receipt finalizer、unknown reconciliation 或 Browser Companion 协议；后续 adapter 必须先定义独立的证据合同，才能获得可信回执语义。下一步若实现 Claude Code，先补本地身份/审批/终态证据合同，再扩展 registry 和定向测试，不改变现有 `codex_desktop_send` / `codex_desktop_status`。
+
+## H1 — Browser Companion toolbar indicator 与 sleep/wake recovery（2026-09-22，现役源码）
+
+- 工具栏 `C/C!/C×` 仅为诊断显示，error > warning > normal；不授予权限、不改变 autonomy 或发送权。Service Worker 在 tick、production send 与恢复路径清除 in-flight 标记后刷新，保证临时 `C!` 能收敛回真实健康状态。
+- MV3 `alarms` watchdog 只做低频 `/state` discovery/reconcile；机器睡眠或后台冻结期间不承诺执行，恢复后的生产动作仍须由真实 owner 文档 heartbeat 经过既有 route、DOM、journal、cooldown 与 exact-owner 门禁触发。
+- 用户已在扩展 Reload 后实测 stale-warning 修复；源码提交 `ab79b6a` 已推送，测试/构建门禁通过。此前安装目标 `15c76d1…` 曾因 rollout pending 与 named identity mismatch 未收敛；最新稳定 launcher 已确认 runtime/installed build 一致、`runtimeUpgrade=current`，不把历史 pending 误记为当前阻塞。
+- 现役细节与运行时排障见 [phase-e-feedback.md](phase-e-feedback.md) 的 toolbar/sleep-wake 小节及 [troubleshooting.md](troubleshooting.md) 的 `named_unhealthy` 说明。

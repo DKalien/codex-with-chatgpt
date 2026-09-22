@@ -10,6 +10,18 @@
 
 Browser Companion 的 MV3 `alarms` watchdog 只做低频、受保护的 `/state` discovery，帮助浏览器从睡眠、后台冻结或 Service Worker 重启后重新发现反馈 outbox；它不会 reserve、begin-send、ack、Retire、写 DOM 或开启 autonomy。机器睡眠期间不承诺执行；恢复后的实际生产动作仍必须由当前 ChatGPT 文档的真实 owner heartbeat 触发，并继续经过 route、DOM、journal、cooldown 与 exact-owner 门禁。
 
+## Toolbar indicator 与收敛边界（2026-09-22）
+
+工具栏指示器是纯诊断显示，不授予权限、改变路由、开启 autonomy 或触发发送：健康且已连接的状态显示 `C`，初始化/等待/临时 in-flight 或需要用户处理的状态显示 `C!`，持久身份漂移、认证过期、`OUTCOME_UNKNOWN`、存储保护失败或未知 journal 状态显示 `C×`；优先级固定为 error > warning > normal。Service Worker 对相同 badge/title 去重，并在 autonomy tick、production send 和恢复路径清除 in-flight 标记后再次刷新，避免短暂 `C!` 残留。
+
+低频 `alarms` 仍只负责 `/state` discovery/reconcile；它不能 reserve、send、写 DOM 或直接调用 autonomy tick。真实 owner 文档的 heartbeat 仍是生产动作的唯一入口。
+
+### 当前部署证据（2026-09-22）
+
+- toolbar stale-warning 修复已由用户在扩展 Reload 后实测；源码提交 `ab79b6a` 已推送，相关 focused/full Vitest、typecheck、build 与 diff-check 均通过。
+- 已安装目标与当前 workspace Bridge 现已都是 `15c76d1…`；最新稳定 launcher `status --json` 报告 `runtimeUpgrade.state=current`、`upgradePending=false`、`desktopCompatibility=current`，因此此前 pending/finalizer 与 PID/startedAt 不一致属于历史部署证据，不是当前状态。
+- 后续排障仍须以同一 workspace 的完整 runtime identity 为准；不要因 HTTP 200 或 tunnel `running=true` 单独重复 rollout，也不要修改绑定、反馈事件或 Browser Companion 权限。
+
 核验日期：2026-09-14。任务来源是用户手动交给本机主代理的任务包。
 本轮是预检，不是 Phase E 自动回流功能完成。
 

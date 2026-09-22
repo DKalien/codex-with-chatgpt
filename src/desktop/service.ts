@@ -2,7 +2,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 import type { Workspace } from "../workspace/manager.js";
 import { isTrustedDesktopReceipt, readExecutionRecordsStrict } from "../execution/records.js";
-import { desktopIpc, DESKTOP_IPC_ERROR_MESSAGES, validateDesktopWireMessage } from "./ipc.js";
+import { getExecutor, type ExecutorAdapter, type ExecutorConnection, type ExecutorExecutionInfo } from "../executor/index.js";
+import { DESKTOP_IPC_ERROR_MESSAGES, validateDesktopWireMessage } from "./ipc.js";
 import { DesktopError, desktopId, publicDelivery, readDesktop, sendInput, targetInput, updateDesktop,
   type DesktopBinding, type DesktopDelivery, type DesktopState } from "./store.js";
 import { unresolvedOutcomeUnknownCommandIds, isOutcomeUnknownAdministrativelyResolved, assertNoOutcomeResolutionForCommand } from "./outcome-resolution.js";
@@ -37,9 +38,9 @@ function target(workspace: LocalWorkspace, binding: z.infer<typeof targetInput>)
   return { threadId: binding.threadId, hostId: binding.hostId, projectId: binding.projectId, workspaceRoot: workspace.root };
 }
 
-export async function bindDesktop(workspace: LocalWorkspace, raw: z.infer<typeof targetInput>): Promise<DesktopBinding> {
+export async function bindDesktop(workspace: LocalWorkspace, raw: z.infer<typeof targetInput>, executor: ExecutorAdapter = getExecutor()): Promise<DesktopBinding> {
   const input = targetInput.parse(raw);
-  const observed = await desktopIpc.inspect(target(workspace, input));
+  const observed = await executor.inspect(target(workspace, input));
   const binding: DesktopBinding = { ...input, bindingId: randomUUID(), title: observed.title, boundAt: new Date().toISOString() };
   return updateDesktop(workspace.id, previous => {
     const state = checked(workspace, previous);
@@ -64,9 +65,9 @@ export function disableDesktop(workspace: LocalWorkspace): void {
 }
 
 /** 本地快捷路径：无 target 参数、无免确认标志；网页 MCP 不注册此操作。 */
-export async function bindCurrentDesktop(workspace: LocalWorkspace) {
+export async function bindCurrentDesktop(workspace: LocalWorkspace, executor: ExecutorAdapter = getExecutor()) {
   assertNoUncertainDelivery(workspace, checked(workspace, readDesktop(workspace.id)));
-  const observed = await desktopIpc.currentIdentity(workspace.root);
+  const observed = await executor.currentIdentity(workspace.root);
   const selected = targetInput.parse({ threadId: observed.threadId, hostId: observed.hostId, projectId: observed.projectId });
   const snapshot = checked(workspace, readDesktop(workspace.id));
   assertNoUncertainDelivery(workspace, snapshot);
@@ -75,7 +76,7 @@ export async function bindCurrentDesktop(workspace: LocalWorkspace) {
   if (sameTarget && snapshot.enabled) return { alreadyEnabled: true, enabled: true, binding: snapshot.binding! };
 
   // 普通 userMessage 不能证明来自本地 composer；只接受本机固定确认框，不能由 prompt 免除。
-  const confirmed = await desktopIpc.confirmCurrent(workspace.root);
+  const confirmed = await executor.confirmCurrent(workspace.root);
   if (confirmed.threadId !== selected.threadId || confirmed.hostId !== selected.hostId ||
     confirmed.projectId !== selected.projectId || confirmed.title !== observed.title)
     throw new DesktopError("DESKTOP_BINDING_CHANGED", "确认期间目标身份发生变化；未绑定或启用，请重新操作。");
@@ -118,14 +119,12 @@ function assertNoUncertainDelivery(workspace: LocalWorkspace, state: DesktopStat
     throw new DesktopError("DESKTOP_HISTORY_FULL", "投递历史容量已满；保留 ID，须人工迁移后继续。");
 }
 
-function sameTarget(left: DesktopTargetInfoLike, right: ReturnType<typeof target>): boolean {
+function sameTarget(left: ExecutorExecutionInfo, right: ReturnType<typeof target>): boolean {
   return left.threadId === right.threadId && left.hostId === right.hostId &&
     left.projectId === right.projectId && left.workspaceRoot === right.workspaceRoot;
 }
 
-type DesktopTargetInfoLike = ReturnType<typeof target> & { runtimeStatus?: string; activeTurnId: string };
-
-function receiptBackedTail(workspace: LocalWorkspace, binding: DesktopBinding, active: DesktopTargetInfoLike): boolean {
+function receiptBackedTail(workspace: LocalWorkspace, binding: DesktopBinding, active: ExecutorExecutionInfo): boolean {
   if (!sameTarget(active, target(workspace, binding))) return false;
   let records;
   try { records = readExecutionRecordsStrict(workspace.id); } catch { return false; }
@@ -146,13 +145,14 @@ async function prepareWithPostResultSettle(
   binding: DesktopBinding,
   authorize: () => void,
   options: PostResultSettleOptions = {},
-): Promise<Awaited<ReturnType<typeof desktopIpc.prepare>>> {
+  executor: ExecutorAdapter,
+): Promise<ExecutorConnection> {
   try {
-    return await desktopIpc.prepare(target(workspace, binding));
+    return await executor.prepare(target(workspace, binding));
   } catch (failure) {
     if (!(failure instanceof DesktopError) || failure.code !== "DESKTOP_BUSY") throw failure;
-    let active: DesktopTargetInfoLike;
-    try { active = await desktopIpc.inspectActiveExecution(target(workspace, binding)) as DesktopTargetInfoLike; }
+    let active: ExecutorExecutionInfo;
+    try { active = await executor.inspectActiveExecution(target(workspace, binding)); }
     catch { throw failure; }
     if (!receiptBackedTail(workspace, binding, active)) throw failure;
 
@@ -167,12 +167,12 @@ async function prepareWithPostResultSettle(
       const state = authorized(workspace, readDesktop(workspace.id), binding.bindingId);
       assertNoUncertainDelivery(workspace, state);
       try {
-        return await desktopIpc.prepare(target(workspace, binding));
+        return await executor.prepare(target(workspace, binding));
       } catch (retryFailure) {
         if (!(retryFailure instanceof DesktopError) || retryFailure.code !== "DESKTOP_BUSY") throw retryFailure;
       }
-      let current: DesktopTargetInfoLike;
-      try { current = await desktopIpc.inspectActiveExecution(target(workspace, binding)) as DesktopTargetInfoLike; }
+      let current: ExecutorExecutionInfo;
+      try { current = await executor.inspectActiveExecution(target(workspace, binding)); }
       catch (error) {
         if (error instanceof DesktopError && error.code === "DESKTOP_BUSY") throw error;
         throw error;
@@ -184,7 +184,8 @@ async function prepareWithPostResultSettle(
 }
 
 export async function sendDesktop(workspace: LocalWorkspace, raw: z.infer<typeof sendInput>, clientId: string,
-  authorize: () => void = () => {}, settleOptions?: PostResultSettleOptions): Promise<ReturnType<typeof publicDelivery>> {
+  authorize: () => void = () => {}, settleOptions?: PostResultSettleOptions,
+  executor: ExecutorAdapter = getExecutor()): Promise<ReturnType<typeof publicDelivery>> {
   const input = sendInput.parse(raw);
   if (input.workspaceId !== workspace.id) throw new DesktopError("DESKTOP_WRONG_WORKSPACE", "请求工作区不匹配。");
   if (!clientId || clientId.length > 256) throw new DesktopError("INSUFFICIENT_SCOPE", "缺少有效的 OAuth 客户端身份。");
@@ -195,7 +196,7 @@ export async function sendDesktop(workspace: LocalWorkspace, raw: z.infer<typeof
   if (prior) return publicDelivery(prior);
   const wireMessage = validateDesktopWireMessage(desktopTaskEnvelope(input));
   assertNoUncertainDelivery(workspace, snapshot);
-  const connection = await prepareWithPostResultSettle(workspace, snapshot.binding, authorize, settleOptions);
+  const connection = await prepareWithPostResultSettle(workspace, snapshot.binding, authorize, settleOptions, executor);
   try {
     // 不跨 IPC 预检持锁；提交点前在短锁内重新读取授权和绑定，防止旧快照越过撤权。
     let committed: { record: DesktopDelivery; attempt: boolean };
@@ -265,12 +266,12 @@ export async function sendDesktop(workspace: LocalWorkspace, raw: z.infer<typeof
   }
 }
 
-export async function desktopStatus(workspace: LocalWorkspace, commandId?: string) {
+export async function desktopStatus(workspace: LocalWorkspace, commandId?: string, executor: ExecutorAdapter = getExecutor()) {
   if (commandId !== undefined) desktopId.parse(commandId);
   let state = checked(workspace, readDesktop(workspace.id));
   let availability: { available: boolean; error?: string; message?: string } = { available: false };
   if (state.binding) {
-    try { await desktopIpc.inspect(target(workspace, state.binding)); availability = { available: true }; }
+    try { await executor.inspect(target(workspace, state.binding)); availability = { available: true }; }
     catch (error) {
       availability = { available: false, error: error instanceof DesktopError ? error.code : "DESKTOP_UNAVAILABLE",
         message: error instanceof DesktopError ? error.message : "Desktop 当前不可用；没有发送消息。" };
