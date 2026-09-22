@@ -12,10 +12,13 @@ const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "
 const cliEntry = path.join(projectRoot, "src/cli/index.ts");
 
 function runRecord(root: string, args: string[]) {
+  const env = { ...process.env };
+  delete env.CODEX_THREAD_ID;
+  delete env.CODEX_SESSION_ID;
   return spawnSync(
     process.execPath,
     ["--import", "tsx", cliEntry, "record", "--workspace", root, "--task", "c2c_test", ...args],
-    { cwd: projectRoot, encoding: "utf8", env: process.env }
+    { cwd: projectRoot, encoding: "utf8", env }
   );
 }
 
@@ -36,6 +39,15 @@ function withRecordEnvironment(run: (root: string, workspace: Workspace) => void
 }
 
 describe("c2c record", () => {
+  it("--json 保持普通非 Desktop record 的结构化成功输出", () => {
+    withRecordEnvironment((root, workspace) => {
+      const result = runRecord(root, ["--iteration", "1", "--changed-files", "", "--tests", "not run", "--json"]);
+      expect(result.status).toBe(0);
+      expect(JSON.parse(result.stdout)).toMatchObject({ ok: true, autoPromotedDesktop: false, taskId: "c2c_test" });
+      expect(readExecutionRecords(workspace.id)).toHaveLength(1);
+    });
+  });
+
   it("records valid numeric options and command output", () => {
     withRecordEnvironment((root, workspace) => {
       const result = runRecord(root, [

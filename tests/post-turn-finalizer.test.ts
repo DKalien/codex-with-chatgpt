@@ -602,11 +602,12 @@ describe("real rollout integration", () => {
       runtime: { ...runtime, runtimeBuildId: newId }, info: { runtimeBuildId: newId } as never, mcpUrl: "https://x/mcp",
     });
     vi.spyOn(desktopIpc, "inspect").mockRejectedValue(Object.assign(new Error("busy"), { code: "DESKTOP_BUSY" }));
-    vi.spyOn(desktopIpc, "currentExecution").mockResolvedValue({
+    const currentExecution = vi.spyOn(desktopIpc, "currentExecution").mockResolvedValueOnce({
       threadId: THREAD, hostId: "local", projectId: "proj-finalizer",
       workspaceRoot: wsRoot, title: "当前执行会话", cwd: wsRoot,
       runtimeStatus: "active", activeTurnId: randomUUID(),
     } as never);
+    currentExecution.mockRejectedValueOnce(Object.assign(new Error("unavailable"), { code: "DESKTOP_STATE_UNAVAILABLE" }));
 
     let spawnCount = 0;
     const finalizerSpawnImpl = (() => {
@@ -620,9 +621,15 @@ describe("real rollout integration", () => {
     expect(item.reason).toBe("busy");
     expect(item.finalizer?.status).toBe("scheduled");
     expect(spawnCount).toBe(1);
+    expect(currentExecution).toHaveBeenCalledTimes(1);
     expect(daemon.restartBridge).not.toHaveBeenCalled();
     expect(readActiveFinalizer(stateDir, workspace.id)).toBeTruthy();
 
+    currentExecution.mockReset().mockResolvedValue({
+      threadId: THREAD, hostId: "local", projectId: "proj-finalizer",
+      workspaceRoot: wsRoot, title: "当前执行会话", cwd: wsRoot,
+      runtimeStatus: "active", activeTurnId: randomUUID(),
+    } as never);
     const summary2 = await rollout({ workspaceRoot: wsRoot, finalizerSpawnImpl });
     const item2 = summary2.workspaces.find(w => w.workspaceId === workspace.id)!;
     expect(item2.finalizer?.status).toBe("existing");

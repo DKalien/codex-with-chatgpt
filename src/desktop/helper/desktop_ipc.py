@@ -2,7 +2,9 @@
 
 这个程序只接受 stdin 上的固定操作：``inspect``、``prepare``、``send``、
 ``reconcile_unknown``、``compatibility``、``compatibility_audit``、``current_identity``、``current_confirm``、``current_execution``、
-``current_result_context`` 和 ``current_result_ownership``。其中 ``current_*`` 只接受
+``inspect_result_context``、``inspect_result_activity_marker``、``inspect_result_terminal_fence``、
+``current_result_context``、``current_result_classification`` 和 ``current_result_ownership``。
+其中 ``current_*`` 只接受
 顶层 ``workspaceRoot``，从继承的当前 Agent 环境解析 thread/project/host；
 它不会接受 stdin 提供的目标身份，也不会执行 stdin 提供的命令或启动
 Desktop、router、app-server。named pipe 帧与请求版本来自
@@ -43,6 +45,7 @@ SNAPSHOT_TIMEOUT_SECONDS = 5.0
 SEND_TIMEOUT_SECONDS = 30.0
 MAX_OBSERVATION_AGE_SECONDS = 2.0
 MAX_RESULT_OWNERSHIP_CHAIN = 8
+MAX_RESULT_ACTIVITY_ITEMS = 4096
 MIN_PYTHON_VERSION = (3, 11)
 COMPATIBILITY_STATUSES = {"current", "unverified", "incompatible"}
 COMPATIBILITY_AUDIT_CLASSIFICATIONS = {
@@ -298,6 +301,19 @@ ERROR_MESSAGES = {
     "DESKTOP_CONFIRMATION_CANCELLED": "本机确认被取消或未完成；没有发送消息。",
     "DESKTOP_RECONCILIATION_CONFLICT": "Desktop 历史无法唯一核对；未恢复结果或修改投递状态。",
 }
+
+# live canonical state 与生成协议中已确认的完整 item type 集合。未知 type
+# 无法安全投影为有序 activity fence，必须 fail closed。
+RESULT_ACTIVITY_ITEM_TYPES = frozenset({
+    "userMessage", "reasoning", "agentMessage", "commandExecution", "subAgentActivity",
+    "collabAgentToolCall", "error", "modelChanged", "contextCompaction", "fileChange",
+    "hookPrompt", "functionCallOutput", "plan", "mcpToolCall", "dynamicToolCall",
+    "webSearch", "imageView", "sleep", "imageGeneration", "enteredReviewMode", "exitedReviewMode",
+})
+# Only the observed terminal epilogue is harmless after the record marker.
+# Keep this deliberately narrower than the complete canonical item set.
+RESULT_ACTIVITY_EPILOGUE_ITEM_TYPES = frozenset({"reasoning", "agentMessage"})
+_RESULT_ACTIVITY_ITEM_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}")
 
 CONFIRMATION_CAPTION = "确认绑定当前 Codex Desktop 会话"
 CONFIRMATION_RISK_TEXT = (
@@ -2358,6 +2374,93 @@ def _result_turn_context(state: dict[str, Any]) -> tuple[str, str]:
     return latest_id, latest_status
 
 
+def _result_activity_sequence(turn: dict[str, Any]) -> tuple[list[str], list[str]]:
+    """投影 canonical turn.items 的完整、有序、无正文 activity 序列。"""
+    items = turn.get("items")
+    if not isinstance(items, list) or not items or len(items) > MAX_RESULT_ACTIVITY_ITEMS:
+        raise _error("DESKTOP_STATE_UNAVAILABLE")
+    item_ids: list[str] = []
+    item_types: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            raise _error("DESKTOP_STATE_UNAVAILABLE")
+        item_id = item.get("id")
+        item_type = item.get("type")
+        if (not isinstance(item_id, str) or _RESULT_ACTIVITY_ITEM_ID_PATTERN.fullmatch(item_id) is None
+                or not isinstance(item_type, str) or item_type not in RESULT_ACTIVITY_ITEM_TYPES or item_id in seen):
+            raise _error("DESKTOP_STATE_UNAVAILABLE")
+        seen.add(item_id)
+        item_ids.append(item_id)
+        item_types.append(item_type)
+    return item_ids, item_types
+
+
+def _result_activity_sha256(item_ids: list[str], item_types: list[str]) -> str:
+    payload = [{"id": item_id, "type": item_type} for item_id, item_type in zip(item_ids, item_types)]
+    canonical = json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode("utf-8", "strict")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _result_activity_marker(item_ids: list[str], item_types: list[str], result_turn_id: str) -> dict[str, Any]:
+    return {
+        "resultTurnId": result_turn_id,
+        "itemIds": list(item_ids),
+        "itemTypes": list(item_types),
+        "itemCount": len(item_ids),
+        "itemSha256": _result_activity_sha256(item_ids, item_types),
+    }
+
+
+def _result_activity_marker_input(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {
+        "resultTurnId", "itemIds", "itemTypes", "itemCount", "itemSha256"
+    }:
+        raise _error("DESKTOP_INVALID_REQUEST")
+    result_turn_id = _uuid(value.get("resultTurnId"))
+    item_ids = value.get("itemIds")
+    item_types = value.get("itemTypes")
+    item_count = value.get("itemCount")
+    item_sha256 = value.get("itemSha256")
+    if (result_turn_id is None or not isinstance(item_ids, list) or not isinstance(item_types, list)
+            or len(item_ids) != len(item_types) or len(item_ids) > MAX_RESULT_ACTIVITY_ITEMS
+            or type(item_count) is not int or item_count != len(item_ids)
+            or not isinstance(item_sha256, str) or _SHA256_PATTERN.fullmatch(item_sha256) is None):
+        raise _error("DESKTOP_INVALID_REQUEST")
+    seen: set[str] = set()
+    for item_id, item_type in zip(item_ids, item_types):
+        if (not isinstance(item_id, str) or _RESULT_ACTIVITY_ITEM_ID_PATTERN.fullmatch(item_id) is None
+                or item_id in seen or not isinstance(item_type, str) or item_type not in RESULT_ACTIVITY_ITEM_TYPES):
+            raise _error("DESKTOP_INVALID_REQUEST")
+        seen.add(item_id)
+    return {
+        "resultTurnId": result_turn_id,
+        "itemIds": list(item_ids),
+        "itemTypes": list(item_types),
+        "itemCount": item_count,
+        "itemSha256": item_sha256,
+        "digestValid": _result_activity_sha256(item_ids, item_types) == item_sha256,
+    }
+
+
+def _result_activity_fence(result_turn_id: str, result_turn_status: str,
+                           item_ids: list[str], item_types: list[str], marker: dict[str, Any]) -> str:
+    if (not marker["digestValid"] or marker["resultTurnId"] != result_turn_id):
+        return "unprovable"
+    marker_ids = marker["itemIds"]
+    marker_types = marker["itemTypes"]
+    if item_ids == marker_ids and item_types == marker_types:
+        return "inProgress" if result_turn_status == "inProgress" else "safe_terminal"
+    prefix_length = len(marker_ids)
+    if (len(item_ids) > prefix_length and item_ids[:prefix_length] == marker_ids
+            and item_types[:prefix_length] == marker_types):
+        suffix_types = item_types[prefix_length:]
+        if suffix_types and all(item_type in RESULT_ACTIVITY_EPILOGUE_ITEM_TYPES for item_type in suffix_types):
+            return "inProgress" if result_turn_status == "inProgress" else "safe_terminal"
+        return "post_record_activity"
+    return "unprovable"
+
+
 def _current_execution(workspace_root: Any) -> dict[str, Any]:
     target = _current_target(workspace_root)
     session, _ = _prepare(target, allow_active=True, require_runner_ancestor=True)
@@ -2368,12 +2471,25 @@ def _current_execution(workspace_root: Any) -> dict[str, Any]:
         if state is None or session.client.snapshot_age() > MAX_OBSERVATION_AGE_SECONDS:
             raise _error("DESKTOP_STATE_UNAVAILABLE")
         _validate_state(state, target, session.client.owner or "", allow_active=True)
+        freshness_deadline = time.monotonic() + SNAPSHOT_TIMEOUT_SECONDS
         # 使用 prepare 时捕获的 runtime 做同一进程/版本复核，避免把新进程或伪造环境当作当前执行。
         _verify_runtime(session.pipe, target, session.runtime)
         _verify_current_runner_ancestor(session.runtime)
         # runtime/runner 核验可能消耗时间；回传前再次确认仍在观测窗口内。
         if session.client.snapshot_age() > MAX_OBSERVATION_AGE_SECONDS:
-            raise _error("DESKTOP_STATE_UNAVAILABLE")
+            if time.monotonic() >= freshness_deadline:
+                raise _error("DESKTOP_STATE_UNAVAILABLE")
+            session.pipe.verify_server()
+            previous_serial = session.client.snapshot_serial
+            state = session.client.snapshot()
+            if session.client.snapshot_serial <= previous_serial:
+                raise _error("DESKTOP_STATE_UNAVAILABLE")
+            _verify_runtime(session.pipe, target, session.runtime)
+            _verify_current_runner_ancestor(session.runtime)
+            if (time.monotonic() >= freshness_deadline
+                    or session.client.snapshot_age() > MAX_OBSERVATION_AGE_SECONDS):
+                raise _error("DESKTOP_STATE_UNAVAILABLE")
+            _validate_state(state, target, session.client.owner or "", allow_active=True)
         active_turn_id = _active_turn_id(state)
         return {
             **_public_info(state, target, session.runtime, session.client),
@@ -2401,6 +2517,92 @@ def _inspect_active_execution(target: dict[str, str]) -> dict[str, Any]:
         }
     finally:
         session.close()
+
+
+def _inspect_result_context(target: dict[str, str]) -> dict[str, Any]:
+    """Detached finalizer 的显式 target 观察；不依赖 runner ancestor。"""
+    session, _ = _prepare(target, allow_active=True)
+    try:
+        session.client.drain(0.1)
+        state = session.client.current_state()
+        if state is None or session.client.snapshot_age() > MAX_OBSERVATION_AGE_SECONDS:
+            raise _error("DESKTOP_STATE_UNAVAILABLE")
+        _validate_state(state, target, session.client.owner or "", allow_active=True)
+        freshness_deadline = time.monotonic() + SNAPSHOT_TIMEOUT_SECONDS
+        _verify_runtime(session.pipe, target, session.runtime)
+        if session.client.snapshot_age() > MAX_OBSERVATION_AGE_SECONDS:
+            if time.monotonic() >= freshness_deadline:
+                raise _error("DESKTOP_STATE_UNAVAILABLE")
+            session.pipe.verify_server()
+            previous_serial = session.client.snapshot_serial
+            state = session.client.snapshot()
+            if session.client.snapshot_serial <= previous_serial:
+                raise _error("DESKTOP_STATE_UNAVAILABLE")
+            _verify_runtime(session.pipe, target, session.runtime)
+            if (time.monotonic() >= freshness_deadline
+                    or session.client.snapshot_age() > MAX_OBSERVATION_AGE_SECONDS):
+                raise _error("DESKTOP_STATE_UNAVAILABLE")
+            _validate_state(state, target, session.client.owner or "", allow_active=True)
+        result_turn_id, result_turn_status = _result_turn_context(state)
+        return {
+            **_public_info(state, target, session.runtime, session.client),
+            "resultTurnId": result_turn_id,
+            "resultTurnStatus": result_turn_status,
+        }
+    finally:
+        session.close()
+
+
+def _inspect_result_activity(target: dict[str, str], marker_value: Any = None, *, verify: bool = False) -> dict[str, Any]:
+    """读取一次 live canonical turn，并只投影有序 item id/type。"""
+    marker = _result_activity_marker_input(marker_value) if verify else None
+    session, _ = _prepare(target, allow_active=True)
+    try:
+        session.client.drain(0.1)
+        state = session.client.current_state()
+        if state is None or session.client.snapshot_age() > MAX_OBSERVATION_AGE_SECONDS:
+            raise _error("DESKTOP_STATE_UNAVAILABLE")
+        _validate_state(state, target, session.client.owner or "", allow_active=True)
+        freshness_deadline = time.monotonic() + SNAPSHOT_TIMEOUT_SECONDS
+        _verify_runtime(session.pipe, target, session.runtime)
+        if session.client.snapshot_age() > MAX_OBSERVATION_AGE_SECONDS:
+            if time.monotonic() >= freshness_deadline:
+                raise _error("DESKTOP_STATE_UNAVAILABLE")
+            session.pipe.verify_server()
+            previous_serial = session.client.snapshot_serial
+            state = session.client.snapshot()
+            if session.client.snapshot_serial <= previous_serial:
+                raise _error("DESKTOP_STATE_UNAVAILABLE")
+            _verify_runtime(session.pipe, target, session.runtime)
+            if (time.monotonic() >= freshness_deadline
+                    or session.client.snapshot_age() > MAX_OBSERVATION_AGE_SECONDS):
+                raise _error("DESKTOP_STATE_UNAVAILABLE")
+            _validate_state(state, target, session.client.owner or "", allow_active=True)
+        result_turn_id, result_turn_status = _result_turn_context(state)
+        turns = _complete_result_turns(state)
+        matches = [turn for turn in turns if turn.get("turnId") == result_turn_id]
+        if len(matches) != 1:
+            raise _error("DESKTOP_STATE_UNAVAILABLE")
+        item_ids, item_types = _result_activity_sequence(matches[0])
+        base = {
+            **_public_info(state, target, session.runtime, session.client),
+            "resultTurnId": result_turn_id,
+            "resultTurnStatus": result_turn_status,
+        }
+        if not verify:
+            return {**base, "marker": _result_activity_marker(item_ids, item_types, result_turn_id)}
+        return {**base, "fence": _result_activity_fence(result_turn_id, result_turn_status,
+                                                           item_ids, item_types, marker)}
+    finally:
+        session.close()
+
+
+def _inspect_result_activity_marker(target: dict[str, str]) -> dict[str, Any]:
+    return _inspect_result_activity(target)
+
+
+def _inspect_result_terminal_fence(target: dict[str, str], marker: Any) -> dict[str, Any]:
+    return _inspect_result_activity(target, marker, verify=True)
 
 
 def _current_result_context(workspace_root: Any) -> dict[str, Any]:
@@ -2480,6 +2682,41 @@ def _origin_matches_expectation(turn: dict[str, Any], expectation: dict[str, Any
     params = turn.get("params")
     if isinstance(params, dict) and params.get("threadId") not in {None, target["threadId"]}:
         raise _error("DESKTOP_TARGET_NOT_FOUND")
+
+
+def _observed_desktop_origin(turn: dict[str, Any], target: dict[str, str]) -> dict[str, Any] | None:
+    text = _turn_text_for_reconciliation(turn)
+    if text is None or not text.lstrip().startswith("{"):
+        return None
+    try:
+        envelope = json.loads(text, object_pairs_hook=_strict_json_object)
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        raise _error("DESKTOP_STATE_UNAVAILABLE")
+    if not isinstance(envelope, dict):
+        raise _error("DESKTOP_STATE_UNAVAILABLE")
+    if envelope.get("type") != "C2C_DESKTOP_TASK":
+        return None
+    if set(envelope) != {"type", "version", "workspaceId", "commandId", "intent", "message"} or envelope.get("version") != 1:
+        raise _error("DESKTOP_STATE_UNAVAILABLE")
+    workspace_id = envelope.get("workspaceId")
+    command_id = envelope.get("commandId")
+    intent = envelope.get("intent")
+    message = envelope.get("message")
+    if (not isinstance(workspace_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", workspace_id)
+            or not isinstance(command_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", command_id)
+            or intent not in {"development_plan", "revision"} or not isinstance(message, str) or not message):
+        raise _error("DESKTOP_STATE_UNAVAILABLE")
+    try:
+        encoded = message.encode("utf-8", "strict")
+    except UnicodeEncodeError:
+        raise _error("DESKTOP_STATE_UNAVAILABLE")
+    if len(encoded) > MAX_MESSAGE_BYTES:
+        raise _error("DESKTOP_STATE_UNAVAILABLE")
+    params = turn.get("params")
+    if isinstance(params, dict) and params.get("threadId") not in {None, target["threadId"]}:
+        raise _error("DESKTOP_TARGET_NOT_FOUND")
+    return {"workspaceId": workspace_id, "commandId": command_id, "intent": intent,
+            "messageBytes": len(encoded), "messageSha256": hashlib.sha256(encoded).hexdigest()}
 
 
 def _native_successor(turn: dict[str, Any], target: dict[str, str]) -> None:
@@ -2585,6 +2822,106 @@ def _current_result_ownership(workspace_root: Any, expectation_value: Any) -> di
         session.close()
 
 
+def _current_result_island(state: dict[str, Any], result_id: str) -> list[dict[str, Any]]:
+    _complete_result_turns(state)
+    history = state.get("turnHistory", {}).get("history", {})
+    islands = history.get("islands") if isinstance(history, dict) else None
+    entities = history.get("entitiesByKey") if isinstance(history, dict) else None
+    matches = []
+    if not isinstance(islands, list) or not isinstance(entities, dict):
+        raise _error("DESKTOP_STATE_UNAVAILABLE")
+    for island in islands:
+        entries = island.get("entries") if isinstance(island, dict) else None
+        boundary = island.get("newerBoundary") if isinstance(island, dict) else None
+        if not isinstance(entries, list) or not entries or not isinstance(boundary, dict):
+            raise _error("DESKTOP_STATE_UNAVAILABLE")
+        turns = []
+        for entry in entries:
+            key = entry.get("value") if isinstance(entry, dict) else None
+            turn = entities.get(key) if isinstance(key, str) else None
+            if not isinstance(turn, dict):
+                raise _error("DESKTOP_STATE_UNAVAILABLE")
+            turns.append(turn)
+        if any(turn.get("turnId") == result_id for turn in turns):
+            if boundary.get("status") != "exhausted":
+                raise _error("DESKTOP_STATE_UNAVAILABLE")
+            matches.append(turns)
+    if len(matches) != 1:
+        raise _error("DESKTOP_STATE_UNAVAILABLE")
+    return matches[0]
+
+
+def _current_result_classification(workspace_root: Any) -> dict[str, Any]:
+    target = _current_target(workspace_root)
+    session, _ = _prepare(target, allow_active=True, require_runner_ancestor=True)
+    try:
+        session.client.drain(0.1)
+        state = session.client.current_state()
+        if state is None or session.client.snapshot_age() > MAX_OBSERVATION_AGE_SECONDS:
+            raise _error("DESKTOP_STATE_UNAVAILABLE")
+        _validate_state(state, target, session.client.owner or "", allow_active=True)
+        _verify_runtime(session.pipe, target, session.runtime)
+        _verify_current_runner_ancestor(session.runtime)
+        if session.client.snapshot_age() > MAX_OBSERVATION_AGE_SECONDS:
+            session.pipe.verify_server()
+            previous_serial = session.client.snapshot_serial
+            state = session.client.snapshot()
+            if session.client.snapshot_serial <= previous_serial:
+                raise _error("DESKTOP_STATE_UNAVAILABLE")
+            _verify_runtime(session.pipe, target, session.runtime)
+            _verify_current_runner_ancestor(session.runtime)
+            if session.client.snapshot_age() > MAX_OBSERVATION_AGE_SECONDS:
+                raise _error("DESKTOP_STATE_UNAVAILABLE")
+            _validate_state(state, target, session.client.owner or "", allow_active=True)
+        result_id, result_status = _result_turn_context(state)
+        island = _current_result_island(state, result_id)
+        indexes = [i for i, turn in enumerate(island) if turn.get("turnId") == result_id]
+        if len(indexes) != 1:
+            raise _error("DESKTOP_STATE_UNAVAILABLE")
+        base = {**_public_info(state, target, session.runtime, session.client),
+                "resultTurnId": result_id, "resultTurnStatus": result_status}
+        current = island[indexes[0]]
+        try:
+            _turn_text_for_reconciliation(current)
+        except DesktopIpcError:
+            _native_successor(current, target)
+        else:
+            observed = _observed_desktop_origin(current, target)
+            if observed is None:
+                return {**base, "classification": "not_applicable"}
+            return {**base, **observed, "classification": "applicable", "ownership": "origin",
+                    "originTurnId": result_id, "chainTurnIds": [result_id], "chainLength": 0, "signature": None}
+        chain = [result_id]
+        cursor = indexes[0]
+        while cursor > 0:
+            if len(chain) - 1 >= MAX_RESULT_OWNERSHIP_CHAIN:
+                raise _error("DESKTOP_STATE_UNAVAILABLE")
+            successor = island[cursor]
+            predecessor = island[cursor - 1]
+            _native_successor(successor, target)
+            if predecessor.get("status") not in {"failed", "interrupted"}:
+                raise _error("DESKTOP_STATE_UNAVAILABLE")
+            predecessor_id = _uuid(predecessor.get("turnId"))
+            if predecessor_id is None:
+                raise _error("DESKTOP_STATE_UNAVAILABLE")
+            chain.insert(0, predecessor_id)
+            try:
+                _turn_text_for_reconciliation(predecessor)
+            except DesktopIpcError:
+                _native_successor(predecessor, target)
+                cursor -= 1
+                continue
+            observed = _observed_desktop_origin(predecessor, target)
+            if observed is None:
+                return {**base, "classification": "not_applicable"}
+            return {**base, **observed, "classification": "applicable", "ownership": "native_continuation",
+                    "originTurnId": predecessor_id, "chainTurnIds": chain,
+                    "chainLength": len(chain) - 1, "signature": _NATIVE_CONTINUATION_TRIGGER}
+        raise _error("DESKTOP_STATE_UNAVAILABLE")
+    finally:
+        session.close()
+
+
 def _current_confirm(workspace_root: Any) -> dict[str, Any]:
     before, before_runtime = _current_identity_checked(workspace_root)
     try:
@@ -2620,7 +2957,7 @@ def _main() -> int:
         request: Any = None
         try:
             request = json.loads(raw.decode("utf-8", "strict"))
-            if not isinstance(request, dict) or set(request) - {"id", "op", "target", "expectation", "message", "workspaceRoot"}:
+            if not isinstance(request, dict) or set(request) - {"id", "op", "target", "expectation", "message", "workspaceRoot", "marker"}:
                 raise _error("DESKTOP_INVALID_REQUEST")
             request_id = request.get("id")
             op = request.get("op")
@@ -2654,11 +2991,32 @@ def _main() -> int:
                     raise _error("DESKTOP_INVALID_REQUEST")
                 target = _target(request.get("target"))
                 _reply({"id": request_id, "ok": True, "value": _inspect_active_execution(target)})
+            elif op == "inspect_result_context":
+                if set(request) != {"id", "op", "target"} or prepared is not None:
+                    raise _error("DESKTOP_INVALID_REQUEST")
+                target = _target(request.get("target"))
+                _reply({"id": request_id, "ok": True, "value": _inspect_result_context(target)})
+            elif op == "inspect_result_activity_marker":
+                if set(request) != {"id", "op", "target"} or prepared is not None:
+                    raise _error("DESKTOP_INVALID_REQUEST")
+                target = _target(request.get("target"))
+                _reply({"id": request_id, "ok": True, "value": _inspect_result_activity_marker(target)})
+            elif op == "inspect_result_terminal_fence":
+                if set(request) != {"id", "op", "target", "marker"} or prepared is not None:
+                    raise _error("DESKTOP_INVALID_REQUEST")
+                target = _target(request.get("target"))
+                _reply({"id": request_id, "ok": True,
+                        "value": _inspect_result_terminal_fence(target, request.get("marker"))})
             elif op == "current_result_ownership":
                 if set(request) != {"id", "op", "workspaceRoot", "expectation"} or prepared is not None:
                     raise _error("DESKTOP_INVALID_REQUEST")
                 _reply({"id": request_id, "ok": True,
                         "value": _current_result_ownership(request.get("workspaceRoot"), request.get("expectation"))})
+            elif op == "current_result_classification":
+                if set(request) != {"id", "op", "workspaceRoot"} or prepared is not None:
+                    raise _error("DESKTOP_INVALID_REQUEST")
+                _reply({"id": request_id, "ok": True,
+                        "value": _current_result_classification(request.get("workspaceRoot"))})
             elif op in {"current_identity", "current_confirm", "current_execution", "current_result_context"}:
                 if set(request) != {"id", "op", "workspaceRoot"} or prepared is not None:
                     raise _error("DESKTOP_INVALID_REQUEST")

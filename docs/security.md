@@ -142,10 +142,13 @@ model/provider/cwd/effort/sandbox/approval/permissions 等 Desktop 执行设置�
 Desktop 接受真实投递后返回 `deliveryStatus=accepted`，它不等待 `completed`，也不产生
 测试通过结论。
 
-执行终态证据使用本机 `desktop record-result`，必须验证真实当前 thread 和唯一 active turn，或
-idle 时 canonical history 最新侧完整的最后 terminal turn，写入前再次确认其
-与 accepted delivery 一致；网页无写 record 工具。Review 以 exact commandId 关联 record/output，
-不能从旧 `test_status` 推导本轮通过。完整规则见 [自动验收记录](desktop-control.md#自动验收记录)。
+执行终态证据使用统一本机 `c2c record`，仅在 accepted Desktop turn 的 terminal 身份经过复核后
+升级为 `desktop_<commandId>` trusted receipt；`inProgress` 只落受保护 pending draft，当前
+canonical history 无法证明 record 后没有继续 command/tool activity 时发出
+`FINAL_RECEIPT_REQUIRED`，不伪造 `C2C_EXECUTED`。写入前再次确认其与 accepted delivery 一致。
+`desktop record-result` 仍保留为低层/测试/高级显式入口，网页无写 record 工具。Review
+以 exact commandId 关联 record/output，不能从旧 `test_status` 推导本轮通过。完整规则见
+[自动验收记录](desktop-control.md#自动验收记录)。
 
 send 的风险标注保持 `readOnlyHint:false`、`destructiveHint:true`、`openWorldHint:true`、
 `idempotentHint:true`；`idempotent` 仅表示同一 `commandId` 防止重复尝试，不是网络 exactly-once，

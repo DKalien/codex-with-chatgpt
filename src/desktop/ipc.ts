@@ -91,6 +91,34 @@ export interface DesktopResultContext extends DesktopTargetInfo {
   resultTurnStatus: DesktopResultTurnStatus;
 }
 
+export const DESKTOP_RESULT_ACTIVITY_ITEM_TYPES = [
+  "userMessage", "reasoning", "agentMessage", "commandExecution", "subAgentActivity",
+  "collabAgentToolCall", "error", "modelChanged", "contextCompaction", "fileChange",
+  "hookPrompt", "functionCallOutput", "plan", "mcpToolCall", "dynamicToolCall",
+  "webSearch", "imageView", "sleep", "imageGeneration", "enteredReviewMode", "exitedReviewMode",
+] as const;
+
+export type DesktopResultActivityItemType = typeof DESKTOP_RESULT_ACTIVITY_ITEM_TYPES[number];
+
+/** canonical turn.items 的无正文、有序 activity 标记。 */
+export interface DesktopResultActivityMarker {
+  resultTurnId: string;
+  itemIds: string[];
+  itemTypes: DesktopResultActivityItemType[];
+  itemCount: number;
+  itemSha256: string;
+}
+
+export type DesktopResultTerminalFenceKind = "inProgress" | "safe_terminal" | "post_record_activity" | "unprovable";
+
+export interface DesktopResultActivityMarkerObservation extends DesktopResultContext {
+  marker: DesktopResultActivityMarker;
+}
+
+export interface DesktopResultTerminalFence extends DesktopResultContext {
+  fence: DesktopResultTerminalFenceKind;
+}
+
 export type DesktopResultOwnershipKind = "origin" | "native_continuation";
 
 export interface DesktopResultOwnershipExpectation extends DesktopUnknownReconcileExpectation {
@@ -103,6 +131,23 @@ export interface DesktopResultOwnership extends DesktopResultContext {
   chainTurnIds: string[];
   chainLength: number;
   signature: "capacity_retry_automatic" | null;
+}
+
+export type DesktopResultClassificationKind = "applicable" | "not_applicable";
+
+/** 当前 canonical result turn 的一次性 self-attestation 分类结果。 */
+export interface DesktopResultClassification extends DesktopResultContext {
+  classification: DesktopResultClassificationKind;
+  workspaceId?: string;
+  commandId?: string;
+  intent?: DesktopUnknownReconcileExpectation["intent"];
+  messageBytes?: number;
+  messageSha256?: string;
+  ownership?: DesktopResultOwnershipKind;
+  originTurnId?: string;
+  chainTurnIds?: string[];
+  chainLength?: number;
+  signature?: "capacity_retry_automatic" | null;
 }
 
 export interface DesktopUnknownReconcileExpectation {
@@ -122,6 +167,8 @@ export interface DesktopUnknownReconcileObservation {
 }
 
 const MAX_RESULT_CONTINUATION_CHAIN = 8;
+const MAX_RESULT_ACTIVITY_ITEMS = 4096;
+const RESULT_ACTIVITY_ITEM_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$/u;
 
 export interface DesktopIpcConnection {
   send(message: string): Promise<{ threadId: string; turnId: string }>;
@@ -521,6 +568,97 @@ function validateResultContext(value: unknown, target: DesktopTarget): DesktopRe
   return { ...info, resultTurnId: input.resultTurnId, resultTurnStatus: input.resultTurnStatus as DesktopResultTurnStatus };
 }
 
+function validateTargetScopedResultContext(value: unknown, target: DesktopTarget): DesktopResultContext {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw error("DESKTOP_PROTOCOL_ERROR");
+  const input = value as Record<string, unknown>;
+  const keys = [
+    "threadId", "hostId", "projectId", "workspaceRoot", "title", "cwd", "workspaceKind", "resumeState",
+    "runtimeStatus", "requestsCount", "desktopVersion", "appServerVersion", "profile", "ownerClientId",
+    "resultTurnId", "resultTurnStatus",
+  ];
+  if (Object.keys(input).sort().join(",") !== [...keys].sort().join(",")) throw error("DESKTOP_PROTOCOL_ERROR");
+  const context = validateResultContext(value, target);
+  if (input.workspaceKind !== "project" || input.resumeState !== "resumed" ||
+      !Number.isSafeInteger(input.requestsCount) || (input.requestsCount as number) < 0 ||
+      typeof input.desktopVersion !== "string" || !input.desktopVersion.trim() || input.desktopVersion.length > 128 ||
+      typeof input.appServerVersion !== "string" || !input.appServerVersion.trim() || input.appServerVersion.length > 128 ||
+      (input.profile !== null && (typeof input.profile !== "string" || !/^desktop-ipc-v[1-9]\d*$/.test(input.profile))) ||
+      typeof input.ownerClientId !== "string" || !isUuid(input.ownerClientId)) {
+    throw error("DESKTOP_PROTOCOL_ERROR");
+  }
+  return context;
+}
+
+export function validateDesktopResultActivityMarker(value: unknown): DesktopResultActivityMarker {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw error("DESKTOP_PROTOCOL_ERROR");
+  const input = value as Record<string, unknown>;
+  if (Object.keys(input).sort().join(",") !== "itemCount,itemIds,itemSha256,itemTypes,resultTurnId") {
+    throw error("DESKTOP_PROTOCOL_ERROR");
+  }
+  const itemIds = input.itemIds;
+  const itemTypes = input.itemTypes;
+  if (!isUuid(input.resultTurnId) || !Array.isArray(itemIds) || !Array.isArray(itemTypes) ||
+      itemIds.length !== itemTypes.length || itemIds.length < 1 || itemIds.length > MAX_RESULT_ACTIVITY_ITEMS ||
+      !Number.isSafeInteger(input.itemCount) || input.itemCount !== itemIds.length ||
+      typeof input.itemSha256 !== "string" || !/^[a-f0-9]{64}$/u.test(input.itemSha256) ||
+      !itemIds.every(itemId => typeof itemId === "string" && RESULT_ACTIVITY_ITEM_ID_PATTERN.test(itemId)) ||
+      new Set(itemIds).size !== itemIds.length ||
+      !itemTypes.every(itemType => typeof itemType === "string" &&
+        (DESKTOP_RESULT_ACTIVITY_ITEM_TYPES as readonly string[]).includes(itemType))) {
+    throw error("DESKTOP_PROTOCOL_ERROR");
+  }
+  return {
+    resultTurnId: input.resultTurnId,
+    itemIds: [...itemIds] as string[],
+    itemTypes: [...itemTypes] as DesktopResultActivityItemType[],
+    itemCount: input.itemCount,
+    itemSha256: input.itemSha256,
+  };
+}
+
+export function validateDesktopResultActivityMarkerObservation(
+  value: unknown,
+  target: DesktopTarget,
+): DesktopResultActivityMarkerObservation {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw error("DESKTOP_PROTOCOL_ERROR");
+  const input = value as Record<string, unknown>;
+  if (Object.keys(input).sort().join(",") !==
+      "appServerVersion,cwd,desktopVersion,hostId,marker,ownerClientId,profile,projectId,requestsCount,resultTurnId,resultTurnStatus,resumeState,runtimeStatus,threadId,title,workspaceKind,workspaceRoot") {
+    throw error("DESKTOP_PROTOCOL_ERROR");
+  }
+  const marker = validateDesktopResultActivityMarker(input.marker);
+  const contextValue = { ...input };
+  delete contextValue.marker;
+  const context = validateTargetScopedResultContext(contextValue, target);
+  if (marker.resultTurnId !== context.resultTurnId) throw error("DESKTOP_PROTOCOL_ERROR");
+  return { ...context, marker };
+}
+
+export function validateDesktopResultTerminalFence(
+  value: unknown,
+  target: DesktopTarget,
+): DesktopResultTerminalFence {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw error("DESKTOP_PROTOCOL_ERROR");
+  const input = value as Record<string, unknown>;
+  if (Object.keys(input).sort().join(",") !==
+      "appServerVersion,cwd,desktopVersion,fence,hostId,ownerClientId,profile,projectId,requestsCount,resultTurnId,resultTurnStatus,resumeState,runtimeStatus,threadId,title,workspaceKind,workspaceRoot") {
+    throw error("DESKTOP_PROTOCOL_ERROR");
+  }
+  const contextValue = { ...input };
+  delete contextValue.fence;
+  const context = validateTargetScopedResultContext(contextValue, target);
+  if (!(["inProgress", "safe_terminal", "post_record_activity", "unprovable"] as const).includes(input.fence as DesktopResultTerminalFenceKind)) {
+    throw error("DESKTOP_PROTOCOL_ERROR");
+  }
+  const fence = input.fence as DesktopResultTerminalFenceKind;
+  const terminal = ["completed", "failed", "interrupted", "cancelled"].includes(context.resultTurnStatus);
+  if ((fence === "inProgress" && context.resultTurnStatus !== "inProgress") ||
+      (fence === "safe_terminal" && !terminal)) {
+    throw error("DESKTOP_STATE_UNAVAILABLE");
+  }
+  return { ...context, fence };
+}
+
 export function validateDesktopHandshakeAudit(value: unknown): DesktopHandshakeAudit {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw error("DESKTOP_PROTOCOL_ERROR");
   const input = value as Record<string, unknown>;
@@ -592,6 +730,46 @@ function validateResultOwnership(value: unknown, target: DesktopTarget): Desktop
     chainLength,
     signature,
   };
+}
+
+function validateResultClassification(value: unknown, target: DesktopTarget): DesktopResultClassification {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw error("DESKTOP_PROTOCOL_ERROR");
+  const input = value as Record<string, unknown>;
+  const allowed = new Set([
+    "threadId", "hostId", "projectId", "workspaceRoot", "title", "cwd", "workspaceKind", "resumeState",
+    "runtimeStatus", "requestsCount", "desktopVersion", "appServerVersion", "profile", "ownerClientId",
+    "resultTurnId", "resultTurnStatus", "classification", "workspaceId", "commandId", "intent",
+    "messageBytes", "messageSha256", "ownership", "originTurnId", "chainTurnIds", "chainLength", "signature",
+  ]);
+  if (Object.keys(input).some(key => !allowed.has(key))) throw error("DESKTOP_PROTOCOL_ERROR");
+  const context = validateResultContext(value, target);
+  if (input.classification === "not_applicable") {
+    if (["workspaceId", "commandId", "intent", "messageBytes", "messageSha256", "ownership", "originTurnId", "chainTurnIds", "chainLength", "signature"]
+      .some(key => Object.prototype.hasOwnProperty.call(input, key))) {
+      throw error("DESKTOP_PROTOCOL_ERROR");
+    }
+    return { ...context, classification: "not_applicable" };
+  }
+  if (input.classification !== "applicable") {
+    throw error("DESKTOP_PROTOCOL_ERROR");
+  }
+  let attestation: DesktopUnknownReconcileExpectation;
+  try {
+    attestation = validateUnknownReconcileExpectation({
+      workspaceId: input.workspaceId,
+      commandId: input.commandId,
+      intent: input.intent,
+      messageBytes: input.messageBytes,
+      messageSha256: input.messageSha256,
+    } as DesktopUnknownReconcileExpectation);
+  } catch {
+    throw error("DESKTOP_PROTOCOL_ERROR");
+  }
+  const ownershipInput = { ...input };
+  delete ownershipInput.classification;
+  for (const key of ["workspaceId", "commandId", "intent", "messageBytes", "messageSha256"]) delete ownershipInput[key];
+  const ownership = validateResultOwnership(ownershipInput, target);
+  return { ...ownership, ...attestation, classification: "applicable" };
 }
 
 function validateUnknownReconcileExpectation(value: DesktopUnknownReconcileExpectation): DesktopUnknownReconcileExpectation {
@@ -848,6 +1026,40 @@ export class DesktopIpcClient {
     } finally { session.close(); }
   }
 
+  /** Detached receipt finalizer 的显式 target 观察；不读取 runner 环境，也不要求 runner ancestor。 */
+  async inspectResultContext(rawTarget: DesktopTarget): Promise<DesktopResultContext> {
+    const target = validateTarget(rawTarget);
+    const session = this.open();
+    try {
+      const value = await session.request("inspect_result_context", { target });
+      return validateTargetScopedResultContext(value, target);
+    } finally { session.close(); }
+  }
+
+  /** 读取当前 canonical turn 的无正文、有序 activity marker。 */
+  async inspectResultActivityMarker(rawTarget: DesktopTarget): Promise<DesktopResultActivityMarkerObservation> {
+    const target = validateTarget(rawTarget);
+    const session = this.open();
+    try {
+      const value = await session.request("inspect_result_activity_marker", { target });
+      return validateDesktopResultActivityMarkerObservation(value, target);
+    } finally { session.close(); }
+  }
+
+  /** 用之前捕获的 marker 做一次 target-scoped 终态 fence 校验。 */
+  async inspectResultTerminalFence(
+    rawTarget: DesktopTarget,
+    rawMarker: DesktopResultActivityMarker,
+  ): Promise<DesktopResultTerminalFence> {
+    const target = validateTarget(rawTarget);
+    const marker = validateDesktopResultActivityMarker(rawMarker);
+    const session = this.open();
+    try {
+      const value = await session.request("inspect_result_terminal_fence", { target, marker });
+      return validateDesktopResultTerminalFence(value, target);
+    } finally { session.close(); }
+  }
+
   async currentResultContext(workspaceRoot: string): Promise<DesktopResultContext> {
     return this.currentOperation("current_result_context", workspaceRoot, validateResultContext) as Promise<DesktopResultContext>;
   }
@@ -861,6 +1073,11 @@ export class DesktopIpcClient {
     const value = await this.currentOperation("current_result_ownership", workspaceRoot, validateResultOwnership, { expectation }) as unknown as DesktopResultOwnership;
     if (value.originTurnId !== expectation.originTurnId) throw error("DESKTOP_RECONCILIATION_CONFLICT");
     return value as DesktopResultOwnership;
+  }
+
+  /** 在单次 current-result 观测中读取 Desktop 自证 envelope，并由调用方与 durable delivery 精确匹配。 */
+  async currentResultClassification(workspaceRoot: string): Promise<DesktopResultClassification> {
+    return this.currentOperation("current_result_classification", workspaceRoot, validateResultClassification) as Promise<DesktopResultClassification>;
   }
 
   async confirmCurrent(workspaceRoot: string): Promise<DesktopTargetInfo> {

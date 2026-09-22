@@ -269,7 +269,7 @@ Desktop Control 是独立于 Remote Control 和 DOM Web Control 的 MCP 写入�
   → 本机重新核对绑定、Desktop 进程/端点、owner、项目和版本
   → 等待有界的真实接受回执
   → deliveryStatus=accepted（带真实 threadId/turnId），网页本轮结束
-  → Desktop 在原 active turn 最终回复前用 desktop record-result 写 exact commandId receipt
+  → Desktop 在最终终态前用统一 c2c record 请求 exact commandId receipt；inProgress 先进入 terminal fence
   → 用户主动要求验收时，ChatGPT 精确匹配该 commandId，再读 record/outputId 与当次代码、Git
 ```
 
@@ -327,11 +327,17 @@ send 的风险标注保持 `readOnlyHint:false`、`destructiveHint:true`、`open
 整个 workspace（包括新绑定）的后续投递暂停，必须先由本机用户人工核对；MVP 没有自动
 恢复或恢复接口。
 
-执行 receipt 只能由匹配 delivery.threadId / delivery.turnId 的真实当前 active turn，或 idle 下
-canonical history 最新侧完整的最后 terminal turn 写入；写入前及幂等返回前仍须复核，
-不能用普通 `c2c record` 或后续 turn 补写。Review 必须从 `execution_summary` 精确匹配该
-commandId，再读取 outputId；缺失时明确报告“本轮验收记录缺失”，不得引用历史 `test_status`
-冒充本轮通过。完整 envelope、幂等和输出限制见 [自动验收记录](desktop-control.md#自动验收记录)。
+执行 receipt 只能由统一 `c2c record` 在匹配 delivery.threadId / delivery.turnId 的真实当前
+terminal turn 写入；写入前及幂等返回前仍须复核，后续 turn 不能代记。若当前 turn 仍为
+`inProgress`，只写入受保护的 pending draft，不产生 trusted receipt；当前 canonical history
+无法证明 record 后没有继续的 command/tool activity 时，通过 `FINAL_RECEIPT_REQUIRED` 控制反馈
+要求重新只读核对，而不是伪造 `C2C_EXECUTED`。该命令在可证明终态时自动升级为
+`desktop_<commandId>` trusted receipt；`desktop record-result` 仍保留为低层/测试/高级显式入口。
+控制事件由声明 `feedbackControlEventVersion=1` 的运行中 Bridge 统一投影；detached worker
+只持久化 alert，旧运行时保持可读且不会被写入前向事件。维护修复不会删除 alert 或改写绑定状态。
+Review 必须从 `execution_summary` 精确匹配该 commandId，再读取 outputId；缺失时明确报告
+“本轮验收记录缺失”，不得引用历史 `test_status` 冒充本轮通过。完整 envelope、幂等和输出限制
+见 [自动验收记录](desktop-control.md#自动验收记录)。
 
 状态持久化 `commandId`、OAuth `clientId`、`bindingId`、正文摘要、投递阶段及真实
 thread/turn ID。必要的这些投递元数据可以由状态查询返回，但状态、日志和

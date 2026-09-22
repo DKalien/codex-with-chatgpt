@@ -19,7 +19,7 @@ it("本机 receipt 绑定原 accepted thread，按本轮文件记录并对失败
 });
 
 it("receipt 校验 exact active 或 idle latest terminal，后续 turn 和未知状态均不落盘", () => {
-  for (const text of ["受控 Desktop IPC", "唯一当前 `inProgress`", "delivery.turnId", "后续 turn 不能代记",
+  for (const text of ["受控 Desktop IPC", "`inProgress` 只创建 pending draft", "delivery.turnId", "后续 turn 不能代记",
     "无/多个/未知 active turn", "状态读取失败", "不创建/修改 execution record 或 output",
     "不接受调用方传入 turnId", "不能单独授权写记录", "重试也必须通过相同 exact-turn 校验",
     "canonical history 最新侧完整", "存在更晚 turn", "写入前再次校验", "DESKTOP_STATE_UNAVAILABLE"])
@@ -38,4 +38,20 @@ it("outcome_unknown 仅允许本机严格对账恢复 receipt identity", () => {
     "0 个候选保持 unknown", "多个候选", "outcome_unknown -> accepted + turnId",
     "不写 execution receipt", "后续 turn", "不能代记"])
     expect(skill).toContain(text);
+});
+
+it("FINAL_RECEIPT_REQUIRED 只读复核后按需推进，不递归制造 closeout", () => {
+  for (const text of [
+    "FINAL_RECEIPT_REQUIRED",
+    "控制唤醒与只读复核信号",
+    "仅发现实际需要修复或补测时",
+    "可继续既定项目目标、开发计划或 DONE",
+    "禁止为了制造回执发送无改动 closeout",
+    "不是新的用户授权",
+  ]) expect(skill).toContain(text);
+  for (const text of [
+    "要求重新只读核对并发起新的 closeout/review",
+    "重新只读核对并发起新的 closeout",
+    "再发起新的 closeout/review command；它不是新的用户授权",
+  ]) expect(skill).not.toContain(text);
 });

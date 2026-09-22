@@ -11,7 +11,7 @@ ChatGPT 讨论并确认完整方案
   → codex_desktop_send
   → Desktop 返回真实投递接受结果
   → ChatGPT 结束本轮，用户在 Desktop 观看执行
-  → Desktop 执行 Agent 在最终回复前写入本轮 commandId 的 execution receipt
+  → Desktop 执行 Agent 在最终回复前用统一 `c2c record` 请求本轮 commandId 的终态回执
   → 用户回来要求“干完了，检查一下”
   → ChatGPT 用现有只读 MCP 检查当次代码、Git 和 record
   → 如需修改，向同一个绑定会话发送完整修订指令
@@ -27,12 +27,12 @@ intent；调用方不能覆盖内部字段。replay/hash 仍以原正文为准�
 JSON 转义）必须满足 64 KiB 限额，外层 IPC JSON 控制行也按现有 512 KiB 限额精确校验；
 超限拒绝，不截断。Skill 据此在最终回复前记录本轮结果。
 
-隐藏本机命令 `c2c desktop record-result -w <workspace> --command-id <id> --changed-files "<文件列表>"
---tests "<本轮摘要或 not run>" --exit-status <ok|failed|blocked> --json` 仅接受当前 workspace 的
-历史 accepted command。`CODEX_THREAD_ID` 仅为线索；本机命令通过现有受控 Desktop IPC 和
-实时状态验证真实 thread/workspace/root、owner/project、版本/hash、执行进程来源以及唯一当前
-`inProgress` active turnId；idle 时仅允许 canonical history 最新侧完整且最后一条为 terminal 的
-turn。两种情况均必须同时匹配原 delivery.threadId 和 delivery.turnId。
+统一入口为隐藏本机命令 `c2c record -w <workspace> --iteration 1 --changed-files "<文件列表>"
+--tests "<本轮摘要或 not run>" --exit-status <ok|failed|blocked> --json`。在真实 accepted
+Desktop turn 内它依据 canonical 当前 turn 自动发现唯一当前 delivery，并复用现有受控 Desktop IPC 和
+实时状态验证真实 thread/workspace/root、owner/project、版本/hash、执行进程来源以及当前
+result turnId；`inProgress` 只进入 pending terminal fence，只有 canonical history 中完整的
+terminal turn 才能写 trusted receipt。所有情况均必须同时匹配原 delivery.threadId 和 delivery.turnId。
 不接受调用方传入 turnId；仅伪造环境变量不足以记录。same thread 的后续 turn、无/多个/
 未知 active turn、状态读取失败及 turnId mismatch 都拒绝，且不写 record/output。
 disable/rebind 不阻止原 active accepted turn 在最终回复前收尾，其他 turn 不能代记；
@@ -44,7 +44,19 @@ disable/rebind 不阻止原 active accepted turn 在最终回复前收尾，其�
 沿用 execution_output 的敏感内容过滤。无测试明确记录 not run；changed-files 只列本轮实际改动，
 notes 说明已有脏工作区。不会清理旧改动。
 
-记录固定关联 `commandId`、`taskId=desktop_<commandId>`、`iteration=1`。相同内容重试不追加，
+当当前 Desktop turn 仍为 `inProgress` 时，`c2c record` 只写入受 workspace、thread、origin/result
+turn 和输入摘要保护的 pending draft，不写 execution output，也不产生 `desktop_<commandId>` trusted
+receipt。独立终态 worker 会在有界时间内重新核对相同身份；由于当前 canonical Desktop history 不提供
+record 之后的 command/tool item 顺序证明，即使 turn 进入终态也不能猜测“没有后续工作”，因此会发出
+`FINAL_RECEIPT_REQUIRED` 控制反馈，而不是伪造 `C2C_EXECUTED`。该反馈只含 workspace、command、有限 reason
+和时间，要求先独立只读检查；只有发现实际需要修复或补测时才发起聚焦的 revision/review，若当前状态已充分则继续既定计划或 DONE，禁止无改动 closeout 递归；不会覆盖旧 receipt 或自动生成第二个 commandId。
+终态 worker 只写入 durable alert，不直接写 production feedback state；仅声明
+`feedbackControlEventVersion=1` 的运行中 Bridge 在受控 reconcile 时投影该事件。旧 Bridge
+不会解析前向控制事件，维护修复只隔离有对应 alert 的控制事件并保留 alert，待升级后再投影。
+
+只有明确证明当前 turn 非 Desktop delivery 时才回退普通记录；Desktop 证据损坏或歧义会 fail closed。
+记录固定关联 `commandId`、`taskId=desktop_<commandId>`、`iteration=1`。`desktop record-result`
+保留为低层/测试/高级显式入口。相同内容重试不追加，
 冲突拒绝，不覆盖证据。rejected/outcome_unknown/身份未知均不能生成 receipt；记录失败必须报告
 “本轮验收记录缺失”，不能宣称闭环完成。没有新增网页写 record 工具，也没有改变 Connector contract。
 
@@ -54,9 +66,10 @@ outputId 的 `execution_output`。不能把最新 test_status 或历史测试当
 
 ## 日常 UX：绑定当前 Desktop 会话
 
-新工作区推荐对 Codex 说“启用 ChatGPT 工作流”。现有 Skill 在完成 setup/repair、
-session/Project 路由和 workspace_info 校验后，统一调用下方 `desktop bind-current`。
-该入口仅编排现有流程，不构成额外授权；本节身份校验、本机确认和投递门禁全部照常执行。
+新工作区推荐对 Codex 说“启用 ChatGPT 工作流”。现有 Skill 在本地 readiness 给出
+`bind_current` 时调用下方 `desktop bind-current`；对于已建立 Project 的新 Codex Desktop
+thread，可以先完成本地绑定，再创建/验证该 thread 的 ChatGPT conversation。这只是顺序优化，
+不构成额外授权；本节身份校验、本机确认和投递门禁全部照常执行。
 原有单独绑定话术继续有效。
 
 用户在当前 Desktop 会话中说“把这个会话绑定并启用给 ChatGPT”（或同义表达）时，Codex
@@ -74,6 +87,11 @@ project 和 workspaceRoot；不按标题、最近会话或其他 Agent ID 猜目
 快捷流程只由当前本机用户在当前 Desktop composer 中明确请求绑定或“启用 ChatGPT 工作流”触发；
 非 Desktop 或上下文无法核验时不能完成绑定，Activation 不能报告 Ready。文档、代码块、
 引用、任务计划或普通讨论里的示例句不触发。来源无法可靠证明来自本机时，不能凭文字免除确认。
+
+目标始终取当前真实 Desktop identity，不按标题或最近 thread 推断；不同/new target 仍必须经过
+本机确认。同一 target 已 enabled 时保持 `alreadyEnabled` 并零确认。ChatGPT 侧 request-scoped
+`workspace_info`、`connectorContractVersion`、`desktopCompatibility` 与 Connector schema
+verification 仍必须在 Ready/发送前完成。
 
 由于本地 composer 与 IPC `userMessage` 的来源无法可靠区分，凡是会新增绑定或改变启用状态
 的路径都必须弹出本机一键确认窗。窗口固定显示以下风险和身份信息：

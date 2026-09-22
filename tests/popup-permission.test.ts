@@ -17,7 +17,18 @@ function popupScripts(dir: string) {
   })).filter(script => script.src);
 }
 
-async function loadPopup(permissionGranted: boolean, requestGranted?: boolean) {
+async function loadPopup(
+  permissionGranted: boolean,
+  requestGranted?: boolean,
+  options: {
+    pairResult?: unknown;
+    connectResult?: unknown;
+    tabId?: number;
+    tabIds?: number[];
+    savedBridgeOrigin?: string;
+    status?: Record<string, unknown>;
+  } = {},
+) {
   const html = fs.readFileSync(path.join(sourcePopup, "popup.html"), "utf8");
   const ids = [...html.matchAll(/\bid="([^"]+)"/g)].map(match => match[1]);
   const elements = new Map(ids.map(id => [id, {
@@ -27,12 +38,16 @@ async function loadPopup(permissionGranted: boolean, requestGranted?: boolean) {
   }]));
   const calls = {
     contains: [] as unknown[], request: [] as unknown[], ownerProof: 0,
+    order: [] as string[],
     runtime: [] as unknown[], storage: [] as unknown[], page: [] as unknown[],
   };
   const requestResult = requestGranted ?? permissionGranted;
   const chrome = {
     tabs: {
-      query: async () => [{ id: 1, url: route }],
+      query: async () => {
+        const id = options.tabIds?.shift() ?? options.tabId ?? 1;
+        return [{ id, url: route }];
+      },
       sendMessage: async (_tabId: number, message: { type: string }) => {
         if (message.type === "c2c.popup.ping") {
           return { safety: { composer: "empty", generation: "idle", safe: true } };
@@ -42,15 +57,18 @@ async function loadPopup(permissionGranted: boolean, requestGranted?: boolean) {
             targetRoute: route, isOwner: true, storageProtected: true,
             ownership: { hasOwner: true }, transport: null,
             journal: { state: "NONE" }, sendProbeLatch: "NONE",
+            ...options.status,
           };
         }
         if (message.type === "c2c.owner-proof.request") {
+          calls.order.push("owner-proof");
           calls.ownerProof += 1;
           return { ok: true, proof: { id: "proof-1" } };
         }
         if (message.type === "c2c.connect.request") {
+          calls.order.push("connect");
           calls.page.push(message);
-          return { ok: true, state: "AWAITING_CONFIRMATION" };
+          return options.connectResult ?? { ok: true, state: "AWAITING_CONFIRMATION" };
         }
         return { ok: true };
       },
@@ -58,17 +76,23 @@ async function loadPopup(permissionGranted: boolean, requestGranted?: boolean) {
     runtime: {
       sendMessage: async (message: unknown) => {
         calls.runtime.push(message);
+        if (typeof message === "object" && message && (message as { type?: string }).type === "c2c.pair") {
+          calls.order.push("pair");
+          return options.pairResult ?? { ok: true };
+        }
         return { ok: true };
       },
     },
     storage: {
       local: {
-        get: async () => ({}),
-        set: async (value: unknown) => { calls.storage.push(value); },
+        get: async () => options.savedBridgeOrigin
+          ? { c2c_companion_bridge_origin_v1: options.savedBridgeOrigin }
+          : {},
+        set: async (value: unknown) => { calls.storage.push(value); calls.order.push("save-origin"); },
       },
       session: {
         get: async () => ({}),
-        set: async (value: unknown) => { calls.storage.push(value); },
+        set: async (value: unknown) => { calls.storage.push(value); calls.order.push("save-intent"); },
         remove: async () => undefined,
       },
     },
@@ -77,6 +101,7 @@ async function loadPopup(permissionGranted: boolean, requestGranted?: boolean) {
       request: (query: unknown) => {
         // Synchronous push proves gesture-time invocation from the click handler.
         calls.request.push(query);
+        calls.order.push("permission");
         return Promise.resolve(requestResult);
       },
     },
@@ -136,6 +161,227 @@ describe("popup Bridge permission and Pair separation", () => {
     expect(calls.contains).toEqual([]);
     expect(elements.get("connect-status")!.textContent).toContain("需要授权连接服务才能继续");
     expect(elements.get("connect-diagnostic")?.textContent).toBe("bridge_permission_denied");
+  });
+
+  it("cold_pair_required opens the one-click first-use section", async () => {
+    const { elements } = await loadPopup(true, true, { connectResult: { ok: false, reason: "cold_pair_required" } });
+    elements.get("bridge-origin")!.value = "https://bridge.example.test";
+    await elements.get("connect-chat")!.onclick!();
+    expect((elements.get("first-use-settings") as { open?: boolean })?.open).toBe(true);
+    expect(elements.get("pair-connect-hint")!.textContent).toContain("首次使用需要配对");
+  });
+
+  it("one-click Pair + Connect requests permission before the ordered identity flow", async () => {
+    const { calls, elements } = await loadPopup(true, true, { connectResult: { ok: true, state: "CONNECTED" } });
+    elements.get("bridge-origin")!.value = "https://bridge.example.test";
+    elements.get("pair-json")!.value = JSON.stringify({ intentId: "intent-1", secret: "c2c_pair_secret" });
+    const pending = elements.get("pair-connect")!.onclick!();
+    expect(calls.order).toEqual(["permission"]);
+    await pending;
+    expect(calls.order).toEqual(["permission", "save-origin", "save-intent", "owner-proof", "pair", "connect"]);
+    expect(calls.page).toEqual([{ type: "c2c.connect.request" }]);
+    expect(JSON.stringify(calls.storage)).not.toContain("c2c_pair_secret");
+    expect(elements.get("pair-json")!.value).toBe("");
+    expect(elements.get("pair-secret")!.value).toBe("");
+    expect(elements.get("connect-status")!.textContent).toBe("当前对话已连接");
+  });
+
+  it("shows a verified connection as healthy only for the current document owner", async () => {
+    const { elements } = await loadPopup(true, true, {
+      status: {
+        isOwner: true,
+        transport: {
+          connected: true,
+          routeVerification: "VERIFIED",
+          rebindPending: false,
+          authStale: false,
+          bridgeOrigin: "https://bridge.example.test",
+          companionId: "companion-1",
+        },
+      },
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    expect(elements.get("user-connection-status")!.textContent).toBe("当前对话已连接");
+    expect(elements.get("user-connection-status")!.className).toContain("ok");
+  });
+
+  it("warns when a refreshed document is no longer the verified owner", async () => {
+    const { elements } = await loadPopup(true, true, {
+      status: {
+        isOwner: false,
+        ownership: { hasOwner: true },
+        transport: {
+          connected: true,
+          routeVerification: "VERIFIED",
+          rebindPending: false,
+          authStale: false,
+          bridgeOrigin: "https://bridge.example.test",
+          companionId: "companion-1",
+        },
+      },
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    expect(elements.get("user-connection-status")!.textContent).toBe("当前页面需要重新连接");
+    expect(elements.get("user-connection-status")!.className).toContain("warn");
+    expect(elements.get("user-action-hint")!.textContent).toContain("连接当前对话");
+    expect(elements.get("user-action-hint")!.textContent).not.toMatch(/Pair|Verify/);
+  });
+
+  it("keeps hard auth repair ahead of the owner-missing warning", async () => {
+    const { elements } = await loadPopup(true, true, {
+      status: {
+        isOwner: false,
+        transport: {
+          connected: true,
+          routeVerification: "VERIFIED",
+          rebindPending: false,
+          authStale: true,
+          bridgeOrigin: "https://bridge.example.test",
+          companionId: "companion-1",
+        },
+      },
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    expect(elements.get("user-connection-status")!.textContent).toBe("连接需要修复");
+    expect(elements.get("user-connection-status")!.className).toContain("bad");
+    expect(elements.get("user-connection-status")!.textContent).not.toContain("重新连接");
+    expect(elements.get("user-action-hint")!.textContent).not.toContain("连接当前对话");
+  });
+
+  it("keeps rebind and route-pending warnings ahead of owner reconnect", async () => {
+    const rebind = await loadPopup(true, true, {
+      status: {
+        isOwner: false,
+        transport: {
+          connected: true,
+          routeVerification: "VERIFIED",
+          rebindPending: true,
+          authStale: false,
+          bridgeOrigin: "https://bridge.example.test",
+          companionId: "companion-1",
+        },
+      },
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    expect(rebind.elements.get("user-connection-status")!.textContent).toBe("正在等待 ChatGPT 完成确认");
+    expect(rebind.elements.get("user-action-hint")!.textContent).toContain("回到 ChatGPT 完成确认");
+
+    const pending = await loadPopup(true, true, {
+      status: {
+        isOwner: false,
+        transport: {
+          connected: true,
+          routeVerification: "PENDING",
+          rebindPending: false,
+          authStale: false,
+          bridgeOrigin: "https://bridge.example.test",
+          companionId: "companion-1",
+        },
+      },
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    expect(pending.elements.get("user-connection-status")!.textContent).toBe("还差一步完成连接");
+  });
+
+  it("brand-new first-use pairing JSON bootstraps and canonicalizes bridge origin", async () => {
+    const { calls, elements } = await loadPopup(true, true);
+    elements.get("pair-json")!.value = JSON.stringify({
+      intentId: "intent-1",
+      secret: "c2c_pair_secret",
+      bridgeOrigin: "https://bridge.example.test/",
+    });
+    await elements.get("pair-connect")!.onclick!();
+    expect(calls.request).toEqual([{ origins: ["https://bridge.example.test/*"] }]);
+    expect(calls.order).toEqual(["permission", "save-origin", "save-intent", "owner-proof", "pair", "connect"]);
+    expect(calls.page).toEqual([{ type: "c2c.connect.request" }]);
+  });
+
+  it("legacy pairing JSON falls back to the saved bridge origin", async () => {
+    const { calls, elements } = await loadPopup(true, true, { savedBridgeOrigin: "https://bridge.example.test/" });
+    elements.get("pair-json")!.value = JSON.stringify({ intentId: "intent-1", secret: "c2c_pair_secret" });
+    await elements.get("pair-connect")!.onclick!();
+    expect(calls.request).toEqual([{ origins: ["https://bridge.example.test/*"] }]);
+    expect(calls.page).toEqual([{ type: "c2c.connect.request" }]);
+  });
+
+  it("unsafe pairing JSON origin stops before permission, owner proof, and pair", async () => {
+    const { calls, elements } = await loadPopup(true, true);
+    elements.get("pair-json")!.value = JSON.stringify({
+      intentId: "intent-1",
+      secret: "c2c_pair_secret",
+      bridgeOrigin: "http://evil.example.test/",
+    });
+    await elements.get("pair-connect")!.onclick!();
+    expect(calls.order).toEqual([]);
+    expect(calls.ownerProof).toBe(0);
+    expect(calls.runtime).toEqual([]);
+    expect(calls.page).toEqual([]);
+    expect(elements.get("connect-diagnostic")!.textContent).toBe("bridge_origin_invalid");
+  });
+
+  it("without pairing or saved origin keeps the first-use origin error", async () => {
+    const { calls, elements } = await loadPopup(true, true);
+    elements.get("pair-json")!.value = JSON.stringify({ intentId: "intent-1", secret: "c2c_pair_secret" });
+    await elements.get("pair-connect")!.onclick!();
+    expect(calls.order).toEqual([]);
+    expect(calls.runtime).toEqual([]);
+    expect(calls.page).toEqual([]);
+    expect(elements.get("connect-diagnostic")!.textContent).toBe("bridge_origin_invalid");
+  });
+
+  it("one-click Pair + Connect reports awaiting confirmation when route attestation is pending", async () => {
+    const { calls, elements } = await loadPopup(true, true, { connectResult: { ok: true, state: "AWAITING_CONFIRMATION" } });
+    elements.get("bridge-origin")!.value = "https://bridge.example.test";
+    elements.get("pair-json")!.value = JSON.stringify({ intentId: "intent-1", secret: "c2c_pair_secret" });
+    await elements.get("pair-connect")!.onclick!();
+    expect(calls.page).toEqual([{ type: "c2c.connect.request" }]);
+    expect(elements.get("connect-status")!.textContent).toBe("已发送连接验证，请回到 ChatGPT 完成确认");
+  });
+
+  it("one-click Pair denial stops before owner proof/pair/connect and keeps input", async () => {
+    const { calls, elements } = await loadPopup(false, false);
+    elements.get("bridge-origin")!.value = "https://bridge.example.test";
+    elements.get("pair-json")!.value = JSON.stringify({ intentId: "intent-1", secret: "c2c_pair_secret" });
+    await elements.get("pair-connect")!.onclick!();
+    expect(calls.order).toEqual(["permission"]);
+    expect(calls.ownerProof).toBe(0);
+    expect(calls.runtime).toEqual([]);
+    expect(calls.page).toEqual([]);
+    expect(elements.get("pair-json")!.value).toContain("c2c_pair_secret");
+  });
+
+  it("one-click Pair failure clears the secret and does not connect", async () => {
+    const { calls, elements } = await loadPopup(true, true, { pairResult: { ok: false, reason: "pair_failed" } });
+    elements.get("bridge-origin")!.value = "https://bridge.example.test";
+    elements.get("pair-json")!.value = JSON.stringify({ intentId: "intent-1", secret: "c2c_pair_secret" });
+    await elements.get("pair-connect")!.onclick!();
+    expect(calls.order).toEqual(["permission", "save-origin", "save-intent", "owner-proof", "pair"]);
+    expect(calls.page).toEqual([]);
+    expect(elements.get("pair-json")!.value).toBe("");
+    expect(elements.get("pair-connect-hint")!.textContent).toContain("配对未成功");
+  });
+
+  it("one-click Pair rejects an active-tab change before pairing", async () => {
+    const { calls, elements } = await loadPopup(true, true, { tabIds: [1, 2] });
+    elements.get("bridge-origin")!.value = "https://bridge.example.test";
+    elements.get("pair-json")!.value = JSON.stringify({ intentId: "intent-1", secret: "c2c_pair_secret" });
+    await elements.get("pair-connect")!.onclick!();
+    expect(calls.ownerProof).toBe(0);
+    expect(calls.runtime).toEqual([]);
+    expect(calls.page).toEqual([]);
+    expect(elements.get("connect-diagnostic")!.textContent).toBe("tab_changed");
+  });
+
+  it("keeps repair controls nested while the one-click action stays in first-use flow", () => {
+    const html = fs.readFileSync(path.join(sourcePopup, "popup.html"), "utf8");
+    const firstUse = html.indexOf('id="first-use-settings"');
+    const manual = html.indexOf('id="manual-repair"');
+    expect(firstUse).toBeGreaterThan(-1);
+    expect(manual).toBeGreaterThan(firstUse);
+    expect(html.indexOf('id="pair-connect"')).toBeLessThan(manual);
+    expect(html.indexOf('id="bind"')).toBeGreaterThan(manual);
+    expect(html.indexOf('id="grant-bridge-access"')).toBeGreaterThan(manual);
+    expect(html.indexOf('id="verify-route"')).toBeGreaterThan(manual);
   });
 
   it("Connect requests permission synchronously before storage or page work", async () => {

@@ -71,7 +71,7 @@ describe.each(["LF", "CRLF"])("Activation Skill 文本契约（%s）", style => 
     expect(skill).toContain("threadConversation projection 不暴露 projectChats");
   });
 
-  it("reuse/use_remote 不 bind-current；bind_current 在 request-scoped verification 后", () => {
+  it("reuse/use_remote 不 bind-current；bind_current 是本地先决步骤", () => {
     const reuseBlock = activation.split("- **`reuse`**：")[1]?.split("- **`use_remote`**")[0] ?? "";
     const remoteBlock = activation.split("- **`use_remote`**：")[1]?.split("3. **Doctor gate")[0] ?? "";
     const bindBlock = activation.split("- **`bind_current`**：")[1]?.split("- **`reuse`**")[0] ?? "";
@@ -79,8 +79,12 @@ describe.each(["LF", "CRLF"])("Activation Skill 文本契约（%s）", style => 
     expect(reuseBlock).not.toContain("c2c desktop bind-current");
     expect(remoteBlock).toContain("不要 Desktop bind-current");
     expect(remoteBlock).not.toContain("c2c desktop bind-current");
+    expect(bindBlock).toContain("本地 prerequisite");
+    expect(bindBlock).toContain("不要等待尚不存在的 ChatGPT conversation 或");
+    expect(bindBlock).toContain("bind_current` → `open_project_chat` →");
     expect(bindBlock).toContain("request-scoped verification");
     expect(bindBlock).toContain("c2c desktop bind-current -w <workspace> --json");
+    expect(bindBlock).not.toContain("仅在当前 ChatGPT conversation 完成 request-scoped verification");
   });
 
   it("Connector schema：intent 两枚举 + userConfirmed true literal", () => {

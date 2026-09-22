@@ -1,14 +1,24 @@
 # Phase E：部署基线与 ChatGPT 接收端预检
 
+> **当前实现（2026-09-22）**：Browser Companion 的 `alarms` 只做低频 `/state`
+> discovery；真实 owner heartbeat 才能触发生产发送。Desktop `c2c record` 在
+> `inProgress` 时进入终态 fence，终态与无后续工具活动可证明时写入 trusted receipt，
+> 否则发出 `FINAL_RECEIPT_REQUIRED` 控制唤醒；新 Bridge 通过受控 reconcile 投影该事件，
+> 旧 Bridge 保持兼容。以下 E0/E1 段落是历史验收记录，不代表当前运行时、部署状态或待办命令。
+
+## Sleep / wake 恢复边界
+
+Browser Companion 的 MV3 `alarms` watchdog 只做低频、受保护的 `/state` discovery，帮助浏览器从睡眠、后台冻结或 Service Worker 重启后重新发现反馈 outbox；它不会 reserve、begin-send、ack、Retire、写 DOM 或开启 autonomy。机器睡眠期间不承诺执行；恢复后的实际生产动作仍必须由当前 ChatGPT 文档的真实 owner heartbeat 触发，并继续经过 route、DOM、journal、cooldown 与 exact-owner 门禁。
+
 核验日期：2026-09-14。任务来源是用户手动交给本机主代理的任务包。
 本轮是预检，不是 Phase E 自动回流功能完成。
 
 | 身份 | 本轮值 |
 | --- | --- |
 | workspace | `codex-with-chatgpt` / `2582910bf0d2` |
-| workspaceRoot | `D:\python\codex-with-chatgpt` |
-| commandId | `phase-e-e0-receiver-preflight-manual-20260914-002` |
-| taskId / iteration | `manual_phase_e_preflight_20260914_002` / `1` |
+| workspaceRoot | 当前 checkout 根目录 |
+| commandId | 本轮预检 command（已脱敏） |
+| taskId / iteration | 本轮预检 task / `1` |
 | 来源 | `manual user task; no accepted Desktop delivery` |
 
 ## 结论与原需求
@@ -37,10 +47,10 @@
 | installedBuildId / runtimeBuildId | 均为上述 `30cd2609…` |
 | current metadata | version 3；installedAt=`2026-09-14T06:16:20.076Z` |
 | runtimeUpgrade | `state=current`；`upgradePending=true`；`reason=named_unhealthy`；target 为上述 build |
-| Bridge | `c2c-bridge` / `0.1.1`；workspace 身份匹配；PID `20196`；startedAt=`2026-09-14T06:17:31.153Z` |
-| pending 文件 | `runtime-upgrades/2582910bf0d2.json`；updatedAt=`2026-09-14T06:17:36.201Z` |
+| Bridge | `c2c-bridge` / `0.1.1`；workspace 身份匹配；进程与启动时间已核验 |
+| pending 文件 | 当前 workspace 的 runtime-upgrades pending 状态；更新时间已核验 |
 | active finalizer | 无；没有等待当前 turn 结束的 job |
-| latest finalizer | `c5d31ea0-fcab-4058-8726-5af43b8227d8`；`blocked / named_unhealthy` |
+| latest finalizer | 已脱敏的 latest finalizer；`blocked / named_unhealthy` |
 | named tunnel | `cloudflare-named`；当前 running；下述公网检查通过 |
 | 权限状态 | Desktop enabled；Remote Control=false；writeProbeEnabled=false；本轮均未改变 |
 
@@ -64,14 +74,9 @@ package/lock 快照逐项一致，依赖摘要一致。checkout dist 重算摘�
 
 ### 两次历史线索及保留事实
 
-- 旧 build `5b7733849f334d1bc75b88d7dcd065cfc169d098b644a714b9ef4a4504cccf2c`
-  的 release manifest 仍存在。现有普通 execution record
-  `post_turn_4aa51c07-bcaf-47f3-bed3-37cc358e9580` 记录 `ok / upgraded`，
-  timestamp=`2026-09-14T04:42:01.564Z`。这是历史成功证据，不是当前运行版本。
-- `post_turn_c5d31ea0-fcab-4058-8726-5af43b8227d8` 的真实记录为
-  `blocked`、`finalizer blocked: named_unhealthy`、目标 `30cd2609…`，
-  timestamp=`2026-09-14T06:17:36.209Z`。对应 latest result 保留 scheduledAt
-  `06:16:39.300Z`、startedAt `06:16:40.515Z`、finishedAt `06:17:36.209Z`（均 UTC）。
+- 历史 release manifest 与 post-turn execution record 均已核验；早期记录分别为
+  `ok / upgraded` 与 `blocked / named_unhealthy`。这些是历史状态证据，不是当前运行版本。
+- 对应 latest result 的 scheduled/started/finished 时间均已核验，但文档不保留一次性标识或精确时间。
 - 当前安装指针和运行进程已经是该目标；pending 与 terminal blocked result 仍存在，active job 已无。
   `src/core/upgrade.ts` 分别计算 build 是否相同与 pending 是否存在，因此
   `current + upgradePending=true` 可以同时出现，status 不会自动清除 pending。
@@ -198,8 +203,7 @@ Web Control、Desktop 和 manual record 使用各自原有终态证明，不能�
 - 直接下载官方 `.md` 副本返回 403；保留响应作失败证据。上述官方结论取自浏览工具实际打开的
   HTML 页面，不把下载失败当成账户无资格或 API 不可用。
 
-原始只读基线与过程材料位于已忽略且本轮唯一的
-`.tooling/phase-e-20260914-6f391850845d46aebd9b15120ec51987/`，未覆盖旧证据：
+原始只读基线与过程材料位于已忽略的 `.tooling/` 审计目录，未覆盖旧证据：
 `baseline-status.json`、`baseline-finalizer.json`、`baseline-head.txt`、`baseline-git-status.txt`、
 `origin-main.txt`、`artifact-verification.json`、`installed-outer-assets.json`、
 `identity-history.json`、`historical-success.json`、`health-observations.json`、`official-sources.json`。
@@ -798,7 +802,7 @@ ready → reserved → claimed → observed
 
 ## Phase F1a operational readiness（2026-09-18）
 
-E1b3d3b2 的最终 live acceptance 已收口：最终 acceptance event 为 `eventId=2c6b1d23641f46c484410c45f9e92d1c`、`attemptId=587c6632-7fa3-487b-a42c-25922952324b`、status=`observed`；extension Reload 已完成，ChatGPT independent review 已完成，live ACK closeout 已完成，browser journal 为 `NONE`，Bridge `inFlight` 为 `none`。历史 event（包括 `e600aed6ef94…`）不再执行 Send、Recover、ACK、Retire、Reserve。
+E1b3d3b2 的最终 live acceptance 已收口：acceptance event 与 attempt 均已核验，status=`observed`；extension Reload、ChatGPT independent review 与 live ACK closeout 均已完成，browser journal 为 `NONE`，Bridge `inFlight` 为 `none`。历史 event 不再执行 Send、Recover、ACK、Retire、Reserve。
 
 F1a 只增加现有 SW status payload 的纯、只读 operational health summary 及 popup 展示，不新增 endpoint，不改变 reserve/begin-send/ACK/recover/retire 语义。摘要限于 mode、identity/owner/storage/transport 门禁、journal phase、in-flight、heartbeat 新鲜度分桶、cooldown 与 allowlisted reason；不暴露 message/DOM/credential/principal/document/tab/event/attempt 标识。`OUTCOME_UNKNOWN` 与 `OBSERVED_PENDING_ACK` 始终标记 recovery-required。
 

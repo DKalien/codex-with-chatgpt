@@ -8,13 +8,17 @@ import { readDesktop, type DesktopState } from "../desktop/store.js";
 import {
   applyProjection,
   ensureFeedbackState,
+  finalReceiptRequiredEventId,
+  FINAL_RECEIPT_REQUIRED_EVENT_KIND,
   feedbackEventId,
   feedbackEventSchema,
   FeedbackError,
   recoverStaleFeedback,
+  type FinalReceiptRequiredEvent,
   type FeedbackEvent,
   type FeedbackState,
 } from "./store.js";
+import { listReceiptFinalizationAlerts } from "../desktop/receipt-finalizer.js";
 
 function truncateSummary(text: string, max = 2000): string {
   return text.length > max ? text.slice(0, max) : text;
@@ -89,7 +93,7 @@ export function reconcileFeedbackOutbox(
   const records = readExecutionRecordsStrict(workspaceId);
   ensureFeedbackState(workspaceId, records.length, stateDir);
   // 即使 slice 为空也必须收敛 stale claimed，保证 status 即可恢复。
-  const state = recoverStaleFeedback(workspaceId, stateDir);
+  let state = recoverStaleFeedback(workspaceId, stateDir);
   if (state.projectionCursor > records.length) {
     throw new FeedbackError(
       "FEEDBACK_CURSOR_CONFLICT",
@@ -138,6 +142,33 @@ export function reconcileFeedbackOutbox(
       targetPrincipalFingerprint: null,
       status: "queued",
     }));
+  }
+  for (const alert of listReceiptFinalizationAlerts(stateDir).filter(item => item.workspaceId === workspaceId)) {
+    const eventId = finalReceiptRequiredEventId({ workspaceId, commandId: alert.commandId, alertId: alert.alertId });
+    if (state.events.some(event => event.eventId === eventId)) continue;
+    const occurredAt = alert.occurredAt;
+    newEvents.push(feedbackEventSchema.parse({
+      version: 1,
+      eventId,
+      kind: FINAL_RECEIPT_REQUIRED_EVENT_KIND,
+      workspaceId,
+      source: "control",
+      commandId: alert.commandId,
+      taskId: `desktop_finalization_${alert.commandId}`,
+      iteration: 1,
+      result: "blocked",
+      changedFilesSummary: [],
+      testsSummary: "",
+      outputAvailable: false,
+      reason: alert.reason,
+      occurredAt,
+      createdAt: occurredAt,
+      updatedAt: occurredAt,
+      targetBindingId: null,
+      targetEpoch: null,
+      targetPrincipalFingerprint: null,
+      status: "queued",
+    } as FinalReceiptRequiredEvent));
   }
   if (newEvents.length === 0 && slice.length === 0) {
     return { state, projected: 0 };

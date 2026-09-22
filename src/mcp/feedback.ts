@@ -26,6 +26,7 @@ import {
   revokeCompanion,
 } from "../feedback/companion.js";
 import { reconcileFeedbackOutbox } from "../feedback/projector.js";
+import { findLiveBridge } from "../bridge/runtime.js";
 
 type ToolResult = {
   content: { type: "text"; text: string }[];
@@ -85,6 +86,30 @@ function principalFromExtra(extra: Extra): ConversationPrincipal {
   const principal = resolveConversationPrincipal(extra);
   requireConversationPrincipal(principal);
   return principal;
+}
+
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]", "::1"]);
+
+async function companionBridgeOrigin(workspaceId: string): Promise<string> {
+  const runtime = await findLiveBridge(workspaceId);
+  if (!runtime) {
+    throw new FeedbackError("FEEDBACK_BRIDGE_ORIGIN_UNAVAILABLE", "当前连接服务未处于健康状态");
+  }
+  const raw = runtime.publicUrl === null
+    ? `http://127.0.0.1:${runtime.port}`
+    : runtime.publicUrl;
+  try {
+    const url = new URL(raw);
+    const loopback = LOOPBACK_HOSTS.has(url.hostname.toLowerCase());
+    const validProtocol = url.protocol === "https:" || (url.protocol === "http:" && loopback);
+    const validPort = runtime.publicUrl !== null || (Number.isInteger(runtime.port) && runtime.port > 0 && runtime.port <= 65535);
+    if (!validProtocol || !validPort || url.username || url.password || url.search || url.hash || url.pathname !== "/") {
+      throw new Error("unsafe bridge origin");
+    }
+    return url.origin;
+  } catch {
+    throw new FeedbackError("FEEDBACK_BRIDGE_ORIGIN_UNAVAILABLE", "当前连接服务地址无效或不安全");
+  }
 }
 
 const securitySchemes = [{ type: "oauth2", scopes: [CODEX_FEEDBACK_SCOPE] }] as const;
@@ -394,6 +419,7 @@ export function registerFeedbackTools(server: McpServer, workspace: Workspace): 
         expiresAt: z.string(),
         bindingId: z.string(),
         epoch: z.number(),
+        bridgeOrigin: z.string().url(),
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
       _meta: modelVisibleMeta(),
@@ -403,12 +429,13 @@ export function registerFeedbackTools(server: McpServer, workspace: Workspace): 
       if (denied) return denied;
       try {
         const principal = principalFromExtra(extra);
+        const bridgeOrigin = await companionBridgeOrigin(workspace.id);
         reconcileFeedbackOutbox(workspace.id);
         const intent = createPairingIntent({
           workspaceId: workspace.id,
           principal,
         });
-        return ok(intent);
+        return ok({ ...intent, bridgeOrigin });
       } catch (error) {
         return mapError(error);
       }

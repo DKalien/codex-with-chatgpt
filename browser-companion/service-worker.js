@@ -127,6 +127,16 @@ import {
   requestConnectCompletion,
   finishConnectFlow,
 } from "./connect-flow.js";
+import {
+  deriveCompanionIndicator,
+  createCompanionIndicatorApplier,
+} from "./action-indicator.js";
+import {
+  WAKE_WATCHDOG_ALARM_NAME,
+  wakeWatchdogEligible,
+  normalizeWakeReason,
+  createWakeWatchdogController,
+} from "./wake-watchdog.js";
 
 const LOCAL_KEY = "c2c_companion_local_v1";
 const TRANSPORT_KEY = "c2c_companion_transport_v1";
@@ -179,10 +189,15 @@ let lastHeartbeatSafety = null;
 let lastEvaluatedEvidence = null;
 let lastRecoveryAt = null;
 let lastRecoveryResult = null;
+let actionIndicatorRefreshSerial = 0;
+const applyActionIndicator = createCompanionIndicatorApplier(() => chrome.action);
+const wakeWatchdogController = createWakeWatchdogController(() => chrome.alarms);
 
 const initPromise = (async () => {
   await hydrate();
 })();
+
+void initPromise.then(() => syncWakeWatchdog());
 
 async function runTransportMutation(operation) {
   if (transportMutationInFlight) {
@@ -281,6 +296,7 @@ async function hydrate() {
   routeAttestLatch = reconciled.sessionLatch;
   connectFlow = parseConnectFlow(stored[CONNECT_FLOW_KEY]);
   hydrated = true;
+  void refreshActionIndicator();
 }
 
 /** Durable latch persist. Fail closed — never swallow storage errors. */
@@ -491,6 +507,142 @@ function safeTransportSummary() {
     connectState: connectFlow.state,
     pairedAt: transport.pairedAt,
   };
+}
+
+function actionIndicatorInput(bridgePermissionGranted, bridgeOriginInvalid = false) {
+  const summary = safeTransportSummary();
+  return {
+    hydrated,
+    storageProtected,
+    transportPresent: Boolean(transport),
+    bridgePermissionGranted,
+    bridgeOriginInvalid,
+    transport: summary,
+    owner: ownerState.owner
+      ? { available: true, canonicalRoute: ownerState.owner.canonicalRoute }
+      : { available: false, canonicalRoute: null },
+    autonomy: autonomySummary(autonomyPolicy, {
+      identityExact: policyIdentityExact(autonomyPolicy, transport),
+      tickInFlight: autonomyTickInFlight,
+      lastTickAt: lastAutonomyTickAt,
+      lastDecision: lastAutonomyDecision,
+      lastReason: lastAutonomyReason,
+      lastHeartbeatAt,
+      lastHeartbeatOwnerExact,
+      lastHeartbeatSafety,
+      lastEvaluatedEvidence,
+      lastRecoveryAt,
+      lastRecoveryResult,
+    }),
+    journal: summarizeProductionJournal(journal),
+    routeAttestFence: { state: routeAttestFence.state },
+    connectFlow: { state: connectFlow.state },
+    productionSendInFlight,
+  };
+}
+
+async function refreshActionIndicator() {
+  const serial = ++actionIndicatorRefreshSerial;
+  const currentTransport = transport;
+  let bridgePermissionGranted = false;
+  let bridgeOriginInvalid = false;
+  const bridgeOrigin = currentTransport?.bridgeOrigin;
+  if (bridgeOrigin) {
+    let canonical = null;
+    try {
+      canonical = parseBridgeOrigin(bridgeOrigin, {
+        allowLoopbackHttp: bridgeOrigin.startsWith("http://"),
+      });
+    } catch {
+      bridgeOriginInvalid = true;
+    }
+    if (canonical) {
+      try {
+        bridgePermissionGranted = await chrome.permissions?.contains?.({
+          origins: [`${canonical}/*`],
+        }) === true;
+      } catch {
+        bridgePermissionGranted = false;
+      }
+    }
+  }
+  if (serial !== actionIndicatorRefreshSerial) return;
+  await applyActionIndicator(deriveCompanionIndicator(
+    actionIndicatorInput(bridgePermissionGranted, bridgeOriginInvalid),
+  ));
+}
+
+function wakeWatchdogInput() {
+  return {
+    storageProtected,
+    transport: transport
+      ? { bridgeOrigin: transport.bridgeOrigin, authStale: transport.authStale === true }
+      : null,
+    autonomyMode: parseAutonomyPolicy(autonomyPolicy).mode,
+    journalState: journal?.state ?? "NONE",
+  };
+}
+
+/**
+ * MV3 wake watchdog is discovery-only. It never owns a page sender or a
+ * production tick; /state reconciliation remains the only network action.
+ */
+async function syncWakeWatchdog({ verify = false } = {}) {
+  await initPromise;
+  const result = await wakeWatchdogController.sync(
+    wakeWatchdogEligible(wakeWatchdogInput()),
+    { verify },
+  ).catch(() => null);
+  return result?.ok === true;
+}
+
+async function handleWakeWatchdogAlarm(alarm) {
+  if (!alarm || alarm.name !== WAKE_WATCHDOG_ALARM_NAME) {
+    return { ok: false, reason: "alarm_ignored" };
+  }
+  await initPromise;
+  if (!wakeWatchdogEligible(wakeWatchdogInput())) {
+    await syncWakeWatchdog({ verify: true });
+    return { ok: false, reason: "watchdog_ineligible" };
+  }
+  const state = await handleFetchState();
+  await syncWakeWatchdog({ verify: true });
+  await refreshActionIndicator();
+  return {
+    ok: state?.ok === true,
+    reason: state?.ok === true ? undefined : normalizeWakeReason(state?.reason),
+    discoveryOnly: true,
+  };
+}
+
+/** Ask only the known active owner tab for a real content-script heartbeat. */
+async function requestActiveOwnerRefresh(expectedTabId = null) {
+  await initPromise;
+  const owner = ownerState.owner;
+  if (
+    !owner
+    || typeof owner.documentId !== "string"
+    || owner.documentId.length === 0
+    || (expectedTabId != null && owner.tabId !== expectedTabId)
+  ) return false;
+  if (typeof chrome.tabs?.query !== "function" || typeof chrome.tabs?.sendMessage !== "function") return false;
+  let tabs;
+  try {
+    tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+  } catch {
+    return false;
+  }
+  const active = Array.isArray(tabs) && tabs.find((tab) => tab?.id === owner.tabId);
+  if (!active || active.id !== owner.tabId) return false;
+  try {
+    await chrome.tabs.sendMessage(owner.tabId, {
+      type: "c2c.wake.refresh",
+      reason: "resume",
+    }, { documentId: owner.documentId });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function statusPayload(tabId, documentId, extra = {}) {
@@ -3468,7 +3620,11 @@ async function handleRetireUnknown() {
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   handleMessage(message, sender)
-    .then(sendResponse)
+    .then((response) => {
+      void refreshActionIndicator();
+      void syncWakeWatchdog();
+      sendResponse(response);
+    })
     .catch(() => sendResponse({ ok: false, reason: "internal" }));
   return true;
 });
@@ -3480,8 +3636,29 @@ chrome.tabs.onRemoved.addListener((tabId) => {
     if (evidence?.tabId === tabId) evidence = null;
     if (ownerProof?.tabId === tabId) ownerProof = null;
     await persistSessionOwnership();
+    await syncWakeWatchdog();
+    await refreshActionIndicator();
   })();
 });
+
+if (chrome.alarms?.onAlarm?.addListener) {
+  chrome.alarms.onAlarm.addListener((alarm) => {
+    void handleWakeWatchdogAlarm(alarm);
+  });
+}
+
+if (chrome.tabs?.onActivated?.addListener) {
+  chrome.tabs.onActivated.addListener(({ tabId }) => {
+    void requestActiveOwnerRefresh(tabId);
+  });
+}
+
+if (chrome.windows?.onFocusChanged?.addListener) {
+  chrome.windows.onFocusChanged.addListener((windowId) => {
+    if (windowId === chrome.windows.WINDOW_ID_NONE || windowId === -1) return;
+    void requestActiveOwnerRefresh();
+  });
+}
 
 chrome.runtime.onInstalled.addListener(() => {
   void (async () => {
@@ -3491,6 +3668,8 @@ chrome.runtime.onInstalled.addListener(() => {
       localState = { schemaVersion: 1, targetRoute: null, paired: false };
       await persistLocal();
     }
+    await syncWakeWatchdog();
+    await refreshActionIndicator();
   })();
 });
 
@@ -3502,5 +3681,7 @@ chrome.runtime.onStartup.addListener(() => {
     evidence = null;
     ownerProof = null;
     await persistSessionOwnership();
+    await syncWakeWatchdog();
+    await refreshActionIndicator();
   })();
 });

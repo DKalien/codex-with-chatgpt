@@ -25,6 +25,10 @@
     grantBridgeAccess: document.getElementById("grant-bridge-access"),
     bridgePermissionStatus: document.getElementById("bridge-permission-status"),
     pairJson: document.getElementById("pair-json"),
+    pairConnect: document.getElementById("pair-connect"),
+    firstUseSettings: document.getElementById("first-use-settings"),
+    firstUseHint: document.getElementById("first-use-hint"),
+    pairConnectHint: document.getElementById("pair-connect-hint"),
     applyPairJson: document.getElementById("apply-pair-json"),
     intentId: document.getElementById("intent-id"),
     pairSecret: document.getElementById("pair-secret"),
@@ -69,10 +73,8 @@
     el.className = "value" + (cls ? " " + cls : "");
   }
 
-  function friendlyConnectState(transport, connectReason) {
-    if (transport?.connected && transport?.routeVerification === "VERIFIED") {
-      return ["当前对话已连接", "ok"];
-    }
+  function friendlyConnectState(transport, isOwner, connectReason) {
+    if (transport?.authStale) return ["连接需要修复", "bad"];
     if (connectReason === "bridge_permission_missing") {
       return ["需要授权连接服务", "warn"];
     }
@@ -82,7 +84,11 @@
     if (transport?.connected && transport?.routeVerification !== "VERIFIED") {
       return ["还差一步完成连接", "warn"];
     }
-    if (transport?.authStale) return ["连接需要修复", "bad"];
+    if (transport?.connected && transport?.routeVerification === "VERIFIED") {
+      return isOwner === true
+        ? ["当前对话已连接", "ok"]
+        : ["当前页面需要重新连接", "warn"];
+    }
     return ["可以连接当前对话", "warn"];
   }
 
@@ -96,8 +102,17 @@
         return "当前页面已变化，请重新打开扩展后再试。";
       case "content_script_unavailable":
         return "当前页面暂时无法连接，请刷新 ChatGPT 页面后再试。";
+      case "cold_pair_required":
+        return "首次使用需要配对，请粘贴配对信息并点击一次完成连接。";
       default:
         return "连接遇到问题，请展开连接设置查看详情。";
+    }
+  }
+
+  function openFirstUse({ focusPairing = false } = {}) {
+    if (els.firstUseSettings) els.firstUseSettings.open = true;
+    if (focusPairing && els.pairJson?.focus) {
+      els.pairJson.focus();
     }
   }
 
@@ -251,8 +266,10 @@
     if (!obj || typeof obj !== "object") return null;
     const intentId = typeof obj.intentId === "string" ? obj.intentId.trim() : "";
     const secret = typeof obj.secret === "string" ? obj.secret : "";
+    const hasBridgeOrigin = Object.prototype.hasOwnProperty.call(obj, "bridgeOrigin");
+    if (hasBridgeOrigin && typeof obj.bridgeOrigin !== "string") return null;
     if (!intentId || !secret) return null;
-    return { intentId, secret };
+    return { intentId, secret, bridgeOrigin: hasBridgeOrigin ? obj.bridgeOrigin.trim() : undefined };
   }
 
   function bridgePermission(origin) {
@@ -346,6 +363,7 @@
 
     els.bind.disabled = !parsed || !tab?.id;
     if (els.connectChat) els.connectChat.disabled = !parsed || !tab?.id;
+    if (els.pairConnect) els.pairConnect.disabled = !parsed || !tab?.id;
     els.pair.disabled = !isOwner;
     if (els.rebindStart) {
       els.rebindStart.disabled = !isOwner || !transport?.bridgeOrigin || transport?.rebindPending === true;
@@ -371,12 +389,19 @@
     const autonomy = status?.autonomy ?? {};
     const autonomyMode = autonomy.mode ?? "off";
     const armed = autonomyMode === "armed";
-    const [connectionText, connectionClass] = friendlyConnectState(transport, status?.connectReason);
+    const [connectionText, connectionClass] = friendlyConnectState(
+      transport,
+      isOwner,
+      status?.connectReason,
+    );
+    const ownerNeedsReconnect = connectionText === "当前页面需要重新连接";
     setText(els.userConnectionStatus, connectionText, connectionClass);
     setText(els.userAutonomyStatus, armed ? "已开启" : "未开启", armed ? "ok" : "warn");
     setText(
       els.userActionHint,
-      connectionText === "当前对话已连接"
+      ownerNeedsReconnect
+      ? "页面刷新后需要重新确认当前页面，请点击“连接当前对话”。"
+      : connectionText === "当前对话已连接"
       ? (armed ? "执行结果会自动回到当前对话。" : "如需自动回流，请勾选确认后开启。")
         : (transport?.rebindPending
           ? "请回到 ChatGPT 完成确认。"
@@ -532,6 +557,10 @@
         setText(els.connectDiagnostic, reason || "ok", res?.ok ? "ok" : "bad");
         setText(els.connectStatus, text, res?.ok ? "ok" : "bad");
         await refresh();
+        if (reason === "cold_pair_required") {
+          openFirstUse({ focusPairing: true });
+          setText(els.pairConnectHint, friendlyConnectReason(reason), "warn");
+        }
       };
     }
 
@@ -572,6 +601,108 @@
       els.pairHint.textContent = "已提取 intentId / secret（secret 仅内存）。立即 Pair。";
       els.pairHint.className = "note ok";
     };
+
+    if (els.pairConnect) {
+      els.pairConnect.onclick = async () => {
+        const fields = extractPairingFields(els.pairJson?.value);
+        if (!fields) {
+          setText(els.pairConnectHint, "无法读取配对信息，请粘贴完整 pairing JSON。", "bad");
+          return;
+        }
+        const originText = fields.bridgeOrigin ?? els.bridgeOrigin?.value?.trim() ?? "";
+        let permission;
+        try {
+          permission = bridgePermission(originText);
+        } catch {
+          setText(els.pairConnectHint, "首次使用需要先在连接修复中设置有效的连接服务地址。", "bad");
+          setText(els.connectDiagnostic, "bridge_origin_invalid", "bad");
+          return;
+        }
+
+        // This call must happen synchronously in the click gesture, before any
+        // storage, tab, or runtime work. Pairing secret remains popup memory.
+        let granted = false;
+        try {
+          granted = await chrome.permissions.request({ origins: [permission.pattern] });
+        } catch {
+          granted = false;
+        }
+        if (!granted) {
+          setText(els.pairConnectHint, "需要授权连接服务才能继续。配对信息仍保留在本次 popup 内存中。", "bad");
+          setText(els.connectDiagnostic, "bridge_permission_denied", "bad");
+          return;
+        }
+
+        await saveBridgeOrigin(permission.origin);
+        await saveIntentSession(fields.intentId);
+        if (els.bridgeOrigin) els.bridgeOrigin.value = permission.origin;
+        const tabNow = await activeTab();
+        if (!tabNow?.id || tabNow.id !== tab?.id) {
+          setText(els.pairConnectHint, "当前页面已变化，请重新打开扩展后再试。", "bad");
+          setText(els.connectDiagnostic, "tab_changed", "bad");
+          return;
+        }
+
+        let proof;
+        try {
+          proof = await chrome.tabs.sendMessage(tabNow.id, { type: "c2c.owner-proof.request" });
+        } catch {
+          proof = null;
+        }
+        if (!proof?.ok || !proof.proof?.id) {
+          setText(els.pairConnectHint, "当前页面无法完成安全校验，请刷新 ChatGPT 页面后再试。", "bad");
+          setText(els.connectDiagnostic, proof?.reason || "owner_proof_missing", "bad");
+          return;
+        }
+
+        let pairAttempted = false;
+        let pairResult;
+        try {
+          pairAttempted = true;
+          pairResult = await chrome.runtime.sendMessage({
+            type: "c2c.pair",
+            bridgeOrigin: permission.origin,
+            intentId: fields.intentId,
+            secret: fields.secret,
+            ownerProofId: proof.proof.id,
+          });
+        } catch (error) {
+          pairResult = { ok: false, reason: error?.message || "pair_runtime_error" };
+        } finally {
+          if (pairAttempted) await clearPairingForm({ includeIntent: true });
+        }
+
+        if (!pairResult?.ok) {
+          const reason = pairResult?.reason || (typeof pairResult?.status === "number" ? `http_${pairResult.status}` : "pair_failed");
+          setText(els.pairConnectHint, `配对未成功（${reason}），请重新粘贴配对信息。`, "bad");
+          setText(els.connectDiagnostic, reason, "bad");
+          await refresh();
+          return;
+        }
+
+        let connectResult;
+        try {
+          connectResult = await chrome.tabs.sendMessage(tabNow.id, { type: "c2c.connect.request" });
+        } catch {
+          connectResult = { ok: false, reason: "content_script_unavailable" };
+        }
+        await refresh();
+        const connectReason = connectResult?.ok ? "" : (connectResult?.reason || "connect_failed");
+        if (connectResult?.ok) {
+          const connected = connectResult.state === "CONNECTED";
+          setText(els.pairConnectHint, connected
+            ? "当前对话已连接。"
+            : "已发送连接验证，请回到 ChatGPT 完成确认。", connected ? "ok" : "warn");
+          setText(els.connectStatus, connected
+            ? "当前对话已连接"
+            : "已发送连接验证，请回到 ChatGPT 完成确认", connected ? "ok" : "warn");
+          if (els.firstUseSettings) els.firstUseSettings.open = false;
+        } else {
+          setText(els.pairConnectHint, friendlyConnectReason(connectReason), "bad");
+          setText(els.connectDiagnostic, connectReason, "bad");
+        }
+      };
+    }
 
     els.grantBridgeAccess.onclick = async () => {
       let permission;

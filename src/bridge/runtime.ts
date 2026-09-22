@@ -3,6 +3,10 @@ import path from "node:path";
 import { getStateDir, readJsonIfExists, writeSecureJson } from "../config/paths.js";
 import { SERVICE_NAME, VERSION } from "../version.js";
 
+/** Capabilities are explicit; an absent token means the runtime is legacy/unknown. */
+export const RUNTIME_CAPABILITY_FINAL_RECEIPT_REQUIRED = "feedback.final_receipt_required" as const;
+export const RUNTIME_CAPABILITIES = [RUNTIME_CAPABILITY_FINAL_RECEIPT_REQUIRED] as const;
+
 /**
  * Runtime state file: how the CLI/Skill finds a running bridge for a
  * workspace. Contains the admin token, so it is 0600 and lives in the user
@@ -19,6 +23,7 @@ export interface RuntimeState {
   publicUrl: string | null;
   startedAt: string;
   runtimeBuildId?: string;
+  capabilities?: readonly string[];
 }
 
 export function runtimeFile(workspaceId: string): string {
@@ -54,6 +59,14 @@ export interface HealthPayload {
   pid?: number;
   startedAt?: string;
   runtimeBuildId?: string;
+  capabilities?: readonly string[];
+}
+
+export function hasRuntimeCapability(
+  runtime: Pick<RuntimeState, "capabilities"> | Pick<HealthPayload, "capabilities">,
+  capability: string,
+): boolean {
+  return runtime.capabilities?.includes(capability) === true;
 }
 
 /** Probe a port and check whether a healthy c2c bridge for the workspace answers. */

@@ -76,8 +76,14 @@
     <button id="autonomy-disable" class="secondary" disabled>暂停自动回流</button>
     <div class="note" id="connect-status">自动回流默认关闭。</div>
 
-    <details>
+    <details id="first-use-settings">
       <summary>首次使用或连接有问题？</summary>
+      <div class="note" id="first-use-hint">首次使用时，粘贴配对信息，然后点击一次完成连接。</div>
+      <div class="row"><div class="label">配对信息</div><textarea id="pair-json" rows="4" placeholder='{"intentId":"...","secret":"c2c_pair_..."}'></textarea></div>
+      <button id="pair-connect" class="primary">配对并连接当前对话</button>
+      <div class="note" id="pair-connect-hint">配对密钥只在本次 popup 内存中使用，不会保存。</div>
+      <details id="manual-repair">
+        <summary>手动连接修复</summary>
       <button id="bind">绑定当前对话</button>
       <button id="unbind" class="secondary">清除本地目标</button>
       <div class="row">
@@ -88,7 +94,6 @@
       <div class="note" id="bridge-permission-status">连接服务权限未检查</div>
       <details>
         <summary>手动配对与连接修复</summary>
-        <div class="row"><div class="label">粘贴配对信息</div><textarea id="pair-json" rows="4" placeholder='{"intentId":"...","secret":"c2c_pair_..."}'></textarea></div>
         <button id="apply-pair-json" class="secondary">应用配对信息</button>
         <div class="row"><div class="label">配对 intentId</div><input id="intent-id" placeholder="uuid" autocomplete="off" /></div>
         <div class="row"><div class="label">一次性配对密钥（仅本次 popup 内存）</div><input id="pair-secret" type="password" placeholder="c2c_pair_..." autocomplete="off" /></div>
@@ -97,6 +102,7 @@
         <button id="rebind-start" class="secondary" disabled>开始连接修复</button>
         <button id="rebind-complete" class="secondary" disabled>完成连接修复</button>
         <button id="verify-route" class="secondary" disabled>验证当前对话</button>
+      </details>
       </details>
     </details>
 

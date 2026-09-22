@@ -10,6 +10,7 @@
 
   let lastHref = location.href;
   let generation = 1;
+  let lastWakeHeartbeatAt = 0;
 
   function parseRoute(href) {
     try {
@@ -92,6 +93,14 @@
     void sendToWorker({ ...buildObserveMessage(), type: "c2c.heartbeat" });
   }
 
+  function wakeHeartbeat() {
+    const now = Date.now();
+    if (now - lastWakeHeartbeatAt < 1000) return;
+    lastWakeHeartbeatAt = now;
+    report();
+    heartbeat();
+  }
+
   function onMaybeNavigate() {
     if (location.href === lastHref) return;
     lastHref = location.href;
@@ -110,6 +119,11 @@
       heartbeat();
     }
   });
+  window.addEventListener("pageshow", wakeHeartbeat);
+  window.addEventListener("focus", wakeHeartbeat);
+
+  // Resume evidence immediately after the document is installed; no DOM mutation.
+  heartbeat();
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (!message || typeof message !== "object") {
@@ -124,6 +138,11 @@
         canonicalRoute: msg.canonicalRoute,
         safety: msg.safety,
       });
+      return false;
+    }
+    if (message.type === "c2c.wake.refresh") {
+      if (!document.hidden) wakeHeartbeat();
+      sendResponse({ ok: true, refreshed: !document.hidden });
       return false;
     }
     if (message.type === "c2c.status.request") {

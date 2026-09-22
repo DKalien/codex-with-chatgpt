@@ -1,16 +1,20 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
-import { listExecutionOutputs, saveExecutionOutput, type ExecutionOutputMeta } from "../execution/output.js";
+import { listExecutionOutputs, saveExecutionOutput, saveRestrictedExecutionOutput, type ExecutionOutputMeta } from "../execution/output.js";
 import {
   appendExecutionRecordLocked,
+  isTrustedDesktopReceipt,
   readExecutionRecordsStrict,
   withExecutionRecordsLockAsync,
   type StoredExecutionRecord,
 } from "../execution/records.js";
 import {
   desktopIpc,
+  type DesktopResultActivityMarkerObservation,
+  type DesktopResultClassification,
   type DesktopResultContext,
   type DesktopResultOwnership,
+  type DesktopTarget,
 } from "./ipc.js";
 import {
   DesktopError,
@@ -19,6 +23,18 @@ import {
   type DesktopDelivery,
 } from "./store.js";
 import { reconcileUnknownDesktopDelivery } from "./unknown-reconciliation.js";
+import {
+  spawnReceiptFinalizerWorker,
+  canonicalReceiptFinalizationInput,
+  receiptFinalizationMarkerDigest,
+  sanitizeReceiptFinalizationInput,
+  stageReceiptFinalization,
+  type ReceiptFinalizationFenceResult,
+  type ReceiptFinalizationInput,
+  type ReceiptFinalizationMarker,
+  writeReceiptFinalizationAlert,
+  type ReceiptFinalizationDraft,
+} from "./receipt-finalizer.js";
 
 export interface DesktopResultWorkspace {
   id: string;
@@ -48,6 +64,23 @@ export class DesktopResultError extends DesktopError {
 export interface DesktopResultReceipt {
   record: StoredExecutionRecord;
   output: ExecutionOutputMeta | null;
+}
+
+/** inProgress 只允许进入 durable pending draft；它不是 trusted receipt。 */
+export class DesktopResultPendingError extends DesktopResultError {
+  readonly draft: ReceiptFinalizationDraft;
+  constructor(draft: ReceiptFinalizationDraft) {
+    super("DESKTOP_RESULT_FINALIZATION_PENDING", "Desktop turn 仍在执行；结果已暂存，等待终态核验后再决定是否回执。 ");
+    this.name = "DesktopResultPendingError";
+    this.draft = draft;
+  }
+}
+
+export interface CurrentDesktopDelivery {
+  commandId: string;
+  threadId: string;
+  turnId: string;
+  ownership: DesktopResultOwnership;
 }
 
 const uuid = z.string().uuid();
@@ -174,17 +207,82 @@ async function readCurrentResultContext(workspace: DesktopResultWorkspace, expec
   return context as DesktopResultContext;
 }
 
+async function readCurrentResultClassification(
+  workspace: DesktopResultWorkspace,
+): Promise<DesktopResultClassification> {
+  for (let attempt = 1; attempt <= RESULT_CONTEXT_ATTEMPTS; attempt += 1) {
+    try {
+      return await desktopIpc.currentResultClassification(workspace.root);
+    } catch (error) {
+      const retryable = error instanceof DesktopError && error.code === "DESKTOP_STATE_UNAVAILABLE";
+      if (!retryable || attempt === RESULT_CONTEXT_ATTEMPTS) {
+        if (error instanceof DesktopError) throw error;
+        throw new DesktopResultError("DESKTOP_RESULT_CURRENT_EXECUTION", "无法确认当前 Desktop result classification；拒绝记录执行结果。");
+      }
+      await waitForResultContextRetry();
+    }
+  }
+  throw new DesktopResultError("DESKTOP_RESULT_CURRENT_EXECUTION", "无法确认当前 Desktop result classification；拒绝记录执行结果。");
+}
+
+/**
+ * Discover only the accepted delivery owned by the current Desktop result turn.
+ * This is deliberately strict: no latest/nearest delivery inference and no
+ * fallback to generic execution records.
+ */
+export async function discoverCurrentDesktopDelivery(
+  workspaceRaw: DesktopResultWorkspace,
+): Promise<CurrentDesktopDelivery> {
+  const workspace = workspaceInput.parse(workspaceRaw);
+  const rawThreadId = process.env.CODEX_THREAD_ID;
+  if (!strictUuid(rawThreadId)) {
+    throw new DesktopResultError("DESKTOP_RESULT_NOT_APPLICABLE", "当前进程不是可识别的 Desktop runner；未写入通用执行记录。");
+  }
+  const threadId = rawThreadId;
+  const state = readDesktop(workspace.id);
+  if (state && state.workspaceRoot !== workspace.root) {
+    throw new DesktopResultError("DESKTOP_WRONG_WORKSPACE", "当前 Desktop workspace 根目录与状态不一致；拒绝回退通用记录。");
+  }
+  const classification = await readCurrentResultClassification(workspace);
+  if (classification.classification === "not_applicable") {
+    throw new DesktopResultError("DESKTOP_RESULT_NOT_APPLICABLE", "当前 Desktop result turn 不是可识别的 accepted delivery；未写入通用执行记录。");
+  }
+  if (!state) {
+    throw new DesktopResultError("DESKTOP_RESULT_CURRENT_EXECUTION", "当前 Desktop result 已自证为 delivery，但 durable workspace 状态缺失；拒绝回退通用记录。");
+  }
+  const candidates = state.deliveries.filter(item => item.threadId === threadId && item.deliveryStatus === "accepted");
+  if (!classification.workspaceId || !classification.commandId || !classification.intent ||
+      classification.messageBytes === undefined || !classification.messageSha256 || !classification.ownership || !classification.originTurnId ||
+      !classification.chainTurnIds || classification.chainLength === undefined || classification.signature === undefined) {
+    throw new DesktopResultError("DESKTOP_RESULT_CURRENT_EXECUTION", "当前 Desktop result classification 不完整；拒绝回退通用记录。");
+  }
+  if (classification.threadId !== threadId || classification.workspaceRoot !== workspace.root || classification.workspaceId !== workspace.id) {
+    throw new DesktopResultError("DESKTOP_RESULT_CURRENT_EXECUTION", "当前 Desktop result classification 身份与 runner/workspace 不一致；拒绝回退通用记录。");
+  }
+  const accepted = candidates.find(item => item.commandId === classification.commandId &&
+      item.threadId === classification.threadId && item.turnId === classification.originTurnId && item.intent === classification.intent &&
+      item.messageBytes === classification.messageBytes && item.messageSha256 === classification.messageSha256 &&
+      classification.workspaceId === workspace.id);
+  if (!accepted ||
+      classification.chainTurnIds[0] !== accepted.turnId ||
+      (classification.ownership === "origin" && classification.resultTurnId !== accepted.turnId) ||
+      (classification.ownership === "native_continuation" && classification.resultTurnId === accepted.turnId)) {
+    throw new DesktopResultError("DESKTOP_RESULT_CURRENT_EXECUTION", "当前 Desktop result self-attestation 与 accepted delivery 不一致；拒绝回退通用记录。");
+  }
+  const {
+    classification: _classification, workspaceId: _workspaceId, commandId: _commandId, intent: _intent,
+    messageBytes: _messageBytes, messageSha256: _messageSha256, ...ownership
+  } = classification;
+  return {
+    commandId: accepted.commandId,
+    threadId: classification.threadId,
+    turnId: classification.resultTurnId,
+    ownership: ownership as DesktopResultOwnership,
+  };
+}
+
 function canonicalInput(input: DesktopResultInput): string {
-  return JSON.stringify({
-    commandId: input.commandId,
-    changedFiles: [...input.changedFiles],
-    tests: input.tests,
-    exitStatus: input.exitStatus,
-    notes: input.notes ?? null,
-    command: input.command ?? null,
-    output: input.output ?? null,
-    exitCode: input.exitCode ?? null,
-  });
+  return canonicalReceiptFinalizationInput(sanitizeReceiptFinalizationInput(input));
 }
 
 function receiptHash(input: DesktopResultInput): string {
@@ -234,6 +332,118 @@ function hasPartialOutput(workspaceId: string, taskId: string): boolean {
   }
 }
 
+function assertFinalizationDelivery(
+  workspace: DesktopResultWorkspace,
+  draft: Extract<ReceiptFinalizationDraft, { version: 2 }>,
+  target: { threadId: string; hostId: string; projectId: string; workspaceRoot: string },
+): void {
+  if (draft.workspaceId !== workspace.id || draft.workspaceRoot !== workspace.root || draft.threadId !== target.threadId ||
+      target.workspaceRoot !== workspace.root || draft.resultTurnId !== draft.marker.resultTurnId) {
+    throw new DesktopResultError("DESKTOP_RESULT_THREAD", "pending receipt 的 terminal fence 身份不一致；拒绝写入结果。 ");
+  }
+  const state = readDesktop(workspace.id);
+  if (!state || state.workspaceRoot !== workspace.root || !state.binding || state.binding.threadId !== draft.threadId ||
+      state.binding.hostId !== target.hostId || state.binding.projectId !== target.projectId) {
+    throw new DesktopResultError("DESKTOP_RESULT_THREAD", "pending receipt 的 Desktop binding 已变化；拒绝写入结果。 ");
+  }
+  const deliveries = state.deliveries.filter(item => item.deliveryStatus === "accepted" && item.commandId === draft.commandId &&
+    item.threadId === draft.threadId && item.turnId === draft.originTurnId);
+  if (deliveries.length !== 1) {
+    throw new DesktopResultError("DESKTOP_RESULT_THREAD", "pending receipt 没有唯一匹配的 accepted delivery；拒绝写入结果。 ");
+  }
+}
+
+function assertFinalizationFence(
+  draft: Extract<ReceiptFinalizationDraft, { version: 2 }>,
+  fence: ReceiptFinalizationFenceResult,
+): void {
+  if (fence.fence !== "safe_terminal" || fence.resultTurnId !== draft.resultTurnId ||
+      fence.threadId !== draft.threadId || fence.workspaceRoot !== draft.workspaceRoot) {
+    throw new DesktopResultError("DESKTOP_RESULT_CURRENT_EXECUTION", "Desktop terminal fence 不是可证明的 safe_terminal；拒绝写入结果。 ");
+  }
+}
+
+/** Detached finalizer 的唯一写入口；复用 execution lock、output sanitizer 和 command 幂等。 */
+export async function finalizeReceiptFinalizationDraft(
+  draft: Extract<ReceiptFinalizationDraft, { version: 2 }>,
+  target: { threadId: string; hostId: string; projectId: string; workspaceRoot: string },
+  fence: ReceiptFinalizationFenceResult,
+): Promise<DesktopResultReceipt> {
+  const workspace = workspaceInput.parse({ id: draft.workspaceId, root: draft.workspaceRoot });
+  assertFinalizationFence(draft, fence);
+  assertFinalizationDelivery(workspace, draft, target);
+  const input = sanitizeReceiptFinalizationInput(draft.input);
+  const digest = createHash("sha256").update(canonicalReceiptFinalizationInput(input), "utf8").digest("hex");
+  if (digest !== draft.inputDigest || input.commandId !== draft.commandId) {
+    throw new DesktopResultError("DESKTOP_RESULT_CONFLICT", "pending receipt input 摘要不一致；拒绝写入结果。 ");
+  }
+  const taskId = `desktop_${draft.commandId}`;
+  return withExecutionRecordsLockAsync(workspace.id, async () => {
+    assertFinalizationDelivery(workspace, draft, target);
+    let records: StoredExecutionRecord[];
+    try { records = readExecutionRecordsStrict(workspace.id); }
+    catch (error) { throw new DesktopResultError("DESKTOP_RESULT_RECORDS_CORRUPT", error instanceof Error ? error.message : "执行记录损坏；拒绝继续。 "); }
+    const prior = existingRecord(records, draft.commandId, taskId, digest);
+    if (prior) {
+      if (!isTrustedDesktopReceipt(prior, draft.commandId)) {
+        throw new DesktopResultError("DESKTOP_RESULT_CONFLICT", "已有记录不是唯一可信 Desktop receipt；拒绝重放。 ");
+      }
+      const output = outputForRecord(workspace.id, prior);
+      const matchingOutputs = listExecutionOutputs(workspace.id, Number.MAX_SAFE_INTEGER)
+        .filter(item => item.taskId === taskId && item.iteration === 1);
+      if ((prior.outputId === undefined && matchingOutputs.length !== 0) ||
+          (prior.outputId !== undefined && matchingOutputs.length !== 1)) {
+        throw new DesktopResultError("DESKTOP_RESULT_PARTIAL", "已有 Desktop receipt 的 output 数量不唯一；拒绝重放。 ");
+      }
+      return { record: prior, output };
+    }
+    if (hasPartialOutput(workspace.id, taskId)) {
+      throw new DesktopResultError("DESKTOP_RESULT_PARTIAL", "已有未完成的 Desktop 结果输出但缺少执行记录；拒绝追加。 ");
+    }
+    const output = input.output !== undefined
+      ? saveExecutionOutput(workspace.id, {
+          command: input.command ?? `Desktop result ${draft.commandId}`,
+          raw: input.output,
+          exitCode: input.exitCode,
+          taskId,
+          iteration: 1,
+        })
+      : input.outputRestrictedReason !== undefined
+        ? saveRestrictedExecutionOutput(workspace.id, {
+            command: input.command ?? `Desktop result ${draft.commandId}`,
+            reason: input.outputRestrictedReason,
+            exitCode: input.exitCode,
+            taskId,
+            iteration: 1,
+          })
+        : null;
+    const record: StoredExecutionRecord = {
+      taskId,
+      iteration: 1,
+      changedFiles: [...input.changedFiles],
+      tests: input.tests,
+      exitStatus: input.exitStatus,
+      timestamp: new Date().toISOString(),
+      ...(input.notes === undefined ? {} : { notes: input.notes }),
+      ...(output === null ? {} : { outputId: output.id, outputAvailable: output.allowed }),
+      commandId: draft.commandId,
+      desktopReceiptSha256: digest,
+    };
+    appendExecutionRecordLocked(workspace.id, record);
+    const committed = readExecutionRecordsStrict(workspace.id)
+      .filter(item => item.commandId === draft.commandId && item.taskId === taskId);
+    if (committed.length !== 1 || !isTrustedDesktopReceipt(committed[0], draft.commandId)) {
+      throw new DesktopResultError("DESKTOP_RESULT_CONFLICT", "Desktop receipt 未形成唯一可信终态；拒绝报告成功。 ");
+    }
+    const outputs = listExecutionOutputs(workspace.id, Number.MAX_SAFE_INTEGER)
+      .filter(item => item.taskId === taskId && item.iteration === 1);
+    if ((output === null && outputs.length !== 0) || (output !== null && outputs.length !== 1)) {
+      throw new DesktopResultError("DESKTOP_RESULT_PARTIAL", "Desktop receipt output 数量不唯一；拒绝报告成功。 ");
+    }
+    return { record: committed[0], output };
+  });
+}
+
 /**
  * 记录已由 Desktop 接受的本次结果。
  *
@@ -245,9 +455,10 @@ function hasPartialOutput(workspaceId: string, taskId: string): boolean {
 export async function recordDesktopResult(
   workspaceRaw: DesktopResultWorkspace,
   rawInput: DesktopResultInput,
+  options: { allowInProgress?: boolean } = {},
 ): Promise<DesktopResultReceipt> {
   const workspace = workspaceInput.parse(workspaceRaw);
-  const input = desktopResultInput.parse(rawInput);
+  const input = sanitizeReceiptFinalizationInput(desktopResultInput.parse(rawInput));
   const threadId = currentThreadId();
   const initial = readDesktopResultDelivery(workspace, input.commandId, threadId);
   let accepted: DesktopDelivery;
@@ -290,6 +501,48 @@ export async function recordDesktopResult(
     }
 
     const firstOwnership = await assertCurrentResultContext(workspace, acceptedNow);
+    if (firstOwnership.resultTurnStatus === "inProgress" && options.allowInProgress !== true) {
+      let draft: ReceiptFinalizationDraft;
+      const durable = readDesktop(workspace.id);
+      const binding = durable?.binding;
+      const target = binding && durable?.workspaceRoot === workspace.root ? {
+        threadId: binding.threadId,
+        hostId: binding.hostId,
+        projectId: binding.projectId,
+        workspaceRoot: workspace.root,
+      } : null;
+      if (!target) {
+        throw new DesktopResultError("DESKTOP_RESULT_THREAD", "pending receipt 缺少稳定 Desktop binding；未写入 pending receipt。 ");
+      }
+      let observed: DesktopResultActivityMarkerObservation;
+      try { observed = await desktopIpc.inspectResultActivityMarker(target); }
+      catch { throw new DesktopResultError("DESKTOP_RESULT_CURRENT_EXECUTION", "无法建立 Desktop receipt activity marker；未写入 pending receipt。 "); }
+      const marker = observed.marker;
+      if (observed.threadId !== threadId || observed.workspaceRoot !== workspace.root || observed.hostId !== target.hostId ||
+          observed.projectId !== target.projectId || observed.resultTurnId !== firstOwnership.resultTurnId ||
+          observed.resultTurnStatus !== "inProgress" || marker.resultTurnId !== firstOwnership.resultTurnId ||
+          marker.itemIds.length !== marker.itemCount || marker.itemTypes.length !== marker.itemCount ||
+          receiptFinalizationMarkerDigest(marker) !== marker.itemSha256) {
+        throw new DesktopResultError("DESKTOP_RESULT_CURRENT_EXECUTION", "Desktop receipt activity marker 身份或摘要不一致；未写入 pending receipt。 ");
+      }
+      draft = stageReceiptFinalization({
+        workspaceId: workspace.id,
+        workspaceRoot: workspace.root,
+        threadId,
+        originTurnId: acceptedNow.turnId!,
+        resultTurnId: firstOwnership.resultTurnId,
+        commandId: input.commandId,
+        input,
+        marker,
+      });
+      try {
+        if (process.env.C2C_RECEIPT_FINALIZER_NO_SPAWN !== "1") spawnReceiptFinalizerWorker(draft);
+      } catch {
+        // spawn 失败由显式 finalization-required alert 表示，不能回退为 trusted receipt。
+        writeReceiptFinalizationAlert(draft, "worker_spawn_failed");
+      }
+      throw new DesktopResultPendingError(draft);
+    }
     if (firstOwnership.ownership === "native_continuation") {
       // Continuation chain 只在第一次 output/record 写入前再次读取；exact
       // origin 路径保持原有单次 current-result 校验。
@@ -303,13 +556,23 @@ export async function recordDesktopResult(
       }
     }
     // 输出先提交；若随后记录追加中断，下次会通过 taskId 发现孤立 output 并 fail closed。
-    const output = input.output === undefined ? null : saveExecutionOutput(workspace.id, {
-      command: input.command ?? `Desktop result ${input.commandId}`,
-      raw: input.output,
-      exitCode: input.exitCode,
-      taskId,
-      iteration: 1,
-    });
+    const output = input.output !== undefined
+      ? saveExecutionOutput(workspace.id, {
+          command: input.command ?? `Desktop result ${input.commandId}`,
+          raw: input.output,
+          exitCode: input.exitCode,
+          taskId,
+          iteration: 1,
+        })
+      : input.outputRestrictedReason !== undefined
+        ? saveRestrictedExecutionOutput(workspace.id, {
+            command: input.command ?? `Desktop result ${input.commandId}`,
+            reason: input.outputRestrictedReason,
+            exitCode: input.exitCode,
+            taskId,
+            iteration: 1,
+          })
+        : null;
     const record: StoredExecutionRecord = {
       taskId,
       iteration: 1,

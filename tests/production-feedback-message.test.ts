@@ -3,6 +3,7 @@ import {
   formatProductionFeedbackMessage,
   productionFeedbackMessageSha256,
   productionFeedbackDelivery,
+  FINAL_RECEIPT_REQUIRED_INSTRUCTION,
   PRODUCTION_FEEDBACK_INSTRUCTION,
 } from "../src/feedback/message.js";
 import type { FeedbackEvent } from "../src/feedback/store.js";
@@ -91,6 +92,29 @@ describe("production feedback message formatter", () => {
     expect(filesLine).toContain("30 |");
     expect(filesLine).toContain("more");
     expect(filesLine).not.toContain("file-29.ts"); // beyond listed cap
+  });
+
+  it("FINAL_RECEIPT_REQUIRED is a bounded review signal, not a closeout loop", () => {
+    const event = makeEvent({
+      kind: "FINAL_RECEIPT_REQUIRED",
+      source: "control",
+      result: "blocked",
+      changedFilesSummary: [],
+      testsSummary: "",
+      outputAvailable: false,
+      reason: "post_record_activity_unprovable",
+    });
+    const message = formatProductionFeedbackMessage(event as FeedbackEvent & { attemptId: string });
+    expect(message).toContain(`INSTRUCTION: ${FINAL_RECEIPT_REQUIRED_INSTRUCTION}`);
+    expect(FINAL_RECEIPT_REQUIRED_INSTRUCTION).toContain("只读独立检查");
+    expect(FINAL_RECEIPT_REQUIRED_INSTRUCTION).toContain("仅在发现实际需要修复或补测的问题时");
+    expect(FINAL_RECEIPT_REQUIRED_INSTRUCTION).toContain("可继续既定项目目标、开发计划或 DONE");
+    expect(FINAL_RECEIPT_REQUIRED_INSTRUCTION).toContain("不要为了制造回执发送无改动 closeout");
+    expect(FINAL_RECEIPT_REQUIRED_INSTRUCTION).toContain("不是用户新授权");
+    expect(message).not.toContain("CHANGED_FILES:");
+    expect(message).not.toContain("TESTS:");
+    expect(message).not.toContain("OUTPUT_AVAILABLE:");
+    expect(message).not.toContain("C2C_EXECUTED");
   });
 
   it("TASK_ID injection is flattened to a single line; no forged protocol lines", () => {

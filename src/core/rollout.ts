@@ -86,12 +86,11 @@ async function idle(workspace: Workspace, info: BridgeAdminInfo, assessment?: Id
 async function tryScheduleSelfBusyFinalizer(
   workspace: Workspace,
   targetBuildId: string,
-  info: BridgeAdminInfo,
+  assessment: IdleAssessment,
   saved: RuntimeState,
   spawnImpl?: typeof spawn,
 ): Promise<{ jobId: string; status: "scheduled" | "existing" } | null> {
   try {
-    const assessment = await assessRolloutIdle(workspace, info);
     if (assessment.blockers.length !== 1 || assessment.blockers[0]!.kind !== "self_turn" || !assessment.selfBusyProof) {
       return null;
     }
@@ -169,8 +168,8 @@ export async function rollout(opts: {
       if (selected && selected.id !== workspaceId) continue;
       let workspace: Workspace | undefined;
       let restarting = false;
-      let lastInfo: BridgeAdminInfo | undefined;
       let lastSaved: RuntimeState | undefined;
+      let initialAssessment: IdleAssessment | undefined;
       try {
         let saved: RuntimeState;
         try { saved = runtimeSchema.parse(JSON.parse(fs.readFileSync(path.join(runtimeDir, name), "utf8"))); }
@@ -189,7 +188,6 @@ export async function rollout(opts: {
         }
         if (observation.state !== "healthy") throw new Skip("runtime_unknown");
         const info = await authenticatedInfo(workspace, saved);
-        lastInfo = info;
         if (info.runtimeBuildId === targetBuildId) {
           clearPending(workspace);
           items.push({ workspaceId, workspaceName: workspace.name, status: "current" });
@@ -197,7 +195,8 @@ export async function rollout(opts: {
         }
         if (info.tunnel?.provider === "cloudflare-quick") throw new Skip("quick");
         // 当前 active workspace 在任何公网探测或关闭之前直接保留 pending。
-        await idle(workspace, info);
+        initialAssessment = await assessRolloutIdle(workspace, info);
+        await idle(workspace, info, initialAssessment);
         const url = await namedUrl(workspace, info);
         restarting = true;
         const result = await restartBridge(workspace.root, { tunnel: true, expectedRuntime: saved,
@@ -219,8 +218,8 @@ export async function rollout(opts: {
         let finalizer: RolloutItem["finalizer"];
         if (workspace) {
           try { writePending(workspace, targetBuildId, reason); } catch { status = "error"; }
-          if (reason === "busy" && !restarting && lastInfo && lastSaved) {
-            finalizer = await tryScheduleSelfBusyFinalizer(workspace, targetBuildId, lastInfo, lastSaved, opts.finalizerSpawnImpl) ?? undefined;
+          if (reason === "busy" && !restarting && initialAssessment && lastSaved) {
+            finalizer = await tryScheduleSelfBusyFinalizer(workspace, targetBuildId, initialAssessment, lastSaved, opts.finalizerSpawnImpl) ?? undefined;
           }
         } else status = "error";
         items.push({ workspaceId, ...(workspace ? { workspaceName: workspace.name } : {}), status, reason, ...(finalizer ? { finalizer } : {}) });

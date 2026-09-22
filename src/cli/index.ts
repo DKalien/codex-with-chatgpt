@@ -88,6 +88,9 @@ import { registerRemoteCommands, remoteStatus } from "./remote.js";
 import { registerFeedbackProbeCommands } from "./feedback-probe.js";
 import { isWriteProbeEnabled, readWriteProbeStatus, WRITE_PROBE_SCOPE } from "../mcp/write-probe.js";
 import { registerDesktopCommands } from "./desktop.js";
+import { DesktopResultError, DesktopResultPendingError, discoverCurrentDesktopDelivery, recordDesktopResult } from "../desktop/result.js";
+import { findReceiptFinalizationDraft, runReceiptFinalizer } from "../desktop/receipt-finalizer.js";
+import { repairForwardFeedbackControlEvents } from "../feedback/store.js";
 import { registerWorkflowCommands } from "./workflow.js";
 import { registerRuntimePruneCommands } from "./runtime-prune.js";
 import { rollout } from "../core/rollout.js";
@@ -193,6 +196,36 @@ ptf.command("run").requiredOption("-w, --workspace <path>").action(async (opts: 
     if (cleanupFailed) process.exitCode = 1;
   }
 });
+
+// ---------------------------------------------------------------- Desktop receipt terminal fence
+const drf = program.command("desktop-receipt-finalizer").description("内部 Desktop receipt 终态 fence worker");
+drf.command("run").requiredOption("-w, --workspace <path>").requiredOption("--draft <id>").action(async (opts: { workspace: string; draft: string }) => {
+  const workspace = new Workspace(path.resolve(opts.workspace));
+  const stateDir = process.env.C2C_RECEIPT_FINALIZER_STATE_DIR ?? getStateDir();
+  const draft = findReceiptFinalizationDraft(stateDir, workspace.id, opts.draft);
+  if (!draft) { process.exitCode = 1; return; }
+  const result = await runReceiptFinalizer(draft, { stateDir });
+  if (!result) { process.exitCode = 1; return; }
+  if ("record" in result) {
+    say(JSON.stringify({ ok: true, finalized: true, commandId: result.record.commandId,
+      taskId: result.record.taskId, outputId: result.record.outputId }));
+    return;
+  }
+  // Worker 只写入 durable alert；feedback projector 在受控 reconcile 路径统一消费。
+  say(JSON.stringify(result));
+});
+
+// Hidden maintenance fence: quarantines only alert-backed forward control events.
+program.command("feedback-control-repair", { hidden: true })
+  .requiredOption("-w, --workspace <path>")
+  .option("--json", "机器可读输出", false)
+  .action((opts: { workspace: string; json?: boolean }) => {
+    const workspace = new Workspace(path.resolve(opts.workspace));
+    const result = repairForwardFeedbackControlEvents(workspace.id, getStateDir());
+    const output = { ok: true, workspaceId: workspace.id, removedEventIds: result.removedEventIds };
+    if (opts.json) say(JSON.stringify(output));
+    else say(`已隔离 ${result.removedEventIds.length} 个不兼容控制事件`);
+  });
 registerRemoteCommands(program);
 registerDesktopCommands(program);
 registerWorkflowCommands(program);
@@ -1258,7 +1291,7 @@ program
   .command("record", { hidden: true })
   .description("Record a Codex execution summary (used by the Skill)")
   .option("-w, --workspace <path>")
-  .requiredOption("--task <id>")
+  .option("--task <id>")
   .requiredOption("--iteration <n>", "non-negative execution iteration", parseNonNegativeInteger)
   .option("--changed-files <filesOrCount>", "comma-separated files or a count", "0")
   .option("--tests <summary>", "e.g. '27 passed'")
@@ -1270,10 +1303,11 @@ program
   .option("--output <text>", "command output (prefer --output-file for long logs)")
   .option("--output-file <path>", "read command output from a local file")
   .option("--exit-code <n>", "numeric exit code of that command", parseInteger)
+  .option("--json", "machine-readable output", false)
   .action(
-    (opts: {
+    async (opts: {
       workspace?: string;
-      task: string;
+      task?: string;
       iteration: number;
       changedFiles: string;
       tests?: string;
@@ -1285,8 +1319,66 @@ program
       output?: string;
       outputFile?: string;
       exitCode?: number;
+      json: boolean;
     }) => {
       const workspace = new Workspace(resolveWorkspace(opts.workspace));
+      let desktopDelivery: Awaited<ReturnType<typeof discoverCurrentDesktopDelivery>> | null = null;
+      try {
+        desktopDelivery = await discoverCurrentDesktopDelivery({ id: workspace.id, root: workspace.root });
+      } catch (error) {
+        if (!(error instanceof DesktopResultError) || error.code !== "DESKTOP_RESULT_NOT_APPLICABLE") throw error;
+      }
+      if (desktopDelivery) {
+        if (opts.iteration !== 1) throw new Error("Desktop 自动 receipt 仅允许 iteration=1。");
+        const changed = opts.changedFiles.trim();
+        if (/^-?\d+$/.test(changed)) {
+          throw new Error("Desktop 自动 receipt 要求实际 changed-files 列表；数字 count 会被拒绝。");
+        }
+        const tests = opts.tests?.trim();
+        if (!tests) throw new Error("Desktop 自动 receipt 要求非空 tests；未运行请填写 not run。");
+        let rawOutput = opts.output;
+        if (opts.outputFile !== undefined) {
+          const fd = fs.openSync(path.resolve(opts.outputFile), "r");
+          try {
+            const buffer = Buffer.alloc(MAX_RECORD_OUTPUT_READ + 1);
+            const count = fs.readSync(fd, buffer, 0, buffer.length, 0);
+            if (count === buffer.length) throw new Error("Desktop 自动 receipt 输出超过 256 KiB；请先生成汇总，不会截断证据。");
+            rawOutput = new TextDecoder("utf-8", { fatal: true }).decode(buffer.subarray(0, count));
+          } finally { fs.closeSync(fd); }
+        }
+        const discovered = desktopDelivery;
+        if (opts.commandId && opts.commandId !== discovered.commandId) {
+          throw new Error("提供的 command-id 与当前 Desktop delivery 不一致；拒绝记录。");
+        }
+        let receipt;
+        try {
+          receipt = await recordDesktopResult({ id: workspace.id, root: workspace.root }, {
+            commandId: discovered.commandId,
+            changedFiles: changed.split(",").map(file => file.trim()).filter(Boolean),
+            tests,
+            exitStatus: opts.exitStatus as "ok" | "failed" | "blocked",
+            ...(opts.notes === undefined ? {} : { notes: opts.notes.slice(0, 400) }),
+            ...(opts.command === undefined ? {} : { command: opts.command }),
+            ...(rawOutput === undefined ? {} : { output: rawOutput }),
+            ...(opts.exitCode === undefined ? {} : { exitCode: opts.exitCode }),
+          });
+        } catch (error) {
+          if (!(error instanceof DesktopResultPendingError)) throw error;
+          const pending = {
+            ok: true,
+            autoPromotedDesktop: true,
+            finalizationPending: true,
+            commandId: discovered.commandId,
+            draftId: error.draft.draftId,
+          };
+          if (opts.json) say(JSON.stringify(pending)); else check("Desktop 结果已暂存，等待终态核验；未生成完成回执");
+          return;
+        }
+        const result = { ok: true, autoPromotedDesktop: true, commandId: discovered.commandId, taskId: receipt.record.taskId, outputId: receipt.record.outputId };
+        if (opts.json) say(JSON.stringify(result)); else check("已自动记录 Desktop execution receipt");
+        return;
+      }
+      if (!opts.task) throw new Error("普通执行记录必须提供 --task；当前 turn 不是 Desktop delivery。");
       const record = executionRecordSchema.parse({
         taskId: opts.task,
         iteration: opts.iteration,
@@ -1320,7 +1412,9 @@ program
         outputId,
         outputAvailable,
       });
-      if (outputId !== undefined && !outputAvailable) check("已记录执行摘要（输出未对 ChatGPT 开放）");
+      if (opts.json) {
+        say(JSON.stringify({ ok: true, autoPromotedDesktop: false, taskId: record.taskId, outputId, outputAvailable }));
+      } else if (outputId !== undefined && !outputAvailable) check("已记录执行摘要（输出未对 ChatGPT 开放）");
       else if (outputId !== undefined) check("已记录执行摘要与输出");
       else check("已记录执行摘要");
     }

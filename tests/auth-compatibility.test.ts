@@ -163,6 +163,7 @@ describe("Desktop OAuth compatibility", () => {
       expect(response.status).toBe(200);
       const body = await response.json() as Record<string, unknown>;
       expect(body.connectorContractVersion).toBe(1);
+      expect(body.feedbackControlEventVersion).toBe(1);
       expect(body.desktopCompatibility).toEqual({ status: "current" });
       const serialized = JSON.stringify(body);
       expect(serialized).not.toContain(token.accessToken);

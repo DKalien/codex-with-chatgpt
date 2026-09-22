@@ -11,6 +11,10 @@ import {
   validateDesktopCompatibility,
   validateDesktopMessage,
   validateDesktopTarget,
+  validateDesktopResultActivityMarker,
+  validateDesktopResultActivityMarkerObservation,
+  validateDesktopResultTerminalFence,
+  type DesktopResultActivityMarker,
 } from "../src/desktop/ipc.js";
 import { MAX_MESSAGE_BYTES } from "../src/desktop/store.js";
 
@@ -181,6 +185,151 @@ describe("Desktop IPC wrapper（fake helper）", () => {
     }
   });
 
+  it("inspectResultContext 使用显式 target，不需要 runner 环境且严格限制 public schema", async () => {
+    vi.stubEnv("CODEX_THREAD_ID", "");
+    const resultTurnId = "01a00000-0000-7000-8000-000000000003";
+    const value = {
+      ...target,
+      title: "目标结果会话",
+      cwd: target.workspaceRoot,
+      workspaceKind: "project",
+      resumeState: "resumed",
+      runtimeStatus: "idle",
+      requestsCount: 0,
+      desktopVersion: "26.915.4065.0",
+      appServerVersion: "0.155.0-alpha.9.2",
+      profile: "desktop-ipc-v1",
+      ownerClientId: "01a00000-0000-7000-8000-000000000004",
+      resultTurnId,
+      resultTurnStatus: "completed",
+    };
+    const fake = fakeSpawner(request => request.op === "inspect_result_context"
+      ? { ok: true, value }
+      : { ok: true, value: {} });
+    await expect(makeClient(fake.spawnImpl).inspectResultContext(target)).resolves.toMatchObject({
+      ...target, resultTurnId, resultTurnStatus: "completed",
+    });
+    expect(fake.requests).toHaveLength(1);
+    expect(fake.requests[0]).toMatchObject({ op: "inspect_result_context", target });
+    expect(Object.keys(fake.requests[0]).sort()).toEqual(["id", "op", "target"]);
+
+    const extra = fakeSpawner(request => request.op === "inspect_result_context"
+      ? { ok: true, value: { ...value, secret: "nope" } }
+      : { ok: true, value: {} });
+    await expect(makeClient(extra.spawnImpl).inspectResultContext(target))
+      .rejects.toMatchObject({ code: "DESKTOP_PROTOCOL_ERROR" });
+    vi.unstubAllEnvs();
+  });
+
+  it("inspectResultActivityMarker 只投影有序 item id/type 且使用严格 target request", async () => {
+    vi.stubEnv("CODEX_THREAD_ID", "");
+    const resultTurnId = "01a00000-0000-7000-8000-000000000003";
+    const marker = {
+      resultTurnId,
+      itemIds: ["item-1", "item-2"],
+      itemTypes: ["userMessage", "commandExecution"],
+      itemCount: 2,
+      itemSha256: "a".repeat(64),
+    } satisfies DesktopResultActivityMarker;
+    const value = {
+      ...target,
+      title: "marker session",
+      cwd: target.workspaceRoot,
+      workspaceKind: "project",
+      resumeState: "resumed",
+      runtimeStatus: "inProgress",
+      requestsCount: 0,
+      desktopVersion: "26.915.4065.0",
+      appServerVersion: "0.155.0-alpha.9.2",
+      profile: "desktop-ipc-v1",
+      ownerClientId: "01a00000-0000-7000-8000-000000000004",
+      resultTurnId,
+      resultTurnStatus: "inProgress",
+      marker,
+    };
+    const fake = fakeSpawner(request => request.op === "inspect_result_activity_marker"
+      ? { ok: true, value }
+      : { ok: true, value: {} });
+    await expect(makeClient(fake.spawnImpl).inspectResultActivityMarker(target)).resolves.toEqual(value);
+    expect(fake.requests).toHaveLength(1);
+    expect(fake.requests[0]).toMatchObject({ op: "inspect_result_activity_marker", target });
+    expect(Object.keys(fake.requests[0]).sort()).toEqual(["id", "op", "target"]);
+    vi.unstubAllEnvs();
+  });
+
+  it("inspectResultTerminalFence 传 marker 做一次性 prefix fence，且不传正文", async () => {
+    vi.stubEnv("CODEX_THREAD_ID", "");
+    const resultTurnId = "01a00000-0000-7000-8000-000000000003";
+    const marker = {
+      resultTurnId,
+      itemIds: ["item-1"],
+      itemTypes: ["userMessage"],
+      itemCount: 1,
+      itemSha256: "a".repeat(64),
+    } satisfies DesktopResultActivityMarker;
+    const base = {
+      ...target,
+      title: "fence session",
+      cwd: target.workspaceRoot,
+      workspaceKind: "project",
+      resumeState: "resumed",
+      runtimeStatus: "idle",
+      requestsCount: 0,
+      desktopVersion: "26.915.4065.0",
+      appServerVersion: "0.155.0-alpha.9.2",
+      profile: "desktop-ipc-v1",
+      ownerClientId: "01a00000-0000-7000-8000-000000000004",
+      resultTurnId,
+      resultTurnStatus: "completed",
+    };
+    const fake = fakeSpawner(request => request.op === "inspect_result_terminal_fence"
+      ? { ok: true, value: { ...base, fence: "safe_terminal" } }
+      : { ok: true, value: {} });
+    await expect(makeClient(fake.spawnImpl).inspectResultTerminalFence(target, marker)).resolves.toMatchObject({
+      ...base, fence: "safe_terminal",
+    });
+    expect(fake.requests).toHaveLength(1);
+    expect(fake.requests[0]).toMatchObject({ op: "inspect_result_terminal_fence", target, marker });
+    expect(Object.keys(fake.requests[0]).sort()).toEqual(["id", "marker", "op", "target"]);
+    vi.unstubAllEnvs();
+  });
+
+  it("activity marker/fence validators 对未知 type、重复 ID、raw body 和状态错配 fail closed", () => {
+    const marker = {
+      resultTurnId: target.threadId,
+      itemIds: ["item-1"],
+      itemTypes: ["userMessage"],
+      itemCount: 1,
+      itemSha256: "a".repeat(64),
+    };
+    expect(validateDesktopResultActivityMarker(marker)).toEqual(marker);
+    for (const broken of [
+      { ...marker, itemTypes: ["unknown"] },
+      { ...marker, itemIds: ["item-1", "item-1"], itemTypes: ["userMessage", "agentMessage"], itemCount: 2 },
+      { ...marker, body: "secret" },
+      { ...marker, itemSha256: "bad" },
+    ]) {
+      expect(() => validateDesktopResultActivityMarker(broken)).toThrowError(/无法确认/);
+    }
+    const context = {
+      ...target,
+      title: "marker",
+      cwd: target.workspaceRoot,
+      workspaceKind: "project",
+      resumeState: "resumed",
+      runtimeStatus: "active",
+      requestsCount: 0,
+      desktopVersion: "26.915.4065.0",
+      appServerVersion: "0.155.0-alpha.9.2",
+      profile: "desktop-ipc-v1",
+      ownerClientId: "01a00000-0000-7000-8000-000000000004",
+      resultTurnId: target.threadId,
+      resultTurnStatus: "inProgress",
+    };
+    expect(validateDesktopResultActivityMarkerObservation({ ...context, marker }, target).marker).toEqual(marker);
+    expect(() => validateDesktopResultTerminalFence({ ...context, fence: "safe_terminal" }, target)).toThrow();
+  });
+
   it("currentResultContext 只传workspace，支持 active exact 与 idle terminal exact", async () => {
     vi.stubEnv("CODEX_THREAD_ID", target.threadId); vi.stubEnv("CODEX_SESSION_ID", target.threadId);
     const resultTurnId = "01a00000-0000-7000-8000-000000000003";
@@ -205,6 +354,35 @@ describe("Desktop IPC wrapper（fake helper）", () => {
         await expect(makeClient(fake.spawnImpl).currentResultContext(target.workspaceRoot))
           .rejects.toMatchObject({ code: "DESKTOP_STATE_UNAVAILABLE" });
       }
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it("currentResultClassification 只传workspace，并投影 self-attestation 与 applicable ownership", async () => {
+    vi.stubEnv("CODEX_THREAD_ID", target.threadId); vi.stubEnv("CODEX_SESSION_ID", target.threadId);
+    const resultTurnId = "01a00000-0000-7000-8000-000000000003";
+    const attestation = {
+      workspaceId: "workspace_test",
+      commandId: "desktop_command_test",
+      intent: "development_plan" as const,
+      messageBytes: 3,
+      messageSha256: "a".repeat(64),
+      originTurnId: resultTurnId,
+    };
+    try {
+      const fake = fakeSpawner(request => request.op === "current_result_classification" ? {
+        ok: true,
+        value: {
+          ...target, title: "结果分类会话", cwd: target.workspaceRoot, runtimeStatus: "active",
+          resultTurnId, resultTurnStatus: "inProgress", classification: "applicable",
+          ...attestation, ownership: "origin", originTurnId: resultTurnId,
+          chainTurnIds: [resultTurnId], chainLength: 0, signature: null,
+        },
+      } : { ok: true, value: {} });
+      const result = await makeClient(fake.spawnImpl).currentResultClassification(target.workspaceRoot);
+      expect(result).toMatchObject({ classification: "applicable", ...attestation,
+        ownership: "origin", resultTurnId });
+      expect(fake.requests).toHaveLength(1);
+      expect(Object.keys(fake.requests[0]).sort()).toEqual(["id", "op", "workspaceRoot"]);
     } finally { vi.unstubAllEnvs(); }
   });
 

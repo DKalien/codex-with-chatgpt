@@ -20,9 +20,15 @@ import { Logger, nullLogger } from "../logger/index.js";
 import { DEFAULT_HOST, DEFAULT_PORT } from "../config/paths.js";
 import { SERVICE_NAME, VERSION } from "../version.js";
 import { getRuntimeBuildId, isRuntimeBuildId } from "../build-id.js";
-import { writeRuntimeState, clearRuntimeState, type RuntimeState } from "./runtime.js";
+import {
+  RUNTIME_CAPABILITIES,
+  writeRuntimeState,
+  clearRuntimeState,
+  type RuntimeState,
+} from "./runtime.js";
 import { readRuntimeUpgrade } from "../core/upgrade.js";
 import { projectRuntimeUpgrade } from "../workflow/request.js";
+import { FEEDBACK_CONTROL_EVENT_VERSION } from "../feedback/store.js";
 
 function tunnelForWorkspace(workspaceId: string, logger: Logger): TunnelProvider {
   const binding = namedTunnelBinding(readTunnelState(workspaceId));
@@ -123,7 +129,8 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   const startedAt = new Date().toISOString();
   app.get("/health", (_req, res) => {
     res.json({ service: SERVICE_NAME, version: VERSION, workspaceId: workspace.id, status: "ok",
-      pid: process.pid, startedAt, ...(runtimeBuildId === null ? {} : { runtimeBuildId }) });
+      pid: process.pid, startedAt, capabilities: RUNTIME_CAPABILITIES,
+      ...(runtimeBuildId === null ? {} : { runtimeBuildId }) });
   });
 
   // ---- OAuth + discovery ---------------------------------------------------
@@ -215,8 +222,10 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
       tokenCount: authStore.tokenCount(),
       desktopCompatibility: authStore.desktopCompatibility(),
       connectorContractVersion: CONNECTOR_CONTRACT_VERSION,
+      feedbackControlEventVersion: FEEDBACK_CONTROL_EVENT_VERSION,
       pairingActive: pairing.hasActiveSession(),
       writeProbeEnabled: isWriteProbeEnabled(),
+      capabilities: RUNTIME_CAPABILITIES,
       pid: process.pid,
       startedAt,
       ...(runtimeBuildId === null ? {} : { runtimeBuildId }),
@@ -274,6 +283,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
       adminToken,
       publicUrl: publicBaseUrl,
       startedAt,
+      capabilities: RUNTIME_CAPABILITIES,
       ...(runtimeBuildId === null ? {} : { runtimeBuildId }),
     };
     writeRuntimeState(state);

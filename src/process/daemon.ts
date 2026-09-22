@@ -189,6 +189,7 @@ export interface BridgeAdminInfo {
   tokenCount: number;
   desktopCompatibility?: DesktopCompatibility;
   connectorContractVersion?: number;
+  feedbackControlEventVersion?: number;
   runtimeBuildId?: string | null;
   pairingActive: boolean;
   writeProbeEnabled?: boolean;

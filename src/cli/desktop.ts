@@ -173,7 +173,7 @@ export function registerDesktopCommands(program: Command): void {
           commandId: opts.commandId, changedFiles: opts.changedFiles.split(",").map(file => file.trim()).filter(Boolean),
           tests: opts.tests, exitStatus: opts.exitStatus, notes: opts.notes, command: opts.command,
           output, exitCode: opts.exitCode === undefined ? undefined : Number(opts.exitCode),
-        });
+        }, { allowInProgress: true });
         print({ ok: true, ...result }, opts.json, "本轮 Desktop execution receipt 已记录。");
       } catch (error) {
         const code = error instanceof DesktopError ? error.code : "DESKTOP_RESULT_INVALID";

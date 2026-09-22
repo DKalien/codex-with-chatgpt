@@ -429,6 +429,40 @@ export function resolveWorkflowReadiness(
   }
   const usableConversation = conversationUsable(conversation, requestPolicy);
   if (!usableConversation.ok) {
+    // A new local Desktop thread must be bound before creating its ChatGPT chat.
+    // MCP saved_binding and safely-ready Remote keep their existing strategies.
+    if (desktopRoute === "current_context" && !remoteSafelyReady(remote)) {
+      if (!desktop.configured) {
+        blockers.push({ code: "desktop_bind_required" });
+        return finish(input, "needs_desktop_bind", "bind_current", blockers);
+      }
+      if (!desktop.enabled) {
+        blockers.push({ code: "desktop_not_enabled" });
+        return finish(input, "needs_desktop_bind", "bind_current", blockers);
+      }
+      if (desktop.currentTarget === "different") {
+        blockers.push({ code: "desktop_target_mismatch", detail: "different" });
+        return finish(input, "needs_desktop_bind", "bind_current", blockers);
+      }
+      if (desktop.currentTarget === "unavailable") {
+        blockers.push({ code: "desktop_unavailable", detail: desktop.bindingAvailability });
+        return finish(input, "needs_desktop_bind", "bind_current", blockers);
+      }
+      if (desktop.currentTarget === "exact") {
+        if (desktop.bindingAvailability === "busy") {
+          blockers.push({ code: "desktop_binding_busy" });
+          return finish(input, "busy", "wait_current_task", blockers);
+        }
+        if (desktop.bindingAvailability === "unknown") {
+          blockers.push({ code: "desktop_delivery_unknown" });
+          return finish(input, "blocked", "stop_unknown", blockers);
+        }
+        if (desktop.bindingAvailability === "unavailable") {
+          blockers.push({ code: "desktop_delivery_unavailable" });
+          return finish(input, "blocked", "stop_unknown", blockers);
+        }
+      }
+    }
     if (conversation.mode === "project") {
       blockers.push({ code: "project_chat_not_same_thread", detail: conversation.chatBinding });
     } else {

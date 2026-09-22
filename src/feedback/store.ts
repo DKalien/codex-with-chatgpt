@@ -7,10 +7,24 @@ import {
   requireConversationPrincipal,
   type ConversationPrincipal,
 } from "../mcp/conversation-principal.js";
+import { listReceiptFinalizationAlerts } from "../desktop/receipt-finalizer.js";
 
 /** production feedback 永久 scope；与 synthetic feedback.probe 分离。 */
 export const CODEX_FEEDBACK_SCOPE = "codex.feedback";
 export const FEEDBACK_EVENT_KIND = "C2C_EXECUTED";
+export const FINAL_RECEIPT_REQUIRED_EVENT_KIND = "FINAL_RECEIPT_REQUIRED";
+/** 新版 Bridge 才声明并投影控制类反馈事件；不改变 connector contract。 */
+export const FEEDBACK_CONTROL_EVENT_VERSION = 1;
+/** Control event reasons are deliberately finite; never carry arbitrary diagnostic text. */
+export const FINAL_RECEIPT_REQUIRED_REASONS = [
+  "missing_final_receipt",
+  "post_record_activity",
+  "post_record_activity_unprovable",
+  "identity_drift",
+  "terminality_unknown",
+  "timeout",
+  "worker_spawn_failed",
+] as const;
 export const FEEDBACK_CLAIM_STALE_MS = 10 * 60_000;
 /** reserved 可逆；比 claimed 短，避免长期占位。 */
 export const FEEDBACK_RESERVATION_STALE_MS = 2 * 60_000;
@@ -42,7 +56,7 @@ export const feedbackBindingSchema = z.object({
   status: z.enum(["active", "superseded"]),
 }).strict();
 
-export const feedbackEventSchema = z.object({
+export const c2cExecutedEventSchema = z.object({
   version: z.literal(1),
   eventId: z.string().regex(HEX32),
   kind: z.literal(FEEDBACK_EVENT_KIND),
@@ -70,6 +84,53 @@ export const feedbackEventSchema = z.object({
   reservedBy: z.string().regex(UUID).optional(),
   retiredAt: z.string().datetime().optional(),
 }).strict();
+
+const feedbackEventLifecycleSchema = {
+  version: z.literal(1),
+  eventId: z.string().regex(HEX32),
+  workspaceId: z.string().regex(WORKSPACE_ID),
+  commandId: z.string().regex(DESKTOP_ID),
+  occurredAt: z.string().max(64).datetime(),
+  createdAt: z.string().max(64).datetime(),
+  updatedAt: z.string().max(64).datetime(),
+  targetBindingId: z.string().regex(UUID).nullable(),
+  targetEpoch: z.number().int().nonnegative().nullable(),
+  targetPrincipalFingerprint: z.string().regex(HEX32).nullable(),
+  status: z.enum(["queued", "ready", "reserved", "claimed", "observed", "outcome_unknown", "retired_unknown"]),
+  attemptId: z.string().regex(UUID).optional(),
+  claimedAt: z.string().max(64).datetime().optional(),
+  reservationId: z.string().regex(UUID).optional(),
+  reservedAt: z.string().max(64).datetime().optional(),
+  reservedBy: z.string().regex(UUID).optional(),
+  retiredAt: z.string().max(64).datetime().optional(),
+} as const;
+
+export const finalReceiptRequiredInputSchema = z.object({
+  workspaceId: z.string().regex(WORKSPACE_ID),
+  commandId: z.string().regex(DESKTOP_ID),
+  reason: z.enum(FINAL_RECEIPT_REQUIRED_REASONS),
+  occurredAt: z.string().max(64).datetime(),
+}).strict();
+
+/** Persisted control event. It intentionally has no task/files/tests/output/raw fields. */
+export const finalReceiptRequiredEventSchema = z.object({
+  ...feedbackEventLifecycleSchema,
+  kind: z.literal(FINAL_RECEIPT_REQUIRED_EVENT_KIND),
+  source: z.literal("control"),
+  taskId: z.string().regex(/^desktop_finalization_[A-Za-z0-9_-]{1,128}$/),
+  iteration: z.literal(1),
+  result: z.literal("blocked"),
+  changedFilesSummary: z.array(z.string().min(1).max(512)).max(0),
+  testsSummary: z.literal(""),
+  outputAvailable: z.literal(false),
+  outputId: z.never().optional(),
+  reason: z.enum(FINAL_RECEIPT_REQUIRED_REASONS),
+}).strict();
+
+export const feedbackEventSchema = z.union([
+  c2cExecutedEventSchema,
+  finalReceiptRequiredEventSchema,
+]);
 
 export const pairingIntentSchema = z.object({
   version: z.literal(1),
@@ -143,8 +204,25 @@ export const feedbackStateSchema = z.object({
   rebindPredecessor: companionRebindPredecessorSchema.nullable().default(null),
 }).strict();
 
+// Compatibility fence: the running pre-command51 Bridge only understands
+// C2C_EXECUTED events. Keep this schema local to the repair path so normal
+// runtime parsing remains the forward-capable union above.
+const legacyFeedbackStateSchema = z.object({
+  version: z.literal(1),
+  workspaceId: z.string().regex(WORKSPACE_ID),
+  projectionCursor: z.number().int().nonnegative(),
+  binding: feedbackBindingSchema.nullable(),
+  events: z.array(c2cExecutedEventSchema).max(10000),
+  pairingIntent: pairingIntentSchema.nullable().default(null),
+  companion: companionRecordSchema.nullable().default(null),
+  rebindIntent: companionRebindIntentSchema.nullable().default(null),
+  rebindPredecessor: companionRebindPredecessorSchema.nullable().default(null),
+}).strict();
+
 export type FeedbackBinding = z.infer<typeof feedbackBindingSchema>;
-export type FeedbackEvent = z.infer<typeof feedbackEventSchema>;
+export type C2CExecutedFeedbackEvent = z.infer<typeof c2cExecutedEventSchema>;
+export type FinalReceiptRequiredEvent = z.infer<typeof finalReceiptRequiredEventSchema>;
+export type FeedbackEvent = C2CExecutedFeedbackEvent | FinalReceiptRequiredEvent;
 export type FeedbackState = z.infer<typeof feedbackStateSchema>;
 export type PairingIntent = z.infer<typeof pairingIntentSchema>;
 export type CompanionRecord = z.infer<typeof companionRecordSchema>;
@@ -1009,6 +1087,133 @@ export function feedbackEventId(parts: {
 }): string {
   return createHash("sha256").update(JSON.stringify(parts), "utf8").digest("hex").slice(0, 32);
 }
+
+export function finalReceiptRequiredEventId(input: {
+  workspaceId: string;
+  commandId: string;
+  alertId: string;
+}): string {
+  return createHash("sha256").update(JSON.stringify(input), "utf8").digest("hex").slice(0, 32);
+}
+
+export interface FinalReceiptRepairResult {
+  state: FeedbackState;
+  removedEventIds: string[];
+}
+
+/**
+ * 锁内收敛 FINAL_RECEIPT_REQUIRED。
+ *
+ * Control event 只有在 durable finalizer alert 与 event 身份完全匹配时才可移除。
+ * 缺失、重复或冲突的 alert 一律 fail closed，且在校验完成前不写 state。
+ */
+export function repairFinalReceiptRequired(
+  workspaceId: string,
+  stateDir = getStateDir(),
+): FinalReceiptRepairResult {
+  return withFeedbackLock(workspaceId, stateDir, (read) => {
+    const previous = requireInitializedState(read(), workspaceId);
+    const alerts = listReceiptFinalizationAlerts(stateDir)
+      .filter((alert) => alert.workspaceId === workspaceId);
+    const alertsByCommand = new Map<string, typeof alerts>();
+    for (const alert of alerts) {
+      const current = alertsByCommand.get(alert.commandId) ?? [];
+      current.push(alert);
+      alertsByCommand.set(alert.commandId, current);
+    }
+    for (const [commandId, commandAlerts] of alertsByCommand) {
+      if (commandAlerts.length > 1) {
+        throw new FeedbackError(
+          "FEEDBACK_FINALIZATION_CONFLICT",
+          `同一 commandId 存在多个 durable finalization alert: ${commandId}`,
+        );
+      }
+    }
+
+    const eventIds = new Set<string>();
+    const controlEventIds = new Set<string>();
+    const controlCommandIds = new Set<string>();
+
+    const removedEventIds: string[] = [];
+    for (const event of previous.events) {
+      if (eventIds.has(event.eventId)) {
+        throw new FeedbackError("FEEDBACK_FINALIZATION_CONFLICT", `feedback state 存在重复 eventId: ${event.eventId}`);
+      }
+      eventIds.add(event.eventId);
+      if (event.kind !== FINAL_RECEIPT_REQUIRED_EVENT_KIND) continue;
+      if (controlEventIds.has(event.eventId) || controlCommandIds.has(event.commandId)) {
+        throw new FeedbackError(
+          "FEEDBACK_FINALIZATION_CONFLICT",
+          `存在重复的 FINAL_RECEIPT_REQUIRED: ${event.commandId}`,
+        );
+      }
+      controlEventIds.add(event.eventId);
+      controlCommandIds.add(event.commandId);
+      const commandAlerts = alertsByCommand.get(event.commandId) ?? [];
+      if (commandAlerts.length === 0) {
+        throw new FeedbackError(
+          "FEEDBACK_FINALIZATION_UNSUPPORTED",
+          `FINAL_RECEIPT_REQUIRED 缺少 durable alert: ${event.commandId}`,
+        );
+      }
+      const [alert] = commandAlerts;
+      const expectedEventId = finalReceiptRequiredEventId({
+        workspaceId,
+        commandId: alert.commandId,
+        alertId: alert.alertId,
+      });
+      if (
+        event.workspaceId !== alert.workspaceId
+        || event.workspaceId !== workspaceId
+        || event.commandId !== alert.commandId
+        || event.eventId !== expectedEventId
+        || event.taskId !== `desktop_finalization_${alert.commandId}`
+        || event.iteration !== 1
+        || event.result !== "blocked"
+        || event.reason !== alert.reason
+        || event.occurredAt !== alert.occurredAt
+        || event.changedFilesSummary.length !== 0
+        || event.testsSummary !== ""
+        || event.outputAvailable !== false
+      ) {
+        throw new FeedbackError(
+          "FEEDBACK_FINALIZATION_CONFLICT",
+          `FINAL_RECEIPT_REQUIRED 与 durable alert 身份冲突: ${event.commandId}`,
+        );
+      }
+      // Never delete an in-flight delivery: the receiver may still need to ACK
+      // this exact attempt. A terminal receipt can only retire queued/ready or
+      // already-settled control state.
+      if (["reserved", "claimed", "outcome_unknown"].includes(event.status)) {
+        throw new FeedbackError(
+          "FEEDBACK_FINALIZATION_CONFLICT",
+          `FINAL_RECEIPT_REQUIRED 仍在投递中: ${event.commandId}`,
+        );
+      }
+      removedEventIds.push(event.eventId);
+    }
+    if (removedEventIds.length === 0) {
+      legacyFeedbackStateSchema.parse(previous);
+      return { state: previous, removedEventIds };
+    }
+    const removed = new Set(removedEventIds);
+    const next: FeedbackState = {
+      ...previous,
+      events: previous.events.filter((event) => !removed.has(event.eventId)),
+    };
+    legacyFeedbackStateSchema.parse(next);
+    writeState(workspaceId, stateDir, next);
+    const reread = requireInitializedState(readState(workspaceId, stateDir), workspaceId);
+    if (reread.events.some((event) => event.kind === FINAL_RECEIPT_REQUIRED_EVENT_KIND)) {
+      throw new FeedbackError("FEEDBACK_FINALIZATION_CONFLICT", "兼容修复后仍残留控制事件");
+    }
+    legacyFeedbackStateSchema.parse(reread);
+    return { state: reread, removedEventIds };
+  });
+}
+
+/** Compatibility name used by maintenance callers; kept as a direct alias. */
+export const repairForwardFeedbackControlEvents = repairFinalReceiptRequired;
 
 export function publicFeedbackEvent(event: FeedbackEvent): Record<string, unknown> {
   return {

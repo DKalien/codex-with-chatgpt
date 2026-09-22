@@ -250,6 +250,19 @@ class ProtocolTests(unittest.TestCase):
         ancestor.assert_called_once_with(RUNTIME)
         self.assertEqual(self.pipe.starts(), [])
 
+    def test_inspect_result_context_uses_explicit_target_without_runner_ancestor(self):
+        turn = {"turnId": OLD_TURN, "status": "completed"}
+        self.pipe.state["turnHistory"] = {"kind": "canonical", "history": {
+            "islands": [{"entries": [{"value": "turn-1"}], "newerBoundary": {"status": "exhausted"}}],
+            "entitiesByKey": {"turn-1": turn},
+        }}
+        with patch.object(h, "_verify_current_runner_ancestor", side_effect=AssertionError("detached worker must not use runner proof")):
+            result = h._inspect_result_context(self.target)
+        self.assertEqual(result["threadId"], THREAD)
+        self.assertEqual(result["resultTurnId"], OLD_TURN)
+        self.assertEqual(result["resultTurnStatus"], "completed")
+        self.assertEqual(self.pipe.starts(), [])
+
     def test_current_execution_rechecks_snapshot_age_after_runtime_validation(self):
         state_file = Path(self.temp.name) / "global-state.json"
         state_file.write_text(json.dumps({
@@ -258,7 +271,8 @@ class ProtocolTests(unittest.TestCase):
         }), encoding="utf-8")
         self.pipe.state["threadRuntimeStatus"] = {"type": "active"}
         self.pipe.state["turns"] = [{"turnId": NEW_TURN, "status": "inProgress"}]
-        ages = iter([0.0, 0.0, 0.0, h.MAX_OBSERVATION_AGE_SECONDS + 1.0])
+        ages = iter([0.0, 0.0, 0.0, h.MAX_OBSERVATION_AGE_SECONDS + 1.0,
+                     h.MAX_OBSERVATION_AGE_SECONDS + 1.0])
         with patch.dict(os.environ, {"CODEX_THREAD_ID": THREAD, "CODEX_SESSION_ID": THREAD}, clear=False), \
                 patch.object(h, "_global_state_path", return_value=state_file), \
                 patch.object(h, "_verify_current_runner_ancestor"), \
@@ -267,6 +281,137 @@ class ProtocolTests(unittest.TestCase):
                 h._current_execution(self.temp.name)
         self.assertEqual(caught.exception.code, "DESKTOP_STATE_UNAVAILABLE")
         self.assertEqual(self.pipe.starts(), [])
+
+    def _current_execution_fixture(self, *, new_turn=NEW_TURN, ages=(0.0, h.MAX_OBSERVATION_AGE_SECONDS + 1.0, 0.0),
+                                    advance_serial=True):
+        target = self.target
+        old = {"id": THREAD, "hostId": "local", "cwd": target["workspaceRoot"], "title": "测试会话",
+               "workspaceKind": "project", "resumeState": "resumed", "threadRuntimeStatus": {"type": "active"},
+               "requests": [], "unconfirmedTurnSubmissions": [], "environments": [],
+               "turns": [{"turnId": OLD_TURN, "status": "inProgress"}]}
+        new = copy.deepcopy(old)
+        new["turns"] = [{"turnId": new_turn, "status": "inProgress"}]
+
+        class Client:
+            owner = OWNER
+
+            def __init__(self):
+                self.snapshot_serial = 7
+                self.snapshot_calls = 0
+                self._ages = iter(ages)
+
+            def drain(self, _timeout):
+                return None
+
+            def current_state(self):
+                return copy.deepcopy(old)
+
+            def snapshot_age(self):
+                return next(self._ages)
+
+            def snapshot(self):
+                self.snapshot_calls += 1
+                if advance_serial:
+                    self.snapshot_serial += 1
+                return copy.deepcopy(new)
+
+        client = Client()
+        pipe = SimpleNamespace(verify_server=Mock(), starts=lambda: [])
+        session = SimpleNamespace(client=client, pipe=pipe, runtime=RUNTIME, close=Mock())
+        return target, session, client, pipe
+
+    def test_current_execution_freshness_refreshes_same_active_turn(self):
+        target, session, client, pipe = self._current_execution_fixture()
+        with patch.object(h, "_current_target", return_value=target), \
+                patch.object(h, "_prepare", return_value=(session, {})), \
+                patch.object(h, "_validate_state") as validate, \
+                patch.object(h, "_verify_runtime", return_value=RUNTIME) as verify_runtime, \
+                patch.object(h, "_verify_current_runner_ancestor") as runner, \
+                patch.object(h, "_public_info", return_value={}):
+            result = h._current_execution(target["workspaceRoot"])
+        self.assertEqual(result["activeTurnId"], NEW_TURN)
+        self.assertEqual(client.snapshot_calls, 1)
+        self.assertEqual(pipe.verify_server.call_count, 1)
+        self.assertEqual(verify_runtime.call_count, 2)
+        self.assertEqual(runner.call_count, 2)
+        self.assertEqual(validate.call_count, 2)
+        self.assertEqual(pipe.starts(), [])
+
+    def test_current_execution_freshness_refresh_returns_new_active_turn(self):
+        target, session, client, pipe = self._current_execution_fixture(new_turn="01a00000-0000-7000-8000-000000000006")
+        with patch.object(h, "_current_target", return_value=target), \
+                patch.object(h, "_prepare", return_value=(session, {})), \
+                patch.object(h, "_validate_state"), \
+                patch.object(h, "_verify_runtime", return_value=RUNTIME) as verify_runtime, \
+                patch.object(h, "_verify_current_runner_ancestor") as runner, \
+                patch.object(h, "_public_info", return_value={}):
+            result = h._current_execution(target["workspaceRoot"])
+        self.assertEqual(result["activeTurnId"], "01a00000-0000-7000-8000-000000000006")
+        self.assertNotEqual(result["activeTurnId"], OLD_TURN)
+        self.assertEqual(client.snapshot_calls, 1)
+        self.assertEqual(verify_runtime.call_count, 2)
+        self.assertEqual(runner.call_count, 2)
+        self.assertEqual(pipe.starts(), [])
+
+    def test_current_execution_freshness_refresh_fail_closed(self):
+        cases = {
+            "timeout": (0.0, h.MAX_OBSERVATION_AGE_SECONDS + 1.0, 0.0),
+            "stale_after_refresh": (0.0, h.MAX_OBSERVATION_AGE_SECONDS + 1.0,
+                                     h.MAX_OBSERVATION_AGE_SECONDS + 1.0),
+            "serial_not_advanced": (0.0, h.MAX_OBSERVATION_AGE_SECONDS + 1.0),
+        }
+        for name, ages in cases.items():
+            with self.subTest(case=name):
+                target, session, client, pipe = self._current_execution_fixture(
+                    ages=ages, advance_serial=name != "serial_not_advanced")
+                if name == "timeout":
+                    clock = iter([0.0, h.SNAPSHOT_TIMEOUT_SECONDS + 1.0])
+                    monotonic = patch.object(h.time, "monotonic", side_effect=lambda: next(clock))
+                else:
+                    monotonic = patch.object(h.time, "monotonic", wraps=h.time.monotonic)
+                with monotonic, \
+                        patch.object(h, "_current_target", return_value=target), \
+                        patch.object(h, "_prepare", return_value=(session, {})), \
+                        patch.object(h, "_validate_state"), \
+                        patch.object(h, "_verify_runtime", return_value=RUNTIME), \
+                        patch.object(h, "_verify_current_runner_ancestor"), \
+                        patch.object(h, "_public_info", return_value={}):
+                    with self.assertRaises(h.DesktopIpcError) as caught:
+                        h._current_execution(target["workspaceRoot"])
+                self.assertEqual(caught.exception.code, "DESKTOP_STATE_UNAVAILABLE")
+                self.assertLessEqual(client.snapshot_calls, 1)
+                self.assertEqual(pipe.starts(), [])
+
+    def test_current_execution_freshness_refresh_rechecks_security_guards(self):
+        cases = {
+            "pipe": ("_pipe", h._error("DESKTOP_PROCESS_CHANGED")),
+            "runtime": ("_runtime", h._error("DESKTOP_PROCESS_CHANGED")),
+            "state": ("_state", h._error("DESKTOP_PROJECT_MISMATCH")),
+            "owner": ("_state", h._error("DESKTOP_NO_OWNER")),
+            "runner": ("_runner", h._error("DESKTOP_CURRENT_CONTEXT_INVALID")),
+        }
+        for name, (guard, failure) in cases.items():
+            with self.subTest(guard=name):
+                target, session, client, pipe = self._current_execution_fixture()
+                if guard == "_pipe":
+                    pipe.verify_server.side_effect = failure
+                with patch.object(h, "_current_target", return_value=target), \
+                        patch.object(h, "_prepare", return_value=(session, {})), \
+                        patch.object(h, "_validate_state") as default_validate, \
+                        patch.object(h, "_verify_runtime", return_value=RUNTIME) as default_runtime, \
+                        patch.object(h, "_verify_current_runner_ancestor") as default_runner, \
+                        patch.object(h, "_public_info", return_value={}):
+                    if guard == "_runtime":
+                        default_runtime.side_effect = [RUNTIME, failure]
+                    elif guard == "_state":
+                        default_validate.side_effect = [None, failure]
+                    elif guard == "_runner":
+                        default_runner.side_effect = [None, failure]
+                    with self.assertRaises(h.DesktopIpcError) as caught:
+                        h._current_execution(target["workspaceRoot"])
+                self.assertEqual(caught.exception.code, failure.code)
+                self.assertLessEqual(client.snapshot_calls, 1)
+                self.assertEqual(pipe.starts(), [])
 
     def test_current_result_context_accepts_active_or_complete_latest_terminal_history(self):
         state_file = Path(self.temp.name) / "global-state.json"
@@ -763,6 +908,146 @@ class ProtocolTests(unittest.TestCase):
             h._main()
         self.assertEqual(json.loads(output.buffer.getvalue()), {"id": CLIENT, "ok": True, "value": expected})
         pipe.assert_not_called()
+
+    def test_inspect_result_context_main_requires_exact_target_request(self):
+        value = {"threadId": THREAD, "hostId": "local", "projectId": "project_test",
+                 "workspaceRoot": str(Path.cwd()), "resultTurnId": OLD_TURN, "resultTurnStatus": "completed"}
+        request = {"id": CLIENT, "op": "inspect_result_context", "target": self.target}
+        source = SimpleNamespace(buffer=io.BytesIO(h._json_bytes(request) + b"\n"))
+        output = SimpleNamespace(buffer=io.BytesIO())
+        with patch.object(h, "_inspect_result_context", return_value=value) as inspect, \
+                patch.object(sys, "stdin", source), patch.object(sys, "stdout", output):
+            h._main()
+        self.assertEqual(json.loads(output.buffer.getvalue()), {"id": CLIENT, "ok": True, "value": value})
+        inspect.assert_called_once_with(self.target)
+
+        invalid = {**request, "workspaceRoot": str(Path.cwd())}
+        invalid["extra"] = True
+        source = SimpleNamespace(buffer=io.BytesIO(h._json_bytes(invalid) + b"\n"))
+        output = SimpleNamespace(buffer=io.BytesIO())
+        with patch.object(sys, "stdin", source), patch.object(sys, "stdout", output):
+            h._main()
+        self.assertEqual(json.loads(output.buffer.getvalue())["code"], "DESKTOP_INVALID_REQUEST")
+
+    def _activity_state(self, *, runtime: str = "idle", status: str = "completed", items=None):
+        items = items or [
+            {"id": "item-1", "type": "userMessage", "content": []},
+            {"id": "item-2", "type": "commandExecution", "command": "<redacted>"},
+        ]
+        turn = {"turnId": NEW_TURN, "status": status, "items": items}
+        self.pipe.state["threadRuntimeStatus"] = {"type": runtime}
+        self.pipe.state["turnHistory"] = {"kind": "canonical", "history": {
+            "islands": [{"entries": [{"value": "turn-1"}], "newerBoundary": {"status": "exhausted"}}],
+            "entitiesByKey": {"turn-1": turn},
+        }}
+        return turn
+
+    def test_result_activity_marker_is_ordered_id_type_only_and_fence_is_prefix_strict(self):
+        self._activity_state()
+        marker_result = h._inspect_result_activity_marker(self.target)
+        marker = marker_result["marker"]
+        self.assertEqual(marker["resultTurnId"], NEW_TURN)
+        self.assertEqual(marker["itemIds"], ["item-1", "item-2"])
+        self.assertEqual(marker["itemTypes"], ["userMessage", "commandExecution"])
+        self.assertEqual(marker["itemCount"], 2)
+        self.assertEqual(marker["itemSha256"], h._result_activity_sha256(marker["itemIds"], marker["itemTypes"]))
+        self.assertNotIn("content", marker)
+        self.assertNotIn("command", marker)
+
+        safe = h._inspect_result_terminal_fence(self.target, marker)
+        self.assertEqual(safe["fence"], "safe_terminal")
+
+        self._activity_state(items=[
+            {"id": "item-1", "type": "userMessage"},
+            {"id": "item-2", "type": "commandExecution"},
+            {"id": "item-3", "type": "reasoning"},
+            {"id": "item-4", "type": "agentMessage"},
+        ])
+        self.assertEqual(h._inspect_result_terminal_fence(self.target, marker)["fence"], "safe_terminal")
+
+        self._activity_state(items=[
+            {"id": "item-1", "type": "userMessage"},
+            {"id": "item-2", "type": "commandExecution"},
+            {"id": "item-3", "type": "reasoning"},
+            {"id": "item-4", "type": "agentMessage"},
+        ], runtime="inProgress", status="inProgress")
+        self.assertEqual(h._inspect_result_terminal_fence(self.target, marker)["fence"], "inProgress")
+
+        self._activity_state(items=[
+            {"id": "item-1", "type": "userMessage"},
+            {"id": "item-2", "type": "commandExecution"},
+            {"id": "item-3", "type": "reasoning"},
+            {"id": "item-4", "type": "commandExecution"},
+        ])
+        self.assertEqual(h._inspect_result_terminal_fence(self.target, marker)["fence"], "post_record_activity")
+
+        self._activity_state(items=[
+            {"id": "item-1", "type": "userMessage"},
+            {"id": "item-2", "type": "commandExecution"},
+            {"id": "item-3", "type": "reasoning"},
+            {"id": "item-4", "type": "mcpToolCall"},
+        ])
+        self.assertEqual(h._inspect_result_terminal_fence(self.target, marker)["fence"], "post_record_activity")
+
+        self._activity_state(items=[
+            {"id": "item-1", "type": "userMessage"},
+            {"id": "item-2", "type": "commandExecution"},
+            {"id": "item-3", "type": "agentMessage"},
+            {"id": "item-4", "type": "fileChange"},
+        ])
+        self.assertEqual(h._inspect_result_terminal_fence(self.target, marker)["fence"], "post_record_activity")
+
+        self._activity_state(items=[
+            {"id": "item-2", "type": "commandExecution"},
+            {"id": "item-1", "type": "userMessage"},
+        ])
+        self.assertEqual(h._inspect_result_terminal_fence(self.target, marker)["fence"], "unprovable")
+
+        self._activity_state(runtime="inProgress", status="inProgress")
+        self.assertEqual(h._inspect_result_terminal_fence(self.target, marker)["fence"], "inProgress")
+
+        bad_digest = {**marker, "itemSha256": "0" * 64}
+        self.assertEqual(h._inspect_result_terminal_fence(self.target, bad_digest)["fence"], "unprovable")
+
+    def test_result_activity_marker_unknown_or_malformed_item_fails_closed(self):
+        for item in ({"type": "agentMessage"}, {"id": "item-1", "type": "futureItem"},
+                     {"id": "item-1", "type": []},
+                     [{"id": "item-1", "type": "userMessage"}, {"id": "item-1", "type": "agentMessage"}],
+                     "malformed"):
+            with self.subTest(item=item):
+                self._activity_state(items=item if isinstance(item, list) else [item])
+                with self.assertRaises(h.DesktopIpcError) as caught:
+                    h._inspect_result_activity_marker(self.target)
+                self.assertEqual(caught.exception.code, "DESKTOP_STATE_UNAVAILABLE")
+
+    def test_result_activity_marker_operations_require_exact_target_shapes(self):
+        marker = {"resultTurnId": NEW_TURN, "itemIds": [], "itemTypes": [], "itemCount": 0,
+                  "itemSha256": h._result_activity_sha256([], [])}
+        value = {"marker": marker}
+        request = {"id": CLIENT, "op": "inspect_result_activity_marker", "target": self.target}
+        source = SimpleNamespace(buffer=io.BytesIO(h._json_bytes(request) + b"\n"))
+        output = SimpleNamespace(buffer=io.BytesIO())
+        with patch.object(h, "_inspect_result_activity_marker", return_value=value) as inspect, \
+                patch.object(sys, "stdin", source), patch.object(sys, "stdout", output):
+            h._main()
+        self.assertEqual(json.loads(output.buffer.getvalue()), {"id": CLIENT, "ok": True, "value": value})
+        inspect.assert_called_once_with(self.target)
+
+        request = {"id": CLIENT, "op": "inspect_result_terminal_fence", "target": self.target, "marker": marker}
+        source = SimpleNamespace(buffer=io.BytesIO(h._json_bytes(request) + b"\n"))
+        output = SimpleNamespace(buffer=io.BytesIO())
+        with patch.object(h, "_inspect_result_terminal_fence", return_value={"fence": "unprovable"}) as fence, \
+                patch.object(sys, "stdin", source), patch.object(sys, "stdout", output):
+            h._main()
+        self.assertEqual(json.loads(output.buffer.getvalue()), {"id": CLIENT, "ok": True, "value": {"fence": "unprovable"}})
+        fence.assert_called_once_with(self.target, marker)
+
+        invalid = {**request, "raw": "body"}
+        source = SimpleNamespace(buffer=io.BytesIO(h._json_bytes(invalid) + b"\n"))
+        output = SimpleNamespace(buffer=io.BytesIO())
+        with patch.object(sys, "stdin", source), patch.object(sys, "stdout", output):
+            h._main()
+        self.assertEqual(json.loads(output.buffer.getvalue())["code"], "DESKTOP_INVALID_REQUEST")
 
 
 class RuntimeTests(unittest.TestCase):
@@ -1551,6 +1836,251 @@ class CatalogAuditTests(unittest.TestCase):
             h._main()
         self.assertEqual(json.loads(output.buffer.getvalue())["value"]["classification"], "unavailable")
         pipe.assert_not_called()
+
+    def _classification_case(self, text, *, turn_id=NEW_TURN, continuation=False, trigger=None, predecessor_status="failed", hops=1, boundary="exhausted", ordinary_origin=False, machine_input=None, machine_items=None, thread_id=None):
+        with tempfile.TemporaryDirectory(prefix="c2c-classification-") as directory:
+            target = {"threadId": THREAD, "hostId": "local", "projectId": "project_test",
+                      "workspaceRoot": directory}
+            pipe = FakePipe(target)
+            if continuation:
+                origin_text = "ordinary" if ordinary_origin else '{"type":"C2C_DESKTOP_TASK","version":1,"workspaceId":"workspace","commandId":"cmd-classify","intent":"development_plan","message":"x"}'
+                origin_item = {"type": "text", "text": origin_text, "text_elements": []}
+                origin = {"turnId": OLD_TURN, "status": predecessor_status, "params": {"input": [origin_item]},
+                          "items": [{"type": "userMessage", "content": [origin_item]}]}
+                turns = [origin]
+                for index in range(hops):
+                    params = {"turnTrigger": trigger or h._NATIVE_CONTINUATION_TRIGGER,
+                              "input": []}
+                    hop_id = turn_id if index == hops - 1 else f"01a00000-0000-7000-8000-{index + 6:012d}"
+                    turns.append({"turnId": hop_id,
+                                  "status": "completed" if index == hops - 1 else "failed",
+                                  "params": {**params, **({"input": machine_input} if machine_input is not None else {}), **({"threadId": thread_id} if thread_id is not None else {})},
+                                  "items": machine_items if machine_items is not None else []})
+            else:
+                item = {"type": "text", "text": text, "text_elements": []}
+                turn = {"turnId": turn_id, "status": "completed", "params": {"input": [item]},
+                        "items": [{"type": "userMessage", "content": [item]}]}
+                turns = [turn]
+            pipe.state["turns"] = turns
+            pipe.state["turnHistory"] = {"kind": "canonical", "history": {
+                "islands": [{"entries": [{"value": f"turn-{i}"} for i in range(len(turns))],
+                              "newerBoundary": {"status": boundary}}],
+                "entitiesByKey": {f"turn-{i}": item for i, item in enumerate(turns)}}}
+            client = SimpleNamespace(drain=Mock(), current_state=lambda: pipe.state,
+                                     snapshot_age=lambda: 0, owner=OWNER)
+            session = SimpleNamespace(client=client, pipe=pipe, runtime=RUNTIME, close=Mock())
+            with patch.object(h, "_current_target", return_value=target), \
+                 patch.object(h, "_prepare", return_value=(session, {})), \
+                 patch.object(h, "_verify_runtime", return_value=RUNTIME), \
+                 patch.object(h, "_public_info", return_value={}), \
+                 patch.object(h, "_verify_current_runner_ancestor"):
+                return h._current_result_classification(directory)
+
+    def test_result_classification_ordinary_and_json_non_c2c_are_not_applicable(self):
+        for text in ("普通后续消息", '{"type":"other"}'):
+            with self.subTest(text=text):
+                result = self._classification_case(text)
+                self.assertEqual(result["classification"], "not_applicable")
+
+    def test_result_classification_current_c2c_origin_has_exact_fingerprint(self):
+        text = '{"type":"C2C_DESKTOP_TASK","version":1,"workspaceId":"workspace","commandId":"cmd-origin","intent":"revision","message":"hello"}'
+        result = self._classification_case(text)
+        self.assertEqual(result["classification"], "applicable")
+        self.assertEqual(result["ownership"], "origin")
+        self.assertEqual(result["workspaceId"], "workspace")
+        self.assertEqual(result["commandId"], "cmd-origin")
+        self.assertEqual(result["intent"], "revision")
+        self.assertEqual(result["messageBytes"], 5)
+        self.assertEqual(result["messageSha256"], hashlib.sha256(b"hello").hexdigest())
+        self.assertEqual(result["originTurnId"], result["resultTurnId"])
+        self.assertEqual(result["chainTurnIds"], [result["resultTurnId"]])
+        self.assertEqual(result["chainLength"], 0)
+        self.assertIsNone(result["signature"])
+        for key in ("text", "message", "envelope", "history", "params", "items"):
+            self.assertNotIn(key, result)
+
+    def test_result_classification_c2c_malformed_variants_fail_closed(self):
+        variants = [
+            '{"type":"C2C_DESKTOP_TASK","version":2,"workspaceId":"workspace","commandId":"x","intent":"revision","message":"x"}',
+            '{"type":"C2C_DESKTOP_TASK","version":1,"workspaceId":"bad space","commandId":"x","intent":"revision","message":"x"}',
+            '{"type":"C2C_DESKTOP_TASK","version":1,"workspaceId":"workspace","commandId":"x","intent":"bad","message":"x"}',
+            '{"type":"C2C_DESKTOP_TASK","version":1,"workspaceId":"workspace","commandId":"x","intent":"revision","message":""}',
+            '{"type":"C2C_DESKTOP_TASK","version":1,"workspaceId":"workspace","commandId":"x","intent":"revision","message":"\ud800"}',
+        ]
+        for text in variants:
+            with self.subTest(text=text), self.assertRaises(h.DesktopIpcError) as caught:
+                self._classification_case(text)
+            self.assertEqual(caught.exception.code, "DESKTOP_STATE_UNAVAILABLE")
+
+    def test_result_classification_malformed_or_c2c_shaped_is_fail_closed(self):
+        cases = ["{malformed", '{"type":"C2C_DESKTOP_TASK"}']
+        for text in cases:
+            with self.subTest(text=text):
+                with self.assertRaises(h.DesktopIpcError) as caught:
+                    self._classification_case(text)
+            self.assertEqual(caught.exception.code, "DESKTOP_STATE_UNAVAILABLE")
+
+    def test_result_classification_native_continuation_is_applicable(self):
+        result = self._classification_case("", continuation=True)
+        self.assertEqual(result["classification"], "applicable")
+        self.assertEqual(result["ownership"], "native_continuation")
+        self.assertEqual(result["chainTurnIds"], [OLD_TURN, NEW_TURN])
+        self.assertEqual(result["chainLength"], 1)
+        self.assertEqual(result["signature"], h._NATIVE_CONTINUATION_TRIGGER)
+        self.assertEqual(result["workspaceId"], "workspace")
+        self.assertEqual(result["commandId"], "cmd-classify")
+        self.assertEqual(result["intent"], "development_plan")
+        self.assertEqual(result["messageBytes"], 1)
+        self.assertEqual(result["messageSha256"], hashlib.sha256(b"x").hexdigest())
+
+    def test_result_classification_max_unique_hops_and_ordinary_origin(self):
+        result = self._classification_case("", continuation=True, hops=h.MAX_RESULT_OWNERSHIP_CHAIN)
+        self.assertEqual(result["chainLength"], h.MAX_RESULT_OWNERSHIP_CHAIN)
+        self.assertEqual(len(set(result["chainTurnIds"])), len(result["chainTurnIds"]))
+        self.assertEqual(self._classification_case("", continuation=True, ordinary_origin=True)["classification"], "not_applicable")
+
+    def test_result_classification_malformed_machine_and_loading_boundary(self):
+        cases = [{"machine_input": [{"type": "bad"}]}, {"machine_items": [{"type": "userMessage"}]},
+                 {"thread_id": "01a00000-0000-7000-8000-000000000099"}, {"boundary": "loading"}]
+        for case in cases:
+            with self.subTest(case=case):
+                with self.assertRaises(h.DesktopIpcError):
+                    self._classification_case("", continuation=True, **case)
+
+    def test_result_classification_two_hop_and_chain_bound(self):
+        result = self._classification_case("", continuation=True, hops=2)
+        self.assertEqual(result["chainLength"], 2)
+        self.assertEqual(result["chainTurnIds"], [OLD_TURN, "01a00000-0000-7000-8000-000000000006", NEW_TURN])
+        for key in ("text", "message", "envelope", "history", "params", "items"):
+            self.assertNotIn(key, result)
+        with self.assertRaises(h.DesktopIpcError) as caught:
+            self._classification_case("", continuation=True, hops=h.MAX_RESULT_OWNERSHIP_CHAIN + 1)
+        self.assertEqual(caught.exception.code, "DESKTOP_STATE_UNAVAILABLE")
+
+    def test_result_classification_continuation_malformed_trigger_or_predecessor_fails_closed(self):
+        for kwargs in ({"trigger": "wrong-trigger"}, {"predecessor_status": "completed"}):
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(h.DesktopIpcError) as caught:
+                    self._classification_case("", continuation=True, **kwargs)
+                self.assertEqual(caught.exception.code, "DESKTOP_STATE_UNAVAILABLE")
+
+    def _cross_island_case(self, origin_boundary):
+        with tempfile.TemporaryDirectory(prefix="c2c-islands-") as directory:
+            target = {"threadId": THREAD, "hostId": "local", "projectId": "project_test", "workspaceRoot": directory}
+            pipe = FakePipe(target)
+            origin = {"turnId": OLD_TURN, "status": "failed", "params": {"input": [{"type": "text", "text": "x", "text_elements": []}]},
+                      "items": [{"type": "userMessage", "content": [{"type": "text", "text": "x", "text_elements": []}]}]}
+            item = {"type": "text", "text": "ordinary", "text_elements": []}
+            current = {"turnId": NEW_TURN, "status": "completed", "params": {"input": [item]},
+                       "items": [{"type": "userMessage", "content": [item]}]}
+            pipe.state["turns"] = [origin, current]
+            pipe.state["turnHistory"] = {"kind": "canonical", "history": {"islands": [
+                {"entries": [{"value": "a"}], "newerBoundary": {"status": origin_boundary}},
+                {"entries": [{"value": "b"}], "newerBoundary": {"status": "exhausted"}}],
+                "entitiesByKey": {"a": origin, "b": current}}}
+            client = SimpleNamespace(drain=Mock(), current_state=lambda: pipe.state, snapshot_age=lambda: 0, owner=OWNER)
+            session = SimpleNamespace(client=client, pipe=pipe, runtime=RUNTIME, close=Mock())
+            with patch.object(h, "_current_target", return_value=target), patch.object(h, "_prepare", return_value=(session, {})), \
+                 patch.object(h, "_verify_runtime", return_value=RUNTIME), patch.object(h, "_public_info", return_value={}), \
+                 patch.object(h, "_verify_current_runner_ancestor"):
+                return h._current_result_classification(directory), pipe
+
+    def test_result_classification_cross_island_exhausted_is_not_applicable(self):
+        result, pipe = self._cross_island_case("exhausted")
+        self.assertEqual(result["classification"], "not_applicable")
+        for key in ("text", "message", "envelope", "history", "params", "items"):
+            self.assertNotIn(key, result)
+        self.assertEqual(pipe.starts(), [])
+
+    def test_result_classification_many_historical_turns_do_not_affect_current(self):
+        with tempfile.TemporaryDirectory(prefix="c2c-history-") as directory:
+            target = {"threadId": THREAD, "hostId": "local", "projectId": "project_test", "workspaceRoot": directory}
+            pipe = FakePipe(target); entities = {}; islands = []; turns = []
+            for index in range(12):
+                tid = f"01a00000-0000-7000-8000-{100 + index:012d}"
+                text = json.dumps({"type":"C2C_DESKTOP_TASK","version":1,"workspaceId":"workspace","commandId":f"old-{index}","intent":"revision","message":"old"}, separators=(",", ":"))
+                item = {"type":"text","text":text,"text_elements":[]}; turn = {"turnId":tid,"status":"completed","params":{"input":[item]},"items":[{"type":"userMessage","content":[item]}]}
+                key=f"old-{index}"; entities[key]=turn; turns.append(turn); islands.append({"entries":[{"value":key}],"newerBoundary":{"status":"exhausted"}})
+            current_text='{"type":"C2C_DESKTOP_TASK","version":1,"workspaceId":"workspace","commandId":"cmd-current","intent":"revision","message":"current"}'
+            item={"type":"text","text":current_text,"text_elements":[]}; current={"turnId":NEW_TURN,"status":"completed","params":{"input":[item]},"items":[{"type":"userMessage","content":[item]}]}
+            entities["current"]=current; turns.append(current); islands.append({"entries":[{"value":"current"}],"newerBoundary":{"status":"exhausted"}})
+            pipe.state["turns"]=turns; pipe.state["turnHistory"]={"kind":"canonical","history":{"islands":islands,"entitiesByKey":entities}}
+            client=SimpleNamespace(drain=Mock(),current_state=lambda:pipe.state,snapshot_age=lambda:0,owner=OWNER)
+            session=SimpleNamespace(client=client,pipe=pipe,runtime=RUNTIME,close=Mock())
+            with patch.object(h,"_current_target",return_value=target), patch.object(h,"_prepare",return_value=(session,{})), patch.object(h,"_verify_runtime",return_value=RUNTIME), patch.object(h,"_verify_current_runner_ancestor"), patch.object(h,"_public_info",return_value={}):
+                result=h._current_result_classification(directory)
+            self.assertEqual(result["commandId"],"cmd-current"); self.assertEqual(result["originTurnId"],NEW_TURN); self.assertEqual(pipe.starts(),[])
+
+    def _fresh_state(self, turn_id, command_id):
+        text = json.dumps({"type":"C2C_DESKTOP_TASK","version":1,"workspaceId":"workspace","commandId":command_id,"intent":"revision","message":"fresh"}, separators=(",", ":"))
+        item = {"type":"text","text":text,"text_elements":[]}; turn = {"turnId":turn_id,"status":"completed","params":{"input":[item]},"items":[{"type":"userMessage","content":[item]}]}
+        return {"id": THREAD, "hostId":"local", "cwd":"", "title":"t", "workspaceKind":"project", "resumeState":"resumed", "threadRuntimeStatus":{"type":"idle"}, "requests":[], "unconfirmedTurnSubmissions":[], "environments":[], "turns":[turn], "turnHistory":{"kind":"canonical","history":{"islands":[{"entries":[{"value":"k"}],"newerBoundary":{"status":"exhausted"}}],"entitiesByKey":{"k":turn}}}}
+
+    def test_result_classification_freshness_refresh_success(self):
+        with tempfile.TemporaryDirectory(prefix="c2c-fresh-") as directory:
+            target={"threadId":THREAD,"hostId":"local","projectId":"project_test","workspaceRoot":directory}; old=self._fresh_state(OLD_TURN,"cmd-old"); new=self._fresh_state(NEW_TURN,"cmd-fresh")
+            class Client:
+                owner=OWNER; snapshot_serial=1
+                def __init__(self): self.ages=[0,h.MAX_OBSERVATION_AGE_SECONDS + 1,0]; self.snapshots=0
+                def drain(self,_): pass
+                def current_state(self): return old
+                def snapshot_age(self): return self.ages.pop(0) if self.ages else 0
+                def snapshot(self): self.snapshots+=1; self.snapshot_serial=2; return new
+            client=Client(); pipe=SimpleNamespace(verify_server=Mock(), starts=lambda:[]); session=SimpleNamespace(client=client,pipe=pipe,runtime=RUNTIME,close=Mock())
+            with patch.object(h,"_current_target",return_value=target), patch.object(h,"_prepare",return_value=(session,{})), patch.object(h,"_validate_state"), patch.object(h,"_verify_runtime",return_value=RUNTIME) as vr, patch.object(h,"_verify_current_runner_ancestor") as va, patch.object(h,"_public_info",return_value={}):
+                result=h._current_result_classification(directory)
+            self.assertEqual(result["commandId"],"cmd-fresh"); self.assertEqual(result["resultTurnId"],NEW_TURN); self.assertEqual(client.snapshots,1); self.assertEqual(vr.call_count,2); self.assertEqual(va.call_count,2); pipe.verify_server.assert_called_once()
+
+    def test_result_classification_freshness_fail_closed_serial_or_age(self):
+        for serial_advanced, fresh_after in ((False, True), (True, False)):
+            with self.subTest(serial_advanced=serial_advanced, fresh_after=fresh_after), tempfile.TemporaryDirectory(prefix="c2c-stale-") as directory:
+                target={"threadId":THREAD,"hostId":"local","projectId":"project_test","workspaceRoot":directory}; state=self._fresh_state(OLD_TURN,"cmd-old")
+                class Client:
+                    owner=OWNER; snapshot_serial=1
+                    def drain(self,_): pass
+                    def current_state(self): return state
+                    def snapshot_age(self): return 0
+                    def snapshot(self):
+                        if serial_advanced: self.snapshot_serial=2
+                        return state
+                client=Client(); ages=iter([0,h.MAX_OBSERVATION_AGE_SECONDS + 1,h.MAX_OBSERVATION_AGE_SECONDS + 1] if not fresh_after else [0,h.MAX_OBSERVATION_AGE_SECONDS + 1,0]); client.snapshot_age=lambda: next(ages,h.MAX_OBSERVATION_AGE_SECONDS + 1)
+                pipe=SimpleNamespace(verify_server=Mock(), starts=lambda:[]); session=SimpleNamespace(client=client,pipe=pipe,runtime=RUNTIME,close=Mock())
+                with patch.object(h,"_current_target",return_value=target), patch.object(h,"_prepare",return_value=(session,{})), patch.object(h,"_validate_state"), patch.object(h,"_verify_runtime",return_value=RUNTIME), patch.object(h,"_verify_current_runner_ancestor"), patch.object(h,"_public_info",return_value={}):
+                    with self.assertRaises(h.DesktopIpcError) as caught: h._current_result_classification(directory)
+                self.assertEqual(caught.exception.code,"DESKTOP_STATE_UNAVAILABLE")
+
+    def test_result_classification_main_rejects_extra_request_fields(self):
+        request = {"id": CLIENT, "op": "current_result_classification", "workspaceRoot": str(Path.cwd()),
+                   "expectations": [], "extra": True}
+        source = SimpleNamespace(buffer=io.BytesIO(h._json_bytes(request) + b"\n"))
+        output = SimpleNamespace(buffer=io.BytesIO())
+        with patch.object(sys, "stdin", source), patch.object(sys, "stdout", output):
+            h._main()
+        response = json.loads(output.buffer.getvalue())
+        self.assertFalse(response["ok"])
+        self.assertEqual(response["code"], "DESKTOP_INVALID_REQUEST")
+
+    def test_result_classification_main_exact_request_succeeds(self):
+        request = {"id": CLIENT, "op": "current_result_classification", "workspaceRoot": str(Path.cwd())}
+        source = SimpleNamespace(buffer=io.BytesIO(h._json_bytes(request) + b"\n"))
+        output = SimpleNamespace(buffer=io.BytesIO())
+        with patch.object(h, "_current_result_classification", return_value={"classification": "not_applicable"}) as classify, \
+                patch.object(sys, "stdin", source), patch.object(sys, "stdout", output):
+            h._main()
+        response = json.loads(output.buffer.getvalue())
+        self.assertEqual(response, {"id": CLIENT, "ok": True, "value": {"classification": "not_applicable"}})
+        classify.assert_called_once_with(str(Path.cwd()))
+
+        request = {"id": CLIENT, "op": "current_result_classification", "workspaceRoot": str(Path.cwd()),
+                   "expectations": []}
+        source = SimpleNamespace(buffer=io.BytesIO(h._json_bytes(request) + b"\n"))
+        output = SimpleNamespace(buffer=io.BytesIO())
+        with patch.object(h, "_current_result_classification", return_value={"classification": "not_applicable"}), \
+                patch.object(sys, "stdin", source), patch.object(sys, "stdout", output):
+            h._main()
+        response = json.loads(output.buffer.getvalue())
+        self.assertFalse(response["ok"])
+        self.assertEqual(response["code"], "DESKTOP_INVALID_REQUEST")
 
 
 if __name__ == "__main__":

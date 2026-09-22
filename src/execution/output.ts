@@ -118,8 +118,11 @@ export interface SaveOutputInput {
 export function saveExecutionOutput(workspaceId: string, input: SaveOutputInput): ExecutionOutputMeta {
   return withOutputLock(workspaceId, () => saveLocked(workspaceId, input));
 }
-function saveLocked(workspaceId: string, input: SaveOutputInput): ExecutionOutputMeta {
-  const sanitized = sanitizeExecutionOutput(input.raw);
+function saveLocked(
+  workspaceId: string,
+  input: SaveOutputInput,
+  sanitized = sanitizeExecutionOutput(input.raw),
+): ExecutionOutputMeta {
   const index = readIndex(workspaceId);
   // 即使所有历史输出为空/受限，也能区分首次写入与意外丢失的 index。
   const initialized = `${indexFile(workspaceId)}.initialized`;
@@ -163,6 +166,21 @@ function saveLocked(workspaceId: string, input: SaveOutputInput): ExecutionOutpu
     try { fs.rmSync(bodyFile(workspaceId, item.id), { force: true }); } catch { /* 保留 orphan */ }
   }
   return meta;
+}
+
+/** Deferred finalization retains only a sanitizer decision, never rejected output. */
+export function saveRestrictedExecutionOutput(
+  workspaceId: string,
+  input: Omit<SaveOutputInput, "raw"> & { reason: string },
+): ExecutionOutputMeta {
+  const reason = input.reason.trim().slice(0, 128) || "restricted";
+  return withOutputLock(workspaceId, () => saveLocked(workspaceId, {
+    command: input.command,
+    exitCode: input.exitCode,
+    taskId: input.taskId,
+    iteration: input.iteration,
+    raw: "",
+  }, { allowed: false, reason }));
 }
 
 export function listExecutionOutputs(workspaceId: string, limit = 20): ExecutionOutputMeta[] {
