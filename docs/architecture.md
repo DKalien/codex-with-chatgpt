@@ -70,6 +70,29 @@
 - capability metadata 仅供规划/UI 描述，不能授予权限；注册表固定且拒绝未知 executor，不做插件自动发现、PATH/网络探测或动态加载。
 - Browser Companion 与 feedback transport 保持 executor-independent；H0 不新增 generic MCP executor 工具，也不引入第二个 executor。
 
+## Executor E1a — Claude runner contract（2026-09-23）
+
+command83 的本机只读审计确认 Claude Code `2.1.220` 已安装；本地帮助提供非交互
+`--print`、显式 `--session-id`、`--resume/--continue/--fork-session`、JSON/stream-JSON
+输出和权限模式线索，但尚未证明 C2C command binding、审批事件观察、取消语义或可信终端回执。
+MiMo Desktop 仍只有 GUI/Browser Bridge 线索，没有稳定 coding-task 机器接口。
+
+- E1a 只提供 `src/executor/claude/` 的本地 invocation builder、固定 JSON parser、受限
+  child-process seam 和 fake-runner 测试；不启动真实 Claude，不把 Claude 加入生产 registry，
+  不新增 generic MCP executor 工具，也不改变 Codex Desktop 状态或工具。
+- builder 只接受调用方提供的绝对 executable identity（路径/version/可选 hash），生成
+  `shell:false` argv，保留 commandId 与生成或校验的 Claude sessionId 本地 correlation；若输出带有
+  `command_id` 才执行 mismatch guard，尚未证明跨进程的 C2C command binding。workspaceRoot/cwd 只有
+  本地绝对路径与词法 containment 校验，不替代 Bridge 的 canonical workspace security boundary，
+  并拒绝绕过审批的 permission mode。candidate capability 只描述观察到的 CLI/实验合同事实。
+- terminal result 只保留有界输出的 bytes/hash/truncated/restricted metadata；malformed、身份不匹配、
+  `is_error=true`、非零退出、超时、取消、输出超限或进程终态不明均 fail closed，不能宣称 trustedTerminalReceipt。
+  AbortSignal 只传给 C2C-owned child；不声称 Claude-native interrupt、descendant cleanup 或 orphan
+  证明，也不引入 retry/fallback。
+- 下一 gate 是受控、只读的真实 Claude smoke，核对实际 JSON/session/exit 语义；之后还需独立定义
+  approval、cancellation 和 receipt evidence 合同，才可评估生产 adapter。Claude 不得自动 fallback
+  到 Codex，MiMo 仍是等待稳定任务 API 的低信任候选。
+
 ## Request lifecycles
 
 **MCP call**: ChatGPT → tunnel (https) → bridge `/mcp` → bearer middleware

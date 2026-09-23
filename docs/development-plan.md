@@ -828,6 +828,23 @@ G3 修复 Browser Companion 误绑错误 ChatGPT conversation 后 production Sen
 
 H0 不抽象 Codex-specific result classification、terminal fence、receipt finalizer、unknown reconciliation 或 Browser Companion 协议；后续 adapter 必须先定义独立的证据合同，才能获得可信回执语义。下一步若实现 Claude Code，先补本地身份/审批/终态证据合同，再扩展 registry 和定向测试，不改变现有 `codex_desktop_send` / `codex_desktop_status`。
 
+## Executor E1a — Claude runner contract（2026-09-23，本轮）
+
+- command83 的只读本机审计确认 Claude Code `2.1.220` 与非交互/会话/JSON 输出帮助线索；
+  C2C command binding、审批观察、取消协议和 trusted terminal receipt 仍未由真实任务证明。
+  MiMo Desktop 没有稳定 coding-task API 证据，继续保持低信任候选。
+- 本轮新增 `src/executor/claude/` 的协议 scaffolding：显式 executable identity、commandId 与 UUID
+  sessionId 的本地 correlation metadata/可选 `command_id` mismatch guard、workspaceRoot/cwd 的
+  词法 containment、固定 JSON argv、safe permission allowlist、bounded child-process seam、结构化
+  parser 和 fail-closed terminal classification（包括 JSON `is_error=true` 即使进程退出码为零）。
+  词法 containment 不替代 Bridge canonical workspace security boundary；测试只使用 fake runner，未启动真实 Claude。
+- Claude candidate descriptor 明确 `productionEnabled=false`，生产 `executorRegistry` 仍只有
+  `codex-desktop`；不新增 generic MCP executor 工具、不改 Desktop schema/工具、不实现 MiMo。
+  candidate capability 不授予权限，`trustedTerminalReceipt` 仍不可用。
+- 下一 gate：受控只读真实 Claude smoke，验证实际 JSON/session/exit 行为；之后另行完成审批可见性、
+  C2C-owned child cancellation（不等同 Claude-native interrupt）、descendant/orphan 行为和可信
+  receipt evidence 合同，再讨论生产注册。
+
 ## H1 — Browser Companion toolbar indicator 与 sleep/wake recovery（2026-09-22，现役源码）
 
 - 工具栏 `C/C!/C×` 仅为诊断显示，error > warning > normal；不授予权限、不改变 autonomy 或发送权。Service Worker 在 tick、production send 与恢复路径清除 in-flight 标记后刷新，保证临时 `C!` 能收敛回真实健康状态。
