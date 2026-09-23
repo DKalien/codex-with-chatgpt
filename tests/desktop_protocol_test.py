@@ -16,6 +16,7 @@ from unittest.mock import Mock, patch
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src/desktop/helper"))
 import desktop_ipc as h
+REAL_VERIFY_RUNTIME = h._verify_runtime
 
 THREAD = "01a00000-0000-7000-8000-000000000001"
 OWNER = "01a00000-0000-7000-8000-000000000002"
@@ -94,6 +95,27 @@ class ProtocolTests(unittest.TestCase):
             active.start()
             self.addCleanup(active.stop)
 
+    def _candidate_fixture(self, *, app_server_version="0.154.0-alpha.6.2", app_server_sha256,
+                           candidate_profile=h.VERIFIED_PROFILE):
+        target = self.target
+        desktop_exe = str(Path(target["workspaceRoot"]) / "ChatGPT.exe")
+        app_server_exe = str(Path(target["workspaceRoot"]) / "codex.exe")
+        rows = [
+            {"pid": 100, "parentPid": 1, "name": "ChatGPT.exe", "exe": desktop_exe, "creation": 10},
+            {"pid": 101, "parentPid": 100, "name": "codex.exe", "exe": app_server_exe, "creation": 11},
+        ]
+        observed = {"observedDesktopVersion": "99.1.1.1", "observedAppServerVersion": app_server_version,
+                    "appServerSha256": app_server_sha256}
+        candidate_runtime = {"desktopVersion": observed["observedDesktopVersion"],
+            "appServerVersion": app_server_version, "appServerSha256": app_server_sha256,
+            "asarHeader": [4, 100, 96, 89], "modules": [
+                {"role": "ipc-main", "path": ".vite/build/src-candidate.js", "sha256": "b" * 64},
+                {"role": "webview-bootstrap", "path": "webview/assets/app-initial-candidate.js", "sha256": "c" * 64}]}
+        audit = {**observed, "classification": "same_protocol_candidate", "status": "unverified", "profile": None,
+                 "candidateProfile": candidate_profile, "candidateRuntime": candidate_runtime,
+                 "asarHeader": candidate_runtime["asarHeader"], "modules": candidate_runtime["modules"]}
+        return target, rows, observed, audit
+
     def test_real_protocol_flow_keeps_text_and_only_accepts_without_completion(self):
         session, info = h._prepare(self.target)
         text = "完整中文方案\n```python\nprint('你好')\n```"
@@ -139,7 +161,8 @@ class ProtocolTests(unittest.TestCase):
         audit = {"classification": "protocol_drift_or_unknown", "asarHeader": [4, 8, 4, 0],
                  "modules": [{"role": "ipc-main", "path": "a", "sha256": "b" * 64},
                              {"role": "webview-bootstrap", "path": "b", "sha256": "c" * 64}]}
-        for key in ("desktopPid", "appServerCreation", "observedAppServerVersion", "appServerSha256"):
+        for key in ("desktopPid", "appServerCreation", "desktopExe", "appServerExe",
+                    "observedAppServerVersion", "appServerSha256"):
             with self.subTest(key=key):
                 changed = {**base, key: (base[key] + 1 if isinstance(base[key], int) else "changed")}
                 with patch.object(h, "_current_target", return_value=target), \
@@ -147,6 +170,132 @@ class ProtocolTests(unittest.TestCase):
                         patch.object(h, "_compatibility_audit_for_paths", return_value=audit):
                     with self.assertRaises(h.DesktopIpcError):
                         h._handshake_audit(target["workspaceRoot"])
+
+    def test_handshake_audit_returns_only_stable_candidate_runtime(self):
+        target = self.target
+        identity = {"desktopPid": 100, "appServerPid": 101, "desktopCreation": 10, "appServerCreation": 11,
+                    "desktopExe": "ChatGPT.exe", "appServerExe": "codex.exe",
+                    "observedDesktopVersion": "99.1.1.1", "observedAppServerVersion": "0.154.0-alpha.6.2",
+                    "appServerSha256": "a" * 64}
+        candidate_runtime = {"desktopVersion": "99.1.1.1", "appServerVersion": "0.154.0-alpha.6.2",
+            "appServerSha256": "a" * 64, "asarHeader": [4, 100, 96, 89], "modules": [
+                {"role": "ipc-main", "path": ".vite/build/src-candidate.js", "sha256": "b" * 64},
+                {"role": "webview-bootstrap", "path": "webview/assets/app-initial-candidate.js", "sha256": "c" * 64}]}
+        audit = {"observedDesktopVersion": "99.1.1.1", "observedAppServerVersion": "0.154.0-alpha.6.2",
+                 "appServerSha256": "a" * 64, "classification": "same_protocol_candidate",
+                 "status": "unverified", "profile": None,
+                 "candidateProfile": "desktop-ipc-v1", "candidateRuntime": candidate_runtime,
+                 "asarHeader": candidate_runtime["asarHeader"], "modules": candidate_runtime["modules"]}
+        with patch.object(h, "_current_target", return_value=target), \
+                patch.object(h, "_verify_runtime_identity", side_effect=[identity, identity]), \
+                patch.object(h, "_compatibility_audit_for_paths", return_value=audit):
+            result = h._handshake_audit(target["workspaceRoot"])
+        self.assertEqual(result["protocolClassification"], "same_protocol_candidate")
+        self.assertEqual(result["candidateRuntime"], candidate_runtime)
+        self.assertNotIn("thread-follower-start-turn", [frame.get("method") for frame in self.pipe.frames])
+
+    def test_prepare_candidate_requires_live_handshake_and_rechecks_runtime_identity(self):
+        known_hash = h.VERIFIED_RUNTIME_26_908["appServerSha256"]
+        target, rows, observed, audit = self._candidate_fixture(app_server_sha256=known_hash)
+        candidate_runtime = audit["candidateRuntime"]
+        audit_state = [audit]
+        with patch.object(h, "_verify_runtime", REAL_VERIFY_RUNTIME), \
+                patch.object(h, "_processes", return_value=rows), \
+                patch.object(h, "_observe_runtime_versions", return_value=observed), \
+                patch.object(h, "_compatibility_audit_for_paths",
+                             side_effect=lambda *_: copy.deepcopy(audit_state[0])), \
+                patch.object(h, "_verify_project"):
+            session, info = h._prepare(target)
+            self.addCleanup(session.close)
+            self.assertEqual(session.runtime["candidateRuntime"], candidate_runtime)
+            self.assertEqual(session.runtime["candidateProfile"], h.VERIFIED_PROFILE)
+            self.assertTrue(session.runtime["_candidateHandshake"])
+            self.assertIsNone(info["profile"])
+            self.assertEqual([frame["method"] for frame in self.pipe.frames if frame["type"] == "request"],
+                             ["initialize", "thread-owner-discovery"])
+            self.assertEqual(self.pipe.starts(), [])
+            h._verify_runtime(session.pipe, target, session.runtime)
+            with self.assertRaises(h.DesktopIpcError):
+                h._verify_runtime(session.pipe, target, {**session.runtime, "_candidateHandshake": False})
+
+            changed = copy.deepcopy(audit)
+            changed["candidateRuntime"]["modules"][0]["path"] = ".vite/build/src-changed.js"
+            changed["modules"] = changed["candidateRuntime"]["modules"]
+            audit_state[0] = changed
+            with self.assertRaises(h.DesktopIpcError) as changed_attestation:
+                h._verify_runtime(session.pipe, target, session.runtime)
+            self.assertEqual(changed_attestation.exception.code, "DESKTOP_PROCESS_CHANGED")
+
+            audit_state[0] = audit
+            rows[1]["creation"] = 12
+            with self.assertRaises(h.DesktopIpcError) as changed_process:
+                h._verify_runtime(session.pipe, target, session.runtime)
+            self.assertEqual(changed_process.exception.code, "DESKTOP_PROCESS_CHANGED")
+
+    def test_candidate_runtime_accepts_each_catalog_hash_for_same_app_server_version(self):
+        version = "0.154.0-alpha.6.2"
+        hashes = {row["appServerSha256"] for row in h.VERIFIED_PROFILES[h.VERIFIED_PROFILE]
+                  if row["appServerVersion"] == version}
+        self.assertGreaterEqual(len(hashes), 2)
+        for server_hash in hashes:
+            with self.subTest(app_server_sha256=server_hash):
+                target, rows, observed, audit = self._candidate_fixture(app_server_sha256=server_hash)
+                identity = {**observed, "desktopPid": 100, "appServerPid": 101,
+                    "desktopCreation": 10, "appServerCreation": 11,
+                    "desktopExe": rows[0]["exe"], "appServerExe": rows[1]["exe"]}
+                with patch.object(h, "_verify_runtime_identity", return_value=identity), \
+                        patch.object(h, "_compatibility_audit_for_paths", return_value=audit):
+                    runtime = h._candidate_runtime(self.pipe, target)
+                self.assertEqual(runtime["candidateRuntime"]["appServerSha256"], server_hash)
+
+    def test_candidate_runtime_requires_catalog_profile_and_app_server_version(self):
+        known_hash = h.VERIFIED_RUNTIME_26_908["appServerSha256"]
+        cases = (("missing-profile", "0.154.0-alpha.6.2"),
+                 (h.VERIFIED_PROFILE, "9.9.9"))
+        for profile, version in cases:
+            with self.subTest(candidate_profile=profile, app_server_version=version):
+                target, rows, observed, audit = self._candidate_fixture(
+                    app_server_version=version, app_server_sha256=known_hash, candidate_profile=profile)
+                identity = {**observed, "desktopPid": 100, "appServerPid": 101,
+                    "desktopCreation": 10, "appServerCreation": 11,
+                    "desktopExe": rows[0]["exe"], "appServerExe": rows[1]["exe"]}
+                with patch.object(h, "_verify_runtime_identity", return_value=identity), \
+                        patch.object(h, "_compatibility_audit_for_paths", return_value=audit):
+                    with self.assertRaises(h.DesktopIpcError) as caught:
+                        h._candidate_runtime(self.pipe, target)
+                self.assertEqual(caught.exception.code, "DESKTOP_VERSION_UNSUPPORTED")
+                self.assertEqual(caught.exception.mismatch, "runtime_pair_unverified")
+
+    def test_prepare_rejects_unknown_app_server_hash_before_live_handshake(self):
+        target, rows, observed, audit = self._candidate_fixture(app_server_sha256="a" * 64)
+        with patch.object(h, "_verify_runtime", REAL_VERIFY_RUNTIME), \
+                patch.object(h, "_processes", return_value=rows), \
+                patch.object(h, "_observe_runtime_versions", return_value=observed), \
+                patch.object(h, "_compatibility_audit_for_paths", return_value=audit), \
+                patch.object(h, "_verify_project"):
+            with self.assertRaises(h.DesktopIpcError) as caught:
+                h._prepare(target)
+        self.assertEqual(caught.exception.code, "DESKTOP_VERSION_UNSUPPORTED")
+        self.assertEqual(caught.exception.mismatch, "app_server_sha256")
+        self.assertEqual(self.pipe.frames, [])
+
+    def test_prepare_does_not_accept_successful_handshake_for_drift_or_ambiguity(self):
+        cases = (("9.9.9", "protocol_drift_or_unknown"),
+                 ("0.154.0-alpha.6.2", "ambiguous"))
+        for app_server_version, classification in cases:
+            with self.subTest(app_server_version=app_server_version, classification=classification):
+                target, rows, observed, audit = self._candidate_fixture(
+                    app_server_version=app_server_version, app_server_sha256="a" * 64)
+                audit["classification"] = classification
+                with patch.object(h, "_verify_runtime", REAL_VERIFY_RUNTIME), \
+                        patch.object(h, "_processes", return_value=rows), \
+                        patch.object(h, "_observe_runtime_versions", return_value=observed), \
+                        patch.object(h, "_compatibility_audit_for_paths", return_value=audit), \
+                        patch.object(h, "_verify_project"):
+                    with self.assertRaises(h.DesktopIpcError) as caught:
+                        h._prepare(target)
+                self.assertEqual(caught.exception.code, "DESKTOP_VERSION_UNSUPPORTED")
+                self.assertEqual(self.pipe.frames, [])
 
     def test_last_check_busy_is_definitely_not_sent(self):
         session, _ = h._prepare(self.target)

@@ -518,6 +518,25 @@ describe("Desktop IPC wrapper（fake helper）", () => {
     expect(() => validateDesktopHandshakeAudit({ ...expected, extra: true })).toThrowError(/无法确认/);
     expect(() => validateDesktopHandshakeAudit({ ...expected, ownerDiscovery: false })).toThrowError(/无法确认/);
     expect(() => validateDesktopHandshakeAudit({ ...expected, protocolClassification: "same_protocol_candidate", stateChange: "bad" })).toThrowError(/无法确认/);
+
+    const candidateRuntime = {
+      desktopVersion: "99.1.1.1",
+      appServerVersion: "0.154.0-alpha.6.2",
+      appServerSha256: "a".repeat(64),
+      asarHeader: [4, 108, 104, 100] as [number, number, number, number],
+      modules: [
+        { role: "ipc-main" as const, path: ".vite/build/src-candidate.js", sha256: "b".repeat(64) },
+        { role: "webview-bootstrap" as const, path: "webview/assets/app-initial-candidate.js", sha256: "c".repeat(64) },
+      ],
+    };
+    const candidate = { ...expected, protocolClassification: "same_protocol_candidate" as const, candidateRuntime };
+    expect(validateDesktopHandshakeAudit(candidate)).toEqual(candidate);
+    expect(() => validateDesktopHandshakeAudit({ ...candidate, candidateRuntime: undefined })).toThrowError(/无法确认/);
+    expect(() => validateDesktopHandshakeAudit({ ...candidate, candidateRuntime: { ...candidateRuntime, token: "secret" } })).toThrowError(/无法确认/);
+    expect(() => validateDesktopHandshakeAudit({ ...candidate, candidateRuntime: {
+      ...candidateRuntime, modules: [candidateRuntime.modules[0]],
+    } })).toThrowError(/无法确认/);
+    expect(() => validateDesktopHandshakeAudit({ ...expected, candidateRuntime })).toThrowError(/无法确认/);
   });
 
   it("compatibility_audit validator 拒绝 secrets、未知字段和坏模块字段", () => {
@@ -536,6 +555,12 @@ describe("Desktop IPC wrapper（fake helper）", () => {
       ],
     };
     expect(validateDesktopCompatibilityAudit(base)).toEqual(base);
+    const legacyHeader = [4, 111, 107, 100];
+    const modernHeader = [4, 108, 104, 100];
+    expect(validateDesktopCompatibilityAudit({ ...base, asarHeader: legacyHeader }).asarHeader).toEqual(legacyHeader);
+    expect(validateDesktopCompatibilityAudit({ ...base, asarHeader: modernHeader }).asarHeader).toEqual(modernHeader);
+    expect(() => validateDesktopCompatibilityAudit({ ...base, asarHeader: [4, 110, 106, 100] })).toThrowError(/无法确认/);
+    expect(() => validateDesktopCompatibilityAudit({ ...base, asarHeader: [3, 111, 107, 100] })).toThrowError(/无法确认/);
     expect(() => validateDesktopCompatibilityAudit({ ...base, token: "secret-token" })).toThrowError(/无法确认/);
     expect(() => validateDesktopCompatibilityAudit({ ...base, modules: [{ ...base.modules[0], sha256: "SECRET" }] })).toThrowError(/无法确认/);
     expect(() => validateDesktopCompatibilityAudit({ ...base, modules: [{ ...base.modules[0], path: "..\\secret.js" }] })).toThrowError(/无法确认/);
@@ -546,6 +571,7 @@ describe("Desktop IPC wrapper（fake helper）", () => {
     } })).toThrowError(/无法确认/);
     const candidate = {
       ...base,
+      asarHeader: modernHeader,
       classification: "same_protocol_candidate" as const,
       status: "unverified" as const,
       profile: null,
@@ -553,7 +579,7 @@ describe("Desktop IPC wrapper（fake helper）", () => {
         desktopVersion: base.observedDesktopVersion,
         appServerVersion: base.observedAppServerVersion,
         appServerSha256: base.appServerSha256,
-        asarHeader: base.asarHeader,
+        asarHeader: modernHeader,
         modules: base.modules,
       },
     };

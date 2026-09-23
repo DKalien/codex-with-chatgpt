@@ -1594,7 +1594,56 @@ def _verify_runtime_identity(pipe: _Pipe, target: dict[str, str], expected: dict
     }
 
 
+def _candidate_runtime(pipe: _Pipe, target: dict[str, str], expected: dict[str, Any] | None = None) -> dict[str, Any]:
+    runtime = _verify_runtime_identity(pipe, target, expected, require_catalog=False)
+    audit = _compatibility_audit_for_paths(runtime["desktopExe"], runtime["appServerExe"])
+    candidate = audit.get("candidateRuntime")
+    if (audit.get("classification") != "same_protocol_candidate"
+            or audit.get("status") != "unverified" or audit.get("profile") is not None
+            or not isinstance(audit.get("candidateProfile"), str)
+            or _PROFILE_NAME_PATTERN.fullmatch(audit["candidateProfile"]) is None
+            or not isinstance(candidate, dict)
+            or set(candidate) != {"desktopVersion", "appServerVersion", "appServerSha256", "asarHeader", "modules"}
+            or candidate.get("desktopVersion") != runtime.get("observedDesktopVersion")
+            or candidate.get("appServerVersion") != runtime.get("observedAppServerVersion")
+            or candidate.get("appServerSha256") != runtime.get("appServerSha256")
+            or audit.get("observedDesktopVersion") != candidate.get("desktopVersion")
+            or audit.get("observedAppServerVersion") != candidate.get("appServerVersion")
+            or audit.get("appServerSha256") != candidate.get("appServerSha256")
+            or audit.get("asarHeader") != candidate.get("asarHeader")
+            or audit.get("modules") != candidate.get("modules")
+            or not isinstance(candidate.get("modules"), list) or len(candidate["modules"]) != 2
+            or {item.get("role") for item in candidate["modules"] if isinstance(item, dict)}
+               != {"ipc-main", "webview-bootstrap"}):
+        raise _version_error("runtime_pair_unverified", _diagnostic_from_observation(runtime, failed=True))
+    profile_runtimes = VERIFIED_PROFILES.get(audit["candidateProfile"])
+    if not profile_runtimes:
+        raise _version_error("runtime_pair_unverified", _diagnostic_from_observation(runtime, failed=True))
+    matching_runtimes = [row for row in profile_runtimes
+                         if row.get("appServerVersion") == candidate["appServerVersion"]]
+    if not matching_runtimes:
+        raise _version_error("runtime_pair_unverified", _diagnostic_from_observation(runtime, failed=True))
+    if not any(row.get("appServerSha256") == candidate["appServerSha256"] for row in matching_runtimes):
+        raise _version_error("app_server_sha256", _diagnostic_from_observation(runtime, failed=True))
+    if expected is not None:
+        if (candidate != expected.get("candidateRuntime")
+                or audit["candidateProfile"] != expected.get("candidateProfile")
+                or any(_normalize_path(runtime[key]) != _normalize_path(expected[key])
+                       for key in ("desktopExe", "appServerExe"))):
+            raise _error("DESKTOP_PROCESS_CHANGED")
+    result = {**runtime, "desktopVersion": candidate["desktopVersion"],
+              "appServerVersion": candidate["appServerVersion"], "profile": None,
+              "candidateRuntime": candidate, "candidateProfile": audit["candidateProfile"]}
+    if expected is not None and expected.get("_candidateHandshake") is True:
+        result["_candidateHandshake"] = True
+    return result
+
+
 def _verify_runtime(pipe: _Pipe, target: dict[str, str], expected: dict[str, Any] | None = None) -> dict[str, Any]:
+    if expected is not None and "candidateRuntime" in expected:
+        if expected.get("_candidateHandshake") is not True:
+            raise _version_error("runtime_pair_unverified")
+        return _candidate_runtime(pipe, target, expected)
     return _verify_runtime_identity(pipe, target, expected, require_catalog=True)
 
 
@@ -2133,12 +2182,26 @@ def _prepare(target: dict[str, str], *, allow_active: bool = False,
     runtime: dict[str, Any] | None = None
     pipe = _Pipe()
     try:
-        runtime = _verify_runtime(pipe, target)
+        candidate_handshake = False
+        try:
+            runtime = _verify_runtime(pipe, target)
+        except DesktopIpcError as error:
+            if error.code != "DESKTOP_VERSION_UNSUPPORTED":
+                raise
+            runtime = _candidate_runtime(pipe, target)
+            candidate_handshake = True
         client = _IpcClient(pipe, target["threadId"], target["hostId"])
         client.initialize()
         client.discover()
         state = client.snapshot()
         _validate_state(state, target, client.owner or "", allow_active=allow_active)
+        if candidate_handshake:
+            if (not client.client_id or client.client_id == "initializing-client" or not client.owner
+                    or not client.following_changed_sent
+                    or client.state_change_kind not in {"snapshot", "patches"}):
+                raise _error("DESKTOP_STATE_UNAVAILABLE")
+            runtime = _candidate_runtime(pipe, target, runtime)
+            runtime["_candidateHandshake"] = True
         info = _public_info(state, target, runtime, client)
         if allow_active:
             client.drain(0.1)
@@ -2156,7 +2219,7 @@ def _prepare(target: dict[str, str], *, allow_active: bool = False,
         return prepared, info
     except DesktopIpcError as error:
         try:
-            if error.code == "DESKTOP_NO_OWNER" and runtime is not None:
+            if error.code == "DESKTOP_NO_OWNER" and runtime is not None and not candidate_handshake:
                 _verify_runtime(pipe, target, runtime)
         finally:
             pipe.close()
@@ -2181,7 +2244,9 @@ def _handshake_audit(workspace_root: Any) -> dict[str, Any]:
         modules = audit.get("modules", [])
         if (audit.get("classification") not in {"protocol_drift_or_unknown", "same_protocol_candidate", "current"}
                 or len(modules) != 2
-                or {item.get("role") for item in modules} != {"ipc-main", "webview-bootstrap"}):
+                or {item.get("role") for item in modules} != {"ipc-main", "webview-bootstrap"}
+                or (audit.get("classification") == "same_protocol_candidate"
+                    and not isinstance(audit.get("candidateRuntime"), dict))):
             raise _error("DESKTOP_STATE_UNAVAILABLE")
         session = _IpcClient(pipe, target["threadId"], target["hostId"])
         session.initialize()
@@ -2194,12 +2259,18 @@ def _handshake_audit(workspace_root: Any) -> dict[str, Any]:
         if (before["desktopPid"] != after["desktopPid"] or before["appServerPid"] != after["appServerPid"]
                 or before["desktopCreation"] != after["desktopCreation"]
                 or before["appServerCreation"] != after["appServerCreation"]
+                or _normalize_path(before["desktopExe"]) != _normalize_path(after["desktopExe"])
+                or _normalize_path(before["appServerExe"]) != _normalize_path(after["appServerExe"])
                 or tuple(before.get(key) for key in ("observedDesktopVersion", "observedAppServerVersion", "appServerSha256")) !=
                    tuple(after.get(key) for key in ("observedDesktopVersion", "observedAppServerVersion", "appServerSha256"))
                 or after_audit.get("modules") != audit.get("modules")
-                or after_audit.get("asarHeader") != audit.get("asarHeader")):
+                or after_audit.get("asarHeader") != audit.get("asarHeader")
+                or (audit.get("classification") == "same_protocol_candidate"
+                    and (after_audit.get("classification") != "same_protocol_candidate"
+                         or after_audit.get("candidateProfile") != audit.get("candidateProfile")
+                         or after_audit.get("candidateRuntime") != audit.get("candidateRuntime")))):
             raise _error("DESKTOP_PROCESS_CHANGED")
-        return {
+        result = {
             "processStable": True,
             "runtimeStable": True,
             "protocolClassification": audit.get("classification"),
@@ -2209,6 +2280,9 @@ def _handshake_audit(workspace_root: Any) -> dict[str, Any]:
             "stateReceived": session.state_change_kind in {"snapshot", "patches"},
             "stateChange": session.state_change_kind,
         }
+        if audit.get("classification") == "same_protocol_candidate":
+            result["candidateRuntime"] = audit["candidateRuntime"]
+        return result
     finally:
         if session is not None:
             session.pipe.close()

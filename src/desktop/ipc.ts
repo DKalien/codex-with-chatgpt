@@ -78,6 +78,7 @@ export interface DesktopHandshakeAudit {
   followingChangedSent: true;
   stateReceived: true;
   stateChange: "snapshot" | "patches";
+  candidateRuntime?: DesktopCompatibilityCandidateRuntime;
 }
 
 export interface DesktopExecutionInfo extends DesktopTargetInfo {
@@ -361,7 +362,8 @@ function auditAsarHeader(value: unknown, nullable = true): [number, number, numb
     !Number.isInteger(item) || item < 0 || item > MAX_AUDIT_ASAR_HEADER_BYTES)) {
     throw error("DESKTOP_PROTOCOL_ERROR");
   }
-  if (value[0] !== 4 || value[1] !== value[2] + 4 || value[2] !== value[3] + 7) {
+  if (value[0] !== 4 || value[1] !== value[2] + 4 ||
+      (value[2] !== value[3] + 7 && value[2] !== value[3] + 4)) {
     throw error("DESKTOP_PROTOCOL_ERROR");
   }
   return [...value] as [number, number, number, number];
@@ -662,17 +664,31 @@ export function validateDesktopResultTerminalFence(
 export function validateDesktopHandshakeAudit(value: unknown): DesktopHandshakeAudit {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw error("DESKTOP_PROTOCOL_ERROR");
   const input = value as Record<string, unknown>;
-  const keys = Object.keys(input).sort().join(",");
-  if (keys !== "followingChangedSent,initialize,ownerDiscovery,processStable,protocolClassification,runtimeStable,stateChange,stateReceived") {
+  const required = [
+    "followingChangedSent", "initialize", "ownerDiscovery", "processStable", "protocolClassification",
+    "runtimeStable", "stateChange", "stateReceived",
+  ];
+  if (!exactKeys(input, required, ["candidateRuntime"])) {
     throw error("DESKTOP_PROTOCOL_ERROR");
   }
+  const candidateRuntime = Object.prototype.hasOwnProperty.call(input, "candidateRuntime")
+    ? auditCandidateRuntime(input.candidateRuntime) : undefined;
   if (input.processStable !== true || input.runtimeStable !== true || input.initialize !== true ||
       input.ownerDiscovery !== true || input.followingChangedSent !== true || input.stateReceived !== true ||
       (input.stateChange !== "snapshot" && input.stateChange !== "patches") ||
       !["current", "same_protocol_candidate", "protocol_drift_or_unknown"].includes(input.protocolClassification as string)) {
     throw error("DESKTOP_PROTOCOL_ERROR");
   }
-  return input as unknown as DesktopHandshakeAudit;
+  if (input.protocolClassification === "same_protocol_candidate") {
+    if (!candidateRuntime || candidateRuntime.modules.length !== 2 ||
+        new Set(candidateRuntime.modules.map(module => module.role)).size !== 2) {
+      throw error("DESKTOP_PROTOCOL_ERROR");
+    }
+  } else if (candidateRuntime) {
+    throw error("DESKTOP_PROTOCOL_ERROR");
+  }
+  return { ...(input as unknown as Omit<DesktopHandshakeAudit, "candidateRuntime">),
+    ...(candidateRuntime ? { candidateRuntime } : {}) };
 }
 
 function validateResultOwnershipExpectation(value: DesktopResultOwnershipExpectation): DesktopResultOwnershipExpectation {
