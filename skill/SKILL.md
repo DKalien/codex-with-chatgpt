@@ -599,7 +599,7 @@ contract v1、本地 desktopCompatibility current 均通过，而原聊天明确
    → returns `{ mcpUrl, pairingCode, workspaceName, connectorName, ... }`.
    `connectorName` is this workspace's plugin title (legacy installs stay
    `Codex with ChatGPT`; additional workspaces get `Codex with ChatGPT · <name>`).
-   Pairing codes expire in ~5 minutes: run `c2c pair --json` for a fresh one if you're slow.
+   Pairing codes expire in ~5 minutes: run `c2c pair -w <workspace> --json` for a fresh one if you're slow.
 4. `c2c prefs --json` (this machine, not this workspace).
    - If `setupMode` is null: tell the user exactly `setupChoicePrompt`. Wait
      for「1」or「2」. Then `c2c prefs set --setup-mode auto` or `--setup-mode manual`.
@@ -695,7 +695,7 @@ next action:
    - Server URL: the current `mcpUrl`
    - Authentication: OAuth
 4. Ask them to Connect / Authorize and enter the current pairing code. If it
-   expired, run `c2c pair --json` and give them only the fresh pairing code.
+   expired, run `c2c pair -w <workspace> --json` and give them only the fresh pairing code.
 5. When they report Connected / authorized / pairing accepted, resume the normal
    setup/reconnect flow at its ChatGPT verification step. If automatic browser
    verification then hits the same explicit failure twice, stop and report the
@@ -1372,7 +1372,7 @@ the previous public address is gone. Doctor already started a new one.
       - Server URL: `chatgptRepair.mcpUrl`
       - Authentication: OAuth
      Then Connect / Authorize and type `chatgptRepair.pairingCode`
-     (or `c2c pair --json` if it expired). Continue as soon as it is Connected —
+     (or `c2c pair -w <workspace> --json` if it expired). Continue as soon as it is Connected —
      do not wait for 8 tools on the settings page.
    - If the name is already gone, skip Delete and only create.
 4. `c2c doctor --json` again. Same tab: only after the Doctor gate is green,
@@ -1405,7 +1405,7 @@ the previous public address is gone. Doctor already started a new one.
 | Bridge not running | `c2c start` (doctor does this automatically) |
 | Tunnel dead / URL unreachable / 全关掉后连接失效 | `c2c doctor` → if `namedRepair.needed`, login to Cloudflare and doctor again (do not Delete). If `chatgptRepair.needed`, tell the user the message, then **Delete** THIS workspace's connector only (`connectorName`) and create it again. Never Reconnect. |
 | ChatGPT says tool call failed / 401 | token expired or revoked → re-pair (new pairing code + authorize) |
-| Pairing code rejected/expired | `c2c pair --json` for a fresh code |
+| Pairing code rejected/expired | `c2c pair -w <workspace> --json` for a fresh code |
 | Same explicit ChatGPT setup/reconnect browser configuration step fails twice after repair | Stop automating ChatGPT settings and use **Guided manual ChatGPT setup fallback**. Do not count browser/js timeout, loading/generating, or login/2FA waiting as failures. |
 | Port conflict | handled automatically; never surface to the user |
 | Every new chat “repairs” / cannot write the log or settings directory | `c2c sandbox-allow --json` (once). Do not ask the user. |

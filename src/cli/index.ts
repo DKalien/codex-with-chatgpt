@@ -844,7 +844,7 @@ program
         report.tunnel = { ok: true, detail: currentUrl };
         const nextMcp = mcpUrlFromPublic(currentUrl);
         const action = connectorAction(lastEndpoint?.mcpUrl, nextMcp);
-        const boundName = nextMcp
+        const boundName = nextMcp && opts.fix
           ? persistWorkspaceEndpoint({
               workspaceId: info.workspaceId,
               workspaceName: info.workspaceName,
@@ -864,7 +864,7 @@ program
           mcpUrl: nextMcp,
           previousMcpUrl: lastEndpoint?.mcpUrl ?? null,
         };
-        if (action === "update") {
+        if (action === "update" && opts.fix) {
           try {
             const pairing = await adminFetch<PairingResponse>(runtime, "POST", "/admin/pairing");
             chatgptRepair.pairingCode = pairing.code;

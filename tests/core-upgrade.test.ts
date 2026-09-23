@@ -1,9 +1,11 @@
 import fs from "node:fs";
+import { createServer } from "node:http";
 import path from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { startBridge } from "../src/bridge/server.js";
+import { endpointFile, writeLastEndpoint } from "../src/config/endpoint.js";
 import { readRuntimeUpgrade, readPending, writePending, clearPending, pendingFile } from "../src/core/upgrade.js";
 import { Workspace } from "../src/workspace/manager.js";
 import { getCurrentInstall, installCore } from "../src/core/install.js";
@@ -135,6 +137,60 @@ process.on("exit", () => fs.writeFileSync(${JSON.stringify(counts)}, JSON.string
     }
     expect(fs.readFileSync(pendingFile(workspace.id))).toEqual(pendingBytes);
   } finally { await bridge.close(); }
+});
+
+it("doctor --no-fix 不写入 Connector endpoint 或生成配对码", async () => {
+  const { state, workspace } = fixture();
+  const healthServer = createServer((_req, res) => { res.writeHead(200); res.end("ok"); });
+  await new Promise<void>((resolve, reject) => {
+    healthServer.once("error", reject);
+    healthServer.listen(0, "127.0.0.1", resolve);
+  });
+  const address = healthServer.address();
+  if (!address || typeof address === "string") throw new Error("health server did not bind");
+  const publicUrl = `http://127.0.0.1:${address.port}`;
+  const bridge = await startBridge({
+    workspaceRoot: workspace.root,
+    port: 0,
+    tunnelProvider: {
+      name: "fixture",
+      async start() { return publicUrl; },
+      async stop() {},
+      async restart() { return publicUrl; },
+      status() { return { running: true, url: publicUrl, provider: "cloudflare-quick" }; },
+      getPublicUrl() { return publicUrl; },
+      async doctor() {
+        return { provider: "cloudflare-quick", binaryFound: true, binaryPath: "fixture",
+          running: true, url: publicUrl, problems: [] };
+      },
+    },
+    authStoreFile: path.join(state, "auth", `${workspace.id}.json`),
+  });
+  try {
+    writeLastEndpoint({
+      workspaceId: workspace.id,
+      port: bridge.port,
+      publicUrl: "https://old.example.test",
+      mcpUrl: "https://old.example.test/mcp",
+      connectorName: "Codex with ChatGPT · fixture",
+    });
+    const savedEndpoint = fs.readFileSync(endpointFile(workspace.id));
+    const cli = path.resolve("src/cli/index.ts");
+    const result = await promisify(execFile)(process.execPath,
+      ["--import", "tsx/esm", cli, "doctor", "-w", workspace.root, "--no-fix", "--json"],
+      { windowsHide: true, env: { ...process.env }, timeout: 15000 }).catch(error => {
+        if (error.code === 1 && typeof error.stdout === "string") return error as { stdout: string };
+        throw error;
+      });
+    const output = JSON.parse(result.stdout);
+    expect(output.chatgptRepair).toMatchObject({ needed: true, connectorAction: "update" });
+    expect(output.chatgptRepair.pairingCode).toBeUndefined();
+    expect(fs.readFileSync(endpointFile(workspace.id))).toEqual(savedEndpoint);
+    expect(bridge.pairing.hasActiveSession()).toBe(false);
+  } finally {
+    await bridge.close();
+    await new Promise<void>(resolve => healthServer.close(() => resolve()));
+  }
 });
 
 it("隐藏 rollout result-file 在维护前拒绝覆盖已有文件", async () => {
