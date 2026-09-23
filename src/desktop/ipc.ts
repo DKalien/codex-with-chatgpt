@@ -40,9 +40,21 @@ export interface DesktopCompatibility {
 export type DesktopCompatibilityAuditClassification =
   | "current"
   | "same_protocol_candidate"
+  | "semantic_same_protocol_candidate"
   | "protocol_drift_or_unknown"
   | "ambiguous"
   | "unavailable";
+
+export type DesktopSemanticReason =
+  | "matched"
+  | "source_too_large"
+  | "lexical_unsupported"
+  | "start_turn_missing"
+  | "start_turn_ambiguous"
+  | "version_unprovable"
+  | "payload_unprovable"
+  | "ack_unprovable"
+  | "not_scanned";
 
 export type DesktopCompatibilityAuditModuleRole = "ipc-main" | "webview-bootstrap";
 
@@ -62,6 +74,8 @@ export interface DesktopCompatibilityCandidateRuntime {
 
 export interface DesktopCompatibilityAudit extends DesktopCompatibility {
   classification: DesktopCompatibilityAuditClassification;
+  semanticReason: DesktopSemanticReason;
+  semanticFingerprint: string | null;
   appServerSha256: string | null;
   asarHeader: [number, number, number, number] | null;
   candidateProfile: string | null;
@@ -73,6 +87,8 @@ export interface DesktopHandshakeAudit {
   processStable: true;
   runtimeStable: true;
   protocolClassification: DesktopCompatibilityAuditClassification;
+  semanticReason: DesktopSemanticReason;
+  semanticFingerprint: string | null;
   initialize: true;
   ownerDiscovery: true;
   followingChangedSent: true;
@@ -248,9 +264,21 @@ const COMPATIBILITY_STATUSES = new Set<DesktopCompatibilityStatus>([
 const COMPATIBILITY_AUDIT_CLASSIFICATIONS = new Set<DesktopCompatibilityAuditClassification>([
   "current",
   "same_protocol_candidate",
+  "semantic_same_protocol_candidate",
   "protocol_drift_or_unknown",
   "ambiguous",
   "unavailable",
+]);
+const DESKTOP_SEMANTIC_REASONS = new Set<DesktopSemanticReason>([
+  "matched",
+  "source_too_large",
+  "lexical_unsupported",
+  "start_turn_missing",
+  "start_turn_ambiguous",
+  "version_unprovable",
+  "payload_unprovable",
+  "ack_unprovable",
+  "not_scanned",
 ]);
 const COMPATIBILITY_AUDIT_MODULE_ROLES = new Set<DesktopCompatibilityAuditModuleRole>([
   "ipc-main",
@@ -346,6 +374,13 @@ function exactKeys(value: Record<string, unknown>, required: readonly string[], 
     Object.prototype.hasOwnProperty.call(value, key));
 }
 
+function auditSemanticReason(value: unknown): DesktopSemanticReason {
+  if (typeof value !== "string" || !DESKTOP_SEMANTIC_REASONS.has(value as DesktopSemanticReason)) {
+    throw error("DESKTOP_PROTOCOL_ERROR");
+  }
+  return value as DesktopSemanticReason;
+}
+
 function auditHash(value: unknown, nullable: false): string;
 function auditHash(value: unknown, nullable?: true): string | null;
 function auditHash(value: unknown, nullable = true): string | null {
@@ -416,7 +451,7 @@ export function validateDesktopCompatibilityAudit(value: unknown): DesktopCompat
   const input = value as Record<string, unknown>;
   const required = [
     "observedDesktopVersion", "observedAppServerVersion", "status", "profile", "classification",
-    "appServerSha256", "asarHeader", "candidateProfile", "modules",
+    "semanticReason", "semanticFingerprint", "appServerSha256", "asarHeader", "candidateProfile", "modules",
   ] as const;
   if (!exactKeys(input, required, ["candidateRuntime"])) throw error("DESKTOP_PROTOCOL_ERROR");
   const compatibility = validateDesktopCompatibility({
@@ -430,6 +465,9 @@ export function validateDesktopCompatibilityAudit(value: unknown): DesktopCompat
       !COMPATIBILITY_AUDIT_CLASSIFICATIONS.has(classification as DesktopCompatibilityAuditClassification)) {
     throw error("DESKTOP_PROTOCOL_ERROR");
   }
+  const semanticReason = auditSemanticReason(input.semanticReason);
+  const semanticFingerprint = auditHash(input.semanticFingerprint);
+  if ((semanticReason === "matched") !== (semanticFingerprint !== null)) throw error("DESKTOP_PROTOCOL_ERROR");
   const candidateProfile = compatibilityProfile(input.candidateProfile);
   const appServerSha256 = auditHash(input.appServerSha256);
   const asarHeader = auditAsarHeader(input.asarHeader);
@@ -448,7 +486,14 @@ export function validateDesktopCompatibilityAudit(value: unknown): DesktopCompat
         JSON.stringify(candidateRuntime.modules) !== JSON.stringify(modules)) {
       throw error("DESKTOP_PROTOCOL_ERROR");
     }
-  } else if (candidateRuntime) {
+  } else if (candidateRuntime ||
+      (classification === "semantic_same_protocol_candidate" && !semanticFingerprint)) {
+    throw error("DESKTOP_PROTOCOL_ERROR");
+  }
+  if (classification === "semantic_same_protocol_candidate" &&
+      (semanticReason !== "matched" || compatibility.status !== "unverified" || compatibility.profile !== null || !candidateProfile ||
+       !compatibility.observedDesktopVersion || !compatibility.observedAppServerVersion || !appServerSha256 ||
+       !asarHeader || modules.length !== 2 || new Set(modules.map(module => module.role)).size !== 2)) {
     throw error("DESKTOP_PROTOCOL_ERROR");
   }
   if (classification === "current" && (compatibility.status !== "current" || !compatibility.profile ||
@@ -459,6 +504,8 @@ export function validateDesktopCompatibilityAudit(value: unknown): DesktopCompat
   return {
     ...compatibility,
     classification: classification as DesktopCompatibilityAuditClassification,
+    semanticReason,
+    semanticFingerprint,
     appServerSha256,
     asarHeader,
     candidateProfile,
@@ -665,7 +712,7 @@ export function validateDesktopHandshakeAudit(value: unknown): DesktopHandshakeA
   if (!value || typeof value !== "object" || Array.isArray(value)) throw error("DESKTOP_PROTOCOL_ERROR");
   const input = value as Record<string, unknown>;
   const required = [
-    "followingChangedSent", "initialize", "ownerDiscovery", "processStable", "protocolClassification",
+    "followingChangedSent", "initialize", "ownerDiscovery", "processStable", "protocolClassification", "semanticReason", "semanticFingerprint",
     "runtimeStable", "stateChange", "stateReceived",
   ];
   if (!exactKeys(input, required, ["candidateRuntime"])) {
@@ -673,10 +720,15 @@ export function validateDesktopHandshakeAudit(value: unknown): DesktopHandshakeA
   }
   const candidateRuntime = Object.prototype.hasOwnProperty.call(input, "candidateRuntime")
     ? auditCandidateRuntime(input.candidateRuntime) : undefined;
+  const semanticReason = auditSemanticReason(input.semanticReason);
+  const semanticFingerprint = auditHash(input.semanticFingerprint);
+  if ((semanticReason === "matched") !== (semanticFingerprint !== null)) throw error("DESKTOP_PROTOCOL_ERROR");
   if (input.processStable !== true || input.runtimeStable !== true || input.initialize !== true ||
       input.ownerDiscovery !== true || input.followingChangedSent !== true || input.stateReceived !== true ||
       (input.stateChange !== "snapshot" && input.stateChange !== "patches") ||
-      !["current", "same_protocol_candidate", "protocol_drift_or_unknown"].includes(input.protocolClassification as string)) {
+      (input.protocolClassification === "semantic_same_protocol_candidate" && semanticReason !== "matched") ||
+      !["current", "same_protocol_candidate", "semantic_same_protocol_candidate", "protocol_drift_or_unknown"]
+        .includes(input.protocolClassification as string)) {
     throw error("DESKTOP_PROTOCOL_ERROR");
   }
   if (input.protocolClassification === "same_protocol_candidate") {
@@ -684,10 +736,11 @@ export function validateDesktopHandshakeAudit(value: unknown): DesktopHandshakeA
         new Set(candidateRuntime.modules.map(module => module.role)).size !== 2) {
       throw error("DESKTOP_PROTOCOL_ERROR");
     }
-  } else if (candidateRuntime) {
+  } else if (candidateRuntime ||
+      (input.protocolClassification === "semantic_same_protocol_candidate" && !semanticFingerprint)) {
     throw error("DESKTOP_PROTOCOL_ERROR");
   }
-  return { ...(input as unknown as Omit<DesktopHandshakeAudit, "candidateRuntime">),
+  return { ...(input as unknown as Omit<DesktopHandshakeAudit, "candidateRuntime">), semanticReason, semanticFingerprint,
     ...(candidateRuntime ? { candidateRuntime } : {}) };
 }
 

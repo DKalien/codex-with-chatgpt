@@ -25,6 +25,33 @@ OLD_TURN = "01a00000-0000-7000-8000-000000000004"
 NEW_TURN = "01a00000-0000-7000-8000-000000000005"
 RUNTIME = {"desktopPid": 100, "appServerPid": 101, "desktopVersion": h.VERIFIED_RUNTIME["desktopVersion"],
            "appServerVersion": h.VERIFIED_RUNTIME["appServerVersion"]}
+SEMANTIC_PROTOCOL_SOURCE = '''
+const send = (source, target, conversation, text) => ({
+  type: "request", method: "thread-follower-start-turn", version: 2,
+  sourceClientId: source, targetClientId: target,
+  params: {conversationId: conversation, turnStart: {request: {threadId: conversation,
+    input: [{type: "text", text: text, text_elements: []}]}}}
+});
+const receipt = response => response.result.result.turn.id;
+'''
+SEMANTIC_PROTOCOL_FUNCTION_EXPRESSION_SOURCE = '''
+const transmit = function (from, to, thread, body) {
+  return ({ type: "request", method: "thread-follower-start-turn", version: 2,
+    sourceClientId: from, targetClientId: to,
+    params: {conversationId: thread, turnStart: {request: {threadId: thread,
+      input: [{type: "text", text: body, text_elements: []}]}}} });
+};
+function unpack(value) { return value.result.result.turn.id; }
+'''
+SEMANTIC_PROTOCOL_RENAMED_SOURCE = '''
+const packet = (left, right, topic, words) => ({
+ type:("request"), method:("thread-follower-start-turn"), version:(2),
+ sourceClientId:(left), targetClientId:(right),
+ params:({conversationId:(topic), turnStart:({request:({threadId:(topic),
+ input:([{type:("text"), text:(words), text_elements:([])}])})})})
+});
+const extract = (value) => (value.result.result.turn.id);
+'''
 
 
 class FakePipe:
@@ -132,6 +159,73 @@ class ProtocolTests(unittest.TestCase):
                          ["initialize", "thread-owner-discovery", "thread-owner-discovery", "thread-follower-start-turn"])
         session.close()
 
+    def test_protocol_v2_fingerprint_ignores_non_protocol_bundle_changes(self):
+        baseline = h._semantic_protocol_v2(SEMANTIC_PROTOCOL_SOURCE)
+        changed = h._semantic_protocol_v2(SEMANTIC_PROTOCOL_SOURCE + '\nconst unrelated={label:"daily-build"}; // ignored')
+        minified = SEMANTIC_PROTOCOL_SOURCE.replace("\n", "").replace("  ", "").replace(": ", ":") \
+            .replace(", ", ",").replace(" = ", "=").replace(" => ", "=>")
+        self.assertEqual(baseline["reason"], "matched")
+        self.assertTrue(baseline["candidate"])
+        self.assertEqual(h._semantic_protocol_v2(SEMANTIC_PROTOCOL_FUNCTION_EXPRESSION_SOURCE)["fingerprint"],
+                         baseline["fingerprint"])
+        self.assertEqual(h._semantic_protocol_v2(SEMANTIC_PROTOCOL_RENAMED_SOURCE)["fingerprint"],
+                         baseline["fingerprint"])
+        self.assertEqual(h._semantic_protocol_v2(minified)["fingerprint"], baseline["fingerprint"])
+        self.assertEqual(changed["fingerprint"], baseline["fingerprint"])
+
+    def test_protocol_v2_fingerprint_changes_or_fails_closed_on_protocol_schema_changes(self):
+        baseline = h._semantic_protocol_v2(SEMANTIC_PROTOCOL_SOURCE)
+        cases = {
+            "method": SEMANTIC_PROTOCOL_SOURCE.replace('method: "thread-follower-start-turn"',
+                                                         'method: "thread-follower-start-next"'),
+            "version": SEMANTIC_PROTOCOL_SOURCE.replace("version: 2", "version: 3"),
+            "payload": SEMANTIC_PROTOCOL_SOURCE.replace("text_elements", "textElements"),
+            "ack": SEMANTIC_PROTOCOL_SOURCE.replace("response.result.result.turn.id", "response.result.result.turn.key"),
+        }
+        for name, source in cases.items():
+            with self.subTest(name=name):
+                result = h._semantic_protocol_v2(source)
+                self.assertNotEqual(result["fingerprint"], baseline["fingerprint"])
+                self.assertIsNone(result["fingerprint"])
+                expected_reason = {"method": "start_turn_missing", "version": "version_unprovable",
+                                   "payload": "payload_unprovable", "ack": "ack_unprovable"}[name]
+                self.assertEqual(result["reason"], expected_reason)
+
+    def test_protocol_v2_repeated_candidate_is_ambiguous_and_bad_input_fails_closed(self):
+        duplicate = SEMANTIC_PROTOCOL_SOURCE + SEMANTIC_PROTOCOL_SOURCE
+        self.assertEqual(h._semantic_protocol_v2(duplicate)["reason"], "start_turn_ambiguous")
+        token_budget = "1;" * (h._MAX_PROTOCOL_TOKENS // 2 + 1)
+        for source in ('const broken="unterminated', 'const broken={', 'const broken="\\uD800"',
+                       token_budget,
+                       SEMANTIC_PROTOCOL_SOURCE + " " * (h._MAX_PROTOCOL_SOURCE_BYTES + 1)):
+            with self.subTest(source_length=len(source)):
+                result = h._semantic_protocol_v2(source)
+                self.assertIsNone(result["fingerprint"])
+                self.assertIn(result["reason"], {"source_too_large", "lexical_unsupported"})
+
+    def test_v2_mutation_contract_is_source_controlled_and_independent_of_catalog_rows(self):
+        fingerprint = h._semantic_protocol_v2(SEMANTIC_PROTOCOL_SOURCE)["fingerprint"]
+        self.assertEqual(fingerprint, h._START_TURN_MUTATION_FINGERPRINT)
+        self.assertFalse(any("ipcSemanticFingerprintV2" in runtime
+                             for runtimes in h.VERIFIED_PROFILES.values() for runtime in runtimes))
+        with patch.object(h, "VERIFIED_PROFILES", {}):
+            self.assertEqual(h._semantic_protocol_v2(SEMANTIC_PROTOCOL_SOURCE)["fingerprint"], fingerprint)
+
+    def test_semantic_candidate_is_diagnostic_only_and_never_enters_production_candidate(self):
+        target, rows, observed, audit = self._candidate_fixture(app_server_sha256="a" * 64)
+        audit = {key: value for key, value in audit.items() if key != "candidateRuntime"}
+        audit.update({"classification": "semantic_same_protocol_candidate", "semanticReason": "matched",
+                      "semanticFingerprint": "d" * 64})
+        identity = {**observed, "desktopPid": 100, "appServerPid": 101,
+            "desktopCreation": 10, "appServerCreation": 11,
+            "desktopExe": rows[0]["exe"], "appServerExe": rows[1]["exe"]}
+        with patch.object(h, "_verify_runtime_identity", return_value=identity), \
+                patch.object(h, "_compatibility_audit_for_paths", return_value=audit):
+            with self.assertRaises(h.DesktopIpcError) as caught:
+                h._candidate_runtime(self.pipe, target)
+        self.assertEqual(caught.exception.code, "DESKTOP_VERSION_UNSUPPORTED")
+        self.assertEqual(self.pipe.frames, [])
+
     def test_handshake_audit_is_read_only_bounded_and_never_starts_turn(self):
         target = self.target
         identity = {"desktopPid": 100, "appServerPid": 101, "desktopCreation": 10, "appServerCreation": 11,
@@ -139,6 +233,7 @@ class ProtocolTests(unittest.TestCase):
                     "observedDesktopVersion": "26.915.4065.0", "observedAppServerVersion": "0.155.0-alpha.9.2",
                     "appServerSha256": "a" * 64}
         audit = {"classification": "protocol_drift_or_unknown", "asarHeader": [4, 8, 4, 0],
+                 "semanticFingerprint": None,
                  "modules": [{"role": "ipc-main", "path": ".vite/build/src-main.js", "sha256": "b" * 64},
                              {"role": "webview-bootstrap", "path": "webview/assets/app-initial-x.js", "sha256": "c" * 64}]}
         with patch.object(h, "_current_target", return_value=target), \
@@ -149,6 +244,8 @@ class ProtocolTests(unittest.TestCase):
             result = h._handshake_audit(target["workspaceRoot"])
         self.assertEqual(result["stateChange"], "snapshot")
         self.assertEqual(result["protocolClassification"], "protocol_drift_or_unknown")
+        self.assertIsNone(result["semanticFingerprint"])
+        self.assertEqual(result["semanticReason"], "not_scanned")
         self.assertEqual(verify.call_args_list[0].kwargs, {"require_catalog": False})
         self.assertNotIn("thread-follower-start-turn", [frame.get("method") for frame in self.pipe.frames])
 
@@ -159,6 +256,7 @@ class ProtocolTests(unittest.TestCase):
                 "observedDesktopVersion": "26.915.4065.0", "observedAppServerVersion": "0.155.0-alpha.9.2",
                 "appServerSha256": "a" * 64}
         audit = {"classification": "protocol_drift_or_unknown", "asarHeader": [4, 8, 4, 0],
+                 "semanticFingerprint": None,
                  "modules": [{"role": "ipc-main", "path": "a", "sha256": "b" * 64},
                              {"role": "webview-bootstrap", "path": "b", "sha256": "c" * 64}]}
         for key in ("desktopPid", "appServerCreation", "desktopExe", "appServerExe",
@@ -183,6 +281,7 @@ class ProtocolTests(unittest.TestCase):
                 {"role": "webview-bootstrap", "path": "webview/assets/app-initial-candidate.js", "sha256": "c" * 64}]}
         audit = {"observedDesktopVersion": "99.1.1.1", "observedAppServerVersion": "0.154.0-alpha.6.2",
                  "appServerSha256": "a" * 64, "classification": "same_protocol_candidate",
+                 "semanticFingerprint": None,
                  "status": "unverified", "profile": None,
                  "candidateProfile": "desktop-ipc-v1", "candidateRuntime": candidate_runtime,
                  "asarHeader": candidate_runtime["asarHeader"], "modules": candidate_runtime["modules"]}
@@ -192,7 +291,50 @@ class ProtocolTests(unittest.TestCase):
             result = h._handshake_audit(target["workspaceRoot"])
         self.assertEqual(result["protocolClassification"], "same_protocol_candidate")
         self.assertEqual(result["candidateRuntime"], candidate_runtime)
+        self.assertIsNone(result["semanticFingerprint"])
         self.assertNotIn("thread-follower-start-turn", [frame.get("method") for frame in self.pipe.frames])
+
+    def test_handshake_audit_fences_semantic_fingerprint_and_returns_no_candidate_runtime(self):
+        target = self.target
+        identity = {"desktopPid": 100, "appServerPid": 101, "desktopCreation": 10, "appServerCreation": 11,
+                    "desktopExe": "ChatGPT.exe", "appServerExe": "codex.exe",
+                    "observedDesktopVersion": "99.1.1.1", "observedAppServerVersion": "9.9.9",
+                    "appServerSha256": "a" * 64}
+        base_audit = {"classification": "semantic_same_protocol_candidate", "semanticReason": "matched",
+                      "semanticFingerprint": "d" * 64,
+                      "asarHeader": [4, 8, 4, 0], "candidateProfile": h.VERIFIED_PROFILE,
+                      "modules": [{"role": "ipc-main", "path": ".vite/build/src-main.js", "sha256": "b" * 64},
+                                  {"role": "webview-bootstrap", "path": "webview/assets/app-initial-x.js", "sha256": "c" * 64}]}
+        with patch.object(h, "_current_target", return_value=target), \
+                patch.object(h, "_verify_runtime_identity", side_effect=[identity, identity]), \
+                patch.object(h, "_compatibility_audit_for_paths", return_value=base_audit):
+            result = h._handshake_audit(target["workspaceRoot"])
+        self.assertEqual(result["protocolClassification"], "semantic_same_protocol_candidate")
+        self.assertEqual(result["semanticFingerprint"], "d" * 64)
+        self.assertEqual(result["semanticReason"], "matched")
+        self.assertNotIn("candidateRuntime", result)
+        self.assertNotIn("thread-follower-start-turn", [frame.get("method") for frame in self.pipe.frames])
+
+        self.pipe.frames.clear()
+        changed = {**base_audit, "semanticFingerprint": "e" * 64}
+        with patch.object(h, "_current_target", return_value=target), \
+                patch.object(h, "_verify_runtime_identity", side_effect=[identity, identity]), \
+                patch.object(h, "_compatibility_audit_for_paths", side_effect=[base_audit, changed]):
+            with self.assertRaises(h.DesktopIpcError) as caught:
+                h._handshake_audit(target["workspaceRoot"])
+        self.assertEqual(caught.exception.code, "DESKTOP_PROCESS_CHANGED")
+        self.assertNotIn("thread-follower-start-turn", [frame.get("method") for frame in self.pipe.frames])
+
+        self.pipe.frames.clear()
+        diagnostic = {**base_audit, "classification": "protocol_drift_or_unknown",
+                      "semanticReason": "version_unprovable", "semanticFingerprint": None}
+        changed_reason = {**diagnostic, "semanticReason": "payload_unprovable"}
+        with patch.object(h, "_current_target", return_value=target), \
+                patch.object(h, "_verify_runtime_identity", side_effect=[identity, identity]), \
+                patch.object(h, "_compatibility_audit_for_paths", side_effect=[diagnostic, changed_reason]):
+            with self.assertRaises(h.DesktopIpcError) as caught:
+                h._handshake_audit(target["workspaceRoot"])
+        self.assertEqual(caught.exception.code, "DESKTOP_PROCESS_CHANGED")
 
     def test_prepare_candidate_requires_live_handshake_and_rechecks_runtime_identity(self):
         known_hash = h.VERIFIED_RUNTIME_26_908["appServerSha256"]
@@ -1844,17 +1986,21 @@ class CatalogAuditTests(unittest.TestCase):
                 self.assertEqual(unavailable["classification"], "unavailable")
                 self.assertNotIn("candidateRuntime", unavailable)
 
-    def test_unknown_app_server_unique_fingerprint_stays_drift_and_sanitizes_modules(self):
+    def test_unknown_app_server_semantic_match_is_diagnostic_only_and_sanitizes_modules(self):
         observed = {"observedDesktopVersion": "26.915.4065.0", "observedAppServerVersion": "0.155.0-alpha.9.3",
                     "appServerSha256": "a" * 64}
         modules = {"ipc-main": [{"role": "ipc-main", "path": ".vite/build/src-new.js", "sha256": "b" * 64,
-                                  "_protocolFingerprint": True}],
+                                  "_semanticFingerprint": "d" * 64,
+                                  "_semanticReason": "matched", "_semanticCandidate": True,
+                                  "_semanticHasStartTurnMethod": True}],
                    "webview-bootstrap": [{"role": "webview-bootstrap", "path": "webview/assets/app-initial-new.js",
                                            "sha256": "c" * 64}]}
         with patch.object(h, "_observe_runtime_versions", return_value=observed), \
                 patch.object(h, "_asar_audit_modules", return_value=([4, 100, 96, 89], modules)):
             result = h._compatibility_audit_for_paths("desktop", "server")
-        self.assertEqual(result["classification"], "protocol_drift_or_unknown")
+        self.assertEqual(result["classification"], "semantic_same_protocol_candidate")
+        self.assertEqual(result["semanticReason"], "matched")
+        self.assertEqual(result["semanticFingerprint"], "d" * 64)
         self.assertEqual(result["modules"], [
             {"role": "ipc-main", "path": ".vite/build/src-new.js", "sha256": "b" * 64},
             {"role": "webview-bootstrap", "path": "webview/assets/app-initial-new.js", "sha256": "c" * 64},
@@ -1915,18 +2061,20 @@ class CatalogAuditTests(unittest.TestCase):
                              {module_path for module_path, _, _ in normal})
             modern_layout = write_asar(asar, normal, framing="modern")
             self.assertEqual(h._asar_audit_modules(str(desktop))[0], modern_layout)
-            fingerprint = b"thread-owner-discovery thread-stream-following-changed thread-follower-start-turn handledByClientId sourceClientId targetClientIds conversationId"
+            fingerprint = SEMANTIC_PROTOCOL_SOURCE.encode()
             one = [(".vite/build/src-one.js", 0, fingerprint),
                    ("webview/assets/app-initial-a.js", len(fingerprint), b"web")]
             write_asar(asar, one, framing="modern")
             one_candidates = h._asar_audit_modules(str(desktop))[1]["ipc-main"]
-            self.assertEqual([item.get("_protocolFingerprint") for item in one_candidates], [True])
+            self.assertEqual([item.get("_semanticFingerprint") for item in one_candidates],
+                             [h._semantic_protocol_v2(SEMANTIC_PROTOCOL_SOURCE)["fingerprint"]])
+            self.assertEqual([item.get("_semanticReason") for item in one_candidates], ["matched"])
             many = [(".vite/build/src-one.js", 0, fingerprint),
                     (".vite/build/src-two.js", len(fingerprint), fingerprint),
                     ("webview/assets/app-initial-a.js", len(fingerprint) * 2, b"web")]
             write_asar(asar, many, framing="modern")
             many_candidates = h._asar_audit_modules(str(desktop))[1]["ipc-main"]
-            self.assertEqual(sum(item.get("_protocolFingerprint") is True for item in many_candidates), 2)
+            self.assertEqual(sum(item.get("_semanticReason") == "matched" for item in many_candidates), 2)
 
             too_many = [
                 (".vite/build/src-a.js", 0, b"a"),

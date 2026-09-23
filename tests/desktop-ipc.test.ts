@@ -25,6 +25,18 @@ const target = {
   workspaceRoot: "D:\\python\\codex-with-chatgpt",
 } as const;
 
+const SEMANTIC_REASONS = [
+  "matched",
+  "source_too_large",
+  "lexical_unsupported",
+  "start_turn_missing",
+  "start_turn_ambiguous",
+  "version_unprovable",
+  "payload_unprovable",
+  "ack_unprovable",
+  "not_scanned",
+] as const;
+
 type FakeRequest = Record<string, unknown> & { op?: string; id?: string };
 type FakeReply = { ok: true; value: unknown } | { ok: false; code: string; notSent?: boolean; compatibility?: unknown };
 
@@ -486,6 +498,8 @@ describe("Desktop IPC wrapper（fake helper）", () => {
       status: "current" as const,
       profile: "desktop-ipc-v1",
       classification: "current" as const,
+      semanticReason: "matched" as const,
+      semanticFingerprint: "d".repeat(64),
       appServerSha256: "a".repeat(64),
       asarHeader: [4, 2489280, 2489276, 2489269] as [number, number, number, number],
       candidateProfile: "desktop-ipc-v1",
@@ -507,6 +521,8 @@ describe("Desktop IPC wrapper（fake helper）", () => {
   it("handshake_audit 使用 workspaceRoot request shape 并严格校验 bounded flags", async () => {
     const expected = {
       processStable: true, runtimeStable: true, protocolClassification: "protocol_drift_or_unknown" as const,
+      semanticReason: "version_unprovable" as const,
+      semanticFingerprint: null,
       initialize: true, ownerDiscovery: true, followingChangedSent: true, stateReceived: true,
       stateChange: "snapshot" as const,
     };
@@ -515,9 +531,35 @@ describe("Desktop IPC wrapper（fake helper）", () => {
     expect(fake.requests).toHaveLength(1);
     expect(fake.requests[0]).toMatchObject({ op: "handshake_audit", workspaceRoot: target.workspaceRoot });
     expect(Object.keys(fake.requests[0]).sort()).toEqual(["id", "op", "workspaceRoot"]);
+    expect(() => validateDesktopHandshakeAudit(Object.fromEntries(
+      Object.entries(expected).filter(([key]) => key !== "semanticFingerprint"),
+    ))).toThrowError(/无法确认/);
+    expect(() => validateDesktopHandshakeAudit(Object.fromEntries(
+      Object.entries(expected).filter(([key]) => key !== "semanticReason"),
+    ))).toThrowError(/无法确认/);
+    expect(() => validateDesktopHandshakeAudit({ ...expected, semanticReason: "future_reason" })).toThrowError(/无法确认/);
+    for (const semanticReason of SEMANTIC_REASONS) {
+      const semanticFingerprint = semanticReason === "matched" ? "d".repeat(64) : null;
+      expect(validateDesktopHandshakeAudit({ ...expected, semanticReason, semanticFingerprint }).semanticReason).toBe(semanticReason);
+    }
+    expect(() => validateDesktopHandshakeAudit({ ...expected, semanticFingerprint: "d".repeat(64) })).toThrowError(/无法确认/);
     expect(() => validateDesktopHandshakeAudit({ ...expected, extra: true })).toThrowError(/无法确认/);
+    expect(() => validateDesktopHandshakeAudit({ ...expected, bundle: "contents" })).toThrowError(/无法确认/);
+    expect(() => validateDesktopHandshakeAudit({ ...expected, descriptor: {} })).toThrowError(/无法确认/);
     expect(() => validateDesktopHandshakeAudit({ ...expected, ownerDiscovery: false })).toThrowError(/无法确认/);
     expect(() => validateDesktopHandshakeAudit({ ...expected, protocolClassification: "same_protocol_candidate", stateChange: "bad" })).toThrowError(/无法确认/);
+    expect(() => validateDesktopHandshakeAudit({ ...expected, semanticFingerprint: "A".repeat(64) })).toThrowError(/无法确认/);
+    expect(() => validateDesktopHandshakeAudit({ ...expected, semanticFingerprint: "a".repeat(63) })).toThrowError(/无法确认/);
+
+    const semanticCandidate = {
+      ...expected,
+      protocolClassification: "semantic_same_protocol_candidate" as const,
+      semanticReason: "matched" as const,
+      semanticFingerprint: "e".repeat(64),
+    };
+    expect(validateDesktopHandshakeAudit(semanticCandidate)).toEqual(semanticCandidate);
+    expect(() => validateDesktopHandshakeAudit({ ...semanticCandidate, semanticReason: "not_scanned" })).toThrowError(/无法确认/);
+    expect(() => validateDesktopHandshakeAudit({ ...semanticCandidate, semanticFingerprint: null })).toThrowError(/无法确认/);
 
     const candidateRuntime = {
       desktopVersion: "99.1.1.1",
@@ -531,6 +573,7 @@ describe("Desktop IPC wrapper（fake helper）", () => {
     };
     const candidate = { ...expected, protocolClassification: "same_protocol_candidate" as const, candidateRuntime };
     expect(validateDesktopHandshakeAudit(candidate)).toEqual(candidate);
+    expect(() => validateDesktopHandshakeAudit({ ...semanticCandidate, candidateRuntime })).toThrowError(/无法确认/);
     expect(() => validateDesktopHandshakeAudit({ ...candidate, candidateRuntime: undefined })).toThrowError(/无法确认/);
     expect(() => validateDesktopHandshakeAudit({ ...candidate, candidateRuntime: { ...candidateRuntime, token: "secret" } })).toThrowError(/无法确认/);
     expect(() => validateDesktopHandshakeAudit({ ...candidate, candidateRuntime: {
@@ -546,6 +589,8 @@ describe("Desktop IPC wrapper（fake helper）", () => {
       status: "current" as const,
       profile: "desktop-ipc-v1",
       classification: "current" as const,
+      semanticReason: "not_scanned" as const,
+      semanticFingerprint: null,
       appServerSha256: "a".repeat(64),
       asarHeader: [4, 2489280, 2489276, 2489269],
       candidateProfile: "desktop-ipc-v1",
@@ -555,6 +600,21 @@ describe("Desktop IPC wrapper（fake helper）", () => {
       ],
     };
     expect(validateDesktopCompatibilityAudit(base)).toEqual(base);
+    expect(() => validateDesktopCompatibilityAudit(Object.fromEntries(
+      Object.entries(base).filter(([key]) => key !== "semanticFingerprint"),
+    ))).toThrowError(/无法确认/);
+    expect(() => validateDesktopCompatibilityAudit(Object.fromEntries(
+      Object.entries(base).filter(([key]) => key !== "semanticReason"),
+    ))).toThrowError(/无法确认/);
+    expect(() => validateDesktopCompatibilityAudit({ ...base, semanticReason: "future_reason" })).toThrowError(/无法确认/);
+    for (const semanticReason of SEMANTIC_REASONS) {
+      const semanticFingerprint = semanticReason === "matched" ? "d".repeat(64) : null;
+      expect(validateDesktopCompatibilityAudit({ ...base, semanticReason, semanticFingerprint }).semanticReason).toBe(semanticReason);
+    }
+    expect(() => validateDesktopCompatibilityAudit({ ...base, semanticFingerprint: "d".repeat(64) })).toThrowError(/无法确认/);
+    expect(() => validateDesktopCompatibilityAudit({ ...base, semanticFingerprint: "A".repeat(64) })).toThrowError(/无法确认/);
+    expect(() => validateDesktopCompatibilityAudit({ ...base, semanticFingerprint: "a".repeat(63) })).toThrowError(/无法确认/);
+    expect(() => validateDesktopCompatibilityAudit({ ...base, semanticFingerprint: undefined })).toThrowError(/无法确认/);
     const legacyHeader = [4, 111, 107, 100];
     const modernHeader = [4, 108, 104, 100];
     expect(validateDesktopCompatibilityAudit({ ...base, asarHeader: legacyHeader }).asarHeader).toEqual(legacyHeader);
@@ -562,6 +622,9 @@ describe("Desktop IPC wrapper（fake helper）", () => {
     expect(() => validateDesktopCompatibilityAudit({ ...base, asarHeader: [4, 110, 106, 100] })).toThrowError(/无法确认/);
     expect(() => validateDesktopCompatibilityAudit({ ...base, asarHeader: [3, 111, 107, 100] })).toThrowError(/无法确认/);
     expect(() => validateDesktopCompatibilityAudit({ ...base, token: "secret-token" })).toThrowError(/无法确认/);
+    expect(() => validateDesktopCompatibilityAudit({ ...base, bundle: "contents" })).toThrowError(/无法确认/);
+    expect(() => validateDesktopCompatibilityAudit({ ...base, descriptor: {} })).toThrowError(/无法确认/);
+    expect(() => validateDesktopCompatibilityAudit({ ...base, extra: true })).toThrowError(/无法确认/);
     expect(() => validateDesktopCompatibilityAudit({ ...base, modules: [{ ...base.modules[0], sha256: "SECRET" }] })).toThrowError(/无法确认/);
     expect(() => validateDesktopCompatibilityAudit({ ...base, modules: [{ ...base.modules[0], path: "..\\secret.js" }] })).toThrowError(/无法确认/);
     expect(() => validateDesktopCompatibilityAudit({ ...base, asarHeader: [4, -1, 0, 0] })).toThrowError(/无法确认/);
@@ -584,6 +647,20 @@ describe("Desktop IPC wrapper（fake helper）", () => {
       },
     };
     expect(validateDesktopCompatibilityAudit(candidate)).toEqual(candidate);
+    const semanticCandidate = {
+      ...base,
+      status: "unverified" as const,
+      profile: null,
+      candidateProfile: "desktop-ipc-v1",
+      classification: "semantic_same_protocol_candidate" as const,
+      semanticReason: "matched" as const,
+      semanticFingerprint: "e".repeat(64),
+    };
+    expect(validateDesktopCompatibilityAudit(semanticCandidate)).toEqual(semanticCandidate);
+    expect(() => validateDesktopCompatibilityAudit({ ...semanticCandidate, semanticReason: "not_scanned" })).toThrowError(/无法确认/);
+    expect(() => validateDesktopCompatibilityAudit({ ...semanticCandidate, semanticFingerprint: null })).toThrowError(/无法确认/);
+    expect(() => validateDesktopCompatibilityAudit({ ...semanticCandidate, candidateRuntime: candidate.candidateRuntime })).toThrowError(/无法确认/);
+    expect(() => validateDesktopCompatibilityAudit({ ...semanticCandidate, status: "current", profile: "desktop-ipc-v1" })).toThrowError(/无法确认/);
     expect(() => validateDesktopCompatibilityAudit({ ...candidate, candidateRuntime: {
       ...candidate.candidateRuntime, desktopVersion: "26.908.9136",
     } })).toThrowError(/无法确认/);

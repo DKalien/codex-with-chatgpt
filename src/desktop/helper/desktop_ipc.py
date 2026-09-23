@@ -49,7 +49,8 @@ MAX_RESULT_ACTIVITY_ITEMS = 4096
 MIN_PYTHON_VERSION = (3, 11)
 COMPATIBILITY_STATUSES = {"current", "unverified", "incompatible"}
 COMPATIBILITY_AUDIT_CLASSIFICATIONS = {
-    "current", "same_protocol_candidate", "protocol_drift_or_unknown", "ambiguous", "unavailable"
+    "current", "same_protocol_candidate", "semantic_same_protocol_candidate",
+    "protocol_drift_or_unknown", "ambiguous", "unavailable"
 }
 _VERSION_PATTERN = re.compile(
     r"\d+\.\d+\.\d+(?:\.\d+)?(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?(?:\+[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?"
@@ -76,10 +77,496 @@ _MAX_ASAR_MODULE_BYTES = 64 * 1024 * 1024
 _MAX_ASAR_AUDIT_CANDIDATES = 16
 _MAX_ASAR_AUDIT_CANDIDATES_PER_ROLE = 8
 _MAX_ASAR_AUDIT_MODULE_BYTES = 128 * 1024 * 1024
+_MAX_PROTOCOL_SOURCE_BYTES = 8 * 1024 * 1024
+_MAX_PROTOCOL_TOKENS = 600_000
+_MAX_PROTOCOL_NESTING = 128
+_MAX_PROTOCOL_NUMBER_CHARS = 128
+_JS_NUMBER_PATTERN = re.compile(
+    r"(?:0[xX][0-9a-fA-F](?:_?[0-9a-fA-F])*|0[bB][01](?:_?[01])*|0[oO][0-7](?:_?[0-7])*|"
+    r"(?:[0-9](?:_?[0-9])*(?:\.(?:[0-9](?:_?[0-9])*)?)?|\.[0-9](?:_?[0-9])*)"
+    r"(?:[eE][+-]?[0-9](?:_?[0-9])*)?)(?:n)?"
+)
+_SEMANTIC_REASON_CODES = {
+    "matched", "source_too_large", "lexical_unsupported", "start_turn_missing",
+    "start_turn_ambiguous", "version_unprovable", "payload_unprovable", "ack_unprovable", "not_scanned",
+}
+_SEMANTIC_CONTRACT_PROFILE = "desktop-ipc-v1"
+_START_TURN_MUTATION_CONTRACT = {
+    "method": "thread-follower-start-turn",
+    "version": 2,
+    "routing": ["sourceClientId", "targetClientId"],
+    "params": {
+        "conversationId": "dynamic",
+        "turnStart": {
+            "request": {
+                "threadId": "dynamic",
+                "input": [{"type": "text", "text": "dynamic", "text_elements": []}],
+            },
+        },
+    },
+    "successAck": ["result", "result", "turn", "id"],
+}
+_START_TURN_MUTATION_FINGERPRINT = hashlib.sha256(
+    json.dumps(_START_TURN_MUTATION_CONTRACT, sort_keys=True, separators=(",", ":")).encode("ascii")
+).hexdigest()
+
 
 
 class _CatalogError(ValueError):
     pass
+
+
+class _ProtocolScanError(ValueError):
+    def __init__(self, classification: str):
+        super().__init__(classification)
+        self.classification = classification
+
+
+def _js_escape(source: str, index: int, *, template: bool) -> tuple[str, int]:
+    if index >= len(source):
+        raise _ProtocolScanError("unavailable")
+    char = source[index]
+    simple = {"b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t", "v": "\v",
+              "0": "\0", "\\": "\\", "'": "'", '"': '"', "/": "/"}
+    if char in simple:
+        if char == "0" and index + 1 < len(source) and source[index + 1].isdigit():
+            raise _ProtocolScanError("unavailable")
+        return simple[char], index + 1
+    if template and char in "`$":
+        return char, index + 1
+    if char in "\r\n\u2028\u2029":
+        if char == "\r" and index + 1 < len(source) and source[index + 1] == "\n":
+            return "", index + 2
+        return "", index + 1
+    if char == "x":
+        raw = source[index + 1:index + 3]
+        if len(raw) != 2 or any(item not in "0123456789abcdefABCDEF" for item in raw):
+            raise _ProtocolScanError("unavailable")
+        return chr(int(raw, 16)), index + 3
+    if char == "u":
+        if index + 1 < len(source) and source[index + 1] == "{":
+            end = source.find("}", index + 2)
+            raw = source[index + 2:end] if end >= 0 else ""
+            if not raw or len(raw) > 6 or any(item not in "0123456789abcdefABCDEF" for item in raw):
+                raise _ProtocolScanError("unavailable")
+            value = int(raw, 16)
+            if value > 0x10FFFF or 0xD800 <= value <= 0xDFFF:
+                raise _ProtocolScanError("unavailable")
+            return chr(value), end + 1
+        raw = source[index + 1:index + 5]
+        if len(raw) != 4 or any(item not in "0123456789abcdefABCDEF" for item in raw):
+            raise _ProtocolScanError("unavailable")
+        value = int(raw, 16)
+        if 0xD800 <= value <= 0xDFFF:
+            raise _ProtocolScanError("unavailable")
+        return chr(value), index + 5
+    if template and char in "0123456789":
+        raise _ProtocolScanError("unavailable")
+    raise _ProtocolScanError("unavailable")
+
+
+def _js_tokens(source: str) -> list[tuple[str, str]]:
+    """有限 JS lexer；不解析或执行 bundle，只投影词法 token。"""
+    if not isinstance(source, str) or "\x00" in source:
+        raise _ProtocolScanError("unavailable")
+    if len(source) > _MAX_PROTOCOL_SOURCE_BYTES or len(source.encode("utf-8", "strict")) > _MAX_PROTOCOL_SOURCE_BYTES:
+        raise _ProtocolScanError("source_too_large")
+    token_count = 0
+    template_depth = 0
+    multi_punct = (">>>=", "===", "!==", ">>>", "**=", "...", "?.", "??", "=>", "==", "!=", "<=", ">=", "&&",
+                   "||", "++", "--", "+=", "-=", "*=", "/=", "%=", "<<", ">>", "**", "&=", "|=", "^=")
+    expression_prefixes = {"(", "[", "{", ",", ";", ":", "?", "=", "!", "~", "&&", "||", "??", "=>",
+                           "+", "-", "*", "%", "&", "|", "^", "<", ">", "return", "throw", "case", "delete",
+                           "void", "typeof", "instanceof", "in", "of", "yield", "await"}
+
+    def token(kind: str, value: str) -> tuple[str, str]:
+        nonlocal token_count
+        token_count += 1
+        if token_count > _MAX_PROTOCOL_TOKENS:
+            raise _ProtocolScanError("lexical_unsupported")
+        return kind, value
+
+    def identifier_start(char: str) -> bool:
+        return char in "_$" or char.isalpha() or (ord(char) > 127 and char.isidentifier())
+
+    def identifier_part(char: str) -> bool:
+        return char in "_$" or char.isalnum() or (ord(char) > 127 and ("a" + char).isidentifier())
+
+    def number_end(index: int) -> int:
+        match = _JS_NUMBER_PATTERN.match(source, index)
+        if match is None:
+            raise _ProtocolScanError("unavailable")
+        end = index + len(match.group(0))
+        if end - index > _MAX_PROTOCOL_NUMBER_CHARS:
+            raise _ProtocolScanError("unavailable")
+        if end < len(source) and (identifier_part(source[end]) or source[end] == "\\"):
+            raise _ProtocolScanError("unavailable")
+        return end
+
+    def scan_template(index: int) -> tuple[list[tuple[str, str]], int]:
+        nonlocal template_depth
+        template_depth += 1
+        if template_depth > _MAX_PROTOCOL_NESTING:
+            raise _ProtocolScanError("unavailable")
+        index += 1
+        chunks: list[str] = []
+        expressions: list[tuple[str, str]] = []
+        dynamic = False
+        while index < len(source):
+            char = source[index]
+            if char == "`":
+                template_depth -= 1
+                if dynamic:
+                    return [token("template_boundary", ""), *expressions, token("template_boundary", "")], index + 1
+                else:
+                    return [token("str", "".join(chunks))], index + 1
+            if source.startswith("${", index):
+                dynamic = True
+                expression, index = scan_code(index + 2, stop_template_expr=True)
+                expressions.extend(expression)
+                continue
+            if char == "\\":
+                escaped, index = _js_escape(source, index + 1, template=True)
+                chunks.append(escaped)
+                continue
+            chunks.append(char)
+            index += 1
+        raise _ProtocolScanError("unavailable")
+
+    def scan_code(index: int, *, stop_template_expr: bool = False) -> tuple[list[tuple[str, str]], int]:
+        local: list[tuple[str, str]] = []
+        stack: list[str] = []
+        pairs = {")": "(", "]": "[", "}": "{"}
+        while index < len(source):
+            char = source[index]
+            if char.isspace() or char == "\ufeff":
+                index += 1
+                continue
+            if stop_template_expr and char == "}" and not stack:
+                return local, index + 1
+            if source.startswith("//", index):
+                end = source.find("\n", index + 2)
+                index = len(source) if end < 0 else end + 1
+                continue
+            if source.startswith("/*", index):
+                end = source.find("*/", index + 2)
+                if end < 0:
+                    raise _ProtocolScanError("unavailable")
+                index = end + 2
+                continue
+            if char in "'\"":
+                quote = char
+                index += 1
+                value: list[str] = []
+                while index < len(source) and source[index] != quote:
+                    current = source[index]
+                    if current in "\r\n\u2028\u2029":
+                        raise _ProtocolScanError("unavailable")
+                    if current == "\\":
+                        escaped, index = _js_escape(source, index + 1, template=False)
+                        value.append(escaped)
+                    else:
+                        value.append(current)
+                        index += 1
+                if index >= len(source):
+                    raise _ProtocolScanError("unavailable")
+                local.append(token("str", "".join(value)))
+                index += 1
+            elif char == "`":
+                template_tokens, index = scan_template(index)
+                local.extend(template_tokens)
+            elif char == "/" and (not local or local[-1][1] in expression_prefixes):
+                index += 1
+                in_class = False
+                escaped = False
+                while index < len(source):
+                    current = source[index]
+                    if current in "\r\n\u2028\u2029":
+                        raise _ProtocolScanError("unavailable")
+                    if escaped:
+                        escaped = False
+                    elif current == "\\":
+                        escaped = True
+                    elif current == "[":
+                        in_class = True
+                    elif current == "]":
+                        in_class = False
+                    elif current == "/" and not in_class:
+                        index += 1
+                        flags: set[str] = set()
+                        while index < len(source) and identifier_part(source[index]):
+                            flag = source[index]
+                            if flag not in "dgimsuvy" or flag in flags:
+                                raise _ProtocolScanError("unavailable")
+                            flags.add(flag)
+                            index += 1
+                        if "u" in flags and "v" in flags:
+                            raise _ProtocolScanError("unavailable")
+                        break
+                    index += 1
+                else:
+                    raise _ProtocolScanError("unavailable")
+                local.append(token("regex", ""))
+            elif identifier_start(char):
+                end = index + 1
+                while end < len(source) and identifier_part(source[end]):
+                    end += 1
+                local.append(token("id", source[index:end]))
+                index = end
+            elif char.isdigit() or (char == "." and index + 1 < len(source) and source[index + 1].isdigit()):
+                end = number_end(index)
+                local.append(token("num", source[index:end]))
+                index = end
+            else:
+                punct = next((candidate for candidate in multi_punct if source.startswith(candidate, index)), char)
+                if punct not in "()[]{}.,;:?~+-*/%&|^!<>=#" and punct not in multi_punct:
+                    raise _ProtocolScanError("unavailable")
+                if punct in "([{":
+                    if len(stack) >= _MAX_PROTOCOL_NESTING:
+                        raise _ProtocolScanError("unavailable")
+                    stack.append(punct)
+                elif punct in ")]}" :
+                    if not stack:
+                        raise _ProtocolScanError("unavailable")
+                    if pairs[punct] != stack.pop():
+                        raise _ProtocolScanError("unavailable")
+                local.append(token("p", punct))
+                index += len(punct)
+        if stop_template_expr or stack:
+            raise _ProtocolScanError("unavailable")
+        return local, index
+
+    scanned, end = scan_code(0)
+    if end != len(source):
+        raise _ProtocolScanError("unavailable")
+    return scanned
+
+
+def _js_pairs(tokens: list[tuple[str, str]]) -> dict[int, int]:
+    pairs: dict[int, int] = {}
+    stack: list[int] = []
+    opening = {"(": ")", "[": "]", "{": "}"}
+    for index, (kind, value) in enumerate(tokens):
+        if kind != "p":
+            continue
+        if value in opening:
+            stack.append(index)
+        elif value in {")", "]", "}"}:
+            if not stack or opening[tokens[stack[-1]][1]] != value:
+                raise _ProtocolScanError("unavailable")
+            start = stack.pop()
+            pairs[start] = index
+    if stack:
+        raise _ProtocolScanError("unavailable")
+    return pairs
+
+
+def _js_segments(tokens: list[tuple[str, str]], start: int, end: int, pairs: dict[int, int], separator: str) \
+        -> list[tuple[int, int]]:
+    segments: list[tuple[int, int]] = []
+    part = start
+    index = start
+    while index < end:
+        kind, value = tokens[index]
+        if kind == "p" and value in {"(", "[", "{"}:
+            close = pairs.get(index)
+            if close is None or close >= end:
+                raise _ProtocolScanError("unavailable")
+            index = close + 1
+            continue
+        if kind == "p" and value == separator:
+            if index > part:
+                segments.append((part, index))
+            part = index + 1
+        index += 1
+    if part < end:
+        segments.append((part, end))
+    return segments
+
+
+def _js_object_properties(tokens: list[tuple[str, str]], open_index: int, close_index: int,
+                          pairs: dict[int, int]) -> dict[str, tuple[int, int]] | None:
+    properties: dict[str, tuple[int, int]] = {}
+    for start, end in _js_segments(tokens, open_index + 1, close_index, pairs, ","):
+        if end - start < 3 or tokens[start + 1] != ("p", ":"):
+            return None
+        key_kind, key = tokens[start]
+        if key_kind not in {"id", "str"} or len(key) > 128 or key in properties:
+            return None
+        properties[key] = (start + 2, end)
+    return properties
+
+
+def _js_object_rows(tokens: list[tuple[str, str]], pairs: dict[int, int]) \
+        -> list[tuple[int, int, dict[str, tuple[int, int]]]]:
+    rows: list[tuple[int, int, dict[str, tuple[int, int]]]] = []
+    for index, (kind, value) in enumerate(tokens):
+        if (kind == "p" and value == "{" and index in pairs and index + 2 < pairs[index]
+                and tokens[index + 1][0] in {"id", "str"} and tokens[index + 2] == ("p", ":")):
+            props = _js_object_properties(tokens, index, pairs[index], pairs)
+            if props is not None:
+                rows.append((index, pairs[index], props))
+    return rows
+
+
+def _js_unwrap_parens(tokens: list[tuple[str, str]], start: int, end: int,
+                      pairs: dict[int, int]) -> tuple[int, int]:
+    while start < end and tokens[start] == ("p", "(") and pairs.get(start) == end - 1:
+        start += 1
+        end -= 1
+    return start, end
+
+
+def _js_value_is(tokens: list[tuple[str, str]], span: tuple[int, int], expected: tuple[str, str],
+                 pairs: dict[int, int]) -> bool:
+    start, end = _js_unwrap_parens(tokens, *span, pairs)
+    return end - start == 1 and tokens[start] == expected
+
+
+def _js_properties_at(tokens: list[tuple[str, str]], span: tuple[int, int],
+                      pairs: dict[int, int]) -> dict[str, tuple[int, int]] | None:
+    start, end = _js_unwrap_parens(tokens, *span, pairs)
+    if start >= end or tokens[start] != ("p", "{") or pairs.get(start) != end - 1:
+        return None
+    return _js_object_properties(tokens, start, end - 1, pairs)
+
+
+def _js_dynamic_value(tokens: list[tuple[str, str]], span: tuple[int, int],
+                      pairs: dict[int, int]) -> bool:
+    start, end = _js_unwrap_parens(tokens, *span, pairs)
+    if start >= end or end - start == 1 and tokens[start][0] in {"str", "num"}:
+        return False
+    return any(kind == "id" and value not in {"null", "undefined", "true", "false"}
+               for kind, value in tokens[start:end])
+
+
+def _js_empty_array(tokens: list[tuple[str, str]], span: tuple[int, int],
+                    pairs: dict[int, int]) -> bool:
+    start, end = _js_unwrap_parens(tokens, *span, pairs)
+    return start < end and tokens[start] == ("p", "[") and pairs.get(start) == end - 1 and end == start + 2
+
+
+def _ack_path_count(tokens: list[tuple[str, str]], pairs: dict[int, int]) -> int:
+    wanted = ["result", "result", "turn", "id"]
+    reverse_pairs = {close: start for start, close in pairs.items()}
+    matches: set[tuple[int, int]] = set()
+    for start, (kind, _) in enumerate(tokens):
+        if kind != "id":
+            continue
+        cursor = start + 1
+        path: list[str] = []
+        while cursor < len(tokens):
+            if tokens[cursor] == ("p", ")") and reverse_pairs.get(cursor, cursor) < start:
+                cursor += 1
+            elif (tokens[cursor] in {("p", "."), ("p", "?.")}
+                  and cursor + 1 < len(tokens) and tokens[cursor + 1][0] == "id"):
+                path.append(tokens[cursor + 1][1])
+                cursor += 2
+            elif tokens[cursor] == ("p", "[") and cursor in pairs:
+                close = pairs[cursor]
+                if close != cursor + 2 or tokens[cursor + 1][0] != "str":
+                    break
+                path.append(tokens[cursor + 1][1])
+                cursor = close + 1
+            else:
+                break
+        if path[-len(wanted):] == wanted:
+            matches.add((start, cursor))
+    return len(matches)
+
+
+def _semantic_result(reason: str, *, fingerprint: str | None = None,
+                     has_start_turn_method: bool = False) -> dict[str, Any]:
+    return {"fingerprint": fingerprint, "reason": reason if reason in _SEMANTIC_REASON_CODES else "lexical_unsupported",
+            "candidate": reason == "matched" and fingerprint == _START_TURN_MUTATION_FINGERPRINT,
+            "hasStartTurnMethod": has_start_turn_method}
+
+
+def _semantic_protocol_v2(source: bytes | bytearray | str) -> dict[str, Any]:
+    """仅投影 source-controlled start-turn contract；绝不返回源码或 descriptor。"""
+    try:
+        if isinstance(source, (bytes, bytearray)):
+            if len(source) > _MAX_PROTOCOL_SOURCE_BYTES:
+                return _semantic_result("source_too_large")
+            source = bytes(source).decode("utf-8", "strict")
+        if not isinstance(source, str):
+            return _semantic_result("lexical_unsupported")
+        try:
+            if len(source.encode("utf-8", "strict")) > _MAX_PROTOCOL_SOURCE_BYTES:
+                return _semantic_result("source_too_large")
+        except UnicodeEncodeError:
+            return _semantic_result("lexical_unsupported")
+        tokens = _js_tokens(source)
+        pairs = _js_pairs(tokens)
+        objects = _js_object_rows(tokens, pairs)
+    except _ProtocolScanError as error:
+        return _semantic_result(error.classification)
+    except (UnicodeDecodeError, UnicodeEncodeError, RecursionError, ValueError, IndexError, KeyError):
+        return _semantic_result("lexical_unsupported")
+
+    method = _START_TURN_MUTATION_CONTRACT["method"]
+    if not any(kind == "str" and value == method for kind, value in tokens):
+        return _semantic_result("start_turn_missing")
+    has_start_turn_method = True
+
+    version_rows = [props[method] for _, _, props in objects if method in props]
+    if len(version_rows) > 1:
+        return _semantic_result("start_turn_ambiguous", has_start_turn_method=has_start_turn_method)
+    version_map_matches = len(version_rows) == 1 and _js_value_is(tokens, version_rows[0], ("num", "2"), pairs)
+    if version_rows and not version_map_matches:
+        return _semantic_result("version_unprovable", has_start_turn_method=has_start_turn_method)
+
+    candidates = [props for _, _, props in objects
+                  if "method" in props and _js_value_is(tokens, props["method"], ("str", method), pairs)]
+    if len(candidates) > 1:
+        return _semantic_result("start_turn_ambiguous", has_start_turn_method=has_start_turn_method)
+    if not candidates:
+        return _semantic_result("version_unprovable", has_start_turn_method=has_start_turn_method)
+
+    request = candidates[0]
+    if "type" not in request or not _js_value_is(tokens, request["type"], ("str", "request"), pairs):
+        return _semantic_result("version_unprovable", has_start_turn_method=has_start_turn_method)
+    if "version" in request:
+        version_matches = _js_value_is(tokens, request["version"], ("num", "2"), pairs)
+        if not version_matches:
+            return _semantic_result("version_unprovable", has_start_turn_method=has_start_turn_method)
+    elif not version_map_matches:
+        return _semantic_result("version_unprovable", has_start_turn_method=has_start_turn_method)
+
+    if not {"sourceClientId", "targetClientId", "params"}.issubset(request) or not all(
+        _js_dynamic_value(tokens, request[field], pairs) for field in ("sourceClientId", "targetClientId")
+    ):
+        return _semantic_result("payload_unprovable", has_start_turn_method=has_start_turn_method)
+    params = _js_properties_at(tokens, request["params"], pairs)
+    if params is None or set(params) != {"conversationId", "turnStart"} \
+            or not _js_dynamic_value(tokens, params["conversationId"], pairs):
+        return _semantic_result("payload_unprovable", has_start_turn_method=has_start_turn_method)
+    turn_start = _js_properties_at(tokens, params["turnStart"], pairs)
+    turn_request = _js_properties_at(tokens, turn_start["request"], pairs) if turn_start else None
+    if turn_start is None or set(turn_start) != {"request"} or turn_request is None \
+            or set(turn_request) != {"threadId", "input"} \
+            or not _js_dynamic_value(tokens, turn_request["threadId"], pairs):
+        return _semantic_result("payload_unprovable", has_start_turn_method=has_start_turn_method)
+    input_start, input_end = _js_unwrap_parens(tokens, *turn_request["input"], pairs)
+    if input_start >= input_end or tokens[input_start] != ("p", "[") or pairs.get(input_start) != input_end - 1:
+        return _semantic_result("payload_unprovable", has_start_turn_method=has_start_turn_method)
+    input_items = _js_segments(tokens, input_start + 1, input_end - 1, pairs, ",")
+    if len(input_items) != 1:
+        return _semantic_result("payload_unprovable", has_start_turn_method=has_start_turn_method)
+    item = _js_properties_at(tokens, input_items[0], pairs)
+    if item is None or set(item) != {"type", "text", "text_elements"} \
+            or not _js_value_is(tokens, item["type"], ("str", "text"), pairs) \
+            or not _js_dynamic_value(tokens, item["text"], pairs) \
+            or not _js_empty_array(tokens, item["text_elements"], pairs):
+        return _semantic_result("payload_unprovable", has_start_turn_method=has_start_turn_method)
+
+    if _ack_path_count(tokens, pairs) != 1:
+        return _semantic_result("ack_unprovable", has_start_turn_method=has_start_turn_method)
+    if sorted(field for field in ("sourceClientId", "targetClientId") if field in request) != \
+            _START_TURN_MUTATION_CONTRACT["routing"]:
+        return _semantic_result("payload_unprovable", has_start_turn_method=has_start_turn_method)
+    return _semantic_result("matched", fingerprint=_START_TURN_MUTATION_FINGERPRINT,
+                            has_start_turn_method=has_start_turn_method)
 
 
 def _safe_version(value: Any) -> str | None:
@@ -179,9 +666,9 @@ def _load_catalog(path: str | os.PathLike[str] | None = None) -> dict[str, tuple
             raise _CatalogError("catalog runtimes")
         normalized: list[dict[str, Any]] = []
         for raw_runtime in runtimes:
-            runtime = _catalog_keys(raw_runtime, {
-                "desktopVersion", "appServerVersion", "appServerSha256", "asarHeader", "modules"
-            })
+            runtime = _catalog_keys(
+                raw_runtime, {"desktopVersion", "appServerVersion", "appServerSha256", "asarHeader", "modules"}
+            )
             desktop_version = _catalog_version(runtime["desktopVersion"], desktop=True)
             app_server_version = _catalog_version(runtime["appServerVersion"])
             pair = (desktop_version, app_server_version)
@@ -197,13 +684,14 @@ def _load_catalog(path: str | os.PathLike[str] | None = None) -> dict[str, tuple
             if set(roles) != set(_MODULE_PATH_PATTERNS) or len(set(roles)) != len(roles) \
                     or len(set(paths)) != len(paths):
                 raise _CatalogError("duplicate catalog module role/path")
-            normalized.append({
+            normalized_runtime = {
                 "desktopVersion": desktop_version,
                 "appServerVersion": app_server_version,
                 "appServerSha256": _catalog_hash(runtime["appServerSha256"]),
                 "asarHeader": list(_catalog_asar_header(runtime["asarHeader"])),
                 "modules": normalized_modules,
-            })
+            }
+            normalized.append(normalized_runtime)
         result[name] = tuple(normalized)
     return result
 
@@ -1242,10 +1730,13 @@ def _asar_audit_modules(desktop_exe: str) -> tuple[list[int], dict[str, list[dic
                         if role == "ipc-main":
                             fingerprint_data.extend(chunk)
                         remaining -= len(chunk)
-                    row = {"role": role, "path": prefix, "sha256": digest.hexdigest()}
+                    row: dict[str, Any] = {"role": role, "path": prefix, "sha256": digest.hexdigest()}
                     if role == "ipc-main":
-                        row["_protocolFingerprint"] = all(marker in fingerprint_data
-                                                           for marker in _AUDIT_IPC_FINGERPRINT)
+                        semantic = _semantic_protocol_v2(bytes(fingerprint_data))
+                        row.update({"_semanticFingerprint": semantic["fingerprint"],
+                                    "_semanticReason": semantic["reason"],
+                                    "_semanticCandidate": semantic["candidate"],
+                                    "_semanticHasStartTurnMethod": semantic["hasStartTurnMethod"]})
                     candidates[role].append(row)
                     return
                 if not isinstance(files, dict) or len(files) > _MAX_ASAR_TREE_NODES:
@@ -1280,7 +1771,8 @@ def _safe_audit_modules(value: Any) -> list[dict[str, str]]:
     for item in value:
         if (not isinstance(item, dict)
                 or set(item) not in ({"role", "path", "sha256"},
-                                     {"role", "path", "sha256", "_protocolFingerprint"})):
+                                     {"role", "path", "sha256", "_semanticFingerprint",
+                                      "_semanticReason", "_semanticCandidate", "_semanticHasStartTurnMethod"})):
             continue
         role, path, digest = item["role"], item["path"], item["sha256"]
         pattern = _MODULE_PATH_PATTERNS.get(role) if isinstance(role, str) else None
@@ -1299,6 +1791,14 @@ def _safe_audit(value: Any = None) -> dict[str, Any]:
     classification = value.get("classification")
     if classification not in COMPATIBILITY_AUDIT_CLASSIFICATIONS:
         classification = "unavailable"
+    semantic_reason = value.get("semanticReason")
+    if semantic_reason not in _SEMANTIC_REASON_CODES:
+        semantic_reason = "not_scanned"
+    semantic_fingerprint = _safe_audit_hash(value.get("semanticFingerprint"))
+    if semantic_reason == "matched" and semantic_fingerprint is None:
+        semantic_reason = "lexical_unsupported"
+    elif semantic_reason != "matched":
+        semantic_fingerprint = None
     profile = value.get("profile") if isinstance(value.get("profile"), str) \
         and _PROFILE_NAME_PATTERN.fullmatch(value["profile"]) else None
     candidate_profile = value.get("candidateProfile") if isinstance(value.get("candidateProfile"), str) \
@@ -1312,6 +1812,8 @@ def _safe_audit(value: Any = None) -> dict[str, Any]:
     result: dict[str, Any] = {
         **_safe_compatibility({**value, "status": status, "profile": profile}),
         "classification": classification,
+        "semanticFingerprint": semantic_fingerprint,
+        "semanticReason": semantic_reason,
         "appServerSha256": _safe_audit_hash(value.get("appServerSha256")),
         "asarHeader": header,
         "candidateProfile": candidate_profile,
@@ -1332,13 +1834,21 @@ def _safe_audit(value: Any = None) -> dict[str, Any]:
                 and len(_safe_audit_modules(runtime["modules"])) == 2):
             runtime["modules"] = _safe_audit_modules(runtime["modules"])
             result["candidateRuntime"] = runtime
+    if classification == "semantic_same_protocol_candidate" and (
+            semantic_fingerprint is None or semantic_reason != "matched" or status != "unverified"
+            or profile is not None or candidate_profile is None
+            or result["observedDesktopVersion"] is None or result["observedAppServerVersion"] is None
+            or result["appServerSha256"] is None or header is None or len(result["modules"]) != 2
+            or {module["role"] for module in result["modules"]} != set(_MODULE_PATH_PATTERNS)
+            or "candidateRuntime" in result):
+        result["classification"] = "protocol_drift_or_unknown"
     return result
 
 
 def _audit_result(observed: dict[str, Any] | None = None, *, status: str = "unverified",
                   classification: str = "unavailable", profile: str | None = None,
-                  app_server_sha256: str | None = None, asar_header: Any = None,
-                  candidate_profile: str | None = None, modules: Any = None,
+                  app_server_sha256: str | None = None, asar_header: Any = None, semantic_reason: str = "not_scanned",
+                  candidate_profile: str | None = None, semantic_fingerprint: str | None = None, modules: Any = None,
                   candidate_runtime: dict[str, Any] | None = None) -> dict[str, Any]:
     observed = observed if isinstance(observed, dict) else {}
     value: dict[str, Any] = {
@@ -1347,6 +1857,8 @@ def _audit_result(observed: dict[str, Any] | None = None, *, status: str = "unve
         "status": status,
         "profile": profile,
         "classification": classification,
+        "semanticFingerprint": semantic_fingerprint,
+        "semanticReason": semantic_reason,
         "appServerSha256": app_server_sha256,
         "asarHeader": asar_header,
         "candidateProfile": candidate_profile,
@@ -1361,18 +1873,24 @@ def _profiles_for_app_server_version(version: str | None) -> list[tuple[str, tup
     if not version:
         return []
     return [(name, runtimes) for name, runtimes in VERIFIED_PROFILES.items()
-            if any(runtime.get("appServerVersion") == version for runtime in runtimes)]
+             if any(runtime.get("appServerVersion") == version for runtime in runtimes)]
 
 
-_AUDIT_IPC_FINGERPRINT = (
-    b"thread-owner-discovery",
-    b"thread-stream-following-changed",
-    b"thread-follower-start-turn",
-    b"handledByClientId",
-    b"sourceClientId",
-    b"targetClientIds",
-    b"conversationId",
-)
+def _semantic_candidate_evidence(ipc_candidates: list[dict[str, Any]]) \
+        -> tuple[str | None, str, list[dict[str, Any]]]:
+    method_candidates = [item for item in ipc_candidates if item.get("_semanticHasStartTurnMethod") is True]
+    if len(method_candidates) > 1:
+        return None, "start_turn_ambiguous", []
+    if not method_candidates:
+        if len(ipc_candidates) != 1:
+            return None, "start_turn_missing" if ipc_candidates else "not_scanned", []
+        method_candidates = ipc_candidates
+    candidate = method_candidates[0]
+    reason = candidate.get("_semanticReason")
+    if reason not in _SEMANTIC_REASON_CODES:
+        reason = "lexical_unsupported"
+    fingerprint = _safe_audit_hash(candidate.get("_semanticFingerprint")) if reason == "matched" else None
+    return fingerprint, reason, [candidate]
 
 
 def _compatibility_audit_for_paths(desktop_exe: str, app_server_exe: str) -> dict[str, Any]:
@@ -1390,11 +1908,25 @@ def _compatibility_audit_for_paths(desktop_exe: str, app_server_exe: str) -> dic
         except DesktopIpcError:
             return _audit_result(observed, status="incompatible", classification="protocol_drift_or_unknown",
                                  profile=name, candidate_profile=name, app_server_sha256=app_server_sha256)
+        semantic_fingerprint = None
+        semantic_reason = "not_scanned"
+        try:
+            _, actual_candidates = _asar_audit_modules(desktop_exe)
+            expected_ipc = next(module for module in _runtime_module_rows(profile) if module["role"] == "ipc-main")
+            actual_ipc = [module for module in actual_candidates.get("ipc-main", [])
+                          if module.get("path") == expected_ipc["path"] and module.get("sha256") == expected_ipc["sha256"]]
+            if len(actual_ipc) == 1:
+                semantic_fingerprint = actual_ipc[0].get("_semanticFingerprint")
+                semantic_reason = actual_ipc[0].get("_semanticReason", "lexical_unsupported")
+        except (_AsarAuditError, StopIteration):
+            pass
         return _audit_result(
             observed,
             status="current",
             classification="current",
             profile=name,
+            semantic_fingerprint=semantic_fingerprint,
+            semantic_reason=semantic_reason,
             app_server_sha256=app_server_sha256,
             asar_header=profile.get("asarHeader"),
             candidate_profile=name,
@@ -1405,14 +1937,22 @@ def _compatibility_audit_for_paths(desktop_exe: str, app_server_exe: str) -> dic
     if not matches:
         try:
             asar_header, candidates = _asar_audit_modules(desktop_exe)
-            ipc = [item for item in candidates.get("ipc-main", []) if item.get("_protocolFingerprint") is True]
+            ipc = candidates.get("ipc-main", [])
+            semantic_fingerprint, semantic_reason, semantic_ipc = _semantic_candidate_evidence(ipc)
             webview = candidates.get("webview-bootstrap", [])
-            modules = [*ipc, *webview] if len(ipc) == 1 and len(webview) == 1 else []
+            modules = [*semantic_ipc, *webview] if len(semantic_ipc) == 1 and len(webview) == 1 else []
             classification = "protocol_drift_or_unknown"
-            if len(ipc) > 1 or len(webview) > 1:
+            if semantic_reason == "start_turn_ambiguous" or len(webview) > 1:
                 classification = "ambiguous"
+            candidate_profile = None
+            if (len(semantic_ipc) == 1 and semantic_ipc[0].get("_semanticCandidate") is True
+                    and len(webview) == 1):
+                classification = "semantic_same_protocol_candidate"
+                candidate_profile = _SEMANTIC_CONTRACT_PROFILE
             return _audit_result(observed, classification=classification, app_server_sha256=app_server_sha256,
-                                 asar_header=asar_header, modules=modules)
+                                 asar_header=asar_header, candidate_profile=candidate_profile,
+                                 semantic_fingerprint=semantic_fingerprint, semantic_reason=semantic_reason,
+                                 modules=modules)
         except _AsarAuditError:
             return _audit_result(observed, classification="protocol_drift_or_unknown",
                                  app_server_sha256=app_server_sha256)
@@ -1446,10 +1986,20 @@ def _compatibility_audit_for_paths(desktop_exe: str, app_server_exe: str) -> dic
                        if runtime_module.get("role") == "ipc-main"
                    }]
     if len(trusted_ipc) != 1:
-        classification = "ambiguous" if len(trusted_ipc) > 1 else "protocol_drift_or_unknown"
+        semantic_fingerprint, semantic_reason, semantic_ipc = _semantic_candidate_evidence(ipc_candidates)
+        classification = "ambiguous" if len(trusted_ipc) > 1 or semantic_reason == "start_turn_ambiguous" else "protocol_drift_or_unknown"
+        if (len(trusted_ipc) == 0 and len(semantic_ipc) == 1
+                and semantic_ipc[0].get("_semanticCandidate") is True and len(webview_candidates) == 1):
+            classification = "semantic_same_protocol_candidate"
+            return _audit_result(observed, classification=classification, candidate_profile=name,
+                                 semantic_fingerprint=semantic_fingerprint, semantic_reason=semantic_reason,
+                                 app_server_sha256=app_server_sha256,
+                                 asar_header=asar_header, modules=[*semantic_ipc, *webview_candidates])
+        selected = semantic_ipc if len(trusted_ipc) == 0 and semantic_ipc else trusted_ipc or ipc_candidates[:1]
         return _audit_result(observed, classification=classification, candidate_profile=name,
-                             app_server_sha256=app_server_sha256, asar_header=asar_header,
-                             modules=[*trusted_ipc, *webview_candidates])
+                             semantic_fingerprint=semantic_fingerprint, semantic_reason=semantic_reason,
+                             app_server_sha256=app_server_sha256,
+                             asar_header=asar_header, modules=[*selected, *webview_candidates])
     modules = [*trusted_ipc, *webview_candidates]
     candidate_runtime = {
         "desktopVersion": observed.get("observedDesktopVersion"),
@@ -1459,6 +2009,8 @@ def _compatibility_audit_for_paths(desktop_exe: str, app_server_exe: str) -> dic
         "modules": modules,
     }
     return _audit_result(observed, classification="same_protocol_candidate", candidate_profile=name,
+                         semantic_fingerprint=trusted_ipc[0].get("_semanticFingerprint"),
+                         semantic_reason=trusted_ipc[0].get("_semanticReason", "not_scanned"),
                          app_server_sha256=app_server_sha256, asar_header=asar_header, modules=modules,
                          candidate_runtime=candidate_runtime)
 
@@ -2242,7 +2794,8 @@ def _handshake_audit(workspace_root: Any) -> dict[str, Any]:
         before = _verify_runtime_identity(pipe, target, require_catalog=False)
         audit = _compatibility_audit_for_paths(before["desktopExe"], before["appServerExe"])
         modules = audit.get("modules", [])
-        if (audit.get("classification") not in {"protocol_drift_or_unknown", "same_protocol_candidate", "current"}
+        if (audit.get("classification") not in {"protocol_drift_or_unknown", "same_protocol_candidate",
+                                                "semantic_same_protocol_candidate", "current"}
                 or len(modules) != 2
                 or {item.get("role") for item in modules} != {"ipc-main", "webview-bootstrap"}
                 or (audit.get("classification") == "same_protocol_candidate"
@@ -2265,6 +2818,10 @@ def _handshake_audit(workspace_root: Any) -> dict[str, Any]:
                    tuple(after.get(key) for key in ("observedDesktopVersion", "observedAppServerVersion", "appServerSha256"))
                 or after_audit.get("modules") != audit.get("modules")
                 or after_audit.get("asarHeader") != audit.get("asarHeader")
+                or after_audit.get("semanticFingerprint") != audit.get("semanticFingerprint")
+                or after_audit.get("semanticReason") != audit.get("semanticReason")
+                or after_audit.get("classification") != audit.get("classification")
+                or after_audit.get("candidateProfile") != audit.get("candidateProfile")
                 or (audit.get("classification") == "same_protocol_candidate"
                     and (after_audit.get("classification") != "same_protocol_candidate"
                          or after_audit.get("candidateProfile") != audit.get("candidateProfile")
@@ -2274,6 +2831,8 @@ def _handshake_audit(workspace_root: Any) -> dict[str, Any]:
             "processStable": True,
             "runtimeStable": True,
             "protocolClassification": audit.get("classification"),
+            "semanticFingerprint": audit.get("semanticFingerprint"),
+            "semanticReason": audit.get("semanticReason", "not_scanned"),
             "initialize": True,
             "ownerDiscovery": bool(owner),
             "followingChangedSent": session.following_changed_sent,
