@@ -3,8 +3,10 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { Workspace } from "../workspace/manager.js";
 import { DesktopError, desktopIntent, sendInput, statusInput } from "../desktop/store.js";
-import { desktopStatus, sendDesktop } from "../desktop/service.js";
+import { desktopStatus } from "../desktop/service.js";
 import { DESKTOP_CONTROL_SCOPE, DESKTOP_READ_SCOPE } from "../auth/store.js";
+import { RoutingError } from "../routing/schema.js";
+import { deliverCurrentCommand } from "../routing/current-command-transport.js";
 
 export { DESKTOP_CONTROL_SCOPE, DESKTOP_READ_SCOPE };
 
@@ -69,6 +71,7 @@ function fail(code: string, message: string, scope?: string): ToolResult {
 
 function safeError(error: unknown): ToolResult {
   if (error instanceof DesktopError) return fail(error.code, error.message);
+  if (error instanceof RoutingError) return fail(error.code, error.message);
   return fail("DESKTOP_ERROR", "Desktop Control 操作失败；请先读取状态。若投递结果不明，请勿重发，先在 Desktop 人工核对。" );
 }
 
@@ -119,10 +122,22 @@ export function registerDesktopTools(
     (input, extra) => result(async () => {
       const auth = requireAuth(extra.authInfo, DESKTOP_CONTROL_SCOPE);
       authorizeNow(auth);
-      return sendDesktop(workspace, input, auth.clientId, () => {
+      if (input.workspaceId !== workspace.id) {
+        throw new DesktopError("DESKTOP_WRONG_WORKSPACE", "请求工作区不匹配。" );
+      }
+      const delivered = await deliverCurrentCommand(workspace, {
+        commandId: input.commandId,
+        intent: input.intent,
+        payload: input.message,
+        userConfirmed: input.userConfirmed,
+      }, auth.clientId, () => {
         authorizeNow(auth);
         desktopAuthorize?.(auth);
-      });
+      }, input.bindingId);
+      if (!delivered.delivery) {
+        throw new RoutingError("ROUTING_DESKTOP_DELIVERY_MISSING", "Desktop adapter 未返回公开 delivery；拒绝返回不完整结果。" );
+      }
+      return delivered.delivery;
     }, DESKTOP_CONTROL_SCOPE)
   );
 

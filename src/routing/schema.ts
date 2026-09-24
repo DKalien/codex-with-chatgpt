@@ -141,13 +141,20 @@ export type RoutingCommand = z.infer<typeof commandSchema>;
 
 /**
  * 创建入口封死：不接受调用方指定初始 deliveryStatus（strict 拒绝多余字段）。
- * 创建一律产生 pending；accepted/rejected/outcome_unknown 只能由未来 transport
- * 阶段的明确状态转换 API 写入。
+ * 创建一律产生 pending；accepted/rejected/outcome_unknown 只能由显式 delivery
+ * transition API 写入。
  */
 export const commandInputSchema = commandSchema
   .omit({ deliveryStatus: true, createdAt: true, updatedAt: true })
   .strict();
 export type CommandInput = z.infer<typeof commandInputSchema>;
+
+/** 仅允许 transport 为已存在的 pending Command 写入首个终态。 */
+export const commandDeliveryTransitionInputSchema = z.object({
+  commandId: routingCommandIdSchema,
+  deliveryStatus: z.enum(["accepted", "rejected", "outcome_unknown"]),
+}).strict();
+export type CommandDeliveryTransitionInput = z.infer<typeof commandDeliveryTransitionInputSchema>;
 
 /** 执行结果状态；与 feedback 事件 result 枚举对齐。 */
 export const resultStatusSchema = z.enum(["ok", "failed", "blocked"]);

@@ -5,12 +5,14 @@ import { Workspace, WorkspaceError } from "../workspace/manager.js";
 import { ensureDir, getStateDir } from "../config/paths.js";
 import {
   RoutingError,
+  commandDeliveryTransitionInputSchema,
   commandInputSchema,
   resultInputSchema,
   routeRegistrationSchema,
   routingStateSchema,
   routingWorkspaceIdSchema,
   type CommandInput,
+  type CommandDeliveryTransitionInput,
   type ResultInput,
   type RouteRegistration,
   type RoutingCommand,
@@ -115,10 +117,8 @@ export function readRouting(
 
 /**
  * module-private 通用写事务；不 export。
- * 对外只暴露语义 API（registerRoute/createCommand/appendResult），
- * 防止调用方绕过 delivery transition 约束直接任意改写 state。
- * 未来 R2/R3 需要 delivery transition 时新增显式函数
- * （如 markCommandAccepted/Rejected/OutcomeUnknown），各自定义合法转换。
+ * 对外只暴露语义 API，防止调用方绕过 delivery transition 约束直接任意改写 state。
+ * `transitionCommandDelivery()` 负责 pending 到首个 Desktop delivery 终态的显式转换。
  *
  * callback 返回 noWrite: true 表示 exact replay：不 bump revision、不重写主 state 文件。
  * noWrite 附带内部断言：previous 必须存在，且 next.state 与 previous 语义完全相同；
@@ -327,6 +327,43 @@ export function createCommand(
     },
     stateDir,
   );
+}
+
+/** 持久化首次 Desktop delivery outcome；相同终态 replay 只读返回。 */
+export function transitionCommandDelivery(
+  identity: RoutingWorkspaceIdentity,
+  input: CommandDeliveryTransitionInput,
+  stateDir = getStateDir(),
+): RoutingCommand {
+  const parsed = commandDeliveryTransitionInputSchema.parse(input);
+  return updateRouting(identity, (previous) => {
+    const state = previous ?? emptyState(identity);
+    const command = state.commands.find((item) => item.commandId === parsed.commandId);
+    if (!command) {
+      throw new RoutingError("ROUTING_COMMAND_NOT_FOUND", "delivery transition 必须引用本 workspace 已存在的 Command。");
+    }
+    if (command.deliveryStatus === parsed.deliveryStatus) {
+      return { state, result: command, noWrite: true };
+    }
+    if (command.deliveryStatus !== "pending") {
+      throw new RoutingError(
+        "ROUTING_COMMAND_DELIVERY_CONFLICT",
+        "Command 已有不同 delivery 终态；拒绝覆盖或重新解释既有结果。",
+      );
+    }
+    const updated: RoutingCommand = {
+      ...command,
+      deliveryStatus: parsed.deliveryStatus,
+      updatedAt: new Date().toISOString(),
+    };
+    return {
+      state: {
+        ...state,
+        commands: state.commands.map((item) => item.commandId === parsed.commandId ? updated : item),
+      },
+      result: updated,
+    };
+  }, stateDir);
 }
 
 /**

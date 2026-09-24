@@ -850,3 +850,53 @@ H0 不抽象 Codex-specific result classification、terminal fence、receipt fin
 - MV3 `alarms` watchdog 只做低频 `/state` discovery/reconcile；机器睡眠或后台冻结期间不承诺执行，恢复后的生产动作仍须由真实 owner 文档 heartbeat 经过既有 route、DOM、journal、cooldown 与 exact-owner 门禁触发。
 - 用户已在扩展 Reload 后实测 stale-warning 修复；源码提交 `ab79b6a` 已推送，测试/构建门禁通过。此前安装目标 `15c76d1…` 曾因 rollout pending 与 named identity mismatch 未收敛；最新稳定 launcher 已确认 runtime/installed build 一致、`runtimeUpgrade=current`，不把历史 pending 误记为当前阻塞。
 - 现役细节与运行时排障见 [phase-e-feedback.md](phase-e-feedback.md) 的 toolbar/sleep-wake 小节及 [troubleshooting.md](troubleshooting.md) 的 `named_unhealthy` 说明。
+
+## R3a — derived current planner route（2026-09-24，routing foundation 完成）
+
+- 新增 `src/routing/current-planner-route.ts`：current planner route 只从现有 VERIFIED Companion
+  candidate 派生；只读解析精确匹配已注册 planner route，显式 ensure 复用 `registerRoute()` 并保持
+  exact replay 无 revision/file rewrite。未验证时即使有历史 route 也返回 none；身份、损坏 state、
+  role 或 locator 冲突 fail closed。ensure 注册后会 recheck authority；期间目标变化则抛
+  `ROUTE_AUTHORITY_CHANGED`，可能留下的旧 route 仅是 catalog/history，不作为 current 返回。
+- 未在 routing schema/store 增加 active/default/current route pointer；helper 不写 feedback state。
+- 本 slice 不接入 Desktop send、feedback send、route-confirm MCP 或 Browser Companion，亦不宣称
+  one-click bind/reconnect UX 已完成。返回值是时点快照而非 lease；未来调用方须在副作用边界重新解析，
+  不得跨 await / 进程边界沿用。后续调用方与 UX 仍需单独设计/授权。
+
+## R3b — derived current executor route（2026-09-24，routing foundation 完成）
+
+- 新增 `src/routing/current-executor-route.ts`：current executor route 从现有 Desktop binding target
+  派生，显式 ensure 注册后 recheck；binding 中途变化时报 `ROUTE_AUTHORITY_CHANGED`，旧 route 仅保留
+  为 catalog/history。exact replay 不 bump revision、不重写 route 文件。
+- route identity 不包含 enabled、availability 或 busy；helper 不写 Desktop state，不等于发送授权/可用性。
+- 不接 Desktop send、feedback、Browser Companion 或 MCP，不增加 current/default pointer、锁或状态机。
+
+## R3c — current Command adapter（2026-09-24，routing foundation 完成）
+
+- 新增 `src/routing/current-command.ts`：显式 ensure 当前 planner/executor routes，计算 payload 的 UTF-8
+  byte length 与 SHA-256，再复用 `createCommand()` 创建 pending Command；current authority 缺失时不猜历史 route。
+- 同 commandId 的 replay/conflict 仍由现有 store 处理；创建前会同步 re-resolve route，但该结果不是
+  transport lease，未来发送边界仍须重新解析。
+- 仅写 routing store；不接 Desktop send、feedback、Browser Companion 或 MCP，也不新增管理层/锁/pointer。
+
+## R3d — current Command Desktop delivery adapter（2026-09-24，slice 完成）
+
+- 新增 `src/routing/current-command-transport.ts`：重解析当前 planner/executor authority 后复用
+  `sendDesktop()` 作为唯一实际 Desktop sender，并把相同 commandId 的 accepted/rejected/outcome_unknown
+  同步写回 routing Command。
+- `transitionCommandDelivery()` 只允许 pending → 首个终态；精确终态 replay 不改文件，不同终态冲突拒绝。
+  若 Desktop 已持久化而 routing sync 失败，错误直接返回；后续同 commandId replay 校验原 Command 的
+  intent/payload 后只读核对 Desktop durable ledger，匹配时只收敛 routing、不进行第二次 IPC send，且不
+  因 current binding 已切换而阻断。ledger 不存在时仍须重验当前 authority 才可发送。
+- 未接 MCP/现有生产调用方、feedback 或 ExecutionResult；未增加队列/锁/确认流程，Desktop 原有门禁不变。
+
+## R3e — 现有 Desktop send 的 routing 生产接线（2026-09-24，slice 完成）
+
+- `codex_desktop_send` 继续使用原工具名、`sendInput` schema、OAuth scope、`userConfirmed` 与 Desktop public
+  delivery 输出；handler 改走 `deliverCurrentCommand()`，`sendDesktop()` 仍是唯一真实 sender。
+- 必填 `bindingId` 显式核验：新/pending 无 Desktop durable record 时必须等于当前 binding；durable replay 必须等于
+  原 delivery bindingId。匹配 replay 返回原 public delivery，不再 IPC send；错 binding 沿用
+  `DESKTOP_BINDING_MISMATCH` / `DESKTOP_COMMAND_CONFLICT` 拒绝。
+- 新 Command 要求当前 Companion planner route VERIFIED；`RoutingError` 保留明确 code/message。workspace mismatch
+  与 Desktop/OAuth 错误映射保持明确，不改变 `codex_desktop_status`。
+- 未新增 MCP tool、确认、队列或状态机；不接 feedback / ExecutionResult，也不宣称 one-click/reconnect UX 完成。

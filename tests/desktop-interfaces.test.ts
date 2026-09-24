@@ -3,15 +3,22 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { Command } from "commander";
 import fs from "node:fs";
+import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { desktopFile } from "../src/desktop/store.js";
+import { feedbackStateFile } from "../src/feedback/store.js";
 import { startBridge, type Bridge } from "../src/bridge/server.js";
 import { bindDesktop, enableDesktop } from "../src/desktop/service.js";
 import { desktopIpc } from "../src/desktop/ipc.js";
 import { DESKTOP_CONTROL_SCOPE, DESKTOP_READ_SCOPE, filterScopes, getSupportedScopes, SUPPORTED_SCOPES } from "../src/auth/store.js";
 import { registerDesktopCommands } from "../src/cli/desktop.js";
+import { createCurrentCommand } from "../src/routing/current-command.js";
+import { listCommands, listRoutes } from "../src/routing/store.js";
 import { cleanup, isolateStateDir, makeTmpDir } from "./helpers.js";
 
 const THREAD_ID = "01a00000-0000-7000-8000-000000000001";
+const THREAD_ID_2 = "01a00000-0000-7000-8000-000000000003";
+const PLANNER_CONVERSATION_ID = "018c0000-0000-7000-8000-00000000c2c1";
 
 let root: string;
 let stateDir: string;
@@ -33,6 +40,41 @@ async function clientFor(scopes: string[], clientId = "desktop-interface-test"):
     requestInit: { headers: { authorization: `Bearer ${token.accessToken}` } },
   }));
   return client;
+}
+
+function seedVerifiedPlannerRoute(): void {
+  const routeCanonical = `https://chatgpt.com/c/${PLANNER_CONVERSATION_ID}`;
+  const now = new Date().toISOString();
+  const file = feedbackStateFile(bridge.workspace.id);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify({
+    version: 1,
+    workspaceId: bridge.workspace.id,
+    projectionCursor: 0,
+    binding: null,
+    events: [],
+    pairingIntent: null,
+    companion: {
+      version: 1,
+      companionId: randomUUID(),
+      bindingId: randomUUID(),
+      epoch: 0,
+      principalFingerprint: "a".repeat(32),
+      credentialHash: "b".repeat(64),
+      routeCanonical,
+      pairedAt: now,
+      routeAttestation: {
+        status: "verified",
+        challengeId: randomUUID(),
+        challengeDigest: "c".repeat(64),
+        routeCanonical,
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+        verifiedAt: now,
+      },
+    },
+    rebindIntent: null,
+    rebindPredecessor: null,
+  }));
 }
 
 beforeEach(async () => {
@@ -159,6 +201,7 @@ describe("Desktop MCP 与本地接口", () => {
 
   it.each(["development_plan", "revision"])("Bridge %s 保留完整中文正文，并只返回真实 accepted 回执", async intent => {
     vi.spyOn(desktopIpc, "inspect").mockResolvedValue({ title: "测试 Desktop 会话" } as never);
+    seedVerifiedPlannerRoute();
     const prefix = "中文计划\n\n";
     const message = prefix + "中".repeat(21000) + "x";
     const send = vi.fn(async (sent: string) => {
@@ -175,7 +218,143 @@ describe("Desktop MCP 与本地接口", () => {
       arguments: { intent, userConfirmed: true, workspaceId: bridge.workspace.id, bindingId: binding.bindingId, commandId: "accepted_command", message },
     }));
     expect(result).toMatchObject({ deliveryStatus: "accepted", threadId: THREAD_ID, turnId: "01a00000-0000-7000-8000-000000000002" });
+    const command = listCommands(bridge.workspace)[0];
+    const routes = listRoutes(bridge.workspace);
+    expect(command).toMatchObject({ commandId: "accepted_command", intent, deliveryStatus: "accepted" });
+    expect(routes.find(route => route.routeId === command.plannerRouteId)).toMatchObject({
+      role: "planner", platform: "chatgpt_web", conversationId: PLANNER_CONVERSATION_ID,
+    });
+    expect(routes.find(route => route.routeId === command.executorRouteId)).toMatchObject({
+      role: "executor", platform: "codex_desktop", conversationId: THREAD_ID,
+    });
     expect(send).toHaveBeenCalledTimes(1);
+    await client.close();
+  });
+
+  it("新 command 的 stale bindingId 不会自动切换目标或进入 IPC", async () => {
+    vi.spyOn(desktopIpc, "inspect").mockResolvedValue({ title: "测试 Desktop 会话" } as never);
+    seedVerifiedPlannerRoute();
+    const binding = await bindDesktop(bridge.workspace, { threadId: THREAD_ID, hostId: "local", projectId: "project_test" });
+    enableDesktop(bridge.workspace, binding.bindingId);
+    const prepare = vi.spyOn(desktopIpc, "prepare");
+    const client = await clientFor([DESKTOP_CONTROL_SCOPE]);
+    const response = await client.callTool({
+      name: "codex_desktop_send",
+      arguments: {
+        intent: "development_plan", userConfirmed: true, workspaceId: bridge.workspace.id,
+        bindingId: randomUUID(), commandId: "stale_binding_command", message: "完整计划",
+      },
+    });
+
+    expect(response.isError).toBe(true);
+    expect(jsonOf<{ error: string }>(response).error).toBe("DESKTOP_BINDING_MISMATCH");
+    expect(prepare).not.toHaveBeenCalled();
+    expect(listCommands(bridge.workspace)).toEqual([]);
+    await client.close();
+  });
+
+  it("pending 且无 Desktop durable record 时，bindingId 仍须匹配当前 target", async () => {
+    vi.spyOn(desktopIpc, "inspect").mockResolvedValue({ title: "测试 Desktop 会话" } as never);
+    seedVerifiedPlannerRoute();
+    const originalBinding = await bindDesktop(bridge.workspace, { threadId: THREAD_ID, hostId: "local", projectId: "project_test" });
+    enableDesktop(bridge.workspace, originalBinding.bindingId);
+    createCurrentCommand(bridge.workspace, {
+      commandId: "pending_binding_switch", intent: "revision", payload: "完整修订",
+    });
+    const currentBinding = await bindDesktop(bridge.workspace, {
+      threadId: THREAD_ID_2, hostId: "local", projectId: "project_next",
+    });
+    enableDesktop(bridge.workspace, currentBinding.bindingId);
+    const prepare = vi.spyOn(desktopIpc, "prepare");
+    const client = await clientFor([DESKTOP_CONTROL_SCOPE]);
+    const input = {
+      intent: "revision", userConfirmed: true, workspaceId: bridge.workspace.id,
+      commandId: "pending_binding_switch", message: "完整修订",
+    };
+
+    const staleTarget = await client.callTool({
+      name: "codex_desktop_send", arguments: { ...input, bindingId: originalBinding.bindingId },
+    });
+    expect(staleTarget.isError).toBe(true);
+    expect(jsonOf<{ error: string }>(staleTarget).error).toBe("DESKTOP_BINDING_MISMATCH");
+
+    const changedRoute = await client.callTool({
+      name: "codex_desktop_send", arguments: { ...input, bindingId: currentBinding.bindingId },
+    });
+    expect(changedRoute.isError).toBe(true);
+    expect(jsonOf<{ error: string }>(changedRoute).error).toBe("ROUTE_AUTHORITY_CHANGED");
+    expect(prepare).not.toHaveBeenCalled();
+    expect(listCommands(bridge.workspace)).toMatchObject([{ commandId: "pending_binding_switch", deliveryStatus: "pending" }]);
+    await client.close();
+  });
+
+  it("durable replay 返回原 delivery、保留原 bindingId，改 bindingId 冲突且不二次发送", async () => {
+    vi.spyOn(desktopIpc, "inspect").mockResolvedValue({ title: "测试 Desktop 会话" } as never);
+    seedVerifiedPlannerRoute();
+    const binding = await bindDesktop(bridge.workspace, { threadId: THREAD_ID, hostId: "local", projectId: "project_test" });
+    enableDesktop(bridge.workspace, binding.bindingId);
+    const send = vi.fn(async () => ({ threadId: THREAD_ID, turnId: "01a00000-0000-7000-8000-000000000004" }));
+    const prepare = vi.spyOn(desktopIpc, "prepare").mockResolvedValue({ send, close: vi.fn() } as never);
+    const client = await clientFor([DESKTOP_CONTROL_SCOPE]);
+    const input = {
+      intent: "revision", userConfirmed: true, workspaceId: bridge.workspace.id,
+      bindingId: binding.bindingId, commandId: "durable_binding_replay", message: "完整修订",
+    };
+    const first = await client.callTool({ name: "codex_desktop_send", arguments: input });
+    const sameBindingReplay = await client.callTool({ name: "codex_desktop_send", arguments: input });
+
+    expect(first.isError).not.toBe(true);
+    expect(sameBindingReplay.isError).not.toBe(true);
+    expect(jsonOf(sameBindingReplay)).toEqual(jsonOf(first));
+    expect(prepare).toHaveBeenCalledOnce();
+    expect(send).toHaveBeenCalledOnce();
+
+    const nextBinding = await bindDesktop(bridge.workspace, {
+      threadId: THREAD_ID_2, hostId: "local", projectId: "project_next",
+    });
+    enableDesktop(bridge.workspace, nextBinding.bindingId);
+    const afterSwitch = await client.callTool({ name: "codex_desktop_send", arguments: input });
+    expect(afterSwitch.isError).not.toBe(true);
+    expect(jsonOf(afterSwitch)).toEqual(jsonOf(first));
+
+    const changedBindingReplay = await client.callTool({
+      name: "codex_desktop_send", arguments: { ...input, bindingId: nextBinding.bindingId },
+    });
+    expect(changedBindingReplay.isError).toBe(true);
+    expect(jsonOf<{ error: string }>(changedBindingReplay).error).toBe("DESKTOP_COMMAND_CONFLICT");
+    expect(prepare).toHaveBeenCalledOnce();
+    expect(send).toHaveBeenCalledOnce();
+    await client.close();
+  });
+
+  it("send 在 workspace 不匹配或 Companion route 未 VERIFIED 时返回明确错误且不发送", async () => {
+    vi.spyOn(desktopIpc, "inspect").mockResolvedValue({ title: "测试 Desktop 会话" } as never);
+    const binding = await bindDesktop(bridge.workspace, { threadId: THREAD_ID, hostId: "local", projectId: "project_test" });
+    enableDesktop(bridge.workspace, binding.bindingId);
+    const prepare = vi.spyOn(desktopIpc, "prepare");
+    const client = await clientFor([DESKTOP_CONTROL_SCOPE]);
+
+    const wrongWorkspace = await client.callTool({
+      name: "codex_desktop_send",
+      arguments: {
+        intent: "development_plan", userConfirmed: true, workspaceId: "wrong_workspace",
+        bindingId: binding.bindingId, commandId: "wrong_workspace_command", message: "完整计划",
+      },
+    });
+    expect(wrongWorkspace.isError).toBe(true);
+    expect(jsonOf<{ error: string }>(wrongWorkspace).error).toBe("DESKTOP_WRONG_WORKSPACE");
+
+    const unverifiedPlanner = await client.callTool({
+      name: "codex_desktop_send",
+      arguments: {
+        intent: "development_plan", userConfirmed: true, workspaceId: bridge.workspace.id,
+        bindingId: binding.bindingId, commandId: "unverified_planner_command", message: "完整计划",
+      },
+    });
+    expect(unverifiedPlanner.isError).toBe(true);
+    expect(jsonOf<{ error: string }>(unverifiedPlanner).error).toBe("ROUTING_ROUTE_NOT_FOUND");
+    expect(prepare).not.toHaveBeenCalled();
+    expect(listCommands(bridge.workspace)).toEqual([]);
     await client.close();
   });
 
@@ -197,6 +376,7 @@ describe("Desktop MCP 与本地接口", () => {
 
   it("提交点重新验证已撤销的 OAuth，撤销期间不发送且不写投递记录", async () => {
     vi.spyOn(desktopIpc, "inspect").mockResolvedValue({ title: "测试 Desktop 会话" } as never);
+    seedVerifiedPlannerRoute();
     const binding = await bindDesktop(bridge.workspace, { threadId: THREAD_ID, hostId: "local", projectId: "project_test" });
     enableDesktop(bridge.workspace, binding.bindingId);
     const send = vi.fn(async () => ({ threadId: THREAD_ID, turnId: "01a00000-0000-7000-8000-000000000002" }));

@@ -1,4 +1,4 @@
-# Routing Architecture（R1 — Project Route Foundation）
+# Routing Architecture（R1 foundation + R3 derived routes）
 
 Routing 是 C2C 的新语义身份层：以 workspace-scoped semantic identity 描述
 "哪个对话在哪个平台上扮演什么角色"，并把 Command / ExecutionResult 建模为
@@ -65,8 +65,8 @@ Planner route → Project → Command → Executor route → ExecutionResult →
 - Planner route 上的规划会话产生 Command，Command 显式引用 `plannerRouteId` 与
   `executorRouteId`（schema 强制 planner→planner、executor→executor，角色放反即拒绝）。
 - Executor route 执行后产出 ExecutionResult，结果沿 Command 引用回流到 Planner route。
-- R1 不设计 active/default route：Command 总是显式引用两条 route，基础模型已闭合；
-  "哪个 planner route 是当前默认回流目标"留待 R3 一键绑定时定义，不提前造第二套
+- Routing store 不保存 active/default route 指针。当前 planner route 从现有 VERIFIED Browser
+  Companion authority 派生；当前 executor route 从现有 Desktop binding target 派生，避免第二个
   binding 状态机。
 
 ## Durable store
@@ -91,19 +91,84 @@ Planner route → Project → Command → Executor route → ExecutionResult →
   `legacyReferenceId=bindingId`）。
 - 旧 feedback → planner candidate，仅当 Companion route attestation 已 VERIFIED；
   否则 `planner candidate = none`。
-- 不生成 routeId、不写 routing store、不写任何旧 state；真正注册成 Route 是以后
-  显式 migration/rebind 的事。
+- projection 本身不生成 routeId、不写 routing store 或任何旧 state；R3a 的独立显式 ensure
+  才会按当前 VERIFIED candidate 注册 Route，不代表旧 state migration 或 rebind。
+
+## R3a 当前 planner route（基础层，未接生产调用方）
+
+- `src/routing/current-planner-route.ts` 复用 `projectLegacyRoutes()` 的 Companion attestation
+  authority；没有 VERIFIED 候选时 current planner route 为 `none`，即使 store 中留有历史 planner
+  route 也不会因“最新”而自动成为 current。
+- 只读解析仅按候选的精确 `(platform=chatgpt_web, conversationId)` 查找已注册 route；role 必须为
+  `planner`，locator 必须与候选完全一致，否则使用 `ROUTE_ROLE_CONFLICT` 或
+  `ROUTE_LOCATOR_CONFLICT` fail closed。身份与 routing-state 损坏仍沿用现有 workspace/store 错误。
+- 显式 `ensureCurrentPlannerRoute()` 先调用现有 `registerRoute()`，再重新读取并核对 VERIFIED
+  Companion authority；若当前候选已不再解析到刚注册的 route，则抛 `ROUTE_AUTHORITY_CHANGED`，
+  旧 route 可留在 catalog/history，但调用方不得当作 current 使用。exact replay 仍不 bump revision、
+  不重写 routing state。该 helper 不写 feedback/Companion state。
+- 当前 route 是每次从已验证 Companion authority 推导的结果，不是新的持久指针；旧 routing route
+  仍作为 catalog/history 保存。此 R3a 仅为 routing foundation，不接 Desktop send、feedback send、
+  route-confirm MCP 或 Browser Companion，也不代表一键绑定/重连 UX 已完成。
+- ensure 返回值只是最终 recheck 时点的快照，不是 lease；后续 R3b 必须在实际副作用边界重新解析，
+  不能跨 `await` 或进程边界把返回 route 当作持续有效的 authority。
+
+## R3b 当前 executor route（基础层，未接生产调用方）
+
+- `src/routing/current-executor-route.ts` 复用 `projectLegacyRoutes()` 的 Desktop binding candidate；
+  route identity 表达当前绑定的 thread/project target，不包含 enabled、availability 或 busy 状态。
+- 只读解析精确匹配已注册的 `codex_desktop` executor route；显式 ensure 复用 `registerRoute()`，
+  exact replay 不改 revision/文件，并在注册后重读 binding。若 binding 在 ensure 期间变化则抛
+  `ROUTE_AUTHORITY_CHANGED`；旧 route 可留作 catalog/history，但不作为 current 返回。
+- helper 只读 Desktop state，不代表 Desktop 可发送或已空闲；返回值是时点快照而非 lease。此 slice
+  不接 Desktop send、feedback、Companion 或 MCP，也不新增持久 current/default pointer。
+
+## R3c 当前 Command adapter（基础层，未接 transport）
+
+- `src/routing/current-command.ts` 显式 ensure 当前 planner 与 executor route；缺少任一当前 authority
+  时抛 `ROUTING_ROUTE_NOT_FOUND`，不从历史 route 推断。它以原始 payload 的 UTF-8 byte length 和
+  SHA-256 调用现有 `createCommand()`，由 routing store 负责 pending 状态与 commandId 幂等/冲突语义。
+- 创建前同步 re-resolve 两条 route 以减少明显 stale；这仍只是时点检查，不是 transport lease。任何
+  未来发送边界必须重新解析当前 authority。该 adapter 只写 routing store，不调用 send、不写 Desktop/
+  feedback/Companion，也不接 MCP。
+
+## R3d Command → Desktop delivery adapter
+
+- `src/routing/current-command-transport.ts` 复用 `createCurrentCommand()`；投递前同步重新解析
+  当前 VERIFIED planner 与 Desktop binding executor，并把与 digest/bytes 完全相同的原始 payload
+  交给唯一 transport `sendDesktop()`。Desktop 仍独立执行现有授权、binding、busy、replay、owner/process
+  与 outcome_unknown 门禁；此检查只是时点快照，不是 lease。
+- 新增 `transitionCommandDelivery()`，仅允许既有 pending Command 转为 `accepted / rejected /
+  outcome_unknown`；相同终态 replay 不写文件，不同终态抛 `ROUTING_COMMAND_DELIVERY_CONFLICT`。
+- routing 同步失败直接暴露；pending Command 的同 commandId replay 先校验 intent/payload，再只读核对
+  Desktop durable ledger。记录与原 executor route 一致时只 transition routing、不 IPC send，也不要求
+  当前 binding 未变化；ledger 无记录时才要求当前 planner/executor authority 一致并调用 sender。
+  不新增重发/补偿队列。
+- 已是 routing 终态的 exact replay 直接返回既有 Command，不要求 current route 未变化，也不再次调用
+  Desktop。R3d 本身不处理 feedback / ExecutionResult。
+
+## R3e 生产 MCP send 接线
+
+- 现有 `codex_desktop_send` handler 调用 `deliverCurrentCommand()`；工具名、`sendInput` schema、OAuth
+  scope、`userConfirmed:true` 和 Desktop public delivery 输出保持不变。`sendDesktop()` 仍是唯一真实 sender。
+- 显式传入的 `bindingId` 不会被 routing 自动替换：新 Command 及无 durable record 的 pending Command
+  必须匹配当前 binding；已有 Desktop delivery 的 replay 必须匹配原 delivery 的 `bindingId`，并返回原 public
+  delivery。不同 binding 沿用 `DESKTOP_BINDING_MISMATCH` / `DESKTOP_COMMAND_CONFLICT` 拒绝，不二次发送。
+- 新 Command 还要求当前 Companion planner route 已 VERIFIED；缺少 authority 时 routing 错误原样返回，发送不进入 IPC。
+- 仅 `codex_desktop_send` 接入；不接 feedback / ExecutionResult，不宣称 one-click bind/reconnect UX 完成。
 
 ## R2 状态（2026-09-24）
 
 R2（Desktop Behavioral Adapter）已把 Desktop 生产信任路径切换为 live 行为证明：
 Desktop 是否可用由当前进程/owner/project/workspace 核验与发送后 canonical turn 证明决定，
 版本/app-server hash/ASAR/catalog/semantic fingerprint 预登记体系整体删除。
-本文件描述的 Routing foundation 仍未接入生产发送；Desktop send 仍走原 behavioral 路径。
+R3e 将现有 `codex_desktop_send` 接到 R3d adapter；底层仍复用原 Desktop behavioral send 路径，
+不改变 `sendDesktop()` 的信任边界。
 
-## R1 边界（明确不做）
+## R1/R3 边界（明确不做）
 
-- 无 transport：不实现 command 真实投递/执行通道，不接 executor adapter 调用。
-- 无生产调用方：现有 Desktop send、feedback、Companion、rollout 零行为变化。
+- R3e 仅把现有 `codex_desktop_send` 接入 R3d adapter；`codex_desktop_status`、feedback、Companion、rollout
+  wiring 不变，不新增 MCP tool。
+- 不做 feedback/ExecutionResult 回流或 executor 执行通道。
 - 不修改 Desktop IPC trust、Companion transport、rollout、OAuth 门禁。
-- 不做 active/default route（R3）、rawSummary/machineEvidence（R4）、一键绑定（R3）。
+- 不做 rawSummary/machineEvidence（R4）或一键绑定/重连 UX；R3a/R3b 派生 routes，R3c 创建 Command，R3d
+  提供 Desktop delivery adapter，R3e 仅接通现有 send tool。
