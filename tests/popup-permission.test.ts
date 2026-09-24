@@ -171,6 +171,27 @@ describe("popup Bridge permission and Pair separation", () => {
     expect(JSON.stringify(calls.page)).not.toMatch(/route|document|tab|credential|principal|secret/);
   });
 
+  it("reports bootstrap takeover waiting without exposing a body field", async () => {
+    const { calls, elements } = await loadPopup(true, true, {
+      status: { connectState: "WAITING_TAKEOVER" },
+      connectResult: { ok: true, state: "WAITING_TAKEOVER" },
+    });
+    await elements.get("connect-chat")!.onclick!();
+    expect(calls.page).toEqual([{ type: "c2c.connect.request" }]);
+    expect(elements.get("connect-status")!.textContent).toBe("正在等待当前 Chat 接管连接");
+    expect(elements.get("user-connection-status")!.textContent).toBe("正在等待当前 Chat 接管连接");
+    expect(elements.get("user-action-hint")!.textContent).toContain("完成反馈连接接管");
+  });
+
+  it("surfaces an exact bootstrap tool-missing diagnostic without retrying the message", async () => {
+    const { calls, elements } = await loadPopup(true, true, {
+      status: { connectState: "WAITING_TAKEOVER", connectReason: "bootstrap_tool_missing" },
+    });
+    expect(elements.get("user-connection-status")!.textContent).toBe("当前对话缺少反馈连接工具");
+    expect(elements.get("user-action-hint")!.textContent).toContain("不会自动重发自举消息");
+    expect(calls.page).toEqual([]);
+  });
+
   it("Connect reports denied Bridge permission before contacting the page", async () => {
     const { calls, elements } = await loadPopup(false);
     elements.get("bridge-origin")!.value = "https://bridge.example.test";

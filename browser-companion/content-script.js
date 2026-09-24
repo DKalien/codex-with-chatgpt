@@ -53,11 +53,18 @@
   function buildObserveMessage() {
     const parsed = parseRoute(location.href);
     const safety = observeSafety();
+    let feedbackBootstrapToolMissing = false;
+    try {
+      feedbackBootstrapToolMissing = globalThis.__c2cFeedbackBootstrapToolMissingReply?.(document) === true;
+    } catch {
+      feedbackBootstrapToolMissing = false;
+    }
     return {
       type: "c2c.observe",
       href: location.href,
       canonicalRoute: parsed ? parsed.canonical : null,
       generation,
+      feedbackBootstrapToolMissing,
       safety: {
         composer: safety.composer,
         generation: safety.generation,
@@ -125,7 +132,7 @@
   // Resume evidence immediately after the document is installed; no DOM mutation.
   heartbeat();
 
-  chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (!message || typeof message !== "object") {
       sendResponse({ ok: false, reason: "bad_message" });
       return false;
@@ -359,6 +366,53 @@
           canonicalRoute: parsed ? parsed.canonical : null,
           generation,
           type: "c2c.route.attest.result",
+        });
+      })();
+      return true;
+    }
+    if (message.type === "c2c.feedback.bootstrap.execute") {
+      const workerUrl = chrome.runtime.getURL("service-worker.js");
+      if (sender?.id !== chrome.runtime.id || sender?.url !== workerUrl) {
+        sendResponse({ ok: false, reason: "bootstrap_sender_invalid", mutationAttempted: false });
+        return false;
+      }
+      const expectedRoute = typeof message.expectedRoute === "string" ? message.expectedRoute : "";
+      const expectedGeneration = message.expectedGeneration;
+      if (typeof globalThis.__c2cRunFeedbackBootstrapSend !== "function") {
+        sendResponse({ ok: false, reason: "bootstrap_capability_missing", mutationAttempted: false });
+        return false;
+      }
+      void (async () => {
+        let result;
+        try {
+          result = await globalThis.__c2cRunFeedbackBootstrapSend(document, {
+            expectedRoute,
+            expectedGeneration,
+            locationHref: location.href,
+            getCurrentGeneration: () => generation,
+            snapshotUserTurns: typeof globalThis.snapshotUserTurns === "function"
+              ? (doc) => globalThis.snapshotUserTurns(doc)
+              : undefined,
+            normalizeText: typeof globalThis.normalizeCanonicalDomText === "function"
+              ? (text) => globalThis.normalizeCanonicalDomText(text)
+              : undefined,
+          });
+        } catch {
+          result = { ok: false, reason: "bootstrap_outcome_unknown", mutationAttempted: true, clickAttempted: true };
+        }
+        const parsed = parseRoute(location.href);
+        sendResponse({
+          ok: result?.ok === true,
+          mode: "feedback_bootstrap_send",
+          reason: result?.ok ? undefined : (result?.reason || "bootstrap_failed"),
+          mutationAttempted: result?.mutationAttempted === true,
+          wrote: result?.wrote === true,
+          clickAttempted: result?.clickAttempted === true,
+          clicked: result?.clicked === true,
+          observed: result?.observed === true,
+          canonicalRoute: parsed ? parsed.canonical : null,
+          generation,
+          type: "c2c.feedback.bootstrap.result",
         });
       })();
       return true;

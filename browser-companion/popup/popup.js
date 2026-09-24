@@ -73,8 +73,15 @@
     el.className = "value" + (cls ? " " + cls : "");
   }
 
-  function friendlyConnectState(transport, isOwner, connectReason) {
+  function friendlyConnectState(transport, isOwner, connectReason, connectState) {
     if (transport?.authStale) return ["连接需要修复", "bad"];
+    if (connectReason === "bootstrap_tool_missing") {
+      return ["当前对话缺少反馈连接工具", "bad"];
+    }
+    if (connectState === "WAITING_TAKEOVER") return ["正在等待当前 Chat 接管连接", "warn"];
+    if (connectState === "TAKEOVER_DISPATCH" || connectState === "OUTCOME_UNKNOWN") {
+      return ["连接发送结果待确认，请勿重复发送", "bad"];
+    }
     if (connectReason === "bridge_permission_missing") {
       return ["需要授权连接服务", "warn"];
     }
@@ -104,6 +111,8 @@
         return "当前页面暂时无法连接，请刷新 ChatGPT 页面后再试。";
       case "cold_pair_required":
         return "首次使用需要配对，请粘贴配对信息并点击一次完成连接。";
+      case "bootstrap_tool_missing":
+        return "当前对话缺少反馈连接工具，请检查 ChatGPT 工具连接后再继续。";
       default:
         return "连接遇到问题，请展开连接设置查看详情。";
     }
@@ -394,6 +403,7 @@
       transport,
       isOwner,
       status?.connectReason,
+      status?.connectState,
     );
     const ownerNeedsReconnect = connectionText === "当前页面需要重新连接";
     setText(els.userConnectionStatus, connectionText, connectionClass);
@@ -402,8 +412,12 @@
       ? "页面刷新后需要重新确认当前页面，请点击“连接当前对话”。"
       : connectionText === "当前对话已连接"
       ? (armed ? "执行结果会自动回到当前对话。" : "如需自动回流，请勾选确认后开启。")
-        : (transport?.rebindPending
+        : (status?.connectReason === "bootstrap_tool_missing"
+          ? "请在当前 Chat 启用 feedback_status 与 feedback_takeover 工具；不会自动重发自举消息。"
+          : transport?.rebindPending
           ? "请回到 ChatGPT 完成确认。"
+          : status?.connectState === "WAITING_TAKEOVER"
+            ? "正在等待当前 Chat 完成反馈连接接管；完成后会自动继续验证。"
           : transport?.connected
             ? "请完成当前对话验证；如未自动出现验证消息，可展开连接设置。"
             : "点击“连接当前对话”开始使用。遇到问题可展开连接设置。");
@@ -554,6 +568,8 @@
         const text = res?.ok
           ? (res.state === "CONNECTED"
               ? "当前对话已连接"
+              : res.state === "WAITING_TAKEOVER"
+                ? "正在等待当前 Chat 接管连接"
               : "已发送连接验证，请回到 ChatGPT 完成确认")
           : friendlyConnectReason(reason);
         setText(els.connectDiagnostic, reason || "ok", res?.ok ? "ok" : "bad");

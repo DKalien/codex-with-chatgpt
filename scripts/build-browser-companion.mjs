@@ -474,6 +474,43 @@ if (/globalThis\.resolveMutationCanonicalRoute\s*=/.test(routeAttestRunClassicTe
   fail("classic route-attestation-run-global must not expose unnamespaced resolveMutationCanonicalRoute");
 }
 
+// Fixed feedback takeover message runner. The executor gets no body from callers.
+const bootstrapRunSrc = fs.readFileSync(path.join(srcCompanion, "feedback-bootstrap-run.js"), "utf8");
+if (!/export async function runFeedbackBootstrapSend/.test(bootstrapRunSrc)
+  || !/export function isFeedbackBootstrapMessage/.test(bootstrapRunSrc)) {
+  fail("feedback-bootstrap-run.js must export its fixed validator and one-shot runner");
+}
+const bootstrapRunClassic = `// fixed feedback bootstrap one-shot runner
+(function () {
+const areChatgptConversationRoutesEquivalent = globalThis.areChatgptConversationRoutesEquivalent || ((left, right) => {
+  const parser = globalThis.parseChatgptConversationRoute;
+  if (typeof parser !== "function") return false;
+  try { return parser(left, { conversationIdPolicy: "uuid" }).canonical === parser(right, { conversationIdPolicy: "uuid" }).canonical; } catch { return false; }
+});
+const resolveChatGptComposer = globalThis.resolveChatGptComposer;
+const resolveChatGptAction = globalThis.resolveChatGptAction;
+const normalizeCanonicalDomText = globalThis.normalizeCanonicalDomText;
+const readCanonicalComposerText = globalThis.__c2cReadCanonicalComposerText;
+const writeCanonicalMessage = globalThis.__c2cWriteCanonicalMessage;
+const verifyCanonicalComposer = globalThis.__c2cVerifyCanonicalComposer;
+const dispatchNativeSend = globalThis.__c2cDispatchNativeSend;
+const resolveMutationCanonicalRoute = globalThis.__c2cResolveMutationCanonicalRoute;
+const collectBoundedDescendants = globalThis.collectBoundedDescendants;
+const snapshotUserTurns = globalThis.snapshotUserTurns;
+${stripExports(bootstrapRunSrc)}
+;globalThis.__c2cRunFeedbackBootstrapSend = runFeedbackBootstrapSend;
+;globalThis.__c2cFeedbackBootstrapToolMissingReply = hasFeedbackBootstrapToolMissingReply;
+})();
+`;
+fs.writeFileSync(path.join(distCompanion, "feedback-bootstrap-run-global.js"), bootstrapRunClassic, "utf8");
+const bootstrapRunClassicText = assertClassicArtifact(
+  path.join(distCompanion, "feedback-bootstrap-run-global.js"),
+  "feedback-bootstrap-run-global.js",
+);
+if (!/globalThis\.__c2cRunFeedbackBootstrapSend\s*=\s*runFeedbackBootstrapSend/.test(bootstrapRunClassicText)) {
+  fail("classic feedback-bootstrap-run-global must expose its fixed runner");
+}
+
 // ESM route-attestation artifacts must remain importable for service-worker + unit tests.
 for (const esmName of ["route-attestation.js", "route-attestation-run.js"]) {
   const esmPath = path.join(distCompanion, esmName);
@@ -549,8 +586,10 @@ const requiredFiles = [
   "route-global.js",
   "route-attestation.js",
   "route-attestation-run.js",
+  "feedback-bootstrap-run.js",
   "route-attestation-global.js",
   "route-attestation-run-global.js",
+  "feedback-bootstrap-run-global.js",
   "popup/popup.html",
   "popup/popup.js",
 ];
@@ -627,6 +666,7 @@ const csJs = (manifest.content_scripts ?? []).flatMap((cs) => cs.js ?? []);
 for (const bannedCs of [
   "route-attestation.js",
   "route-attestation-run.js",
+  "feedback-bootstrap-run.js",
   "dom-adapter.js",
   "turn-observer.js",
 ]) {
@@ -637,6 +677,7 @@ for (const bannedCs of [
 for (const requiredCs of [
   "route-attestation-global.js",
   "route-attestation-run-global.js",
+  "feedback-bootstrap-run-global.js",
   "dom-adapter-global.js",
   "turn-observer-global.js",
 ]) {
@@ -655,6 +696,7 @@ const expectedCsOrder = [
   "send-probe-run.js",
   "route-attestation-global.js",
   "route-attestation-run-global.js",
+  "feedback-bootstrap-run-global.js",
   "production-send-runtime-global.js",
   "content-script.js",
 ];
@@ -701,6 +743,23 @@ for (const dep of routeAttestRunDeps) {
   const providerText = fs.readFileSync(path.join(distCompanion, dep.file), "utf8");
   if (!dep.expose.test(providerText)) {
     fail(`route-attest run dep ${dep.symbol}: ${dep.file} does not expose ${dep.expose}`);
+  }
+}
+const bootstrapRunDeps = [
+  ...routeAttestRunDeps.filter(({ file }) => file !== "route-attestation-global.js"),
+  { symbol: "areChatgptConversationRoutesEquivalent", file: "route-global.js", expose: /globalThis\.areChatgptConversationRoutesEquivalent\s*=/ },
+  { symbol: "collectBoundedDescendants", file: "turn-observer-global.js", expose: /globalThis\.collectBoundedDescendants\s*=/ },
+];
+const bootstrapRunIdx = csJs.indexOf("feedback-bootstrap-run-global.js");
+if (bootstrapRunIdx < 0) fail("manifest missing feedback-bootstrap-run-global.js");
+for (const dep of bootstrapRunDeps) {
+  const idx = csJs.indexOf(dep.file);
+  if (idx < 0 || idx >= bootstrapRunIdx) {
+    fail(`feedback bootstrap dep ${dep.symbol}: ${dep.file} must load before feedback-bootstrap-run-global.js`);
+  }
+  const providerText = fs.readFileSync(path.join(distCompanion, dep.file), "utf8");
+  if (!dep.expose.test(providerText)) {
+    fail(`feedback bootstrap dep ${dep.symbol}: ${dep.file} does not expose ${dep.expose}`);
   }
 }
 const writeClassicForDeps = fs.readFileSync(path.join(distCompanion, "composer-write-adapter.js"), "utf8");

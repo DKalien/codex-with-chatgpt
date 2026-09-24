@@ -1453,6 +1453,7 @@ describe("E1b3d2a runtime packaging gates", () => {
       "send-probe-run.js",
       "route-attestation-global.js",
       "route-attestation-run-global.js",
+      "feedback-bootstrap-run-global.js",
       "production-send-runtime-global.js",
       "content-script.js",
     ]);
@@ -1461,6 +1462,7 @@ describe("E1b3d2a runtime packaging gates", () => {
     expect(js).not.toContain("production-send-runtime.js");
     expect(js).not.toContain("route-attestation.js");
     expect(js).not.toContain("route-attestation-run.js");
+    expect(js).not.toContain("feedback-bootstrap-run.js");
     expect(js).not.toContain("dom-adapter.js");
     expect(js).not.toContain("turn-observer.js");
     expect(js).toContain("dom-adapter-global.js");

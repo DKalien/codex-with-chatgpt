@@ -316,6 +316,182 @@ describe("G4c one-click connect orchestration", () => {
     }
   });
 
+  it("A. NOT_SUCCESSOR binds the new page and sends one fixed bootstrap instead of cold-pairing", async () => {
+    const worker = await loadWorker(responseBody(), {
+      oldRoute: OLD_ROUTE,
+      transport: { routeVerification: "VERIFIED" },
+      fetch: async (url) => String(url).includes("/rebind/init")
+        ? jsonResponse(409, { error: "COMPANION_REBIND_NOT_SUCCESSOR" })
+        : Promise.reject(new Error(`unexpected URL ${String(url)}`)),
+      tabsSendMessage: async (_tabId, message) => ({
+        type: "c2c.feedback.bootstrap.result",
+        mode: "feedback_bootstrap_send",
+        ok: true,
+        mutationAttempted: true,
+        clickAttempted: true,
+        clicked: true,
+        observed: true,
+        canonicalRoute: ROUTE,
+        generation: 1,
+      }),
+    });
+    const sender = { tab: { id: 7 }, documentId: "document-g4-rebind", frameId: 0, url: ROUTE };
+    const result = await worker.send({
+      type: "c2c.connect.page",
+      generation: 1,
+      safety: { composer: "empty", generation: "idle", safe: true },
+    }, sender) as Record<string, any>;
+
+    expect(result).toMatchObject({ ok: true, state: "WAITING_TAKEOVER" });
+    expect(result.reason).not.toBe("cold_pair_required");
+    expect(worker.local.values.get(CONNECT_KEY)).toMatchObject({ state: "WAITING_TAKEOVER", challengeId: null });
+    expect(worker.tabsSendMessage).toHaveBeenCalledTimes(1);
+    expect(worker.tabsSendMessage.mock.calls[0][1]).toEqual({
+      type: "c2c.feedback.bootstrap.execute",
+      expectedRoute: ROUTE,
+      expectedGeneration: 1,
+    });
+    expect(worker.fetchMock.mock.calls.filter(([url]) => String(url).includes("/rebind/init"))).toHaveLength(1);
+  });
+
+  it("C. repeated exact-owner heartbeat waits for takeover without resending bootstrap", async () => {
+    const worker = await loadWorker(responseBody(), {
+      oldRoute: OLD_ROUTE,
+      fetch: async (url) => String(url).includes("/rebind/init")
+        ? jsonResponse(409, { error: "COMPANION_REBIND_NOT_SUCCESSOR" })
+        : Promise.reject(new Error(`unexpected URL ${String(url)}`)),
+      tabsSendMessage: async () => ({
+        type: "c2c.feedback.bootstrap.result", mode: "feedback_bootstrap_send", ok: true,
+        mutationAttempted: true, clickAttempted: true, clicked: true, observed: true,
+        canonicalRoute: ROUTE, generation: 1,
+      }),
+    });
+    const sender = { tab: { id: 7 }, documentId: "document-g4-rebind", frameId: 0, url: ROUTE };
+    const safety = { composer: "empty", generation: "idle", safe: true };
+    await worker.send({ type: "c2c.connect.page", generation: 1, safety }, sender);
+    await worker.send({
+      type: "c2c.heartbeat", generation: 1, safety, feedbackBootstrapToolMissing: true,
+    }, sender);
+    await worker.send({ type: "c2c.heartbeat", generation: 1, safety }, sender);
+    expect(worker.tabsSendMessage).toHaveBeenCalledTimes(1);
+    expect(worker.fetchMock.mock.calls.filter(([url]) => String(url).includes("/rebind/init"))).toHaveLength(3);
+    expect(worker.local.values.get(CONNECT_KEY)).toMatchObject({ state: "WAITING_TAKEOVER" });
+    const status = await worker.send({ type: "c2c.status.page", href: ROUTE, generation: 1 }, sender) as Record<string, unknown>;
+    expect(status.connectReason).toBe("bootstrap_tool_missing");
+  });
+
+  it("G. a blocked takeover remains waiting and never pairs or sends a second bootstrap", async () => {
+    let rebindCalls = 0;
+    const worker = await loadWorker(responseBody(), {
+      oldRoute: OLD_ROUTE,
+      fetch: async (url) => {
+        if (!String(url).includes("/rebind/init")) throw new Error(`unexpected URL ${String(url)}`);
+        rebindCalls += 1;
+        return rebindCalls === 1
+          ? jsonResponse(409, { error: "COMPANION_REBIND_NOT_SUCCESSOR" })
+          : jsonResponse(409, { error: "COMPANION_REPAIR_BLOCKED" });
+      },
+      tabsSendMessage: async () => ({
+        type: "c2c.feedback.bootstrap.result", mode: "feedback_bootstrap_send", ok: true,
+        mutationAttempted: true, clickAttempted: true, clicked: true, observed: true,
+        canonicalRoute: ROUTE, generation: 1,
+      }),
+    });
+    const sender = { tab: { id: 7 }, documentId: "document-g4-rebind", frameId: 0, url: ROUTE };
+    const safety = { composer: "empty", generation: "idle", safe: true };
+    await worker.send({ type: "c2c.connect.page", generation: 1, safety }, sender);
+    await worker.send({ type: "c2c.heartbeat", generation: 1, safety }, sender);
+    expect(worker.local.values.get(CONNECT_KEY)).toMatchObject({ state: "WAITING_TAKEOVER" });
+    expect(worker.tabsSendMessage).toHaveBeenCalledTimes(1);
+    expect(rebindCalls).toBe(2);
+  });
+
+  it.each([true, false])(
+    "D/E. heartbeat resumes after takeover, attests once, verifies, and honors rearm preference=%s",
+    async (rearmOnConnect) => {
+    let takeoverDone = false;
+    const urls: string[] = [];
+    const worker = await loadWorker(responseBody(), {
+      oldRoute: OLD_ROUTE,
+      autonomyPolicy: rearmOnConnect
+        ? {
+            mode: "armed", bindingId: OLD_BINDING, epoch: OLD_EPOCH,
+            routeCanonical: OLD_ROUTE, armedAt: 100, rearmOnConnect: true,
+          }
+        : { mode: "off", rearmOnConnect: false },
+      fetch: async (url) => {
+        const value = String(url);
+        urls.push(value);
+        if (value.includes("/rebind/init")) {
+          return takeoverDone
+            ? jsonResponse(200, responseBody())
+            : jsonResponse(409, { error: "COMPANION_REBIND_NOT_SUCCESSOR" });
+        }
+        if (value.includes("/rebind/status")) return jsonResponse(200, {
+          workspaceId: WORKSPACE, companionId: NEW_COMPANION, bindingId: NEW_BINDING,
+          epoch: OLD_EPOCH + 1, routeCanonical: ROUTE, challengeId: CHALLENGE, state: "CONFIRMED",
+        });
+        if (value.includes("/rebind/complete")) return jsonResponse(200, completedBody());
+        if (value.endsWith("/state")) return urls.some(item => item.includes("/rebind/complete"))
+          ? jsonResponse(200, verifiedState())
+          : jsonResponse(401, { error: "COMPANION_EPOCH_STALE" });
+        throw new Error(`unexpected URL ${value}`);
+      },
+      tabsSendMessage: async (_tabId, message) => message.type === "c2c.feedback.bootstrap.execute"
+        ? {
+            type: "c2c.feedback.bootstrap.result", mode: "feedback_bootstrap_send", ok: true,
+            mutationAttempted: true, clickAttempted: true, clicked: true, observed: true,
+            canonicalRoute: ROUTE, generation: 1,
+          }
+        : { ok: true, observed: true, mutationAttempted: true, clickAttempted: true },
+    });
+    const sender = { tab: { id: 7 }, documentId: "document-g4-rebind", frameId: 0, url: ROUTE };
+    const safety = { composer: "empty", generation: "idle", safe: true };
+    await worker.send({ type: "c2c.connect.page", generation: 1, safety }, sender);
+    await worker.send({ type: "c2c.heartbeat", generation: 1, safety }, sender);
+    expect(worker.tabsSendMessage.mock.calls.filter(([, message]) => message.type === "c2c.feedback.bootstrap.execute")).toHaveLength(1);
+
+    takeoverDone = true;
+    await worker.send({ type: "c2c.heartbeat", generation: 1, safety }, sender);
+    expect(worker.tabsSendMessage.mock.calls.filter(([, message]) => message.type === "c2c.route.attest.execute")).toHaveLength(1);
+    await worker.send({ type: "c2c.heartbeat", generation: 1, safety }, sender);
+    expect(worker.local.values.get(CONNECT_KEY)).toMatchObject({ state: "DONE", bootstrapAutoResume: false });
+    expect(worker.local.values.get(TRANSPORT_KEY)).toMatchObject({ routeVerification: "VERIFIED", rebindPending: false });
+    expect(worker.local.values.get(AUTONOMY_KEY)).toMatchObject(rearmOnConnect
+      ? {
+          mode: "armed", bindingId: NEW_BINDING, epoch: OLD_EPOCH + 1,
+          routeCanonical: ROUTE, rearmOnConnect: true,
+        }
+      : { mode: "off", rearmOnConnect: false });
+    if (rearmOnConnect) {
+      expect((worker.local.values.get(AUTONOMY_KEY) as { armedAt: number }).armedAt).toBeGreaterThan(100);
+    }
+    expect(urls.filter(url => url.includes("/rebind/complete"))).toHaveLength(1);
+    if (!rearmOnConnect) expect((await worker.send({ type: "c2c.autonomy.arm" }, {})).ok).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+
+  it("F. a durable bootstrap dispatch fence survives restart without a second DOM send", async () => {
+    const worker = await loadWorker(responseBody(), {
+      oldRoute: OLD_ROUTE,
+      connectFlow: {
+        state: "TAKEOVER_DISPATCH", workspaceId: WORKSPACE, bindingId: OLD_BINDING,
+        epoch: OLD_EPOCH, companionId: OLD_COMPANION, routeCanonical: ROUTE,
+        challengeId: null, updatedAt: Date.now(),
+      },
+      fetch: async () => { throw new Error("durable dispatch must not retry /rebind/init"); },
+      tabsSendMessage: async () => { throw new Error("durable dispatch must not resend bootstrap"); },
+    });
+    const sender = { tab: { id: 7 }, documentId: "document-g4-rebind", frameId: 0, url: ROUTE };
+    const result = await worker.send({
+      type: "c2c.connect.page", generation: 1,
+      safety: { composer: "empty", generation: "idle", safe: true },
+    }, sender);
+    expect(result).toMatchObject({ ok: false, reason: "connect_outcome_unknown", state: "OUTCOME_UNKNOWN" });
+    expect(worker.fetchMock).not.toHaveBeenCalled();
+    expect(worker.tabsSendMessage).not.toHaveBeenCalled();
+  });
+
   it("hydration disarms a changed identity but retains the explicit rearm preference", async () => {
     const worker = await loadWorker(responseBody(), {
       autonomyPolicy: {

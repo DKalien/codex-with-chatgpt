@@ -961,6 +961,7 @@ describe("G3 route attestation browser contract (source)", () => {
     const js = (manifest.content_scripts ?? []).flatMap((cs: { js?: string[] }) => cs.js ?? []);
     expect(js).toContain("route-attestation-global.js");
     expect(js).toContain("route-attestation-run-global.js");
+    expect(js).toContain("feedback-bootstrap-run-global.js");
     expect(js).toContain("dom-adapter-global.js");
     expect(js).toContain("turn-observer-global.js");
     expect(js).not.toContain("route-attestation.js");
@@ -978,6 +979,7 @@ describe("G3 route attestation browser contract (source)", () => {
       "send-probe-run.js",
       "route-attestation-global.js",
       "route-attestation-run-global.js",
+      "feedback-bootstrap-run-global.js",
       "production-send-runtime-global.js",
       "content-script.js",
     ]);
@@ -988,12 +990,16 @@ describe("G3 route attestation browser contract (source)", () => {
     expect(js.indexOf("send-click-adapter.js")).toBeLessThan(js.indexOf("route-attestation-run-global.js"));
     expect(js.indexOf("route-attestation-global.js")).toBeLessThan(js.indexOf("route-attestation-run-global.js"));
     expect(js.indexOf("route-attestation-run-global.js")).toBeLessThan(js.indexOf("content-script.js"));
+    expect(js.indexOf("route-attestation-run-global.js")).toBeLessThan(js.indexOf("feedback-bootstrap-run-global.js"));
+    expect(js.indexOf("feedback-bootstrap-run-global.js")).toBeLessThan(js.indexOf("content-script.js"));
   });
 
   it("build script generates classic route-attestation artifacts with fail-fast gates", () => {
     const build = fs.readFileSync(path.join(projectRoot, "scripts", "build-browser-companion.mjs"), "utf8");
     expect(build).toMatch(/route-attestation-global\.js/);
     expect(build).toMatch(/route-attestation-run-global\.js/);
+    expect(build).toMatch(/feedback-bootstrap-run-global\.js/);
+    expect(build).toMatch(/__c2cRunFeedbackBootstrapSend/);
     expect(build).toMatch(/dom-adapter-global\.js/);
     expect(build).toMatch(/turn-observer-global\.js/);
     expect(build).toMatch(/__c2cRunRouteAttestationSend/);
@@ -1017,6 +1023,7 @@ describe("G3 route attestation browser contract (source)", () => {
     expect(js).not.toContain("turn-observer.js");
     expect(js).toContain("route-attestation-global.js");
     expect(js).toContain("route-attestation-run-global.js");
+    expect(js).toContain("feedback-bootstrap-run-global.js");
     expect(js).toContain("dom-adapter-global.js");
     expect(js).toContain("turn-observer-global.js");
 
@@ -1038,6 +1045,9 @@ describe("G3 route attestation browser contract (source)", () => {
     expect(classicRun).not.toMatch(/globalThis\.resolveMutationCanonicalRoute\s*=/);
     const classicAttest = fs.readFileSync(path.join(distCompanion, "route-attestation-global.js"), "utf8");
     expect(classicAttest).toMatch(/globalThis\.(extractRouteChallengeId|findRouteAttestationUserTurn|isRouteAttestationMessage)/);
+    const classicBootstrap = fs.readFileSync(path.join(distCompanion, "feedback-bootstrap-run-global.js"), "utf8");
+    expect(classicBootstrap).toMatch(/globalThis\.__c2cRunFeedbackBootstrapSend\s*=\s*runFeedbackBootstrapSend/);
+    expect(classicBootstrap).toMatch(/globalThis\.__c2cFeedbackBootstrapToolMissingReply\s*=\s*hasFeedbackBootstrapToolMissingReply/);
 
     const writeClassic = fs.readFileSync(path.join(distCompanion, "composer-write-adapter.js"), "utf8");
     expect(writeClassic).toMatch(/globalThis\.__c2cResolveMutationCanonicalRoute\s*=/);

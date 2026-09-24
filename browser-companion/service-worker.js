@@ -123,6 +123,10 @@ import {
   parseConnectFlow,
   connectFlowIdentity,
   connectFlowMatches,
+  connectFlowTargetMatches,
+  takeoverConnectFlowIdentity,
+  beginConnectTakeover,
+  observeConnectTakeover,
   beginConnectAttestation,
   requestConnectCompletion,
   finishConnectFlow,
@@ -186,6 +190,7 @@ let lastAutonomyReason = null;
 let lastHeartbeatAt = null;
 let lastHeartbeatOwnerExact = false;
 let lastHeartbeatSafety = null;
+let connectReason = null;
 let lastEvaluatedEvidence = null;
 let lastRecoveryAt = null;
 let lastRecoveryResult = null;
@@ -705,6 +710,7 @@ function statusPayload(tabId, documentId, extra = {}) {
     routeAttestLatch: routeAttestLatch.state,
     routeAttestFence: routeAttestFence.state,
     connectState: connectFlow.state,
+    connectReason,
     productionSendInFlight,
     autonomy: autonomySummary(autonomyPolicy, {
       identityExact: policyIdentityExact(autonomyPolicy, transport),
@@ -1083,6 +1089,7 @@ async function handlePair(message) {
 
   // Durable success — switch memory only now.
   transport = nextTransport;
+  connectReason = null;
   localState = nextLocal;
   routeAttestFence = nextFence;
   routeAttestLatch = nextLatch;
@@ -1268,6 +1275,7 @@ async function handleRebindStart(message) {
     };
   }
   transport = nextTransport;
+  connectReason = null;
   localState = nextLocal;
   routeAttestFence = nextFence;
   routeAttestLatch = emptyRouteAttestLatch();
@@ -1453,6 +1461,210 @@ async function maybeCompleteConnectedRebind(ownerExact) {
   return handleRebindComplete({ managed: true });
 }
 
+function ownerStillMatches(owner) {
+  return Boolean(
+    owner
+    && ownerState.owner
+    && isOwner(ownerState, owner.tabId, owner.documentId)
+    && ownerState.owner.generation === owner.generation
+    && areChatgptConversationRoutesEquivalent(ownerState.owner.canonicalRoute, owner.canonicalRoute),
+  );
+}
+
+async function dispatchFeedbackBootstrap(identity) {
+  const owner = ownerState.owner ? { ...ownerState.owner } : null;
+  if (!owner || !isOwner(ownerState, owner.tabId, owner.documentId)
+    || !areChatgptConversationRoutesEquivalent(owner.canonicalRoute, identity.routeCanonical)) {
+    return { ok: false, reason: "not_exact_owner", retryAllowed: false };
+  }
+  const previous = connectFlow;
+  connectReason = null;
+  const begun = beginConnectTakeover(connectFlow, identity);
+  if (!begun.ok) return { ok: false, reason: begun.reason, state: begun.flow.state, retryAllowed: false };
+  connectFlow = begun.flow;
+  if (!await persistConnectFlow()) {
+    connectFlow = finishConnectFlow(connectFlow, identity, "OUTCOME_UNKNOWN");
+    await persistConnectFlow().catch(() => false);
+    return { ok: false, reason: "bootstrap_fence_persist_failed", state: "OUTCOME_UNKNOWN", retryAllowed: false };
+  }
+
+  let response;
+  try {
+    response = await chrome.tabs.sendMessage(owner.tabId, {
+      type: "c2c.feedback.bootstrap.execute",
+      expectedRoute: owner.canonicalRoute,
+      expectedGeneration: owner.generation,
+    }, { documentId: owner.documentId });
+  } catch {
+    connectFlow = finishConnectFlow(connectFlow, identity, "OUTCOME_UNKNOWN");
+    await persistConnectFlow().catch(() => false);
+    return { ok: false, reason: "bootstrap_outcome_unknown", state: "OUTCOME_UNKNOWN", retryAllowed: false };
+  }
+
+  const responseIdentityMatches = response?.type === "c2c.feedback.bootstrap.result"
+    && response.mode === "feedback_bootstrap_send"
+    && response.generation === owner.generation
+    && areChatgptConversationRoutesEquivalent(response.canonicalRoute, owner.canonicalRoute)
+    && ownerStillMatches(owner);
+  if (responseIdentityMatches && response.ok === true
+    && response.mutationAttempted === true
+    && response.clickAttempted === true
+    && response.clicked === true
+    && response.observed === true) {
+    connectFlow = observeConnectTakeover(connectFlow, identity);
+    if (!await persistConnectFlow()) {
+      connectFlow = finishConnectFlow(connectFlow, identity, "OUTCOME_UNKNOWN");
+      await persistConnectFlow().catch(() => false);
+      return { ok: false, reason: "bootstrap_observation_fence_persist_failed", state: "OUTCOME_UNKNOWN", retryAllowed: false };
+    }
+    return { ok: true, state: "WAITING_TAKEOVER", retryAllowed: false };
+  }
+
+  const provenNoMutation = responseIdentityMatches
+    && response.ok === false
+    && response.mutationAttempted !== true
+    && response.clickAttempted !== true
+    && response.observed !== true;
+  if (provenNoMutation) {
+    connectFlow = previous;
+    if (await persistConnectFlow()) {
+      return { ok: false, reason: response.reason || "bootstrap_not_dispatched", state: connectFlow.state, retryAllowed: true };
+    }
+  }
+  connectFlow = finishConnectFlow(connectFlow, identity, "OUTCOME_UNKNOWN");
+  await persistConnectFlow().catch(() => false);
+  return { ok: false, reason: response?.reason || "bootstrap_outcome_unknown", state: "OUTCOME_UNKNOWN", retryAllowed: false };
+}
+
+async function dispatchConnectRouteAttestation({ resumeExisting = false } = {}) {
+  if (!ownerState.owner
+    || !areChatgptConversationRoutesEquivalent(ownerState.owner.canonicalRoute, transport?.routeCanonical)) {
+    return { ok: false, reason: "not_exact_owner", retryAllowed: false };
+  }
+  const flowIdentity = connectFlowIdentity(transport);
+  if (!flowIdentity) return { ok: false, reason: "connect_identity_invalid", retryAllowed: false };
+  let begun;
+  if (connectFlow.state === "ATTEST_REQUESTED" && connectFlowMatches(connectFlow, flowIdentity)) {
+    if (!resumeExisting || connectFlow.bootstrapAutoResume !== true || routeAttestFence.state !== "NONE") {
+      return { ok: false, reason: "connect_active", state: connectFlow.state, retryAllowed: false };
+    }
+    begun = { ok: true, flow: connectFlow };
+  } else {
+    begun = beginConnectAttestation(connectFlow, flowIdentity);
+  }
+  if (!begun.ok) {
+    return {
+      ok: begun.reason === "already_connected",
+      reason: begun.reason,
+      state: connectFlow.state,
+      retryAllowed: false,
+    };
+  }
+  connectFlow = begun.flow;
+  if (!await persistConnectFlow()) {
+    connectFlow = finishConnectFlow(connectFlow, flowIdentity, "OUTCOME_UNKNOWN");
+    await persistConnectFlow().catch(() => false);
+    return { ok: false, reason: "connect_fence_persist_failed", state: "OUTCOME_UNKNOWN", retryAllowed: false };
+  }
+
+  const attested = await handleMessage(
+    { type: ROUTE_ATTEST_SEND_TYPE },
+    {},
+    { transportMutationHeld: true },
+  );
+  if (!attested?.ok) {
+    const noMutation = attested?.mutationAttempted !== true
+      && attested?.clickAttempted !== true
+      && routeAttestLatch.state === "NONE"
+      && routeAttestFence.state === "NONE";
+    if (noMutation && connectFlow.bootstrapAutoResume !== true) {
+      connectFlow = emptyConnectFlow();
+      if (!await persistConnectFlow()) {
+        connectFlow = finishConnectFlow(connectFlow, flowIdentity, "OUTCOME_UNKNOWN");
+        await persistConnectFlow().catch(() => false);
+        return { ok: false, reason: "connect_fence_persist_failed", state: "OUTCOME_UNKNOWN", retryAllowed: false };
+      }
+      return { ...attested, state: "NONE", retryAllowed: true };
+    }
+    if (noMutation && connectFlow.bootstrapAutoResume === true) {
+      // The takeover already succeeded. Keep the exact successor identity so an
+      // exact owner heartbeat may retry only this proven pre-dispatch route check.
+      if (!await persistConnectFlow()) {
+        connectFlow = finishConnectFlow(connectFlow, flowIdentity, "OUTCOME_UNKNOWN");
+        await persistConnectFlow().catch(() => false);
+        return { ok: false, reason: "connect_fence_persist_failed", state: "OUTCOME_UNKNOWN", retryAllowed: false };
+      }
+      return { ok: true, state: "AWAITING_CONFIRMATION", routeVerification: "PENDING", autonomy: "off" };
+    }
+    if (attested?.mutationAttempted === true
+      || attested?.clickAttempted === true
+      || attested?.fenceState === "OUTCOME_UNKNOWN") {
+      connectFlow = finishConnectFlow(connectFlow, flowIdentity, "OUTCOME_UNKNOWN");
+      await persistConnectFlow().catch(() => false);
+    }
+    return { ...attested, state: connectFlow.state };
+  }
+  if (attested.serverConfirmed === true) {
+    connectFlow = finishConnectFlow(connectFlow, flowIdentity, "DONE");
+    if (!await persistConnectFlow()) {
+      connectFlow = finishConnectFlow(connectFlow, flowIdentity, "OUTCOME_UNKNOWN");
+      await persistConnectFlow().catch(() => false);
+      return { ok: false, reason: "connect_done_persist_failed", retryAllowed: false };
+    }
+  }
+  const autonomy = attested.serverConfirmed === true
+    ? await rearmAutonomyAfterVerifiedConnect()
+    : { ok: true, mode: parseAutonomyPolicy(autonomyPolicy).mode };
+  return {
+    ok: true,
+    state: attested.serverConfirmed === true ? "CONNECTED" : "AWAITING_CONFIRMATION",
+    routeVerification: attested.routeVerification,
+    autonomy: autonomy.mode,
+    autonomyReason: autonomy.ok ? undefined : autonomy.reason,
+  };
+}
+
+async function resumeConnectAfterTakeover(ownerExact) {
+  if (ownerExact !== true || connectFlow.state !== "WAITING_TAKEOVER") {
+    if (ownerExact === true && connectFlow.state === "ATTEST_REQUESTED"
+      && connectFlow.bootstrapAutoResume === true) {
+      return dispatchConnectRouteAttestation({ resumeExisting: true });
+    }
+    return { ok: false, reason: "takeover_not_waiting" };
+  }
+  if (!connectFlowTargetMatches(connectFlow, transport?.workspaceId, ownerState.owner?.canonicalRoute)) {
+    return { ok: false, reason: "takeover_target_mismatch", retryAllowed: false };
+  }
+  if (transport?.rebindPending === true
+    && areChatgptConversationRoutesEquivalent(transport.routeCanonical, connectFlow.routeCanonical)) {
+    return dispatchConnectRouteAttestation();
+  }
+  ownerProof = mintOwnerProof({
+    tabId: ownerState.owner.tabId,
+    documentId: ownerState.owner.documentId,
+    routeCanonical: ownerState.owner.canonicalRoute,
+  });
+  const started = await handleRebindStart({ ownerProofId: ownerProof.id });
+  if (!started.ok) {
+    if (started.reason === "COMPANION_REBIND_NOT_SUCCESSOR") {
+      return { ok: true, state: "WAITING_TAKEOVER", reason: "waiting_for_takeover", retryAllowed: true };
+    }
+    if (started.reason === "COMPANION_UNAUTHORIZED" || started.reason === "transport_missing") {
+      return { ok: false, reason: "cold_pair_required", retryAllowed: false };
+    }
+    if (started.retryAllowed === false) {
+      const identity = takeoverConnectFlowIdentity(transport, connectFlow.routeCanonical);
+      if (identity) {
+        connectFlow = finishConnectFlow(connectFlow, identity, "OUTCOME_UNKNOWN");
+        await persistConnectFlow().catch(() => false);
+      }
+    }
+    return { ...started, state: connectFlow.state };
+  }
+  connectReason = null;
+  return dispatchConnectRouteAttestation();
+}
+
 async function handleConnectPage(sender, message) {
   if (connectInFlight) return { ok: false, reason: "connect_in_flight", retryAllowed: false };
   connectInFlight = true;
@@ -1507,6 +1719,27 @@ async function handleConnectPage(sender, message) {
     }
     if (permission !== true) return { ok: false, reason: "bridge_permission_missing" };
 
+    if (connectFlow.state === "TAKEOVER_DISPATCH" || connectFlow.state === "OUTCOME_UNKNOWN") {
+      return { ok: false, reason: "connect_outcome_unknown", state: "OUTCOME_UNKNOWN", retryAllowed: false };
+    }
+    if (connectFlow.state === "WAITING_TAKEOVER"
+      && !connectFlowTargetMatches(connectFlow, transport.workspaceId, canonicalRoute)) {
+      return { ok: false, reason: "connect_identity_conflict", state: connectFlow.state, retryAllowed: false };
+    }
+    if (["ATTEST_REQUESTED", "COMPLETE_REQUESTED"].includes(connectFlow.state)
+      && !connectFlowTargetMatches(connectFlow, transport.workspaceId, canonicalRoute)) {
+      return { ok: false, reason: "connect_identity_conflict", state: connectFlow.state, retryAllowed: false };
+    }
+    if (connectFlowTargetMatches(connectFlow, transport.workspaceId, canonicalRoute)) {
+      if (connectFlow.state === "WAITING_TAKEOVER") {
+        if (transport.rebindPending === true
+          && areChatgptConversationRoutesEquivalent(transport.routeCanonical, canonicalRoute)) {
+          return dispatchConnectRouteAttestation();
+        }
+        return { ok: true, state: "WAITING_TAKEOVER", reason: "waiting_for_takeover", retryAllowed: false };
+      }
+    }
+
     let currentPairPending = false;
     if (!transport.rebindPending && areChatgptConversationRoutesEquivalent(transport.routeCanonical, canonicalRoute)) {
       const current = await handleFetchState();
@@ -1535,12 +1768,15 @@ async function handleConnectPage(sender, message) {
       });
       const started = await handleRebindStart({ ownerProofId: ownerProof.id });
       if (!started.ok) {
-        const coldPair = [
-          "COMPANION_UNAUTHORIZED",
-          "COMPANION_EPOCH_STALE",
-          "COMPANION_REBIND_NOT_SUCCESSOR",
-        ].includes(started.reason);
-        return { ...started, reason: coldPair ? "cold_pair_required" : started.reason };
+        if (started.reason === "COMPANION_REBIND_NOT_SUCCESSOR") {
+          const takeoverIdentity = takeoverConnectFlowIdentity(transport, canonicalRoute);
+          if (!takeoverIdentity) return { ok: false, reason: "connect_identity_invalid", retryAllowed: false };
+          return dispatchFeedbackBootstrap(takeoverIdentity);
+        }
+        if (started.reason === "COMPANION_UNAUTHORIZED" || started.reason === "transport_missing") {
+          return { ...started, reason: "cold_pair_required" };
+        }
+        return started;
       }
     }
 
@@ -1550,68 +1786,7 @@ async function handleConnectPage(sender, message) {
       || !areChatgptConversationRoutesEquivalent(transport.routeCanonical, canonicalRoute)) {
       return { ok: false, reason: "owner_identity_changed", retryAllowed: false };
     }
-    const flowIdentity = connectFlowIdentity(transport);
-    const begun = beginConnectAttestation(connectFlow, flowIdentity);
-    if (!begun.ok) {
-      return {
-        ok: begun.reason === "already_connected",
-        reason: begun.reason,
-        state: connectFlow.state,
-        retryAllowed: false,
-      };
-    }
-    connectFlow = begun.flow;
-    if (!await persistConnectFlow()) {
-      connectFlow = finishConnectFlow(connectFlow, flowIdentity, "OUTCOME_UNKNOWN");
-      await persistConnectFlow().catch(() => false);
-      return { ok: false, reason: "connect_fence_persist_failed", retryAllowed: false };
-    }
-
-    const attested = await handleMessage(
-      { type: ROUTE_ATTEST_SEND_TYPE },
-      {},
-      { transportMutationHeld: true },
-    );
-    if (!attested?.ok) {
-      const noMutation = attested?.mutationAttempted !== true
-        && attested?.clickAttempted !== true
-        && routeAttestLatch.state === "NONE"
-        && routeAttestFence.state === "NONE";
-      if (noMutation) {
-        connectFlow = emptyConnectFlow();
-        if (!await persistConnectFlow()) {
-          connectFlow = finishConnectFlow(connectFlow, flowIdentity, "OUTCOME_UNKNOWN");
-          await persistConnectFlow().catch(() => false);
-          return { ok: false, reason: "connect_fence_persist_failed", retryAllowed: false };
-        }
-        return { ...attested, state: "NONE", retryAllowed: true };
-      }
-      if (attested?.mutationAttempted === true
-        || attested?.clickAttempted === true
-        || attested?.fenceState === "OUTCOME_UNKNOWN") {
-        connectFlow = finishConnectFlow(connectFlow, flowIdentity, "OUTCOME_UNKNOWN");
-        await persistConnectFlow().catch(() => false);
-      }
-      return { ...attested, state: connectFlow.state };
-    }
-    if (attested.serverConfirmed === true) {
-      connectFlow = finishConnectFlow(connectFlow, flowIdentity, "DONE");
-      if (!await persistConnectFlow()) {
-        connectFlow = finishConnectFlow(connectFlow, flowIdentity, "OUTCOME_UNKNOWN");
-        await persistConnectFlow().catch(() => false);
-        return { ok: false, reason: "connect_done_persist_failed", retryAllowed: false };
-      }
-    }
-    const autonomy = attested.serverConfirmed === true
-      ? await rearmAutonomyAfterVerifiedConnect()
-      : { ok: true, mode: parseAutonomyPolicy(autonomyPolicy).mode };
-    return {
-      ok: true,
-      state: attested.serverConfirmed === true ? "CONNECTED" : "AWAITING_CONFIRMATION",
-      routeVerification: attested.routeVerification,
-      autonomy: autonomy.mode,
-      autonomyReason: autonomy.ok ? undefined : autonomy.reason,
-    };
+    return dispatchConnectRouteAttestation();
   } finally {
     connectInFlight = false;
   }
@@ -1912,6 +2087,7 @@ async function handleClearTransport() {
     return { ok: false, reason: "journal_active", journalState: journal.state };
   }
   transport = null;
+  connectReason = null;
   await forceAutonomyOff("transport_clear", { clearRearmPreference: true });
   await persistTransport();
   // Durable route-attest fence is NOT cleared here. Transport clear must not
@@ -2194,6 +2370,38 @@ async function handleMessage(message, sender, { transportMutationHeld = false } 
       lastHeartbeatAt = Date.now();
       lastHeartbeatOwnerExact = ownerExact === true;
       lastHeartbeatSafety = buildHeartbeatSafetySnapshot(message.safety);
+      const bootstrapConnectWaiting = connectFlow.state === "WAITING_TAKEOVER"
+        || (connectFlow.state === "ATTEST_REQUESTED" && connectFlow.bootstrapAutoResume === true);
+      const bootstrapOwnerExact = bootstrapConnectWaiting && connectFlowTargetMatches(
+        connectFlow,
+        transport?.workspaceId,
+        canonical,
+      ) && isExactOwnerHeartbeat({
+        identityOk: identity.ok === true,
+        tabId,
+        documentId,
+        canonicalRoute: canonical,
+        owner: ownerState.owner,
+        transportRoute: connectFlow.routeCanonical,
+      });
+      if (bootstrapOwnerExact && connectFlow.state === "WAITING_TAKEOVER"
+        && message.feedbackBootstrapToolMissing === true) {
+        connectReason = "bootstrap_tool_missing";
+      }
+      if (bootstrapOwnerExact && connectFlow.state === "WAITING_TAKEOVER") {
+        try {
+          await runTransportMutation(() => resumeConnectAfterTakeover(true));
+        } catch {
+          // A failed bounded attempt never causes the fixed bootstrap message to be resent.
+        }
+      } else if (bootstrapOwnerExact && connectFlow.state === "ATTEST_REQUESTED"
+        && routeAttestFence.state === "NONE") {
+        try {
+          await runTransportMutation(() => resumeConnectAfterTakeover(true));
+        } catch {
+          // Only a proven pre-dispatch failure may be retried on a later exact heartbeat.
+        }
+      }
       // Route attestation confirmation poll: read-only /state, independent of autonomy.
       // Bounded by shouldPollRouteAttestConfirm (owner exact + identity + challenge + expiry).
       if (routeAttestLatch.state === "OBSERVED_PENDING_CONFIRM"

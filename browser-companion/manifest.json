@@ -38,6 +38,7 @@
         "send-probe-run.js",
         "route-attestation-global.js",
         "route-attestation-run-global.js",
+        "feedback-bootstrap-run-global.js",
         "production-send-runtime-global.js",
         "content-script.js"
       ],

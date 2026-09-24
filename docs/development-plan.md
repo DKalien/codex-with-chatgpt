@@ -902,12 +902,21 @@ H0 不抽象 Codex-specific result classification、terminal fence、receipt fin
 - 未新增 MCP tool、确认、队列或状态机；不接 feedback / ExecutionResult。Browser Companion 重连 UX
   由独立 R3f slice 提供，不改变本 slice 的 routing/send 边界。
 
-## R3f — Browser Companion 一键重连自动恢复（2026-09-24，完成）
+## R3f — Browser Companion 一键重连自动恢复（2026-09-24，首轮实现）
 
 - 用户成功开启自动回流后，显式点击“连接当前对话”可在新绑定完成且 authenticated route attestation 为
   `VERIFIED` 后，基于新 binding / epoch / route 写入 fresh ARMED policy；旧会话的 ARMED authority 不迁移。
 - `rearmOnConnect` 仅是偏好，不是发送 authority；身份变化、连接过程和验证降级先关闭 autonomy。
   手动暂停、显式 unbind、清除 transport 会清除此偏好；重连后的真实发送门禁不变。
 - 自动恢复持久化失败时 route connection 仍可保持 VERIFIED，但 autonomy 保持 OFF；不重复 attestation。
-- R3a–R3e 提供 derived routing 与现有 Desktop send 接线；R3f 提供 Companion reconnect UX。R3 完成，
-  不包含 feedback / ExecutionResult 或 R4。
+- R3a–R3e 提供 derived routing 与现有 Desktop send 接线；R3f 提供已配对页面的 Companion reconnect UX。
+  后续新 Chat live smoke 暴露 takeover bootstrap 缺口，因此 R3 总阶段尚未完成；不包含 feedback / ExecutionResult 或 R4。
+
+## R3 live smoke gap / R3g（代码完成，live smoke pending；2026-09-25）
+
+- 新 Chat 的当前 owner 绑定不等于 Companion server binding successor；首次 `/rebind/init` 返回
+  `COMPANION_REBIND_NOT_SUCCESSOR` 时，Browser Companion 需通过同一 Chat 的固定控制消息等待现有
+  `feedback_status` / `feedback_takeover` 完成 takeover，再继续原 rebind 与 VERIFIED route attestation。
+- R3g 将 bootstrap dispatch/wait 纳入既有 durable connect-flow，固定消息经 exact user-turn observation
+  后才等待；dispatch 歧义与浏览器重启均 fail closed、不自动重发。代码及自动化回归完成；真实新 Chat
+  单击 live smoke 尚待用户重载扩展后验证，因此 R3 暂不宣称整体完成。
