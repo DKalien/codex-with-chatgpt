@@ -65,7 +65,7 @@ const CODEX_DESKTOP_DESCRIPTOR: ExecutorDescriptor = Object.freeze({
   capabilities: CODEX_DESKTOP_CAPABILITIES,
 });
 
-/** 只包装现有 IPC；身份、版本、owner、审批和 busy 校验仍由 desktopIpc/helper 负责。 */
+/** 只包装现有 IPC；身份、owner、审批和 busy 校验仍由 desktopIpc/helper 负责。 */
 export class CodexDesktopAdapter implements ExecutorAdapter {
   readonly descriptor = CODEX_DESKTOP_DESCRIPTOR;
 

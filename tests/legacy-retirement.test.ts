@@ -321,9 +321,9 @@ describe("legacy accepted retirement", () => {
     expect(readLegacyRetirements(workspace.id)).toEqual([]);
   });
 
+  // R2 起版本字段已退出 context identity（desktopVersion 不再参与 equality），不再有用例。
   it.each([
     ["owner", { ownerClientId: "other-owner" }],
-    ["version", { desktopVersion: "9.9.9" }],
     ["cwd", { cwd: "other-cwd" }],
   ] as const)("ownerless 写入前 current context %s 变化时拒绝且不写入", async (_name, changed) => {
     seedDelivery();

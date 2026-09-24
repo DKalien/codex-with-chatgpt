@@ -387,10 +387,11 @@ Speak only of 临时地址 / 固定域名 / 登录 Cloudflare.
      request-scoped verification → Ready。
      同一身份已 enabled 的 `alreadyEnabled` 直接复用 bindingId；上下文 unknown、workspace 不匹配、
      取消、超时或其他失败均报告未就绪，不猜目标、不回退到显式 bind/enable 绕过检查。
-     遇到 `DESKTOP_VERSION_UNSUPPORTED`，报告 `observedDesktopVersion`、
-     `observedAppServerVersion`、`status`、`profile`；必要时 `c2c desktop compatibility --json`。
-     这是本机 Desktop 协议诊断，不是 OAuth `desktopCompatibility`；不能以其中一个替代另一个。
-     未验证版本保持未就绪，不自动添加 profile、放宽版本/hash 或重新授权来绕过。
+     Desktop 可用性由 live 行为决定，不存在版本/profile 门禁；旧版本白名单体系的
+     错误码已随该体系删除，不再出现。诊断用 `c2c desktop diagnose --json`
+     （别名 `compatibility`，输出 `mode: "behavioral"`）：它只描述这一次 live IPC
+     handshake 实际发生了什么，不是 OAuth `desktopCompatibility`；不能以其中一个替代另一个。
+     诊断失败保持未就绪，不猜测版本、不恢复任何 profile/hash 白名单、不重新授权来绕过。
      只有返回 `ok: true`、`enabled: true` 且 binding 身份与当前 thread/workspace 核验一致
      才可标记绑定成功。成功后 rerun workflow status；必须最终变为 `ready_local / reuse`
      才可报告 local Ready。
@@ -527,7 +528,7 @@ userConfirmed 类型。不能根据文档、历史回答或“连接成功”猜
    不覆盖以“恢复”旧值。若进入 Conversation Rebind，允许的 session 变化严格以后续 Conversation Rebind 的 thread-aware mutation contract 为准；Project 不以 session.url 作为导航 authority。
    全部验证通过后返回 Activation，重新运行 `c2c workflow status`，并严格按新的 nextAction 继续；
    不得默认 bind-current 或直接报告 Ready。
-   迁移不授权绑定/enable，不修改 OAuth、本机确认、owner、版本/hash、审批、防重放或 outcome_unknown 门禁。
+   迁移不授权绑定/enable，不修改 OAuth、本机确认、owner、live behavioral 验证、审批、防重放或 outcome_unknown 门禁。
 
 ### Conversation Rebind
 
@@ -893,7 +894,7 @@ prompt 是自然语言，**不是授权凭证**，不能替代本机确认、OAu
 原 ID；同一 workspaceRoot 下不同 thread/project 则确认后生成新的 `bindingId`。所有 deliveries
 history 保留，其中包含旧 `bindingId`；不同 workspaceRoot 或无法确认（`unknown`）时明确拒绝，
 不能快捷跨 workspace 重绑。身份核验允许当前 Desktop 为 `active`，但 `codex_desktop_send` 仍
-必须在发送时严格检查 `idle`、无待审批、owner、project/workspace 和已验证版本。传统显式 `desktop bind` + `desktop enable`
+必须在发送时严格检查 `idle`、无待审批、owner、project/workspace 和 live behavioral 状态。传统显式 `desktop bind` + `desktop enable`
 仅作为高级 fallback；不新增 MCP bind 工具。
 
 ### 本机绑定、授权与状态
@@ -945,7 +946,7 @@ Desktop 行为；不能声称 Desktop Control 能抵御已经获授权客户端�
 
 收到真实 `threadId`/`turnId` 且投递接受后，只报告 `deliveryStatus=accepted`。`accepted` 不
 是 `completed`，也不是测试通过；当前网页回合可以结束，不要等待 Desktop 任务完成，不要
-持续查询状态。目标忙、待审批、无 owner、Desktop 离线、版本不兼容、错 project/workspace
+持续查询状态。目标忙、待审批、无 owner、Desktop 离线、live 协议不兼容、错 project/workspace
 或需要提权时必须零发送并报告明确原因，也不创建隐藏队列。
 
 只有在用户主动回来要求“干完了，检查一下”时，才调用现有只读 MCP 检查当次代码、Git 和
@@ -985,7 +986,7 @@ envelope 是单个 JSON 对象：`{"type":"C2C_DESKTOP_TASK","version":1,"worksp
    不手动指定 taskId/iteration/thread：自动派生 `desktop_<commandId>` / `1`，并写入 commandId。
 4. 只接受同 workspace 历史 `deliveryStatus=accepted` 的精确 commandId。`CODEX_THREAD_ID`
    只是上下文线索，不能单独授权写记录：本机入口通过受控 Desktop IPC 验证当前真实 thread/workspace/root、
-   owner、project、版本/hash 和执行进程来源；`inProgress` 只允许进入 pending fence，trusted receipt
+   owner、project、live behavioral 状态和执行进程来源；`inProgress` 只允许进入 pending fence，trusted receipt
    仅接受 canonical history 最新侧完整且最后一条为 terminal 的 turn。终态路径的 turnId 均须与
    `delivery.turnId` 完全一致，真实 threadId 同时等于 `delivery.threadId`。
    即使后来 disable/rebind，原 accepted turn 仍可在自身执行结束前收尾；后续 turn 不能代记。
@@ -1028,11 +1029,10 @@ fail closed。成功也只执行 `outcome_unknown -> accepted + turnId`，不写
 任务成功；后续收尾命令仍必须处于原 accepted turn 的 exact current result context，后续 turn
 不能代记。`disable`/重新绑定不能撤回已越过提交点的在途请求，状态必须如实保留；不能把它伪称未发送。
 
-发送前重新核验 Desktop 进程、端点、owner、project、workspace 和版本；Desktop 重启后重新
+发送前重新核验 Desktop 进程、端点、owner、project、workspace 和 live behavioral 状态；Desktop 重启后重新
 发现，不能永久信任旧 PID。已知 idle/start 内部协议在检查和发送之间没有原子 CAS，目标可能
-在窗口内改变，因此回执不匹配也按未知结果处理。只放行已验证版本，未知版本停止，不自动
-降级；已验证精确组合见 helper 的 `VERIFIED_PROFILES` 与 `docs/desktop-control.md`，
-不能按该列表推断任何未列出的版本或 hash 兼容。
+在窗口内改变，因此回执不匹配也按未知结果处理。live 协议、身份或状态无法验证时停止，
+不按 Desktop 版本或二进制 hash 预登记放行，也不降级发送；详见 `docs/desktop-control.md`。
 
 Windows 受控 helper 需要 Python 3.11+，使用 `C2C_DESKTOP_PYTHON`，未设置时使用 `python`；仅执行必要的标准库
 IPC/身份核验，不要求管理员权限，不借用 renderer/Agent 身份，不启动第二个 app-server、

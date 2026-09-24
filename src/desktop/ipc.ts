@@ -21,80 +21,8 @@ export interface DesktopTargetInfo extends DesktopTarget {
   resumeState?: string;
   runtimeStatus?: string;
   requestsCount?: number;
-  desktopVersion?: string;
-  appServerVersion?: string;
-  profile?: string | null;
   /** 内部诊断字段；不会由 MCP 直接返回。 */
   ownerClientId?: string | null;
-}
-
-export type DesktopCompatibilityStatus = "current" | "unverified" | "incompatible";
-
-export interface DesktopCompatibility {
-  observedDesktopVersion: string | null;
-  observedAppServerVersion: string | null;
-  status: DesktopCompatibilityStatus;
-  profile: string | null;
-}
-
-export type DesktopCompatibilityAuditClassification =
-  | "current"
-  | "same_protocol_candidate"
-  | "semantic_same_protocol_candidate"
-  | "protocol_drift_or_unknown"
-  | "ambiguous"
-  | "unavailable";
-
-export type DesktopSemanticReason =
-  | "matched"
-  | "source_too_large"
-  | "lexical_unsupported"
-  | "start_turn_missing"
-  | "start_turn_ambiguous"
-  | "version_unprovable"
-  | "payload_unprovable"
-  | "ack_unprovable"
-  | "not_scanned";
-
-export type DesktopCompatibilityAuditModuleRole = "ipc-main" | "webview-bootstrap";
-
-export interface DesktopCompatibilityAuditModule {
-  role: DesktopCompatibilityAuditModuleRole;
-  path: string;
-  sha256: string;
-}
-
-export interface DesktopCompatibilityCandidateRuntime {
-  desktopVersion: string;
-  appServerVersion: string;
-  appServerSha256: string;
-  asarHeader: [number, number, number, number];
-  modules: DesktopCompatibilityAuditModule[];
-}
-
-export interface DesktopCompatibilityAudit extends DesktopCompatibility {
-  classification: DesktopCompatibilityAuditClassification;
-  semanticReason: DesktopSemanticReason;
-  semanticFingerprint: string | null;
-  appServerSha256: string | null;
-  asarHeader: [number, number, number, number] | null;
-  candidateProfile: string | null;
-  modules: DesktopCompatibilityAuditModule[];
-  candidateRuntime?: DesktopCompatibilityCandidateRuntime;
-}
-
-export interface DesktopHandshakeAudit {
-  processStable: true;
-  runtimeStable: true;
-  protocolClassification: DesktopCompatibilityAuditClassification;
-  semanticReason: DesktopSemanticReason;
-  semanticFingerprint: string | null;
-  initialize: true;
-  ownerDiscovery: true;
-  followingChangedSent: true;
-  stateReceived: true;
-  stateChange: "snapshot" | "patches";
-  candidateRuntime?: DesktopCompatibilityCandidateRuntime;
 }
 
 export interface DesktopExecutionInfo extends DesktopTargetInfo {
@@ -208,7 +136,6 @@ type HelperResponse = {
   value?: unknown;
   code?: unknown;
   notSent?: unknown;
-  compatibility?: unknown;
 };
 
 type Pending = {
@@ -219,8 +146,13 @@ type Pending = {
 };
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
-const DEFAULT_SEND_TIMEOUT_MS = 40_000;
-const MAX_TIMEOUT_MS = 60_000;
+// helper 单次 send 最坏路径上界（preflight 双份 5s discovery/snapshot +
+// drain/current_state + 30s start-turn ACK + 30s post-start bounded wait +
+// final discovery ≈ 86s）；外层超时必须大于该上界并留余量，否则 Node 会在
+// helper 仍处于合法 bounded proof window 时先杀掉它，制造不必要的
+// durable outcome_unknown。
+const DEFAULT_SEND_TIMEOUT_MS = 90_000;
+const MAX_TIMEOUT_MS = 120_000;
 const MAX_CONTROL_FRAME_BYTES = 512 * 1024;
 const SEND_REQUEST_ID_PLACEHOLDER = "00000000-0000-0000-0000-000000000000";
 
@@ -232,7 +164,6 @@ const SAFE_CODES = new Set([
   "DESKTOP_IPC_UNAVAILABLE",
   "DESKTOP_IPC_SERVER_MISMATCH",
   "DESKTOP_PROCESS_CHANGED",
-  "DESKTOP_VERSION_UNSUPPORTED",
   "DESKTOP_PROJECT_MISMATCH",
   "DESKTOP_TARGET_NOT_FOUND",
   "DESKTOP_NO_OWNER",
@@ -254,37 +185,6 @@ const SAFE_CODES = new Set([
   "DESKTOP_RECONCILIATION_CONFLICT",
 ]);
 
-const COMPATIBILITY_VERSION = /^\d+\.\d+\.\d+(?:\.\d+)?(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?(?:\+[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?$/;
-const COMPATIBILITY_PROFILE = /^desktop-ipc-v[1-9]\d*$/;
-const COMPATIBILITY_STATUSES = new Set<DesktopCompatibilityStatus>([
-  "current",
-  "unverified",
-  "incompatible",
-]);
-const COMPATIBILITY_AUDIT_CLASSIFICATIONS = new Set<DesktopCompatibilityAuditClassification>([
-  "current",
-  "same_protocol_candidate",
-  "semantic_same_protocol_candidate",
-  "protocol_drift_or_unknown",
-  "ambiguous",
-  "unavailable",
-]);
-const DESKTOP_SEMANTIC_REASONS = new Set<DesktopSemanticReason>([
-  "matched",
-  "source_too_large",
-  "lexical_unsupported",
-  "start_turn_missing",
-  "start_turn_ambiguous",
-  "version_unprovable",
-  "payload_unprovable",
-  "ack_unprovable",
-  "not_scanned",
-]);
-const COMPATIBILITY_AUDIT_MODULE_ROLES = new Set<DesktopCompatibilityAuditModuleRole>([
-  "ipc-main",
-  "webview-bootstrap",
-]);
-
 const ERROR_MESSAGES: Record<string, string> = {
   DESKTOP_UNSUPPORTED_PLATFORM: "当前平台不支持 Desktop Control。",
   DESKTOP_TOKEN_UNVERIFIED: "当前进程权限无法安全确认；已拒绝 Desktop 投递。",
@@ -293,7 +193,6 @@ const ERROR_MESSAGES: Record<string, string> = {
   DESKTOP_IPC_UNAVAILABLE: "Codex Desktop 当前不可用；没有发送消息。",
   DESKTOP_IPC_SERVER_MISMATCH: "Desktop IPC 服务端身份不匹配；没有发送消息。",
   DESKTOP_PROCESS_CHANGED: "Desktop/app-server 进程已变化；没有发送消息。",
-  DESKTOP_VERSION_UNSUPPORTED: "当前 Desktop/app-server 版本未经过适配验证；没有发送消息。",
   DESKTOP_PROJECT_MISMATCH: "Desktop 会话项目或实际目录与绑定不匹配；没有发送消息。",
   DESKTOP_TARGET_NOT_FOUND: "找不到绑定的 Desktop 会话；没有发送消息。",
   DESKTOP_NO_OWNER: "绑定会话没有可确认的 Desktop owner；没有发送消息。",
@@ -304,7 +203,7 @@ const ERROR_MESSAGES: Record<string, string> = {
   DESKTOP_IPC_TIMEOUT: "Desktop IPC 接受回执超时；没有发送消息。",
   DESKTOP_IPC_REJECTED: "Desktop 拒绝了投递；结果无法作为成功确认。",
   DESKTOP_OUTCOME_UNKNOWN: "Desktop 投递结果不明，消息可能已执行；不要重发。",
-  DESKTOP_PROTOCOL_ERROR: "Desktop IPC 返回无法确认的结果；不要重发。",
+  DESKTOP_PROTOCOL_ERROR: "Desktop 协议无法安全确认；没有发送消息。",
   DESKTOP_INTERNAL_ERROR: "Desktop Control 暂时不可用；没有发送消息。",
   DESKTOP_PYTHON_UNAVAILABLE: "无法启动 Desktop IPC helper 的 Python 运行时；没有发送消息。",
   DESKTOP_PYTHON_UNSUPPORTED: "运行 Desktop IPC helper 需要 Python 3.11 或更高版本；没有发送消息。",
@@ -319,54 +218,6 @@ function messageFor(code: string, fallback = "DESKTOP_INTERNAL_ERROR"): string {
   return ERROR_MESSAGES[code] ?? ERROR_MESSAGES[fallback] ?? "Desktop Control 暂时不可用。";
 }
 
-function compatibilityVersion(value: unknown): string | null {
-  if (value === null) return null;
-  if (typeof value !== "string" || value.length > 64 || !COMPATIBILITY_VERSION.test(value)) {
-    throw error("DESKTOP_PROTOCOL_ERROR");
-  }
-  return value;
-}
-
-function compatibilityProfile(value: unknown): string | null {
-  if (value === null) return null;
-  if (typeof value !== "string" || value.length > 64 || !COMPATIBILITY_PROFILE.test(value)) {
-    throw error("DESKTOP_PROTOCOL_ERROR");
-  }
-  return value;
-}
-
-export function validateDesktopCompatibility(value: unknown): DesktopCompatibility {
-  if (!value || typeof value !== "object" || Array.isArray(value)) throw error("DESKTOP_PROTOCOL_ERROR");
-  const input = value as Record<string, unknown>;
-  for (const key of ["observedDesktopVersion", "observedAppServerVersion", "status", "profile"] as const) {
-    if (!Object.prototype.hasOwnProperty.call(input, key)) throw error("DESKTOP_PROTOCOL_ERROR");
-  }
-  const status = input.status;
-  if (typeof status !== "string" || !COMPATIBILITY_STATUSES.has(status as DesktopCompatibilityStatus)) {
-    throw error("DESKTOP_PROTOCOL_ERROR");
-  }
-  const observedDesktopVersion = compatibilityVersion(input.observedDesktopVersion);
-  const observedAppServerVersion = compatibilityVersion(input.observedAppServerVersion);
-  const profile = compatibilityProfile(input.profile);
-  if (status === "current" && (!observedDesktopVersion || !observedAppServerVersion || !profile)) {
-    throw error("DESKTOP_PROTOCOL_ERROR");
-  }
-  return {
-    observedDesktopVersion,
-    observedAppServerVersion,
-    status: status as DesktopCompatibilityStatus,
-    profile,
-  };
-}
-
-const AUDIT_HASH = /^[a-f0-9]{64}$/u;
-const AUDIT_DESKTOP_VERSION = /^\d+\.\d+\.\d+\.\d+$/u;
-const MAX_AUDIT_ASAR_HEADER_BYTES = 64 * 1024 * 1024;
-const AUDIT_MODULE_PATHS: Record<DesktopCompatibilityAuditModuleRole, RegExp> = {
-  "ipc-main": /^\.vite\/build\/src-[A-Za-z0-9_-]+\.js$/u,
-  "webview-bootstrap": /^webview\/assets\/app-initial-[A-Za-z0-9_-]+\.js$/u,
-};
-
 function exactKeys(value: Record<string, unknown>, required: readonly string[], optional: readonly string[] = []): boolean {
   const allowed = new Set([...required, ...optional]);
   const keys = Object.keys(value);
@@ -374,165 +225,9 @@ function exactKeys(value: Record<string, unknown>, required: readonly string[], 
     Object.prototype.hasOwnProperty.call(value, key));
 }
 
-function auditSemanticReason(value: unknown): DesktopSemanticReason {
-  if (typeof value !== "string" || !DESKTOP_SEMANTIC_REASONS.has(value as DesktopSemanticReason)) {
-    throw error("DESKTOP_PROTOCOL_ERROR");
-  }
-  return value as DesktopSemanticReason;
-}
-
-function auditHash(value: unknown, nullable: false): string;
-function auditHash(value: unknown, nullable?: true): string | null;
-function auditHash(value: unknown, nullable = true): string | null {
-  if (value === null && nullable) return null;
-  if (typeof value !== "string" || !AUDIT_HASH.test(value)) throw error("DESKTOP_PROTOCOL_ERROR");
-  return value;
-}
-
-function auditAsarHeader(value: unknown, nullable: false): [number, number, number, number];
-function auditAsarHeader(value: unknown, nullable?: true): [number, number, number, number] | null;
-function auditAsarHeader(value: unknown, nullable = true): [number, number, number, number] | null {
-  if (value === null && nullable) return null;
-  if (!Array.isArray(value) || value.length !== 4 || value.some(item =>
-    !Number.isInteger(item) || item < 0 || item > MAX_AUDIT_ASAR_HEADER_BYTES)) {
-    throw error("DESKTOP_PROTOCOL_ERROR");
-  }
-  if (value[0] !== 4 || value[1] !== value[2] + 4 ||
-      (value[2] !== value[3] + 7 && value[2] !== value[3] + 4)) {
-    throw error("DESKTOP_PROTOCOL_ERROR");
-  }
-  return [...value] as [number, number, number, number];
-}
-
-function auditModule(value: unknown): DesktopCompatibilityAuditModule {
-  if (!value || typeof value !== "object" || Array.isArray(value)) throw error("DESKTOP_PROTOCOL_ERROR");
-  const input = value as Record<string, unknown>;
-  if (!exactKeys(input, ["role", "path", "sha256"])) throw error("DESKTOP_PROTOCOL_ERROR");
-  const role = input.role;
-  const modulePath = input.path;
-  if (typeof role !== "string" || !COMPATIBILITY_AUDIT_MODULE_ROLES.has(role as DesktopCompatibilityAuditModuleRole) ||
-      typeof modulePath !== "string" || !AUDIT_MODULE_PATHS[role as DesktopCompatibilityAuditModuleRole].test(modulePath)) {
-    throw error("DESKTOP_PROTOCOL_ERROR");
-  }
-  const sha256 = auditHash(input.sha256, false);
-  return { role: role as DesktopCompatibilityAuditModuleRole, path: modulePath, sha256 };
-}
-
-function auditModules(value: unknown): DesktopCompatibilityAuditModule[] {
-  if (!Array.isArray(value) || value.length > 2) throw error("DESKTOP_PROTOCOL_ERROR");
-  const modules = value.map(auditModule);
-  if (new Set(modules.map(module => module.role)).size !== modules.length ||
-      new Set(modules.map(module => module.path)).size !== modules.length) {
-    throw error("DESKTOP_PROTOCOL_ERROR");
-  }
-  return modules;
-}
-
-function auditCandidateRuntime(value: unknown): DesktopCompatibilityCandidateRuntime {
-  if (!value || typeof value !== "object" || Array.isArray(value)) throw error("DESKTOP_PROTOCOL_ERROR");
-  const input = value as Record<string, unknown>;
-  if (!exactKeys(input, ["desktopVersion", "appServerVersion", "appServerSha256", "asarHeader", "modules"])) {
-    throw error("DESKTOP_PROTOCOL_ERROR");
-  }
-  const desktopVersion = input.desktopVersion;
-  if (typeof desktopVersion !== "string" || desktopVersion.length > 64 || !AUDIT_DESKTOP_VERSION.test(desktopVersion)) {
-    throw error("DESKTOP_PROTOCOL_ERROR");
-  }
-  const appServerVersion = compatibilityVersion(input.appServerVersion);
-  const appServerSha256 = auditHash(input.appServerSha256, false);
-  const asarHeader = auditAsarHeader(input.asarHeader, false);
-  const modules = auditModules(input.modules);
-  if (!appServerVersion || !asarHeader) throw error("DESKTOP_PROTOCOL_ERROR");
-  return { desktopVersion, appServerVersion, appServerSha256, asarHeader, modules };
-}
-
-export function validateDesktopCompatibilityAudit(value: unknown): DesktopCompatibilityAudit {
-  if (!value || typeof value !== "object" || Array.isArray(value)) throw error("DESKTOP_PROTOCOL_ERROR");
-  const input = value as Record<string, unknown>;
-  const required = [
-    "observedDesktopVersion", "observedAppServerVersion", "status", "profile", "classification",
-    "semanticReason", "semanticFingerprint", "appServerSha256", "asarHeader", "candidateProfile", "modules",
-  ] as const;
-  if (!exactKeys(input, required, ["candidateRuntime"])) throw error("DESKTOP_PROTOCOL_ERROR");
-  const compatibility = validateDesktopCompatibility({
-    observedDesktopVersion: input.observedDesktopVersion,
-    observedAppServerVersion: input.observedAppServerVersion,
-    status: input.status,
-    profile: input.profile,
-  });
-  const classification = input.classification;
-  if (typeof classification !== "string" ||
-      !COMPATIBILITY_AUDIT_CLASSIFICATIONS.has(classification as DesktopCompatibilityAuditClassification)) {
-    throw error("DESKTOP_PROTOCOL_ERROR");
-  }
-  const semanticReason = auditSemanticReason(input.semanticReason);
-  const semanticFingerprint = auditHash(input.semanticFingerprint);
-  if ((semanticReason === "matched") !== (semanticFingerprint !== null)) throw error("DESKTOP_PROTOCOL_ERROR");
-  const candidateProfile = compatibilityProfile(input.candidateProfile);
-  const appServerSha256 = auditHash(input.appServerSha256);
-  const asarHeader = auditAsarHeader(input.asarHeader);
-  const modules = auditModules(input.modules);
-  const candidateRuntime = Object.prototype.hasOwnProperty.call(input, "candidateRuntime")
-    ? auditCandidateRuntime(input.candidateRuntime) : undefined;
-  if (classification === "same_protocol_candidate") {
-    if (!candidateRuntime || !candidateProfile || compatibility.status !== "unverified" || compatibility.profile !== null ||
-        !compatibility.observedDesktopVersion || !compatibility.observedAppServerVersion || !appServerSha256 || !asarHeader ||
-        modules.length !== 2 || candidateRuntime.modules.length !== 2 ||
-        new Set(modules.map(module => module.role)).size !== 2 ||
-        candidateRuntime.desktopVersion !== compatibility.observedDesktopVersion ||
-        candidateRuntime.appServerVersion !== compatibility.observedAppServerVersion ||
-        candidateRuntime.appServerSha256 !== appServerSha256 ||
-        JSON.stringify(candidateRuntime.asarHeader) !== JSON.stringify(asarHeader) ||
-        JSON.stringify(candidateRuntime.modules) !== JSON.stringify(modules)) {
-      throw error("DESKTOP_PROTOCOL_ERROR");
-    }
-  } else if (candidateRuntime ||
-      (classification === "semantic_same_protocol_candidate" && !semanticFingerprint)) {
-    throw error("DESKTOP_PROTOCOL_ERROR");
-  }
-  if (classification === "semantic_same_protocol_candidate" &&
-      (semanticReason !== "matched" || compatibility.status !== "unverified" || compatibility.profile !== null || !candidateProfile ||
-       !compatibility.observedDesktopVersion || !compatibility.observedAppServerVersion || !appServerSha256 ||
-       !asarHeader || modules.length !== 2 || new Set(modules.map(module => module.role)).size !== 2)) {
-    throw error("DESKTOP_PROTOCOL_ERROR");
-  }
-  if (classification === "current" && (compatibility.status !== "current" || !compatibility.profile ||
-      candidateProfile !== compatibility.profile || !appServerSha256 || !asarHeader || modules.length !== 2 ||
-      new Set(modules.map(module => module.role)).size !== 2)) {
-    throw error("DESKTOP_PROTOCOL_ERROR");
-  }
-  return {
-    ...compatibility,
-    classification: classification as DesktopCompatibilityAuditClassification,
-    semanticReason,
-    semanticFingerprint,
-    appServerSha256,
-    asarHeader,
-    candidateProfile,
-    modules,
-    ...(candidateRuntime ? { candidateRuntime } : {}),
-  };
-}
-
-export function desktopCompatibilityFromError(value: unknown): DesktopCompatibility | undefined {
-  if (!value || typeof value !== "object") return undefined;
-  try {
-    return validateDesktopCompatibility((value as { compatibility?: unknown }).compatibility);
-  } catch {
-    return undefined;
-  }
-}
-
-function error(
-  code: string,
-  options: { notSent?: boolean; compatibility?: DesktopCompatibility } = {},
-): DesktopError & { notSent: boolean; compatibility?: DesktopCompatibility } {
-  const result = new DesktopError(code, messageFor(code)) as DesktopError & {
-    notSent: boolean;
-    compatibility?: DesktopCompatibility;
-  };
+function error(code: string, options: { notSent?: boolean } = {}): DesktopError & { notSent: boolean } {
+  const result = new DesktopError(code, messageFor(code)) as DesktopError & { notSent: boolean };
   result.notSent = options.notSent ?? true;
-  if (options.compatibility !== undefined) result.compatibility = options.compatibility;
   return result;
 }
 
@@ -622,16 +317,12 @@ function validateTargetScopedResultContext(value: unknown, target: DesktopTarget
   const input = value as Record<string, unknown>;
   const keys = [
     "threadId", "hostId", "projectId", "workspaceRoot", "title", "cwd", "workspaceKind", "resumeState",
-    "runtimeStatus", "requestsCount", "desktopVersion", "appServerVersion", "profile", "ownerClientId",
-    "resultTurnId", "resultTurnStatus",
+    "runtimeStatus", "requestsCount", "ownerClientId", "resultTurnId", "resultTurnStatus",
   ];
   if (Object.keys(input).sort().join(",") !== [...keys].sort().join(",")) throw error("DESKTOP_PROTOCOL_ERROR");
   const context = validateResultContext(value, target);
   if (input.workspaceKind !== "project" || input.resumeState !== "resumed" ||
       !Number.isSafeInteger(input.requestsCount) || (input.requestsCount as number) < 0 ||
-      typeof input.desktopVersion !== "string" || !input.desktopVersion.trim() || input.desktopVersion.length > 128 ||
-      typeof input.appServerVersion !== "string" || !input.appServerVersion.trim() || input.appServerVersion.length > 128 ||
-      (input.profile !== null && (typeof input.profile !== "string" || !/^desktop-ipc-v[1-9]\d*$/.test(input.profile))) ||
       typeof input.ownerClientId !== "string" || !isUuid(input.ownerClientId)) {
     throw error("DESKTOP_PROTOCOL_ERROR");
   }
@@ -672,7 +363,7 @@ export function validateDesktopResultActivityMarkerObservation(
   if (!value || typeof value !== "object" || Array.isArray(value)) throw error("DESKTOP_PROTOCOL_ERROR");
   const input = value as Record<string, unknown>;
   if (Object.keys(input).sort().join(",") !==
-      "appServerVersion,cwd,desktopVersion,hostId,marker,ownerClientId,profile,projectId,requestsCount,resultTurnId,resultTurnStatus,resumeState,runtimeStatus,threadId,title,workspaceKind,workspaceRoot") {
+      "cwd,hostId,marker,ownerClientId,projectId,requestsCount,resultTurnId,resultTurnStatus,resumeState,runtimeStatus,threadId,title,workspaceKind,workspaceRoot") {
     throw error("DESKTOP_PROTOCOL_ERROR");
   }
   const marker = validateDesktopResultActivityMarker(input.marker);
@@ -690,7 +381,7 @@ export function validateDesktopResultTerminalFence(
   if (!value || typeof value !== "object" || Array.isArray(value)) throw error("DESKTOP_PROTOCOL_ERROR");
   const input = value as Record<string, unknown>;
   if (Object.keys(input).sort().join(",") !==
-      "appServerVersion,cwd,desktopVersion,fence,hostId,ownerClientId,profile,projectId,requestsCount,resultTurnId,resultTurnStatus,resumeState,runtimeStatus,threadId,title,workspaceKind,workspaceRoot") {
+      "cwd,fence,hostId,ownerClientId,projectId,requestsCount,resultTurnId,resultTurnStatus,resumeState,runtimeStatus,threadId,title,workspaceKind,workspaceRoot") {
     throw error("DESKTOP_PROTOCOL_ERROR");
   }
   const contextValue = { ...input };
@@ -708,40 +399,38 @@ export function validateDesktopResultTerminalFence(
   return { ...context, fence };
 }
 
-export function validateDesktopHandshakeAudit(value: unknown): DesktopHandshakeAudit {
+export interface DesktopDiagnosis {
+  mode: "behavioral";
+  processStable: true;
+  initialize: true;
+  ownerDiscovery: boolean;
+  followingChangedSent: boolean;
+  stateReceived: boolean;
+  stateChange: "snapshot" | "patches" | null;
+}
+
+export function validateDesktopDiagnosis(value: unknown): DesktopDiagnosis {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw error("DESKTOP_PROTOCOL_ERROR");
   const input = value as Record<string, unknown>;
-  const required = [
-    "followingChangedSent", "initialize", "ownerDiscovery", "processStable", "protocolClassification", "semanticReason", "semanticFingerprint",
-    "runtimeStable", "stateChange", "stateReceived",
-  ];
-  if (!exactKeys(input, required, ["candidateRuntime"])) {
+  if (Object.keys(input).sort().join(",") !==
+      "followingChangedSent,initialize,mode,ownerDiscovery,processStable,stateChange,stateReceived") {
     throw error("DESKTOP_PROTOCOL_ERROR");
   }
-  const candidateRuntime = Object.prototype.hasOwnProperty.call(input, "candidateRuntime")
-    ? auditCandidateRuntime(input.candidateRuntime) : undefined;
-  const semanticReason = auditSemanticReason(input.semanticReason);
-  const semanticFingerprint = auditHash(input.semanticFingerprint);
-  if ((semanticReason === "matched") !== (semanticFingerprint !== null)) throw error("DESKTOP_PROTOCOL_ERROR");
-  if (input.processStable !== true || input.runtimeStable !== true || input.initialize !== true ||
-      input.ownerDiscovery !== true || input.followingChangedSent !== true || input.stateReceived !== true ||
-      (input.stateChange !== "snapshot" && input.stateChange !== "patches") ||
-      (input.protocolClassification === "semantic_same_protocol_candidate" && semanticReason !== "matched") ||
-      !["current", "same_protocol_candidate", "semantic_same_protocol_candidate", "protocol_drift_or_unknown"]
-        .includes(input.protocolClassification as string)) {
+  if (input.processStable !== true || input.initialize !== true || input.mode !== "behavioral" ||
+      typeof input.ownerDiscovery !== "boolean" || typeof input.followingChangedSent !== "boolean" ||
+      typeof input.stateReceived !== "boolean" ||
+      (input.stateChange !== "snapshot" && input.stateChange !== "patches" && input.stateChange !== null)) {
     throw error("DESKTOP_PROTOCOL_ERROR");
   }
-  if (input.protocolClassification === "same_protocol_candidate") {
-    if (!candidateRuntime || candidateRuntime.modules.length !== 2 ||
-        new Set(candidateRuntime.modules.map(module => module.role)).size !== 2) {
-      throw error("DESKTOP_PROTOCOL_ERROR");
-    }
-  } else if (candidateRuntime ||
-      (input.protocolClassification === "semantic_same_protocol_candidate" && !semanticFingerprint)) {
-    throw error("DESKTOP_PROTOCOL_ERROR");
-  }
-  return { ...(input as unknown as Omit<DesktopHandshakeAudit, "candidateRuntime">), semanticReason, semanticFingerprint,
-    ...(candidateRuntime ? { candidateRuntime } : {}) };
+  return {
+    mode: "behavioral",
+    processStable: true,
+    initialize: true,
+    ownerDiscovery: input.ownerDiscovery as boolean,
+    followingChangedSent: input.followingChangedSent as boolean,
+    stateReceived: input.stateReceived as boolean,
+    stateChange: input.stateChange as DesktopDiagnosis["stateChange"],
+  };
 }
 
 function validateResultOwnershipExpectation(value: DesktopResultOwnershipExpectation): DesktopResultOwnershipExpectation {
@@ -764,7 +453,7 @@ function validateResultOwnership(value: unknown, target: DesktopTarget): Desktop
   const input = value as Record<string, unknown>;
   const allowed = new Set([
     "threadId", "hostId", "projectId", "workspaceRoot", "title", "cwd", "workspaceKind", "resumeState",
-    "runtimeStatus", "requestsCount", "desktopVersion", "appServerVersion", "profile", "ownerClientId",
+    "runtimeStatus", "requestsCount", "ownerClientId",
     "resultTurnId", "resultTurnStatus", "ownership", "originTurnId", "chainTurnIds", "chainLength", "signature",
   ]);
   if (Object.keys(input).some(key => !allowed.has(key))) throw error("DESKTOP_PROTOCOL_ERROR");
@@ -806,7 +495,7 @@ function validateResultClassification(value: unknown, target: DesktopTarget): De
   const input = value as Record<string, unknown>;
   const allowed = new Set([
     "threadId", "hostId", "projectId", "workspaceRoot", "title", "cwd", "workspaceKind", "resumeState",
-    "runtimeStatus", "requestsCount", "desktopVersion", "appServerVersion", "profile", "ownerClientId",
+    "runtimeStatus", "requestsCount", "ownerClientId",
     "resultTurnId", "resultTurnStatus", "classification", "workspaceId", "commandId", "intent",
     "messageBytes", "messageSha256", "ownership", "originTurnId", "chainTurnIds", "chainLength", "signature",
   ]);
@@ -999,12 +688,7 @@ class HelperSession {
           ? response.code
           : pending.operation === "send" ? "DESKTOP_OUTCOME_UNKNOWN" : "DESKTOP_PROTOCOL_ERROR";
         // 缺失 notSent 不能证明尚未进入真实 start；send 必须保守为 unknown。
-        const notSent = response.notSent === true;
-        const compatibility = desktopCompatibilityFromError(response);
-        pending.reject(error(requestedCode, {
-          notSent,
-          ...(compatibility ? { compatibility } : {}),
-        }));
+        pending.reject(error(requestedCode, { notSent: response.notSent === true }));
       }
     }
   }
@@ -1048,32 +732,13 @@ export class DesktopIpcClient {
     }
   }
 
-  async compatibility(): Promise<DesktopCompatibility> {
-    const session = this.open();
-    try {
-      const value = await session.request("compatibility", {});
-      return validateDesktopCompatibility(value);
-    } finally {
-      session.close();
-    }
-  }
-
-  async compatibilityAudit(): Promise<DesktopCompatibilityAudit> {
-    const session = this.open();
-    try {
-      const value = await session.request("compatibility_audit", {});
-      return validateDesktopCompatibilityAudit(value);
-    } finally {
-      session.close();
-    }
-  }
-
-  async handshakeAudit(workspaceRoot: string): Promise<DesktopHandshakeAudit> {
+  /** 只读 live handshake 诊断；不做信任分类，也不输出版本或 bundle 信息。 */
+  async diagnose(workspaceRoot: string): Promise<DesktopDiagnosis> {
     if (typeof workspaceRoot !== "string" || !workspaceRoot.trim()) throw error("DESKTOP_INVALID_REQUEST");
     const session = this.open();
     try {
-      const value = await session.request("handshake_audit", { workspaceRoot });
-      return validateDesktopHandshakeAudit(value);
+      const value = await session.request("diagnose", { workspaceRoot });
+      return validateDesktopDiagnosis(value);
     } finally { session.close(); }
   }
 

@@ -411,7 +411,7 @@ describe("Desktop 持久化投递", () => {
     expect(close).toHaveBeenCalled();
   });
 
-  it.each(["DESKTOP_BUSY", "DESKTOP_AWAITING_APPROVAL", "DESKTOP_NO_OWNER", "DESKTOP_WRONG_PROJECT", "DESKTOP_VERSION_UNSUPPORTED", "DESKTOP_ELEVATED"])("%s 预检失败零发送", async code => {
+  it.each(["DESKTOP_BUSY", "DESKTOP_AWAITING_APPROVAL", "DESKTOP_NO_OWNER", "DESKTOP_WRONG_PROJECT", "DESKTOP_ELEVATED"])("%s 预检失败零发送", async code => {
     enableDesktop(workspace, bindingId);
     vi.mocked(desktopIpc.prepare).mockRejectedValue(new DesktopError(code, "预检阻断"));
     await expect(sendDesktop(workspace, input(), "client")).rejects.toMatchObject({ code });
@@ -458,6 +458,18 @@ describe("Desktop 持久化投递", () => {
     expect((await desktopStatus(workspace)).unresolvedDelivery).toBe(false);
     send.mockResolvedValue({ threadId: target.threadId, turnId: randomUUID() });
     expect((await sendDesktop(workspace, input({ commandId: "explicit_new_request" }), "client")).deliveryStatus).toBe("accepted");
+  });
+
+  it("PROTOCOL_ERROR+notSent=true按pre-start证据保存rejected，无notSent仍unknown", async () => {
+    enableDesktop(workspace, bindingId);
+    send.mockRejectedValue(Object.assign(new DesktopError("DESKTOP_PROTOCOL_ERROR", "不能泄露的底层正文"), { notSent: true }));
+    const rejected = await sendDesktop(workspace, input(), "client");
+    expect(rejected).toMatchObject({ deliveryStatus: "rejected", error: "DESKTOP_PROTOCOL_ERROR" });
+    expect(rejected.message).not.toContain("底层正文");
+    expect((await desktopStatus(workspace)).unresolvedDelivery).toBe(false);
+    send.mockRejectedValue(new DesktopError("DESKTOP_PROTOCOL_ERROR", "协议失败"));
+    const unknown = await sendDesktop(workspace, input({ commandId: "explicit_new_request" }), "client");
+    expect(unknown.deliveryStatus).toBe("outcome_unknown");
   });
 
   it("没有明确notSent证据不能将busy错误当成零发送", async () => {

@@ -266,7 +266,7 @@ Desktop Control 是独立于 Remote Control 和 DOM Web Control 的 MCP 写入�
 当前对话用户明确确认完整方案或修订
   → codex_desktop_send（codex.desktop.control）
     intent=development_plan|revision, userConfirmed=true
-  → 本机重新核对绑定、Desktop 进程/端点、owner、项目和版本
+  → 本机重新核对绑定、Desktop 进程/端点、owner、项目和 live behavioral 状态
   → 等待有界的真实接受回执
   → deliveryStatus=accepted（带真实 threadId/turnId），网页本轮结束
   → Desktop 在最终终态前用统一 c2c record 请求 exact commandId receipt；inProgress 先进入 terminal fence
@@ -300,7 +300,7 @@ Codex 自动点击，也不得用脚本代点；本机用户必须自己点击�
 所有 deliveries history 始终保留，其中包含旧 `bindingId`。不同 workspaceRoot 或无法确认
 （`unknown`）时，明确拒绝快捷 bind/enable/send，不能换 ID 或重新绑定绕过。身份核验允许当前
 Desktop 为 `active`，但 send 仍必须严格满足 `idle`、无待审批、owner、project/workspace
-匹配和已验证版本。
+匹配和 live behavioral 验证。
 
 本机用户先用 `desktop bind` 指定真实 `threadId`、`host`、Desktop `project` 和当前
 workspace，再用 `desktop enable` 明确接受 Desktop 会话现有权限可能修改文件或执行命令。
@@ -322,7 +322,7 @@ send 的风险标注保持 `readOnlyHint:false`、`destructiveHint:true`、`open
 `idempotentHint:true`；`idempotent` 仅表示同一 `commandId` 防止重复尝试，不是网络 exactly-once。
 
 `accepted` 仅表示投递被 Desktop 接受，不是 `completed`，也不是测试通过。忙、待审批、
-无 owner、离线、错项目、workspace 不匹配、提权或版本不兼容时零发送并返回明确错误。
+无 owner、离线、错项目、workspace 不匹配、提权或 live 协议不兼容时零发送并返回明确错误。
 回执超时、断线或落盘不明返回 `outcome_unknown`；不要重发、换 `commandId` 或重新绑定绕过，
 整个 workspace（包括新绑定）的后续投递暂停，必须先由本机用户人工核对；MVP 没有自动
 恢复或恢复接口。
@@ -356,8 +356,10 @@ client、同 ID、同参数重放返回原记录，`intent` 或其他参数冲�
 阻断规则保持不变。
 
 IPC 只在本机受控使用，Windows helper 使用 `C2C_DESKTOP_PYTHON` 或 `python`，不要求
-管理员权限、不启动第二个 app-server/router，也不通过 Tunnel 暴露原始 RPC。只放行已
-验证 Desktop/app-server 版本，未知版本停止；Desktop 重启后重新发现进程和 owner。
+管理员权限、不启动第二个 app-server/router，也不通过 Tunnel 暴露原始 RPC。Desktop
+是否可用由当前 live 行为证明决定（进程树、owner、project/workspace、新鲜状态与
+发送后 canonical turn 证明），不再按 Desktop/app-server 版本或二进制 hash 预登记放行；
+Desktop 重启后重新发现进程和 owner。
 已知 idle/start 内部协议在检查和发送之间没有原子 CAS，目标可能在窗口内改变，因此回执
 不匹配也按未知结果处理。profile 标识与 `override=null` 属于不同字段层次，设置继承只是
 源码推断；provider 和服务端最终权限解析可能仍是 unknown，不能据此声称所有权限设置已通过。

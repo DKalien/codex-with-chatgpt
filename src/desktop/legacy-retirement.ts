@@ -100,9 +100,6 @@ type OwnerlessContext = {
   resultTurnStatus: "inProgress";
   runtimeStatus: "active" | "inProgress";
   requestsCount?: number;
-  desktopVersion?: string;
-  appServerVersion?: string;
-  profile?: string | null;
   ownerClientId?: string | null;
 };
 
@@ -383,9 +380,6 @@ function ownerlessContext(value: unknown, binding: NonNullable<DesktopState["bin
     resultTurnStatus: "inProgress",
     runtimeStatus,
     requestsCount: context.requestsCount,
-    desktopVersion: context.desktopVersion,
-    appServerVersion: context.appServerVersion,
-    profile: context.profile,
     ownerClientId: context.ownerClientId,
   };
 }
@@ -396,8 +390,7 @@ function sameOwnerlessContext(a: OwnerlessContext, b: OwnerlessContext): boolean
     a.workspaceKind === b.workspaceKind && a.resumeState === b.resumeState &&
     a.resultTurnId === b.resultTurnId && a.resultTurnStatus === b.resultTurnStatus &&
     a.runtimeStatus === b.runtimeStatus && a.requestsCount === b.requestsCount &&
-    a.desktopVersion === b.desktopVersion && a.appServerVersion === b.appServerVersion &&
-    a.profile === b.profile && a.ownerClientId === b.ownerClientId;
+    a.ownerClientId === b.ownerClientId;
 }
 
 function waitForCurrentContextRetry(): Promise<void> {

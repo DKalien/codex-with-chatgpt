@@ -57,7 +57,7 @@ it("不同target生成新bindingId，保持全部旧投递记录", async () => {
 });
 
 it.each(["DESKTOP_CURRENT_CONTEXT_INVALID", "DESKTOP_PROJECT_MISMATCH", "DESKTOP_NO_OWNER",
-  "DESKTOP_VERSION_UNSUPPORTED", "DESKTOP_ELEVATED"])("%s 零绑定、零确认、零启用", async code => {
+  "DESKTOP_ELEVATED"])("%s 零绑定、零确认、零启用", async code => {
   vi.mocked(desktopIpc.currentIdentity).mockRejectedValue(new DesktopError(code, "拒绝"));
   await expect(bindCurrentDesktop(workspace)).rejects.toMatchObject({ code });
   expect(bytes()).toBeNull();
@@ -122,85 +122,46 @@ it("CLI 无需ID参数成功，拒绝target覆盖和免确认选项", async () =
   expect(desktopIpc.confirmCurrent).toHaveBeenCalledTimes(1);
 });
 
-it("CLI compatibility JSON 只读诊断，接受 workspace 参数但不初始化状态", async () => {
+it("CLI diagnose JSON 只读诊断，接受 workspace 参数但不初始化状态", async () => {
   const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
-  const compatibility = {
-    observedDesktopVersion: "26.903.9818.0",
-    observedAppServerVersion: "0.153.4",
-    status: "current" as const,
-    profile: "desktop-ipc-v1",
+  const diagnosis = {
+    mode: "behavioral" as const,
+    processStable: true as const,
+    initialize: true as const,
+    ownerDiscovery: true,
+    followingChangedSent: true,
+    stateReceived: true,
+    stateChange: "snapshot" as const,
   };
-  vi.spyOn(desktopIpc, "compatibility").mockResolvedValue(compatibility);
+  vi.spyOn(desktopIpc, "diagnose").mockResolvedValue(diagnosis);
   const program = new Command().exitOverride(); registerDesktopCommands(program);
-  await program.parseAsync(["node", "c2c", "desktop", "compatibility", "-w", workspace.root, "--json"]);
-  expect(JSON.parse(String(out.mock.calls[0][0]))).toEqual({ ok: true, ...compatibility });
-  expect(desktopIpc.compatibility).toHaveBeenCalledOnce();
+  await program.parseAsync(["node", "c2c", "desktop", "diagnose", "-w", workspace.root, "--json"]);
+  expect(JSON.parse(String(out.mock.calls[0][0]))).toEqual({ ok: true, ...diagnosis });
+  expect(desktopIpc.diagnose).toHaveBeenCalledOnce();
   expect(bytes()).toBeNull();
 });
 
-it("CLI compatibility --audit 只读审计，选择独立方法且不初始化状态", async () => {
+it("CLI compatibility 别名仍调用 diagnose，且不做信任分类", async () => {
   const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
-  const audit = {
-    observedDesktopVersion: "26.908.9136.0",
-    observedAppServerVersion: "0.154.0-alpha.6.2",
-    status: "current" as const,
-    profile: "desktop-ipc-v1",
-    classification: "current" as const,
-    appServerSha256: "a".repeat(64),
-    asarHeader: [4, 2489280, 2489276, 2489269] as [number, number, number, number],
-    candidateProfile: "desktop-ipc-v1",
-    modules: [
-      { role: "ipc-main" as const, path: ".vite/build/src-test.js", sha256: "b".repeat(64) },
-      { role: "webview-bootstrap" as const, path: "webview/assets/app-initial-test.js", sha256: "c".repeat(64) },
-    ],
-  };
-  vi.spyOn(desktopIpc, "compatibilityAudit").mockResolvedValue(audit);
-  const compatibility = vi.spyOn(desktopIpc, "compatibility");
+  const diagnose = vi.spyOn(desktopIpc, "diagnose").mockResolvedValue({
+    mode: "behavioral" as const,
+    processStable: true as const,
+    initialize: true as const,
+    ownerDiscovery: false,
+    followingChangedSent: true,
+    stateReceived: false,
+    stateChange: null,
+  });
   const program = new Command().exitOverride(); registerDesktopCommands(program);
-  await program.parseAsync(["node", "c2c", "desktop", "compatibility", "--audit", "-w", workspace.root, "--json"]);
-  expect(JSON.parse(String(out.mock.calls[0][0]))).toEqual({ ok: true, ...audit });
-  expect(desktopIpc.compatibilityAudit).toHaveBeenCalledOnce();
-  expect(compatibility).not.toHaveBeenCalled();
-  expect(bytes()).toBeNull();
+  await program.parseAsync(["node", "c2c", "desktop", "compatibility", "--json"]);
+  expect(JSON.parse(String(out.mock.calls[0][0]))).toMatchObject({ ok: true, processStable: true, stateChange: null });
+  expect(diagnose).toHaveBeenCalledOnce();
 });
 
-it("CLI compatibility --handshake-audit 仅调用 workspace-scoped handshake", async () => {
+it("CLI bind-current 错误只输出安全消息，不带回 helper 诊断对象", async () => {
   const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
-  const result = { processStable: true as const, runtimeStable: true as const,
-    protocolClassification: "current" as const, initialize: true as const, ownerDiscovery: true as const,
-    followingChangedSent: true as const, stateReceived: true as const, stateChange: "snapshot" as const };
-  const handshake = vi.spyOn(desktopIpc, "handshakeAudit").mockResolvedValue(result);
-  const compatibility = vi.spyOn(desktopIpc, "compatibility");
-  const audit = vi.spyOn(desktopIpc, "compatibilityAudit");
-  const program = new Command().exitOverride(); registerDesktopCommands(program);
-  await program.parseAsync(["node", "c2c", "desktop", "compatibility", "--handshake-audit", "-w", workspace.root, "--json"]);
-  expect(JSON.parse(String(out.mock.calls[0][0]))).toEqual({ ok: true, ...result });
-  expect(handshake).toHaveBeenCalledWith(workspace.root);
-  expect(compatibility).not.toHaveBeenCalled();
-  expect(audit).not.toHaveBeenCalled();
-});
-
-it("CLI compatibility 拒绝同时 --audit --handshake-audit 且不调用任何方法", async () => {
-  const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
-  const handshake = vi.spyOn(desktopIpc, "handshakeAudit");
-  const compatibility = vi.spyOn(desktopIpc, "compatibility");
-  const audit = vi.spyOn(desktopIpc, "compatibilityAudit");
-  const program = new Command().exitOverride(); registerDesktopCommands(program);
-  await program.parseAsync(["node", "c2c", "desktop", "compatibility", "--audit", "--handshake-audit", "--json"]);
-  expect(JSON.parse(String(out.mock.calls[0][0]))).toMatchObject({ ok: false, error: "DESKTOP_INVALID_REQUEST" });
-  expect(handshake).not.toHaveBeenCalled();
-  expect(compatibility).not.toHaveBeenCalled();
-  expect(audit).not.toHaveBeenCalled();
-});
-
-it("CLI bind-current 错误只输出安全 compatibility 投影", async () => {
-  const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
-  const failure = new DesktopError("DESKTOP_VERSION_UNSUPPORTED", "secret token pipe");
+  const failure = new DesktopError("DESKTOP_STATE_UNAVAILABLE", "secret token pipe");
   (failure as DesktopError & { compatibility: unknown }).compatibility = {
-    observedDesktopVersion: "26.903.9818.0",
-    observedAppServerVersion: "0.153.4",
-    status: "incompatible",
-    profile: "desktop-ipc-v1",
     token: "secret-token",
     pipe: "\\\\.\\pipe\\secret",
   };
@@ -208,10 +169,8 @@ it("CLI bind-current 错误只输出安全 compatibility 投影", async () => {
   const program = new Command().exitOverride(); registerDesktopCommands(program);
   await program.parseAsync(["node", "c2c", "desktop", "bind-current", "--json"]);
   const payload = JSON.parse(String(out.mock.calls[0][0])) as Record<string, unknown>;
-  expect(payload).toMatchObject({ ok: false, error: "DESKTOP_VERSION_UNSUPPORTED", compatibility: {
-    observedDesktopVersion: "26.903.9818.0", observedAppServerVersion: "0.153.4",
-    status: "incompatible", profile: "desktop-ipc-v1",
-  } });
+  expect(payload).toMatchObject({ ok: false, error: "DESKTOP_STATE_UNAVAILABLE" });
+  expect(payload).not.toHaveProperty("compatibility");
   expect(payload).not.toHaveProperty("token");
   expect(payload).not.toHaveProperty("pipe");
   expect(String(payload.message)).not.toContain("secret");

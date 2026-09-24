@@ -19,10 +19,12 @@ describe.each(["LF", "CRLF"])("Activation Skill 文本契约（%s）", style => 
   const upgrade = activation.split("### Runtime build upgrade")[1]?.split("### Runtime contract refresh")[0]
     ?? skill.split("### Runtime build upgrade")[1]?.split("### Runtime contract refresh")[0] ?? "";
 
-  it("Desktop 版本 / launcher / 触发语安全契约", () => {
-    for (const text of ["DESKTOP_VERSION_UNSUPPORTED", "observedDesktopVersion", "不是 OAuth `desktopCompatibility`",
+  it("Desktop 行为模型 / launcher / 触发语安全契约", () => {
+    for (const text of ["c2c desktop diagnose", 'mode: "behavioral"', "不是 OAuth `desktopCompatibility`",
       "启用 ChatGPT 工作流", "Enable the ChatGPT workflow"])
       expect(skill).toContain(text);
+    for (const legacy of ["DESKTOP_VERSION_UNSUPPORTED", "observedDesktopVersion", "observedAppServerVersion"])
+      expect(skill).not.toContain(legacy);
     expect(skill.match(/<C2C_LAUNCHER_PATH>/g)).toHaveLength(1);
   });
 

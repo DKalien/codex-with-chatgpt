@@ -44,7 +44,7 @@
 | --- | --- |
 | `bridge/` | Express app assembly, loopback-only listener, port fallback, runtime state, admin API |
 | `mcp/` | McpServer with workspace/git/search/session/pairing/feedback/workflow tools (base read-only set + separately guarded Desktop/Remote/feedback schemas); stateless Streamable HTTP transport (fresh server per request, JSON responses) |
-| `desktop/` | Local Desktop binding, version-gated IPC delivery, replay-safe state and delivery status |
+| `desktop/` | Local Desktop binding, behaviorally attested IPC delivery, replay-safe state and delivery status |
 | `executor/` | Executor Core 的有限适配器契约、固定注册表及当前 Codex Desktop adapter |
 | `auth/` | OAuth 2.1 authorization server: discovery metadata (RFC 8414 + Protected Resource Metadata), dynamic client registration (RFC 7591), authorization-code + PKCE (S256 only), refresh rotation, revocation (RFC 7009). Opaque tokens stored as SHA-256 hashes |
 | `pairing/` | PairingCode lifecycle: CSPRNG generation, TTL, attempt limits, IP rate limit, one-time use |
@@ -64,7 +64,7 @@
 本地 executor adapter 负责连接与投递 → 隔离的 workspace。`src/executor/` 只抽取当前 Desktop
 控制服务已经需要的绑定、身份确认、准备/发送连接和 active 检查，不复制 IPC、状态存储或回执终结器。
 
-- 当前生产 adapter 是 `codex-desktop`（Codex Desktop）；现有 helper 的版本、hash、owner、project、workspace、审批、busy、单次发送和回执门禁仍是唯一权威。
+- 当前生产 adapter 是 `codex-desktop`（Codex Desktop）；现有 helper 的 live 进程/owner/project/workspace 核验、发送行为证明（单次 start-turn + canonical turn 证明）、审批、busy 和回执门禁仍是唯一权威。
 - Claude Code 是计划中的第一个额外 adapter；H0 只留下扩展接缝，不实现该集成。
 - Mimo Desktop 依赖稳定的本机机器接口；仅 GUI 自动化属于较低信任路径，不能自动继承 Codex 的 trusted receipt 语义。
 - capability metadata 仅供规划/UI 描述，不能授予权限；注册表固定且拒绝未知 executor，不做插件自动发现、PATH/网络探测或动态加载。
@@ -101,7 +101,7 @@ MiMo Desktop 仍只有 GUI/Browser Bridge 线索，没有稳定 coding-task 机�
 
 **Desktop delivery**: ChatGPT → tunnel (https) → bridge `/mcp` → bearer middleware
 and `codex.desktop.control` check → local enable/binding/workspace check → fresh
-Desktop process/endpoint/owner/version check → controlled local IPC → bounded
+Desktop process/endpoint/owner check → controlled local IPC → bounded
 acceptance receipt. The bridge records the delivery before the send attempt and
 returns `accepted` only with the real Desktop thread/turn IDs; it never waits for
 task completion or exposes raw IPC through the tunnel.

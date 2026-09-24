@@ -94,6 +94,13 @@ Planner route → Project → Command → Executor route → ExecutionResult →
 - 不生成 routeId、不写 routing store、不写任何旧 state；真正注册成 Route 是以后
   显式 migration/rebind 的事。
 
+## R2 状态（2026-09-24）
+
+R2（Desktop Behavioral Adapter）已把 Desktop 生产信任路径切换为 live 行为证明：
+Desktop 是否可用由当前进程/owner/project/workspace 核验与发送后 canonical turn 证明决定，
+版本/app-server hash/ASAR/catalog/semantic fingerprint 预登记体系整体删除。
+本文件描述的 Routing foundation 仍未接入生产发送；Desktop send 仍走原 behavioral 路径。
+
 ## R1 边界（明确不做）
 
 - 无 transport：不实现 command 真实投递/执行通道，不接 executor adapter 调用。

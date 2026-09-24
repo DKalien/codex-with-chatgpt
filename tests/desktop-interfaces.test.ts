@@ -251,7 +251,7 @@ describe("Desktop MCP 与本地接口", () => {
     const program = new Command();
     registerDesktopCommands(program);
     const desktop = program.commands.find(command => command.name() === "desktop");
-    expect(desktop?.commands.map(command => command.name())).toEqual(["record-result", "reconcile-unknown", "legacy-reconcile", "legacy-retire", "abandon", "resolve-unknown", "bind-current", "bind", "enable", "disable", "status", "history", "compatibility"]);
+    expect(desktop?.commands.map(command => command.name())).toEqual(["record-result", "reconcile-unknown", "legacy-reconcile", "legacy-retire", "abandon", "resolve-unknown", "bind-current", "bind", "enable", "disable", "status", "history", "diagnose"]);
     expect(desktop?.commands.find(command => command.name() === "enable")?.options.map(option => option.long)).toContain("--accept-desktop-permissions");
     expect(desktop?.commands.find(command => command.name() === "legacy-reconcile")?.options.map(option => option.long)).toEqual([
       "--workspace", "--command-id", "--list", "--json",

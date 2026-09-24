@@ -30,7 +30,7 @@ JSON 转义）必须满足 64 KiB 限额，外层 IPC JSON 控制行也按现有
 统一入口为隐藏本机命令 `c2c record -w <workspace> --iteration 1 --changed-files "<文件列表>"
 --tests "<本轮摘要或 not run>" --exit-status <ok|failed|blocked> --json`。在真实 accepted
 Desktop turn 内它依据 canonical 当前 turn 自动发现唯一当前 delivery，并复用现有受控 Desktop IPC 和
-实时状态验证真实 thread/workspace/root、owner/project、版本/hash、执行进程来源以及当前
+实时状态验证真实 thread/workspace/root、owner/project、live behavioral 状态、执行进程来源以及当前
 result turnId；`inProgress` 只进入 pending terminal fence，只有 canonical history 中完整的
 terminal turn 才能写 trusted receipt。所有情况均必须同时匹配原 delivery.threadId 和 delivery.turnId。
 不接受调用方传入 turnId；仅伪造环境变量不足以记录。same thread 的后续 turn、无/多个/
@@ -116,11 +116,11 @@ verification 仍必须在 Ready/发送前完成。
 | 同一 thread/project/workspace，disabled | 本机用户确认后重新 enabled；复用原 `bindingId`，保留全部 deliveries history。 |
 | 同一 workspaceRoot 但不同 thread/project | 本机用户确认后生成新的 `bindingId` 并启用；旧 deliveries history 保留，其中含旧 `bindingId`。 |
 | 不同 workspaceRoot | 拒绝当前检查，不执行跨 workspace 快捷重绑。 |
-| 任一身份、项目、workspace 或版本无法确认（`unknown`） | 阻断快捷 bind/enable/send，等待本机用户人工核对；不能靠换 ID 绕过。 |
+| 任一身份、项目、workspace 或 live 状态无法确认（`unknown`） | 阻断快捷 bind/enable/send，等待本机用户人工核对；不能靠换 ID 绕过。 |
 
 绑定身份核验可以接受 Desktop 状态为 `active`，因为它核对的是当前真实上下文；这不放宽
 投递门禁。`codex_desktop_send` 仍必须在发送时严格满足目标 `idle`、无待审批、owner
-匹配、project/workspace 匹配以及已验证版本。传统显式 `desktop bind` + `desktop enable`
+匹配、project/workspace 匹配以及 live behavioral 验证。传统显式 `desktop bind` + `desktop enable`
 命令仍保留为高级 fallback；不新增 MCP bind 工具。
 
 ## 本机绑定与授权
@@ -170,7 +170,7 @@ launcher 校验并执行机器目录中的不可变 release（含独立依赖）
 并发 rollout 未取得机器锁时只报告 `rollout_busy`，不会回写虚假的 pending。
 本机 `rollout --json` 只重启已认证且健康的 named workspace，保持固定 URL；quick 不自动重启。
 当前执行 turn、Desktop busy/approval/未解决 outcome、Remote active/uncertain/queued、配对中或
-身份未知均跳过，绝不为了升级打断任务。原 binding/enable、版本/hash、owner、审批、replay 和
+身份未知均跳过，绝不为了升级打断任务。原 binding/enable、live behavioral、owner、审批、replay 和
 outcome_unknown 门禁保持。`status/doctor --json` 的 `runtimeUpgrade` 报告安装/运行 build 与 pending。
 第一阶段没有常驻 Supervisor；当前 Review Bridge 按 active 跳过，后续空闲时再受控 rollout。
 
@@ -218,7 +218,7 @@ owner discovery 的精确 `no-client-found` 响应表示没有客户端可处理
 
 对符合上述 pre-receipt、无 execution/output 资格的 ownerless 历史等待项，可在当前绑定的
 Desktop 维护 turn 中显式执行 `desktop legacy-retire --command-id <id> --ownerless`。
-此模式只接受经过进程、版本和 project 前后复核的 `DESKTOP_NO_OWNER`，独立证据明确记录
+此模式只接受经过进程、owner 和 project 前后复核的 `DESKTOP_NO_OWNER`，独立证据明确记录
 `kind: ownerless`、观测时间和维护 thread/turn；它表示停止把该旧投递视为活动等待项，绝不
 表示不存在、完成或成功。普通 retirement 的 missing-target 门槛不变。
 maintenanceThreadId / maintenanceTurnId 仅为创建时审计信息，正常 rebind 后不迁移或重写，
@@ -335,7 +335,7 @@ Desktop 行为；本功能不承诺抵御已经获授权客户端。
 
 发送同时要求有效 OAuth `codex.desktop.control`、本机 `desktop enable` 和匹配的当前
 `bindingId`。目标忙、待审批、没有 owner、Desktop 离线、项目或 workspace 不匹配、
-提权或版本不兼容时零发送，并返回明确的失败原因。若初始忙碌可严格证明是同一绑定、同一
+提权或 live 协议不兼容时零发送，并返回明确的失败原因。若初始忙碌可严格证明是同一绑定、同一
 thread 的 active turn，且该 turn 已有唯一匹配的 accepted delivery 和可信 execution receipt，
 发送可同步等待最多 30 秒、约每秒复核一次；只重试 prepare，不创建后台队列，也不会在
 prepare 成功前持久化新 delivery。该同步等待必须保持在有效的外层 tool/request budget 内。
@@ -412,99 +412,39 @@ C2C 自有状态会保存 `commandId`、OAuth `clientId`、`bindingId`、原文�
 状态查询应如实保留该阶段。重新绑定后的新会话必须重新本地授权，且不能绕过 workspace
 级别的 `outcome_unknown` 阻断。
 
-## 本机 IPC 与版本门禁
+## 本机 IPC 与 live 行为证明
 
 IPC 发送前会重新核验 Desktop 服务进程、端点、owner 和绑定目标的新鲜状态；Desktop
 重启后重新发现，不能永久信任旧 PID。已知的 Desktop idle/start 内部协议在检查和实际
 发送之间没有原子 CAS，目标可能在窗口内改变；因此回执不匹配或不明时必须按未知结果
-处理，不能据此宣称 exactly-once。未知版本停止，不能自动降级验证。本机已验证的
-精确组合包括 Desktop `26.903.9818.0` / app-server `0.153.4`，
-Desktop `26.908.4834.0` / app-server `0.154.0-alpha.6.2`，以及
-Desktop `26.908.9136.0` / app-server `0.154.0-alpha.6.2`；其他组合仍须重新核验。
-这不是“所有 26.908 都兼容”，而是三个分别固定的 exact runtime。
+处理，不能据此宣称 exactly-once。
 
-已验证组合统一保存在随 helper 一起构建的版本化 `desktop_profiles.json` catalog；helper 在加载边界严格校验
-schema、大小、字段、版本、hash、ASAR header、必需模块 role/path 以及所有重复项，再派生内部
-`VERIFIED_PROFILES`。每个协议 profile 只包含精确运行时组合：Desktop/package 版本、app-server
-二进制 SHA-256、两个协议模块 SHA-256，以及同一安装包的 ASAR 头部布局。catalog 缺失或损坏时
-一律 fail closed，不能成为 `current`。2026-09-11
-核验确认 ASAR 头部为 2,441,036 字节；原先 1 MiB 解析上限会误报
-`DESKTOP_VERSION_UNSUPPORTED`。现改为匹配已验证的精确头部布局，仍逐一验证全部哈希，
-未知头部、未知哈希或混合版本继续拒绝。旧组合的 app-server 哈希来自普通权限成功 PoC 的
-`binding.json`（output 21/22 关联证据），不是按版本字符串猜测的新白名单。
-本地 `c2c desktop compatibility --json` 提供只读兼容性诊断，不绑定、不启用、不投递，
-也不修改机器状态。返回 `observedDesktopVersion`、`observedAppServerVersion`、`status`
-和匹配的 `profile`，不返回 token、pipe、进程路径或原始 IPC 数据。
-`current` 表示精确版本组合及全部 profile 哈希通过；`unverified` 表示观察到的组合没有
-已验证 profile；`incompatible` 表示匹配组合的完整性或协议要求不符。无法读取的版本为
-`null`，不能猜成已验证版本。诊断成功不代表 owner、项目、运行态或投递权限通过。
+2026-09-24（R2）起，Desktop 是否可用完全由当前 live 行为决定，不再由 Desktop 版本、
+app-server hash、ASAR 布局、catalog 或 semantic fingerprint 决定。旧版本门禁体系
+（`desktop_profiles.json` catalog、`VERIFIED_PROFILES`、app-server/ASAR/模块 SHA-256
+预登记、semantic fingerprint 扫描、`compatibility`/`handshake_audit` 信任分类与
+`DESKTOP_VERSION_UNSUPPORTED` 门禁）已整体删除；Desktop 自动升级后无需修改任何
+catalog 即可继续工作。`c2c desktop diagnose`（别名 `compatibility`）只描述这一次
+live handshake 实际发生了什么（进程稳定、initialize、owner 发现、following 请求、
+状态接收与变更类型，附带 `mode: "behavioral"` 标记），不做 trusted/untrusted 分类，
+也不输出版本或 bundle 信息；
+无法确定 conversation target 时明确返回"无法进行 live conversation diagnosis"。
 
-`c2c desktop compatibility --audit --json` 在同一只读进程发现基础上提供有限 candidate auditor，
-不会 bind、enable、连接 IPC、发送消息或修改 workspace/机器状态。未知 Desktop 仅在 app-server
-版本精确命中单一 profile、ASAR 可有限解析、唯一 webview bootstrap 存在，且所有 IPC main 候选中
-恰有一个 SHA-256 与该 profile 已信任模块 byte-identical 时，才返回 `same_protocol_candidate` 和可直接
-审查的 exact `candidateRuntime`；app-server 二进制 hash 可以变化，但候选仍是 `unverified`，绝不自动
-晋升为 `current`。版本变化、IPC hash 变化、缺失、多个命中、ASAR 歧义或运行进程歧义都保持
-`protocol_drift_or_unknown`、`ambiguous` 或 `unavailable`，且不会产生可信运行时。
+发送信任来自行为证明链：fresh pre-start state → before turn IDs + snapshot serial →
+send-ready（idle、无请求、无未确认提交、无 inProgress turn）+ process/owner fence →
+恰好一次 start-turn → ACK 返回新 turnId → post-start 新鲜观测（serial 严格增大）→
+ACK turnId 在当前会话 canonical 历史中恰好一个且正文与提交的 C2C envelope 严格相等 →
+final process/owner fence → 返回回执。start-turn 写入尝试之后的一切不确定性
+（超时、进程/owner 漂移、状态不可用、正文不匹配）统一收敛为
+`DESKTOP_OUTCOME_UNKNOWN`、`notSent=false`，绝不自动重发；start-turn 之前的失败保持
+具体错误码且 `notSent=true`。owner 一致性由 session identity 的前后 fence 单独保证，
+不塞进 send-ready gate。
 
-候选 promotion 必须由人工审查 exact row，加入 source-controlled catalog，完成 catalog/helper/CLI 测试，
-再用 source checkout 做一次只读握手后才可提交、推送；CLI 自身永不改 catalog。正常 compatibility、
-bind/current-context/prepare/send 仍只接受 catalog 中 exact 版本对、app-server SHA、ASAR header 与必需
-模块 path/hash 的全量匹配。wildcard、版本范围及“新版本默认兼容”继续禁止。
-
-`DESKTOP_VERSION_UNSUPPORTED` 保留原错误码，附带同样的安全诊断字段。Activation 应直接
-报告实际观察版本；不要把这里的 Desktop 协议 profile 与 OAuth Connector 的
-`desktopCompatibility` 混淆，也不能通过重新配对修复协议不兼容。
-新增组合必须审计 IPC 请求版本、owner、project/workspace、turn state、current identity、
-current execution 和 prepare/send 假设，并固定同一安装包的精确版本及 hash。
-协议兼容才复用 `desktop-ipc-v1`；协议变化须新增独立 profile 并保留旧组合。
-不接受 wildcard、版本范围或“更新版本默认兼容”。真实投递前先完成只读身份验证，
-再经原本的本机确认、OAuth、idle、审批、binding 和 replay 门禁进行最小 E2E。
-
-2026-09-12 升级审计观察到 Desktop `26.908.4834.0`、实际运行 app-server
-`0.154.0-alpha.6.2`（直接读取运行文件的静态 provenance 版本标记）。运行中 app-server SHA-256 为
-`081e4de4be8e38fac6ed4d95e3b1a0b9f6d31c090ddc36e1696b349fe406f575`；
-ASAR 头部为 `(4, 2489280, 2489276, 2489269)`，主模块
-`.vite/build/src-CCXHtyvY.js` SHA-256 为
-`a42da38cbb14b28399f1d54fcf453bffc5e9802663e7e098f187c8378f4c7a40`。
-UI 模块 `webview/assets/app-initial-d9bed9d614d8.js` SHA-256 为
-`7c3a89e7e224f76031b45a88f72af8cd60f0c3d47aac9ca34b2c70e11dfe9867`。
-静态核验确认请求版本、following/snapshot、owner 和 start 返回结构保持兼容；固定上述
-hash 后，在主会话进行真实只读握手，普通权限、runner ancestor、project/workspace、owner、
-新鲜 snapshot 及唯一 `inProgress` turn 全部通过，因此该精确组合复用 `desktop-ipc-v1`。
-安装包内附 app-server 的 hash 不同，不作为该运行组合的替代项。只读证据不冒充真实 send/receipt E2E。
-正式 `current_identity` 与 `current_execution` 也已通过；当前会话为 active，`inspect` 和
-`prepare` 均返回 `DESKTOP_BUSY`、`notSent=true`。完整 hash 复核仍逐次执行；只有未知
-hash 才额外扫描静态版本标记，避免重复扫描使快照超过原有 2 秒新鲜度限制。
-
-2026-09-17 只读审计新增 Desktop `26.908.9136.0` / app-server `0.154.0-alpha.6.2`
-exact 组合。运行中 app-server SHA-256 为
-`960c111d47afd61669954b9df9e56083e302edbfa3ef6962d81dcc14a30051dc`；
-ASAR 头部仍为 `(4, 2489280, 2489276, 2489269)`。IPC 主模块
-`.vite/build/src-CCXHtyvY.js` SHA-256 仍为
-`a42da38cbb14b28399f1d54fcf453bffc5e9802663e7e098f187c8378f4c7a40`，
-与 `26.908.4834.0` byte-identical；request versions 仍为 initialize=0、
-thread-owner-discovery=1、thread-follower-start-turn=2，静态审计未发现
-owner/project/workspace/snapshot/following/turn identity protocol change。
-UI 模块变为 `webview/assets/app-initial-bcc2ff475eb6.js`，SHA-256 为
-`3c15444f96a8d48844258618fe0d4278409e626f0ee563a77d2c669ec669c510`。
-app-server provenance marker 改为 compact 形式
-`standalonelocal buildversion: `，且 platform delimiter 可为换行；
-parser 仍仅接受 exact accepted markers，歧义一律 fail closed。
-因为 IPC 协议语义未变，该组合复用 `desktop-ipc-v1`，但 desktop/app-server/module
-hash 仍整组单独固定；不接受版本范围、wildcard 或“26.908 默认兼容”。
-
-2026-09-21 精确 promotion Desktop `26.915.4065.0` / app-server `0.155.0-alpha.9.2`：
-app-server SHA-256 为 `bc45017e8239dc150258f69309ced9df6bbcdf5b8e4f346decf780ac0999e226`，
-ASAR header 为 `(4, 4230936, 4230932, 4230928)`，采用已审计的 modern framing
-`json_offset == json_size + 4`。IPC main `.vite/build/src-C3YaUE83.js` SHA-256 为
-`14c8c23e8b8dfa874d3fb5a50d54fb28eccf55fb83232c3ab29cb7c0ef0a0472`，webview
-`webview/assets/app-initial-6c4523b43a11.js` SHA-256 为
-`146b5204b30bd1766f19c0dd5b76f23515a77708ae80bb66ded6469e11431374`。受限 live handshake
-已验证 initialize/owner/following/state 链路，start-turn cross-layer static forensic 也已闭合
-helper request 与 `TurnStartResponse.turn.id` 返回语义，因此仅上述 exact row 复用
-`desktop-ipc-v1`。这不表示其他 `26.915` 或 `0.155` 组合兼容，任一 version/hash/header/module
-漂移仍 fail closed。
+`DESKTOP_PROTOCOL_ERROR` 用于 wire 版本漂移（如 `thread-stream-state-changed`
+version 不等于 11）等协议层不可理解响应。不要把这里的 live 诊断与 OAuth Connector 的
+`desktopCompatibility` 混淆，也不能通过重新配对修复行为核验失败。
+真实投递前先完成只读身份验证，再经原本的本机确认、OAuth、idle、审批、binding 和
+replay 门禁进行最小 E2E。
 
 Windows 受控 helper 需要 Python 3.11 或更高版本，使用环境变量 `C2C_DESKTOP_PYTHON`
 指定解释器路径，未设置时使用 `python`；它

@@ -1,7 +1,7 @@
 """Codex Desktop Control 的受控 Windows IPC helper。
 
 这个程序只接受 stdin 上的固定操作：``inspect``、``prepare``、``send``、
-``reconcile_unknown``、``compatibility``、``compatibility_audit``、``current_identity``、``current_confirm``、``current_execution``、
+``reconcile_unknown``、``diagnose``、``current_identity``、``current_confirm``、``current_execution``、
 ``inspect_result_context``、``inspect_result_activity_marker``、``inspect_result_terminal_fence``、
 ``current_result_context``、``current_result_classification`` 和 ``current_result_ownership``。
 其中 ``current_*`` 只接受
@@ -20,7 +20,6 @@ import ctypes
 import hashlib
 import json
 import math
-import mmap
 import os
 from pathlib import Path
 import re
@@ -31,7 +30,7 @@ import unicodedata
 import uuid
 from ctypes import wintypes
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 
 PIPE_NAME = r"\\.\pipe\codex-ipc"
@@ -44,705 +43,16 @@ DISCOVERY_TIMEOUT_SECONDS = 5.0
 SNAPSHOT_TIMEOUT_SECONDS = 5.0
 SEND_TIMEOUT_SECONDS = 30.0
 MAX_OBSERVATION_AGE_SECONDS = 2.0
+# ACK 后等待 canonical state 出现 ACK turn 的有界 deadline；只轮询 state，绝不重发 start-turn。
+POST_START_STATE_DEADLINE_SECONDS = 30.0
 MAX_RESULT_OWNERSHIP_CHAIN = 8
 MAX_RESULT_ACTIVITY_ITEMS = 4096
 MIN_PYTHON_VERSION = (3, 11)
-COMPATIBILITY_STATUSES = {"current", "unverified", "incompatible"}
-COMPATIBILITY_AUDIT_CLASSIFICATIONS = {
-    "current", "same_protocol_candidate", "semantic_same_protocol_candidate",
-    "protocol_drift_or_unknown", "ambiguous", "unavailable"
-}
-_VERSION_PATTERN = re.compile(
-    r"\d+\.\d+\.\d+(?:\.\d+)?(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?(?:\+[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?"
-)
-_DESKTOP_VERSION_PATTERN = re.compile(r"\d+\.\d+\.\d+\.\d+")
-_PROFILE_NAME_PATTERN = re.compile(r"desktop-ipc-v[1-9][0-9]*")
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
-_MODULE_PATH_PATTERNS = {
-    "ipc-main": re.compile(r"^\.vite/build/src-[A-Za-z0-9_-]+\.js$"),
-    "webview-bootstrap": re.compile(r"^webview/assets/app-initial-[A-Za-z0-9_-]+\.js$"),
-}
 
-PROFILE_CATALOG_PATH = Path(__file__).with_name("desktop_profiles.json")
-_CATALOG_MAX_BYTES = 512 * 1024
-_CATALOG_MAX_PROFILES = 32
-_CATALOG_MAX_RUNTIMES = 128
-_CATALOG_MAX_MODULES = 2
-_CATALOG_MAX_STRING = 256
-_MAX_ASAR_HEADER_BYTES = 64 * 1024 * 1024
-_MAX_ASAR_FILE_BYTES = 2 * 1024 * 1024 * 1024
-_MAX_ASAR_TREE_NODES = 100_000
-_MAX_ASAR_DEPTH = 64
-_MAX_ASAR_MODULE_BYTES = 64 * 1024 * 1024
-_MAX_ASAR_AUDIT_CANDIDATES = 16
-_MAX_ASAR_AUDIT_CANDIDATES_PER_ROLE = 8
-_MAX_ASAR_AUDIT_MODULE_BYTES = 128 * 1024 * 1024
-_MAX_PROTOCOL_SOURCE_BYTES = 8 * 1024 * 1024
-_MAX_PROTOCOL_TOKENS = 600_000
-_MAX_PROTOCOL_NESTING = 128
-_MAX_PROTOCOL_NUMBER_CHARS = 128
-_JS_NUMBER_PATTERN = re.compile(
-    r"(?:0[xX][0-9a-fA-F](?:_?[0-9a-fA-F])*|0[bB][01](?:_?[01])*|0[oO][0-7](?:_?[0-7])*|"
-    r"(?:[0-9](?:_?[0-9])*(?:\.(?:[0-9](?:_?[0-9])*)?)?|\.[0-9](?:_?[0-9])*)"
-    r"(?:[eE][+-]?[0-9](?:_?[0-9])*)?)(?:n)?"
-)
-_SEMANTIC_REASON_CODES = {
-    "matched", "source_too_large", "lexical_unsupported", "start_turn_missing",
-    "start_turn_ambiguous", "version_unprovable", "payload_unprovable", "ack_unprovable", "not_scanned",
-}
-_SEMANTIC_CONTRACT_PROFILE = "desktop-ipc-v1"
-_START_TURN_MUTATION_CONTRACT = {
-    "method": "thread-follower-start-turn",
-    "version": 2,
-    "routing": ["sourceClientId", "targetClientId"],
-    "params": {
-        "conversationId": "dynamic",
-        "turnStart": {
-            "request": {
-                "threadId": "dynamic",
-                "input": [{"type": "text", "text": "dynamic", "text_elements": []}],
-            },
-        },
-    },
-    "successAck": ["result", "result", "turn", "id"],
-}
-_START_TURN_MUTATION_FINGERPRINT = hashlib.sha256(
-    json.dumps(_START_TURN_MUTATION_CONTRACT, sort_keys=True, separators=(",", ":")).encode("ascii")
-).hexdigest()
+# R2 起 compatibility trust 体系已移除：Desktop 是否可用由 live 行为决定，
+# 不再由 Desktop 版本、app-server hash、ASAR、catalog 或 semantic fingerprint 决定。
 
-
-
-class _CatalogError(ValueError):
-    pass
-
-
-class _ProtocolScanError(ValueError):
-    def __init__(self, classification: str):
-        super().__init__(classification)
-        self.classification = classification
-
-
-def _js_escape(source: str, index: int, *, template: bool) -> tuple[str, int]:
-    if index >= len(source):
-        raise _ProtocolScanError("unavailable")
-    char = source[index]
-    simple = {"b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t", "v": "\v",
-              "0": "\0", "\\": "\\", "'": "'", '"': '"', "/": "/"}
-    if char in simple:
-        if char == "0" and index + 1 < len(source) and source[index + 1].isdigit():
-            raise _ProtocolScanError("unavailable")
-        return simple[char], index + 1
-    if template and char in "`$":
-        return char, index + 1
-    if char in "\r\n\u2028\u2029":
-        if char == "\r" and index + 1 < len(source) and source[index + 1] == "\n":
-            return "", index + 2
-        return "", index + 1
-    if char == "x":
-        raw = source[index + 1:index + 3]
-        if len(raw) != 2 or any(item not in "0123456789abcdefABCDEF" for item in raw):
-            raise _ProtocolScanError("unavailable")
-        return chr(int(raw, 16)), index + 3
-    if char == "u":
-        if index + 1 < len(source) and source[index + 1] == "{":
-            end = source.find("}", index + 2)
-            raw = source[index + 2:end] if end >= 0 else ""
-            if not raw or len(raw) > 6 or any(item not in "0123456789abcdefABCDEF" for item in raw):
-                raise _ProtocolScanError("unavailable")
-            value = int(raw, 16)
-            if value > 0x10FFFF or 0xD800 <= value <= 0xDFFF:
-                raise _ProtocolScanError("unavailable")
-            return chr(value), end + 1
-        raw = source[index + 1:index + 5]
-        if len(raw) != 4 or any(item not in "0123456789abcdefABCDEF" for item in raw):
-            raise _ProtocolScanError("unavailable")
-        value = int(raw, 16)
-        if 0xD800 <= value <= 0xDFFF:
-            raise _ProtocolScanError("unavailable")
-        return chr(value), index + 5
-    if template and char in "0123456789":
-        raise _ProtocolScanError("unavailable")
-    raise _ProtocolScanError("unavailable")
-
-
-def _js_tokens(source: str) -> list[tuple[str, str]]:
-    """有限 JS lexer；不解析或执行 bundle，只投影词法 token。"""
-    if not isinstance(source, str) or "\x00" in source:
-        raise _ProtocolScanError("unavailable")
-    if len(source) > _MAX_PROTOCOL_SOURCE_BYTES or len(source.encode("utf-8", "strict")) > _MAX_PROTOCOL_SOURCE_BYTES:
-        raise _ProtocolScanError("source_too_large")
-    token_count = 0
-    template_depth = 0
-    multi_punct = (">>>=", "===", "!==", ">>>", "**=", "...", "?.", "??", "=>", "==", "!=", "<=", ">=", "&&",
-                   "||", "++", "--", "+=", "-=", "*=", "/=", "%=", "<<", ">>", "**", "&=", "|=", "^=")
-    expression_prefixes = {"(", "[", "{", ",", ";", ":", "?", "=", "!", "~", "&&", "||", "??", "=>",
-                           "+", "-", "*", "%", "&", "|", "^", "<", ">", "return", "throw", "case", "delete",
-                           "void", "typeof", "instanceof", "in", "of", "yield", "await"}
-
-    def token(kind: str, value: str) -> tuple[str, str]:
-        nonlocal token_count
-        token_count += 1
-        if token_count > _MAX_PROTOCOL_TOKENS:
-            raise _ProtocolScanError("lexical_unsupported")
-        return kind, value
-
-    def identifier_start(char: str) -> bool:
-        return char in "_$" or char.isalpha() or (ord(char) > 127 and char.isidentifier())
-
-    def identifier_part(char: str) -> bool:
-        return char in "_$" or char.isalnum() or (ord(char) > 127 and ("a" + char).isidentifier())
-
-    def number_end(index: int) -> int:
-        match = _JS_NUMBER_PATTERN.match(source, index)
-        if match is None:
-            raise _ProtocolScanError("unavailable")
-        end = index + len(match.group(0))
-        if end - index > _MAX_PROTOCOL_NUMBER_CHARS:
-            raise _ProtocolScanError("unavailable")
-        if end < len(source) and (identifier_part(source[end]) or source[end] == "\\"):
-            raise _ProtocolScanError("unavailable")
-        return end
-
-    def scan_template(index: int) -> tuple[list[tuple[str, str]], int]:
-        nonlocal template_depth
-        template_depth += 1
-        if template_depth > _MAX_PROTOCOL_NESTING:
-            raise _ProtocolScanError("unavailable")
-        index += 1
-        chunks: list[str] = []
-        expressions: list[tuple[str, str]] = []
-        dynamic = False
-        while index < len(source):
-            char = source[index]
-            if char == "`":
-                template_depth -= 1
-                if dynamic:
-                    return [token("template_boundary", ""), *expressions, token("template_boundary", "")], index + 1
-                else:
-                    return [token("str", "".join(chunks))], index + 1
-            if source.startswith("${", index):
-                dynamic = True
-                expression, index = scan_code(index + 2, stop_template_expr=True)
-                expressions.extend(expression)
-                continue
-            if char == "\\":
-                escaped, index = _js_escape(source, index + 1, template=True)
-                chunks.append(escaped)
-                continue
-            chunks.append(char)
-            index += 1
-        raise _ProtocolScanError("unavailable")
-
-    def scan_code(index: int, *, stop_template_expr: bool = False) -> tuple[list[tuple[str, str]], int]:
-        local: list[tuple[str, str]] = []
-        stack: list[str] = []
-        pairs = {")": "(", "]": "[", "}": "{"}
-        while index < len(source):
-            char = source[index]
-            if char.isspace() or char == "\ufeff":
-                index += 1
-                continue
-            if stop_template_expr and char == "}" and not stack:
-                return local, index + 1
-            if source.startswith("//", index):
-                end = source.find("\n", index + 2)
-                index = len(source) if end < 0 else end + 1
-                continue
-            if source.startswith("/*", index):
-                end = source.find("*/", index + 2)
-                if end < 0:
-                    raise _ProtocolScanError("unavailable")
-                index = end + 2
-                continue
-            if char in "'\"":
-                quote = char
-                index += 1
-                value: list[str] = []
-                while index < len(source) and source[index] != quote:
-                    current = source[index]
-                    if current in "\r\n\u2028\u2029":
-                        raise _ProtocolScanError("unavailable")
-                    if current == "\\":
-                        escaped, index = _js_escape(source, index + 1, template=False)
-                        value.append(escaped)
-                    else:
-                        value.append(current)
-                        index += 1
-                if index >= len(source):
-                    raise _ProtocolScanError("unavailable")
-                local.append(token("str", "".join(value)))
-                index += 1
-            elif char == "`":
-                template_tokens, index = scan_template(index)
-                local.extend(template_tokens)
-            elif char == "/" and (not local or local[-1][1] in expression_prefixes):
-                index += 1
-                in_class = False
-                escaped = False
-                while index < len(source):
-                    current = source[index]
-                    if current in "\r\n\u2028\u2029":
-                        raise _ProtocolScanError("unavailable")
-                    if escaped:
-                        escaped = False
-                    elif current == "\\":
-                        escaped = True
-                    elif current == "[":
-                        in_class = True
-                    elif current == "]":
-                        in_class = False
-                    elif current == "/" and not in_class:
-                        index += 1
-                        flags: set[str] = set()
-                        while index < len(source) and identifier_part(source[index]):
-                            flag = source[index]
-                            if flag not in "dgimsuvy" or flag in flags:
-                                raise _ProtocolScanError("unavailable")
-                            flags.add(flag)
-                            index += 1
-                        if "u" in flags and "v" in flags:
-                            raise _ProtocolScanError("unavailable")
-                        break
-                    index += 1
-                else:
-                    raise _ProtocolScanError("unavailable")
-                local.append(token("regex", ""))
-            elif identifier_start(char):
-                end = index + 1
-                while end < len(source) and identifier_part(source[end]):
-                    end += 1
-                local.append(token("id", source[index:end]))
-                index = end
-            elif char.isdigit() or (char == "." and index + 1 < len(source) and source[index + 1].isdigit()):
-                end = number_end(index)
-                local.append(token("num", source[index:end]))
-                index = end
-            else:
-                punct = next((candidate for candidate in multi_punct if source.startswith(candidate, index)), char)
-                if punct not in "()[]{}.,;:?~+-*/%&|^!<>=#" and punct not in multi_punct:
-                    raise _ProtocolScanError("unavailable")
-                if punct in "([{":
-                    if len(stack) >= _MAX_PROTOCOL_NESTING:
-                        raise _ProtocolScanError("unavailable")
-                    stack.append(punct)
-                elif punct in ")]}" :
-                    if not stack:
-                        raise _ProtocolScanError("unavailable")
-                    if pairs[punct] != stack.pop():
-                        raise _ProtocolScanError("unavailable")
-                local.append(token("p", punct))
-                index += len(punct)
-        if stop_template_expr or stack:
-            raise _ProtocolScanError("unavailable")
-        return local, index
-
-    scanned, end = scan_code(0)
-    if end != len(source):
-        raise _ProtocolScanError("unavailable")
-    return scanned
-
-
-def _js_pairs(tokens: list[tuple[str, str]]) -> dict[int, int]:
-    pairs: dict[int, int] = {}
-    stack: list[int] = []
-    opening = {"(": ")", "[": "]", "{": "}"}
-    for index, (kind, value) in enumerate(tokens):
-        if kind != "p":
-            continue
-        if value in opening:
-            stack.append(index)
-        elif value in {")", "]", "}"}:
-            if not stack or opening[tokens[stack[-1]][1]] != value:
-                raise _ProtocolScanError("unavailable")
-            start = stack.pop()
-            pairs[start] = index
-    if stack:
-        raise _ProtocolScanError("unavailable")
-    return pairs
-
-
-def _js_segments(tokens: list[tuple[str, str]], start: int, end: int, pairs: dict[int, int], separator: str) \
-        -> list[tuple[int, int]]:
-    segments: list[tuple[int, int]] = []
-    part = start
-    index = start
-    while index < end:
-        kind, value = tokens[index]
-        if kind == "p" and value in {"(", "[", "{"}:
-            close = pairs.get(index)
-            if close is None or close >= end:
-                raise _ProtocolScanError("unavailable")
-            index = close + 1
-            continue
-        if kind == "p" and value == separator:
-            if index > part:
-                segments.append((part, index))
-            part = index + 1
-        index += 1
-    if part < end:
-        segments.append((part, end))
-    return segments
-
-
-def _js_object_properties(tokens: list[tuple[str, str]], open_index: int, close_index: int,
-                          pairs: dict[int, int]) -> dict[str, tuple[int, int]] | None:
-    properties: dict[str, tuple[int, int]] = {}
-    for start, end in _js_segments(tokens, open_index + 1, close_index, pairs, ","):
-        if end - start < 3 or tokens[start + 1] != ("p", ":"):
-            return None
-        key_kind, key = tokens[start]
-        if key_kind not in {"id", "str"} or len(key) > 128 or key in properties:
-            return None
-        properties[key] = (start + 2, end)
-    return properties
-
-
-def _js_object_rows(tokens: list[tuple[str, str]], pairs: dict[int, int]) \
-        -> list[tuple[int, int, dict[str, tuple[int, int]]]]:
-    rows: list[tuple[int, int, dict[str, tuple[int, int]]]] = []
-    for index, (kind, value) in enumerate(tokens):
-        if (kind == "p" and value == "{" and index in pairs and index + 2 < pairs[index]
-                and tokens[index + 1][0] in {"id", "str"} and tokens[index + 2] == ("p", ":")):
-            props = _js_object_properties(tokens, index, pairs[index], pairs)
-            if props is not None:
-                rows.append((index, pairs[index], props))
-    return rows
-
-
-def _js_unwrap_parens(tokens: list[tuple[str, str]], start: int, end: int,
-                      pairs: dict[int, int]) -> tuple[int, int]:
-    while start < end and tokens[start] == ("p", "(") and pairs.get(start) == end - 1:
-        start += 1
-        end -= 1
-    return start, end
-
-
-def _js_value_is(tokens: list[tuple[str, str]], span: tuple[int, int], expected: tuple[str, str],
-                 pairs: dict[int, int]) -> bool:
-    start, end = _js_unwrap_parens(tokens, *span, pairs)
-    return end - start == 1 and tokens[start] == expected
-
-
-def _js_properties_at(tokens: list[tuple[str, str]], span: tuple[int, int],
-                      pairs: dict[int, int]) -> dict[str, tuple[int, int]] | None:
-    start, end = _js_unwrap_parens(tokens, *span, pairs)
-    if start >= end or tokens[start] != ("p", "{") or pairs.get(start) != end - 1:
-        return None
-    return _js_object_properties(tokens, start, end - 1, pairs)
-
-
-def _js_dynamic_value(tokens: list[tuple[str, str]], span: tuple[int, int],
-                      pairs: dict[int, int]) -> bool:
-    start, end = _js_unwrap_parens(tokens, *span, pairs)
-    if start >= end or end - start == 1 and tokens[start][0] in {"str", "num"}:
-        return False
-    return any(kind == "id" and value not in {"null", "undefined", "true", "false"}
-               for kind, value in tokens[start:end])
-
-
-def _js_empty_array(tokens: list[tuple[str, str]], span: tuple[int, int],
-                    pairs: dict[int, int]) -> bool:
-    start, end = _js_unwrap_parens(tokens, *span, pairs)
-    return start < end and tokens[start] == ("p", "[") and pairs.get(start) == end - 1 and end == start + 2
-
-
-def _ack_path_count(tokens: list[tuple[str, str]], pairs: dict[int, int]) -> int:
-    wanted = ["result", "result", "turn", "id"]
-    reverse_pairs = {close: start for start, close in pairs.items()}
-    matches: set[tuple[int, int]] = set()
-    for start, (kind, _) in enumerate(tokens):
-        if kind != "id":
-            continue
-        cursor = start + 1
-        path: list[str] = []
-        while cursor < len(tokens):
-            if tokens[cursor] == ("p", ")") and reverse_pairs.get(cursor, cursor) < start:
-                cursor += 1
-            elif (tokens[cursor] in {("p", "."), ("p", "?.")}
-                  and cursor + 1 < len(tokens) and tokens[cursor + 1][0] == "id"):
-                path.append(tokens[cursor + 1][1])
-                cursor += 2
-            elif tokens[cursor] == ("p", "[") and cursor in pairs:
-                close = pairs[cursor]
-                if close != cursor + 2 or tokens[cursor + 1][0] != "str":
-                    break
-                path.append(tokens[cursor + 1][1])
-                cursor = close + 1
-            else:
-                break
-        if path[-len(wanted):] == wanted:
-            matches.add((start, cursor))
-    return len(matches)
-
-
-def _semantic_result(reason: str, *, fingerprint: str | None = None,
-                     has_start_turn_method: bool = False) -> dict[str, Any]:
-    return {"fingerprint": fingerprint, "reason": reason if reason in _SEMANTIC_REASON_CODES else "lexical_unsupported",
-            "candidate": reason == "matched" and fingerprint == _START_TURN_MUTATION_FINGERPRINT,
-            "hasStartTurnMethod": has_start_turn_method}
-
-
-def _semantic_protocol_v2(source: bytes | bytearray | str) -> dict[str, Any]:
-    """仅投影 source-controlled start-turn contract；绝不返回源码或 descriptor。"""
-    try:
-        if isinstance(source, (bytes, bytearray)):
-            if len(source) > _MAX_PROTOCOL_SOURCE_BYTES:
-                return _semantic_result("source_too_large")
-            source = bytes(source).decode("utf-8", "strict")
-        if not isinstance(source, str):
-            return _semantic_result("lexical_unsupported")
-        try:
-            if len(source.encode("utf-8", "strict")) > _MAX_PROTOCOL_SOURCE_BYTES:
-                return _semantic_result("source_too_large")
-        except UnicodeEncodeError:
-            return _semantic_result("lexical_unsupported")
-        tokens = _js_tokens(source)
-        pairs = _js_pairs(tokens)
-        objects = _js_object_rows(tokens, pairs)
-    except _ProtocolScanError as error:
-        return _semantic_result(error.classification)
-    except (UnicodeDecodeError, UnicodeEncodeError, RecursionError, ValueError, IndexError, KeyError):
-        return _semantic_result("lexical_unsupported")
-
-    method = _START_TURN_MUTATION_CONTRACT["method"]
-    if not any(kind == "str" and value == method for kind, value in tokens):
-        return _semantic_result("start_turn_missing")
-    has_start_turn_method = True
-
-    version_rows = [props[method] for _, _, props in objects if method in props]
-    if len(version_rows) > 1:
-        return _semantic_result("start_turn_ambiguous", has_start_turn_method=has_start_turn_method)
-    version_map_matches = len(version_rows) == 1 and _js_value_is(tokens, version_rows[0], ("num", "2"), pairs)
-    if version_rows and not version_map_matches:
-        return _semantic_result("version_unprovable", has_start_turn_method=has_start_turn_method)
-
-    candidates = [props for _, _, props in objects
-                  if "method" in props and _js_value_is(tokens, props["method"], ("str", method), pairs)]
-    if len(candidates) > 1:
-        return _semantic_result("start_turn_ambiguous", has_start_turn_method=has_start_turn_method)
-    if not candidates:
-        return _semantic_result("version_unprovable", has_start_turn_method=has_start_turn_method)
-
-    request = candidates[0]
-    if "type" not in request or not _js_value_is(tokens, request["type"], ("str", "request"), pairs):
-        return _semantic_result("version_unprovable", has_start_turn_method=has_start_turn_method)
-    if "version" in request:
-        version_matches = _js_value_is(tokens, request["version"], ("num", "2"), pairs)
-        if not version_matches:
-            return _semantic_result("version_unprovable", has_start_turn_method=has_start_turn_method)
-    elif not version_map_matches:
-        return _semantic_result("version_unprovable", has_start_turn_method=has_start_turn_method)
-
-    if not {"sourceClientId", "targetClientId", "params"}.issubset(request) or not all(
-        _js_dynamic_value(tokens, request[field], pairs) for field in ("sourceClientId", "targetClientId")
-    ):
-        return _semantic_result("payload_unprovable", has_start_turn_method=has_start_turn_method)
-    params = _js_properties_at(tokens, request["params"], pairs)
-    if params is None or set(params) != {"conversationId", "turnStart"} \
-            or not _js_dynamic_value(tokens, params["conversationId"], pairs):
-        return _semantic_result("payload_unprovable", has_start_turn_method=has_start_turn_method)
-    turn_start = _js_properties_at(tokens, params["turnStart"], pairs)
-    turn_request = _js_properties_at(tokens, turn_start["request"], pairs) if turn_start else None
-    if turn_start is None or set(turn_start) != {"request"} or turn_request is None \
-            or set(turn_request) != {"threadId", "input"} \
-            or not _js_dynamic_value(tokens, turn_request["threadId"], pairs):
-        return _semantic_result("payload_unprovable", has_start_turn_method=has_start_turn_method)
-    input_start, input_end = _js_unwrap_parens(tokens, *turn_request["input"], pairs)
-    if input_start >= input_end or tokens[input_start] != ("p", "[") or pairs.get(input_start) != input_end - 1:
-        return _semantic_result("payload_unprovable", has_start_turn_method=has_start_turn_method)
-    input_items = _js_segments(tokens, input_start + 1, input_end - 1, pairs, ",")
-    if len(input_items) != 1:
-        return _semantic_result("payload_unprovable", has_start_turn_method=has_start_turn_method)
-    item = _js_properties_at(tokens, input_items[0], pairs)
-    if item is None or set(item) != {"type", "text", "text_elements"} \
-            or not _js_value_is(tokens, item["type"], ("str", "text"), pairs) \
-            or not _js_dynamic_value(tokens, item["text"], pairs) \
-            or not _js_empty_array(tokens, item["text_elements"], pairs):
-        return _semantic_result("payload_unprovable", has_start_turn_method=has_start_turn_method)
-
-    if _ack_path_count(tokens, pairs) != 1:
-        return _semantic_result("ack_unprovable", has_start_turn_method=has_start_turn_method)
-    if sorted(field for field in ("sourceClientId", "targetClientId") if field in request) != \
-            _START_TURN_MUTATION_CONTRACT["routing"]:
-        return _semantic_result("payload_unprovable", has_start_turn_method=has_start_turn_method)
-    return _semantic_result("matched", fingerprint=_START_TURN_MUTATION_FINGERPRINT,
-                            has_start_turn_method=has_start_turn_method)
-
-
-def _safe_version(value: Any) -> str | None:
-    return value if isinstance(value, str) and len(value) <= 64 and _VERSION_PATTERN.fullmatch(value) else None
-
-
-def _catalog_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in result:
-            raise _CatalogError("duplicate catalog key")
-        result[key] = value
-    return result
-
-
-def _catalog_keys(value: Any, expected: set[str]) -> dict[str, Any]:
-    if not isinstance(value, dict) or set(value) != expected:
-        raise _CatalogError("catalog object keys")
-    return value
-
-
-def _catalog_string(value: Any, *, pattern: re.Pattern[str] | None = None) -> str:
-    if not isinstance(value, str) or not 0 < len(value) <= _CATALOG_MAX_STRING or "\x00" in value:
-        raise _CatalogError("catalog string")
-    if pattern is not None and pattern.fullmatch(value) is None:
-        raise _CatalogError("catalog string format")
-    return value
-
-
-def _catalog_version(value: Any, *, desktop: bool = False) -> str:
-    text = _catalog_string(value)
-    if _VERSION_PATTERN.fullmatch(text) is None or (desktop and _DESKTOP_VERSION_PATTERN.fullmatch(text) is None):
-        raise _CatalogError("catalog version")
-    return text
-
-
-def _catalog_hash(value: Any) -> str:
-    return _catalog_string(value, pattern=_SHA256_PATTERN)
-
-
-def _catalog_asar_header(value: Any) -> tuple[int, int, int, int]:
-    if not isinstance(value, list) or len(value) != 4:
-        raise _CatalogError("catalog asar header")
-    if any(type(item) is not int or item < 0 or item > _MAX_ASAR_HEADER_BYTES for item in value):
-        raise _CatalogError("catalog asar header bounds")
-    version, header_size, json_offset, json_size = value
-    if (version != 4 or header_size < 16 or json_size <= 0
-            or header_size != json_offset + 4
-            or json_offset not in {json_size + 7, json_size + 4}):
-        raise _CatalogError("catalog asar header layout")
-    if json_offset > header_size or header_size - json_size > 64:
-        raise _CatalogError("catalog asar header layout")
-    return version, header_size, json_offset, json_size
-
-
-def _catalog_module(value: Any) -> dict[str, str]:
-    module = _catalog_keys(value, {"role", "path", "sha256"})
-    role = _catalog_string(module["role"])
-    pattern = _MODULE_PATH_PATTERNS.get(role)
-    if pattern is None:
-        raise _CatalogError("catalog module role")
-    path = _catalog_string(module["path"])
-    if ("\\" in path or path.startswith("/") or any(part in {"", ".", ".."} for part in path.split("/"))
-            or pattern.fullmatch(path) is None):
-        raise _CatalogError("catalog module path")
-    return {"role": role, "path": path, "sha256": _catalog_hash(module["sha256"])}
-
-
-def _load_catalog(path: str | os.PathLike[str] | None = None) -> dict[str, tuple[dict[str, Any], ...]]:
-    """读取固定 schema 的信任 catalog；任一异常都由调用方按 fail-closed 处理。"""
-    path = PROFILE_CATALOG_PATH if path is None else path
-    try:
-        with open(path, "rb") as stream:
-            raw = stream.read(_CATALOG_MAX_BYTES + 1)
-        if len(raw) > _CATALOG_MAX_BYTES:
-            raise _CatalogError("catalog too large")
-        document = json.loads(raw.decode("utf-8", "strict"), object_pairs_hook=_catalog_object)
-    except _CatalogError:
-        raise
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError, RecursionError) as error:
-        raise _CatalogError("catalog unavailable") from error
-    root = _catalog_keys(document, {"schemaVersion", "profiles"})
-    if type(root["schemaVersion"]) is not int or root["schemaVersion"] != 1:
-        raise _CatalogError("catalog schema")
-    profiles = root["profiles"]
-    if not isinstance(profiles, list) or not 0 < len(profiles) <= _CATALOG_MAX_PROFILES:
-        raise _CatalogError("catalog profiles")
-    result: dict[str, tuple[dict[str, Any], ...]] = {}
-    version_pairs: set[tuple[str, str]] = set()
-    for raw_profile in profiles:
-        profile = _catalog_keys(raw_profile, {"name", "runtimes"})
-        name = _catalog_string(profile["name"], pattern=_PROFILE_NAME_PATTERN)
-        if name in result:
-            raise _CatalogError("duplicate profile")
-        runtimes = profile["runtimes"]
-        if not isinstance(runtimes, list) or not 0 < len(runtimes) <= _CATALOG_MAX_RUNTIMES:
-            raise _CatalogError("catalog runtimes")
-        normalized: list[dict[str, Any]] = []
-        for raw_runtime in runtimes:
-            runtime = _catalog_keys(
-                raw_runtime, {"desktopVersion", "appServerVersion", "appServerSha256", "asarHeader", "modules"}
-            )
-            desktop_version = _catalog_version(runtime["desktopVersion"], desktop=True)
-            app_server_version = _catalog_version(runtime["appServerVersion"])
-            pair = (desktop_version, app_server_version)
-            if pair in version_pairs:
-                raise _CatalogError("duplicate runtime version pair")
-            version_pairs.add(pair)
-            modules = runtime["modules"]
-            if not isinstance(modules, list) or len(modules) != _CATALOG_MAX_MODULES:
-                raise _CatalogError("catalog modules")
-            normalized_modules = [_catalog_module(module) for module in modules]
-            roles = [module["role"] for module in normalized_modules]
-            paths = [module["path"] for module in normalized_modules]
-            if set(roles) != set(_MODULE_PATH_PATTERNS) or len(set(roles)) != len(roles) \
-                    or len(set(paths)) != len(paths):
-                raise _CatalogError("duplicate catalog module role/path")
-            normalized_runtime = {
-                "desktopVersion": desktop_version,
-                "appServerVersion": app_server_version,
-                "appServerSha256": _catalog_hash(runtime["appServerSha256"]),
-                "asarHeader": list(_catalog_asar_header(runtime["asarHeader"])),
-                "modules": normalized_modules,
-            }
-            normalized.append(normalized_runtime)
-        result[name] = tuple(normalized)
-    return result
-
-
-def _legacy_runtime(runtime: dict[str, Any]) -> dict[str, Any]:
-    """保留旧 helper 测试和调用方需要的 moduleHashes 兼容投影。"""
-    value = copy.deepcopy(runtime)
-    modules = value.get("modules")
-    if isinstance(modules, list):
-        value["moduleHashes"] = {module["path"]: module["sha256"] for module in modules}
-    value["asarHeader"] = tuple(value["asarHeader"])
-    return value
-
-
-try:
-    _CATALOG_PROFILES = _load_catalog()
-except _CatalogError:
-    _CATALOG_PROFILES = {}
-
-VERIFIED_PROFILES = {
-    name: tuple(_legacy_runtime(runtime) for runtime in runtimes)
-    for name, runtimes in _CATALOG_PROFILES.items()
-}
-VERIFIED_PROFILE = "desktop-ipc-v1" if "desktop-ipc-v1" in VERIFIED_PROFILES else None
-
-
-def _legacy_runtime_for_pair(desktop_version: str, app_server_version: str) -> dict[str, Any]:
-    for runtimes in VERIFIED_PROFILES.values():
-        for runtime in runtimes:
-            if (runtime.get("desktopVersion"), runtime.get("appServerVersion")) == (
-                    desktop_version, app_server_version):
-                return runtime
-    return {}
-
-
-VERIFIED_RUNTIME = _legacy_runtime_for_pair("26.903.9818.0", "0.153.4")
-VERIFIED_RUNTIME_26_908 = _legacy_runtime_for_pair("26.908.4834.0", "0.154.0-alpha.6.2")
-VERIFIED_RUNTIME_26_908_9136 = _legacy_runtime_for_pair("26.908.9136.0", "0.154.0-alpha.6.2")
-VERIFIED_RUNTIME_26_915 = _legacy_runtime_for_pair("26.915.4065.0", "0.155.0-alpha.9.2")
-
-
-def _safe_compatibility(value: Any = None) -> dict[str, Any]:
-    value = value if isinstance(value, dict) else {}
-    status = value.get("status")
-    return {
-        "observedDesktopVersion": _safe_version(value.get("observedDesktopVersion")),
-        "observedAppServerVersion": _safe_version(value.get("observedAppServerVersion")),
-        "status": status if status in COMPATIBILITY_STATUSES else "unverified",
-        "profile": value.get("profile") if isinstance(value.get("profile"), str)
-        and bool(re.fullmatch(r"desktop-ipc-v[1-9][0-9]*", value["profile"])) else None,
-    }
 
 
 REQUEST_VERSIONS = {
@@ -769,7 +79,6 @@ ERROR_MESSAGES = {
     "DESKTOP_IPC_UNAVAILABLE": "Codex Desktop 当前不可用；没有发送消息。",
     "DESKTOP_IPC_SERVER_MISMATCH": "Desktop IPC 服务端身份不匹配；没有发送消息。",
     "DESKTOP_PROCESS_CHANGED": "Desktop/app-server 进程已变化；没有发送消息。",
-    "DESKTOP_VERSION_UNSUPPORTED": "当前 Desktop/app-server 版本未经过适配验证；没有发送消息。",
     "DESKTOP_PROJECT_MISMATCH": "Desktop 会话项目或实际目录与绑定不匹配；没有发送消息。",
     "DESKTOP_TARGET_NOT_FOUND": "找不到绑定的 Desktop 会话；没有发送消息。",
     "DESKTOP_NO_OWNER": "绑定会话没有可确认的 Desktop owner；没有发送消息。",
@@ -780,7 +89,7 @@ ERROR_MESSAGES = {
     "DESKTOP_IPC_TIMEOUT": "Desktop IPC 接受回执超时；没有发送消息。",
     "DESKTOP_IPC_REJECTED": "Desktop 拒绝了投递；结果无法作为成功确认。",
     "DESKTOP_OUTCOME_UNKNOWN": "Desktop 投递结果不明，消息可能已执行；不要重发。",
-    "DESKTOP_PROTOCOL_ERROR": "Desktop IPC 返回无法确认的结果；不要重发。",
+    "DESKTOP_PROTOCOL_ERROR": "Desktop 协议无法安全确认；没有发送消息。",
     "DESKTOP_INTERNAL_ERROR": "Desktop Control 暂时不可用；没有发送消息。",
     "DESKTOP_INVALID_REQUEST": "Desktop Control 请求格式无效；没有发送消息。",
     "DESKTOP_MESSAGE_TOO_LARGE": "消息超过 64 KiB UTF-8 上限；拒绝投递，不截断。",
@@ -1402,8 +711,8 @@ def _process_parent_ids() -> dict[int, int]:
     return result
 
 
-def _verify_current_runner_ancestor(runtime: dict[str, Any]) -> None:
-    expected = runtime.get("appServerPid")
+def _verify_current_runner_ancestor(process: dict[str, Any]) -> None:
+    expected = process.get("appServerPid")
     if type(expected) is not int or expected <= 0:
         raise _error("DESKTOP_CURRENT_CONTEXT_INVALID")
     parents = _process_parent_ids()
@@ -1420,637 +729,6 @@ def _verify_current_runner_ancestor(runtime: dict[str, Any]) -> None:
             break
         current = parent
     raise _error("DESKTOP_CURRENT_CONTEXT_INVALID")
-
-
-def _version_error(mismatch: str, compatibility: Any = None) -> DesktopIpcError:
-    error = _error("DESKTOP_VERSION_UNSUPPORTED")
-    # 仅内部诊断类别，不带路径/配置，也不透传到 MCP/CLI。
-    error.mismatch = mismatch
-    error.compatibility = _safe_compatibility(compatibility)
-    return error
-
-
-def _profile_for_pair(desktop_version: str | None, app_server_version: str | None) -> tuple[str, dict[str, Any]] | None:
-    if not desktop_version or not app_server_version:
-        return None
-    matches = [(name, runtime) for name, runtimes in VERIFIED_PROFILES.items() for runtime in runtimes
-               if (runtime["desktopVersion"], runtime["appServerVersion"]) == (desktop_version, app_server_version)]
-    return matches[0] if len(matches) == 1 else None
-
-
-def _runtime_module_rows(runtime: dict[str, Any]) -> list[dict[str, str]]:
-    modules = runtime.get("modules")
-    if isinstance(modules, list):
-        return [module for module in modules if isinstance(module, dict)]
-    hashes = runtime.get("moduleHashes")
-    if not isinstance(hashes, dict):
-        return []
-    rows: list[dict[str, str]] = []
-    for path, digest in hashes.items():
-        if not isinstance(path, str) or not isinstance(digest, str):
-            continue
-        role = next((candidate for candidate, pattern in _MODULE_PATH_PATTERNS.items()
-                     if pattern.fullmatch(path)), None)
-        if role is not None:
-            rows.append({"role": role, "path": path, "sha256": digest})
-    return rows
-
-
-def _runtime_module_hashes(runtime: dict[str, Any]) -> dict[str, str]:
-    hashes = runtime.get("moduleHashes")
-    if isinstance(hashes, dict):
-        return hashes
-    rows = _runtime_module_rows(runtime)
-    return {module["path"]: module["sha256"] for module in rows
-            if isinstance(module.get("path"), str) and isinstance(module.get("sha256"), str)}
-
-
-def _catalog_runtime_projection(runtime: dict[str, Any]) -> dict[str, Any]:
-    """仅返回 catalog runtime 行；不把旧兼容 moduleHashes 泄漏到审计结果。"""
-    modules = _runtime_module_rows(runtime)
-    return {
-        "desktopVersion": runtime.get("desktopVersion"),
-        "appServerVersion": runtime.get("appServerVersion"),
-        "appServerSha256": runtime.get("appServerSha256"),
-        "asarHeader": list(runtime.get("asarHeader", ())),
-        "modules": [
-            {"role": module.get("role"), "path": module.get("path"), "sha256": module.get("sha256")}
-            for module in modules
-        ],
-    }
-
-
-def _sha256_file(path: str) -> str | None:
-    try:
-        with open(path, "rb") as stream:
-            return hashlib.file_digest(stream, "sha256").hexdigest()
-    except (OSError, ValueError):
-        return None
-
-
-def _static_file_version(path: str) -> str | None:
-    """只读提取二进制 provenance 中的版本；不执行未知程序，歧义时不猜。
-
-    仅接受 exact accepted markers；任一 marker 出现多次、新旧 marker 同时出现、
-    缺少已观察到的 platform delimiter 或 version 非法时一律 fail closed。
-    """
-    markers = (
-        b"standalone local buildversion: ",
-        b"standalonelocal buildversion: ",
-        b"standalonenpmbunpnpmvite+brewlocal buildversion: ",
-    )
-    # Exact delimiters observed in audited binaries (space vs newline before platform).
-    delimiters = (
-        b" platform:",
-        b"\nplatform:",
-    )
-    try:
-        with open(path, "rb") as stream:
-            if not 0 < os.fstat(stream.fileno()).st_size <= 512 * 1024 * 1024:
-                return None
-            with mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ) as data:
-                hits: list[tuple[bytes, int]] = []
-                for marker in markers:
-                    offset = data.find(marker)
-                    if offset < 0:
-                        continue
-                    if data.find(marker, offset + len(marker)) >= 0:
-                        return None
-                    hits.append((marker, offset))
-                if len(hits) != 1:
-                    return None
-                marker, offset = hits[0]
-                tail = data[offset + len(marker):offset + len(marker) + 96]
-                versions: list[bytes] = []
-                for delimiter in delimiters:
-                    raw, separator, _ = tail.partition(delimiter)
-                    if separator:
-                        versions.append(raw)
-                if len(versions) != 1:
-                    return None
-                return _safe_version(versions[0].decode("ascii"))
-    except (OSError, ValueError, UnicodeDecodeError):
-        return None
-
-
-def _static_desktop_version(desktop_exe: str) -> str | None:
-    match = re.search(r"(?:^|[\\/])OpenAI\.Codex_(\d+(?:\.\d+){3})_", desktop_exe, re.IGNORECASE)
-    return match.group(1) if match else None
-
-
-def _observe_runtime_versions(desktop_exe: str, app_server_exe: str) -> dict[str, Any]:
-    app_server_hash = _sha256_file(app_server_exe)
-    # 已知文件的完整 hash 本身提供精确版本证据，避免每次状态复核再扫描大二进制。
-    # 未知 hash 仍可只读诊断版本，但绝不因此放行。
-    versions = {runtime["appServerVersion"] for runtimes in VERIFIED_PROFILES.values() for runtime in runtimes
-                if app_server_hash is not None and app_server_hash == runtime["appServerSha256"]}
-    app_server_version = versions.pop() if len(versions) == 1 else _static_file_version(app_server_exe)
-    return {"observedDesktopVersion": _static_desktop_version(desktop_exe),
-            "observedAppServerVersion": app_server_version, "appServerSha256": app_server_hash}
-
-
-def _diagnostic_from_observation(observed: dict[str, Any], *, failed: bool = False) -> dict[str, Any]:
-    pair = _profile_for_pair(observed.get("observedDesktopVersion"), observed.get("observedAppServerVersion"))
-    return _safe_compatibility({
-        **observed,
-        "status": "incompatible" if pair and failed else "unverified",
-        "profile": pair[0] if pair else None,
-    })
-
-
-def _asar_module_hashes(desktop_exe: str, profile: dict[str, Any]) -> dict[str, str]:
-    asar = Path(desktop_exe).parent / "resources" / "app.asar"
-    try:
-        with asar.open("rb") as stream:
-            header = stream.read(16)
-            if len(header) != 16:
-                raise _version_error("asar_header_truncated")
-            layout = struct.unpack("<4I", header)
-            # 原 1 MiB 上限会误拒绝已验证包的 2,441,036 字节头部。
-            # 使用已验证组合的精确布局，仍在分配/解析前拒绝任意未知长度。
-            if layout != profile["asarHeader"]:
-                raise _version_error("asar_header_layout")
-            _, header_size, _, json_size = layout
-            raw_tree = stream.read(json_size)
-            if len(raw_tree) != json_size:
-                raise _version_error("asar_header_truncated")
-            tree = json.loads(raw_tree.decode("utf-8", "strict"))
-            hashes: dict[str, str] = {}
-            for module, expected in _runtime_module_hashes(profile).items():
-                node: Any = tree
-                for part in module.split("/"):
-                    files = node.get("files") if isinstance(node, dict) else None
-                    node = files.get(part) if isinstance(files, dict) else None
-                    if not isinstance(node, dict):
-                        raise ValueError
-                offset = int(node.get("offset", 0))
-                size = int(node.get("size", 0))
-                if offset < 0 or size <= 0 or size > MAX_FRAME_BYTES or node.get("unpacked"):
-                    raise ValueError
-                stream.seek(8 + header_size + offset)
-                raw_module = stream.read(size)
-                if len(raw_module) != size:
-                    raise _version_error("asar_module_truncated")
-                digest = hashlib.sha256(raw_module).hexdigest()
-                if digest != expected:
-                    raise _version_error("asar_module_sha256")
-                hashes[module] = digest
-            return hashes
-    except DesktopIpcError:
-        raise
-    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError, UnicodeDecodeError):
-        raise _version_error("asar_container_invalid")
-
-
-def _checked_runtime(desktop_exe: str, observed: dict[str, Any]) -> dict[str, Any]:
-    pair = _profile_for_pair(observed["observedDesktopVersion"], observed["observedAppServerVersion"])
-    diagnostic = _diagnostic_from_observation(observed, failed=True)
-    if pair is None:
-        raise _version_error("runtime_pair_unverified", diagnostic)
-    name, profile = pair
-    if observed["appServerSha256"] != profile["appServerSha256"]:
-        raise _version_error("app_server_sha256", diagnostic)
-    try:
-        module_hashes = _asar_module_hashes(desktop_exe, profile)
-    except DesktopIpcError as error:
-        error.compatibility = diagnostic
-        raise
-    return {"desktopVersion": profile["desktopVersion"], "appServerVersion": profile["appServerVersion"],
-            "appServerSha256": profile.get("appServerSha256"), "asarHeader": profile.get("asarHeader"),
-            "modules": _runtime_module_rows(profile), "moduleHashes": module_hashes, "profile": name}
-
-
-def _runtime_version(desktop_exe: str, app_server_exe: str) -> dict[str, Any]:
-    return _checked_runtime(desktop_exe, _observe_runtime_versions(desktop_exe, app_server_exe))
-
-
-def _compatibility_for_paths(desktop_exe: str, app_server_exe: str) -> dict[str, Any]:
-    observed = _observe_runtime_versions(desktop_exe, app_server_exe)
-    try:
-        runtime = _checked_runtime(desktop_exe, observed)
-    except DesktopIpcError as error:
-        return error.compatibility
-    return _safe_compatibility({**observed, "status": "current", "profile": runtime["profile"]})
-
-
-class _AsarAuditError(ValueError):
-    pass
-
-
-def _asar_number(value: Any) -> int:
-    if type(value) is int:
-        number = value
-    elif isinstance(value, str) and value.isascii() and value.isdigit():
-        number = int(value, 10)
-    else:
-        raise _AsarAuditError("asar number")
-    if number < 0:
-        raise _AsarAuditError("asar number bounds")
-    return number
-
-
-def _asar_audit_modules(desktop_exe: str) -> tuple[list[int], dict[str, list[dict[str, str]]]]:
-    """有限读取 ASAR，只保留两个协议候选模块的 role/path/hash。"""
-    asar = Path(desktop_exe).parent / "resources" / "app.asar"
-    candidates: dict[str, list[dict[str, str]]] = {role: [] for role in _MODULE_PATH_PATTERNS}
-    try:
-        with asar.open("rb") as stream:
-            file_size = os.fstat(stream.fileno()).st_size
-            if file_size <= 16 or file_size > _MAX_ASAR_FILE_BYTES:
-                raise _AsarAuditError("asar size")
-            header = stream.read(16)
-            if len(header) != 16:
-                raise _AsarAuditError("asar header")
-            layout = list(struct.unpack("<4I", header))
-            version, header_size, json_offset, json_size = layout
-            if (version != 4 or header_size < 16 or header_size > _MAX_ASAR_HEADER_BYTES
-                    or json_size <= 0 or header_size != json_offset + 4
-                    or json_offset not in {json_size + 7, json_size + 4}):
-                raise _AsarAuditError("asar header layout")
-            tree_start = 16
-            tree_end = tree_start + json_size
-            data_start = 8 + header_size
-            if tree_end > data_start or data_start > file_size:
-                raise _AsarAuditError("asar header bounds")
-            stream.seek(tree_start)
-            raw_tree = stream.read(json_size)
-            if len(raw_tree) != json_size:
-                raise _AsarAuditError("asar tree truncated")
-            try:
-                tree = json.loads(raw_tree.decode("utf-8", "strict"), object_pairs_hook=_catalog_object)
-            except (_CatalogError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError, RecursionError) as error:
-                raise _AsarAuditError("asar tree invalid") from error
-            nodes = 0
-            candidate_count = 0
-            candidate_bytes = 0
-            candidate_offsets: list[tuple[int, int]] = []
-
-            def walk(node: Any, prefix: str, depth: int) -> None:
-                nonlocal nodes, candidate_count, candidate_bytes
-                nodes += 1
-                if nodes > _MAX_ASAR_TREE_NODES or depth > _MAX_ASAR_DEPTH or not isinstance(node, dict):
-                    raise _AsarAuditError("asar tree bounds")
-                files = node.get("files")
-                if files is None:
-                    if prefix == "":
-                        raise _AsarAuditError("asar root")
-                    role = next((candidate for candidate, pattern in _MODULE_PATH_PATTERNS.items()
-                                 if pattern.fullmatch(prefix)), None)
-                    if role is None:
-                        return
-                    if node.get("unpacked"):
-                        raise _AsarAuditError("asar unpacked module")
-                    offset = _asar_number(node.get("offset"))
-                    size = _asar_number(node.get("size"))
-                    if size <= 0 or size > _MAX_ASAR_MODULE_BYTES:
-                        raise _AsarAuditError("asar module bounds")
-                    start = data_start + offset
-                    if start < data_start or start > file_size or size > file_size - start:
-                        raise _AsarAuditError("asar module bounds")
-                    if (candidate_count >= _MAX_ASAR_AUDIT_CANDIDATES
-                            or len(candidates[role]) >= _MAX_ASAR_AUDIT_CANDIDATES_PER_ROLE
-                            or candidate_bytes > _MAX_ASAR_AUDIT_MODULE_BYTES - size):
-                        raise _AsarAuditError("asar audit budget")
-                    end = start + size
-                    if any(start < previous_end and previous_start < end
-                           for previous_start, previous_end in candidate_offsets):
-                        raise _AsarAuditError("asar module overlap")
-                    candidate_offsets.append((start, end))
-                    candidate_count += 1
-                    candidate_bytes += size
-                    stream.seek(start)
-                    digest = hashlib.sha256()
-                    fingerprint_data = bytearray()
-                    remaining = size
-                    while remaining:
-                        chunk = stream.read(min(1024 * 1024, remaining))
-                        if not chunk:
-                            raise _AsarAuditError("asar module truncated")
-                        digest.update(chunk)
-                        if role == "ipc-main":
-                            fingerprint_data.extend(chunk)
-                        remaining -= len(chunk)
-                    row: dict[str, Any] = {"role": role, "path": prefix, "sha256": digest.hexdigest()}
-                    if role == "ipc-main":
-                        semantic = _semantic_protocol_v2(bytes(fingerprint_data))
-                        row.update({"_semanticFingerprint": semantic["fingerprint"],
-                                    "_semanticReason": semantic["reason"],
-                                    "_semanticCandidate": semantic["candidate"],
-                                    "_semanticHasStartTurnMethod": semantic["hasStartTurnMethod"]})
-                    candidates[role].append(row)
-                    return
-                if not isinstance(files, dict) or len(files) > _MAX_ASAR_TREE_NODES:
-                    raise _AsarAuditError("asar files")
-                for name, child in files.items():
-                    if (not isinstance(name, str) or not 0 < len(name) <= _CATALOG_MAX_STRING or "\x00" in name
-                            or "/" in name or "\\" in name or name in {".", ".."}):
-                        raise _AsarAuditError("asar file name")
-                    child_path = f"{prefix}/{name}" if prefix else name
-                    if len(child_path) > _CATALOG_MAX_STRING:
-                        raise _AsarAuditError("asar path bounds")
-                    walk(child, child_path, depth + 1)
-
-            walk(tree, "", 0)
-            return layout, candidates
-    except _AsarAuditError:
-        raise
-    except (OSError, struct.error, ValueError, TypeError) as error:
-        raise _AsarAuditError("asar unavailable") from error
-
-
-def _safe_audit_hash(value: Any) -> str | None:
-    return value if isinstance(value, str) and _SHA256_PATTERN.fullmatch(value) else None
-
-
-def _safe_audit_modules(value: Any) -> list[dict[str, str]]:
-    if not isinstance(value, list):
-        return []
-    result: list[dict[str, str]] = []
-    seen_roles: set[str] = set()
-    seen_paths: set[str] = set()
-    for item in value:
-        if (not isinstance(item, dict)
-                or set(item) not in ({"role", "path", "sha256"},
-                                     {"role", "path", "sha256", "_semanticFingerprint",
-                                      "_semanticReason", "_semanticCandidate", "_semanticHasStartTurnMethod"})):
-            continue
-        role, path, digest = item["role"], item["path"], item["sha256"]
-        pattern = _MODULE_PATH_PATTERNS.get(role) if isinstance(role, str) else None
-        if (pattern is None or not isinstance(path, str) or pattern.fullmatch(path) is None
-                or path in seen_paths or role in seen_roles or _safe_audit_hash(digest) is None):
-            continue
-        seen_roles.add(role)
-        seen_paths.add(path)
-        result.append({"role": role, "path": path, "sha256": digest})
-    return result
-
-
-def _safe_audit(value: Any = None) -> dict[str, Any]:
-    value = value if isinstance(value, dict) else {}
-    status = value.get("status") if value.get("status") in COMPATIBILITY_STATUSES else "unverified"
-    classification = value.get("classification")
-    if classification not in COMPATIBILITY_AUDIT_CLASSIFICATIONS:
-        classification = "unavailable"
-    semantic_reason = value.get("semanticReason")
-    if semantic_reason not in _SEMANTIC_REASON_CODES:
-        semantic_reason = "not_scanned"
-    semantic_fingerprint = _safe_audit_hash(value.get("semanticFingerprint"))
-    if semantic_reason == "matched" and semantic_fingerprint is None:
-        semantic_reason = "lexical_unsupported"
-    elif semantic_reason != "matched":
-        semantic_fingerprint = None
-    profile = value.get("profile") if isinstance(value.get("profile"), str) \
-        and _PROFILE_NAME_PATTERN.fullmatch(value["profile"]) else None
-    candidate_profile = value.get("candidateProfile") if isinstance(value.get("candidateProfile"), str) \
-        and _PROFILE_NAME_PATTERN.fullmatch(value["candidateProfile"]) else None
-    header = value.get("asarHeader")
-    if (not isinstance(header, (list, tuple)) or len(header) != 4
-            or any(type(item) is not int or item < 0 or item > _MAX_ASAR_HEADER_BYTES for item in header)):
-        header = None
-    else:
-        header = list(header)
-    result: dict[str, Any] = {
-        **_safe_compatibility({**value, "status": status, "profile": profile}),
-        "classification": classification,
-        "semanticFingerprint": semantic_fingerprint,
-        "semanticReason": semantic_reason,
-        "appServerSha256": _safe_audit_hash(value.get("appServerSha256")),
-        "asarHeader": header,
-        "candidateProfile": candidate_profile,
-        "modules": _safe_audit_modules(value.get("modules")),
-    }
-    candidate_runtime = value.get("candidateRuntime")
-    if isinstance(candidate_runtime, dict) and set(candidate_runtime) == {
-        "desktopVersion", "appServerVersion", "appServerSha256", "asarHeader", "modules"
-    }:
-        runtime = _catalog_runtime_projection(candidate_runtime)
-        if (_safe_version(runtime["desktopVersion"]) is not None
-                and _DESKTOP_VERSION_PATTERN.fullmatch(runtime["desktopVersion"]) is not None
-                and _safe_version(runtime["appServerVersion"]) is not None
-                and _safe_audit_hash(runtime["appServerSha256"]) is not None
-                and isinstance(runtime["asarHeader"], list) and len(runtime["asarHeader"]) == 4
-                and all(type(item) is int and 0 <= item <= _MAX_ASAR_HEADER_BYTES
-                        for item in runtime["asarHeader"])
-                and len(_safe_audit_modules(runtime["modules"])) == 2):
-            runtime["modules"] = _safe_audit_modules(runtime["modules"])
-            result["candidateRuntime"] = runtime
-    if classification == "semantic_same_protocol_candidate" and (
-            semantic_fingerprint is None or semantic_reason != "matched" or status != "unverified"
-            or profile is not None or candidate_profile is None
-            or result["observedDesktopVersion"] is None or result["observedAppServerVersion"] is None
-            or result["appServerSha256"] is None or header is None or len(result["modules"]) != 2
-            or {module["role"] for module in result["modules"]} != set(_MODULE_PATH_PATTERNS)
-            or "candidateRuntime" in result):
-        result["classification"] = "protocol_drift_or_unknown"
-    return result
-
-
-def _audit_result(observed: dict[str, Any] | None = None, *, status: str = "unverified",
-                  classification: str = "unavailable", profile: str | None = None,
-                  app_server_sha256: str | None = None, asar_header: Any = None, semantic_reason: str = "not_scanned",
-                  candidate_profile: str | None = None, semantic_fingerprint: str | None = None, modules: Any = None,
-                  candidate_runtime: dict[str, Any] | None = None) -> dict[str, Any]:
-    observed = observed if isinstance(observed, dict) else {}
-    value: dict[str, Any] = {
-        "observedDesktopVersion": observed.get("observedDesktopVersion"),
-        "observedAppServerVersion": observed.get("observedAppServerVersion"),
-        "status": status,
-        "profile": profile,
-        "classification": classification,
-        "semanticFingerprint": semantic_fingerprint,
-        "semanticReason": semantic_reason,
-        "appServerSha256": app_server_sha256,
-        "asarHeader": asar_header,
-        "candidateProfile": candidate_profile,
-        "modules": modules if modules is not None else [],
-    }
-    if candidate_runtime is not None:
-        value["candidateRuntime"] = candidate_runtime
-    return _safe_audit(value)
-
-
-def _profiles_for_app_server_version(version: str | None) -> list[tuple[str, tuple[dict[str, Any], ...]]]:
-    if not version:
-        return []
-    return [(name, runtimes) for name, runtimes in VERIFIED_PROFILES.items()
-             if any(runtime.get("appServerVersion") == version for runtime in runtimes)]
-
-
-def _semantic_candidate_evidence(ipc_candidates: list[dict[str, Any]]) \
-        -> tuple[str | None, str, list[dict[str, Any]]]:
-    method_candidates = [item for item in ipc_candidates if item.get("_semanticHasStartTurnMethod") is True]
-    if len(method_candidates) > 1:
-        return None, "start_turn_ambiguous", []
-    if not method_candidates:
-        if len(ipc_candidates) != 1:
-            return None, "start_turn_missing" if ipc_candidates else "not_scanned", []
-        method_candidates = ipc_candidates
-    candidate = method_candidates[0]
-    reason = candidate.get("_semanticReason")
-    if reason not in _SEMANTIC_REASON_CODES:
-        reason = "lexical_unsupported"
-    fingerprint = _safe_audit_hash(candidate.get("_semanticFingerprint")) if reason == "matched" else None
-    return fingerprint, reason, [candidate]
-
-
-def _compatibility_audit_for_paths(desktop_exe: str, app_server_exe: str) -> dict[str, Any]:
-    observed = _observe_runtime_versions(desktop_exe, app_server_exe)
-    app_server_sha256 = observed.get("appServerSha256")
-    if (_safe_version(observed.get("observedDesktopVersion")) is None
-            or _safe_version(observed.get("observedAppServerVersion")) is None
-            or _safe_audit_hash(app_server_sha256) is None):
-        return _audit_result(observed, classification="unavailable", app_server_sha256=app_server_sha256)
-    exact = _profile_for_pair(observed.get("observedDesktopVersion"), observed.get("observedAppServerVersion"))
-    if exact is not None:
-        name, profile = exact
-        try:
-            _checked_runtime(desktop_exe, observed)
-        except DesktopIpcError:
-            return _audit_result(observed, status="incompatible", classification="protocol_drift_or_unknown",
-                                 profile=name, candidate_profile=name, app_server_sha256=app_server_sha256)
-        semantic_fingerprint = None
-        semantic_reason = "not_scanned"
-        try:
-            _, actual_candidates = _asar_audit_modules(desktop_exe)
-            expected_ipc = next(module for module in _runtime_module_rows(profile) if module["role"] == "ipc-main")
-            actual_ipc = [module for module in actual_candidates.get("ipc-main", [])
-                          if module.get("path") == expected_ipc["path"] and module.get("sha256") == expected_ipc["sha256"]]
-            if len(actual_ipc) == 1:
-                semantic_fingerprint = actual_ipc[0].get("_semanticFingerprint")
-                semantic_reason = actual_ipc[0].get("_semanticReason", "lexical_unsupported")
-        except (_AsarAuditError, StopIteration):
-            pass
-        return _audit_result(
-            observed,
-            status="current",
-            classification="current",
-            profile=name,
-            semantic_fingerprint=semantic_fingerprint,
-            semantic_reason=semantic_reason,
-            app_server_sha256=app_server_sha256,
-            asar_header=profile.get("asarHeader"),
-            candidate_profile=name,
-            modules=_runtime_module_rows(profile),
-        )
-
-    matches = _profiles_for_app_server_version(observed.get("observedAppServerVersion"))
-    if not matches:
-        try:
-            asar_header, candidates = _asar_audit_modules(desktop_exe)
-            ipc = candidates.get("ipc-main", [])
-            semantic_fingerprint, semantic_reason, semantic_ipc = _semantic_candidate_evidence(ipc)
-            webview = candidates.get("webview-bootstrap", [])
-            modules = [*semantic_ipc, *webview] if len(semantic_ipc) == 1 and len(webview) == 1 else []
-            classification = "protocol_drift_or_unknown"
-            if semantic_reason == "start_turn_ambiguous" or len(webview) > 1:
-                classification = "ambiguous"
-            candidate_profile = None
-            if (len(semantic_ipc) == 1 and semantic_ipc[0].get("_semanticCandidate") is True
-                    and len(webview) == 1):
-                classification = "semantic_same_protocol_candidate"
-                candidate_profile = _SEMANTIC_CONTRACT_PROFILE
-            return _audit_result(observed, classification=classification, app_server_sha256=app_server_sha256,
-                                 asar_header=asar_header, candidate_profile=candidate_profile,
-                                 semantic_fingerprint=semantic_fingerprint, semantic_reason=semantic_reason,
-                                 modules=modules)
-        except _AsarAuditError:
-            return _audit_result(observed, classification="protocol_drift_or_unknown",
-                                 app_server_sha256=app_server_sha256)
-    known_desktop_versions = {
-        runtime.get("desktopVersion") for runtimes in VERIFIED_PROFILES.values() for runtime in runtimes
-    }
-    if observed.get("observedDesktopVersion") in known_desktop_versions:
-        name = matches[0][0] if len(matches) == 1 else None
-        return _audit_result(observed, classification="protocol_drift_or_unknown", profile=name,
-                             candidate_profile=name, app_server_sha256=app_server_sha256)
-    if len(matches) != 1:
-        return _audit_result(observed, classification="ambiguous", app_server_sha256=app_server_sha256)
-    name, runtimes = matches[0]
-    try:
-        asar_header, candidates = _asar_audit_modules(desktop_exe)
-    except _AsarAuditError:
-        return _audit_result(observed, classification="protocol_drift_or_unknown", candidate_profile=name,
-                             app_server_sha256=app_server_sha256)
-    ipc_candidates = candidates.get("ipc-main", [])
-    webview_candidates = candidates.get("webview-bootstrap", [])
-    if len(webview_candidates) != 1:
-        classification = "ambiguous" if len(webview_candidates) > 1 else "protocol_drift_or_unknown"
-        return _audit_result(observed, classification=classification, candidate_profile=name,
-                             app_server_sha256=app_server_sha256, asar_header=asar_header,
-                             modules=webview_candidates)
-    trusted_ipc = [module for module in ipc_candidates
-                   if module.get("sha256") in {
-                       runtime_module.get("sha256")
-                       for runtime in runtimes
-                       for runtime_module in _runtime_module_rows(runtime)
-                       if runtime_module.get("role") == "ipc-main"
-                   }]
-    if len(trusted_ipc) != 1:
-        semantic_fingerprint, semantic_reason, semantic_ipc = _semantic_candidate_evidence(ipc_candidates)
-        classification = "ambiguous" if len(trusted_ipc) > 1 or semantic_reason == "start_turn_ambiguous" else "protocol_drift_or_unknown"
-        if (len(trusted_ipc) == 0 and len(semantic_ipc) == 1
-                and semantic_ipc[0].get("_semanticCandidate") is True and len(webview_candidates) == 1):
-            classification = "semantic_same_protocol_candidate"
-            return _audit_result(observed, classification=classification, candidate_profile=name,
-                                 semantic_fingerprint=semantic_fingerprint, semantic_reason=semantic_reason,
-                                 app_server_sha256=app_server_sha256,
-                                 asar_header=asar_header, modules=[*semantic_ipc, *webview_candidates])
-        selected = semantic_ipc if len(trusted_ipc) == 0 and semantic_ipc else trusted_ipc or ipc_candidates[:1]
-        return _audit_result(observed, classification=classification, candidate_profile=name,
-                             semantic_fingerprint=semantic_fingerprint, semantic_reason=semantic_reason,
-                             app_server_sha256=app_server_sha256,
-                             asar_header=asar_header, modules=[*selected, *webview_candidates])
-    modules = [*trusted_ipc, *webview_candidates]
-    candidate_runtime = {
-        "desktopVersion": observed.get("observedDesktopVersion"),
-        "appServerVersion": observed.get("observedAppServerVersion"),
-        "appServerSha256": app_server_sha256,
-        "asarHeader": asar_header,
-        "modules": modules,
-    }
-    return _audit_result(observed, classification="same_protocol_candidate", candidate_profile=name,
-                         semantic_fingerprint=trusted_ipc[0].get("_semanticFingerprint"),
-                         semantic_reason=trusted_ipc[0].get("_semanticReason", "not_scanned"),
-                         app_server_sha256=app_server_sha256, asar_header=asar_header, modules=modules,
-                         candidate_runtime=candidate_runtime)
-
-
-def _runtime_process_pairs() -> list[tuple[str, str]]:
-    """只从现有进程树定位 Desktop/app-server，不启动或连接 app-server。"""
-    rows = _processes()
-    servers = [
-        row for row in rows
-        if row.get("name", "").casefold() == "chatgpt.exe"
-        and type(row.get("pid")) is int and row["pid"] > 0
-        and type(row.get("creation")) is int and row["creation"] > 0
-        and isinstance(row.get("exe"), str) and bool(row["exe"])
-    ]
-    pairs: list[tuple[str, str]] = []
-    for server in servers:
-        children = [
-            row for row in rows
-            if row.get("name", "").casefold() == "codex.exe"
-            and row.get("parentPid") == server["pid"]
-            and type(row.get("pid")) is int and row["pid"] > 0
-            and type(row.get("creation")) is int and row["creation"] > 0
-            and isinstance(row.get("exe"), str) and bool(row["exe"])
-        ]
-        if len(children) == 1:
-            pairs.append((server["exe"], children[0]["exe"]))
-    return pairs
-
-
-def _compatibility_audit() -> dict[str, Any]:
-    _query_standard_token()
-    pairs = _runtime_process_pairs()
-    if len(pairs) == 0:
-        return _audit_result(classification="unavailable")
-    if len(pairs) != 1:
-        return _audit_result(classification="ambiguous")
-    return _compatibility_audit_for_paths(*pairs[0])
-
-
-compatibility_audit = _compatibility_audit
 
 
 def _global_state_path() -> Path:
@@ -2112,8 +790,8 @@ def _verify_project(target: dict[str, str]) -> None:
         raise _error("DESKTOP_PROJECT_MISMATCH")
 
 
-def _verify_runtime_identity(pipe: _Pipe, target: dict[str, str], expected: dict[str, Any] | None = None,
-                             *, require_catalog: bool = False) -> dict[str, Any]:
+def _verify_process_identity(pipe: _Pipe, target: dict[str, str], expected: dict[str, Any] | None = None) -> dict[str, Any]:
+    """核对当前 pipe 对端是唯一 ChatGPT Desktop 进程树；不读取版本或 bundle。"""
     pipe.verify_server()
     rows = _processes()
     server = next((row for row in rows if row["pid"] == pipe.server_pid), None)
@@ -2125,18 +803,17 @@ def _verify_runtime_identity(pipe: _Pipe, target: dict[str, str], expected: dict
     if len(children) != 1 or not children[0]["exe"] or children[0]["creation"] <= 0:
         raise _error("DESKTOP_PROCESS_CHANGED")
     app_server = children[0]
-    version = (_runtime_version(server["exe"], app_server["exe"])
-               if require_catalog else _observe_runtime_versions(server["exe"], app_server["exe"]))
     if expected and (
         expected["desktopPid"] != pipe.server_pid
         or expected["appServerPid"] != app_server["pid"]
         or expected["desktopCreation"] != server["creation"]
         or expected["appServerCreation"] != app_server["creation"]
+        or _normalize_path(expected["desktopExe"]) != _normalize_path(server["exe"])
+        or _normalize_path(expected["appServerExe"]) != _normalize_path(app_server["exe"])
     ):
         raise _error("DESKTOP_PROCESS_CHANGED")
     _verify_project(target)
     return {
-        **version,
         "desktopPid": pipe.server_pid,
         "desktopExe": server["exe"],
         "desktopCreation": server["creation"],
@@ -2145,73 +822,6 @@ def _verify_runtime_identity(pipe: _Pipe, target: dict[str, str], expected: dict
         "appServerCreation": app_server["creation"],
     }
 
-
-def _candidate_runtime(pipe: _Pipe, target: dict[str, str], expected: dict[str, Any] | None = None) -> dict[str, Any]:
-    runtime = _verify_runtime_identity(pipe, target, expected, require_catalog=False)
-    audit = _compatibility_audit_for_paths(runtime["desktopExe"], runtime["appServerExe"])
-    candidate = audit.get("candidateRuntime")
-    if (audit.get("classification") != "same_protocol_candidate"
-            or audit.get("status") != "unverified" or audit.get("profile") is not None
-            or not isinstance(audit.get("candidateProfile"), str)
-            or _PROFILE_NAME_PATTERN.fullmatch(audit["candidateProfile"]) is None
-            or not isinstance(candidate, dict)
-            or set(candidate) != {"desktopVersion", "appServerVersion", "appServerSha256", "asarHeader", "modules"}
-            or candidate.get("desktopVersion") != runtime.get("observedDesktopVersion")
-            or candidate.get("appServerVersion") != runtime.get("observedAppServerVersion")
-            or candidate.get("appServerSha256") != runtime.get("appServerSha256")
-            or audit.get("observedDesktopVersion") != candidate.get("desktopVersion")
-            or audit.get("observedAppServerVersion") != candidate.get("appServerVersion")
-            or audit.get("appServerSha256") != candidate.get("appServerSha256")
-            or audit.get("asarHeader") != candidate.get("asarHeader")
-            or audit.get("modules") != candidate.get("modules")
-            or not isinstance(candidate.get("modules"), list) or len(candidate["modules"]) != 2
-            or {item.get("role") for item in candidate["modules"] if isinstance(item, dict)}
-               != {"ipc-main", "webview-bootstrap"}):
-        raise _version_error("runtime_pair_unverified", _diagnostic_from_observation(runtime, failed=True))
-    profile_runtimes = VERIFIED_PROFILES.get(audit["candidateProfile"])
-    if not profile_runtimes:
-        raise _version_error("runtime_pair_unverified", _diagnostic_from_observation(runtime, failed=True))
-    matching_runtimes = [row for row in profile_runtimes
-                         if row.get("appServerVersion") == candidate["appServerVersion"]]
-    if not matching_runtimes:
-        raise _version_error("runtime_pair_unverified", _diagnostic_from_observation(runtime, failed=True))
-    if not any(row.get("appServerSha256") == candidate["appServerSha256"] for row in matching_runtimes):
-        raise _version_error("app_server_sha256", _diagnostic_from_observation(runtime, failed=True))
-    if expected is not None:
-        if (candidate != expected.get("candidateRuntime")
-                or audit["candidateProfile"] != expected.get("candidateProfile")
-                or any(_normalize_path(runtime[key]) != _normalize_path(expected[key])
-                       for key in ("desktopExe", "appServerExe"))):
-            raise _error("DESKTOP_PROCESS_CHANGED")
-    result = {**runtime, "desktopVersion": candidate["desktopVersion"],
-              "appServerVersion": candidate["appServerVersion"], "profile": None,
-              "candidateRuntime": candidate, "candidateProfile": audit["candidateProfile"]}
-    if expected is not None and expected.get("_candidateHandshake") is True:
-        result["_candidateHandshake"] = True
-    return result
-
-
-def _verify_runtime(pipe: _Pipe, target: dict[str, str], expected: dict[str, Any] | None = None) -> dict[str, Any]:
-    if expected is not None and "candidateRuntime" in expected:
-        if expected.get("_candidateHandshake") is not True:
-            raise _version_error("runtime_pair_unverified")
-        return _candidate_runtime(pipe, target, expected)
-    return _verify_runtime_identity(pipe, target, expected, require_catalog=True)
-
-
-def _runtime_process_pair() -> tuple[str, str] | None:
-    """只从现有进程树定位唯一 Desktop/app-server，不启动或连接 app-server。"""
-    pairs = _runtime_process_pairs()
-    return pairs[0] if len(pairs) == 1 else None
-
-
-def _compatibility() -> dict[str, Any]:
-    _query_standard_token()
-    pair = _runtime_process_pair()
-    return _safe_compatibility() if pair is None else _compatibility_for_paths(*pair)
-
-
-# ---- protocol client and fresh state -------------------------------------
 
 def _patch_state(state: dict[str, Any], patches: list[Any]) -> dict[str, Any]:
     result = copy.deepcopy(state)
@@ -2315,7 +925,7 @@ class _IpcClient:
         if method != "thread-stream-state-changed":
             return
         if value.get("version") != 11:
-            raise _error("DESKTOP_VERSION_UNSUPPORTED")
+            raise _error("DESKTOP_PROTOCOL_ERROR")
         params = value.get("params")
         if not isinstance(params, dict) or params.get("conversationId") != self.thread_id or params.get("hostId") != self.host_id:
             return
@@ -2467,14 +1077,21 @@ class _IpcClient:
         return time.monotonic() - self.states[self.owner][2]
 
 
-def _turns(state: dict[str, Any]) -> list[dict[str, Any]]:
+def _observed_turns(state: dict[str, Any], *, require_exhausted: bool = True) -> list[dict[str, Any]]:
+    """观察用 turn 集合：canonical 结构严格校验，exhausted 要求可配置。
+
+    require_exhausted=True（默认）保持基线语义：canonical 最新 island 的
+    newerBoundary 必须 exhausted。require_exhausted=False 供只读观察路径
+    （validate/active）使用：真实 active 会话的 canonical history 正常处于
+    loading，不能因此拒绝观察；islands/entities/entry 结构仍逐项严格校验。
+    """
     history = state.get("turnHistory")
     if isinstance(history, dict) and history.get("kind") == "canonical":
         body = history.get("history")
         if not isinstance(body, dict) or not isinstance(body.get("islands"), list) or not body["islands"] or not isinstance(body.get("entitiesByKey"), dict):
             raise _error("DESKTOP_STATE_UNAVAILABLE")
         islands = body["islands"]
-        if not isinstance(islands[-1], dict) or not isinstance(islands[-1].get("newerBoundary"), dict) or islands[-1]["newerBoundary"].get("status") != "exhausted":
+        if require_exhausted and (not isinstance(islands[-1], dict) or not isinstance(islands[-1].get("newerBoundary"), dict) or islands[-1]["newerBoundary"].get("status") != "exhausted"):
             raise _error("DESKTOP_STATE_UNAVAILABLE")
         turns: list[dict[str, Any]] = []
         for island in islands:
@@ -2492,6 +1109,11 @@ def _turns(state: dict[str, Any]) -> list[dict[str, Any]]:
     if not isinstance(turns, list) or not all(isinstance(turn, dict) for turn in turns):
         raise _error("DESKTOP_STATE_UNAVAILABLE")
     return turns
+
+
+def _turns(state: dict[str, Any]) -> list[dict[str, Any]]:
+    """send-safe / result 语义的严格 turn 集合：canonical 必须 exhausted。"""
+    return _observed_turns(state, require_exhausted=True)
 
 
 def _reconcile_expectation(value: Any) -> dict[str, Any]:
@@ -2531,6 +1153,100 @@ def _turn_text_for_reconciliation(turn: dict[str, Any]) -> str | None:
     except UnicodeEncodeError:
         raise _error("DESKTOP_STATE_UNAVAILABLE")
     return text
+def _assert_post_start_target(state: dict[str, Any], target: dict[str, str]) -> None:
+    """post-start 每份 observation（含第一份）都必须仍指向绑定 target。"""
+    if state.get("id") != target["threadId"] or state.get("hostId") != target["hostId"]:
+        raise _error("DESKTOP_OUTCOME_UNKNOWN", not_sent=False)
+
+
+def _verify_live_ack_turn(state: dict[str, Any], turn_id: str, message: str) -> Literal["pending", "verified", "invalid"]:
+    """独立于 terminal reconciliation 的 post-start tri-state verifier。"""
+    history = state.get("turnHistory")
+    if not isinstance(history, dict) or history.get("kind") != "canonical":
+        return "invalid"
+    try:
+        turns = _observed_turns(state, require_exhausted=False)
+    except (DesktopIpcError, TypeError):
+        return "invalid"
+    occurrences = [turn for turn in turns if turn.get("turnId") == turn_id]
+    if len(occurrences) > 1:
+        return "invalid"
+    if not occurrences:
+        return "pending"
+
+    turn = occurrences[0]
+    status = turn.get("status")
+    if not isinstance(status, str) or status not in {"inProgress", "completed", "failed", "interrupted", "cancelled"}:
+        return "invalid"
+    in_progress = status == "inProgress"
+
+    params = turn.get("params")
+    raw_input = params.get("input") if isinstance(params, dict) else None
+    if not isinstance(raw_input, list) or len(raw_input) != 1:
+        return "invalid"
+    input_item = raw_input[0]
+    if (not isinstance(input_item, dict) or set(input_item) != {"type", "text", "text_elements"}
+            or input_item.get("type") != "text" or input_item.get("text_elements") != []
+            or not isinstance(input_item.get("text"), str)):
+        return "invalid"
+    input_text = input_item["text"]
+    try:
+        input_text.encode("utf-8", "strict")
+    except UnicodeEncodeError:
+        return "invalid"
+    # params.input 已完整可读；任何正文差异都是矛盾，不能等待镜像补齐。
+    if input_text != message:
+        return "invalid"
+
+    def pending_or_invalid() -> Literal["pending", "invalid"]:
+        return "pending" if in_progress else "invalid"
+
+    if "items" not in turn:
+        return pending_or_invalid()
+    items = turn["items"]
+    if not isinstance(items, list):
+        return "invalid"
+    user_messages: list[dict[str, Any]] = []
+    for item in items:
+        item_type = item.get("type") if isinstance(item, dict) else None
+        if not isinstance(item_type, str) or item_type not in RESULT_ACTIVITY_ITEM_TYPES:
+            return "invalid"
+        if item_type == "userMessage":
+            user_messages.append(item)
+    if len(user_messages) > 1:
+        return "invalid"
+    if not user_messages:
+        return pending_or_invalid()
+
+    user_message = user_messages[0]
+    if "content" not in user_message:
+        return pending_or_invalid()
+    content = user_message["content"]
+    if not isinstance(content, list):
+        return "invalid"
+    if not content:
+        return pending_or_invalid()
+    if len(content) != 1:
+        return "invalid"
+    content_item = content[0]
+    if not isinstance(content_item, dict):
+        return "invalid"
+    expected_keys = {"type", "text", "text_elements"}
+    if (set(content_item) - expected_keys or content_item.get("type") != "text"
+            or ("text" in content_item and not isinstance(content_item["text"], str))
+            or ("text_elements" in content_item and content_item["text_elements"] != [])):
+        return "invalid"
+    if "text" in content_item:
+        try:
+            content_item["text"].encode("utf-8", "strict")
+        except UnicodeEncodeError:
+            return "invalid"
+        if content_item["text"] != input_text:
+            return "invalid"
+    if set(content_item) != expected_keys:
+        return pending_or_invalid()
+    return "verified" if content_item == input_item else "invalid"
+
 
 
 def _strict_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -2588,18 +1304,18 @@ def _reconcile_turn_ids(state: dict[str, Any], expectation: dict[str, Any]) -> l
 def _reconcile_unknown(target: dict[str, str], expectation_value: Any) -> dict[str, Any]:
     target = _target(target)
     expectation = _reconcile_expectation(expectation_value)
-    session, _ = _prepare(target, allow_active=True)
+    session, _ = _prepare(target, purpose="observe")
     try:
         before = session.client.current_state()
         if before is None or session.client.snapshot_age() > MAX_OBSERVATION_AGE_SECONDS:
             raise _error("DESKTOP_STATE_UNAVAILABLE")
-        _validate_state(before, target, session.client.owner or "", allow_active=True)
+        _validate_observed_state(before, target, session.client.owner or "")
         before_candidates = _reconcile_turn_ids(before, expectation)
-        _verify_runtime(session.pipe, target, session.runtime)
+        _verify_process_identity(session.pipe, target, session.process)
         after = session.client.snapshot()
-        _validate_state(after, target, session.client.owner or "", allow_active=True)
+        _validate_observed_state(after, target, session.client.owner or "")
         after_candidates = _reconcile_turn_ids(after, expectation)
-        _verify_runtime(session.pipe, target, session.runtime)
+        _verify_process_identity(session.pipe, target, session.process)
         if before_candidates != after_candidates:
             raise _error("DESKTOP_RECONCILIATION_CONFLICT")
         return {
@@ -2613,7 +1329,21 @@ def _reconcile_unknown(target: dict[str, str], expectation_value: Any) -> dict[s
         session.close()
 
 
-def _validate_state(state: dict[str, Any], target: dict[str, str], owner: str, *, allow_active: bool = False) -> None:
+def _unconfirmed_submissions(state: dict[str, Any]) -> list[Any]:
+    value = state.get("unconfirmedTurnSubmissions")
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    raise _error("DESKTOP_STATE_UNAVAILABLE")
+
+
+def _validate_observed_state(state: dict[str, Any], target: dict[str, str], owner: str) -> None:
+    """验证这是正确且结构可理解的会话；忙、请求或未确认提交允许存在。
+
+    只读观察不跳过 shape validation：所有字段的类型仍必须合法，
+    turn status 非法值仍然拒绝。
+    """
     if state.get("id") != target["threadId"] or state.get("hostId") != target["hostId"]:
         raise _error("DESKTOP_TARGET_NOT_FOUND")
     cwd = state.get("cwd")
@@ -2625,31 +1355,41 @@ def _validate_state(state: dict[str, Any], target: dict[str, str], owner: str, *
         raise _error("DESKTOP_STATE_UNAVAILABLE")
     runtime = state.get("threadRuntimeStatus")
     runtime_type = runtime.get("type") if isinstance(runtime, dict) else None
-    if runtime_type != "idle" and not (allow_active and runtime_type in {"active", "inProgress"}):
-        raise _error("DESKTOP_BUSY")
-    requests = state.get("requests")
-    if not isinstance(requests, list):
-        raise _error("DESKTOP_APPROVAL_PENDING")
-    if requests:
-        raise _error("DESKTOP_APPROVAL_PENDING")
-    if state.get("unconfirmedTurnSubmissions"):
-        raise _error("DESKTOP_APPROVAL_PENDING")
+    if runtime_type not in {"idle", "active", "inProgress"}:
+        raise _error("DESKTOP_STATE_UNAVAILABLE")
+    if not isinstance(state.get("requests"), list):
+        raise _error("DESKTOP_STATE_UNAVAILABLE")
+    _unconfirmed_submissions(state)
     terminal_statuses = {"completed", "failed", "interrupted", "cancelled"}
-    for turn in _turns(state):
+    for turn in _observed_turns(state, require_exhausted=False):
         status = turn.get("status")
-        if status == "inProgress":
-            if not allow_active:
-                raise _error("DESKTOP_BUSY")
-            continue
-        if status not in terminal_statuses:
+        if status != "inProgress" and status not in terminal_statuses:
             raise _error("DESKTOP_STATE_UNAVAILABLE")
     for environment in state.get("environments") or []:
         if not isinstance(environment, dict) or _normalize_path(str(environment.get("cwd", ""))) != _normalize_path(target["workspaceRoot"]):
             raise _error("DESKTOP_PROJECT_MISMATCH")
     _require(bool(owner), "DESKTOP_NO_OWNER")
 
+def _assert_send_ready(state: dict[str, Any]) -> None:
+    """发送前 runtime gate：idle、无请求、无未确认提交、无 inProgress turn。
 
-def _public_info(state: dict[str, Any], target: dict[str, str], runtime: dict[str, Any], client: _IpcClient) -> dict[str, Any]:
+    不含 owner 一致性——owner 属于 _IpcClient session identity，
+    由 prepare/send 前后的 owner fence 单独保证。
+    """
+    runtime = state.get("threadRuntimeStatus")
+    runtime_type = runtime.get("type") if isinstance(runtime, dict) else None
+    if runtime_type != "idle":
+        raise _error("DESKTOP_BUSY")
+    if state.get("requests"):
+        raise _error("DESKTOP_APPROVAL_PENDING")
+    if _unconfirmed_submissions(state):
+        raise _error("DESKTOP_APPROVAL_PENDING")
+    for turn in _turns(state):
+        if turn.get("status") == "inProgress":
+            raise _error("DESKTOP_BUSY")
+
+
+def _public_info(state: dict[str, Any], target: dict[str, str], client: _IpcClient) -> dict[str, Any]:
     title = state.get("title")
     cwd = state.get("cwd")
     runtime_state = state.get("threadRuntimeStatus")
@@ -2668,9 +1408,6 @@ def _public_info(state: dict[str, Any], target: dict[str, str], runtime: dict[st
         "resumeState": state.get("resumeState"),
         "runtimeStatus": runtime_status,
         "requestsCount": len(state.get("requests", [])),
-        "desktopVersion": runtime["desktopVersion"],
-        "appServerVersion": runtime["appServerVersion"],
-        "profile": runtime.get("profile"),
         "ownerClientId": client.owner,
     }
 
@@ -2680,99 +1417,152 @@ class _Prepared:
     target: dict[str, str]
     pipe: _Pipe
     client: _IpcClient
-    runtime: dict[str, Any]
+    process: dict[str, Any]
+
+    def _process_fence(self) -> None:
+        _verify_process_identity(self.pipe, self.target, self.process)
 
     def send(self, message: str) -> dict[str, str]:
-        _message(message)
-        _query_standard_token()
-        current = _verify_runtime(self.pipe, self.target, self.runtime)
-        if current["desktopPid"] != self.runtime["desktopPid"] or current["appServerPid"] != self.runtime["appServerPid"]:
-            raise _error("DESKTOP_PROCESS_CHANGED")
+        """Behavioral send attestation：单次 start-turn + 事后 canonical 证明。"""
+        self.start_attempted = False
+        try:
+            return self._send_inner(message)
+        except DesktopIpcError as error:
+            # boundary authority：start-turn 尝试之前，任何 DesktopIpcError 都没有
+            # 送达字节，统一强制重投影为相同 code + notSent=true；boundary 之后
+            # 统一收敛 unknown/false（见下方 except 分支）。
+            if self.start_attempted:
+                raise
+            raise _error(error.code, not_sent=True) from error
+        except Exception as error:
+            if self.start_attempted:
+                raise
+            raise _error("DESKTOP_INTERNAL_ERROR", not_sent=True) from error
+
+    def _send_inner(self, message: str) -> dict[str, str]:
+        # ---- preflight：start-turn 之前，失败可返回具体错误且 notSent=true ----
+        self._process_fence()
         self.client.discover()
         state = self.client.snapshot()
-        _validate_state(state, self.target, self.client.owner or "")
+        _validate_observed_state(state, self.target, self.client.owner or "")
+        _assert_send_ready(state)
         _query_standard_token()
-        # 提交前最后核对进程、项目与 owner；协议没有原子 idle/start CAS，故保持窗口有界。
-        _verify_runtime(self.pipe, self.target, self.runtime)
+        # 提交前最后核对进程与 owner；协议没有原子 idle/start CAS，故保持窗口有界。
+        self._process_fence()
         self.client.drain(0.1)
         state = self.client.current_state()
         if state is None or self.client.snapshot_age() > MAX_OBSERVATION_AGE_SECONDS:
             raise _error("DESKTOP_STATE_UNAVAILABLE")
-        _validate_state(state, self.target, self.client.owner or "")
-        # 使用最后一次状态观测建立 ACK 防重放集合；初始 snapshot 期间
-        # 若已有其他 turn 到达，旧集合不能作为真实新 turn 的依据。
+        _validate_observed_state(state, self.target, self.client.owner or "")
+        _assert_send_ready(state)
+        # mutation boundary 前最后一次 targeted owner fence；协议没有原子
+        # idle/start CAS，故把 owner 漂移窗口压到这次 discover 之后。
+        self.client.discover()
+        # 以最后一次状态观测建立 ACK 防重放集合与 observation 高水位。
         before_turn_ids = {
             turn.get("turnId")
             for turn in _turns(state)
             if isinstance(turn.get("turnId"), str)
         }
-        request = self.client._envelope("thread-follower-start-turn", {
-            "conversationId": self.target["threadId"],
-            "turnStart": {
-                "request": {
-                    "threadId": self.target["threadId"],
-                    "input": [{"type": "text", "text": message, "text_elements": []}],
-                }
-            },
-        }, self.client.owner)
-        response = self.client.request(request, SEND_TIMEOUT_SECONDS, sent_code="DESKTOP_OUTCOME_UNKNOWN")
-        result = response.get("result")
-        nested = result.get("result") if isinstance(result, dict) else None
-        turn = nested.get("turn") if isinstance(nested, dict) else None
-        turn_id = turn.get("id") if isinstance(turn, dict) else None
-        if _uuid(turn_id) is None or turn_id in before_turn_ids:
-            raise _error("DESKTOP_OUTCOME_UNKNOWN", not_sent=False)
-        return {"threadId": self.target["threadId"], "turnId": turn_id}
+        before_serial = self.client.snapshot_serial
+        # ---- mutation boundary：唯一一次 start-turn 写入尝试前翻转 ----
+        self.start_attempted = True
+        try:
+            request = self.client._envelope("thread-follower-start-turn", {
+                "conversationId": self.target["threadId"],
+                "turnStart": {
+                    "request": {
+                        "threadId": self.target["threadId"],
+                        "input": [{"type": "text", "text": message, "text_elements": []}],
+                    }
+                },
+            }, self.client.owner)
+            response = self.client.request(request, SEND_TIMEOUT_SECONDS, sent_code="DESKTOP_OUTCOME_UNKNOWN")
+            result = response.get("result")
+            nested = result.get("result") if isinstance(result, dict) else None
+            turn = nested.get("turn") if isinstance(nested, dict) else None
+            turn_id = turn.get("id") if isinstance(turn, dict) else None
+            if _uuid(turn_id) is None or turn_id in before_turn_ids:
+                raise _error("DESKTOP_OUTCOME_UNKNOWN", not_sent=False)
+            # ---- post-start observation fence：必须拿到 serial 严格增大的新 snapshot ----
+            deadline = time.monotonic() + POST_START_STATE_DEADLINE_SECONDS
+            state = self.client.snapshot()
+            if time.monotonic() >= deadline:
+                raise _error("DESKTOP_OUTCOME_UNKNOWN", not_sent=False)
+            if self.client.snapshot_serial <= before_serial:
+                raise _error("DESKTOP_OUTCOME_UNKNOWN", not_sent=False)
+            _assert_post_start_target(state, self.target)
+            # ---- bounded wait：只轮询 state，绝不重发 start-turn ----
+            # 只有 turn 尚未出现，或唯一 inProgress turn 的 userMessage 镜像尚未完成，
+            # 才能等待；重复、未知结构或任一可读正文不匹配都立即 unknown。
+            verification = _verify_live_ack_turn(state, turn_id, message)
+            while verification == "pending":
+                if time.monotonic() >= deadline:
+                    raise _error("DESKTOP_OUTCOME_UNKNOWN", not_sent=False)
+                state = self.client.snapshot()
+                if time.monotonic() >= deadline:
+                    raise _error("DESKTOP_OUTCOME_UNKNOWN", not_sent=False)
+                if self.client.snapshot_serial <= before_serial:
+                    raise _error("DESKTOP_OUTCOME_UNKNOWN", not_sent=False)
+                _assert_post_start_target(state, self.target)
+                verification = _verify_live_ack_turn(state, turn_id, message)
+            if verification != "verified":
+                raise _error("DESKTOP_OUTCOME_UNKNOWN", not_sent=False)
+            # ---- final process/owner fence ----
+            self._process_fence()
+            self.client.discover()
+            return {"threadId": self.target["threadId"], "turnId": turn_id}
+        except DesktopIpcError:
+            # boundary 之后的一切不确定性统一收敛为 outcome unknown；
+            # 不依赖下层 helper 的默认 not_sent，绝不第二次 start-turn。
+            if self.start_attempted:
+                raise _error("DESKTOP_OUTCOME_UNKNOWN", not_sent=False)
+            raise
+        except TimeoutError:
+            if self.start_attempted:
+                raise _error("DESKTOP_OUTCOME_UNKNOWN", not_sent=False)
+            raise
 
     def close(self) -> None:
         self.pipe.close()
 
 
-def _prepare(target: dict[str, str], *, allow_active: bool = False,
+def _prepare(target: dict[str, str], *, purpose: str = "send",
              require_runner_ancestor: bool = False) -> tuple[_Prepared, dict[str, Any]]:
+    """purpose="observe" 只观察（忙/请求/未确认提交都允许）；purpose="send" 才做 send-ready gate。"""
+    if purpose not in {"observe", "send"}:
+        raise _error("DESKTOP_INVALID_REQUEST")
     _query_standard_token()
-    runtime: dict[str, Any] | None = None
+    process: dict[str, Any] | None = None
     pipe = _Pipe()
     try:
-        candidate_handshake = False
-        try:
-            runtime = _verify_runtime(pipe, target)
-        except DesktopIpcError as error:
-            if error.code != "DESKTOP_VERSION_UNSUPPORTED":
-                raise
-            runtime = _candidate_runtime(pipe, target)
-            candidate_handshake = True
+        process = _verify_process_identity(pipe, target)
         client = _IpcClient(pipe, target["threadId"], target["hostId"])
         client.initialize()
         client.discover()
         state = client.snapshot()
-        _validate_state(state, target, client.owner or "", allow_active=allow_active)
-        if candidate_handshake:
-            if (not client.client_id or client.client_id == "initializing-client" or not client.owner
-                    or not client.following_changed_sent
-                    or client.state_change_kind not in {"snapshot", "patches"}):
-                raise _error("DESKTOP_STATE_UNAVAILABLE")
-            runtime = _candidate_runtime(pipe, target, runtime)
-            runtime["_candidateHandshake"] = True
-        info = _public_info(state, target, runtime, client)
-        if allow_active:
+        _validate_observed_state(state, target, client.owner or "")
+        if purpose == "send":
+            _assert_send_ready(state)
+        info = _public_info(state, target, client)
+        if purpose == "observe":
             client.drain(0.1)
             state = client.current_state()
             if state is None or client.snapshot_age() > MAX_OBSERVATION_AGE_SECONDS:
                 raise _error("DESKTOP_STATE_UNAVAILABLE")
-            _validate_state(state, target, client.owner or "", allow_active=True)
-            info = _public_info(state, target, runtime, client)
-        _verify_runtime(pipe, target, runtime)
+            _validate_observed_state(state, target, client.owner or "")
+            info = _public_info(state, target, client)
+        process = _verify_process_identity(pipe, target, process)
         if require_runner_ancestor:
-            _verify_current_runner_ancestor(runtime)
+            _verify_current_runner_ancestor(process)
         if client.snapshot_age() > MAX_OBSERVATION_AGE_SECONDS:
             raise _error("DESKTOP_STATE_UNAVAILABLE")
-        prepared = _Prepared(target, pipe, client, runtime)
+        prepared = _Prepared(target, pipe, client, process)
         return prepared, info
     except DesktopIpcError as error:
         try:
-            if error.code == "DESKTOP_NO_OWNER" and runtime is not None and not candidate_handshake:
-                _verify_runtime(pipe, target, runtime)
+            if error.code == "DESKTOP_NO_OWNER" and process is not None:
+                _verify_process_identity(pipe, target, process)
         finally:
             pipe.close()
         raise
@@ -2784,64 +1574,30 @@ def _prepare(target: dict[str, str], *, allow_active: bool = False,
         raise _error("DESKTOP_INTERNAL_ERROR")
 
 
-def _handshake_audit(workspace_root: Any) -> dict[str, Any]:
-    """只读 live handshake；不要求 catalog trust，也不发送 start-turn。"""
+def _diagnose(workspace_root: Any) -> dict[str, Any]:
+    """只读 live handshake 诊断；不发送 start-turn，不做信任分类。"""
     target = _current_target(workspace_root)
     _query_standard_token()
     pipe = _Pipe()
     session: _IpcClient | None = None
     try:
-        before = _verify_runtime_identity(pipe, target, require_catalog=False)
-        audit = _compatibility_audit_for_paths(before["desktopExe"], before["appServerExe"])
-        modules = audit.get("modules", [])
-        if (audit.get("classification") not in {"protocol_drift_or_unknown", "same_protocol_candidate",
-                                                "semantic_same_protocol_candidate", "current"}
-                or len(modules) != 2
-                or {item.get("role") for item in modules} != {"ipc-main", "webview-bootstrap"}
-                or (audit.get("classification") == "same_protocol_candidate"
-                    and not isinstance(audit.get("candidateRuntime"), dict))):
-            raise _error("DESKTOP_STATE_UNAVAILABLE")
+        before = _verify_process_identity(pipe, target)
         session = _IpcClient(pipe, target["threadId"], target["hostId"])
         session.initialize()
         owner = session.discover()
         state = session.snapshot()
         if not isinstance(state, dict):
             raise _error("DESKTOP_STATE_UNAVAILABLE")
-        after = _verify_runtime_identity(pipe, target, before, require_catalog=False)
-        after_audit = _compatibility_audit_for_paths(after["desktopExe"], after["appServerExe"])
-        if (before["desktopPid"] != after["desktopPid"] or before["appServerPid"] != after["appServerPid"]
-                or before["desktopCreation"] != after["desktopCreation"]
-                or before["appServerCreation"] != after["appServerCreation"]
-                or _normalize_path(before["desktopExe"]) != _normalize_path(after["desktopExe"])
-                or _normalize_path(before["appServerExe"]) != _normalize_path(after["appServerExe"])
-                or tuple(before.get(key) for key in ("observedDesktopVersion", "observedAppServerVersion", "appServerSha256")) !=
-                   tuple(after.get(key) for key in ("observedDesktopVersion", "observedAppServerVersion", "appServerSha256"))
-                or after_audit.get("modules") != audit.get("modules")
-                or after_audit.get("asarHeader") != audit.get("asarHeader")
-                or after_audit.get("semanticFingerprint") != audit.get("semanticFingerprint")
-                or after_audit.get("semanticReason") != audit.get("semanticReason")
-                or after_audit.get("classification") != audit.get("classification")
-                or after_audit.get("candidateProfile") != audit.get("candidateProfile")
-                or (audit.get("classification") == "same_protocol_candidate"
-                    and (after_audit.get("classification") != "same_protocol_candidate"
-                         or after_audit.get("candidateProfile") != audit.get("candidateProfile")
-                         or after_audit.get("candidateRuntime") != audit.get("candidateRuntime")))):
-            raise _error("DESKTOP_PROCESS_CHANGED")
-        result = {
+        _verify_process_identity(pipe, target, before)
+        return {
+            "mode": "behavioral",
             "processStable": True,
-            "runtimeStable": True,
-            "protocolClassification": audit.get("classification"),
-            "semanticFingerprint": audit.get("semanticFingerprint"),
-            "semanticReason": audit.get("semanticReason", "not_scanned"),
             "initialize": True,
             "ownerDiscovery": bool(owner),
             "followingChangedSent": session.following_changed_sent,
             "stateReceived": session.state_change_kind in {"snapshot", "patches"},
             "stateChange": session.state_change_kind,
         }
-        if audit.get("classification") == "same_protocol_candidate":
-            result["candidateRuntime"] = audit["candidateRuntime"]
-        return result
     finally:
         if session is not None:
             session.pipe.close()
@@ -2849,24 +1605,21 @@ def _handshake_audit(workspace_root: Any) -> dict[str, Any]:
             pipe.close()
 
 
-def _current_identity_checked(workspace_root: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+def _current_identity_checked(workspace_root: Any) -> dict[str, Any]:
     target = _current_target(workspace_root)
-    session, info = _prepare(target, allow_active=True, require_runner_ancestor=True)
+    session, info = _prepare(target, purpose="observe", require_runner_ancestor=True)
     try:
-        return info, copy.deepcopy(session.runtime)
+        return info
     finally:
         session.close()
 
 
-def _same_current_identity(left: dict[str, Any], right: dict[str, Any], left_runtime: dict[str, Any],
-                           right_runtime: dict[str, Any]) -> bool:
+def _same_current_identity(left: dict[str, Any], right: dict[str, Any]) -> bool:
     for key in ("threadId", "hostId", "projectId", "workspaceRoot", "title", "workspaceKind", "resumeState",
-                "ownerClientId", "desktopVersion", "appServerVersion", "profile"):
+                "ownerClientId"):
         if left.get(key) != right.get(key):
             return False
-    if _normalize_path(str(left.get("cwd", ""))) != _normalize_path(str(right.get("cwd", ""))):
-        return False
-    return left_runtime == right_runtime
+    return _normalize_path(str(left.get("cwd", ""))) == _normalize_path(str(right.get("cwd", "")))
 
 
 def _display_metadata(value: str) -> str:
@@ -2907,8 +1660,7 @@ def _show_confirmation(info: dict[str, Any]) -> bool:
 
 
 def _current_identity(workspace_root: Any) -> dict[str, Any]:
-    info, _ = _current_identity_checked(workspace_root)
-    return info
+    return _current_identity_checked(workspace_root)
 
 
 def _active_turn_id(state: dict[str, Any]) -> str:
@@ -2917,7 +1669,7 @@ def _active_turn_id(state: dict[str, Any]) -> str:
     if runtime_type not in {"active", "inProgress"}:
         raise _error("DESKTOP_STATE_UNAVAILABLE")
     active: list[str] = []
-    for turn in _turns(state):
+    for turn in _observed_turns(state, require_exhausted=False):
         if turn.get("status") != "inProgress":
             continue
         turn_id = _uuid(turn.get("turnId"))
@@ -3096,19 +1848,19 @@ def _result_activity_fence(result_turn_id: str, result_turn_status: str,
 
 def _current_execution(workspace_root: Any) -> dict[str, Any]:
     target = _current_target(workspace_root)
-    session, _ = _prepare(target, allow_active=True, require_runner_ancestor=True)
+    session, _ = _prepare(target, purpose="observe", require_runner_ancestor=True)
     try:
         # 取 prepare 阶段之后仍在窗口内的新鲜状态；不接受环境变量提供的 turnId。
         session.client.drain(0.1)
         state = session.client.current_state()
         if state is None or session.client.snapshot_age() > MAX_OBSERVATION_AGE_SECONDS:
             raise _error("DESKTOP_STATE_UNAVAILABLE")
-        _validate_state(state, target, session.client.owner or "", allow_active=True)
+        _validate_observed_state(state, target, session.client.owner or "")
         freshness_deadline = time.monotonic() + SNAPSHOT_TIMEOUT_SECONDS
-        # 使用 prepare 时捕获的 runtime 做同一进程/版本复核，避免把新进程或伪造环境当作当前执行。
-        _verify_runtime(session.pipe, target, session.runtime)
-        _verify_current_runner_ancestor(session.runtime)
-        # runtime/runner 核验可能消耗时间；回传前再次确认仍在观测窗口内。
+        # 使用 prepare 时捕获的 process identity 做同一进程复核，避免把新进程或伪造环境当作当前执行。
+        _verify_process_identity(session.pipe, target, session.process)
+        _verify_current_runner_ancestor(session.process)
+        # process/runner 核验可能消耗时间；回传前再次确认仍在观测窗口内。
         if session.client.snapshot_age() > MAX_OBSERVATION_AGE_SECONDS:
             if time.monotonic() >= freshness_deadline:
                 raise _error("DESKTOP_STATE_UNAVAILABLE")
@@ -3117,15 +1869,15 @@ def _current_execution(workspace_root: Any) -> dict[str, Any]:
             state = session.client.snapshot()
             if session.client.snapshot_serial <= previous_serial:
                 raise _error("DESKTOP_STATE_UNAVAILABLE")
-            _verify_runtime(session.pipe, target, session.runtime)
-            _verify_current_runner_ancestor(session.runtime)
+            _verify_process_identity(session.pipe, target, session.process)
+            _verify_current_runner_ancestor(session.process)
             if (time.monotonic() >= freshness_deadline
                     or session.client.snapshot_age() > MAX_OBSERVATION_AGE_SECONDS):
                 raise _error("DESKTOP_STATE_UNAVAILABLE")
-            _validate_state(state, target, session.client.owner or "", allow_active=True)
+            _validate_observed_state(state, target, session.client.owner or "")
         active_turn_id = _active_turn_id(state)
         return {
-            **_public_info(state, target, session.runtime, session.client),
+            **_public_info(state, target, session.client),
             "activeTurnId": active_turn_id,
         }
     finally:
@@ -3133,19 +1885,19 @@ def _current_execution(workspace_root: Any) -> dict[str, Any]:
 
 
 def _inspect_active_execution(target: dict[str, str]) -> dict[str, Any]:
-    session, _ = _prepare(target, allow_active=True)
+    session, _ = _prepare(target, purpose="observe")
     try:
         session.client.drain(0.1)
         state = session.client.current_state()
         if state is None or session.client.snapshot_age() > MAX_OBSERVATION_AGE_SECONDS:
             raise _error("DESKTOP_STATE_UNAVAILABLE")
-        _validate_state(state, target, session.client.owner or "", allow_active=True)
-        _verify_runtime(session.pipe, target, session.runtime)
+        _validate_observed_state(state, target, session.client.owner or "")
+        _verify_process_identity(session.pipe, target, session.process)
         if session.client.snapshot_age() > MAX_OBSERVATION_AGE_SECONDS:
             raise _error("DESKTOP_STATE_UNAVAILABLE")
         active_turn_id = _active_turn_id(state)
         return {
-            **_public_info(state, target, session.runtime, session.client),
+            **_public_info(state, target, session.client),
             "activeTurnId": active_turn_id,
         }
     finally:
@@ -3154,15 +1906,15 @@ def _inspect_active_execution(target: dict[str, str]) -> dict[str, Any]:
 
 def _inspect_result_context(target: dict[str, str]) -> dict[str, Any]:
     """Detached finalizer 的显式 target 观察；不依赖 runner ancestor。"""
-    session, _ = _prepare(target, allow_active=True)
+    session, _ = _prepare(target, purpose="observe")
     try:
         session.client.drain(0.1)
         state = session.client.current_state()
         if state is None or session.client.snapshot_age() > MAX_OBSERVATION_AGE_SECONDS:
             raise _error("DESKTOP_STATE_UNAVAILABLE")
-        _validate_state(state, target, session.client.owner or "", allow_active=True)
+        _validate_observed_state(state, target, session.client.owner or "")
         freshness_deadline = time.monotonic() + SNAPSHOT_TIMEOUT_SECONDS
-        _verify_runtime(session.pipe, target, session.runtime)
+        _verify_process_identity(session.pipe, target, session.process)
         if session.client.snapshot_age() > MAX_OBSERVATION_AGE_SECONDS:
             if time.monotonic() >= freshness_deadline:
                 raise _error("DESKTOP_STATE_UNAVAILABLE")
@@ -3171,14 +1923,14 @@ def _inspect_result_context(target: dict[str, str]) -> dict[str, Any]:
             state = session.client.snapshot()
             if session.client.snapshot_serial <= previous_serial:
                 raise _error("DESKTOP_STATE_UNAVAILABLE")
-            _verify_runtime(session.pipe, target, session.runtime)
+            _verify_process_identity(session.pipe, target, session.process)
             if (time.monotonic() >= freshness_deadline
                     or session.client.snapshot_age() > MAX_OBSERVATION_AGE_SECONDS):
                 raise _error("DESKTOP_STATE_UNAVAILABLE")
-            _validate_state(state, target, session.client.owner or "", allow_active=True)
+            _validate_observed_state(state, target, session.client.owner or "")
         result_turn_id, result_turn_status = _result_turn_context(state)
         return {
-            **_public_info(state, target, session.runtime, session.client),
+            **_public_info(state, target, session.client),
             "resultTurnId": result_turn_id,
             "resultTurnStatus": result_turn_status,
         }
@@ -3189,15 +1941,15 @@ def _inspect_result_context(target: dict[str, str]) -> dict[str, Any]:
 def _inspect_result_activity(target: dict[str, str], marker_value: Any = None, *, verify: bool = False) -> dict[str, Any]:
     """读取一次 live canonical turn，并只投影有序 item id/type。"""
     marker = _result_activity_marker_input(marker_value) if verify else None
-    session, _ = _prepare(target, allow_active=True)
+    session, _ = _prepare(target, purpose="observe")
     try:
         session.client.drain(0.1)
         state = session.client.current_state()
         if state is None or session.client.snapshot_age() > MAX_OBSERVATION_AGE_SECONDS:
             raise _error("DESKTOP_STATE_UNAVAILABLE")
-        _validate_state(state, target, session.client.owner or "", allow_active=True)
+        _validate_observed_state(state, target, session.client.owner or "")
         freshness_deadline = time.monotonic() + SNAPSHOT_TIMEOUT_SECONDS
-        _verify_runtime(session.pipe, target, session.runtime)
+        _verify_process_identity(session.pipe, target, session.process)
         if session.client.snapshot_age() > MAX_OBSERVATION_AGE_SECONDS:
             if time.monotonic() >= freshness_deadline:
                 raise _error("DESKTOP_STATE_UNAVAILABLE")
@@ -3206,11 +1958,11 @@ def _inspect_result_activity(target: dict[str, str], marker_value: Any = None, *
             state = session.client.snapshot()
             if session.client.snapshot_serial <= previous_serial:
                 raise _error("DESKTOP_STATE_UNAVAILABLE")
-            _verify_runtime(session.pipe, target, session.runtime)
+            _verify_process_identity(session.pipe, target, session.process)
             if (time.monotonic() >= freshness_deadline
                     or session.client.snapshot_age() > MAX_OBSERVATION_AGE_SECONDS):
                 raise _error("DESKTOP_STATE_UNAVAILABLE")
-            _validate_state(state, target, session.client.owner or "", allow_active=True)
+            _validate_observed_state(state, target, session.client.owner or "")
         result_turn_id, result_turn_status = _result_turn_context(state)
         turns = _complete_result_turns(state)
         matches = [turn for turn in turns if turn.get("turnId") == result_turn_id]
@@ -3218,7 +1970,7 @@ def _inspect_result_activity(target: dict[str, str], marker_value: Any = None, *
             raise _error("DESKTOP_STATE_UNAVAILABLE")
         item_ids, item_types = _result_activity_sequence(matches[0])
         base = {
-            **_public_info(state, target, session.runtime, session.client),
+            **_public_info(state, target, session.client),
             "resultTurnId": result_turn_id,
             "resultTurnStatus": result_turn_status,
         }
@@ -3240,17 +1992,17 @@ def _inspect_result_terminal_fence(target: dict[str, str], marker: Any) -> dict[
 
 def _current_result_context(workspace_root: Any) -> dict[str, Any]:
     target = _current_target(workspace_root)
-    session, _ = _prepare(target, allow_active=True, require_runner_ancestor=True)
+    session, _ = _prepare(target, purpose="observe", require_runner_ancestor=True)
     try:
-        # 与 current_execution 一样，在 runtime/runner 核验前后都只使用新鲜快照。
+        # 与 current_execution 一样，在 process/runner 核验前后都只使用新鲜快照。
         session.client.drain(0.1)
         state = session.client.current_state()
         if state is None or session.client.snapshot_age() > MAX_OBSERVATION_AGE_SECONDS:
             raise _error("DESKTOP_STATE_UNAVAILABLE")
-        _validate_state(state, target, session.client.owner or "", allow_active=True)
+        _validate_observed_state(state, target, session.client.owner or "")
         freshness_deadline = time.monotonic() + SNAPSHOT_TIMEOUT_SECONDS
-        _verify_runtime(session.pipe, target, session.runtime)
-        _verify_current_runner_ancestor(session.runtime)
+        _verify_process_identity(session.pipe, target, session.process)
+        _verify_current_runner_ancestor(session.process)
         if session.client.snapshot_age() > MAX_OBSERVATION_AGE_SECONDS:
             if time.monotonic() >= freshness_deadline:
                 raise _error("DESKTOP_STATE_UNAVAILABLE")
@@ -3259,14 +2011,14 @@ def _current_result_context(workspace_root: Any) -> dict[str, Any]:
             state = session.client.snapshot()
             if session.client.snapshot_serial <= previous_serial:
                 raise _error("DESKTOP_STATE_UNAVAILABLE")
-            _verify_runtime(session.pipe, target, session.runtime)
+            _verify_process_identity(session.pipe, target, session.process)
             if (time.monotonic() >= freshness_deadline
                     or session.client.snapshot_age() > MAX_OBSERVATION_AGE_SECONDS):
                 raise _error("DESKTOP_STATE_UNAVAILABLE")
-            _validate_state(state, target, session.client.owner or "", allow_active=True)
+            _validate_observed_state(state, target, session.client.owner or "")
         result_turn_id, result_turn_status = _result_turn_context(state)
         return {
-            **_public_info(state, target, session.runtime, session.client),
+            **_public_info(state, target, session.client),
             "resultTurnId": result_turn_id,
             "resultTurnStatus": result_turn_status,
         }
@@ -3372,16 +2124,16 @@ def _native_successor(turn: dict[str, Any], target: dict[str, str]) -> None:
 def _current_result_ownership(workspace_root: Any, expectation_value: Any) -> dict[str, Any]:
     target = _current_target(workspace_root)
     expectation = _continuation_expectation(expectation_value)
-    session, _ = _prepare(target, allow_active=True, require_runner_ancestor=True)
+    session, _ = _prepare(target, purpose="observe", require_runner_ancestor=True)
     try:
         session.client.drain(0.1)
         state = session.client.current_state()
         if state is None or session.client.snapshot_age() > MAX_OBSERVATION_AGE_SECONDS:
             raise _error("DESKTOP_STATE_UNAVAILABLE")
-        _validate_state(state, target, session.client.owner or "", allow_active=True)
+        _validate_observed_state(state, target, session.client.owner or "")
         freshness_deadline = time.monotonic() + SNAPSHOT_TIMEOUT_SECONDS
-        _verify_runtime(session.pipe, target, session.runtime)
-        _verify_current_runner_ancestor(session.runtime)
+        _verify_process_identity(session.pipe, target, session.process)
+        _verify_current_runner_ancestor(session.process)
         if session.client.snapshot_age() > MAX_OBSERVATION_AGE_SECONDS:
             if time.monotonic() >= freshness_deadline:
                 raise _error("DESKTOP_STATE_UNAVAILABLE")
@@ -3390,11 +2142,11 @@ def _current_result_ownership(workspace_root: Any, expectation_value: Any) -> di
             state = session.client.snapshot()
             if session.client.snapshot_serial <= previous_serial:
                 raise _error("DESKTOP_STATE_UNAVAILABLE")
-            _verify_runtime(session.pipe, target, session.runtime)
-            _verify_current_runner_ancestor(session.runtime)
+            _verify_process_identity(session.pipe, target, session.process)
+            _verify_current_runner_ancestor(session.process)
             if time.monotonic() >= freshness_deadline or session.client.snapshot_age() > MAX_OBSERVATION_AGE_SECONDS:
                 raise _error("DESKTOP_STATE_UNAVAILABLE")
-            _validate_state(state, target, session.client.owner or "", allow_active=True)
+            _validate_observed_state(state, target, session.client.owner or "")
 
         all_turns = _complete_result_turns(state)
         ids = [turn.get("turnId") for turn in all_turns]
@@ -3416,7 +2168,7 @@ def _current_result_ownership(workspace_root: Any, expectation_value: Any) -> di
             raise _error("DESKTOP_STATE_UNAVAILABLE")
         if result_index == origin_index:
             return {
-                **_public_info(state, target, session.runtime, session.client),
+                **_public_info(state, target, session.client),
                 "resultTurnId": result_id,
                 "resultTurnStatus": result_status,
                 "ownership": "origin",
@@ -3442,7 +2194,7 @@ def _current_result_ownership(workspace_root: Any, expectation_value: Any) -> di
         if chain[-1] != result_id:
             raise _error("DESKTOP_STATE_UNAVAILABLE")
         return {
-            **_public_info(state, target, session.runtime, session.client),
+            **_public_info(state, target, session.client),
             "resultTurnId": result_id,
             "resultTurnStatus": result_status,
             "ownership": "native_continuation",
@@ -3486,32 +2238,32 @@ def _current_result_island(state: dict[str, Any], result_id: str) -> list[dict[s
 
 def _current_result_classification(workspace_root: Any) -> dict[str, Any]:
     target = _current_target(workspace_root)
-    session, _ = _prepare(target, allow_active=True, require_runner_ancestor=True)
+    session, _ = _prepare(target, purpose="observe", require_runner_ancestor=True)
     try:
         session.client.drain(0.1)
         state = session.client.current_state()
         if state is None or session.client.snapshot_age() > MAX_OBSERVATION_AGE_SECONDS:
             raise _error("DESKTOP_STATE_UNAVAILABLE")
-        _validate_state(state, target, session.client.owner or "", allow_active=True)
-        _verify_runtime(session.pipe, target, session.runtime)
-        _verify_current_runner_ancestor(session.runtime)
+        _validate_observed_state(state, target, session.client.owner or "")
+        _verify_process_identity(session.pipe, target, session.process)
+        _verify_current_runner_ancestor(session.process)
         if session.client.snapshot_age() > MAX_OBSERVATION_AGE_SECONDS:
             session.pipe.verify_server()
             previous_serial = session.client.snapshot_serial
             state = session.client.snapshot()
             if session.client.snapshot_serial <= previous_serial:
                 raise _error("DESKTOP_STATE_UNAVAILABLE")
-            _verify_runtime(session.pipe, target, session.runtime)
-            _verify_current_runner_ancestor(session.runtime)
+            _verify_process_identity(session.pipe, target, session.process)
+            _verify_current_runner_ancestor(session.process)
             if session.client.snapshot_age() > MAX_OBSERVATION_AGE_SECONDS:
                 raise _error("DESKTOP_STATE_UNAVAILABLE")
-            _validate_state(state, target, session.client.owner or "", allow_active=True)
+            _validate_observed_state(state, target, session.client.owner or "")
         result_id, result_status = _result_turn_context(state)
         island = _current_result_island(state, result_id)
         indexes = [i for i, turn in enumerate(island) if turn.get("turnId") == result_id]
         if len(indexes) != 1:
             raise _error("DESKTOP_STATE_UNAVAILABLE")
-        base = {**_public_info(state, target, session.runtime, session.client),
+        base = {**_public_info(state, target, session.client),
                 "resultTurnId": result_id, "resultTurnStatus": result_status}
         current = island[indexes[0]]
         try:
@@ -3556,7 +2308,7 @@ def _current_result_classification(workspace_root: Any) -> dict[str, Any]:
 
 
 def _current_confirm(workspace_root: Any) -> dict[str, Any]:
-    before, before_runtime = _current_identity_checked(workspace_root)
+    before = _current_identity_checked(workspace_root)
     try:
         confirmed = _show_confirmation(before)
     except DesktopIpcError:
@@ -3565,8 +2317,8 @@ def _current_confirm(workspace_root: Any) -> dict[str, Any]:
         confirmed = False
     if confirmed is not True:
         raise _error("DESKTOP_CONFIRMATION_CANCELLED")
-    after, after_runtime = _current_identity_checked(workspace_root)
-    if not _same_current_identity(before, after, before_runtime, after_runtime):
+    after = _current_identity_checked(workspace_root)
+    if not _same_current_identity(before, after):
         raise _error("DESKTOP_CURRENT_CONTEXT_INVALID")
     return after
 
@@ -3599,7 +2351,7 @@ def _main() -> int:
                 raise _error("DESKTOP_PYTHON_UNSUPPORTED")
             if op == "inspect":
                 target = _target(request.get("target"))
-                session, info = _prepare(target)
+                session, info = _prepare(target, purpose="observe")
                 session.close()
                 _reply({"id": request_id, "ok": True, "value": info})
             elif op == "reconcile_unknown":
@@ -3607,18 +2359,10 @@ def _main() -> int:
                     raise _error("DESKTOP_INVALID_REQUEST")
                 _reply({"id": request_id, "ok": True,
                         "value": _reconcile_unknown(request.get("target"), request.get("expectation"))})
-            elif op == "compatibility":
-                if set(request) != {"id", "op"} or prepared is not None:
-                    raise _error("DESKTOP_INVALID_REQUEST")
-                _reply({"id": request_id, "ok": True, "value": _compatibility()})
-            elif op == "compatibility_audit":
-                if set(request) != {"id", "op"} or prepared is not None:
-                    raise _error("DESKTOP_INVALID_REQUEST")
-                _reply({"id": request_id, "ok": True, "value": _compatibility_audit()})
-            elif op == "handshake_audit":
+            elif op == "diagnose":
                 if set(request) != {"id", "op", "workspaceRoot"} or prepared is not None:
                     raise _error("DESKTOP_INVALID_REQUEST")
-                _reply({"id": request_id, "ok": True, "value": _handshake_audit(request.get("workspaceRoot"))})
+                _reply({"id": request_id, "ok": True, "value": _diagnose(request.get("workspaceRoot"))})
             elif op == "inspect_active_execution":
                 if set(request) != {"id", "op", "target"} or prepared is not None:
                     raise _error("DESKTOP_INVALID_REQUEST")
@@ -3666,7 +2410,7 @@ def _main() -> int:
                 if prepared is not None:
                     raise _error("DESKTOP_IPC_UNAVAILABLE")
                 target = _target(request.get("target"))
-                prepared, info = _prepare(target)
+                prepared, info = _prepare(target, purpose="send")
                 _reply({"id": request_id, "ok": True, "value": info})
             elif op == "send":
                 if prepared is None:
@@ -3685,11 +2429,8 @@ def _main() -> int:
             else:
                 raise _error("DESKTOP_INVALID_REQUEST")
         except DesktopIpcError as error:
-            reply = {"id": request.get("id") if isinstance(request, dict) else None, "ok": False,
-                     "code": error.code, "notSent": error.not_sent}
-            if hasattr(error, "compatibility"):
-                reply["compatibility"] = _safe_compatibility(getattr(error, "compatibility"))
-            _reply(reply)
+            _reply({"id": request.get("id") if isinstance(request, dict) else None, "ok": False,
+                    "code": error.code, "notSent": error.not_sent})
         except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError, OSError):
             is_send = isinstance(request, dict) and request.get("op") == "send"
             _reply({"id": request.get("id") if isinstance(request, dict) else None, "ok": False,

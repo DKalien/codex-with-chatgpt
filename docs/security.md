@@ -96,7 +96,7 @@ Activation 的旧 Connector 迁移只检查同一有效授权的 Desktop scopes 
 AuthStore 加载授权文件失败或结构损坏时保留原文件并拒绝重新注册/发放授权覆盖；需要人工核对。
 
 绑定由本机用户明确指定真实 Desktop `threadId`、`host`、project 和 workspaceRoot，并
-在绑定时核对 Desktop 当前 cwd、owner 和版本。每个 workspace 只有一个当前绑定；重新绑定
+在绑定时核对 Desktop 当前 cwd、owner 和 live behavioral 状态。每个 workspace 只有一个当前绑定；重新绑定
 生成新的 `bindingId` 并关闭启用状态，旧请求不能转投新目标。网页不能 bind、enable 或改
 本机权限。
 
@@ -119,7 +119,7 @@ thread/user ID、`--yes` 或 `--accept` 等绕过确认的参数，确认窗最�
 下不同 thread/project 需确认后生成新的 `bindingId`。所有 deliveries history 保留，其中含旧
 `bindingId`；不同 workspaceRoot 或无法确认（`unknown`）时明确阻断快捷 bind/enable/send，
 不能用新 ID 或重新绑定规避。身份核验允许 `active`，但 send 仍严格要求 `idle`、无待审批、
-owner/project/workspace 匹配和已验证版本。传统显式 `desktop bind` + `desktop enable` 仍只是
+owner/project/workspace 匹配和 live behavioral 验证。传统显式 `desktop bind` + `desktop enable` 仍只是
 高级 fallback，不新增 MCP bind 工具。
 
 身份来源没有可依赖的 composer/IPC 区分信号；`CODEX_INTERNAL_ORIGINATOR_OVERRIDE='Codex Desktop'`
@@ -127,7 +127,7 @@ owner/project/workspace 匹配和已验证版本。传统显式 `desktop bind` +
 
 发送前重新核对 Desktop 服务进程、端点、owner、项目和 workspace；Desktop 重启后重新发现，
 不永久信任旧 PID。Desktop idle/start 内部协议在检查和实际发送之间没有原子 CAS，目标
-可能在窗口内改变，回执不匹配或不明必须按未知结果处理。未知版本、离线、忙、待审批、无 owner、错项目、workspace 不匹配或
+可能在窗口内改变，回执不匹配或不明必须按未知结果处理。live 状态无法验证、离线、忙、待审批、无 owner、错项目、workspace 不匹配或
 提权时零发送。Windows helper 仅使用 `C2C_DESKTOP_PYTHON` 或 `python` 完成受控标准库
 IPC，不要求管理员权限，不启动第二个 app-server/router，也不把原始 RPC 暴露到 Tunnel。
 

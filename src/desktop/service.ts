@@ -242,8 +242,10 @@ export async function sendDesktop(workspace: LocalWorkspace, raw: z.infer<typeof
       return publicDelivery(accepted);
     } catch (failure) {
       // 只信受控适配器明确确认尚未进入 start 的白名单错误；任意 IPC 写入后异常均是 unknown。
+      // R2 合同：helper 在 mutation boundary 后已把 protocol error 统一转成
+      // OUTCOME_UNKNOWN/notSent=false，因此 PROTOCOL_ERROR+notSent=true 是 pre-start 证据。
       if (failure instanceof DesktopError && (failure as DesktopError & { notSent?: boolean }).notSent === true &&
-        DESKTOP_IPC_ERROR_MESSAGES[failure.code] && !["DESKTOP_OUTCOME_UNKNOWN", "DESKTOP_PROTOCOL_ERROR", "DESKTOP_IPC_REJECTED"].includes(failure.code)) {
+        DESKTOP_IPC_ERROR_MESSAGES[failure.code] && !["DESKTOP_OUTCOME_UNKNOWN", "DESKTOP_IPC_REJECTED"].includes(failure.code)) {
         try {
           const rejected = withEvidenceLock(workspace.id, () => updateDesktop(workspace.id, previous => {
             const state = checked(workspace, previous);

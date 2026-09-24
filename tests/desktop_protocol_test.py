@@ -1,11 +1,9 @@
 """真实 helper 流程 + 假 pipe/WinAPI；不连接 Desktop、不读取用户配置。"""
 import copy
-import ctypes
 import hashlib
 import io
 import json
 import os
-import struct
 from pathlib import Path
 import sys
 import tempfile
@@ -16,43 +14,13 @@ from unittest.mock import Mock, patch
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src/desktop/helper"))
 import desktop_ipc as h
-REAL_VERIFY_RUNTIME = h._verify_runtime
 
 THREAD = "01a00000-0000-7000-8000-000000000001"
 OWNER = "01a00000-0000-7000-8000-000000000002"
 CLIENT = "01a00000-0000-7000-8000-000000000003"
 OLD_TURN = "01a00000-0000-7000-8000-000000000004"
 NEW_TURN = "01a00000-0000-7000-8000-000000000005"
-RUNTIME = {"desktopPid": 100, "appServerPid": 101, "desktopVersion": h.VERIFIED_RUNTIME["desktopVersion"],
-           "appServerVersion": h.VERIFIED_RUNTIME["appServerVersion"]}
-SEMANTIC_PROTOCOL_SOURCE = '''
-const send = (source, target, conversation, text) => ({
-  type: "request", method: "thread-follower-start-turn", version: 2,
-  sourceClientId: source, targetClientId: target,
-  params: {conversationId: conversation, turnStart: {request: {threadId: conversation,
-    input: [{type: "text", text: text, text_elements: []}]}}}
-});
-const receipt = response => response.result.result.turn.id;
-'''
-SEMANTIC_PROTOCOL_FUNCTION_EXPRESSION_SOURCE = '''
-const transmit = function (from, to, thread, body) {
-  return ({ type: "request", method: "thread-follower-start-turn", version: 2,
-    sourceClientId: from, targetClientId: to,
-    params: {conversationId: thread, turnStart: {request: {threadId: thread,
-      input: [{type: "text", text: body, text_elements: []}]}}} });
-};
-function unpack(value) { return value.result.result.turn.id; }
-'''
-SEMANTIC_PROTOCOL_RENAMED_SOURCE = '''
-const packet = (left, right, topic, words) => ({
- type:("request"), method:("thread-follower-start-turn"), version:(2),
- sourceClientId:(left), targetClientId:(right),
- params:({conversationId:(topic), turnStart:({request:({threadId:(topic),
- input:([{type:("text"), text:(words), text_elements:([])}])})})})
-});
-const extract = (value) => (value.result.result.turn.id);
-'''
-
+PROCESS = {"desktopPid": 100, "appServerPid": 101}
 
 class FakePipe:
     def __init__(self, target):
@@ -66,6 +34,9 @@ class FakePipe:
         self.turn_id = NEW_TURN
         self.failure = None
         self.response_errors = {}
+        self.suppressed = set()
+        self.suppress_after_start = set()
+        self.start_seen = False
         self.closed = False
         self.server_pid = 100
         self.server_exe = str(Path(target["workspaceRoot"]) / "ChatGPT.exe")
@@ -77,11 +48,15 @@ class FakePipe:
         value = h._Decoder().feed(raw)[0]
         self.frames.append(value)
         method = value.get("method")
-        if method in self.response_errors:
+        if method in self.suppressed:
+            return
+        if method in self.response_errors and "requestId" in value:
             self.pending.append(h._frame({"type": "response", "requestId": value["requestId"],
                 "resultType": "error", "error": self.response_errors[method]}))
             return
         if method == "thread-stream-following-changed":
+            if self.start_seen and method in self.suppress_after_start:
+                return
             self.pending.append(h._frame({"type": "broadcast", "method": "thread-stream-state-changed", "version": 11,
                 "sourceClientId": OWNER, "params": {"conversationId": THREAD, "hostId": "local",
                 "change": {"type": "snapshot", "conversationState": copy.deepcopy(self.state), "revision": 1}}}))
@@ -90,6 +65,7 @@ class FakePipe:
         if method == "initialize":
             result = {"clientId": CLIENT}
         if method == "thread-follower-start-turn":
+            self.start_seen = True
             if self.failure == "partial_write":
                 raise h.DesktopIpcError("DESKTOP_IPC_UNAVAILABLE", "敏感底层正文", not_sent=True)
             if self.failure == "lost_receipt":
@@ -116,37 +92,425 @@ class ProtocolTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.target = {"threadId": THREAD, "hostId": "local", "projectId": "project_test", "workspaceRoot": self.temp.name}
         self.pipe = FakePipe(self.target)
+        rows = [{"pid": 100, "parentPid": 1, "name": "ChatGPT.exe", "exe": self.pipe.server_exe, "creation": 10},
+                {"pid": 101, "parentPid": 100, "name": "codex.exe",
+                 "exe": str(Path(self.temp.name) / "codex.exe"), "creation": 11}]
+        self.state_file = Path(self.temp.name) / "global-state.json"
+        self.state_file.write_text(json.dumps({
+            "thread-project-assignments": {THREAD: {"projectKind": "local", "projectId": "project_test"}},
+            "local-projects": {"project_test": {"rootPaths": [self.temp.name]}},
+        }), encoding="utf-8")
         for name, replacement in (("_Pipe", Mock(return_value=self.pipe)), ("_query_standard_token", Mock()),
-                                  ("_verify_runtime", Mock(return_value=RUNTIME))):
+                                  ("_processes", Mock(return_value=rows)),
+                                  ("_global_state_path", Mock(return_value=self.state_file))):
             active = patch.object(h, name, replacement)
             active.start()
             self.addCleanup(active.stop)
 
-    def _candidate_fixture(self, *, app_server_version="0.154.0-alpha.6.2", app_server_sha256,
-                           candidate_profile=h.VERIFIED_PROFILE):
-        target = self.target
-        desktop_exe = str(Path(target["workspaceRoot"]) / "ChatGPT.exe")
-        app_server_exe = str(Path(target["workspaceRoot"]) / "codex.exe")
-        rows = [
-            {"pid": 100, "parentPid": 1, "name": "ChatGPT.exe", "exe": desktop_exe, "creation": 10},
-            {"pid": 101, "parentPid": 100, "name": "codex.exe", "exe": app_server_exe, "creation": 11},
-        ]
-        observed = {"observedDesktopVersion": "99.1.1.1", "observedAppServerVersion": app_server_version,
-                    "appServerSha256": app_server_sha256}
-        candidate_runtime = {"desktopVersion": observed["observedDesktopVersion"],
-            "appServerVersion": app_server_version, "appServerSha256": app_server_sha256,
-            "asarHeader": [4, 100, 96, 89], "modules": [
-                {"role": "ipc-main", "path": ".vite/build/src-candidate.js", "sha256": "b" * 64},
-                {"role": "webview-bootstrap", "path": "webview/assets/app-initial-candidate.js", "sha256": "c" * 64}]}
-        audit = {**observed, "classification": "same_protocol_candidate", "status": "unverified", "profile": None,
-                 "candidateProfile": candidate_profile, "candidateRuntime": candidate_runtime,
-                 "asarHeader": candidate_runtime["asarHeader"], "modules": candidate_runtime["modules"]}
-        return target, rows, observed, audit
+    def _send_fixture(self, *, turn_id=NEW_TURN, message="完整方案"):
+        """send attestation 测试夹具：ACK turn 已进入 non-exhausted canonical 历史。"""
+        item = {"type": "text", "text": message, "text_elements": []}
+        turn = {"turnId": turn_id, "status": "inProgress", "params": {"input": [item]},
+                "items": [{"type": "userMessage", "content": [item]}]}
+        self.pipe.state["turns"] = list(self.pipe.state.get("turns", [])) + [turn]
+        self.pipe.state["turnHistory"] = {"kind": "canonical", "history": {
+            "islands": [{
+                "olderBoundary": {"status": "exhausted"},
+                "entries": [{"value": "turn-old"}, {"value": "turn-new"}],
+                "newerBoundary": {"status": "loading"},
+            }],
+            "entitiesByKey": {
+                "turn-old": {"turnId": OLD_TURN, "status": "completed"},
+                "turn-new": turn,
+            },
+        }}
+        self.pipe.turn_id = turn_id
+        return message
+
+    def _inject_on_start(self, injected):
+        """让 pipe 在收到 start-turn 后把指定 turn 追加进状态与 canonical 历史。"""
+        original_write = self.pipe.write
+
+        def write_with_turns(raw):
+            original_write(raw)
+            if self.pipe.frames[-1].get("method") == "thread-follower-start-turn":
+                self.pipe.state["turns"].extend(copy.deepcopy(injected))
+                entities = {"turn-old": {"turnId": OLD_TURN, "status": "completed"}}
+                entries = [{"value": "turn-old"}]
+                for index, item in enumerate(injected):
+                    key = f"turn-new-{index}"
+                    entries.append({"value": key})
+                    entities[key] = copy.deepcopy(item)
+                self.pipe.state["turnHistory"] = {"kind": "canonical", "history": {
+                    "islands": [{
+                        "olderBoundary": {"status": "exhausted"},
+                        "entries": entries,
+                        "newerBoundary": {"status": "loading"},
+                    }],
+                    "entitiesByKey": entities,
+                }}
+
+        return patch.object(self.pipe, "write", write_with_turns)
+
+    def test_observe_allows_active_and_pending_states_without_start(self):
+        self.pipe.state["threadRuntimeStatus"] = {"type": "active"}
+        self.pipe.state["turns"] = [{"turnId": OLD_TURN, "status": "inProgress"}]
+        session, info = h._prepare(self.target, purpose="observe")
+        self.assertEqual(info["runtimeStatus"], "active")
+        self.assertEqual(self.pipe.starts(), [])
+        session.close()
+
+        self.pipe.state["requests"] = [{"kind": "approval"}]
+        session, info = h._prepare(self.target, purpose="observe")
+        self.assertEqual(info["requestsCount"], 1)
+        self.assertEqual(self.pipe.starts(), [])
+        session.close()
+
+    def test_prepare_rejects_invalid_turn_status_even_when_observing(self):
+        self.pipe.state["turns"] = [{"turnId": OLD_TURN, "status": "futureStatus"}]
+        with self.assertRaises(h.DesktopIpcError) as caught:
+            h._prepare(self.target, purpose="observe")
+        self.assertEqual(caught.exception.code, "DESKTOP_STATE_UNAVAILABLE")
+        self.assertEqual(self.pipe.starts(), [])
+
+    def test_prepare_send_gate_rejects_active_and_pending_with_busy(self):
+        self.pipe.state["threadRuntimeStatus"] = {"type": "active"}
+        with self.assertRaises(h.DesktopIpcError) as caught:
+            h._prepare(self.target)
+        self.assertEqual(caught.exception.code, "DESKTOP_BUSY")
+        self.assertEqual(self.pipe.starts(), [])
+
+    def test_inspect_observes_active_and_pending_without_start_turn(self):
+        # inspect 是 observe purpose：active + pending approval 仍可观察，绝不 start-turn。
+        self.pipe.state["threadRuntimeStatus"] = {"type": "active"}
+        self.pipe.state["requests"] = [{"kind": "approval"}]
+        self.pipe.state["turns"] = [{"turnId": OLD_TURN, "status": "inProgress"}]
+        request = {"id": CLIENT, "op": "inspect", "target": self.target}
+        source = SimpleNamespace(buffer=io.BytesIO(h._json_bytes(request) + b"\n"))
+        output = SimpleNamespace(buffer=io.BytesIO())
+        with patch.object(sys, "stdin", source), patch.object(sys, "stdout", output):
+            h._main()
+        response = json.loads(output.buffer.getvalue())
+        self.assertTrue(response["ok"])
+        self.assertEqual(response["value"]["runtimeStatus"], "active")
+        self.assertEqual(response["value"]["requestsCount"], 1)
+        self.assertEqual(self.pipe.starts(), [])
+
+    def test_prepare_send_purpose_gates_active_and_pending(self):
+        # 同一状态：send purpose 的 prepare 分别被 BUSY / APPROVAL_PENDING 拒绝。
+        self.pipe.state["threadRuntimeStatus"] = {"type": "active"}
+        with self.assertRaises(h.DesktopIpcError) as caught:
+            h._prepare(self.target, purpose="send")
+        self.assertEqual(caught.exception.code, "DESKTOP_BUSY")
+        self.assertEqual(self.pipe.starts(), [])
+
+        self.pipe.state["threadRuntimeStatus"] = {"type": "idle"}
+        self.pipe.state["requests"] = [{"kind": "approval"}]
+        with self.assertRaises(h.DesktopIpcError) as caught:
+            h._prepare(self.target, purpose="send")
+        self.assertEqual(caught.exception.code, "DESKTOP_APPROVAL_PENDING")
+        self.assertEqual(self.pipe.starts(), [])
+
+    def test_inspect_observes_active_canonical_loading_history_and_send_gates_busy(self):
+        # 真实 active 会话的 canonical history 正常处于 loading（non-exhausted）：
+        # observe 必须能完成 validate 并读出 activeTurnId；同一状态 send purpose
+        # 仍被 BUSY 拒绝（_assert_send_ready 保持严格路径）。
+        self.pipe.state.pop("turns", None)
+        self.pipe.state["threadRuntimeStatus"] = {"type": "active"}
+        self.pipe.state["turnHistory"] = {"kind": "canonical", "history": {
+            "islands": [{
+                "olderBoundary": {"status": "exhausted"},
+                "entries": [{"value": "turn-old"}, {"value": "turn-active"}],
+                "newerBoundary": {"status": "loading"},
+            }],
+            "entitiesByKey": {
+                "turn-old": {"turnId": OLD_TURN, "status": "completed"},
+                "turn-active": {"turnId": NEW_TURN, "status": "inProgress"},
+            },
+        }}
+        request = {"id": CLIENT, "op": "inspect", "target": self.target}
+        source = SimpleNamespace(buffer=io.BytesIO(h._json_bytes(request) + b"\n"))
+        output = SimpleNamespace(buffer=io.BytesIO())
+        with patch.object(sys, "stdin", source), patch.object(sys, "stdout", output):
+            h._main()
+        response = json.loads(output.buffer.getvalue())
+        self.assertTrue(response["ok"])
+        self.assertEqual(response["value"]["runtimeStatus"], "active")
+        self.assertEqual(self.pipe.starts(), [])
+
+        self.assertEqual(h._active_turn_id(self.pipe.state), NEW_TURN)
+        session, info = h._prepare(self.target, purpose="observe")
+        self.assertEqual(info["runtimeStatus"], "active")
+        session.close()
+        with self.assertRaises(h.DesktopIpcError) as caught:
+            h._prepare(self.target, purpose="send")
+        self.assertEqual(caught.exception.code, "DESKTOP_BUSY")
+        self.assertEqual(self.pipe.starts(), [])
+
+    def test_send_attestation_accepts_when_ack_turn_matches_envelope(self):
+        session, _ = h._prepare(self.target)
+        message = "完整中文方案\n```python\nprint('你好')\n```"
+        item = {"type": "text", "text": message, "text_elements": []}
+        turn = {"turnId": NEW_TURN, "status": "inProgress", "params": {"input": [item]},
+                "items": [{"type": "userMessage", "content": [item]}]}
+        with self._inject_on_start([turn]):
+            self.assertEqual(session.send(message), {"threadId": THREAD, "turnId": NEW_TURN})
+        self.assertEqual(len(self.pipe.starts()), 1)
+        session.close()
+
+    def test_post_start_waits_for_unique_inprogress_user_message_mirror(self):
+        session, _ = h._prepare(self.target)
+        message = "完整方案"
+        item = {"type": "text", "text": message, "text_elements": []}
+        partial = {"turnId": NEW_TURN, "status": "inProgress", "params": {"input": [item]},
+                   "items": [{"type": "userMessage"}]}
+        complete = {**partial, "items": [{"type": "userMessage", "content": [item]}]}
+        observations = {"count": 0}
+        with self._inject_on_start([partial]), patch.object(h, "POST_START_STATE_DEADLINE_SECONDS", 2.0):
+            original_write = self.pipe.write
+
+            def write_complete_on_second_snapshot(raw):
+                value = h._Decoder().feed(raw)[0]
+                if self.pipe.start_seen and value.get("method") == "thread-stream-following-changed":
+                    observations["count"] += 1
+                    if observations["count"] == 2:
+                        self.pipe.state["turns"][-1] = copy.deepcopy(complete)
+                        self.pipe.state["turnHistory"]["history"]["entitiesByKey"]["turn-new-0"] = copy.deepcopy(complete)
+                original_write(raw)
+
+            with patch.object(self.pipe, "write", write_complete_on_second_snapshot):
+                self.assertEqual(session.send(message), {"threadId": THREAD, "turnId": NEW_TURN})
+        self.assertEqual(observations["count"], 2)
+        self.assertEqual(len(self.pipe.starts()), 1)
+        session.close()
+
+    def test_post_start_complete_wrong_params_input_is_immediately_unknown(self):
+        session, _ = h._prepare(self.target)
+        wrong = {"type": "text", "text": "错误正文", "text_elements": []}
+        partial = {"turnId": NEW_TURN, "status": "inProgress", "params": {"input": [wrong]}}
+        with patch.object(h, "POST_START_STATE_DEADLINE_SECONDS", 2.0), self._inject_on_start([partial]):
+            with self.assertRaises(h.DesktopIpcError) as caught:
+                session.send("完整方案")
+        self.assertEqual(caught.exception.code, "DESKTOP_OUTCOME_UNKNOWN")
+        self.assertFalse(caught.exception.not_sent)
+        self.assertEqual(len(self.pipe.starts()), 1)
+        session.close()
+
+    def test_post_start_terminal_ack_with_incomplete_mirror_is_unknown(self):
+        session, _ = h._prepare(self.target)
+        item = {"type": "text", "text": "完整方案", "text_elements": []}
+        terminal = {"turnId": NEW_TURN, "status": "completed", "params": {"input": [item]}}
+        with self._inject_on_start([terminal]):
+            with self.assertRaises(h.DesktopIpcError) as caught:
+                session.send("完整方案")
+        self.assertEqual(caught.exception.code, "DESKTOP_OUTCOME_UNKNOWN")
+        self.assertFalse(caught.exception.not_sent)
+        self.assertEqual(len(self.pipe.starts()), 1)
+        session.close()
+
+    def test_send_attestation_fails_closed_when_ack_turn_missing_or_ambiguous(self):
+        item = {"type": "text", "text": "完整方案", "text_elements": []}
+        matching = {"turnId": NEW_TURN, "status": "inProgress", "params": {"input": [item]},
+                    "items": [{"type": "userMessage", "content": [item]}]}
+        mismatched = {"turnId": NEW_TURN, "status": "inProgress",
+                      "params": {"input": [{"type": "text", "text": "别的消息", "text_elements": []}]},
+                      "items": [{"type": "userMessage", "content": [
+                          {"type": "text", "text": "别的消息", "text_elements": []}]}]}
+        cases = {"missing": [], "mismatched": [mismatched], "duplicated": [matching, matching]}
+        for name, injected in cases.items():
+            with self.subTest(case=name):
+                self.pipe.closed = False
+                self.pipe.frames.clear()
+                self.pipe.pending.clear()
+                self.pipe.start_seen = False
+                self.pipe.state["turns"] = [{"turnId": OLD_TURN, "status": "completed"}]
+                self.pipe.state.pop("turnHistory", None)
+                session, _ = h._prepare(self.target)
+                with patch.object(h, "POST_START_STATE_DEADLINE_SECONDS", 0.1), \
+                        self._inject_on_start(injected):
+                    with self.assertRaises(h.DesktopIpcError) as caught:
+                        session.send("完整方案")
+                self.assertEqual(caught.exception.code, "DESKTOP_OUTCOME_UNKNOWN")
+                self.assertFalse(caught.exception.not_sent)
+                self.assertEqual(len(self.pipe.starts()), 1)
+                session.close()
+
+    def test_post_start_state_unavailable_becomes_outcome_unknown(self):
+        # 硬验收：mutation boundary 之后收到的普通 DESKTOP_STATE_UNAVAILABLE
+        # 必须对外收敛为 OUTCOME_UNKNOWN / notSent=false，且 start-turn 恰好一次。
+        session, _ = h._prepare(self.target)
+        message = "完整方案"
+        item = {"type": "text", "text": message, "text_elements": []}
+        turn = {"turnId": NEW_TURN, "status": "inProgress", "params": {"input": [item]},
+                "items": [{"type": "userMessage", "content": [item]}]}
+        self.pipe.suppress_after_start.add("thread-stream-following-changed")
+        with patch.object(h, "SNAPSHOT_TIMEOUT_SECONDS", 0.05), self._inject_on_start([turn]):
+            with self.assertRaises(h.DesktopIpcError) as caught:
+                session.send(message)
+        self.assertEqual(caught.exception.code, "DESKTOP_OUTCOME_UNKNOWN")
+        self.assertFalse(caught.exception.not_sent)
+        self.assertEqual(len(self.pipe.starts()), 1)
+
+    def test_pre_start_state_unavailable_keeps_not_sent_and_zero_starts(self):
+        # 硬验收：同样的 DESKTOP_STATE_UNAVAILABLE 发生在 start-turn 之前时，
+        # 必须保持 notSent=true 且 start-turn 计数为 0。
+        session, _ = h._prepare(self.target)
+        self.pipe.suppressed.add("thread-stream-following-changed")
+        with patch.object(h, "SNAPSHOT_TIMEOUT_SECONDS", 0.05):
+            with self.assertRaises(h.DesktopIpcError) as caught:
+                session.send("完整方案")
+        self.assertEqual(caught.exception.code, "DESKTOP_STATE_UNAVAILABLE")
+        self.assertTrue(caught.exception.not_sent)
+        self.assertEqual(self.pipe.starts(), [])
+
+    def test_send_attestation_rejects_mixed_duplicate_turn_id(self):
+        # 同一 turnId 出现两次：一个正文精确、一个正文错误。先按 turnId 判重
+        # （必须恰好 1 个 occurrence），因此必须收敛 OUTCOME_UNKNOWN。
+        session, _ = h._prepare(self.target)
+        message = "完整方案"
+        item = {"type": "text", "text": message, "text_elements": []}
+        exact = {"turnId": NEW_TURN, "status": "inProgress", "params": {"input": [item]},
+                 "items": [{"type": "userMessage", "content": [item]}]}
+        wrong_item = {"type": "text", "text": "别的消息", "text_elements": []}
+        wrong = {"turnId": NEW_TURN, "status": "inProgress", "params": {"input": [wrong_item]},
+                 "items": [{"type": "userMessage", "content": [wrong_item]}]}
+        original_write = self.pipe.write
+
+        def write_with_mixed(raw):
+            original_write(raw)
+            if self.pipe.frames[-1].get("method") == "thread-follower-start-turn":
+                self.pipe.state["turnHistory"] = {"kind": "canonical", "history": {
+                    "islands": [{
+                        "olderBoundary": {"status": "exhausted"},
+                        "entries": [{"value": "turn-a"}, {"value": "turn-b"}],
+                        "newerBoundary": {"status": "loading"},
+                    }],
+                    "entitiesByKey": {"turn-a": exact, "turn-b": wrong},
+                }}
+
+        with patch.object(self.pipe, "write", write_with_mixed):
+            with self.assertRaises(h.DesktopIpcError) as caught:
+                session.send(message)
+        self.assertEqual(caught.exception.code, "DESKTOP_OUTCOME_UNKNOWN")
+        self.assertFalse(caught.exception.not_sent)
+        self.assertEqual(len(self.pipe.starts()), 1)
+        session.close()
+
+    def test_post_start_bounded_wait_accepts_turn_on_second_observation(self):
+        # ACK 后第一次 fresh canonical snapshot 还没有该 turn；有界等待内第二次
+        # observation 出现唯一精确 turn → 成功，且 start-turn 仍恰好一次。
+        # pre-start 即为 exhausted canonical（无 ACK turn），post-start 证明接受
+        # boundary 变为 loading 的 non-exhausted canonical。
+        self.pipe.state.pop("turns", None)
+        self.pipe.state["turnHistory"] = {"kind": "canonical", "history": {
+            "islands": [{
+                "olderBoundary": {"status": "exhausted"},
+                "entries": [{"value": "turn-old"}],
+                "newerBoundary": {"status": "exhausted"},
+            }],
+            "entitiesByKey": {"turn-old": {"turnId": OLD_TURN, "status": "completed"}},
+        }}
+        session, _ = h._prepare(self.target)
+        message = "完整方案"
+        item = {"type": "text", "text": message, "text_elements": []}
+        turn = {"turnId": NEW_TURN, "status": "inProgress", "params": {"input": [item]},
+                "items": [{"type": "userMessage", "content": [item]}]}
+        original_write = self.pipe.write
+        observations = {"count": 0}
+
+        def write_with_late_turn(raw):
+            original_write(raw)
+            if self.pipe.start_seen and self.pipe.frames[-1].get("method") == "thread-stream-following-changed":
+                observations["count"] += 1
+                if observations["count"] >= 2:
+                    self.pipe.state["turnHistory"] = {"kind": "canonical", "history": {
+                        "islands": [{
+                            "olderBoundary": {"status": "exhausted"},
+                            "entries": [{"value": "turn-old"}, {"value": "turn-new"}],
+                            "newerBoundary": {"status": "loading"},
+                        }],
+                        "entitiesByKey": {
+                            "turn-old": {"turnId": OLD_TURN, "status": "completed"},
+                            "turn-new": copy.deepcopy(turn),
+                        },
+                    }}
+
+        with patch.object(h, "POST_START_STATE_DEADLINE_SECONDS", 2.0), \
+                patch.object(self.pipe, "write", write_with_late_turn):
+            self.assertEqual(session.send(message), {"threadId": THREAD, "turnId": NEW_TURN})
+        self.assertEqual(len(self.pipe.starts()), 1)
+        session.close()
+
+    def test_post_start_bounded_wait_expires_as_outcome_unknown(self):
+        # 有界等待内 canonical state 始终没有 ACK turn → OUTCOME_UNKNOWN，且不重发。
+        session, _ = h._prepare(self.target)
+        message = "完整方案"
+        original_write = self.pipe.write
+
+        def write_without_turn(raw):
+            original_write(raw)
+            if self.pipe.start_seen and self.pipe.frames[-1].get("method") == "thread-stream-following-changed":
+                self.pipe.state["turnHistory"] = {"kind": "canonical", "history": {
+                    "islands": [{
+                        "olderBoundary": {"status": "exhausted"},
+                        "entries": [{"value": "turn-old"}],
+                        "newerBoundary": {"status": "loading"},
+                    }],
+                    "entitiesByKey": {"turn-old": {"turnId": OLD_TURN, "status": "completed"}},
+                }}
+
+        with patch.object(h, "POST_START_STATE_DEADLINE_SECONDS", 1.0), \
+                patch.object(h, "SNAPSHOT_TIMEOUT_SECONDS", 0.05), \
+                patch.object(self.pipe, "write", write_without_turn):
+            with self.assertRaises(h.DesktopIpcError) as caught:
+                session.send(message)
+        self.assertEqual(caught.exception.code, "DESKTOP_OUTCOME_UNKNOWN")
+        self.assertFalse(caught.exception.not_sent)
+        self.assertEqual(len(self.pipe.starts()), 1)
+        session.close()
+
+    def test_post_start_process_drift_is_outcome_unknown(self):
+        session, _ = h._prepare(self.target)
+        message = "完整方案"
+        item = {"type": "text", "text": message, "text_elements": []}
+        turn = {"turnId": NEW_TURN, "status": "inProgress", "params": {"input": [item]},
+                "items": [{"type": "userMessage", "content": [item]}]}
+        rows = [{"pid": 100, "parentPid": 1, "name": "ChatGPT.exe", "exe": self.pipe.server_exe, "creation": 10},
+                {"pid": 101, "parentPid": 100, "name": "codex.exe",
+                 "exe": str(Path(self.temp.name) / "codex.exe"), "creation": 11}]
+
+        def processes():
+            return [] if self.pipe.start_seen else rows
+
+        with patch.object(h, "_processes", side_effect=processes), self._inject_on_start([turn]):
+            with self.assertRaises(h.DesktopIpcError) as caught:
+                session.send(message)
+        self.assertEqual(caught.exception.code, "DESKTOP_OUTCOME_UNKNOWN")
+        self.assertFalse(caught.exception.not_sent)
+        self.assertEqual(len(self.pipe.starts()), 1)
+
+    def test_post_start_owner_drift_is_outcome_unknown(self):
+        session, _ = h._prepare(self.target)
+        message = "完整方案"
+        item = {"type": "text", "text": message, "text_elements": []}
+        turn = {"turnId": NEW_TURN, "status": "inProgress", "params": {"input": [item]},
+                "items": [{"type": "userMessage", "content": [item]}]}
+        with patch.object(h._IpcClient, "discover", side_effect=[None, None, h._error("DESKTOP_OWNER_CHANGED")]), \
+                self._inject_on_start([turn]):
+            with self.assertRaises(h.DesktopIpcError) as caught:
+                session.send(message)
+        self.assertEqual(caught.exception.code, "DESKTOP_OUTCOME_UNKNOWN")
+        self.assertFalse(caught.exception.not_sent)
+        self.assertEqual(len(self.pipe.starts()), 1)
 
     def test_real_protocol_flow_keeps_text_and_only_accepts_without_completion(self):
         session, info = h._prepare(self.target)
         text = "完整中文方案\n```python\nprint('你好')\n```"
-        self.assertEqual(session.send(text), {"threadId": THREAD, "turnId": NEW_TURN})
+        item = {"type": "text", "text": text, "text_elements": []}
+        turn = {"turnId": NEW_TURN, "status": "inProgress", "params": {"input": [item]},
+                "items": [{"type": "userMessage", "content": [item]}]}
+        with self._inject_on_start([turn]):
+            self.assertEqual(session.send(text), {"threadId": THREAD, "turnId": NEW_TURN})
         self.assertEqual(info["title"], "测试会话")
         start = self.pipe.starts()[0]
         self.assertEqual(start["version"], 2)
@@ -156,288 +520,11 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(start["params"], {"conversationId": THREAD, "turnStart": {"request": {
             "threadId": THREAD, "input": [{"type": "text", "text": text, "text_elements": []}]}}})
         self.assertEqual([frame["method"] for frame in self.pipe.frames if frame["type"] == "request"],
-                         ["initialize", "thread-owner-discovery", "thread-owner-discovery", "thread-follower-start-turn"])
+                         ["initialize", "thread-owner-discovery", "thread-owner-discovery",
+                          "thread-owner-discovery", "thread-follower-start-turn", "thread-owner-discovery"])
+        newer = self.pipe.state["turnHistory"]["history"]["islands"][0]["newerBoundary"]
+        self.assertNotEqual(newer.get("status"), "exhausted")
         session.close()
-
-    def test_protocol_v2_fingerprint_ignores_non_protocol_bundle_changes(self):
-        baseline = h._semantic_protocol_v2(SEMANTIC_PROTOCOL_SOURCE)
-        changed = h._semantic_protocol_v2(SEMANTIC_PROTOCOL_SOURCE + '\nconst unrelated={label:"daily-build"}; // ignored')
-        minified = SEMANTIC_PROTOCOL_SOURCE.replace("\n", "").replace("  ", "").replace(": ", ":") \
-            .replace(", ", ",").replace(" = ", "=").replace(" => ", "=>")
-        self.assertEqual(baseline["reason"], "matched")
-        self.assertTrue(baseline["candidate"])
-        self.assertEqual(h._semantic_protocol_v2(SEMANTIC_PROTOCOL_FUNCTION_EXPRESSION_SOURCE)["fingerprint"],
-                         baseline["fingerprint"])
-        self.assertEqual(h._semantic_protocol_v2(SEMANTIC_PROTOCOL_RENAMED_SOURCE)["fingerprint"],
-                         baseline["fingerprint"])
-        self.assertEqual(h._semantic_protocol_v2(minified)["fingerprint"], baseline["fingerprint"])
-        self.assertEqual(changed["fingerprint"], baseline["fingerprint"])
-
-    def test_protocol_v2_fingerprint_changes_or_fails_closed_on_protocol_schema_changes(self):
-        baseline = h._semantic_protocol_v2(SEMANTIC_PROTOCOL_SOURCE)
-        cases = {
-            "method": SEMANTIC_PROTOCOL_SOURCE.replace('method: "thread-follower-start-turn"',
-                                                         'method: "thread-follower-start-next"'),
-            "version": SEMANTIC_PROTOCOL_SOURCE.replace("version: 2", "version: 3"),
-            "payload": SEMANTIC_PROTOCOL_SOURCE.replace("text_elements", "textElements"),
-            "ack": SEMANTIC_PROTOCOL_SOURCE.replace("response.result.result.turn.id", "response.result.result.turn.key"),
-        }
-        for name, source in cases.items():
-            with self.subTest(name=name):
-                result = h._semantic_protocol_v2(source)
-                self.assertNotEqual(result["fingerprint"], baseline["fingerprint"])
-                self.assertIsNone(result["fingerprint"])
-                expected_reason = {"method": "start_turn_missing", "version": "version_unprovable",
-                                   "payload": "payload_unprovable", "ack": "ack_unprovable"}[name]
-                self.assertEqual(result["reason"], expected_reason)
-
-    def test_protocol_v2_repeated_candidate_is_ambiguous_and_bad_input_fails_closed(self):
-        duplicate = SEMANTIC_PROTOCOL_SOURCE + SEMANTIC_PROTOCOL_SOURCE
-        self.assertEqual(h._semantic_protocol_v2(duplicate)["reason"], "start_turn_ambiguous")
-        token_budget = "1;" * (h._MAX_PROTOCOL_TOKENS // 2 + 1)
-        for source in ('const broken="unterminated', 'const broken={', 'const broken="\\uD800"',
-                       token_budget,
-                       SEMANTIC_PROTOCOL_SOURCE + " " * (h._MAX_PROTOCOL_SOURCE_BYTES + 1)):
-            with self.subTest(source_length=len(source)):
-                result = h._semantic_protocol_v2(source)
-                self.assertIsNone(result["fingerprint"])
-                self.assertIn(result["reason"], {"source_too_large", "lexical_unsupported"})
-
-    def test_v2_mutation_contract_is_source_controlled_and_independent_of_catalog_rows(self):
-        fingerprint = h._semantic_protocol_v2(SEMANTIC_PROTOCOL_SOURCE)["fingerprint"]
-        self.assertEqual(fingerprint, h._START_TURN_MUTATION_FINGERPRINT)
-        self.assertFalse(any("ipcSemanticFingerprintV2" in runtime
-                             for runtimes in h.VERIFIED_PROFILES.values() for runtime in runtimes))
-        with patch.object(h, "VERIFIED_PROFILES", {}):
-            self.assertEqual(h._semantic_protocol_v2(SEMANTIC_PROTOCOL_SOURCE)["fingerprint"], fingerprint)
-
-    def test_semantic_candidate_is_diagnostic_only_and_never_enters_production_candidate(self):
-        target, rows, observed, audit = self._candidate_fixture(app_server_sha256="a" * 64)
-        audit = {key: value for key, value in audit.items() if key != "candidateRuntime"}
-        audit.update({"classification": "semantic_same_protocol_candidate", "semanticReason": "matched",
-                      "semanticFingerprint": "d" * 64})
-        identity = {**observed, "desktopPid": 100, "appServerPid": 101,
-            "desktopCreation": 10, "appServerCreation": 11,
-            "desktopExe": rows[0]["exe"], "appServerExe": rows[1]["exe"]}
-        with patch.object(h, "_verify_runtime_identity", return_value=identity), \
-                patch.object(h, "_compatibility_audit_for_paths", return_value=audit):
-            with self.assertRaises(h.DesktopIpcError) as caught:
-                h._candidate_runtime(self.pipe, target)
-        self.assertEqual(caught.exception.code, "DESKTOP_VERSION_UNSUPPORTED")
-        self.assertEqual(self.pipe.frames, [])
-
-    def test_handshake_audit_is_read_only_bounded_and_never_starts_turn(self):
-        target = self.target
-        identity = {"desktopPid": 100, "appServerPid": 101, "desktopCreation": 10, "appServerCreation": 11,
-                    "desktopExe": "ChatGPT.exe", "appServerExe": "codex.exe",
-                    "observedDesktopVersion": "26.915.4065.0", "observedAppServerVersion": "0.155.0-alpha.9.2",
-                    "appServerSha256": "a" * 64}
-        audit = {"classification": "protocol_drift_or_unknown", "asarHeader": [4, 8, 4, 0],
-                 "semanticFingerprint": None,
-                 "modules": [{"role": "ipc-main", "path": ".vite/build/src-main.js", "sha256": "b" * 64},
-                             {"role": "webview-bootstrap", "path": "webview/assets/app-initial-x.js", "sha256": "c" * 64}]}
-        with patch.object(h, "_current_target", return_value=target), \
-                patch.object(h, "_verify_runtime_identity", side_effect=[identity, identity]) as verify, \
-                patch.object(h, "_compatibility_audit_for_paths", return_value=audit), \
-                patch.object(h, "_runtime_version", side_effect=AssertionError("trusted runtime forbidden")), \
-                patch.object(h, "_checked_runtime", side_effect=AssertionError("catalog trust forbidden")):
-            result = h._handshake_audit(target["workspaceRoot"])
-        self.assertEqual(result["stateChange"], "snapshot")
-        self.assertEqual(result["protocolClassification"], "protocol_drift_or_unknown")
-        self.assertIsNone(result["semanticFingerprint"])
-        self.assertEqual(result["semanticReason"], "not_scanned")
-        self.assertEqual(verify.call_args_list[0].kwargs, {"require_catalog": False})
-        self.assertNotIn("thread-follower-start-turn", [frame.get("method") for frame in self.pipe.frames])
-
-    def test_handshake_audit_rejects_identity_or_audit_drift(self):
-        target = self.target
-        base = {"desktopPid": 100, "appServerPid": 101, "desktopCreation": 10, "appServerCreation": 11,
-                "desktopExe": "ChatGPT.exe", "appServerExe": "codex.exe",
-                "observedDesktopVersion": "26.915.4065.0", "observedAppServerVersion": "0.155.0-alpha.9.2",
-                "appServerSha256": "a" * 64}
-        audit = {"classification": "protocol_drift_or_unknown", "asarHeader": [4, 8, 4, 0],
-                 "semanticFingerprint": None,
-                 "modules": [{"role": "ipc-main", "path": "a", "sha256": "b" * 64},
-                             {"role": "webview-bootstrap", "path": "b", "sha256": "c" * 64}]}
-        for key in ("desktopPid", "appServerCreation", "desktopExe", "appServerExe",
-                    "observedAppServerVersion", "appServerSha256"):
-            with self.subTest(key=key):
-                changed = {**base, key: (base[key] + 1 if isinstance(base[key], int) else "changed")}
-                with patch.object(h, "_current_target", return_value=target), \
-                        patch.object(h, "_verify_runtime_identity", side_effect=[base, changed]), \
-                        patch.object(h, "_compatibility_audit_for_paths", return_value=audit):
-                    with self.assertRaises(h.DesktopIpcError):
-                        h._handshake_audit(target["workspaceRoot"])
-
-    def test_handshake_audit_returns_only_stable_candidate_runtime(self):
-        target = self.target
-        identity = {"desktopPid": 100, "appServerPid": 101, "desktopCreation": 10, "appServerCreation": 11,
-                    "desktopExe": "ChatGPT.exe", "appServerExe": "codex.exe",
-                    "observedDesktopVersion": "99.1.1.1", "observedAppServerVersion": "0.154.0-alpha.6.2",
-                    "appServerSha256": "a" * 64}
-        candidate_runtime = {"desktopVersion": "99.1.1.1", "appServerVersion": "0.154.0-alpha.6.2",
-            "appServerSha256": "a" * 64, "asarHeader": [4, 100, 96, 89], "modules": [
-                {"role": "ipc-main", "path": ".vite/build/src-candidate.js", "sha256": "b" * 64},
-                {"role": "webview-bootstrap", "path": "webview/assets/app-initial-candidate.js", "sha256": "c" * 64}]}
-        audit = {"observedDesktopVersion": "99.1.1.1", "observedAppServerVersion": "0.154.0-alpha.6.2",
-                 "appServerSha256": "a" * 64, "classification": "same_protocol_candidate",
-                 "semanticFingerprint": None,
-                 "status": "unverified", "profile": None,
-                 "candidateProfile": "desktop-ipc-v1", "candidateRuntime": candidate_runtime,
-                 "asarHeader": candidate_runtime["asarHeader"], "modules": candidate_runtime["modules"]}
-        with patch.object(h, "_current_target", return_value=target), \
-                patch.object(h, "_verify_runtime_identity", side_effect=[identity, identity]), \
-                patch.object(h, "_compatibility_audit_for_paths", return_value=audit):
-            result = h._handshake_audit(target["workspaceRoot"])
-        self.assertEqual(result["protocolClassification"], "same_protocol_candidate")
-        self.assertEqual(result["candidateRuntime"], candidate_runtime)
-        self.assertIsNone(result["semanticFingerprint"])
-        self.assertNotIn("thread-follower-start-turn", [frame.get("method") for frame in self.pipe.frames])
-
-    def test_handshake_audit_fences_semantic_fingerprint_and_returns_no_candidate_runtime(self):
-        target = self.target
-        identity = {"desktopPid": 100, "appServerPid": 101, "desktopCreation": 10, "appServerCreation": 11,
-                    "desktopExe": "ChatGPT.exe", "appServerExe": "codex.exe",
-                    "observedDesktopVersion": "99.1.1.1", "observedAppServerVersion": "9.9.9",
-                    "appServerSha256": "a" * 64}
-        base_audit = {"classification": "semantic_same_protocol_candidate", "semanticReason": "matched",
-                      "semanticFingerprint": "d" * 64,
-                      "asarHeader": [4, 8, 4, 0], "candidateProfile": h.VERIFIED_PROFILE,
-                      "modules": [{"role": "ipc-main", "path": ".vite/build/src-main.js", "sha256": "b" * 64},
-                                  {"role": "webview-bootstrap", "path": "webview/assets/app-initial-x.js", "sha256": "c" * 64}]}
-        with patch.object(h, "_current_target", return_value=target), \
-                patch.object(h, "_verify_runtime_identity", side_effect=[identity, identity]), \
-                patch.object(h, "_compatibility_audit_for_paths", return_value=base_audit):
-            result = h._handshake_audit(target["workspaceRoot"])
-        self.assertEqual(result["protocolClassification"], "semantic_same_protocol_candidate")
-        self.assertEqual(result["semanticFingerprint"], "d" * 64)
-        self.assertEqual(result["semanticReason"], "matched")
-        self.assertNotIn("candidateRuntime", result)
-        self.assertNotIn("thread-follower-start-turn", [frame.get("method") for frame in self.pipe.frames])
-
-        self.pipe.frames.clear()
-        changed = {**base_audit, "semanticFingerprint": "e" * 64}
-        with patch.object(h, "_current_target", return_value=target), \
-                patch.object(h, "_verify_runtime_identity", side_effect=[identity, identity]), \
-                patch.object(h, "_compatibility_audit_for_paths", side_effect=[base_audit, changed]):
-            with self.assertRaises(h.DesktopIpcError) as caught:
-                h._handshake_audit(target["workspaceRoot"])
-        self.assertEqual(caught.exception.code, "DESKTOP_PROCESS_CHANGED")
-        self.assertNotIn("thread-follower-start-turn", [frame.get("method") for frame in self.pipe.frames])
-
-        self.pipe.frames.clear()
-        diagnostic = {**base_audit, "classification": "protocol_drift_or_unknown",
-                      "semanticReason": "version_unprovable", "semanticFingerprint": None}
-        changed_reason = {**diagnostic, "semanticReason": "payload_unprovable"}
-        with patch.object(h, "_current_target", return_value=target), \
-                patch.object(h, "_verify_runtime_identity", side_effect=[identity, identity]), \
-                patch.object(h, "_compatibility_audit_for_paths", side_effect=[diagnostic, changed_reason]):
-            with self.assertRaises(h.DesktopIpcError) as caught:
-                h._handshake_audit(target["workspaceRoot"])
-        self.assertEqual(caught.exception.code, "DESKTOP_PROCESS_CHANGED")
-
-    def test_prepare_candidate_requires_live_handshake_and_rechecks_runtime_identity(self):
-        known_hash = h.VERIFIED_RUNTIME_26_908["appServerSha256"]
-        target, rows, observed, audit = self._candidate_fixture(app_server_sha256=known_hash)
-        candidate_runtime = audit["candidateRuntime"]
-        audit_state = [audit]
-        with patch.object(h, "_verify_runtime", REAL_VERIFY_RUNTIME), \
-                patch.object(h, "_processes", return_value=rows), \
-                patch.object(h, "_observe_runtime_versions", return_value=observed), \
-                patch.object(h, "_compatibility_audit_for_paths",
-                             side_effect=lambda *_: copy.deepcopy(audit_state[0])), \
-                patch.object(h, "_verify_project"):
-            session, info = h._prepare(target)
-            self.addCleanup(session.close)
-            self.assertEqual(session.runtime["candidateRuntime"], candidate_runtime)
-            self.assertEqual(session.runtime["candidateProfile"], h.VERIFIED_PROFILE)
-            self.assertTrue(session.runtime["_candidateHandshake"])
-            self.assertIsNone(info["profile"])
-            self.assertEqual([frame["method"] for frame in self.pipe.frames if frame["type"] == "request"],
-                             ["initialize", "thread-owner-discovery"])
-            self.assertEqual(self.pipe.starts(), [])
-            h._verify_runtime(session.pipe, target, session.runtime)
-            with self.assertRaises(h.DesktopIpcError):
-                h._verify_runtime(session.pipe, target, {**session.runtime, "_candidateHandshake": False})
-
-            changed = copy.deepcopy(audit)
-            changed["candidateRuntime"]["modules"][0]["path"] = ".vite/build/src-changed.js"
-            changed["modules"] = changed["candidateRuntime"]["modules"]
-            audit_state[0] = changed
-            with self.assertRaises(h.DesktopIpcError) as changed_attestation:
-                h._verify_runtime(session.pipe, target, session.runtime)
-            self.assertEqual(changed_attestation.exception.code, "DESKTOP_PROCESS_CHANGED")
-
-            audit_state[0] = audit
-            rows[1]["creation"] = 12
-            with self.assertRaises(h.DesktopIpcError) as changed_process:
-                h._verify_runtime(session.pipe, target, session.runtime)
-            self.assertEqual(changed_process.exception.code, "DESKTOP_PROCESS_CHANGED")
-
-    def test_candidate_runtime_accepts_each_catalog_hash_for_same_app_server_version(self):
-        version = "0.154.0-alpha.6.2"
-        hashes = {row["appServerSha256"] for row in h.VERIFIED_PROFILES[h.VERIFIED_PROFILE]
-                  if row["appServerVersion"] == version}
-        self.assertGreaterEqual(len(hashes), 2)
-        for server_hash in hashes:
-            with self.subTest(app_server_sha256=server_hash):
-                target, rows, observed, audit = self._candidate_fixture(app_server_sha256=server_hash)
-                identity = {**observed, "desktopPid": 100, "appServerPid": 101,
-                    "desktopCreation": 10, "appServerCreation": 11,
-                    "desktopExe": rows[0]["exe"], "appServerExe": rows[1]["exe"]}
-                with patch.object(h, "_verify_runtime_identity", return_value=identity), \
-                        patch.object(h, "_compatibility_audit_for_paths", return_value=audit):
-                    runtime = h._candidate_runtime(self.pipe, target)
-                self.assertEqual(runtime["candidateRuntime"]["appServerSha256"], server_hash)
-
-    def test_candidate_runtime_requires_catalog_profile_and_app_server_version(self):
-        known_hash = h.VERIFIED_RUNTIME_26_908["appServerSha256"]
-        cases = (("missing-profile", "0.154.0-alpha.6.2"),
-                 (h.VERIFIED_PROFILE, "9.9.9"))
-        for profile, version in cases:
-            with self.subTest(candidate_profile=profile, app_server_version=version):
-                target, rows, observed, audit = self._candidate_fixture(
-                    app_server_version=version, app_server_sha256=known_hash, candidate_profile=profile)
-                identity = {**observed, "desktopPid": 100, "appServerPid": 101,
-                    "desktopCreation": 10, "appServerCreation": 11,
-                    "desktopExe": rows[0]["exe"], "appServerExe": rows[1]["exe"]}
-                with patch.object(h, "_verify_runtime_identity", return_value=identity), \
-                        patch.object(h, "_compatibility_audit_for_paths", return_value=audit):
-                    with self.assertRaises(h.DesktopIpcError) as caught:
-                        h._candidate_runtime(self.pipe, target)
-                self.assertEqual(caught.exception.code, "DESKTOP_VERSION_UNSUPPORTED")
-                self.assertEqual(caught.exception.mismatch, "runtime_pair_unverified")
-
-    def test_prepare_rejects_unknown_app_server_hash_before_live_handshake(self):
-        target, rows, observed, audit = self._candidate_fixture(app_server_sha256="a" * 64)
-        with patch.object(h, "_verify_runtime", REAL_VERIFY_RUNTIME), \
-                patch.object(h, "_processes", return_value=rows), \
-                patch.object(h, "_observe_runtime_versions", return_value=observed), \
-                patch.object(h, "_compatibility_audit_for_paths", return_value=audit), \
-                patch.object(h, "_verify_project"):
-            with self.assertRaises(h.DesktopIpcError) as caught:
-                h._prepare(target)
-        self.assertEqual(caught.exception.code, "DESKTOP_VERSION_UNSUPPORTED")
-        self.assertEqual(caught.exception.mismatch, "app_server_sha256")
-        self.assertEqual(self.pipe.frames, [])
-
-    def test_prepare_does_not_accept_successful_handshake_for_drift_or_ambiguity(self):
-        cases = (("9.9.9", "protocol_drift_or_unknown"),
-                 ("0.154.0-alpha.6.2", "ambiguous"))
-        for app_server_version, classification in cases:
-            with self.subTest(app_server_version=app_server_version, classification=classification):
-                target, rows, observed, audit = self._candidate_fixture(
-                    app_server_version=app_server_version, app_server_sha256="a" * 64)
-                audit["classification"] = classification
-                with patch.object(h, "_verify_runtime", REAL_VERIFY_RUNTIME), \
-                        patch.object(h, "_processes", return_value=rows), \
-                        patch.object(h, "_observe_runtime_versions", return_value=observed), \
-                        patch.object(h, "_compatibility_audit_for_paths", return_value=audit), \
-                        patch.object(h, "_verify_project"):
-                    with self.assertRaises(h.DesktopIpcError) as caught:
-                        h._prepare(target)
-                self.assertEqual(caught.exception.code, "DESKTOP_VERSION_UNSUPPORTED")
-                self.assertEqual(self.pipe.frames, [])
 
     def test_last_check_busy_is_definitely_not_sent(self):
         session, _ = h._prepare(self.target)
@@ -447,6 +534,69 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "DESKTOP_BUSY")
         self.assertTrue(caught.exception.not_sent)
         self.assertEqual(self.pipe.starts(), [])
+
+    def test_pre_start_discover_timeout_is_not_sent_with_zero_starts(self):
+        # boundary authority：pre-start targeted discover 超时（request 层默认
+        # not_sent=False）必须在 send() 边界被强制重投影为 notSent=true，且
+        # start-turn 计数为 0。
+        session, _ = h._prepare(self.target)
+        self.pipe.suppressed.add("thread-owner-discovery")
+        with patch.object(h, "DISCOVERY_TIMEOUT_SECONDS", 0.05):
+            with self.assertRaises(h.DesktopIpcError) as caught:
+                session.send("完整方案")
+        self.assertEqual(caught.exception.code, "DESKTOP_IPC_TIMEOUT")
+        self.assertTrue(caught.exception.not_sent)
+        self.assertEqual(self.pipe.starts(), [])
+        session.close()
+
+    def test_post_start_wrong_target_on_first_observation_is_outcome_unknown(self):
+        # 第一份 post-start snapshot 的 conversationState 本体指向错误 target
+        # （广播帧参数匹配、body id/hostId 错误）且恰好包含 exact turn →
+        # OUTCOME_UNKNOWN，start-turn 恰好一次。
+        session, _ = h._prepare(self.target)
+        message = "完整方案"
+        item = {"type": "text", "text": message, "text_elements": []}
+        turn = {"turnId": NEW_TURN, "status": "inProgress", "params": {"input": [item]},
+                "items": [{"type": "userMessage", "content": [item]}]}
+        original_write = self.pipe.write
+
+        def write_with_wrong_target(raw):
+            original_write(raw)
+            if self.pipe.frames[-1].get("method") == "thread-follower-start-turn":
+                self.pipe.state["id"] = "01a00000-0000-7000-8000-000000000009"
+                self.pipe.state["hostId"] = "remote"
+                self.pipe.state["turnHistory"] = {"kind": "canonical", "history": {
+                    "islands": [{
+                        "olderBoundary": {"status": "exhausted"},
+                        "entries": [{"value": "turn-old"}, {"value": "turn-new"}],
+                        "newerBoundary": {"status": "loading"},
+                    }],
+                    "entitiesByKey": {
+                        "turn-old": {"turnId": OLD_TURN, "status": "completed"},
+                        "turn-new": turn,
+                    },
+                }}
+
+        with patch.object(self.pipe, "write", write_with_wrong_target):
+            with self.assertRaises(h.DesktopIpcError) as caught:
+                session.send(message)
+        self.assertEqual(caught.exception.code, "DESKTOP_OUTCOME_UNKNOWN")
+        self.assertFalse(caught.exception.not_sent)
+        self.assertEqual(len(self.pipe.starts()), 1)
+        session.close()
+
+    def test_pre_start_owner_drift_after_final_state_check_is_not_sent(self):
+        # 最后一次状态检查之后的 targeted owner fence 发现漂移 → 具体错误 + notSent=true，
+        # start-turn 计数为 0；post-start final fence 不受影响。
+        session, _ = h._prepare(self.target)
+        with patch.object(h._IpcClient, "discover",
+                          side_effect=[None, h._error("DESKTOP_OWNER_CHANGED")]), \
+                self.assertRaises(h.DesktopIpcError) as caught:
+            session.send("完整方案")
+        self.assertEqual(caught.exception.code, "DESKTOP_OWNER_CHANGED")
+        self.assertTrue(caught.exception.not_sent)
+        self.assertEqual(self.pipe.starts(), [])
+        session.close()
 
     def test_current_identity_uses_current_env_mapping_and_allows_active_without_start(self):
         state_file = Path(self.temp.name) / "global-state.json"
@@ -463,7 +613,10 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(info["threadId"], THREAD)
         self.assertEqual(info["projectId"], "project_test")
         self.assertEqual(info["runtimeStatus"], "active")
-        ancestor.assert_called_once_with(RUNTIME)
+        process = {"desktopPid": 100, "desktopExe": str(Path(self.temp.name) / "ChatGPT.exe"),
+                   "desktopCreation": 10, "appServerPid": 101,
+                   "appServerExe": str(Path(self.temp.name) / "codex.exe"), "appServerCreation": 11}
+        ancestor.assert_called_once_with(process)
         self.assertEqual(self.pipe.starts(), [])
 
     def test_current_execution_reads_single_active_turn_from_flat_and_canonical_state(self):
@@ -538,7 +691,10 @@ class ProtocolTests(unittest.TestCase):
             with self.assertRaises(h.DesktopIpcError) as caught:
                 h._current_execution(self.temp.name)
         self.assertEqual(caught.exception.code, "DESKTOP_CURRENT_CONTEXT_INVALID")
-        ancestor.assert_called_once_with(RUNTIME)
+        process = {"desktopPid": 100, "desktopExe": str(Path(self.temp.name) / "ChatGPT.exe"),
+                   "desktopCreation": 10, "appServerPid": 101,
+                   "appServerExe": str(Path(self.temp.name) / "codex.exe"), "appServerCreation": 11}
+        ancestor.assert_called_once_with(process)
         self.assertEqual(self.pipe.starts(), [])
 
     def test_inspect_result_context_uses_explicit_target_without_runner_ancestor(self):
@@ -608,22 +764,22 @@ class ProtocolTests(unittest.TestCase):
 
         client = Client()
         pipe = SimpleNamespace(verify_server=Mock(), starts=lambda: [])
-        session = SimpleNamespace(client=client, pipe=pipe, runtime=RUNTIME, close=Mock())
+        session = SimpleNamespace(client=client, pipe=pipe, process=PROCESS, close=Mock())
         return target, session, client, pipe
 
     def test_current_execution_freshness_refreshes_same_active_turn(self):
         target, session, client, pipe = self._current_execution_fixture()
         with patch.object(h, "_current_target", return_value=target), \
                 patch.object(h, "_prepare", return_value=(session, {})), \
-                patch.object(h, "_validate_state") as validate, \
-                patch.object(h, "_verify_runtime", return_value=RUNTIME) as verify_runtime, \
+                patch.object(h, "_validate_observed_state") as validate, \
+                patch.object(h, "_verify_process_identity", return_value=PROCESS) as verify_process, \
                 patch.object(h, "_verify_current_runner_ancestor") as runner, \
                 patch.object(h, "_public_info", return_value={}):
             result = h._current_execution(target["workspaceRoot"])
         self.assertEqual(result["activeTurnId"], NEW_TURN)
         self.assertEqual(client.snapshot_calls, 1)
         self.assertEqual(pipe.verify_server.call_count, 1)
-        self.assertEqual(verify_runtime.call_count, 2)
+        self.assertEqual(verify_process.call_count, 2)
         self.assertEqual(runner.call_count, 2)
         self.assertEqual(validate.call_count, 2)
         self.assertEqual(pipe.starts(), [])
@@ -632,15 +788,15 @@ class ProtocolTests(unittest.TestCase):
         target, session, client, pipe = self._current_execution_fixture(new_turn="01a00000-0000-7000-8000-000000000006")
         with patch.object(h, "_current_target", return_value=target), \
                 patch.object(h, "_prepare", return_value=(session, {})), \
-                patch.object(h, "_validate_state"), \
-                patch.object(h, "_verify_runtime", return_value=RUNTIME) as verify_runtime, \
+                patch.object(h, "_validate_observed_state"), \
+                patch.object(h, "_verify_process_identity", return_value=PROCESS) as verify_process, \
                 patch.object(h, "_verify_current_runner_ancestor") as runner, \
                 patch.object(h, "_public_info", return_value={}):
             result = h._current_execution(target["workspaceRoot"])
         self.assertEqual(result["activeTurnId"], "01a00000-0000-7000-8000-000000000006")
         self.assertNotEqual(result["activeTurnId"], OLD_TURN)
         self.assertEqual(client.snapshot_calls, 1)
-        self.assertEqual(verify_runtime.call_count, 2)
+        self.assertEqual(verify_process.call_count, 2)
         self.assertEqual(runner.call_count, 2)
         self.assertEqual(pipe.starts(), [])
 
@@ -663,8 +819,8 @@ class ProtocolTests(unittest.TestCase):
                 with monotonic, \
                         patch.object(h, "_current_target", return_value=target), \
                         patch.object(h, "_prepare", return_value=(session, {})), \
-                        patch.object(h, "_validate_state"), \
-                        patch.object(h, "_verify_runtime", return_value=RUNTIME), \
+                        patch.object(h, "_validate_observed_state"), \
+                        patch.object(h, "_verify_process_identity", return_value=PROCESS), \
                         patch.object(h, "_verify_current_runner_ancestor"), \
                         patch.object(h, "_public_info", return_value={}):
                     with self.assertRaises(h.DesktopIpcError) as caught:
@@ -676,7 +832,7 @@ class ProtocolTests(unittest.TestCase):
     def test_current_execution_freshness_refresh_rechecks_security_guards(self):
         cases = {
             "pipe": ("_pipe", h._error("DESKTOP_PROCESS_CHANGED")),
-            "runtime": ("_runtime", h._error("DESKTOP_PROCESS_CHANGED")),
+            "process": ("_process", h._error("DESKTOP_PROCESS_CHANGED")),
             "state": ("_state", h._error("DESKTOP_PROJECT_MISMATCH")),
             "owner": ("_state", h._error("DESKTOP_NO_OWNER")),
             "runner": ("_runner", h._error("DESKTOP_CURRENT_CONTEXT_INVALID")),
@@ -688,12 +844,12 @@ class ProtocolTests(unittest.TestCase):
                     pipe.verify_server.side_effect = failure
                 with patch.object(h, "_current_target", return_value=target), \
                         patch.object(h, "_prepare", return_value=(session, {})), \
-                        patch.object(h, "_validate_state") as default_validate, \
-                        patch.object(h, "_verify_runtime", return_value=RUNTIME) as default_runtime, \
+                        patch.object(h, "_validate_observed_state") as default_validate, \
+                        patch.object(h, "_verify_process_identity", return_value=PROCESS) as default_process, \
                         patch.object(h, "_verify_current_runner_ancestor") as default_runner, \
                         patch.object(h, "_public_info", return_value={}):
-                    if guard == "_runtime":
-                        default_runtime.side_effect = [RUNTIME, failure]
+                    if guard == "_process":
+                        default_process.side_effect = [PROCESS, failure]
                     elif guard == "_state":
                         default_validate.side_effect = [None, failure]
                     elif guard == "_runner":
@@ -902,17 +1058,17 @@ class ProtocolTests(unittest.TestCase):
         def monotonic():
             return real_monotonic() + (h.SNAPSHOT_TIMEOUT_SECONDS + 1.0 if expired else 0.0)
 
-        def verify_runtime(*args):
+        def verify_process(*args):
             nonlocal expired, verify_calls
             verify_calls += 1
             if verify_calls == 3:
                 expired = True
-            return RUNTIME
+            return PROCESS
 
         with patch.dict(os.environ, {"CODEX_THREAD_ID": THREAD, "CODEX_SESSION_ID": THREAD}, clear=False), \
                 patch.object(h, "_global_state_path", return_value=state_file), \
                 patch.object(h, "_verify_current_runner_ancestor"), \
-                patch.object(h, "_verify_runtime", side_effect=verify_runtime), \
+                patch.object(h, "_verify_process_identity", side_effect=verify_process), \
                 patch.object(h._IpcClient, "snapshot_age", side_effect=iter(ages)), \
                 patch.object(h.time, "monotonic", new=monotonic):
             with self.assertRaises(h.DesktopIpcError) as caught:
@@ -936,16 +1092,16 @@ class ProtocolTests(unittest.TestCase):
                 self.pipe.state["turns"] = [{"turnId": OLD_TURN, "status": "inProgress"}]
                 calls = 0
 
-                def verify_runtime(*args):
+                def verify_process(*args):
                     nonlocal calls
                     calls += 1
                     if calls == 4:
                         raise h._error(code)
-                    return RUNTIME
+                    return PROCESS
 
                 with patch.dict(os.environ, {"CODEX_THREAD_ID": THREAD, "CODEX_SESSION_ID": THREAD}, clear=False), \
                         patch.object(h, "_global_state_path", return_value=state_file), \
-                        patch.object(h, "_verify_runtime", side_effect=verify_runtime), \
+                        patch.object(h, "_verify_process_identity", side_effect=verify_process), \
                         patch.object(h, "_verify_current_runner_ancestor") as runner, \
                         patch.object(h._IpcClient, "snapshot_age", side_effect=iter([0.1, 1.0, 1.1, 3.0, 0.1])):
                     with self.assertRaises(h.DesktopIpcError) as caught:
@@ -971,16 +1127,16 @@ class ProtocolTests(unittest.TestCase):
         def monotonic():
             return real_monotonic() + (h.SNAPSHOT_TIMEOUT_SECONDS + 1.0 if expired else 0.0)
 
-        def verify_runtime(*args):
+        def verify_process(*args):
             nonlocal calls, expired
             calls += 1
             if calls == 4:
                 expired = True
-            return RUNTIME
+            return PROCESS
 
         with patch.dict(os.environ, {"CODEX_THREAD_ID": THREAD, "CODEX_SESSION_ID": THREAD}, clear=False), \
                 patch.object(h, "_global_state_path", return_value=state_file), \
-                patch.object(h, "_verify_runtime", side_effect=verify_runtime), \
+                patch.object(h, "_verify_process_identity", side_effect=verify_process), \
                 patch.object(h, "_verify_current_runner_ancestor") as runner, \
                 patch.object(h._IpcClient, "snapshot_age", side_effect=iter([0.1, 1.0, 1.1, 3.0, 0.1])), \
                 patch.object(h.time, "monotonic", new=monotonic):
@@ -1022,13 +1178,9 @@ class ProtocolTests(unittest.TestCase):
                         patch.object(h, "_global_state_path", return_value=state_file), \
                         patch.object(h, "_verify_current_runner_ancestor"), \
                         patch.object(h._IpcClient, "snapshot_age", side_effect=snapshot_age):
-                    if state_change == "approval":
-                        with self.assertRaises(h.DesktopIpcError) as caught:
-                            h._current_result_context(self.temp.name)
-                        self.assertEqual(caught.exception.code, "DESKTOP_APPROVAL_PENDING")
-                    else:
-                        result = h._current_result_context(self.temp.name)
-                        self.assertEqual(result["resultTurnId"], NEW_TURN)
+                    result = h._current_result_context(self.temp.name)
+                    expected_turn = OLD_TURN if state_change == "approval" else NEW_TURN
+                    self.assertEqual(result["resultTurnId"], expected_turn)
                 self.assertEqual(sum(frame.get("method") == "thread-stream-following-changed" for frame in self.pipe.frames), 2)
 
     def test_current_confirm_cancelled_is_local_only_and_does_not_start(self):
@@ -1082,24 +1234,24 @@ class ProtocolTests(unittest.TestCase):
                 self.assertEqual(caught.exception.code, "DESKTOP_IPC_TIMEOUT")
                 self.pipe.response_errors.clear()
 
-    def test_prepare_no_owner_rechecks_initial_runtime_before_close(self):
+    def test_prepare_no_owner_rechecks_initial_process_before_close(self):
         self.pipe.owner = None
-        verify = Mock(side_effect=[RUNTIME, RUNTIME])
-        with patch.object(h, "_verify_runtime", verify):
+        verify = Mock(side_effect=[PROCESS, PROCESS])
+        with patch.object(h, "_verify_process_identity", verify):
             with self.assertRaises(h.DesktopIpcError) as caught:
                 h._prepare(self.target)
         self.assertEqual(caught.exception.code, "DESKTOP_NO_OWNER")
         self.assertEqual(verify.call_count, 2)
-        self.assertEqual(verify.call_args_list[1].args, (self.pipe, self.target, RUNTIME))
+        self.assertEqual(verify.call_args_list[1].args, (self.pipe, self.target, PROCESS))
         self.assertTrue(self.pipe.closed)
 
-    def test_prepare_no_owner_recheck_rejects_runtime_project_or_process_change(self):
-        for code in ("DESKTOP_VERSION_UNSUPPORTED", "DESKTOP_PROJECT_MISMATCH", "DESKTOP_PROCESS_CHANGED"):
+    def test_prepare_no_owner_recheck_rejects_project_or_process_change(self):
+        for code in ("DESKTOP_PROJECT_MISMATCH", "DESKTOP_PROCESS_CHANGED"):
             with self.subTest(code=code):
                 self.pipe.owner = None
                 self.pipe.closed = False
-                verify = Mock(side_effect=[RUNTIME, h._error(code)])
-                with patch.object(h, "_verify_runtime", verify):
+                verify = Mock(side_effect=[PROCESS, h._error(code)])
+                with patch.object(h, "_verify_process_identity", verify):
                     with self.assertRaises(h.DesktopIpcError) as caught:
                         h._prepare(self.target)
                 self.assertEqual(caught.exception.code, code)
@@ -1111,7 +1263,7 @@ class ProtocolTests(unittest.TestCase):
             with self.subTest(code=code):
                 verify = Mock()
                 with patch.object(h, "_query_standard_token", side_effect=h._error(code)), \
-                        patch.object(h, "_verify_runtime", verify):
+                        patch.object(h, "_verify_process_identity", verify):
                     with self.assertRaises(h.DesktopIpcError) as caught:
                         h._prepare(self.target)
                 self.assertEqual(caught.exception.code, code)
@@ -1185,20 +1337,25 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(fake.send.call_count, 1)
         self.assertEqual(fake.send.call_args.args[0], "\x00" * 65536)
 
-    def test_compatibility_operation_is_read_only_and_returns_only_safe_fields(self):
-        request = {"id": CLIENT, "op": "compatibility"}
+    def test_diagnose_operation_accepts_only_id_op_workspace_root(self):
+        request = {"id": CLIENT, "op": "diagnose", "workspaceRoot": "workspace", "target": {}}
         source = SimpleNamespace(buffer=io.BytesIO(h._json_bytes(request) + b"\n"))
         output = SimpleNamespace(buffer=io.BytesIO())
-        expected = {"observedDesktopVersion": "26.908.4834.0", "observedAppServerVersion": "0.154.0-alpha.6.2",
-                    "status": "current", "profile": h.VERIFIED_PROFILE}
-        rows = [{"pid": 100, "name": "ChatGPT.exe", "parentPid": 1, "exe": "ChatGPT.exe", "creation": 10},
-                {"pid": 101, "name": "codex.exe", "parentPid": 100, "exe": "codex.exe", "creation": 11}]
-        with patch.object(h, "_Pipe") as pipe, patch.object(h, "_processes", return_value=rows), \
-                patch.object(h, "_compatibility_for_paths", return_value=expected), \
+        with patch.object(sys, "stdin", source), patch.object(sys, "stdout", output):
+            h._main()
+        self.assertEqual(json.loads(output.buffer.getvalue()),
+                         {"id": CLIENT, "ok": False, "code": "DESKTOP_INVALID_REQUEST", "notSent": True})
+
+    def test_diagnose_reports_behavioral_mode(self):
+        # diagnosis 输出必须带 mode: "behavioral"，明确告诉机器消费者这不是 compatibility 分类。
+        request = {"id": CLIENT, "op": "diagnose", "workspaceRoot": "workspace"}
+        source = SimpleNamespace(buffer=io.BytesIO(h._json_bytes(request) + b"\n"))
+        output = SimpleNamespace(buffer=io.BytesIO())
+        with patch.object(h, "_diagnose", return_value={"mode": "behavioral", "processStable": True}), \
                 patch.object(sys, "stdin", source), patch.object(sys, "stdout", output):
             h._main()
-        self.assertEqual(json.loads(output.buffer.getvalue()), {"id": CLIENT, "ok": True, "value": expected})
-        pipe.assert_not_called()
+        self.assertEqual(json.loads(output.buffer.getvalue()),
+                         {"id": CLIENT, "ok": True, "value": {"mode": "behavioral", "processStable": True}})
 
     def test_inspect_result_context_main_requires_exact_target_request(self):
         value = {"threadId": THREAD, "hostId": "local", "projectId": "project_test",
@@ -1341,798 +1498,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(json.loads(output.buffer.getvalue())["code"], "DESKTOP_INVALID_REQUEST")
 
 
-class RuntimeTests(unittest.TestCase):
-    def test_production_verify_runtime_requires_catalog_identity_path(self):
-        target = {"threadId": THREAD, "hostId": "local", "projectId": "project_test", "workspaceRoot": str(Path.cwd())}
-        pipe = FakePipe(target)
-        with patch.object(h, "_verify_runtime_identity", return_value={"desktopExe": "x"}) as identity:
-            result = h._verify_runtime(pipe, target)
-        identity.assert_called_once_with(pipe, target, None, require_catalog=True)
-        self.assertEqual(result["desktopExe"], "x")
-
-    def test_missing_or_ambiguous_runtime_diagnosis_is_unverified_without_ipc(self):
-        for rows in ([], [
-            {"pid": 1, "name": "ChatGPT.exe", "creation": 1, "exe": "desktop"},
-            {"pid": 2, "parentPid": 1, "name": "codex.exe", "creation": 2, "exe": "server1"},
-            {"pid": 3, "parentPid": 1, "name": "codex.exe", "creation": 3, "exe": "server2"},
-        ]):
-            with patch.object(h, "_query_standard_token"), patch.object(h, "_processes", return_value=rows), \
-                    patch.object(h, "_Pipe") as pipe:
-                self.assertEqual(h._compatibility(), {"observedDesktopVersion": None,
-                    "observedAppServerVersion": None, "status": "unverified", "profile": None})
-                pipe.assert_not_called()
-
-    def test_audited_runtime_pairs_share_one_profile_and_require_exact_hashes(self):
-        for profile in (h.VERIFIED_RUNTIME, h.VERIFIED_RUNTIME_26_908,
-                        h.VERIFIED_RUNTIME_26_908_9136, h.VERIFIED_RUNTIME_26_915):
-            with self.subTest(pair=(profile["desktopVersion"], profile["appServerVersion"])), \
-                    tempfile.TemporaryDirectory(prefix="c2c-profile-offline-") as directory:
-                root = Path(directory) / f"OpenAI.Codex_{profile['desktopVersion']}_x64" / "app"
-                root.mkdir(parents=True)
-                desktop = root / "ChatGPT.exe"
-                server = root / "codex.exe"
-                if profile is h.VERIFIED_RUNTIME:
-                    server.write_bytes(b"legacy app-server without a provenance marker")
-                else:
-                    server.write_bytes(b"standalone local buildversion: 0.154.0-alpha.6.2 platform: audited")
-                module_hashes = {"fixture.js": hashlib.sha256(b"fixture module").hexdigest()}
-                fixture = {**profile, "appServerSha256": hashlib.sha256(server.read_bytes()).hexdigest(),
-                           "moduleHashes": module_hashes}
-                with patch.dict(h.VERIFIED_PROFILES, {h.VERIFIED_PROFILE: (fixture,)}, clear=True), \
-                        patch.object(h, "_asar_module_hashes", return_value=module_hashes) as asar:
-                    runtime = h._runtime_version(str(desktop), str(server))
-                    self.assertEqual(runtime["profile"], h.VERIFIED_PROFILE)
-                    self.assertEqual(runtime["desktopVersion"], profile["desktopVersion"])
-                    self.assertEqual(runtime["appServerVersion"], profile["appServerVersion"])
-                    self.assertEqual(h._compatibility_for_paths(str(desktop), str(server)), {
-                        "observedDesktopVersion": profile["desktopVersion"],
-                        "observedAppServerVersion": profile["appServerVersion"],
-                        "status": "current", "profile": h.VERIFIED_PROFILE,
-                    })
-                    self.assertEqual(asar.call_count, 2)
-
-    def test_runtime_26_908_9136_exact_combination_is_current(self):
-        profile = h.VERIFIED_RUNTIME_26_908_9136
-        self.assertEqual(profile["desktopVersion"], "26.908.9136.0")
-        self.assertEqual(profile["appServerVersion"], "0.154.0-alpha.6.2")
-        self.assertEqual(profile["appServerSha256"],
-                         "960c111d47afd61669954b9df9e56083e302edbfa3ef6962d81dcc14a30051dc")
-        self.assertEqual(profile["asarHeader"], (4, 2489280, 2489276, 2489269))
-        self.assertEqual(profile["moduleHashes"], {
-            ".vite/build/src-CCXHtyvY.js":
-                "a42da38cbb14b28399f1d54fcf453bffc5e9802663e7e098f187c8378f4c7a40",
-            "webview/assets/app-initial-bcc2ff475eb6.js":
-                "3c15444f96a8d48844258618fe0d4278409e626f0ee563a77d2c669ec669c510",
-        })
-        self.assertIn(profile, h.VERIFIED_PROFILES[h.VERIFIED_PROFILE])
-        # IPC 主模块与已验证 26.908.4834.0 byte-identical；webview bundle 单独固定。
-        self.assertEqual(
-            profile["moduleHashes"][".vite/build/src-CCXHtyvY.js"],
-            h.VERIFIED_RUNTIME_26_908["moduleHashes"][".vite/build/src-CCXHtyvY.js"],
-        )
-        self.assertNotEqual(
-            profile["moduleHashes"]["webview/assets/app-initial-bcc2ff475eb6.js"],
-            h.VERIFIED_RUNTIME_26_908["moduleHashes"]["webview/assets/app-initial-d9bed9d614d8.js"],
-        )
-
-    def test_runtime_26_915_exact_catalog_row_is_current_and_any_drift_fails_closed(self):
-        profile = h.VERIFIED_RUNTIME_26_915
-        self.assertEqual(profile, {
-            "desktopVersion": "26.915.4065.0",
-            "appServerVersion": "0.155.0-alpha.9.2",
-            "appServerSha256": "bc45017e8239dc150258f69309ced9df6bbcdf5b8e4f346decf780ac0999e226",
-            "asarHeader": (4, 4230936, 4230932, 4230928),
-            "modules": [
-                {"role": "ipc-main", "path": ".vite/build/src-C3YaUE83.js",
-                 "sha256": "14c8c23e8b8dfa874d3fb5a50d54fb28eccf55fb83232c3ab29cb7c0ef0a0472"},
-                {"role": "webview-bootstrap", "path": "webview/assets/app-initial-6c4523b43a11.js",
-                 "sha256": "146b5204b30bd1766f19c0dd5b76f23515a77708ae80bb66ded6469e11431374"},
-            ],
-            "moduleHashes": {
-                ".vite/build/src-C3YaUE83.js":
-                    "14c8c23e8b8dfa874d3fb5a50d54fb28eccf55fb83232c3ab29cb7c0ef0a0472",
-                "webview/assets/app-initial-6c4523b43a11.js":
-                    "146b5204b30bd1766f19c0dd5b76f23515a77708ae80bb66ded6469e11431374",
-            },
-        })
-        self.assertIn(profile, h.VERIFIED_PROFILES["desktop-ipc-v1"])
-        observed = {"observedDesktopVersion": profile["desktopVersion"],
-                    "observedAppServerVersion": profile["appServerVersion"],
-                    "appServerSha256": profile["appServerSha256"]}
-        with patch.object(h, "_observe_runtime_versions", return_value=observed), \
-                patch.object(h, "_asar_module_hashes", return_value=profile["moduleHashes"]):
-            self.assertEqual(h._checked_runtime("desktop", observed)["profile"], "desktop-ipc-v1")
-            self.assertEqual(h._compatibility_for_paths("desktop", "server")["status"], "current")
-            self.assertEqual(h._compatibility_audit_for_paths("desktop", "server")["classification"], "current")
-
-        for field, value in (("observedDesktopVersion", "26.915.4065.1"),
-                             ("observedAppServerVersion", "0.155.0-alpha.9.3"),
-                             ("appServerSha256", "0" * 64)):
-            with self.subTest(field=field), self.assertRaises(h.DesktopIpcError):
-                h._checked_runtime("desktop", {**observed, field: value})
-        for mismatch in ("asar_header_layout", "asar_module_sha256"):
-            with self.subTest(mismatch=mismatch), \
-                    patch.object(h, "_asar_module_hashes", side_effect=h._version_error(mismatch)), \
-                    self.assertRaises(h.DesktopIpcError):
-                h._checked_runtime("desktop", observed)
-
-    def test_production_asar_module_hashes_accepts_modern_framing_and_rejects_drift(self):
-        ipc_path = ".vite/build/src-modern.js"
-        webview_path = "webview/assets/app-initial-modern.js"
-        ipc_bytes = b"exact ipc module"
-        webview_bytes = b"exact webview module"
-
-        tree = {"files": {}}
-        offset = 0
-        for module_path, module_bytes in ((ipc_path, ipc_bytes), (webview_path, webview_bytes)):
-            files = tree["files"]
-            parts = module_path.split("/")
-            for part in parts[:-1]:
-                files = files.setdefault(part, {"files": {}})["files"]
-            files[parts[-1]] = {"size": len(module_bytes), "offset": str(offset)}
-            offset += len(module_bytes)
-
-        raw_tree = json.dumps(tree, separators=(",", ":")).encode("utf-8")
-        layout = (4, len(raw_tree) + 8, len(raw_tree) + 4, len(raw_tree))
-        profile = {
-            "asarHeader": layout,
-            "modules": [
-                {"role": "ipc-main", "path": ipc_path,
-                 "sha256": hashlib.sha256(ipc_bytes).hexdigest()},
-                {"role": "webview-bootstrap", "path": webview_path,
-                 "sha256": hashlib.sha256(webview_bytes).hexdigest()},
-            ],
-        }
-
-        with tempfile.TemporaryDirectory(prefix="c2c-modern-asar-") as directory:
-            desktop = Path(directory) / "app" / "ChatGPT.exe"
-            asar = desktop.parent / "resources" / "app.asar"
-            asar.parent.mkdir(parents=True)
-
-            def write_modules(current_ipc, current_webview):
-                asar.write_bytes(
-                    struct.pack("<4I", *layout) + raw_tree + current_ipc + current_webview
-                )
-
-            write_modules(ipc_bytes, webview_bytes)
-            self.assertEqual(h._asar_module_hashes(str(desktop), profile), {
-                ipc_path: hashlib.sha256(ipc_bytes).hexdigest(),
-                webview_path: hashlib.sha256(webview_bytes).hexdigest(),
-            })
-
-            for current_ipc, current_webview in (
-                    (b"X" + ipc_bytes[1:], webview_bytes),
-                    (ipc_bytes, b"X" + webview_bytes[1:])):
-                write_modules(current_ipc, current_webview)
-                with self.assertRaises(h.DesktopIpcError) as raised:
-                    h._asar_module_hashes(str(desktop), profile)
-                self.assertEqual(raised.exception.mismatch, "asar_module_sha256")
-
-    def test_runtime_26_908_9136_any_single_field_drift_fails_closed(self):
-        base = h.VERIFIED_RUNTIME_26_908_9136
-        with tempfile.TemporaryDirectory(prefix="c2c-9136-drift-") as directory:
-            root = Path(directory) / f"OpenAI.Codex_{base['desktopVersion']}_x64" / "app"
-            root.mkdir(parents=True)
-            desktop = root / "ChatGPT.exe"
-            server = root / "codex.exe"
-            server.write_bytes(b"standalonelocal buildversion: 0.154.0-alpha.6.2\nplatform: audited")
-            server_hash = hashlib.sha256(server.read_bytes()).hexdigest()
-            fixture = {**base, "appServerSha256": server_hash}
-
-            # exact pair + exact hashes → current
-            with patch.dict(h.VERIFIED_PROFILES, {h.VERIFIED_PROFILE: (fixture,)}, clear=True), \
-                    patch.object(h, "_asar_module_hashes", return_value=fixture["moduleHashes"]):
-                self.assertEqual(
-                    h._compatibility_for_paths(str(desktop), str(server))["status"], "current"
-                )
-
-            # wrong desktop version path → pair 不匹配 → unverified
-            wrong_desktop = Path(directory) / "OpenAI.Codex_26.908.4834.0_x64" / "app" / "ChatGPT.exe"
-            wrong_desktop.parent.mkdir(parents=True)
-            with patch.dict(h.VERIFIED_PROFILES, {h.VERIFIED_PROFILE: (fixture,)}, clear=True):
-                result = h._compatibility_for_paths(str(wrong_desktop), str(server))
-            self.assertEqual(result["status"], "unverified")
-            self.assertIsNone(result["profile"])
-
-            # wrong app-server version（静态 marker 写出别的版本）→ pair 不匹配 → unverified
-            server.write_bytes(b"standalonelocal buildversion: 0.153.4\nplatform: audited")
-            with patch.dict(h.VERIFIED_PROFILES, {h.VERIFIED_PROFILE: (fixture,)}, clear=True):
-                result = h._compatibility_for_paths(str(desktop), str(server))
-            self.assertEqual(result["status"], "unverified")
-            self.assertIsNone(result["profile"])
-            server.write_bytes(b"standalonelocal buildversion: 0.154.0-alpha.6.2\nplatform: audited")
-
-            # wrong app-server SHA → pair 版本匹配但 hash 不匹配 → incompatible
-            bad_sha = {**fixture, "appServerSha256": "0" * 64}
-            with patch.dict(h.VERIFIED_PROFILES, {h.VERIFIED_PROFILE: (bad_sha,)}, clear=True), \
-                    patch.object(h, "_asar_module_hashes") as asar:
-                result = h._compatibility_for_paths(str(desktop), str(server))
-            self.assertEqual(result["status"], "incompatible")
-            self.assertEqual(result["profile"], h.VERIFIED_PROFILE)
-            asar.assert_not_called()
-
-            # ASAR header 漂移：写入真实但错误布局的 asar 文件
-            asar = desktop.parent / "resources" / "app.asar"
-            asar.parent.mkdir(parents=True, exist_ok=True)
-            bad_header_bytes = struct.pack("<4I", 4, 64, 60, 16) + b"{}"
-            asar.write_bytes(bad_header_bytes)
-            with patch.dict(h.VERIFIED_PROFILES, {h.VERIFIED_PROFILE: (fixture,)}, clear=True):
-                with self.assertRaises(h.DesktopIpcError) as caught:
-                    h._runtime_version(str(desktop), str(server))
-            self.assertEqual(caught.exception.mismatch, "asar_header_layout")
-
-            # IPC / webview module hash 漂移：按 exact module path 提供错误 hash
-            for label, path, digest in (
-                ("ipc", ".vite/build/src-CCXHtyvY.js", "b" * 64),
-                ("webview", "webview/assets/app-initial-bcc2ff475eb6.js", "c" * 64),
-            ):
-                with self.subTest(module=label):
-                    bad_modules = {**fixture["moduleHashes"], path: digest}
-                    bad = {**fixture, "moduleHashes": bad_modules}
-                    with patch.dict(h.VERIFIED_PROFILES, {h.VERIFIED_PROFILE: (bad,)}, clear=True), \
-                            patch.object(h, "_asar_module_hashes", side_effect=h.DesktopIpcError(
-                                "DESKTOP_VERSION_UNSUPPORTED", "asar_module_sha256"
-                            ) if False else None):
-                        # 直接让 _asar_module_hashes 抛出 module sha 错误语义：
-                        with patch.object(
-                            h, "_asar_module_hashes",
-                            side_effect=h._version_error("asar_module_sha256"),
-                        ):
-                            with self.assertRaises(h.DesktopIpcError) as caught:
-                                h._runtime_version(str(desktop), str(server))
-                    self.assertEqual(caught.exception.mismatch, "asar_module_sha256")
-
-    def test_runtime_26_908_9136_rejects_cross_runtime_mix(self):
-        # 9136 Desktop + 4834 app-server hash：pair 版本可匹配 9136，但 hash 必须 exact。
-        mix_hash = {
-            **h.VERIFIED_RUNTIME_26_908_9136,
-            "appServerSha256": h.VERIFIED_RUNTIME_26_908["appServerSha256"],
-        }
-        with tempfile.TemporaryDirectory(prefix="c2c-9136-mix-") as directory:
-            root9136 = Path(directory) / "OpenAI.Codex_26.908.9136.0_x64" / "app"
-            root9136.mkdir(parents=True)
-            desktop9136 = root9136 / "ChatGPT.exe"
-            server9136 = root9136 / "codex.exe"
-            server9136.write_bytes(b"standalonelocal buildversion: 0.154.0-alpha.6.2\nplatform: audited")
-            with patch.dict(
-                h.VERIFIED_PROFILES,
-                {h.VERIFIED_PROFILE: (mix_hash,)},
-                clear=True,
-            ), patch.object(h, "_asar_module_hashes") as asar:
-                result = h._compatibility_for_paths(str(desktop9136), str(server9136))
-            self.assertEqual(result["status"], "incompatible")
-            self.assertEqual(result["profile"], h.VERIFIED_PROFILE)
-            asar.assert_not_called()
-
-            # 4834 Desktop + 声称 9136 webview hash：pair 版本匹配 4834 后 asar 必须 exact。
-            mix_webview = {
-                **h.VERIFIED_RUNTIME_26_908,
-                "appServerSha256": hashlib.sha256(
-                    b"standalone local buildversion: 0.154.0-alpha.6.2 platform: audited"
-                ).hexdigest(),
-                "moduleHashes": {
-                    ".vite/build/src-CCXHtyvY.js":
-                        h.VERIFIED_RUNTIME_26_908["moduleHashes"][".vite/build/src-CCXHtyvY.js"],
-                    "webview/assets/app-initial-bcc2ff475eb6.js":
-                        h.VERIFIED_RUNTIME_26_908_9136["moduleHashes"][
-                            "webview/assets/app-initial-bcc2ff475eb6.js"
-                        ],
-                },
-            }
-            root4834 = Path(directory) / "OpenAI.Codex_26.908.4834.0_x64" / "app"
-            root4834.mkdir(parents=True)
-            desktop4834 = root4834 / "ChatGPT.exe"
-            server4834 = root4834 / "codex.exe"
-            server4834.write_bytes(b"standalone local buildversion: 0.154.0-alpha.6.2 platform: audited")
-            with patch.dict(
-                h.VERIFIED_PROFILES,
-                {h.VERIFIED_PROFILE: (mix_webview,)},
-                clear=True,
-            ), patch.object(
-                h,
-                "_asar_module_hashes",
-                side_effect=h._version_error("asar_module_sha256"),
-            ):
-                with self.assertRaises(h.DesktopIpcError) as caught:
-                    h._runtime_version(str(desktop4834), str(server4834))
-            self.assertEqual(caught.exception.mismatch, "asar_module_sha256")
-
-    def test_unknown_mixed_and_hash_mismatch_are_fail_closed_diagnostics(self):
-        with tempfile.TemporaryDirectory(prefix="c2c-compatibility-offline-") as directory:
-            root = Path(directory) / f"OpenAI.Codex_{h.VERIFIED_RUNTIME['desktopVersion']}_x64" / "app"
-            root.mkdir(parents=True)
-            desktop = root / "ChatGPT.exe"
-            server = root / "codex.exe"
-
-            server.write_bytes(b"standalone local buildversion: 9.9.9 platform: unknown")
-            unknown = h._compatibility_for_paths(str(desktop), str(server))
-            self.assertEqual(unknown, {"observedDesktopVersion": h.VERIFIED_RUNTIME["desktopVersion"],
-                                       "observedAppServerVersion": "9.9.9", "status": "unverified", "profile": None})
-
-            server.write_bytes(b"standalone local buildversion: 0.154.0-alpha.6.2 platform: mixed")
-            mixed = h._compatibility_for_paths(str(desktop), str(server))
-            self.assertEqual(mixed, {"observedDesktopVersion": h.VERIFIED_RUNTIME["desktopVersion"],
-                                     "observedAppServerVersion": "0.154.0-alpha.6.2", "status": "unverified",
-                                     "profile": None})
-
-            server.write_bytes(b"standalone local buildversion: 0.153.4 platform: changed")
-            with patch.object(h, "_asar_module_hashes") as asar:
-                mismatched = h._compatibility_for_paths(str(desktop), str(server))
-            self.assertEqual(mismatched, {"observedDesktopVersion": h.VERIFIED_RUNTIME["desktopVersion"],
-                                          "observedAppServerVersion": h.VERIFIED_RUNTIME["appServerVersion"],
-                                          "status": "incompatible", "profile": h.VERIFIED_PROFILE})
-            asar.assert_not_called()
-
-    def test_provenance_parser_accepts_prerelease_and_rejects_ambiguous_marker(self):
-        with tempfile.TemporaryDirectory(prefix="c2c-provenance-offline-") as directory:
-            binary = Path(directory) / "codex.exe"
-            marker = b"standalone local buildversion: "
-            binary.write_bytes(b"prefix\x00" + marker + b"0.154.0-alpha.6.2 platform: install method: commit:")
-            self.assertEqual(h._static_file_version(str(binary)), "0.154.0-alpha.6.2")
-            binary.write_bytes(marker + b"0.153.4 platform:x\x00" + marker + b"0.154.0-alpha.6.2 platform:y")
-            self.assertIsNone(h._static_file_version(str(binary)))
-
-    def test_provenance_parser_accepts_compact_marker_and_fails_closed_on_ambiguity(self):
-        old = b"standalone local buildversion: "
-        new = b"standalonelocal buildversion: "
-        current = b"standalonenpmbunpnpmvite+brewlocal buildversion: "
-        with tempfile.TemporaryDirectory(prefix="c2c-provenance-compact-") as directory:
-            binary = Path(directory) / "codex.exe"
-            # old marker + prerelease + space delimiter
-            binary.write_bytes(b"prefix\x00" + old + b"0.154.0-alpha.6.2 platform: install method: commit:")
-            self.assertEqual(h._static_file_version(str(binary)), "0.154.0-alpha.6.2")
-            # new compact marker + prerelease + space delimiter
-            binary.write_bytes(b"prefix\x00" + new + b"0.154.0-alpha.6.2 platform: install method: commit:")
-            self.assertEqual(h._static_file_version(str(binary)), "0.154.0-alpha.6.2")
-            # new compact marker + prerelease + newline delimiter (real 26.908.9136 shape)
-            binary.write_bytes(b"prefix\x00" + new + b"0.154.0-alpha.6.2\nplatform: install method: commit:")
-            self.assertEqual(h._static_file_version(str(binary)), "0.154.0-alpha.6.2")
-            # current 26.915 marker + newline delimiter
-            binary.write_bytes(b"prefix\x00" + current + b"0.155.0-alpha.9.2\nplatform: install method: commit:")
-            self.assertEqual(h._static_file_version(str(binary)), "0.155.0-alpha.9.2")
-            # old duplicated
-            binary.write_bytes(old + b"0.153.4 platform:x\x00" + old + b"0.154.0-alpha.6.2 platform:y")
-            self.assertIsNone(h._static_file_version(str(binary)))
-            # new duplicated
-            binary.write_bytes(new + b"0.153.4 platform:x\x00" + new + b"0.154.0-alpha.6.2 platform:y")
-            self.assertIsNone(h._static_file_version(str(binary)))
-            # old + new together
-            binary.write_bytes(old + b"0.153.4 platform:x\x00" + new + b"0.154.0-alpha.6.2 platform:y")
-            self.assertIsNone(h._static_file_version(str(binary)))
-            # current duplicated
-            binary.write_bytes(current + b"0.155.0-alpha.9.2\nplatform:x\x00" + current + b"0.155.0-alpha.9.2\nplatform:y")
-            self.assertIsNone(h._static_file_version(str(binary)))
-            # malformed version
-            binary.write_bytes(new + b"not-a-version platform: x")
-            self.assertIsNone(h._static_file_version(str(binary)))
-            # missing platform delimiter
-            binary.write_bytes(new + b"0.154.0-alpha.6.2 install method: commit:")
-            self.assertIsNone(h._static_file_version(str(binary)))
-            # no marker
-            binary.write_bytes(b"no provenance marker here")
-            self.assertIsNone(h._static_file_version(str(binary)))
-
-    def test_unknown_compact_marker_pair_stays_unverified(self):
-        # 未入册的 Desktop 版本 + compact marker 仍必须 unverified / profile=null。
-        desktop = "OpenAI.Codex_26.908.9999.0_x64/app/ChatGPT.exe"
-        with tempfile.TemporaryDirectory(prefix="c2c-provenance-unverified-") as directory:
-            binary = Path(directory) / "codex.exe"
-            binary.write_bytes(
-                b"x\x00standalonelocal buildversion: 0.154.0-alpha.6.2\nplatform: install method: commit:"
-            )
-            with patch.object(h, "_sha256_file", return_value="960c111d47afd61669954b9df9e56083e302edbfa3ef6962d81dcc14a30051dc"):
-                observed = h._observe_runtime_versions(desktop, str(binary))
-            self.assertEqual(observed["observedDesktopVersion"], "26.908.9999.0")
-            self.assertEqual(observed["observedAppServerVersion"], "0.154.0-alpha.6.2")
-            diagnostic = h._compatibility_for_paths(desktop, str(binary))
-            self.assertEqual(diagnostic, {
-                "observedDesktopVersion": "26.908.9999.0",
-                "observedAppServerVersion": "0.154.0-alpha.6.2",
-                "status": "unverified",
-                "profile": None,
-            })
-
-    def test_known_hash_skips_binary_scan_but_unknown_hash_uses_static_evidence(self):
-        desktop = f"OpenAI.Codex_{h.VERIFIED_RUNTIME['desktopVersion']}_x64/app/ChatGPT.exe"
-        with patch.object(h, "_sha256_file", return_value=h.VERIFIED_RUNTIME["appServerSha256"]), \
-                patch.object(h, "_static_file_version") as static_version:
-            observed = h._observe_runtime_versions(desktop, "codex.exe")
-        self.assertEqual(observed["observedAppServerVersion"], h.VERIFIED_RUNTIME["appServerVersion"])
-        static_version.assert_not_called()
-
-        with patch.object(h, "_sha256_file", return_value="0" * 64), \
-                patch.object(h, "_static_file_version", return_value="9.9.9") as static_version:
-            observed = h._observe_runtime_versions(desktop, "codex.exe")
-        self.assertEqual(observed["observedAppServerVersion"], "9.9.9")
-        static_version.assert_called_once_with("codex.exe")
-
-    def test_verified_large_asar_header_and_mixed_or_corrupt_combinations(self):
-        # 不 mock ASAR 读取：复现真实 2.44 MB 头部，旧 1 MiB guard 会失败。
-        with tempfile.TemporaryDirectory(prefix="c2c-asar-offline-") as directory:
-            desktop = Path(directory) / "OpenAI.Codex_26.903.9818.0_x64" / "app" / "ChatGPT.exe"
-            asar = desktop.parent / "resources" / "app.asar"
-            asar.parent.mkdir(parents=True)
-            server = desktop.parent / "codex.exe"
-            server_bytes = b"standalone local buildversion: 0.153.4 platform: offline"
-            server.write_bytes(server_bytes)
-            module = b"verified offline protocol"
-            layout = h.VERIFIED_RUNTIME["asarHeader"]
-            tree = {"files": {"protocol.js": {"offset": "0", "size": len(module)}}, "padding": ""}
-            tree["padding"] = " " * (layout[3] - len(json.dumps(tree).encode()))
-            raw_tree = json.dumps(tree).encode()
-            self.assertEqual(len(raw_tree), layout[3])
-            header = struct.pack("<4I", *layout)
-            valid = header + raw_tree + bytes(8 + layout[1] - 16 - len(raw_tree)) + module
-            profile = {**h.VERIFIED_RUNTIME, "appServerSha256": hashlib.sha256(server.read_bytes()).hexdigest(),
-                       "moduleHashes": {"protocol.js": hashlib.sha256(module).hexdigest()}}
-            with patch.dict(h.VERIFIED_PROFILES, {h.VERIFIED_PROFILE: (profile,)}, clear=True):
-                asar.write_bytes(valid)
-                self.assertEqual(h._runtime_version(str(desktop), str(server))["moduleHashes"], profile["moduleHashes"])
-                cases = [
-                    (header[:12], "asar_header_truncated"),
-                    (struct.pack("<4I", 4, 0xffffffff, 0xfffffffb, 0xfffffff0), "asar_header_layout"),
-                    (header + raw_tree[:100], "asar_header_truncated"),
-                    (valid[:-1], "asar_module_truncated"),
-                    (valid[:-1] + b"!", "asar_module_sha256"),
-                ]
-                for raw, mismatch in cases:
-                    with self.subTest(mismatch=mismatch):
-                        asar.write_bytes(raw)
-                        with self.assertRaises(h.DesktopIpcError) as caught:
-                            h._runtime_version(str(desktop), str(server))
-                        self.assertEqual(caught.exception.mismatch, mismatch)
-                        self.assertTrue(caught.exception.not_sent)
-                asar.write_bytes(valid)
-                # 只要整组中的一个成员变化，即便版本字符串相同也拒绝。
-                server.write_bytes(b"standalone local buildversion: 0.153.4 platform: changed")
-                with self.assertRaises(h.DesktopIpcError) as caught:
-                    h._runtime_version(str(desktop), str(server))
-                self.assertEqual(caught.exception.mismatch, "app_server_sha256")
-                with self.assertRaises(h.DesktopIpcError) as caught:
-                    h._runtime_version(str(desktop).replace("26.903.9818.0", "26.903.9999.0"), str(server))
-                self.assertEqual(caught.exception.mismatch, "runtime_pair_unverified")
-
-    def test_internal_mismatch_does_not_leak_through_helper_reply(self):
-        request = {"id": CLIENT, "op": "inspect", "target": {"threadId": THREAD}}
-        source = SimpleNamespace(buffer=io.BytesIO(h._json_bytes(request) + b"\n"))
-        output = SimpleNamespace(buffer=io.BytesIO())
-        with patch.object(h, "_target", return_value={}), patch.object(h, "_prepare", side_effect=h._version_error("asar_header_layout")), \
-                patch.object(sys, "stdin", source), patch.object(sys, "stdout", output):
-            h._main()
-        self.assertEqual(json.loads(output.buffer.getvalue()),
-                         {"id": CLIENT, "ok": False, "code": "DESKTOP_VERSION_UNSUPPORTED", "notSent": True,
-                         "compatibility": {"observedDesktopVersion": None, "observedAppServerVersion": None,
-                                             "status": "unverified", "profile": None}})
-
-    def test_handshake_operation_accepts_only_id_op_workspace_root(self):
-        request = {"id": CLIENT, "op": "handshake_audit", "workspaceRoot": "workspace", "target": {}}
-        source = SimpleNamespace(buffer=io.BytesIO(h._json_bytes(request) + b"\n"))
-        output = SimpleNamespace(buffer=io.BytesIO())
-        with patch.object(sys, "stdin", source), patch.object(sys, "stdout", output):
-            h._main()
-        self.assertEqual(json.loads(output.buffer.getvalue()),
-                         {"id": CLIENT, "ok": False, "code": "DESKTOP_INVALID_REQUEST", "notSent": True})
-
-    def test_new_connection_rediscovers_but_inflight_pid_reuse_is_rejected(self):
-        target = {"threadId": THREAD, "hostId": "local", "projectId": "project_test", "workspaceRoot": str(Path.cwd())}
-        pipe = FakePipe(target)
-        rows = [{"pid": 100, "name": "ChatGPT.exe", "parentPid": 1, "exe": pipe.server_exe, "creation": 10},
-                {"pid": 101, "name": "codex.exe", "parentPid": 100, "exe": str(Path.cwd() / "codex.exe"), "creation": 11}]
-        with patch.object(h, "_processes", return_value=rows), patch.object(h, "_runtime_version", return_value=RUNTIME), patch.object(h, "_verify_project"):
-            old = h._verify_runtime(pipe, target)
-            rows[1]["creation"] = 12
-            with self.assertRaises(h.DesktopIpcError):
-                h._verify_runtime(pipe, target, old)
-            self.assertEqual(h._verify_runtime(pipe, target)["appServerCreation"], 12)
-            rows[1]["parentPid"] = 999
-            with self.assertRaises(h.DesktopIpcError):
-                h._verify_runtime(pipe, target)
-
-    def test_project_mapping_reads_only_isolated_fixture(self):
-        with tempfile.TemporaryDirectory(prefix="c2c-project-offline-") as directory:
-            file = Path(directory) / "state.json"
-            target = {"threadId": THREAD, "hostId": "local", "projectId": "project_test", "workspaceRoot": directory}
-            value = {"thread-project-assignments": {THREAD: {"projectKind": "local", "projectId": "project_test"}},
-                     "local-projects": {"project_test": {"rootPaths": [directory]}}}
-            file.write_text(json.dumps(value), encoding="utf-8")
-            with patch.object(h, "_global_state_path", return_value=file):
-                h._verify_project(target)
-                value["thread-project-assignments"][THREAD]["projectId"] = "other"
-                file.write_text(json.dumps(value), encoding="utf-8")
-                with self.assertRaises(h.DesktopIpcError):
-                    h._verify_project(target)
-
-    def test_unknown_version_and_changed_server_binary_fail_closed(self):
-        with self.assertRaises(h.DesktopIpcError):
-            h._runtime_version("OpenAI.Codex_0.0.0.0_x64/app/ChatGPT.exe", "does-not-exist")
-        with tempfile.TemporaryDirectory(prefix="c2c-version-offline-") as directory:
-            server = Path(directory) / "codex.exe"
-            server.write_bytes(b"verified fake binary")
-            digest = hashlib.sha256(server.read_bytes()).hexdigest()
-            desktop = "OpenAI.Codex_26.903.9818.0_x64/app/ChatGPT.exe"
-            profile = {**h.VERIFIED_RUNTIME, "appServerSha256": digest}
-            with patch.dict(h.VERIFIED_PROFILES, {h.VERIFIED_PROFILE: (profile,)}, clear=True), \
-                    patch.object(h, "_asar_module_hashes", return_value={}):
-                h._runtime_version(desktop, str(server))
-                server.write_bytes(b"changed")
-                with self.assertRaises(h.DesktopIpcError) as caught:
-                    h._runtime_version(desktop, str(server))
-                self.assertEqual(caught.exception.mismatch, "runtime_pair_unverified")
-
-
-class CatalogAuditTests(unittest.TestCase):
-    def test_catalog_asar_header_accepts_only_audited_legacy_and_modern_framing(self):
-        self.assertEqual(h._catalog_asar_header([4, 100, 96, 89]), (4, 100, 96, 89))
-        self.assertEqual(h._catalog_asar_header([4, 97, 93, 89]), (4, 97, 93, 89))
-        with self.assertRaises(h._CatalogError):
-            h._catalog_asar_header([4, 98, 94, 89])
-
-    def test_catalog_loader_is_strict_and_bounded(self):
-        catalog = json.loads(Path(h.PROFILE_CATALOG_PATH).read_text(encoding="utf-8"))
-        with tempfile.TemporaryDirectory(prefix="c2c-catalog-guard-") as directory:
-            path = Path(directory) / "profiles.json"
-
-            def load(value):
-                path.write_text(json.dumps(value), encoding="utf-8")
-                return h._load_catalog(path)
-
-            self.assertEqual(set(h._load_catalog()), {h.VERIFIED_PROFILE})
-            for name, broken in {
-                "schema": {**catalog, "schemaVersion": 2},
-                "root_extra": {**catalog, "extra": True},
-                "profiles_missing": {"schemaVersion": 1},
-                "profile_extra": {**catalog, "profiles": [{**catalog["profiles"][0], "extra": True}]},
-                "profile_duplicate": {**catalog, "profiles": catalog["profiles"] * 2},
-                "runtime_missing": {**catalog, "profiles": [{**catalog["profiles"][0], "runtimes": [
-                    {key: value for key, value in catalog["profiles"][0]["runtimes"][0].items()
-                     if key != "appServerVersion"}]}]},
-                "bad_version": {**catalog, "profiles": [{**catalog["profiles"][0], "runtimes": [
-                    {**catalog["profiles"][0]["runtimes"][0], "desktopVersion": "26.*"}]}]},
-                "version_duplicate": {**catalog, "profiles": [{**catalog["profiles"][0], "runtimes":
-                    catalog["profiles"][0]["runtimes"] + [catalog["profiles"][0]["runtimes"][0]]}]},
-                "bad_hash": {**catalog, "profiles": [{**catalog["profiles"][0], "runtimes": [
-                    {**catalog["profiles"][0]["runtimes"][0], "appServerSha256": "x" * 64}]}]},
-                "bad_role": {**catalog, "profiles": [{**catalog["profiles"][0], "runtimes": [
-                    {**catalog["profiles"][0]["runtimes"][0], "modules": [
-                        {**catalog["profiles"][0]["runtimes"][0]["modules"][0], "role": "ipc"},
-                        catalog["profiles"][0]["runtimes"][0]["modules"][1]]}]}]},
-                "duplicate_role": {**catalog, "profiles": [{**catalog["profiles"][0], "runtimes": [
-                    {**catalog["profiles"][0]["runtimes"][0], "modules": [
-                        catalog["profiles"][0]["runtimes"][0]["modules"][0],
-                        {**catalog["profiles"][0]["runtimes"][0]["modules"][0],
-                         "path": ".vite/build/src-other.js"}]}]}]},
-                "bad_path": {**catalog, "profiles": [{**catalog["profiles"][0], "runtimes": [
-                    {**catalog["profiles"][0]["runtimes"][0], "modules": [
-                        {**catalog["profiles"][0]["runtimes"][0]["modules"][0], "path": "../secret.js"},
-                        catalog["profiles"][0]["runtimes"][0]["modules"][1]]}]}]},
-            }.items():
-                with self.subTest(name=name), self.assertRaises(h._CatalogError):
-                    load(broken)
-            path.write_text('{"schemaVersion":1,"schemaVersion":1,"profiles":[]}', encoding="utf-8")
-            with self.assertRaises(h._CatalogError):
-                h._load_catalog(path)
-            with self.assertRaises(h._CatalogError):
-                h._load_catalog(Path(directory) / "missing.json")
-        with patch.dict(h.VERIFIED_PROFILES, {}, clear=True), \
-                patch.object(h, "_observe_runtime_versions", return_value={
-                    "observedDesktopVersion": "26.908.9136.0",
-                    "observedAppServerVersion": "0.154.0-alpha.6.2",
-                    "appServerSha256": "a" * 64,
-                }):
-            self.assertNotEqual(h._compatibility_for_paths("desktop", "server")["status"], "current")
-
-    def test_audit_current_candidate_drift_ambiguity_and_malformed_asar(self):
-        current = {"observedDesktopVersion": h.VERIFIED_RUNTIME_26_908_9136["desktopVersion"],
-                   "observedAppServerVersion": h.VERIFIED_RUNTIME_26_908_9136["appServerVersion"],
-                   "appServerSha256": h.VERIFIED_RUNTIME_26_908_9136["appServerSha256"]}
-        with patch.object(h, "_observe_runtime_versions", return_value=current), \
-                patch.object(h, "_checked_runtime"):
-            result = h._compatibility_audit_for_paths("desktop", "server")
-        self.assertEqual(result["classification"], "current")
-        self.assertEqual(result["candidateProfile"], h.VERIFIED_PROFILE)
-        self.assertNotIn("candidateRuntime", result)
-        self.assertEqual({module["role"] for module in result["modules"]}, {"ipc-main", "webview-bootstrap"})
-
-        ipc_hash = "a" * 64
-        row = {"desktopVersion": "26.908.4834.0", "appServerVersion": "0.154.0-alpha.6.2",
-               "appServerSha256": "0" * 64, "asarHeader": [4, 100, 96, 89], "modules": [
-                   {"role": "ipc-main", "path": ".vite/build/src-trusted.js", "sha256": ipc_hash},
-                   {"role": "webview-bootstrap", "path": "webview/assets/app-initial-old.js", "sha256": "c" * 64}]}
-        observed = {"observedDesktopVersion": "99.1.1.1", "observedAppServerVersion": row["appServerVersion"],
-                    "appServerSha256": "b" * 64}
-        modules = {"ipc-main": [{"role": "ipc-main", "path": ".vite/build/src-new.js", "sha256": ipc_hash}],
-                   "webview-bootstrap": [{"role": "webview-bootstrap", "path": "webview/assets/app-initial-new.js",
-                                           "sha256": "d" * 64}]}
-        with patch.dict(h.VERIFIED_PROFILES, {h.VERIFIED_PROFILE: (row,)}, clear=True), \
-                patch.object(h, "_observe_runtime_versions", return_value=observed), \
-                patch.object(h, "_asar_audit_modules", return_value=([4, 100, 96, 89], modules)):
-            self.assertEqual(h._compatibility_for_paths("desktop", "server")["status"], "unverified")
-            candidate = h._compatibility_audit_for_paths("desktop", "server")
-            self.assertEqual(candidate["classification"], "same_protocol_candidate")
-            self.assertEqual(candidate["candidateRuntime"]["desktopVersion"], "99.1.1.1")
-            self.assertEqual(candidate["candidateRuntime"]["appServerSha256"], "b" * 64)
-            with patch.object(h, "_observe_runtime_versions", return_value={
-                    **observed, "observedDesktopVersion": "99.1.1"}):
-                invalid_candidate = h._compatibility_audit_for_paths("desktop", "server")
-            self.assertNotIn("candidateRuntime", invalid_candidate)
-            bad = {**modules, "ipc-main": [{"role": "ipc-main", "path": ".vite/build/src-new.js", "sha256": "e" * 64}]}
-            with patch.object(h, "_asar_audit_modules", return_value=([4, 100, 96, 89], bad)):
-                self.assertEqual(h._compatibility_audit_for_paths("desktop", "server")["classification"],
-                                 "protocol_drift_or_unknown")
-            many = {**modules, "ipc-main": [modules["ipc-main"][0],
-                {**modules["ipc-main"][0], "path": ".vite/build/src-second.js"}]}
-            with patch.object(h, "_asar_audit_modules", return_value=([4, 100, 96, 89], many)):
-                self.assertEqual(h._compatibility_audit_for_paths("desktop", "server")["classification"],
-                                 "ambiguous")
-            with patch.object(h, "_asar_audit_modules", side_effect=h._AsarAuditError("bad")):
-                self.assertEqual(h._compatibility_audit_for_paths("desktop", "server")["classification"],
-                                 "protocol_drift_or_unknown")
-            no_webview = {**modules, "webview-bootstrap": []}
-            with patch.object(h, "_asar_audit_modules", return_value=([4, 100, 96, 89], no_webview)):
-                self.assertEqual(h._compatibility_audit_for_paths("desktop", "server")["classification"],
-                                 "protocol_drift_or_unknown")
-            many_webview = {**modules, "webview-bootstrap": [modules["webview-bootstrap"][0],
-                {**modules["webview-bootstrap"][0], "path": "webview/assets/app-initial-second.js"}]}
-            with patch.object(h, "_asar_audit_modules", return_value=([4, 100, 96, 89], many_webview)):
-                self.assertEqual(h._compatibility_audit_for_paths("desktop", "server")["classification"],
-                                 "ambiguous")
-            with patch.object(h, "_observe_runtime_versions", return_value={**observed,
-                    "observedAppServerVersion": "9.9.9"}):
-                self.assertEqual(h._compatibility_audit_for_paths("desktop", "server")["classification"],
-                                 "protocol_drift_or_unknown")
-            with patch.object(h, "_observe_runtime_versions", return_value={**observed,
-                    "appServerSha256": None}):
-                unavailable = h._compatibility_audit_for_paths("desktop", "server")
-                self.assertEqual(unavailable["classification"], "unavailable")
-                self.assertNotIn("candidateRuntime", unavailable)
-
-    def test_unknown_app_server_semantic_match_is_diagnostic_only_and_sanitizes_modules(self):
-        observed = {"observedDesktopVersion": "26.915.4065.0", "observedAppServerVersion": "0.155.0-alpha.9.3",
-                    "appServerSha256": "a" * 64}
-        modules = {"ipc-main": [{"role": "ipc-main", "path": ".vite/build/src-new.js", "sha256": "b" * 64,
-                                  "_semanticFingerprint": "d" * 64,
-                                  "_semanticReason": "matched", "_semanticCandidate": True,
-                                  "_semanticHasStartTurnMethod": True}],
-                   "webview-bootstrap": [{"role": "webview-bootstrap", "path": "webview/assets/app-initial-new.js",
-                                           "sha256": "c" * 64}]}
-        with patch.object(h, "_observe_runtime_versions", return_value=observed), \
-                patch.object(h, "_asar_audit_modules", return_value=([4, 100, 96, 89], modules)):
-            result = h._compatibility_audit_for_paths("desktop", "server")
-        self.assertEqual(result["classification"], "semantic_same_protocol_candidate")
-        self.assertEqual(result["semanticReason"], "matched")
-        self.assertEqual(result["semanticFingerprint"], "d" * 64)
-        self.assertEqual(result["modules"], [
-            {"role": "ipc-main", "path": ".vite/build/src-new.js", "sha256": "b" * 64},
-            {"role": "webview-bootstrap", "path": "webview/assets/app-initial-new.js", "sha256": "c" * 64},
-        ])
-        self.assertNotIn("candidateRuntime", result)
-
-    def test_audit_asar_malformed_and_oversized_headers_fail_closed(self):
-        with tempfile.TemporaryDirectory(prefix="c2c-audit-asar-") as directory:
-            desktop = Path(directory) / "OpenAI.Codex_99.1.1.1_x64" / "app" / "ChatGPT.exe"
-            asar = desktop.parent / "resources" / "app.asar"
-            asar.parent.mkdir(parents=True)
-            for name, raw in {
-                "truncated": b"short",
-                "oversized_header": struct.pack("<4I", 4, h._MAX_ASAR_HEADER_BYTES + 1,
-                                                  h._MAX_ASAR_HEADER_BYTES - 3,
-                                                  h._MAX_ASAR_HEADER_BYTES - 10),
-                "ambiguous_layout": struct.pack("<4I", 4, 100, 95, 89) + b"{}",
-                "third_gap": struct.pack("<4I", 4, 98, 94, 89) + b"{}",
-            }.items():
-                with self.subTest(name=name):
-                    asar.write_bytes(raw)
-                    with self.assertRaises(h._AsarAuditError):
-                        h._asar_audit_modules(str(desktop))
-
-    def test_audit_asar_budget_overlap_and_normal_candidates(self):
-        def write_asar(path, modules, *, framing="legacy"):
-            tree = {"files": {}}
-            for module_path, offset, data in modules:
-                node = tree
-                parts = module_path.split("/")
-                for part in parts[:-1]:
-                    node = node.setdefault("files", {}).setdefault(part, {})
-                node.setdefault("files", {})[parts[-1]] = {"offset": str(offset), "size": len(data)}
-            raw_tree = json.dumps(tree, separators=(",", ":")).encode()
-            json_size = max(256, len(raw_tree))
-            layout = ([4, json_size + 11, json_size + 7, json_size]
-                      if framing == "legacy" else [4, json_size + 8, json_size + 4, json_size])
-            raw_tree += b" " * (json_size - len(raw_tree))
-            body = bytearray(max(offset + len(data) for _, offset, data in modules))
-            for _, offset, data in modules:
-                body[offset:offset + len(data)] = data
-            gap = b"\0" * (8 + layout[1] - 16 - len(raw_tree))
-            path.write_bytes(struct.pack("<4I", *layout) + raw_tree + gap + body)
-            return layout
-
-        with tempfile.TemporaryDirectory(prefix="c2c-audit-asar-budget-") as directory:
-            desktop = Path(directory) / "OpenAI.Codex_99.1.1.1_x64" / "app" / "ChatGPT.exe"
-            asar = desktop.parent / "resources" / "app.asar"
-            asar.parent.mkdir(parents=True)
-            normal = [
-                (".vite/build/src-a.js", 0, b"ipc"),
-                ("webview/assets/app-initial-a.js", 3, b"web"),
-            ]
-            layout = write_asar(asar, normal)
-            observed_layout, candidates = h._asar_audit_modules(str(desktop))
-            self.assertEqual(observed_layout, layout)
-            self.assertEqual({module["path"] for items in candidates.values() for module in items},
-                             {module_path for module_path, _, _ in normal})
-            modern_layout = write_asar(asar, normal, framing="modern")
-            self.assertEqual(h._asar_audit_modules(str(desktop))[0], modern_layout)
-            fingerprint = SEMANTIC_PROTOCOL_SOURCE.encode()
-            one = [(".vite/build/src-one.js", 0, fingerprint),
-                   ("webview/assets/app-initial-a.js", len(fingerprint), b"web")]
-            write_asar(asar, one, framing="modern")
-            one_candidates = h._asar_audit_modules(str(desktop))[1]["ipc-main"]
-            self.assertEqual([item.get("_semanticFingerprint") for item in one_candidates],
-                             [h._semantic_protocol_v2(SEMANTIC_PROTOCOL_SOURCE)["fingerprint"]])
-            self.assertEqual([item.get("_semanticReason") for item in one_candidates], ["matched"])
-            many = [(".vite/build/src-one.js", 0, fingerprint),
-                    (".vite/build/src-two.js", len(fingerprint), fingerprint),
-                    ("webview/assets/app-initial-a.js", len(fingerprint) * 2, b"web")]
-            write_asar(asar, many, framing="modern")
-            many_candidates = h._asar_audit_modules(str(desktop))[1]["ipc-main"]
-            self.assertEqual(sum(item.get("_semanticReason") == "matched" for item in many_candidates), 2)
-
-            too_many = [
-                (".vite/build/src-a.js", 0, b"a"),
-                ("webview/assets/app-initial-a.js", 1, b"b"),
-            ]
-            write_asar(asar, too_many)
-            with patch.object(h, "_MAX_ASAR_AUDIT_CANDIDATES", 1), \
-                    self.assertRaises(h._AsarAuditError):
-                h._asar_audit_modules(str(desktop))
-
-            too_many_per_role = [
-                (".vite/build/src-a.js", 0, b"a"),
-                (".vite/build/src-b.js", 1, b"b"),
-            ]
-            write_asar(asar, too_many_per_role)
-            with patch.object(h, "_MAX_ASAR_AUDIT_CANDIDATES_PER_ROLE", 1), \
-                    self.assertRaises(h._AsarAuditError):
-                h._asar_audit_modules(str(desktop))
-
-            cumulative = [
-                (".vite/build/src-a.js", 0, b"ab"),
-                ("webview/assets/app-initial-a.js", 2, b"cd"),
-            ]
-            write_asar(asar, cumulative)
-            with patch.object(h, "_MAX_ASAR_AUDIT_MODULE_BYTES", 3), \
-                    self.assertRaises(h._AsarAuditError):
-                h._asar_audit_modules(str(desktop))
-
-            overlap = [
-                (".vite/build/src-a.js", 0, b"abc"),
-                ("webview/assets/app-initial-a.js", 1, b"bc"),
-            ]
-            write_asar(asar, overlap)
-            with self.assertRaises(h._AsarAuditError):
-                h._asar_audit_modules(str(desktop))
-
-    def test_legacy_runtime_lookup_and_asar_hashes_require_explicit_profile(self):
-        runtimes = h.VERIFIED_PROFILES[h.VERIFIED_PROFILE]
-        with patch.dict(h.VERIFIED_PROFILES, {h.VERIFIED_PROFILE: tuple(reversed(runtimes))}, clear=True):
-            self.assertEqual(h._legacy_runtime_for_pair("26.903.9818.0", "0.153.4"), runtimes[0])
-            self.assertEqual(h._legacy_runtime_for_pair("26.908.9136.0", "0.154.0-alpha.6.2"), runtimes[2])
-        with self.assertRaises(TypeError):
-            h._asar_module_hashes("desktop")
-
-    def test_audit_process_pair_and_operation_are_read_only(self):
-        with patch.object(h, "_query_standard_token") as token, patch.object(h, "_runtime_process_pairs", return_value=[]):
-            self.assertEqual(h._compatibility_audit()["classification"], "unavailable")
-            token.assert_called_once_with()
-        with patch.object(h, "_query_standard_token"), patch.object(h, "_runtime_process_pairs", return_value=[("a", "b"), ("c", "d")]):
-            self.assertEqual(h._compatibility_audit()["classification"], "ambiguous")
-        request = {"id": CLIENT, "op": "compatibility_audit"}
-        source = SimpleNamespace(buffer=io.BytesIO(h._json_bytes(request) + b"\n"))
-        output = SimpleNamespace(buffer=io.BytesIO())
-        with patch.object(h, "_compatibility_audit", return_value=h._audit_result()), \
-                patch.object(h, "_Pipe") as pipe, patch.object(sys, "stdin", source), patch.object(sys, "stdout", output):
-            h._main()
-        self.assertEqual(json.loads(output.buffer.getvalue())["value"]["classification"], "unavailable")
-        pipe.assert_not_called()
+class ClassificationTests(unittest.TestCase):
 
     def _classification_case(self, text, *, turn_id=NEW_TURN, continuation=False, trigger=None, predecessor_status="failed", hops=1, boundary="exhausted", ordinary_origin=False, machine_input=None, machine_items=None, thread_id=None):
         with tempfile.TemporaryDirectory(prefix="c2c-classification-") as directory:
@@ -2165,10 +1531,10 @@ class CatalogAuditTests(unittest.TestCase):
                 "entitiesByKey": {f"turn-{i}": item for i, item in enumerate(turns)}}}
             client = SimpleNamespace(drain=Mock(), current_state=lambda: pipe.state,
                                      snapshot_age=lambda: 0, owner=OWNER)
-            session = SimpleNamespace(client=client, pipe=pipe, runtime=RUNTIME, close=Mock())
+            session = SimpleNamespace(client=client, pipe=pipe, process=PROCESS, close=Mock())
             with patch.object(h, "_current_target", return_value=target), \
                  patch.object(h, "_prepare", return_value=(session, {})), \
-                 patch.object(h, "_verify_runtime", return_value=RUNTIME), \
+                 patch.object(h, "_verify_process_identity", return_value=PROCESS), \
                  patch.object(h, "_public_info", return_value={}), \
                  patch.object(h, "_verify_current_runner_ancestor"):
                 return h._current_result_classification(directory)
@@ -2179,7 +1545,7 @@ class CatalogAuditTests(unittest.TestCase):
                 result = self._classification_case(text)
                 self.assertEqual(result["classification"], "not_applicable")
 
-    def test_result_classification_current_c2c_origin_has_exact_fingerprint(self):
+    def test_result_classification_current_c2c_origin_has_exact_envelope_match(self):
         text = '{"type":"C2C_DESKTOP_TASK","version":1,"workspaceId":"workspace","commandId":"cmd-origin","intent":"revision","message":"hello"}'
         result = self._classification_case(text)
         self.assertEqual(result["classification"], "applicable")
@@ -2276,9 +1642,9 @@ class CatalogAuditTests(unittest.TestCase):
                 {"entries": [{"value": "b"}], "newerBoundary": {"status": "exhausted"}}],
                 "entitiesByKey": {"a": origin, "b": current}}}
             client = SimpleNamespace(drain=Mock(), current_state=lambda: pipe.state, snapshot_age=lambda: 0, owner=OWNER)
-            session = SimpleNamespace(client=client, pipe=pipe, runtime=RUNTIME, close=Mock())
+            session = SimpleNamespace(client=client, pipe=pipe, process=PROCESS, close=Mock())
             with patch.object(h, "_current_target", return_value=target), patch.object(h, "_prepare", return_value=(session, {})), \
-                 patch.object(h, "_verify_runtime", return_value=RUNTIME), patch.object(h, "_public_info", return_value={}), \
+                 patch.object(h, "_verify_process_identity", return_value=PROCESS), patch.object(h, "_public_info", return_value={}), \
                  patch.object(h, "_verify_current_runner_ancestor"):
                 return h._current_result_classification(directory), pipe
 
@@ -2303,8 +1669,8 @@ class CatalogAuditTests(unittest.TestCase):
             entities["current"]=current; turns.append(current); islands.append({"entries":[{"value":"current"}],"newerBoundary":{"status":"exhausted"}})
             pipe.state["turns"]=turns; pipe.state["turnHistory"]={"kind":"canonical","history":{"islands":islands,"entitiesByKey":entities}}
             client=SimpleNamespace(drain=Mock(),current_state=lambda:pipe.state,snapshot_age=lambda:0,owner=OWNER)
-            session=SimpleNamespace(client=client,pipe=pipe,runtime=RUNTIME,close=Mock())
-            with patch.object(h,"_current_target",return_value=target), patch.object(h,"_prepare",return_value=(session,{})), patch.object(h,"_verify_runtime",return_value=RUNTIME), patch.object(h,"_verify_current_runner_ancestor"), patch.object(h,"_public_info",return_value={}):
+            session=SimpleNamespace(client=client,pipe=pipe,process=PROCESS,close=Mock())
+            with patch.object(h,"_current_target",return_value=target), patch.object(h,"_prepare",return_value=(session,{})), patch.object(h,"_verify_process_identity",return_value=PROCESS), patch.object(h,"_verify_current_runner_ancestor"), patch.object(h,"_public_info",return_value={}):
                 result=h._current_result_classification(directory)
             self.assertEqual(result["commandId"],"cmd-current"); self.assertEqual(result["originTurnId"],NEW_TURN); self.assertEqual(pipe.starts(),[])
 
@@ -2323,8 +1689,8 @@ class CatalogAuditTests(unittest.TestCase):
                 def current_state(self): return old
                 def snapshot_age(self): return self.ages.pop(0) if self.ages else 0
                 def snapshot(self): self.snapshots+=1; self.snapshot_serial=2; return new
-            client=Client(); pipe=SimpleNamespace(verify_server=Mock(), starts=lambda:[]); session=SimpleNamespace(client=client,pipe=pipe,runtime=RUNTIME,close=Mock())
-            with patch.object(h,"_current_target",return_value=target), patch.object(h,"_prepare",return_value=(session,{})), patch.object(h,"_validate_state"), patch.object(h,"_verify_runtime",return_value=RUNTIME) as vr, patch.object(h,"_verify_current_runner_ancestor") as va, patch.object(h,"_public_info",return_value={}):
+            client=Client(); pipe=SimpleNamespace(verify_server=Mock(), starts=lambda:[]); session=SimpleNamespace(client=client,pipe=pipe,process=PROCESS,close=Mock())
+            with patch.object(h,"_current_target",return_value=target), patch.object(h,"_prepare",return_value=(session,{})), patch.object(h,"_validate_observed_state"), patch.object(h,"_verify_process_identity",return_value=PROCESS) as vr, patch.object(h,"_verify_current_runner_ancestor") as va, patch.object(h,"_public_info",return_value={}):
                 result=h._current_result_classification(directory)
             self.assertEqual(result["commandId"],"cmd-fresh"); self.assertEqual(result["resultTurnId"],NEW_TURN); self.assertEqual(client.snapshots,1); self.assertEqual(vr.call_count,2); self.assertEqual(va.call_count,2); pipe.verify_server.assert_called_once()
 
@@ -2341,8 +1707,8 @@ class CatalogAuditTests(unittest.TestCase):
                         if serial_advanced: self.snapshot_serial=2
                         return state
                 client=Client(); ages=iter([0,h.MAX_OBSERVATION_AGE_SECONDS + 1,h.MAX_OBSERVATION_AGE_SECONDS + 1] if not fresh_after else [0,h.MAX_OBSERVATION_AGE_SECONDS + 1,0]); client.snapshot_age=lambda: next(ages,h.MAX_OBSERVATION_AGE_SECONDS + 1)
-                pipe=SimpleNamespace(verify_server=Mock(), starts=lambda:[]); session=SimpleNamespace(client=client,pipe=pipe,runtime=RUNTIME,close=Mock())
-                with patch.object(h,"_current_target",return_value=target), patch.object(h,"_prepare",return_value=(session,{})), patch.object(h,"_validate_state"), patch.object(h,"_verify_runtime",return_value=RUNTIME), patch.object(h,"_verify_current_runner_ancestor"), patch.object(h,"_public_info",return_value={}):
+                pipe=SimpleNamespace(verify_server=Mock(), starts=lambda:[]); session=SimpleNamespace(client=client,pipe=pipe,process=PROCESS,close=Mock())
+                with patch.object(h,"_current_target",return_value=target), patch.object(h,"_prepare",return_value=(session,{})), patch.object(h,"_validate_observed_state"), patch.object(h,"_verify_process_identity",return_value=PROCESS), patch.object(h,"_verify_current_runner_ancestor"), patch.object(h,"_public_info",return_value={}):
                     with self.assertRaises(h.DesktopIpcError) as caught: h._current_result_classification(directory)
                 self.assertEqual(caught.exception.code,"DESKTOP_STATE_UNAVAILABLE")
 
