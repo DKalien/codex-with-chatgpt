@@ -52,6 +52,7 @@ const OPERATIONAL_REASONS = new Set([
   "cas_input_missing", "cas_previous_mismatch", "illegal_transition", "inflight_present",
   "journal_identity_missing", "events_missing", "observed_event_not_found", "observed_event_ambiguous",
   "owner_document_invalid", "owner_generation_missing", "binding_mismatch", "composer_not_empty",
+  "autonomy_rearm_persist_failed",
   "generation_not_idle", "journal_active", "journal_missing", "message_missing", "message_sha256_invalid",
   "not_owner", "document_id_unavailable", "pre_send_identity_missing", "reservation_id_missing",
   "attempt_id_missing", "transport_identity_missing", "claimed_message_mismatch", "claimed_message_sha_mismatch",
@@ -173,6 +174,7 @@ export function emptyAutonomyPolicy() {
     routeCanonical: null,
     armedAt: null,
     lastProductionAttemptAt: null,
+    rearmOnConnect: false,
   };
 }
 
@@ -189,6 +191,7 @@ export function parseAutonomyPolicy(raw) {
     lastProductionAttemptAt: Number.isFinite(raw.lastProductionAttemptAt)
       ? Number(raw.lastProductionAttemptAt)
       : null,
+    rearmOnConnect: raw.rearmOnConnect === true,
   };
 }
 
@@ -196,6 +199,7 @@ export function autonomySummary(policy, extra = {}) {
   const p = parseAutonomyPolicy(policy);
   return {
     mode: p.mode,
+    rearmOnConnect: p.rearmOnConnect,
     identityExact: extra.identityExact === true,
     tickInFlight: extra.tickInFlight === true,
     lastTickAt: Number.isFinite(extra.lastTickAt) ? extra.lastTickAt : null,
@@ -412,15 +416,20 @@ export function policyIdentityExact(policy, transport) {
 export function disarmOnIdentityChange(policy, transport) {
   const p = parseAutonomyPolicy(policy);
   if (p.mode === "off") return { policy: p, changed: false };
+  const disarmed = () => ({
+    ...emptyAutonomyPolicy(),
+    lastProductionAttemptAt: p.lastProductionAttemptAt,
+    rearmOnConnect: p.rearmOnConnect,
+  });
   if (!transport) {
-    return { policy: emptyAutonomyPolicy(), changed: true };
+    return { policy: disarmed(), changed: true };
   }
   if (
     p.bindingId !== transport.bindingId
     || p.epoch !== transport.epoch
     || !areChatgptConversationRoutesEquivalent(p.routeCanonical, transport.routeCanonical)
   ) {
-    return { policy: emptyAutonomyPolicy(), changed: true };
+    return { policy: disarmed(), changed: true };
   }
   return { policy: p, changed: false };
 }

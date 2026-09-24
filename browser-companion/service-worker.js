@@ -257,7 +257,7 @@ async function hydrate() {
   const disarmed = disarmOnIdentityChange(autonomyPolicy, transport);
   if (disarmed.changed) {
     // Memory OFF first; persist fault still leaves scheduler off.
-    autonomyPolicy = emptyAutonomyPolicy();
+    autonomyPolicy = disarmed.policy;
     try {
       await chrome.storage.local.set({ [AUTONOMY_STORAGE_KEY]: autonomyPolicy });
     } catch {
@@ -438,9 +438,14 @@ async function commitAutonomyPolicy(proposed) {
  * Immediate in-memory OFF (scheduler fail closed). Persist after.
  * Persist fault still leaves memory OFF and is reported.
  */
-async function forceAutonomyOff(reason) {
+async function forceAutonomyOff(reason, { clearRearmPreference = false } = {}) {
   const previous = autonomyPolicy;
-  autonomyPolicy = emptyAutonomyPolicy();
+  const parsedPrevious = parseAutonomyPolicy(previous);
+  autonomyPolicy = {
+    ...emptyAutonomyPolicy(),
+    lastProductionAttemptAt: parsedPrevious.lastProductionAttemptAt,
+    rearmOnConnect: clearRearmPreference ? false : parsedPrevious.rearmOnConnect,
+  };
   lastAutonomyDecision = "off";
   lastAutonomyReason = reason || "disarmed";
   try {
@@ -455,6 +460,44 @@ async function forceAutonomyOff(reason) {
     };
   }
   return { ok: true, policy: autonomyPolicy, reason: lastAutonomyReason };
+}
+
+async function rearmAutonomyAfterVerifiedConnect() {
+  const current = parseAutonomyPolicy(autonomyPolicy);
+  if (!current.rearmOnConnect) return { ok: true, mode: current.mode };
+  const routeVerified = storageProtected === true
+    && transport?.authStale !== true
+    && transport?.rebindPending !== true
+    && transport?.routeVerification === "VERIFIED"
+    && typeof transport.bindingId === "string"
+    && Number.isInteger(transport.epoch)
+    && typeof transport.routeCanonical === "string"
+    && ownerState.owner != null
+    && areChatgptConversationRoutesEquivalent(ownerState.owner.canonicalRoute, transport.routeCanonical);
+  if (!routeVerified) {
+    lastAutonomyDecision = "off";
+    lastAutonomyReason = "route_unverified";
+    return { ok: false, mode: "off", reason: lastAutonomyReason };
+  }
+  const proposed = {
+    ...emptyAutonomyPolicy(),
+    mode: "armed",
+    bindingId: transport.bindingId,
+    epoch: transport.epoch,
+    routeCanonical: transport.routeCanonical,
+    armedAt: Date.now(),
+    lastProductionAttemptAt: current.lastProductionAttemptAt,
+    rearmOnConnect: true,
+  };
+  const commit = await commitAutonomyPolicy(proposed);
+  if (!commit.ok) {
+    lastAutonomyDecision = "off";
+    lastAutonomyReason = "autonomy_rearm_persist_failed";
+    return { ok: false, mode: "off", reason: lastAutonomyReason };
+  }
+  lastAutonomyDecision = null;
+  lastAutonomyReason = null;
+  return { ok: true, mode: "armed" };
 }
 
 async function persistSessionOwnership() {
@@ -745,7 +788,7 @@ async function unbindAll() {
   };
   evidence = null;
   ownerProof = null;
-  await forceAutonomyOff("unbind");
+  await forceAutonomyOff("unbind", { clearRearmPreference: true });
   await persistLocal();
   await persistSessionOwnership();
   return statusPayload(-1, null);
@@ -1343,11 +1386,17 @@ async function handleRebindComplete({ managed = false } = {}) {
   connectFlow = nextConnectFlow;
   await forceAutonomyOff("identity_disarm");
   const stateRes = await handleFetchState();
+  const verified = stateRes?.ok === true && stateRes?.status?.routeVerification === "VERIFIED";
+  const autonomy = managed && verified
+    ? await rearmAutonomyAfterVerifiedConnect()
+    : { ok: true, mode: parseAutonomyPolicy(autonomyPolicy).mode };
   return {
-    ok: stateRes?.ok === true && stateRes?.status?.routeVerification === "VERIFIED",
+    ok: verified,
     reason: stateRes?.ok ? undefined : stateRes?.reason,
     routeVerification: stateRes?.status?.routeVerification ?? "PENDING",
     productionEligible: stateRes?.status?.productionEligible === true,
+    autonomy: autonomy.mode,
+    autonomyReason: autonomy.ok ? undefined : autonomy.reason,
     retryAllowed: false,
   };
 }
@@ -1462,7 +1511,14 @@ async function handleConnectPage(sender, message) {
     if (!transport.rebindPending && areChatgptConversationRoutesEquivalent(transport.routeCanonical, canonicalRoute)) {
       const current = await handleFetchState();
       if (current?.ok && current.status?.routeVerification === "VERIFIED") {
-        return { ok: true, state: "CONNECTED", routeVerification: "VERIFIED", autonomy: "off" };
+        const autonomy = await rearmAutonomyAfterVerifiedConnect();
+        return {
+          ok: true,
+          state: "CONNECTED",
+          routeVerification: "VERIFIED",
+          autonomy: autonomy.mode,
+          autonomyReason: autonomy.ok ? undefined : autonomy.reason,
+        };
       }
       currentPairPending = current?.ok === true
         && current.status?.routeVerification === "PENDING";
@@ -1546,11 +1602,15 @@ async function handleConnectPage(sender, message) {
         return { ok: false, reason: "connect_done_persist_failed", retryAllowed: false };
       }
     }
+    const autonomy = attested.serverConfirmed === true
+      ? await rearmAutonomyAfterVerifiedConnect()
+      : { ok: true, mode: parseAutonomyPolicy(autonomyPolicy).mode };
     return {
       ok: true,
       state: attested.serverConfirmed === true ? "CONNECTED" : "AWAITING_CONFIRMATION",
       routeVerification: attested.routeVerification,
-      autonomy: "off",
+      autonomy: autonomy.mode,
+      autonomyReason: autonomy.ok ? undefined : autonomy.reason,
     };
   } finally {
     connectInFlight = false;
@@ -1852,7 +1912,7 @@ async function handleClearTransport() {
     return { ok: false, reason: "journal_active", journalState: journal.state };
   }
   transport = null;
-  await forceAutonomyOff("transport_clear");
+  await forceAutonomyOff("transport_clear", { clearRearmPreference: true });
   await persistTransport();
   // Durable route-attest fence is NOT cleared here. Transport clear must not
   // silently authorize the same challenge again; only re-pair with a new
@@ -2147,7 +2207,9 @@ async function handleMessage(message, sender, { transportMutationHeld = false } 
             const completed = await runTransportMutation(
               () => maybeCompleteConnectedRebind(ownerExact),
             );
-            if (completed?.ok) lastAutonomyReason = "connect_rebind_verified";
+            if (completed?.ok) {
+              lastAutonomyReason = completed.autonomyReason || "connect_rebind_verified";
+            }
           } catch {
             // Read-only status or fenced completion failure never resends attestation/complete.
           }
@@ -2171,7 +2233,15 @@ async function handleMessage(message, sender, { transportMutationHeld = false } 
                 lastAutonomyReason = "route_attest_server_verified";
                 if (restartSafeConnectPoll || connectFlow.state === "ATTEST_REQUESTED") {
                   connectFlow = finishConnectFlow(connectFlow, flowIdentity, "DONE");
-                  await persistConnectFlow();
+                  if (await persistConnectFlow()) {
+                    const currentFlowIdentity = connectFlowIdentity(transport);
+                    if (connectFlow.state === "DONE"
+                      && currentFlowIdentity
+                      && connectFlowMatches(connectFlow, currentFlowIdentity)) {
+                      const autonomy = await rearmAutonomyAfterVerifiedConnect();
+                      if (!autonomy.ok) lastAutonomyReason = autonomy.reason;
+                    }
+                  }
                 }
               }
             } catch {
@@ -2320,7 +2390,7 @@ async function handleMessage(message, sender, { transportMutationHeld = false } 
       return { ok: false, reason: "autonomy_payload_forbidden" };
     }
     if (message.type === "c2c.autonomy.disable") {
-      const off = await forceAutonomyOff("manual_disable");
+      const off = await forceAutonomyOff("manual_disable", { clearRearmPreference: true });
       return {
         ok: off.ok === true,
         mode: "off",
@@ -2356,6 +2426,7 @@ async function handleMessage(message, sender, { transportMutationHeld = false } 
       routeCanonical: transport.routeCanonical,
       armedAt: Date.now(),
       lastProductionAttemptAt: autonomyPolicy.lastProductionAttemptAt,
+      rearmOnConnect: mode === "armed" ? true : parseAutonomyPolicy(autonomyPolicy).rearmOnConnect,
     };
     const commit = await commitAutonomyPolicy(proposed);
     if (!commit.ok) {

@@ -146,9 +146,11 @@ describe("E1b3d3b2 autonomy policy", () => {
   });
   it("A. default / hydrate parse → OFF", () => {
     expect(emptyAutonomyPolicy().mode).toBe("off");
+    expect(emptyAutonomyPolicy().rearmOnConnect).toBe(false);
     expect(parseAutonomyPolicy(undefined).mode).toBe("off");
     expect(parseAutonomyPolicy(null).mode).toBe("off");
     expect(parseAutonomyPolicy({ mode: "nope" }).mode).toBe("off");
+    expect(parseAutonomyPolicy({ rearmOnConnect: "true" }).rearmOnConnect).toBe(false);
   });
 
   it("A2. parse keeps valid mode and identity fields", () => {
@@ -159,9 +161,11 @@ describe("E1b3d3b2 autonomy policy", () => {
       routeCanonical: ROUTE,
       armedAt: 1,
       lastProductionAttemptAt: 2,
+      rearmOnConnect: true,
     });
     expect(p.mode).toBe("armed");
     expect(p.lastProductionAttemptAt).toBe(2);
+    expect(p.rearmOnConnect).toBe(true);
   });
 
   it("B. shadow ready>0 → would_reserve_and_send with zero mutations planned", () => {
@@ -358,14 +362,21 @@ describe("E1b3d3b2 autonomy policy", () => {
   });
 
   it("N. identity change disarms armed policy", () => {
-    const armed = armedPolicy();
+    const armed = armedPolicy({ rearmOnConnect: true, lastProductionAttemptAt: 123 });
     const same = disarmOnIdentityChange(armed, TRANSPORT);
     expect(same.changed).toBe(false);
     const other = disarmOnIdentityChange(armed, { ...TRANSPORT, epoch: 2 });
     expect(other.changed).toBe(true);
-    expect(other.policy.mode).toBe("off");
+    expect(other.policy).toMatchObject({
+      mode: "off",
+      rearmOnConnect: true,
+      lastProductionAttemptAt: 123,
+      bindingId: null,
+      epoch: null,
+      routeCanonical: null,
+    });
     const noTransport = disarmOnIdentityChange(armed, null);
-    expect(noTransport.policy.mode).toBe("off");
+    expect(noTransport.policy).toMatchObject({ mode: "off", rearmOnConnect: true });
   });
 
   it("O. disable does not touch journal (policy only)", () => {
@@ -434,12 +445,13 @@ describe("E1b3d3b2 autonomy policy", () => {
   });
 
   it("summary is diagnostic-only safe fields", () => {
-    const s = autonomySummary(armedPolicy({ lastProductionAttemptAt: 99 }), {
+    const s = autonomySummary(armedPolicy({ lastProductionAttemptAt: 99, rearmOnConnect: true }), {
       identityExact: true,
       lastDecision: "cooldown",
       lastReason: "production_cooldown",
     });
     expect(s.mode).toBe("armed");
+    expect(s.rearmOnConnect).toBe(true);
     expect(JSON.stringify(s)).not.toContain("credential");
     expect(JSON.stringify(s)).not.toContain("message");
     expect(s.lastProductionAttemptAt).toBe(99);

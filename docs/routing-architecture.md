@@ -154,7 +154,8 @@ Planner route → Project → Command → Executor route → ExecutionResult →
   必须匹配当前 binding；已有 Desktop delivery 的 replay 必须匹配原 delivery 的 `bindingId`，并返回原 public
   delivery。不同 binding 沿用 `DESKTOP_BINDING_MISMATCH` / `DESKTOP_COMMAND_CONFLICT` 拒绝，不二次发送。
 - 新 Command 还要求当前 Companion planner route 已 VERIFIED；缺少 authority 时 routing 错误原样返回，发送不进入 IPC。
-- 仅 `codex_desktop_send` 接入；不接 feedback / ExecutionResult，不宣称 one-click bind/reconnect UX 完成。
+- 仅 `codex_desktop_send` 接入；不接 feedback / ExecutionResult。Browser Companion 重连 UX 由独立 R3f
+  提供，不改变本 slice 的 routing/send 边界。
 
 ## R2 状态（2026-09-24）
 
@@ -170,5 +171,6 @@ R3e 将现有 `codex_desktop_send` 接到 R3d adapter；底层仍复用原 Deskt
   wiring 不变，不新增 MCP tool。
 - 不做 feedback/ExecutionResult 回流或 executor 执行通道。
 - 不修改 Desktop IPC trust、Companion transport、rollout、OAuth 门禁。
-- 不做 rawSummary/machineEvidence（R4）或一键绑定/重连 UX；R3a/R3b 派生 routes，R3c 创建 Command，R3d
-  提供 Desktop delivery adapter，R3e 仅接通现有 send tool。
+- 不做 rawSummary/machineEvidence（R4）。R3a/R3b 派生 routes，R3c 创建 Command，R3d 提供 Desktop
+  delivery adapter，R3e 接通现有 send tool；R3f 的一键重连 UX 位于 Browser Companion，不创建第二套路由
+  authority 或持久 current/default route pointer。

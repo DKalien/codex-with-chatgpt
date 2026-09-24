@@ -140,6 +140,25 @@ describe("popup classic packaging", () => {
 });
 
 describe("popup Bridge permission and Pair separation", () => {
+  it("shows the saved auto-rearm preference and restores the pause prompt when cleared", async () => {
+    const transport = { connected: true, routeVerification: "VERIFIED", productionEligible: true };
+    const saved = await loadPopup(true, true, {
+      status: { transport, autonomy: { mode: "off", rearmOnConnect: true } },
+    });
+    expect(saved.elements.get("user-action-hint")!.textContent)
+      .toContain("连接后将自动恢复自动回流");
+    expect(saved.elements.get("autonomy-disable")!.disabled).toBe(false);
+
+    const paused = await loadPopup(true, true, {
+      status: { transport, autonomy: { mode: "off", rearmOnConnect: false } },
+    });
+    expect(paused.elements.get("user-action-hint")!.textContent)
+      .toContain("如需自动回流，请勾选确认后开启。");
+    expect(paused.elements.get("user-action-hint")!.textContent)
+      .not.toContain("连接后将自动恢复自动回流");
+    expect(paused.elements.get("autonomy-disable")!.disabled).toBe(true);
+  });
+
   it("Connect uses one fixed content-script request and no popup identity or owner proof", async () => {
     const { calls, elements } = await loadPopup(true);
     elements.get("bridge-origin")!.value = "https://bridge.example.test";

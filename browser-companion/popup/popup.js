@@ -389,6 +389,7 @@
     const autonomy = status?.autonomy ?? {};
     const autonomyMode = autonomy.mode ?? "off";
     const armed = autonomyMode === "armed";
+    const rearmOnConnect = autonomy.rearmOnConnect === true;
     const [connectionText, connectionClass] = friendlyConnectState(
       transport,
       isOwner,
@@ -397,9 +398,7 @@
     const ownerNeedsReconnect = connectionText === "当前页面需要重新连接";
     setText(els.userConnectionStatus, connectionText, connectionClass);
     setText(els.userAutonomyStatus, armed ? "已开启" : "未开启", armed ? "ok" : "warn");
-    setText(
-      els.userActionHint,
-      ownerNeedsReconnect
+    const actionHint = ownerNeedsReconnect
       ? "页面刷新后需要重新确认当前页面，请点击“连接当前对话”。"
       : connectionText === "当前对话已连接"
       ? (armed ? "执行结果会自动回到当前对话。" : "如需自动回流，请勾选确认后开启。")
@@ -407,7 +406,10 @@
           ? "请回到 ChatGPT 完成确认。"
           : transport?.connected
             ? "请完成当前对话验证；如未自动出现验证消息，可展开连接设置。"
-            : "点击“连接当前对话”开始使用。遇到问题可展开连接设置。"),
+            : "点击“连接当前对话”开始使用。遇到问题可展开连接设置。");
+    setText(
+      els.userActionHint,
+      rearmOnConnect && !armed ? `${actionHint} 连接后将自动恢复自动回流。` : actionHint,
       connectionClass,
     );
     if (els.autonomyStatus) {
@@ -474,7 +476,7 @@
     updateAutonomyArmEnabled();
     updateRouteVerifyEnabled();
     if (els.autonomyDisable) {
-      els.autonomyDisable.disabled = autonomyMode === "off";
+      els.autonomyDisable.disabled = autonomyMode === "off" && !rearmOnConnect;
     }
 
     if (els.productionStatus) {

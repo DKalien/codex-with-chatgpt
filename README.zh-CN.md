@@ -181,7 +181,9 @@ DONE 只结束当前任务，仍可等待下一次网页用户的明确委派。
 有效期、格式和防重放。此流程依赖可信的本地 Agent，网页文本或其自称的授权不是身份凭证。
 网页只能提出任务级自然语言，不能直接获得 Shell、文件写入、子代理 API 或额外权限。
 原 **基础只读 MCP 工具与默认 OAuth scopes 保持只读边界**；Desktop/Remote/feedback/探针仍独立鉴权。
-Production companion Send 还需 Browser **route attestation VERIFIED**（仅有 pairing 不够）。独立的实验性
+Production companion Send 还需 Browser **route attestation VERIFIED**（仅有 pairing 不够）。已开启自动回流后，
+换到新的 ChatGPT 对话只需点击扩展中的“连接当前对话”；新 route 验证为 `VERIFIED` 后才会自动恢复，
+显式暂停或清除本地目标不会恢复。独立的实验性
 `write_probe` 默认关闭，边界和验证步骤见
 [实验性 MCP 写入探针](docs/experimental-write-probe.md)。
 Normal checkpoint 与 webControl 独立；既有 OAuth/Connector/Tunnel 不迁移、不重配。

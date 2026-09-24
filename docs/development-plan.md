@@ -859,9 +859,9 @@ H0 不抽象 Codex-specific result classification、terminal fence、receipt fin
   role 或 locator 冲突 fail closed。ensure 注册后会 recheck authority；期间目标变化则抛
   `ROUTE_AUTHORITY_CHANGED`，可能留下的旧 route 仅是 catalog/history，不作为 current 返回。
 - 未在 routing schema/store 增加 active/default/current route pointer；helper 不写 feedback state。
-- 本 slice 不接入 Desktop send、feedback send、route-confirm MCP 或 Browser Companion，亦不宣称
-  one-click bind/reconnect UX 已完成。返回值是时点快照而非 lease；未来调用方须在副作用边界重新解析，
-  不得跨 await / 进程边界沿用。后续调用方与 UX 仍需单独设计/授权。
+- 本 slice 不接入 Desktop send、feedback send、route-confirm MCP 或 Browser Companion；其 route 返回值是
+  时点快照而非 lease，调用方须在副作用边界重新解析，不得跨 await / 进程边界沿用。Browser Companion
+  重连体验在独立 R3f slice 完成，未改变此 route authority。
 
 ## R3b — derived current executor route（2026-09-24，routing foundation 完成）
 
@@ -899,4 +899,15 @@ H0 不抽象 Codex-specific result classification、terminal fence、receipt fin
   `DESKTOP_BINDING_MISMATCH` / `DESKTOP_COMMAND_CONFLICT` 拒绝。
 - 新 Command 要求当前 Companion planner route VERIFIED；`RoutingError` 保留明确 code/message。workspace mismatch
   与 Desktop/OAuth 错误映射保持明确，不改变 `codex_desktop_status`。
-- 未新增 MCP tool、确认、队列或状态机；不接 feedback / ExecutionResult，也不宣称 one-click/reconnect UX 完成。
+- 未新增 MCP tool、确认、队列或状态机；不接 feedback / ExecutionResult。Browser Companion 重连 UX
+  由独立 R3f slice 提供，不改变本 slice 的 routing/send 边界。
+
+## R3f — Browser Companion 一键重连自动恢复（2026-09-24，完成）
+
+- 用户成功开启自动回流后，显式点击“连接当前对话”可在新绑定完成且 authenticated route attestation 为
+  `VERIFIED` 后，基于新 binding / epoch / route 写入 fresh ARMED policy；旧会话的 ARMED authority 不迁移。
+- `rearmOnConnect` 仅是偏好，不是发送 authority；身份变化、连接过程和验证降级先关闭 autonomy。
+  手动暂停、显式 unbind、清除 transport 会清除此偏好；重连后的真实发送门禁不变。
+- 自动恢复持久化失败时 route connection 仍可保持 VERIFIED，但 autonomy 保持 OFF；不重复 attestation。
+- R3a–R3e 提供 derived routing 与现有 Desktop send 接线；R3f 提供 Companion reconnect UX。R3 完成，
+  不包含 feedback / ExecutionResult 或 R4。

@@ -19,7 +19,7 @@ const EVIDENCE_KEY = "c2c_companion_evidence_v1";
 const CONNECT_KEY = "c2c_companion_connect_flow_v1";
 const AUTONOMY_KEY = "c2c_companion_autonomy_v1";
 
-function storageArea(initial: Record<string, unknown>, failAutonomyPersist = false) {
+function storageArea(initial: Record<string, unknown>, failAutonomyPersist = false, failArmedAutonomyPersist = false) {
   const values = new Map(Object.entries(initial));
   return {
     values,
@@ -31,6 +31,9 @@ function storageArea(initial: Record<string, unknown>, failAutonomyPersist = fal
     async set(row: Record<string, unknown>) {
       if (failAutonomyPersist && Object.hasOwn(row, AUTONOMY_KEY)) {
         throw new Error("autonomy storage unavailable");
+      }
+      if (failArmedAutonomyPersist && (row[AUTONOMY_KEY] as { mode?: string } | undefined)?.mode === "armed") {
+        throw new Error("armed autonomy storage unavailable");
       }
       for (const [key, value] of Object.entries(row)) values.set(key, value);
     },
@@ -104,6 +107,7 @@ async function loadWorker(body: Record<string, unknown>, opts: {
   connectFlow?: Record<string, unknown>;
   routeFence?: Record<string, unknown>;
   failAutonomyPersist?: boolean;
+  failArmedAutonomyPersist?: boolean;
   autonomyPolicy?: Record<string, unknown>;
   fetch?: (url: unknown, init?: unknown) => Promise<unknown>;
   tabsSendMessage?: (tabId: number, message: Record<string, unknown>) => Promise<unknown>;
@@ -123,7 +127,11 @@ async function loadWorker(body: Record<string, unknown>, opts: {
   if (opts.connectFlow) initial.local[CONNECT_KEY] = opts.connectFlow;
   if (opts.routeFence) initial.local[FENCE_KEY] = opts.routeFence;
   if (opts.autonomyPolicy) initial.local[AUTONOMY_KEY] = opts.autonomyPolicy;
-  const local = storageArea(initial.local, opts.failAutonomyPersist === true);
+  const local = storageArea(
+    initial.local,
+    opts.failAutonomyPersist === true,
+    opts.failArmedAutonomyPersist === true,
+  );
   const session = storageArea(initial.session);
   let messageListener: ((message: unknown, sender: unknown, sendResponse: (response: unknown) => void) => unknown) | null = null;
   const tabsSendMessage = vi.fn(opts.tabsSendMessage ?? (async () => ({ ok: true })));
@@ -210,10 +218,22 @@ describe("G4c one-click connect orchestration", () => {
     };
   }
 
-  it("binds the real sender, sends attestation once, then heartbeat completes once", async () => {
+  it.each([false, true])(
+    "binds the real sender, then heartbeat completes once (rearm persist failure=%s)",
+    async (failRearmPersistence) => {
     const urls: string[] = [];
     const worker = await loadWorker(responseBody(), {
       oldRoute: OLD_ROUTE,
+      failArmedAutonomyPersist: failRearmPersistence,
+      autonomyPolicy: {
+        mode: "armed",
+        bindingId: OLD_BINDING,
+        epoch: OLD_EPOCH,
+        routeCanonical: OLD_ROUTE,
+        armedAt: 100,
+        lastProductionAttemptAt: 123456,
+        rearmOnConnect: true,
+      },
       tabsSendMessage: async (_tabId, message) => message.type === "c2c.route.attest.execute"
         ? { ok: true, observed: true, mutationAttempted: true, clickAttempted: true }
         : { ok: true },
@@ -246,6 +266,13 @@ describe("G4c one-click connect orchestration", () => {
       ok: boolean; state?: string;
     };
     expect(connected).toMatchObject({ ok: true, state: "AWAITING_CONFIRMATION" });
+    expect(worker.local.values.get(AUTONOMY_KEY)).toMatchObject({
+      mode: "off",
+      rearmOnConnect: true,
+      bindingId: null,
+      epoch: null,
+      routeCanonical: null,
+    });
     expect(worker.tabsSendMessage).toHaveBeenCalledTimes(1);
     expect(urls.filter(url => url.includes("/rebind/init"))).toHaveLength(1);
     const duplicate = await worker.send({
@@ -265,11 +292,138 @@ describe("G4c one-click connect orchestration", () => {
       rebindPending: false,
     });
     expect(worker.local.values.get(CONNECT_KEY)).toMatchObject({ state: "DONE", challengeId: CHALLENGE });
+    expect(worker.local.values.get(AUTONOMY_KEY)).toMatchObject(failRearmPersistence
+      ? { mode: "off", rearmOnConnect: true, bindingId: null, epoch: null, routeCanonical: null }
+      : {
+          mode: "armed",
+          bindingId: NEW_BINDING,
+          epoch: OLD_EPOCH + 1,
+          routeCanonical: ROUTE,
+          rearmOnConnect: true,
+          lastProductionAttemptAt: 123456,
+        });
+    if (!failRearmPersistence) {
+      expect((worker.local.values.get(AUTONOMY_KEY) as { armedAt: number }).armedAt).toBeGreaterThan(100);
+    }
     const status = await worker.send({
       type: "c2c.status.page", href: ROUTE, generation: 1, safety,
     }, sender) as Record<string, any>;
     expect(status.connectState).toBe("DONE");
-    expect(status.autonomy.mode).toBe("off");
+    expect(status.autonomy.mode).toBe(failRearmPersistence ? "off" : "armed");
+    expect(status.autonomy.rearmOnConnect).toBe(true);
+    if (failRearmPersistence) {
+      expect(status.autonomy.lastReason).toBe("autonomy_rearm_persist_failed");
+    }
+  });
+
+  it("hydration disarms a changed identity but retains the explicit rearm preference", async () => {
+    const worker = await loadWorker(responseBody(), {
+      autonomyPolicy: {
+        mode: "armed",
+        bindingId: "99999999-9999-4999-8999-999999999999",
+        epoch: OLD_EPOCH,
+        routeCanonical: ROUTE,
+        armedAt: 100,
+        lastProductionAttemptAt: 123456,
+        rearmOnConnect: true,
+      },
+    });
+    expect(worker.local.values.get(AUTONOMY_KEY)).toMatchObject({
+      mode: "off",
+      bindingId: null,
+      epoch: null,
+      routeCanonical: null,
+      rearmOnConnect: true,
+      lastProductionAttemptAt: 123456,
+    });
+  });
+
+  it("successful explicit Arm saves the rearm-on-connect preference", async () => {
+    const worker = await loadWorker(verifiedState({
+      companionId: OLD_COMPANION,
+      bindingId: OLD_BINDING,
+      epoch: OLD_EPOCH,
+    }), { transport: { routeVerification: "VERIFIED" } });
+    const result = await worker.send({ type: "c2c.autonomy.arm" }, {}) as Record<string, any>;
+    expect(result).toMatchObject({ ok: true, mode: "armed", policy: { rearmOnConnect: true } });
+  });
+
+  it("a route with no saved preference stays OFF after Connect", async () => {
+    const worker = await loadWorker(verifiedState({
+      companionId: OLD_COMPANION,
+      bindingId: OLD_BINDING,
+      epoch: OLD_EPOCH,
+    }), { transport: { routeVerification: "VERIFIED" } });
+    const sender = { tab: { id: 7 }, documentId: "document-g4-rebind", frameId: 0, url: ROUTE };
+    const result = await worker.send({
+      type: "c2c.connect.page",
+      generation: 1,
+      safety: { composer: "empty", generation: "idle", safe: true },
+    }, sender);
+    expect(result).toMatchObject({ ok: true, state: "CONNECTED", autonomy: "off" });
+    expect(worker.local.values.get(AUTONOMY_KEY)).toMatchObject({ mode: "off", rearmOnConnect: false });
+    expect(worker.tabsSendMessage).not.toHaveBeenCalled();
+  });
+
+  it("manual disable clears the preference and Connect does not rearm it", async () => {
+    const worker = await loadWorker(verifiedState({
+      companionId: OLD_COMPANION,
+      bindingId: OLD_BINDING,
+      epoch: OLD_EPOCH,
+    }), {
+      transport: { routeVerification: "VERIFIED" },
+      autonomyPolicy: {
+        mode: "armed",
+        bindingId: OLD_BINDING,
+        epoch: OLD_EPOCH,
+        routeCanonical: ROUTE,
+        armedAt: 100,
+        rearmOnConnect: true,
+      },
+    });
+    expect(await worker.send({ type: "c2c.autonomy.disable" }, {})).toMatchObject({ ok: true, mode: "off" });
+    expect(worker.local.values.get(AUTONOMY_KEY)).toMatchObject({ mode: "off", rearmOnConnect: false });
+    const sender = { tab: { id: 7 }, documentId: "document-g4-rebind", frameId: 0, url: ROUTE };
+    const result = await worker.send({
+      type: "c2c.connect.page",
+      generation: 1,
+      safety: { composer: "empty", generation: "idle", safe: true },
+    }, sender);
+    expect(result).toMatchObject({ ok: true, state: "CONNECTED", autonomy: "off" });
+    expect(worker.local.values.get(AUTONOMY_KEY)).toMatchObject({ mode: "off", rearmOnConnect: false });
+  });
+
+  it("explicit unbind clears the auto-rearm preference", async () => {
+    const worker = await loadWorker(responseBody(), {
+      autonomyPolicy: {
+        mode: "armed",
+        bindingId: OLD_BINDING,
+        epoch: OLD_EPOCH,
+        routeCanonical: ROUTE,
+        armedAt: 100,
+        rearmOnConnect: true,
+      },
+    });
+
+    await worker.send({ type: "c2c.unbind" });
+
+    expect(worker.local.values.get(AUTONOMY_KEY)).toMatchObject({ mode: "off", rearmOnConnect: false });
+  });
+
+  it("explicit transport clear clears the auto-rearm preference", async () => {
+    const worker = await loadWorker(responseBody(), {
+      autonomyPolicy: {
+        mode: "armed",
+        bindingId: OLD_BINDING,
+        epoch: OLD_EPOCH,
+        routeCanonical: ROUTE,
+        armedAt: 100,
+        rearmOnConnect: true,
+      },
+    });
+
+    expect(await worker.send({ type: "c2c.transport.clear" })).toMatchObject({ ok: true });
+    expect(worker.local.values.get(AUTONOMY_KEY)).toMatchObject({ mode: "off", rearmOnConnect: false });
   });
 
   it("holds the mutation gate across route attestation RPC and persistence", async () => {
@@ -452,6 +606,7 @@ describe("G4c one-click connect orchestration", () => {
   it("is idempotent for exact VERIFIED state with zero route DOM Send", async () => {
     const worker = await loadWorker(responseBody(), {
       transport: { routeVerification: "VERIFIED" },
+      autonomyPolicy: { mode: "off", rearmOnConnect: true },
       fetch: async (url) => String(url).endsWith("/state")
         ? jsonResponse(200, verifiedState({
             companionId: OLD_COMPANION,
@@ -467,6 +622,13 @@ describe("G4c one-click connect orchestration", () => {
       safety: { composer: "empty", generation: "idle", safe: true },
     }, sender);
     expect(result).toMatchObject({ ok: true, state: "CONNECTED", routeVerification: "VERIFIED" });
+    expect(worker.local.values.get(AUTONOMY_KEY)).toMatchObject({
+      mode: "armed",
+      bindingId: OLD_BINDING,
+      epoch: OLD_EPOCH,
+      routeCanonical: ROUTE,
+      rearmOnConnect: true,
+    });
     expect(worker.tabsSendMessage).not.toHaveBeenCalled();
     expect(worker.fetchMock).toHaveBeenCalledTimes(1);
   });
