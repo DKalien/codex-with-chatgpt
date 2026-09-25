@@ -357,6 +357,7 @@ const areChatgptConversationRoutesEquivalent = globalThis.areChatgptConversation
   if (typeof parser !== "function") return false;
   try { return parser(left, { conversationIdPolicy: "uuid" }).canonical === parser(right, { conversationIdPolicy: "uuid" }).canonical; } catch { return false; }
 });
+const matchesSendTargetIdentity = globalThis.matchesSendTargetIdentity;
 ${stripExports(reservationJournalSrc)}
 ${stripExports(sendOrchestratorSrc)}
 ${stripExports(productionRuntimeSrc)}
@@ -382,6 +383,14 @@ if (/globalThis\.(markSendIntent|markClaimed|markReserved|emptyJournal)\s*=/.tes
 }
 if (/globalThis\.(runSendOrchestration|recoverSendOrchestration)\s*=/.test(productionClassic)) {
   fail("classic production-send-runtime must not expose orchestrator globals");
+}
+// R3r: the classic production runtime must consume the SHARED structural Send
+// matcher, never a local data-testid hardcode.
+if (!/matchesSendTargetIdentity\(/.test(productionClassic)) {
+  fail("classic production-send-runtime-global must consume the shared matchesSendTargetIdentity");
+}
+if (/data-testid.*send-button/.test(productionClassic)) {
+  fail("classic production-send-runtime-global must not hardcode data-testid send-button");
 }
 fs.writeFileSync(
   path.join(distCompanion, "production-send-runtime-global.js"),

@@ -48,21 +48,16 @@ import {
   buildMarkerRepresentationDiagnostic,
   sanitizeMarkerRepresentation,
   TURN_DIAGNOSTIC_LIMITS,
-} from "../browser-companion/turn-observer.js";
-import {
-  hasExactAttemptMarker,
-  findCanonicalUserTurn,
-  buildTurnObservationDiagnostic,
-  sanitizeObservationDiagnostic,
-  buildMarkerRepresentationDiagnostic,
-  sanitizeMarkerRepresentation,
-  TURN_DIAGNOSTIC_LIMITS,
   collectBoundedDescendants,
   canonicalTurnBodyMatch,
   hasExactVisibleBodyDescendant,
   snapshotUserTurns,
 } from "../browser-companion/turn-observer.js";
-import { normalizeCanonicalDomText } from "../browser-companion/dom-adapter.js";
+import {
+  matchesSendTargetIdentity,
+  normalizeCanonicalDomText,
+  resolveChatGptAction,
+} from "../browser-companion/dom-adapter.js";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const companionRoot = path.join(projectRoot, "browser-companion");
@@ -2155,6 +2150,405 @@ describe("E1b3d3b packaging regression", () => {
 function pathToFileURLSafe(p: string) {
   return new URL(`file:///${p.replace(/\\/g, "/")}`).href;
 }
+
+describe("E1b3d3b R3r production fallback ready inspector Send parity", () => {
+  // Minimal fake DOM mirroring exactly what the shared matcher/classifier read:
+  // className stays a plain string (hasClass regex), buttons expose
+  // getAttribute/hasAttribute, no real nodes.
+  function fakeBtn(opts: {
+    attrs?: Record<string, string>;
+    className?: string;
+    disabled?: boolean;
+  }) {
+    const attrs = opts.attrs ?? {};
+    return {
+      className: opts.className ?? "",
+      disabled: opts.disabled === true,
+      getAttribute(name: string) {
+        return Object.prototype.hasOwnProperty.call(attrs, name) ? attrs[name] : null;
+      },
+      hasAttribute(name: string) {
+        return Object.prototype.hasOwnProperty.call(attrs, name);
+      },
+      closest() {
+        return null;
+      },
+    };
+  }
+
+  function fakeDoc() {
+    return { querySelector: () => null };
+  }
+
+  function fakeForm(selects: Record<string, unknown>, buttons: unknown[]) {
+    return {
+      querySelector(sel: string) {
+        return Object.prototype.hasOwnProperty.call(selects, sel) ? selects[sel] : null;
+      },
+      querySelectorAll(sel: string) {
+        if (sel === "button") return buttons;
+        return [];
+      },
+    };
+  }
+
+  const CURRENT_TOKENS = "size-token-button-composer bg-composer-primary";
+
+  function fallbackSpy(form: unknown, overrides: Record<string, unknown> = {}) {
+    const editor = { closest: () => form, isContentEditable: true };
+    return makeSpies({
+      // No dedicated ready DI: force the production fallback inspector path.
+      waitForSendReady: undefined,
+      doc: fakeDoc() as never,
+      resolveChatGptComposer: () => ({
+        editor,
+        kind: "contenteditable",
+        form,
+        evidence: "prompt_textarea",
+      }),
+      readCanonicalComposerText: () => ({ ok: true, text: MESSAGE }),
+      resolveChatGptAction: (d: unknown, e: unknown) =>
+        resolveChatGptAction(d as never, e as never),
+      ...overrides,
+    });
+  }
+
+  const HAPPY_PERSIST = [
+    "SEND_INTENT",
+    "CLAIMED",
+    "COMPOSER_WRITE_INTENT",
+    "SEND_DISPATCH_INTENT",
+    "OBSERVED_PENDING_ACK",
+    "NONE",
+  ];
+
+  it("current structural Send ready → exactly one click → exact observation/ACK", async () => {
+    const sendBtn = fakeBtn({ attrs: { type: "submit" }, className: CURRENT_TOKENS });
+    const form = fakeForm({}, [sendBtn]);
+    const spy = fallbackSpy(form);
+    // The real classifier routes this DOM through the structural Send branch.
+    const action = resolveChatGptAction(fakeDoc() as never, { closest: () => form } as never);
+    expect(action).toMatchObject({
+      kind: "send",
+      enabled: true,
+      evidence: "current_submit_send",
+    });
+    expect(matchesSendTargetIdentity(action.button as never)).toBe(true);
+    const r = await runProductionSend(spy);
+    expect(r.ok).toBe(true);
+    expect(spy.calls.beginSend).toBe(1);
+    expect(spy.calls.write).toBe(1);
+    expect(spy.calls.click).toBe(1);
+    expect(spy.calls.ack).toBe(1);
+    expect(spy.calls.persist).toEqual(HAPPY_PERSIST);
+    expect(spy.journal.state).toBe("NONE");
+  });
+
+  it("legacy data-testid Send keeps working through the shared matcher", async () => {
+    const legacyBtn = fakeBtn({
+      attrs: { "data-testid": "send-button", type: "submit" },
+      className: "btn",
+    });
+    const form = fakeForm({ 'button[data-testid="send-button"]': legacyBtn }, [legacyBtn]);
+    const spy = fallbackSpy(form);
+    const action = resolveChatGptAction(fakeDoc() as never, { closest: () => form } as never);
+    expect(action).toMatchObject({
+      kind: "send",
+      enabled: true,
+      evidence: "form_send_button",
+    });
+    expect(matchesSendTargetIdentity(legacyBtn as never)).toBe(true);
+    const r = await runProductionSend(spy);
+    expect(r.ok).toBe(true);
+    expect(spy.calls.click).toBe(1);
+    expect(spy.calls.persist).toEqual(HAPPY_PERSIST);
+    expect(spy.journal.state).toBe("NONE");
+  });
+
+  it("partial structural Send candidate fails closed via shared matcher (zero click)", async () => {
+    const partialBtn = fakeBtn({
+      attrs: { type: "submit" },
+      className: "size-token-button-composer",
+    });
+    expect(matchesSendTargetIdentity(partialBtn as never)).toBe(false);
+    const spy = fallbackSpy(fakeForm({}, []), {
+      resolveChatGptAction: () => ({
+        button: partialBtn,
+        kind: "send",
+        enabled: true,
+        evidence: "current_submit_send",
+      }),
+    });
+    const r = await runProductionSend(spy);
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe("send_target_invalid");
+    expect(spy.calls.click).toBe(0);
+    expect(spy.journal.state).toBe("OUTCOME_UNKNOWN");
+    expect(spy.calls.persist).toContain("OUTCOME_UNKNOWN");
+    expect(spy.calls.persist).not.toContain("SEND_DISPATCH_INTENT");
+  });
+
+  it("disabled Send target is never clicked (classifier + matcher both fail closed)", async () => {
+    // (a) classifier path: enabled=false → send_disabled.
+    const disabledLegacy = fakeBtn({
+      attrs: { "data-testid": "send-button", "aria-disabled": "true" },
+    });
+    const spyA = fallbackSpy(fakeForm({}, []), {
+      resolveChatGptAction: () => ({
+        button: disabledLegacy,
+        kind: "send",
+        enabled: false,
+        evidence: "form_send_button_disabled",
+      }),
+    });
+    const ra = await runProductionSend(spyA);
+    expect(ra.ok).toBe(false);
+    expect(ra.reason).toBe("send_disabled");
+    expect(spyA.calls.click).toBe(0);
+    expect(spyA.journal.state).toBe("OUTCOME_UNKNOWN");
+
+    // (b) matcher path: claimed enabled but the button is aria-disabled →
+    // the shared matcher rejects it as a Send target.
+    const ariaDisabled = fakeBtn({
+      attrs: { type: "submit", "aria-disabled": "true" },
+      className: CURRENT_TOKENS,
+    });
+    expect(matchesSendTargetIdentity(ariaDisabled as never)).toBe(false);
+    const spyB = fallbackSpy(fakeForm({}, []), {
+      resolveChatGptAction: () => ({
+        button: ariaDisabled,
+        kind: "send",
+        enabled: true,
+        evidence: "current_submit_send",
+      }),
+    });
+    const rb = await runProductionSend(spyB);
+    expect(rb.ok).toBe(false);
+    expect(rb.reason).toBe("send_target_invalid");
+    expect(spyB.calls.click).toBe(0);
+    expect(spyB.journal.state).toBe("OUTCOME_UNKNOWN");
+  });
+
+  it("Stop identity never becomes a click target (generation_active)", async () => {
+    const stopBtn = fakeBtn({ attrs: { "data-testid": "stop-button" } });
+    const doc = {
+      querySelector(sel: string) {
+        return sel === 'button[data-testid="stop-button"]' ? stopBtn : null;
+      },
+    };
+    const form = fakeForm({}, []);
+    const editor = { closest: () => form, isContentEditable: true };
+    const spy = makeSpies({
+      waitForSendReady: undefined,
+      doc: doc as never,
+      resolveChatGptComposer: () => ({
+        editor,
+        kind: "contenteditable",
+        form,
+        evidence: "prompt_textarea",
+      }),
+      readCanonicalComposerText: () => ({ ok: true, text: MESSAGE }),
+      resolveChatGptAction: (d: unknown, e: unknown) =>
+        resolveChatGptAction(d as never, e as never),
+    });
+    const action = resolveChatGptAction(doc as never, editor as never);
+    expect(action).toMatchObject({ kind: "stop", evidence: "legacy_stop" });
+    const r = await runProductionSend(spy);
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe("generation_active");
+    expect(spy.calls.click).toBe(0);
+    expect(spy.journal.state).toBe("OUTCOME_UNKNOWN");
+  });
+
+  it("blank-composer voice control keeps polling idle and never clicks", async () => {
+    const voiceBtn = fakeBtn({
+      attrs: { "aria-label": "开始语音" },
+      className: CURRENT_TOKENS,
+    });
+    const form = {
+      querySelector: () => null,
+      querySelectorAll(sel: string) {
+        if (sel === "button") return [voiceBtn];
+        if (sel === 'button[aria-label="开始语音"]') return [voiceBtn];
+        return [];
+      },
+    };
+    const spy = fallbackSpy(form, { sendReadyTimeoutMs: 0 });
+    const action = resolveChatGptAction(fakeDoc() as never, { closest: () => form } as never);
+    expect(action).toMatchObject({
+      kind: "idle",
+      button: null,
+      evidence: "current_voice_idle",
+    });
+    const r = await runProductionSend(spy);
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe("send_ready_timeout");
+    expect(spy.calls.click).toBe(0);
+    expect(spy.journal.state).toBe("OUTCOME_UNKNOWN");
+  });
+
+  it("malformed / incomplete structural DOM still fails closed", async () => {
+    // (a) multiple complete structural candidates → classifier unknown.
+    const b1 = fakeBtn({ attrs: { type: "submit" }, className: CURRENT_TOKENS });
+    const b2 = fakeBtn({ attrs: { type: "submit" }, className: CURRENT_TOKENS });
+    const multiForm = fakeForm({}, [b1, b2]);
+    const spyA = fallbackSpy(multiForm);
+    expect(
+      resolveChatGptAction(fakeDoc() as never, { closest: () => multiForm } as never).kind,
+    ).toBe("unknown");
+    const ra = await runProductionSend(spyA);
+    expect(ra.ok).toBe(false);
+    expect(ra.reason).toBe("generation_unknown");
+    expect(spyA.calls.click).toBe(0);
+
+    // (b) zero buttons → classifier unknown.
+    const emptyForm = fakeForm({}, []);
+    const spyB = fallbackSpy(emptyForm);
+    const rb = await runProductionSend(spyB);
+    expect(rb.ok).toBe(false);
+    expect(rb.reason).toBe("generation_unknown");
+    expect(spyB.calls.click).toBe(0);
+
+    // (c) identity drift: classifier claims send with a null button →
+    // the shared matcher fails closed.
+    const spyC = fallbackSpy(fakeForm({}, []), {
+      resolveChatGptAction: () => ({
+        button: null,
+        kind: "send",
+        enabled: true,
+        evidence: "current_submit_send",
+      }),
+    });
+    const rc = await runProductionSend(spyC);
+    expect(rc.ok).toBe(false);
+    expect(rc.reason).toBe("send_target_invalid");
+    expect(spyC.calls.click).toBe(0);
+    expect(spyC.journal.state).toBe("OUTCOME_UNKNOWN");
+  });
+
+  it("R3r source drift: fallback inspector consumes the shared matcher only", () => {
+    const src = fs.readFileSync(
+      path.join(companionRoot, "production-send-runtime.js"),
+      "utf8",
+    );
+    expect(src).toMatch(
+      /import\s*\{[\s\S]*?matchesSendTargetIdentity[\s\S]*?\}\s*from\s*"\.\/dom-adapter\.js";/,
+    );
+    expect(src).toMatch(/typeof matchesSendTargetIdentity !== "function"/);
+    expect(src).toMatch(/matchesSendTargetIdentity\(action\.button\)/);
+    // No local Send identity hardcode may reappear in the production runtime.
+    expect(src).not.toMatch(/data-testid/);
+  });
+
+  it("R3r build drift: classic production runtime binds and consumes the shared matcher", () => {
+    const classicPath = path.join(distCompanion, "production-send-runtime-global.js");
+    if (!fs.existsSync(classicPath)) {
+      expect(true).toBe(true);
+      return;
+    }
+    const classic = fs.readFileSync(classicPath, "utf8");
+    expect(classic).toMatch(
+      /const matchesSendTargetIdentity = globalThis\.matchesSendTargetIdentity;/,
+    );
+    expect(classic).toMatch(/matchesSendTargetIdentity\(action\.button\)/);
+    expect(classic).not.toMatch(/data-testid.*send-button/);
+    expect(classic).not.toMatch(/^import\s/m);
+    expect(classic).not.toMatch(/^export\s/m);
+  });
+
+  it("R3r classic runtime without dom-adapter binding fails closed on ready (never clicks)", async () => {
+    const classicPath = path.join(distCompanion, "production-send-runtime-global.js");
+    if (!fs.existsSync(classicPath)) {
+      expect(true).toBe(true);
+      return;
+    }
+    const sandbox: Record<string, unknown> = {};
+    sandbox.globalThis = sandbox;
+    // route-global parses routes with `new URL(...)`; the vm context needs the host builtin.
+    sandbox.URL = URL;
+    const context = vm.createContext(sandbox);
+    // Deliberately skip dom-adapter-global.js: no globalThis.matchesSendTargetIdentity.
+    const loadOrder = [
+      "route-global.js",
+      "turn-observer-global.js",
+      "composer-write-adapter.js",
+      "send-click-adapter.js",
+      "production-send-runtime-global.js",
+    ];
+    for (const file of loadOrder) {
+      const p = path.join(distCompanion, file);
+      if (!fs.existsSync(p)) continue;
+      vm.runInContext(fs.readFileSync(p, "utf8"), context, { filename: file });
+    }
+    expect(sandbox.matchesSendTargetIdentity).toBeUndefined();
+    const run = (
+      sandbox as {
+        __c2cRunProductionSend?: (ctx: unknown) => Promise<Record<string, unknown>>;
+      }
+    ).__c2cRunProductionSend;
+    expect(typeof run).toBe("function");
+
+    const sendBtn = fakeBtn({ attrs: { type: "submit" }, className: CURRENT_TOKENS });
+    const form = fakeForm({}, [sendBtn]);
+    const editor = { closest: () => form, isContentEditable: true };
+    let dispatches = 0;
+    const result = await run!({
+      doc: fakeDoc(),
+      journal: reservedJournal(),
+      expectedRoute: ROUTE,
+      expectedGeneration: 3,
+      routeCanonical: ROUTE,
+      bindingId: "b",
+      epoch: 1,
+      getCurrentRoute: () => ROUTE,
+      getCurrentGeneration: () => 3,
+      inspectComposerWriteCapability: () => ({
+        ok: true,
+        editorKind: "contenteditable",
+        action: { kind: "idle", enabled: true },
+      }),
+      writeCanonicalMessage: async () => ({ ok: true }),
+      verifyCanonicalComposer: async () => ({ ok: true }),
+      dispatchNativeSend: async () => {
+        dispatches += 1;
+        return { ok: true, clicked: 1 };
+      },
+      snapshotUserTurns: () => [],
+      findCanonicalUserTurn: () => ({ ok: true, turn: { id: "u1", text: MESSAGE } }),
+      // ESM import (module-scoped deps intact) — the sandbox itself must stay
+      // without dom-adapter globals, so the classic typeof guard is what fails.
+      hasExactAttemptMarker: (m: string, a: string) => hasExactAttemptMarker(m, a),
+      resolveChatGptComposer: () => ({
+        editor,
+        kind: "contenteditable",
+        form,
+        evidence: "prompt_textarea",
+      }),
+      readCanonicalComposerText: () => ({ ok: true, text: MESSAGE }),
+      resolveChatGptAction: () => ({
+        button: sendBtn,
+        kind: "send",
+        enabled: true,
+        evidence: "current_submit_send",
+      }),
+      normalizeCanonicalDomText: (t: string) => t,
+      persistJournal: async (next: unknown) => next,
+      beginSend: async () => ({
+        eventId: EVENT_ID,
+        status: "claimed",
+        attemptId: ATTEMPT,
+        message: MESSAGE,
+        messageSha256: MESSAGE_SHA,
+      }),
+      ackObserved: async () => ({ eventId: EVENT_ID, status: "observed" }),
+    });
+    // The typeof guard fails closed instead of throwing a TypeError.
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("send_target_invalid");
+    expect(result.zeroClick).toBe(true);
+    expect(dispatches).toBe(0);
+  });
+});
 
 describe("E1b3d3b helpers", () => {
   it("summarizeProductionJournal never includes message", () => {

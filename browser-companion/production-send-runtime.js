@@ -8,7 +8,11 @@ import {
   runSendOrchestration,
   recoverSendOrchestration,
 } from "./send-orchestrator.js";
-import { resolveChatGptAction, resolveChatGptComposer } from "./dom-adapter.js";
+import {
+  matchesSendTargetIdentity,
+  resolveChatGptAction,
+  resolveChatGptComposer,
+} from "./dom-adapter.js";
 import { readCanonicalComposerText } from "./composer-write-adapter.js";
 import { areChatgptConversationRoutesEquivalent } from "./route-esm.js";
 
@@ -178,7 +182,15 @@ function defaultSendReadyInspector(ctx) {
       if (action.kind === "unknown") return psFail("generation_unknown");
       if (action.kind === "send") {
         if (action.enabled !== true) return psFail("send_disabled");
-        if (action.button?.getAttribute?.("data-testid") !== "send-button") {
+        // R3r Send parity: the shared structural matcher (dom-adapter) is the
+        // single Send identity source — exactly what the bootstrap ready gate,
+        // the click adapter's second line of defense and the route-attest
+        // runner consume. Legacy testid identity passes through it; the
+        // current structural submit identity matches it. A missing classic
+        // binding fails closed, never clicks. No local identity hardcode is
+        // allowed here: the build drift gate forbids reintroducing one.
+        if (typeof matchesSendTargetIdentity !== "function"
+          || !matchesSendTargetIdentity(action.button)) {
           return psFail("send_target_invalid");
         }
         return psOk();
