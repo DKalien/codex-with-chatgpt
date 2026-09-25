@@ -161,16 +161,20 @@
       return true;
     }
     if (message.type === "c2c.bind.request") {
-      const msg = buildObserveMessage();
-      void sendToWorker({ ...msg, type: "c2c.bind" }).then((response) => {
+      // Identity comes only from the forwarded MessageSender; generation is freshness only.
+      void sendToWorker({ type: "c2c.bind", generation }).then((response) => {
         sendResponse(response);
       });
       return true;
     }
     if (message.type === "c2c.connect.request") {
-      // Fixed popup request. Route/document/tab authority comes from this CS MessageSender.
-      const msg = buildObserveMessage();
-      void sendToWorker({ ...msg, type: "c2c.connect.page" }).then((response) => {
+      // Identity comes from MessageSender; safety and generation are runtime evidence only.
+      const observation = buildObserveMessage();
+      void sendToWorker({
+        type: "c2c.connect.page",
+        generation: observation.generation,
+        safety: observation.safety,
+      }).then((response) => {
         sendResponse(response);
       });
       return true;

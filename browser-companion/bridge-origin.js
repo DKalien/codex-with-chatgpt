@@ -1,3 +1,5 @@
+import { parseChatgptConversationRoute } from "./route-esm.js";
+
 /**
  * Bridge origin parser (browser-safe).
  * Production: HTTPS origin only. Dev: loopback HTTP only.
@@ -13,6 +15,71 @@ export class BridgeOriginError extends Error {
 
 /** Mounted Bridge companion router prefix. Keep in sync with src/bridge/server.ts. */
 export const COMPANION_API_PREFIX = "/api/companion/v1";
+
+const FEEDBACK_ENDPOINTS = new Set([
+  "/pair",
+  "/rebind/init",
+  "/rebind/complete",
+  "/rebind/status",
+  "/state",
+  "/reserve",
+  "/release",
+  "/begin-send",
+  "/ack",
+  "/retire-unknown",
+]);
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function feedbackEndpointPath(path) {
+  if (typeof path !== "string" || path.length === 0 || path.length > 4096 || /[#\\]/.test(path)) {
+    throw new BridgeOriginError("仅允许 Browser Companion feedback API endpoint");
+  }
+  const raw = path.startsWith("/") ? path : `/${path}`;
+  const queryAt = raw.indexOf("?");
+  const pathname = queryAt < 0 ? raw : raw.slice(0, queryAt);
+  const query = queryAt < 0 ? "" : raw.slice(queryAt);
+  const endpoint = pathname.startsWith(`${COMPANION_API_PREFIX}/`)
+    ? pathname.slice(COMPANION_API_PREFIX.length)
+    : pathname;
+
+  if (pathname.includes("%") || !FEEDBACK_ENDPOINTS.has(endpoint)) {
+    throw new BridgeOriginError("仅允许 Browser Companion feedback API endpoint");
+  }
+  if (endpoint !== "/rebind/status") {
+    if (query) throw new BridgeOriginError("feedback API endpoint 不接受 query");
+    return `${COMPANION_API_PREFIX}${endpoint}`;
+  }
+  if (!query) throw new BridgeOriginError("rebind/status query 无效");
+
+  const match = /^\?routeCanonical=([^&]+)&challengeId=([^&]+)$/.exec(query);
+  if (!match) throw new BridgeOriginError("rebind/status query 无效");
+  let routeCanonical;
+  let challengeId;
+  try {
+    routeCanonical = decodeURIComponent(match[1]);
+    challengeId = decodeURIComponent(match[2]);
+  } catch {
+    throw new BridgeOriginError("rebind/status query 无效");
+  }
+  if (!UUID.test(challengeId)
+      || encodeURIComponent(routeCanonical) !== match[1]
+      || encodeURIComponent(challengeId) !== match[2]) {
+    throw new BridgeOriginError("rebind/status query 无效");
+  }
+  let parsedRouteCanonical;
+  try {
+    parsedRouteCanonical = parseChatgptConversationRoute(routeCanonical, {
+      allowQueryOrHash: false,
+      conversationIdPolicy: "uuid",
+    }).canonical;
+  } catch {
+    throw new BridgeOriginError("rebind/status query 无效");
+  }
+  if (parsedRouteCanonical !== routeCanonical) {
+    throw new BridgeOriginError("rebind/status query 无效");
+  }
+  return `${COMPANION_API_PREFIX}${endpoint}${query}`;
+}
 
 /**
  * @param {string} raw
@@ -57,15 +124,13 @@ export function parseBridgeOrigin(raw, opts = {}) {
 }
 
 /**
- * Build companion API URL under /api/companion/v1.
- * Callers pass short endpoints only ("/pair", "/state", …).
+ * Build an allowlisted feedback Companion API URL under /api/companion/v1.
+ * Callers pass fixed endpoints; /rebind/status accepts only its existing bounded query.
  * Idempotent if path already includes the prefix.
  */
 export function companionApiUrl(origin, path) {
-  const base = parseBridgeOrigin(origin, { allowLoopbackHttp: origin.startsWith("http://") });
-  let p = path.startsWith("/") ? path : `/${path}`;
-  if (!p.startsWith(`${COMPANION_API_PREFIX}/`) && p !== COMPANION_API_PREFIX) {
-    p = `${COMPANION_API_PREFIX}${p}`;
-  }
-  return `${base}${p}`;
+  const base = parseBridgeOrigin(origin, {
+    allowLoopbackHttp: typeof origin === "string" && origin.startsWith("http://"),
+  });
+  return `${base}${feedbackEndpointPath(path)}`;
 }

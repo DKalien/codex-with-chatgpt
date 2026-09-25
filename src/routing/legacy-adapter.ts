@@ -1,6 +1,6 @@
 import { parseChatgptConversationRoute } from "../chatgpt/route.js";
-import { readDesktop } from "../desktop/store.js";
 import { isRouteAttestationVerified, readFeedbackState } from "../feedback/store.js";
+import { projectDesktopExecutorCandidate, type DesktopExecutorCandidate } from "./desktop-adapter.js";
 import { resolveWorkspaceIdentity, type RoutingWorkspaceIdentity } from "./store.js";
 
 /**
@@ -15,14 +15,7 @@ import { resolveWorkspaceIdentity, type RoutingWorkspaceIdentity } from "./store
  * 状态目录沿用 getStateDir()（测试经 C2C_STATE_DIR 隔离）。
  */
 
-export interface LegacyExecutorCandidate {
-  kind: "executor";
-  platform: "codex_desktop";
-  conversationId: string;
-  locator: { hostId: "local"; executorProjectId: string };
-  /** 仅为引用 ID（desktop bindingId），不承担真实身份。 */
-  legacyReferenceId: string;
-}
+export type LegacyExecutorCandidate = DesktopExecutorCandidate;
 
 export interface LegacyPlannerCandidate {
   kind: "planner";
@@ -39,32 +32,6 @@ export type LegacyRouteCandidate = LegacyExecutorCandidate | LegacyPlannerCandid
 export interface LegacyProjection {
   executorCandidate: LegacyExecutorCandidate | null;
   plannerCandidate: LegacyPlannerCandidate | null;
-}
-
-/**
- * Desktop binding → executor candidate。
- * 仅当 desktop state 存在、已绑定且 workspaceRoot 与调用方 identity 一致时产出；
- * 其余情况（未初始化、损坏、root 不匹配）一律 none。
- */
-function projectExecutorCandidate(
-  identity: RoutingWorkspaceIdentity,
-): LegacyExecutorCandidate | null {
-  try {
-    const state = readDesktop(identity.id);
-    const binding = state?.binding;
-    if (!state || !binding) return null;
-    if (state.workspaceRoot !== identity.root) return null;
-    return {
-      kind: "executor",
-      platform: "codex_desktop",
-      conversationId: binding.threadId,
-      locator: { hostId: binding.hostId, executorProjectId: binding.projectId },
-      legacyReferenceId: binding.bindingId,
-    };
-  } catch {
-    // 旧 state 损坏或结构不符：fail closed，不产出候选。
-    return null;
-  }
 }
 
 /**
@@ -107,7 +74,7 @@ function projectPlannerCandidate(
 export function projectLegacyRoutes(identity: RoutingWorkspaceIdentity): LegacyProjection {
   const resolved = resolveWorkspaceIdentity(identity);
   return {
-    executorCandidate: projectExecutorCandidate(resolved),
+    executorCandidate: projectDesktopExecutorCandidate(resolved),
     plannerCandidate: projectPlannerCandidate(resolved),
   };
 }

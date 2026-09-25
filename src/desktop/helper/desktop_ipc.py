@@ -36,6 +36,7 @@ from typing import Any, Literal
 PIPE_NAME = r"\\.\pipe\codex-ipc"
 MAX_MESSAGE_BYTES = 64 * 1024
 MAX_FRAME_BYTES = 16 * 1024 * 1024
+MAX_PIPE_READ_BYTES = 1024 * 1024
 MAX_CONTROL_LINE_BYTES = 512 * 1024
 WRITE_TIMEOUT_SECONDS = 5.0
 INITIALIZE_TIMEOUT_SECONDS = 5.0
@@ -454,9 +455,8 @@ class _Pipe:
                     raise _error("DESKTOP_IPC_UNAVAILABLE")
                 raise _win_error(code)
             if available.value:
-                if available.value > MAX_FRAME_BYTES + 4:
-                    raise _error("DESKTOP_PROTOCOL_ERROR")
-                return self._read_available(int(available.value), deadline)
+                # available 是当前 backlog 字节数，不是下一帧长度；由 Decoder 检查单帧上限。
+                return self._read_available(min(int(available.value), MAX_PIPE_READ_BYTES), deadline)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError
@@ -483,6 +483,8 @@ class _Pipe:
                 in_flight = False
                 if code == ERROR_BROKEN_PIPE:
                     raise _error("DESKTOP_IPC_UNAVAILABLE")
+                if code == ERROR_MORE_DATA:
+                    return buffer.raw[: read.value]
                 raise _win_error(code)
             remaining = deadline - time.monotonic()
             result = _kernel32.WaitForSingleObject(event, self._wait_ms(max(0.0, remaining)))

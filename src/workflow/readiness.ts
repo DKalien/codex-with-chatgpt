@@ -427,9 +427,28 @@ export function resolveWorkflowReadiness(
     blockers.push({ code: "project_not_ready" });
     return finish(input, "needs_project", "bind_project", blockers);
   }
+
+  if (desktopRoute === "current_context" && desktop.currentTarget === "exact") {
+    if (desktop.bindingAvailability === "busy") {
+      blockers.push({ code: "desktop_binding_busy" });
+      return finish(input, "busy", "wait_current_task", blockers);
+    }
+    if (desktop.bindingAvailability === "unknown") {
+      blockers.push({ code: "desktop_delivery_unknown" });
+      return finish(input, "blocked", "stop_unknown", blockers);
+    }
+    if (desktop.bindingAvailability === "unavailable" && !remoteSafelyReady(remote)) {
+      blockers.push({ code: "desktop_delivery_unavailable" });
+      return finish(input, "blocked", "stop_unknown", blockers);
+    }
+  }
+
   const usableConversation = conversationUsable(conversation, requestPolicy);
-  if (!usableConversation.ok) {
-    // A new local Desktop thread must be bound before creating its ChatGPT chat.
+  // Local Desktop readiness does not require a ChatGPT chat for this thread.
+  // Project readiness is still checked above before this local-only shortcut.
+  const localDesktopReady = desktopRoute === "current_context" && desktopLocalReady(desktop);
+  if (!usableConversation.ok && !localDesktopReady) {
+    // Resolve an incomplete local Desktop route before any missing-chat action.
     // MCP saved_binding and safely-ready Remote keep their existing strategies.
     if (desktopRoute === "current_context" && !remoteSafelyReady(remote)) {
       if (!desktop.configured) {
@@ -455,10 +474,6 @@ export function resolveWorkflowReadiness(
         }
         if (desktop.bindingAvailability === "unknown") {
           blockers.push({ code: "desktop_delivery_unknown" });
-          return finish(input, "blocked", "stop_unknown", blockers);
-        }
-        if (desktop.bindingAvailability === "unavailable") {
-          blockers.push({ code: "desktop_delivery_unavailable" });
           return finish(input, "blocked", "stop_unknown", blockers);
         }
       }

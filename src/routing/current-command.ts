@@ -7,13 +7,14 @@ import { createCommand, type RoutingWorkspaceIdentity } from "./store.js";
 /** 创建当前 planner/executor route 对应的 pending Command；不投递、不授权发送。 */
 export function createCurrentCommand(
   identity: RoutingWorkspaceIdentity,
+  plannerFingerprint: string,
   input: Pick<CommandInput, "commandId" | "intent"> & { payload: string },
 ): RoutingCommand {
-  const planner = ensureCurrentPlannerRoute(identity);
+  const planner = ensureCurrentPlannerRoute(identity, plannerFingerprint);
   if (!planner) {
     throw new RoutingError(
       "ROUTING_ROUTE_NOT_FOUND",
-      "当前 VERIFIED planner route 不存在；拒绝从历史 route 推断。",
+      "当前 MCP request planner route 不存在；拒绝从历史 route 推断。",
     );
   }
   const executor = ensureCurrentExecutorRoute(identity);
@@ -28,7 +29,7 @@ export function createCurrentCommand(
   const payloadSha256 = createHash("sha256").update(input.payload, "utf8").digest("hex");
 
   // Recheck immediately before the local pending write; this snapshot is not a transport lease.
-  const currentPlanner = resolveCurrentPlannerRoute(identity);
+  const currentPlanner = resolveCurrentPlannerRoute(identity, plannerFingerprint);
   const currentExecutor = resolveCurrentExecutorRoute(identity);
   if (currentPlanner?.routeId !== planner.routeId || currentExecutor?.routeId !== executor.routeId) {
     throw new RoutingError(

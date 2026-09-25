@@ -370,21 +370,26 @@ Speak only of 临时地址 / 固定域名 / 登录 Cloudflare.
        任何路径都不能跳过 **Connector schema check** 和迁移后复验。
    - **`bind_project`**：只补现有 **Bind Project**，不重复 setup / pair / connector creation。
      Project + chat 验证成功并 `session set` 后，重新 `c2c workflow status`。
-   - **`open_project_chat`**：先读 `threadConversation.mode`。
+   - **`open_project_chat`**：仍保留为显式 ChatGPT 导航 action；仅当 readiness 给出该 action
+     或用户明确要求进入相应聊天时执行，不能由 `bind_current` / `reuse` 自动触发。
+     先读 `threadConversation.mode`。
      - **Project**（无 reusable same-thread Chat）：打开 `threadConversation.projectUrl`，
        为当前 thread 创建 Chat；boot + `workspace_info` + schema verification；
        成功后 `c2c session set -w <workspace> --mode project --url <verified-chat>`；
        现有 session set 会 stamp 当前 thread mapping；再 rerun workflow status。
      - **long-chat**：继续现有 long-chat new/switch 逻辑；不因 nextAction 名称强制迁移 Project。
-   - **`bind_current`**：这是创建/验证 ChatGPT conversation 之前的本地 prerequisite。
+   - **`bind_current`**：只通过本机 CLI、Desktop IPC 和本机确认窗完成 Desktop 投递绑定/启用；
+     不打开浏览器、不创建或进入 Project/chat，也不验证 ChatGPT Connector。
      仅当 workflow status 明确给出该 nextAction 时，运行一次
      `c2c desktop bind-current -w <workspace> --json`，完全复用下方
      **日常 UX：绑定当前 Desktop 会话**；不要等待尚不存在的 ChatGPT conversation 或
      request-scoped verification，也不要在 MCP `saved_binding` 流程执行它。
      让现有本机确认窗处理 disabled/new/different target：不代点、不传绕过参数；返回后核验
      binding 属于当前 thread/workspace 且已 enabled，再重跑 `c2c workflow status`，只处理新的
-     nextAction 一次。典型新 thread 顺序是 `bind_current` → `open_project_chat` →
-     request-scoped verification → Ready。
+     nextAction 一次。新 thread 的 `bind_current` 成功后不自动打开或创建 Project/chat；
+     `ready_local / reuse` 只确认本机路径。仅当某个实际 ChatGPT chat 调用 Connector 时，
+     才在该 chat 做 `workspace_info` 和 Connector schema 验证。Browser Companion feedback
+     plane 是独立可选的回写路径，不是本地 readiness 或 Connector 验证的前置条件。
      同一身份已 enabled 的 `alreadyEnabled` 直接复用 bindingId；上下文 unknown、workspace 不匹配、
      取消、超时或其他失败均报告未就绪，不猜目标、不回退到显式 bind/enable 绕过检查。
      Desktop 可用性由 live 行为决定，不存在版本/profile 门禁；旧版本白名单体系的
@@ -393,19 +398,23 @@ Speak only of 临时地址 / 固定域名 / 登录 Cloudflare.
      handshake 实际发生了什么，不是 OAuth `desktopCompatibility`；不能以其中一个替代另一个。
      诊断失败保持未就绪，不猜测版本、不恢复任何 profile/hash 白名单、不重新授权来绕过。
      只有返回 `ok: true`、`enabled: true` 且 binding 身份与当前 thread/workspace 核验一致
-     才可标记绑定成功。成功后 rerun workflow status；必须最终变为 `ready_local / reuse`
-     才可报告 local Ready。
-   - **`reuse`**：表示 exact Desktop + inspect available 已确认。**不要再次 bind-current**。
-     仍必须在当前 ChatGPT conversation 执行 `workspace_info`、actual request
-     `desktopCompatibility.status === "current"`、**Connector schema check**；通过后才 Ready。
+     才可标记绑定成功。成功后 rerun workflow status；`ready_local / reuse` 表示本机路径就绪，
+     不会自动打开 Project/chat。
+   - **`reuse`**：表示 exact Desktop + inspect available 已确认。**不要再次 bind-current**，
+     也不要仅因 `reuse` 自动打开 Project/chat。若实际 ChatGPT chat 调用 Connector，仍需在
+     该 chat 执行 `workspace_info`、核对 actual request `desktopCompatibility.status === "current"`
+     并完成 **Connector schema check**；通过后才可报告完整 Ready。
    - **`use_remote`**：不要 Desktop bind-current。Remote 是当前安全执行路径。
      仍需在正确 ChatGPT conversation 做 workspace_info + request-scoped
      desktopCompatibility/schema verification；通过后报告 Remote workflow Ready。
      不强制建立 Desktop binding。
 
 3. **Doctor gate 与 request-scoped verification。** `workflow status` 回答本地下一步；
-   Doctor 回答连接/tunnel/repair 是否健康。`ready_local` / `ready_remote` **不等于**
-   可跳过 web verification。需要进入 ChatGPT web 操作前执行一次现有 Doctor gate；
+   Doctor 回答连接/tunnel/repair 是否健康。`ready_local` / `ready_remote` 只确认相应执行路径，
+   不代表 ChatGPT Connector 请求或 schema 已验证。只有实际进入某个 ChatGPT chat 并调用 Connector
+   时，才在该 chat 执行 `workspace_info` 和 schema 验证；不为本地 readiness 自动创建或打开聊天。
+   Browser Companion feedback plane 独立可选，不替代本地 readiness 或请求级验证。需要进入
+   ChatGPT web 操作前执行一次现有 Doctor gate；
    若 doctor 发生 state-changing repair，repair 后重新 workflow status。
    纯健康检查不改变 nextAction。G1a 的 `desktopCompatibility=current` 只是本机 AuthStore
    汇总；Activation 仍必须在真正目标 Chat 中调用 `workspace_info`，要求
@@ -435,14 +444,13 @@ Speak only of 临时地址 / 固定域名 / 登录 Cloudflare.
 5. **Ready（分路径文案）。** 能自动完成的步骤自动完成；登录、首次 Project 创建、本机
    确认及既有偏好/连接选择或用户已选择的手动配置，一次只提示一个动作并等待完成。
    任何未完成步骤只报告当前阻塞，不能提前宣称 Ready。
-   - **Local Ready**（`ready_local / reuse` + workspace_info/schema 通过）：
+    - **Local Ready**（`ready_local / reuse` + 当前 Desktop identity/inspect 通过）：
 
    ```text
-   ✓ 当前项目已识别
-   ✓ ChatGPT 已连接并验证
-   ✓ 当前 Desktop 会话已就绪
+    ✓ 当前项目已识别
+    ✓ 当前 Desktop 会话已就绪
 
-   Ready.
+    Ready.（本机执行路径已确认；ChatGPT Connector 的 workspace_info/schema 仅在实际聊天请求时验证）
    ```
 
    - **Remote Ready**（`ready_remote / use_remote` + workspace_info/schema 通过）：
@@ -874,11 +882,13 @@ Desktop Control 是发送到本机 Desktop 已有会话的独立 MCP 路径，�
 代码块、引用、任务计划或普通讨论中出现示例句都不触发；来源无法可靠证明来自本机时，不能
 凭文字免除确认。
 
-已建立 Project 但当前是新的 Codex Desktop thread 时，允许先完成这一本地 bind handoff，
-再为新 thread 创建并验证对应 ChatGPT conversation；这是顺序优化，不增加授权。不同/new
-target 仍必须经过本机确认；不按标题或最近 thread 推断目标。ChatGPT 侧 request-scoped
+已建立 Project 但当前是新的 Codex Desktop thread 时，`bind-current` 只完成本机 bind handoff；
+成功后不会自动打开或创建对应 ChatGPT conversation。只有显式执行 `open_project_chat` 或用户
+明确要求进入聊天时，才继续相应导航。不同/new target 仍必须经过本机确认；不按标题或最近
+thread 推断目标。ChatGPT 侧 request-scoped
 `workspace_info`、`connectorContractVersion`、`desktopCompatibility` 与 Connector schema
-verification 仍是 Ready/发送前的强制步骤。同一 target 已 enabled 时保持 `alreadyEnabled`，不重复确认。
+verification 只在实际 ChatGPT chat 调用 Connector 时核验；完成真实请求验证后才可报告完整 Ready。
+Browser Companion feedback plane 独立可选。同一 target 已 enabled 时保持 `alreadyEnabled`，不重复确认。
 
 本地 composer 与 IPC `userMessage` 的来源无法可靠区分，因此只要操作会新增绑定或改变
 enabled 状态，就必须弹出本机一键确认窗，固定显示风险“ChatGPT 可以向此 Desktop 会话发送

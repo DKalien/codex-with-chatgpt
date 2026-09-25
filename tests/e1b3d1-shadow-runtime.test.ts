@@ -18,6 +18,8 @@ import {
   isExtensionInternalSender,
   buildShadowInspectRequest,
   validateShadowInspectResponse,
+  buildOwnerLocalShadowInspectRequest,
+  validateOwnerLocalShadowInspectResponse,
 } from "../browser-companion/shadow-rpc.js";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -270,7 +272,82 @@ describe("E1b3d1 exact-document RPC (sendMessage options + generation + sender)"
     expect(sw).toMatch(/tabs\.sendMessage\(\s*request\.tabId,\s*request\.message,\s*request\.sendOptions/);
     expect(sw).toMatch(/isExtensionInternalSender/);
     expect(sw).toMatch(/popup_sender_required/);
-    expect(sw).toMatch(/shadow_generation_mismatch|validateShadowInspectResponse/);
+    expect(sw).toMatch(/shadow_generation_mismatch|validateOwnerLocalShadowInspectResponse/);
+  });
+});
+
+describe("R3i owner-local read-only shadow RPC", () => {
+  const owner = {
+    tabId: 7,
+    documentId: "doc-current-chat",
+    canonicalRoute: ROUTE
+      .replace("11111111-1111-4111-8111-111111111111", "33333333-3333-4333-8333-333333333333")
+      .replace("/c/", "/g/g-p-test/c/"),
+    generation: 19,
+  };
+
+  it("inspects a different owner route without consulting old transport", () => {
+    expect(buildShadowInspectRequest(owner, { routeCanonical: ROUTE, authStale: false }).reason)
+      .toBe("owner_route_mismatch");
+    const req = buildOwnerLocalShadowInspectRequest(owner);
+    expect(req).toEqual({
+      ok: true,
+      tabId: owner.tabId,
+      message: { type: "c2c.send.shadow.inspect" },
+      sendOptions: { documentId: owner.documentId },
+    });
+    expect(validateOwnerLocalShadowInspectResponse({
+      mode: "read_only",
+      canonicalRoute: owner.canonicalRoute,
+      documentCanonicalRoute: owner.canonicalRoute,
+      generation: owner.generation,
+      composer: { present: true },
+    }, owner).ok).toBe(true);
+  });
+
+  it("uses only owner route/document/generation and has no caller body fields", () => {
+    const req = buildOwnerLocalShadowInspectRequest(owner);
+    expect(req.message).toEqual({ type: "c2c.send.shadow.inspect" });
+    expect(req.sendOptions.documentId).toBe(owner.documentId);
+    expect(validateOwnerLocalShadowInspectResponse({
+      mode: "read_only",
+      canonicalRoute: owner.canonicalRoute,
+      documentCanonicalRoute: owner.canonicalRoute,
+      generation: owner.generation,
+    }, owner).ok).toBe(true);
+  });
+
+  it("fails closed on missing owner, malformed response, route mismatch, or generation mismatch", () => {
+    expect(buildOwnerLocalShadowInspectRequest(null).reason).toBe("owner_document_invalid");
+    expect(validateOwnerLocalShadowInspectResponse(null, owner).reason).toBe("malformed_shadow_response");
+    expect(validateOwnerLocalShadowInspectResponse({
+      mode: "read_only",
+      canonicalRoute: owner.canonicalRoute,
+      documentCanonicalRoute: ROUTE,
+      generation: owner.generation,
+    }, owner).reason).toBe("shadow_route_mismatch");
+    expect(validateOwnerLocalShadowInspectResponse({
+      mode: "read_only",
+      canonicalRoute: owner.canonicalRoute,
+      documentCanonicalRoute: owner.canonicalRoute,
+      generation: owner.generation + 1,
+    }, owner).reason).toBe("shadow_generation_mismatch");
+  });
+
+  it("service-worker inspect stays owner-local and read-only", () => {
+    const sw = fs.readFileSync(path.join(companionRoot, "service-worker.js"), "utf8");
+    const start = sw.indexOf("async function handleShadowInspect() {");
+    const end = sw.indexOf("\n}\n\n/**", start);
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const body = sw.slice(start, end);
+    expect(body).toMatch(/if \(!ownerState\.owner\)[\s\S]*reason: "owner_missing"/);
+    expect(body).toMatch(/buildOwnerLocalShadowInspectRequest\(owner\)/);
+    expect(body).toMatch(/validateOwnerLocalShadowInspectResponse\(response, owner\)/);
+    expect(body).not.toMatch(/requireProtectedTransport|\btransport\b|journal\s*=|autonomy|connectFlow|persist|\.click\(|writeCanonicalMessage/);
+    const cs = fs.readFileSync(path.join(companionRoot, "content-script.js"), "utf8");
+    expect(cs).toMatch(/if \(message\.type === "c2c\.send\.shadow\.inspect"\)[\s\S]*?__c2cInspectShadowEvidence/);
+    expect(cs).not.toMatch(/function writeCanonicalMessage|function dispatchNativeSend|\.click\(\)/);
   });
 });
 

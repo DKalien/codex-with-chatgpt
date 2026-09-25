@@ -1015,7 +1015,7 @@
         const se = a.stopEvidence || null;
         setText(
           els.shadowEvidence,
-          `READ ONLY — no composer write / no Send | routeExact=${res.routeExact} | editor=${c.editorKind || "?"} composerEvidence=${c.evidence ?? "none"} | empty=${c.textEmpty} | action=${a.kind} evidence=${a.evidence ?? "none"} enabled=${a.enabled} sendButton=${a.hasExactSendButton} | stopSource=${se?.source ?? "none"} stopTestId=${se?.dataTestId ?? "-"} stopAria=${se?.ariaLabel ?? "-"} stopInForm=${se?.insideComposerForm ?? "-"} | gen=${s.generation} safe=${s.safe} | turns=${res.userTurnCount ?? "?"}`,
+          `READ ONLY — scope=${res.scope ?? "owner_local"}; no composer write / no Send | ownerRouteExact=${res.routeExact} | editor=${c.editorKind || "?"} composerEvidence=${c.evidence ?? "none"} | empty=${c.textEmpty} | action=${a.kind} evidence=${a.evidence ?? "none"} enabled=${a.enabled} sendButton=${a.hasExactSendButton} | stopSource=${se?.source ?? "none"} stopTestId=${se?.dataTestId ?? "-"} stopAria=${se?.ariaLabel ?? "-"} stopInForm=${se?.insideComposerForm ?? "-"} | gen=${s.generation} safe=${s.safe} | turns=${res.userTurnCount ?? "?"}`,
           s.safe === true ? "ok" : "warn",
         );
         if (els.shadowControls) {
@@ -1148,7 +1148,7 @@
       els.productionSend.onclick = async () => {
         if (!els.productionSendConfirm.checked || !els.productionSendResult) return;
         els.productionSend.disabled = true;
-        els.productionSendResult.textContent = "PRODUCTION SEND — sending reserved feedback…";
+        els.productionSendResult.textContent = "FEEDBACK DELIVERY — writing reserved feedback to the current Chat…";
         els.productionSendResult.className = "value warn";
         let res;
         try {
@@ -1158,7 +1158,7 @@
           res = { ok: false, reason: e?.message || "runtime_error", retryAllowed: false };
         }
         const lines = [
-          "PRODUCTION SEND",
+          "FEEDBACK DELIVERY",
           `ok=${res?.ok === true} reason=${res?.reason ?? (res?.ok ? "ok" : "unknown")}`,
           `journal=${res?.journal?.state ?? res?.productionJournal ?? "-"}`,
           `eventId=${res?.eventId ?? res?.journal?.eventId ?? "-"}`,

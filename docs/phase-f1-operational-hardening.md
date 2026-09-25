@@ -165,7 +165,7 @@ F1b 合入时明确未做：
 3. 旧 document 被 ownership invalidation 清除；不应再被视为 exact owner
 4. health 应显示 `waiting_owner` / `owner_unavailable`（SHADOW 下；**不是** OFF 下）
 5. 新 document 的普通 heartbeat / observe **不会自动继承或恢复 owner**（content-script heartbeat 仅为 passive observation；SW heartbeat path 只计算 `isExactOwnerHeartbeat`，不自动 bind）
-6. Operator 必须通过现有**显式 Bind / ownership 流程**（`c2c.bind.request → c2c.bind → bindOwner(...)`）绑定**当前新 document**
+6. Operator 必须通过现有**显式 Bind / ownership 流程**（`c2c.bind.request → c2c.bind → bindCurrentDocument(state, {tabId, documentId, canonicalRoute})`）绑定**当前新 document**；三字段由真实 MessageSender 派生
 7. Bind 成功后，后续 heartbeat 才能成为 `exact-owner heartbeat`
 8. 此后 health 才恢复正常 SHADOW readiness
 9. 不发生 reserve / beginSend / DOM write / click / ACK

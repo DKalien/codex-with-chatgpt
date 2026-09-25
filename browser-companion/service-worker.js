@@ -7,12 +7,13 @@
 
 import {
   emptyOwnerState,
-  bindOwner,
+  bindCurrentDocument,
   invalidateOnTabRemoved,
   isOwner,
   ownerStatus,
   resetSessionOwnership,
   resolveSenderDocumentIdentity,
+  resolveCurrentDocumentBindingIdentity,
   applyObserveOwnership,
   OWNERSHIP_SCHEMA_VERSION,
 } from "./ownership.js";
@@ -43,8 +44,8 @@ import {
 } from "./owner-proof.js";
 import {
   isExtensionInternalSender,
-  buildShadowInspectRequest,
-  validateShadowInspectResponse,
+  buildOwnerLocalShadowInspectRequest,
+  validateOwnerLocalShadowInspectResponse,
 } from "./shadow-rpc.js";
 import {
   buildWriteProbeRequest,
@@ -808,8 +809,8 @@ function requireProtectedTransport() {
 }
 
 /**
- * Atomically apply current page observation before any owner-gated action.
- * Uses MessageSender + message.href (not stale 800ms poll).
+ * Atomically apply sender identity plus runtime freshness/safety before any
+ * owner-gated action; route authority comes only from MessageSender.url.
  */
 async function refreshPageObservation(sender, message) {
   const identity = resolveSenderDocumentIdentity(sender);
@@ -818,8 +819,7 @@ async function refreshPageObservation(sender, message) {
   }
   const tabId = identity.ok || identity.reason === "document_id_unavailable" ? identity.tabId : null;
   const documentId = identity.ok ? identity.documentId : null;
-  const href = typeof message?.href === "string" ? message.href : sender?.url;
-  const parsed = parseRouteSafe(href ?? "");
+  const parsed = parseRouteSafe(sender?.url ?? "");
   const canonical = parsed ? parsed.canonical : null;
   const generation = Number.isFinite(message?.generation) ? Number(message.generation) : 1;
 
@@ -1677,20 +1677,12 @@ async function handleConnectPage(sender, message) {
     if (!autonomyOff.ok) {
       return { ok: false, reason: "autonomy_persist_failed", autonomy: "off", retryAllowed: true };
     }
-    const identity = resolveSenderDocumentIdentity(sender);
-    if (!identity.ok) return { ok: false, reason: identity.reason };
-    const parsed = parseRouteSafe(sender?.url ?? "");
-    if (!parsed) return { ok: false, reason: "invalid_route" };
-    const canonicalRoute = parsed.canonical;
+    const currentDocument = resolveCurrentDocumentBindingIdentity(sender);
+    if (!currentDocument.ok) return { ok: false, reason: currentDocument.reason };
+    const identity = currentDocument.identity;
+    const canonicalRoute = identity.canonicalRoute;
     const generation = Number.isFinite(message?.generation) ? Number(message.generation) : 1;
-    const bound = bindOwner(ownerState, {
-      tabId: identity.tabId,
-      documentId: identity.documentId,
-      canonicalRoute,
-      generation,
-      frameId: 0,
-      lastSeen: Date.now(),
-    }, canonicalRoute);
+    const bound = bindCurrentDocument(ownerState, identity, { generation });
     if (!bound.ok) return { ok: false, reason: bound.reason };
     ownerState = bound.state;
     localState = { ...localState, targetRoute: canonicalRoute, paired: true };
@@ -2285,7 +2277,7 @@ async function handleMessage(message, sender, { transportMutationHeld = false } 
     if (parseAutonomyPolicy(autonomyPolicy).mode === "armed") {
       return { ok: false, reason: "autonomy_armed" };
     }
-    return handleReservePage(sender, message);
+    return handleReservePage(sender, { generation, safety: message?.safety });
   }
   if (message.type === "c2c.release") return handleRelease();
   if (message.type === "c2c.recover") return handleRecover();
@@ -2302,13 +2294,26 @@ async function handleMessage(message, sender, { transportMutationHeld = false } 
   if (message.type === "c2c.connect.page") {
     return runTransportMutation(() => handleConnectPage(sender, message));
   }
+  if (message.type === "c2c.bind") {
+    const currentDocument = resolveCurrentDocumentBindingIdentity(sender);
+    if (!currentDocument.ok) return { ok: false, reason: currentDocument.reason };
+    const { tabId, documentId, canonicalRoute } = currentDocument.identity;
+    const generation = Number.isFinite(message.generation) ? Number(message.generation) : 1;
+    const result = bindCurrentDocument(ownerState, currentDocument.identity, { generation });
+    ownerState = result.state;
+    if (result.ok) {
+      localState = { ...localState, targetRoute: canonicalRoute, paired: true };
+      await persistLocal();
+    }
+    await persistSessionOwnership();
+    return statusPayload(tabId, documentId, { reason: result.reason, canonicalRoute });
+  }
 
   const identity = resolveSenderDocumentIdentity(sender);
   const tabId =
     identity.ok || identity.reason === "document_id_unavailable" ? identity.tabId : null;
   const documentId = identity.ok ? identity.documentId : null;
-  const href = typeof message.href === "string" ? message.href : sender?.url;
-  const parsed = parseRouteSafe(href ?? "");
+  const parsed = parseRouteSafe(sender?.url ?? "");
   const canonical = parsed ? parsed.canonical : null;
   const generation = Number.isFinite(message.generation) ? Number(message.generation) : 1;
 
@@ -2473,35 +2478,6 @@ async function handleMessage(message, sender, { transportMutationHeld = false } 
       canonicalRoute: canonical,
       documentIdAvailable: Boolean(documentId),
       source: message.type,
-    });
-  }
-
-  if (message.type === "c2c.bind") {
-    if (!identity.ok) {
-      return { ok: false, reason: identity.reason, canonicalRoute: canonical };
-    }
-    if (!canonical) return { ok: false, reason: "invalid_route" };
-    const result = bindOwner(
-      ownerState,
-      {
-        tabId: identity.tabId,
-        documentId: identity.documentId,
-        canonicalRoute: canonical,
-        generation,
-        frameId: 0,
-        lastSeen: Date.now(),
-      },
-      canonical,
-    );
-    ownerState = result.state;
-    if (result.ok) {
-      localState = { ...localState, targetRoute: canonical, paired: true };
-      await persistLocal();
-    }
-    await persistSessionOwnership();
-    return statusPayload(identity.tabId, identity.documentId, {
-      reason: result.reason,
-      canonicalRoute: canonical,
     });
   }
 
@@ -2859,14 +2835,12 @@ async function handleSendProbeReset() {
  */
 async function handleShadowInspect() {
   await initPromise;
-  const gate = requireProtectedTransport();
-  if (!gate.ok) return gate;
   if (!ownerState.owner) {
     return { ok: false, reason: "owner_missing" };
   }
   const owner = ownerState.owner;
 
-  const request = buildShadowInspectRequest(owner, transport);
+  const request = buildOwnerLocalShadowInspectRequest(owner);
   if (!request.ok) {
     return { ok: false, reason: request.reason };
   }
@@ -2883,7 +2857,7 @@ async function handleShadowInspect() {
     return { ok: false, reason: "no_content_script" };
   }
 
-  const check = validateShadowInspectResponse(response, owner, transport);
+  const check = validateOwnerLocalShadowInspectResponse(response, owner);
   if (!check.ok) {
     return { ok: false, reason: check.reason };
   }
@@ -2892,6 +2866,7 @@ async function handleShadowInspect() {
   return {
     ok: true,
     mode: "read_only",
+    scope: "owner_local",
     routeExact: true,
     documentIdExact: true,
     owner: {

@@ -94,47 +94,39 @@ Planner route → Project → Command → Executor route → ExecutionResult →
 - projection 本身不生成 routeId、不写 routing store 或任何旧 state；R3a 的独立显式 ensure
   才会按当前 VERIFIED candidate 注册 Route，不代表旧 state migration 或 rebind。
 
-## R3a 当前 planner route（基础层，未接生产调用方）
+## R3a planner route（初版语义，已由 R3l 收敛）
 
-- `src/routing/current-planner-route.ts` 复用 `projectLegacyRoutes()` 的 Companion attestation
-  authority；没有 VERIFIED 候选时 current planner route 为 `none`，即使 store 中留有历史 planner
-  route 也不会因“最新”而自动成为 current。
-- 只读解析仅按候选的精确 `(platform=chatgpt_web, conversationId)` 查找已注册 route；role 必须为
-  `planner`，locator 必须与候选完全一致，否则使用 `ROUTE_ROLE_CONFLICT` 或
-  `ROUTE_LOCATOR_CONFLICT` fail closed。身份与 routing-state 损坏仍沿用现有 workspace/store 错误。
-- 显式 `ensureCurrentPlannerRoute()` 先调用现有 `registerRoute()`，再重新读取并核对 VERIFIED
-  Companion authority；若当前候选已不再解析到刚注册的 route，则抛 `ROUTE_AUTHORITY_CHANGED`，
-  旧 route 可留在 catalog/history，但调用方不得当作 current 使用。exact replay 仍不 bump revision、
-  不重写 routing state。该 helper 不写 feedback/Companion state。
-- 当前 route 是每次从已验证 Companion authority 推导的结果，不是新的持久指针；旧 routing route
-  仍作为 catalog/history 保存。此 R3a 仅为 routing foundation，不接 Desktop send、feedback send、
-  route-confirm MCP 或 Browser Companion，也不代表一键绑定/重连 UX 已完成。
+- 初版曾从 VERIFIED Companion candidate 派生；该 planner authority 已由 R3l 替换，不再是当前生产语义。
+- 现行 `current-planner-route.ts` 以同一次 MCP request 的可信 conversation principal fingerprint 为身份；
+  只读解析及显式 ensure 均精确匹配该 request route，且注册后 re-resolve。旧 Companion-derived route
+  仅保留为 routing catalog/history，不会被新请求自动采用。
+- current route 每次从 request-scoped fingerprint 派生，不是新的持久指针；旧 routing route 仍作为
+  catalog/history 保存。生产 send 接线及 Browser reconnect UX 分别见 R3e 与 R3f–R3l。
 - ensure 返回值只是最终 recheck 时点的快照，不是 lease；后续 R3b 必须在实际副作用边界重新解析，
   不能跨 `await` 或进程边界把返回 route 当作持续有效的 authority。
 
-## R3b 当前 executor route（基础层，未接生产调用方）
+## R3b 当前 executor route（derived foundation）
 
-- `src/routing/current-executor-route.ts` 复用 `projectLegacyRoutes()` 的 Desktop binding candidate；
+- `src/routing/current-executor-route.ts` 复用 Desktop-only `desktop-adapter.ts` 的 binding candidate；
   route identity 表达当前绑定的 thread/project target，不包含 enabled、availability 或 busy 状态。
 - 只读解析精确匹配已注册的 `codex_desktop` executor route；显式 ensure 复用 `registerRoute()`，
   exact replay 不改 revision/文件，并在注册后重读 binding。若 binding 在 ensure 期间变化则抛
   `ROUTE_AUTHORITY_CHANGED`；旧 route 可留作 catalog/history，但不作为 current 返回。
-- helper 只读 Desktop state，不代表 Desktop 可发送或已空闲；返回值是时点快照而非 lease。此 slice
-  不接 Desktop send、feedback、Companion 或 MCP，也不新增持久 current/default pointer。
+- helper 只读 Desktop state，不代表 Desktop 可发送或已空闲；返回值是时点快照而非 lease，不新增持久
+  current/default pointer。
 
-## R3c 当前 Command adapter（基础层，未接 transport）
+## R3c 当前 Command adapter（Command catalog foundation）
 
-- `src/routing/current-command.ts` 显式 ensure 当前 planner 与 executor route；缺少任一当前 authority
+- `src/routing/current-command.ts` 显式 ensure 当前 request-principal planner 与 Desktop executor route；缺少任一当前 authority
   时抛 `ROUTING_ROUTE_NOT_FOUND`，不从历史 route 推断。它以原始 payload 的 UTF-8 byte length 和
   SHA-256 调用现有 `createCommand()`，由 routing store 负责 pending 状态与 commandId 幂等/冲突语义。
-- 创建前同步 re-resolve 两条 route 以减少明显 stale；这仍只是时点检查，不是 transport lease。任何
-  未来发送边界必须重新解析当前 authority。该 adapter 只写 routing store，不调用 send、不写 Desktop/
-  feedback/Companion，也不接 MCP。
+- 创建前同步 re-resolve 两条 route 以减少明显 stale；这仍只是时点检查，不是 transport lease。该 adapter
+  只写 routing store，不调用 send、不写 Desktop/feedback/Companion。
 
 ## R3d Command → Desktop delivery adapter
 
-- `src/routing/current-command-transport.ts` 复用 `createCurrentCommand()`；投递前同步重新解析
-  当前 VERIFIED planner 与 Desktop binding executor，并把与 digest/bytes 完全相同的原始 payload
+- `src/routing/current-command-transport.ts` 复用 `createCurrentCommand()`；首次投递前同步重新解析
+  当前 MCP request planner 与 Desktop binding executor，并把与 digest/bytes 完全相同的原始 payload
   交给唯一 transport `sendDesktop()`。Desktop 仍独立执行现有授权、binding、busy、replay、owner/process
   与 outcome_unknown 门禁；此检查只是时点快照，不是 lease。
 - 新增 `transitionCommandDelivery()`，仅允许既有 pending Command 转为 `accepted / rejected /
@@ -153,7 +145,8 @@ Planner route → Project → Command → Executor route → ExecutionResult →
 - 显式传入的 `bindingId` 不会被 routing 自动替换：新 Command 及无 durable record 的 pending Command
   必须匹配当前 binding；已有 Desktop delivery 的 replay 必须匹配原 delivery 的 `bindingId`，并返回原 public
   delivery。不同 binding 沿用 `DESKTOP_BINDING_MISMATCH` / `DESKTOP_COMMAND_CONFLICT` 拒绝，不二次发送。
-- 新 Command 还要求当前 Companion planner route 已 VERIFIED；缺少 authority 时 routing 错误原样返回，发送不进入 IPC。
+- 新 Command 要求同一 MCP request 有官方 conversation principal；planner route 只由其 fingerprint 派生，
+  不读取 Companion/feedback authority。缺少 principal 时以明确 routing error 拒绝，发送不进入 IPC。
 - 仅 `codex_desktop_send` 接入；不接 feedback / ExecutionResult。Browser Companion 重连 UX 由独立 R3f
   提供，不改变本 slice 的 routing/send 边界。
 
@@ -172,5 +165,28 @@ R3e 将现有 `codex_desktop_send` 接到 R3d adapter；底层仍复用原 Deskt
 - 不做 feedback/ExecutionResult 回流或 executor 执行通道。
 - 不修改 Desktop IPC trust、Companion transport、rollout、OAuth 门禁。
 - 不做 rawSummary/machineEvidence（R4）。R3a/R3b 派生 routes，R3c 创建 Command，R3d 提供 Desktop
-  delivery adapter，R3e 接通现有 send tool；R3f 的一键重连 UX 位于 Browser Companion，不创建第二套路由
-  authority 或持久 current/default route pointer。
+  delivery adapter，R3e 接通现有 send tool；新 Chat reconnect/bootstrap UX 位于 Browser Companion，不创建第二套路由
+  authority 或持久 current/default route pointer。该实现仍待部署后的真实新 Chat live smoke。
+
+## R3k Task delivery 与 Feedback return plane
+
+- 运行时职责分离：任务投递入口是 `codex_desktop_send → deliverCurrentCommand() → sendDesktop()`；Browser Companion
+  只负责当前 Chat owner/connect、feedback pair/takeover/rebind/route attestation，以及 RESERVED feedback
+  的 reserve/release/回写与 ack。Browser 所称的 feedback delivery 是把 feedback 写回 ChatGPT，不是向 Codex
+  下发开发任务。
+- Browser Companion 的 Bridge URL builder 仅允许现有 `/api/companion/v1` feedback endpoints；`/rebind/status`
+  只允许 canonical ChatGPT conversation route 与 UUID challengeId 两个固定 query 参数。源码架构测试同时禁止
+  Browser task-delivery imports/calls，并禁止 Desktop MCP/transport 反向依赖 Browser runtime。
+- 边界限定：Desktop task delivery 不检查 Browser 扩展是否在线或其实时健康；R3e 曾从持久
+  feedback/Companion state 派生 planner authority，该限制已由 R3l 移除。
+
+## R3l Task delivery planner authority
+
+- Planner 仅从本次 MCP request 的官方 conversation principal 派生；缺少官方 `_meta["openai/session"]`
+  时以 `ROUTING_PLANNER_IDENTITY_UNAVAILABLE` fail closed，不从参数、sessionId、Browser state 或历史 route 回退。
+- 新 Command 只保存引用 request-scoped planner route；原始 MCP session 不持久化、不返回。Executor 只从
+  当前 Desktop binding 投影，`current-executor-route.ts` 经 Desktop-only adapter 读取，不依赖 feedback/store。
+- 既有 commandId replay 在 terminal fast path 或 Desktop durable delivery 同步前，也会核对原 planner route 属于本次
+  request principal；主体不匹配时以 `COMMAND_CONFLICT` 拒绝，不写 routing 状态、不发送。
+- Browser Companion / feedback 是 return plane；离线、无 binding 或 feedback state 缺失/损坏不阻断新 task
+  delivery。旧 Companion-derived planner routes 保留作历史记录，不删除、不迁移、不覆盖。

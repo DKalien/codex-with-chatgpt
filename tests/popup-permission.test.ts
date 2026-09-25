@@ -80,6 +80,10 @@ async function loadPopup(
           calls.page.push(message);
           return options.connectResult ?? { ok: true, state: "AWAITING_CONFIRMATION" };
         }
+        if (message.type === "c2c.bind.request") {
+          calls.page.push(message);
+          return { ok: true };
+        }
         return { ok: true };
       },
     },
@@ -185,6 +189,13 @@ describe("popup Bridge permission and Pair separation", () => {
     expect(calls.ownerProof).toBe(0);
     expect(calls.runtime).toEqual([]);
     expect(JSON.stringify(calls.page)).not.toMatch(/route|document|tab|credential|principal|secret/);
+  });
+
+  it("advanced Bind also sends a fixed zero-parameter request", async () => {
+    const { calls, elements } = await loadPopup(true);
+    await elements.get("bind")!.onclick!();
+    expect(calls.page).toEqual([{ type: "c2c.bind.request" }]);
+    expect(JSON.stringify(calls.page)).not.toMatch(/route|document|tab|generation|credential|principal|secret/);
   });
 
   it("reports bootstrap takeover waiting without exposing a body field", async () => {

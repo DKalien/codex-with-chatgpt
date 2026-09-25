@@ -5,13 +5,14 @@ import { describe, expect, it } from "vitest";
 import {
   emptyOwnerState,
   observeDocument,
-  bindOwner,
+  bindCurrentDocument,
   invalidateOnRouteChange,
   invalidateOnTabRemoved,
   invalidateOnDocumentChanged,
   isOwner,
   resetSessionOwnership,
   resolveSenderDocumentIdentity,
+  resolveCurrentDocumentBindingIdentity,
   applyObserveOwnership,
 } from "../browser-companion/ownership.js";
 import { observeChatGptSafety, fakeDom } from "../browser-companion/dom-adapter.js";
@@ -27,6 +28,14 @@ const ROUTE_B = "https://chatgpt.com/c/22222222-2222-4222-8222-222222222222";
 
 function doc(tabId: number, documentId: string, canonicalRoute: string, generation = 1) {
   return { tabId, documentId, canonicalRoute, generation, frameId: 0, lastSeen: Date.now() };
+}
+
+function bindDoc(state: ReturnType<typeof emptyOwnerState>, observation: ReturnType<typeof doc>) {
+  return bindCurrentDocument(state, {
+    tabId: observation.tabId,
+    documentId: observation.documentId,
+    canonicalRoute: observation.canonicalRoute,
+  }, { generation: observation.generation, now: observation.lastSeen });
 }
 
 describe("browser companion manifest", () => {
@@ -80,7 +89,7 @@ describe("sender document identity (P1 fail-closed)", () => {
   });
 
   it("reload with missing documentId cannot inherit owner", () => {
-    const bound = bindOwner(emptyOwnerState(), doc(1, "real-doc-1", ROUTE), ROUTE);
+    const bound = bindDoc(emptyOwnerState(), doc(1, "real-doc-1", ROUTE));
     expect(bound.ok).toBe(true);
     // same tab after reload, but sender lacks documentId — cannot re-bind
     const missing = resolveSenderDocumentIdentity({ tab: { id: 1 }, frameId: 0 });
@@ -92,56 +101,102 @@ describe("sender document identity (P1 fail-closed)", () => {
 
   it("subframe and no-tab rejected", () => {
     expect(resolveSenderDocumentIdentity({ tab: { id: 1 }, frameId: 2, documentId: "d" }).ok).toBe(false);
+    expect(resolveSenderDocumentIdentity({ tab: { id: 1 }, documentId: "d" })).toMatchObject({
+      ok: false, reason: "frame_id_unavailable",
+    });
     expect(resolveSenderDocumentIdentity({ frameId: 0, documentId: "d" }).ok).toBe(false);
     const ok = resolveSenderDocumentIdentity({ tab: { id: 9 }, frameId: 0, documentId: "doc-9" });
-    expect(ok).toEqual({ ok: true, tabId: 9, documentId: "doc-9", frameId: 0 });
+    expect(ok).toEqual({ ok: true, tabId: 9, documentId: "doc-9" });
+  });
+
+  it("derives only tab/document/route from MessageSender and sender.url", () => {
+    const result = resolveCurrentDocumentBindingIdentity({
+      tab: { id: 9 }, documentId: "doc-9", frameId: 0,
+      url: ROUTE,
+      tabId: 99, canonicalRoute: ROUTE_B, href: ROUTE_B, targetRoute: ROUTE_B,
+    });
+    expect(result).toEqual({
+      ok: true,
+      identity: { tabId: 9, documentId: "doc-9", canonicalRoute: ROUTE },
+    });
+    expect(resolveCurrentDocumentBindingIdentity({
+      tab: { id: 9 }, documentId: "doc-9", frameId: 0, url: "https://chatgpt.com/",
+    })).toMatchObject({ ok: false, reason: "invalid_route" });
+  });
+});
+
+describe("popup-to-content identity boundary", () => {
+  it("forwards only fixed commands plus runtime freshness/evidence, never binding identity", () => {
+    const source = fs.readFileSync(path.join(projectRoot, "browser-companion", "content-script.js"), "utf8");
+    const bindStart = source.indexOf('if (message.type === "c2c.bind.request")');
+    const connectStart = source.indexOf('if (message.type === "c2c.connect.request")', bindStart);
+    const ownerProofStart = source.indexOf('if (message.type === "c2c.owner-proof.request")', connectStart);
+    expect(bindStart).toBeGreaterThanOrEqual(0);
+    expect(connectStart).toBeGreaterThan(bindStart);
+    expect(ownerProofStart).toBeGreaterThan(connectStart);
+    const bindBranch = source.slice(bindStart, connectStart);
+    const connectBranch = source.slice(connectStart, ownerProofStart);
+    expect(bindBranch).toMatch(/sendToWorker\(\{\s*type:\s*"c2c\.bind",\s*generation\s*\}\)/);
+    expect(connectBranch).toMatch(/sendToWorker\(\{\s*type:\s*"c2c\.connect\.page",\s*generation:\s*observation\.generation,\s*safety:\s*observation\.safety,?\s*\}\)/);
+    expect(bindBranch).not.toMatch(/(?:tabId|documentId|canonicalRoute|targetRoute|frameId|lastSeen|href):/);
+    expect(connectBranch).not.toMatch(/(?:tabId|documentId|canonicalRoute|targetRoute|frameId|lastSeen|href):/);
   });
 });
 
 describe("ownership reducer", () => {
-  it("correct tab+document can bind; wrong route cannot", () => {
+  it("binds the strict three-field identity and derives targetRoute", () => {
     const state = emptyOwnerState();
-    const bad = bindOwner(state, doc(1, "d1", ROUTE_B), ROUTE);
+    const bad = bindCurrentDocument(state, { tabId: 1, documentId: "d1", canonicalRoute: "https://chatgpt.com/" });
     expect(bad.ok).toBe(false);
-    if (!bad.ok) expect(bad.reason).toBe("route_mismatch");
-    const good = bindOwner(state, doc(1, "d1", ROUTE), ROUTE);
+    if (!bad.ok) expect(bad.reason).toBe("invalid_route");
+    const good = bindCurrentDocument(state, { tabId: 1, documentId: "d1", canonicalRoute: ROUTE }, {
+      generation: 4, now: 12345,
+    });
     expect(good.ok).toBe(true);
     expect(isOwner(good.state, 1, "d1")).toBe(true);
+    expect(good.state.targetRoute).toBe(ROUTE);
+    expect(good.state.owner).toMatchObject({ tabId: 1, documentId: "d1", canonicalRoute: ROUTE, generation: 4, lastSeen: 12345 });
+    expect(good.state.owner).not.toHaveProperty("frameId");
   });
 
   it("empty documentId cannot bind", () => {
-    const r = bindOwner(emptyOwnerState(), doc(1, "", ROUTE), ROUTE);
+    const r = bindCurrentDocument(emptyOwnerState(), { tabId: 1, documentId: "", canonicalRoute: ROUTE });
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toBe("document_id_required");
   });
 
-  it("subframe cannot bind", () => {
-    const r = bindOwner(emptyOwnerState(), { ...doc(1, "d1", ROUTE), frameId: 2 }, ROUTE);
-    expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.reason).toBe("subframe_forbidden");
+  it("generation is freshness metadata, not document identity", () => {
+    const identity = { tabId: 1, documentId: "d1", canonicalRoute: ROUTE };
+    const first = bindCurrentDocument(emptyOwnerState(), identity, { generation: 1, now: 100 });
+    const refreshed = bindCurrentDocument(first.state, identity, { generation: 2, now: 200 });
+    expect(first.ok && refreshed.ok).toBe(true);
+    expect(isOwner(refreshed.state, 1, "d1")).toBe(true);
+    expect(refreshed.state.owner).toMatchObject({ ...identity, generation: 2, lastSeen: 200 });
+    expect(bindCurrentDocument(emptyOwnerState(), { ...identity, generation: 1 }, { now: 100 }))
+      .toMatchObject({ ok: false, reason: "invalid_identity" });
   });
 
   it("second tab does not silently steal owner", () => {
-    const first = bindOwner(emptyOwnerState(), doc(1, "d1", ROUTE), ROUTE);
+    const first = bindDoc(emptyOwnerState(), doc(1, "d1", ROUTE));
     expect(first.ok).toBe(true);
     const observed = observeDocument(first.state, doc(2, "d2", ROUTE));
     expect(isOwner(observed, 1, "d1")).toBe(true);
     expect(isOwner(observed, 2, "d2")).toBe(false);
-    const stolen = bindOwner(observed, doc(2, "d2", ROUTE), ROUTE);
+    const stolen = bindDoc(observed, doc(2, "d2", ROUTE));
     expect(stolen.ok).toBe(true);
     expect(isOwner(stolen.state, 2, "d2")).toBe(true);
     expect(isOwner(stolen.state, 1, "d1")).toBe(false);
   });
 
   it("navigation away invalidates owner", () => {
-    const bound = bindOwner(emptyOwnerState(), doc(1, "d1", ROUTE), ROUTE);
+    const bound = bindDoc(emptyOwnerState(), doc(1, "d1", ROUTE));
     expect(bound.ok).toBe(true);
     const next = invalidateOnRouteChange(bound.state, 1, "d1", ROUTE_B);
     expect(next.owner).toBeNull();
   });
 
   it("new document cannot inherit old document authorization", () => {
-    const bound = bindOwner(emptyOwnerState(), doc(1, "d1", ROUTE), ROUTE);
+    const bound = bindDoc(emptyOwnerState(), doc(1, "d1", ROUTE));
     expect(bound.ok).toBe(true);
     const afterReload = invalidateOnDocumentChanged(bound.state, 1, "d1", "d2");
     expect(isOwner(afterReload, 1, "d2")).toBe(false);
@@ -149,7 +204,7 @@ describe("ownership reducer", () => {
   });
 
   it("tab removal invalidates owner", () => {
-    const bound = bindOwner(emptyOwnerState(), doc(7, "d7", ROUTE), ROUTE);
+    const bound = bindDoc(emptyOwnerState(), doc(7, "d7", ROUTE));
     expect(bound.ok).toBe(true);
     const next = invalidateOnTabRemoved(bound.state, 7);
     expect(next.owner).toBeNull();
@@ -157,7 +212,7 @@ describe("ownership reducer", () => {
   });
 
   it("browser session reset clears ephemeral ownership but keeps targetRoute", () => {
-    const bound = bindOwner(emptyOwnerState(), doc(1, "d1", ROUTE), ROUTE);
+    const bound = bindDoc(emptyOwnerState(), doc(1, "d1", ROUTE));
     const reset = resetSessionOwnership(bound.state);
     expect(reset.owner).toBeNull();
     expect(reset.targetRoute).toBe(ROUTE);
@@ -305,7 +360,7 @@ describe("DOM adapter generation positive evidence (P1)", () => {
 
 describe("ownership reload / page status (final review-fix)", () => {
   it("bind tab1/d1 → observe tab1/d2 → owner=null", () => {
-    const bound = bindOwner(emptyOwnerState(), doc(1, "d1", ROUTE), ROUTE);
+    const bound = bindDoc(emptyOwnerState(), doc(1, "d1", ROUTE));
     expect(bound.ok).toBe(true);
     const next = applyObserveOwnership(bound.state, {
       tabId: 1,
@@ -318,7 +373,7 @@ describe("ownership reload / page status (final review-fix)", () => {
   });
 
   it("bind tab1/d1 → same tab missing documentId → owner=null", () => {
-    const bound = bindOwner(emptyOwnerState(), doc(1, "d1", ROUTE), ROUTE);
+    const bound = bindDoc(emptyOwnerState(), doc(1, "d1", ROUTE));
     expect(bound.ok).toBe(true);
     const next = applyObserveOwnership(bound.state, {
       tabId: 1,
@@ -329,7 +384,7 @@ describe("ownership reload / page status (final review-fix)", () => {
   });
 
   it("other tab without documentId does not clear owner", () => {
-    const bound = bindOwner(emptyOwnerState(), doc(1, "d1", ROUTE), ROUTE);
+    const bound = bindDoc(emptyOwnerState(), doc(1, "d1", ROUTE));
     const next = applyObserveOwnership(bound.state, {
       tabId: 2,
       documentId: null,
@@ -339,7 +394,7 @@ describe("ownership reload / page status (final review-fix)", () => {
   });
 
   it("same document remains owner after observe", () => {
-    const bound = bindOwner(emptyOwnerState(), doc(1, "d1", ROUTE), ROUTE);
+    const bound = bindDoc(emptyOwnerState(), doc(1, "d1", ROUTE));
     const next = applyObserveOwnership(bound.state, {
       tabId: 1,
       documentId: "d1",
@@ -349,7 +404,7 @@ describe("ownership reload / page status (final review-fix)", () => {
   });
 
   it("tab2 same route does not steal owner on observe", () => {
-    const bound = bindOwner(emptyOwnerState(), doc(1, "d1", ROUTE), ROUTE);
+    const bound = bindDoc(emptyOwnerState(), doc(1, "d1", ROUTE));
     const next = applyObserveOwnership(bound.state, {
       tabId: 2,
       documentId: "d2",

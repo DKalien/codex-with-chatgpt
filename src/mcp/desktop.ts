@@ -7,6 +7,11 @@ import { desktopStatus } from "../desktop/service.js";
 import { DESKTOP_CONTROL_SCOPE, DESKTOP_READ_SCOPE } from "../auth/store.js";
 import { RoutingError } from "../routing/schema.js";
 import { deliverCurrentCommand } from "../routing/current-command-transport.js";
+import {
+  ConversationPrincipalError,
+  requireConversationPrincipal,
+  resolveConversationPrincipal,
+} from "./conversation-principal.js";
 
 export { DESKTOP_CONTROL_SCOPE, DESKTOP_READ_SCOPE };
 
@@ -90,6 +95,22 @@ function authorizeNow(auth: AuthInfo): void {
   }
 }
 
+function requestPlannerFingerprint(extra: { authInfo?: AuthInfo; sessionId?: string; _meta?: unknown }): string {
+  try {
+    const principal = resolveConversationPrincipal(extra);
+    requireConversationPrincipal(principal);
+    return principal.fingerprint;
+  } catch (error) {
+    if (error instanceof ConversationPrincipalError) {
+      throw new RoutingError(
+        "ROUTING_PLANNER_IDENTITY_UNAVAILABLE",
+        "缺少当前 MCP 对话主体；拒绝创建或投递 Desktop Command。",
+      );
+    }
+    throw error;
+  }
+}
+
 function result(action: () => unknown | Promise<unknown>, scope?: string): Promise<ToolResult> {
   return Promise.resolve().then(action).then((data) => ok(data as Record<string, unknown>)).catch((error) =>
     error instanceof DesktopError && error.code === "INSUFFICIENT_SCOPE"
@@ -125,7 +146,8 @@ export function registerDesktopTools(
       if (input.workspaceId !== workspace.id) {
         throw new DesktopError("DESKTOP_WRONG_WORKSPACE", "请求工作区不匹配。" );
       }
-      const delivered = await deliverCurrentCommand(workspace, {
+      const plannerFingerprint = requestPlannerFingerprint(extra);
+      const delivered = await deliverCurrentCommand(workspace, plannerFingerprint, {
         commandId: input.commandId,
         intent: input.intent,
         payload: input.message,

@@ -130,7 +130,7 @@
     <button id="recover" class="secondary" disabled>Recover from /state</button>
     <hr />
     <div class="note" style="color:#f28b82;font-weight:700;">
-      AUTONOMY — 默认 OFF。SHADOW 只读；ARMED 可按 heartbeat 自动 reserve + production Send。绝不自动 Retire。
+      AUTONOMY — 默认 OFF。SHADOW 只读；ARMED 可按 heartbeat 自动 reserve + feedback delivery（写回当前 Chat）。绝不自动 Retire。
     </div>
     <pre class="value" id="autonomy-status" style="white-space: pre-wrap; margin: 0; max-height: 140px; overflow: auto;">—</pre>
     <div class="row">
@@ -184,19 +184,19 @@
     </div>
     <hr />
     <div class="note" style="color:#f28b82;font-weight:700;">
-      PRODUCTION SEND — 会把当前 RESERVED production feedback 通过真实 ChatGPT Send 发出，并调用 /begin-send 与 /ack。
+      FEEDBACK DELIVERY — 会把当前 RESERVED feedback 写回当前 ChatGPT 对话，并调用 /begin-send 与 /ack；不会向 Codex 下发任务。
     </div>
     <div class="row">
-      <div class="label">Production journal（durable；关闭 popup 仍保留）</div>
+      <div class="label">Feedback delivery journal（durable；关闭 popup 仍保留）</div>
       <pre class="value" id="production-status" style="white-space: pre-wrap; margin: 0; max-height: 140px; overflow: auto;">—</pre>
     </div>
     <label class="note" style="display:flex;gap:8px;align-items:flex-start;color:#f28b82;">
       <input type="checkbox" id="production-send-confirm" style="margin-top:2px;" />
-      <span>I understand this sends the reserved production feedback</span>
+      <span>I understand this writes reserved feedback into the current Chat</span>
     </label>
-    <button id="production-send" class="secondary" disabled style="background:#c5221f;">SEND reserved feedback once</button>
+    <button id="production-send" class="secondary" disabled style="background:#c5221f;">WRITE reserved feedback to Chat once</button>
     <div class="row">
-      <div class="label">Production send — REAL FEEDBACK DELIVERY</div>
+      <div class="label">FEEDBACK DELIVERY — write-back result</div>
       <pre class="value" id="production-send-result" style="white-space: pre-wrap; margin: 0; max-height: 180px; overflow: auto;">—</pre>
     </div>
     <button id="clear-transport" class="secondary" disabled>Clear transport</button>

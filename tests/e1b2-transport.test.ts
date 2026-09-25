@@ -85,6 +85,33 @@ describe("bridge origin parser", () => {
       .toBe("https://b.example.com/api/companion/v1/state");
   });
 
+  it("companionApiUrl allows only feedback endpoints and the bounded rebind status query", () => {
+    const route = "https://chatgpt.com/g/g-p-6aa296e634348191b441d56fdab23b7b/c/6ab246f9-3b94-83ec-b873-9bc2ac9edf67";
+    const challengeId = "6ab246f9-3b94-83ec-b873-9bc2ac9edf67";
+    const status = `/rebind/status?routeCanonical=${encodeURIComponent(route)}&challengeId=${challengeId}`;
+    expect(companionApiUrl("https://b.example.com", status))
+      .toBe(`https://b.example.com/api/companion/v1${status}`);
+
+    for (const endpoint of [
+      "/pair", "/rebind/init", "/rebind/complete", "/rebind/status", "/state",
+      "/reserve", "/release", "/begin-send", "/ack", "/retire-unknown",
+    ]) {
+      if (endpoint === "/rebind/status") continue;
+      expect(companionApiUrl("https://b.example.com", endpoint))
+        .toBe(`https://b.example.com/api/companion/v1${endpoint}`);
+    }
+
+    for (const endpoint of [
+      "/desktop", "/command", "/task", "/routing", "/api/companion/v1/desktop",
+      "/pair?next=/desktop", "/pair/../desktop", "//other.example/desktop",
+      "/rebind/status?routeCanonical=bad&challengeId=also-bad",
+      `/rebind/status?routeCanonical=${encodeURIComponent(route)}&challengeId=${challengeId}&extra=1`,
+      `/rebind/status?routeCanonical=${encodeURIComponent(route)}&challengeId=${challengeId}&challengeId=${challengeId}`,
+    ]) {
+      expect(() => companionApiUrl("https://b.example.com", endpoint)).toThrow(BridgeOriginError);
+    }
+  });
+
   it("service-worker short endpoints always resolve via companionApiUrl", () => {
     const sw = fs.readFileSync(path.join(projectRoot, "browser-companion", "service-worker.js"), "utf8");
     expect(sw).toMatch(/companionApiUrl\(origin,\s*"\/pair"\)/);
@@ -589,6 +616,8 @@ describe("extension static safety (E1b2 + E1b3a)", () => {
       "production-send-runtime.js",
       "production-send-runtime-global.js",
       "service-worker.js",
+      // Endpoint allowlist names are inert; the Bridge URL builder has no send capability.
+      "bridge-origin.js",
       // E1b3d3b CS production DI shell wires beginSend/persist/ack names to SW RPC only.
       "content-script.js",
     ]);

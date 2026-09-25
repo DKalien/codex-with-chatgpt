@@ -1797,9 +1797,10 @@ describe("E1b3d3b RPC ambiguity", () => {
 describe("E1b3d3b popup / packaging gates", () => {
   it("popup production button is explicit and confirmation-gated", () => {
     const html = fs.readFileSync(path.join(companionRoot, "popup", "popup.html"), "utf8");
-    expect(html).toMatch(/SEND reserved feedback once/);
-    expect(html).toMatch(/I understand this sends the reserved production feedback/);
-    expect(html).toMatch(/PRODUCTION SEND/);
+    expect(html).toMatch(/WRITE reserved feedback to Chat once/);
+    expect(html).toMatch(/I understand this writes reserved feedback into the current Chat/);
+    expect(html).toMatch(/FEEDBACK DELIVERY/);
+    expect(html).toMatch(/不会向 Codex 下发任务/);
     expect(html).toMatch(/production-status/);
     const js = fs.readFileSync(path.join(companionRoot, "popup", "popup.js"), "utf8");
     expect(js).toMatch(/c2c\.production\.send\.request/);

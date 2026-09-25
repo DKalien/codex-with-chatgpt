@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { sendDesktop } from "../desktop/service.js";
 import { DesktopError, publicDelivery, readDesktop, type DesktopDelivery } from "../desktop/store.js";
-import { projectLegacyRoutes } from "./legacy-adapter.js";
+import { projectDesktopExecutorCandidate } from "./desktop-adapter.js";
 import { RoutingError, type CommandInput, type RoutingCommand } from "./schema.js";
 import { createCurrentCommand } from "./current-command.js";
 import { resolveCurrentExecutorRoute } from "./current-executor-route.js";
@@ -15,6 +15,21 @@ function assertCommandReplay(command: RoutingCommand, input: Pick<CommandInput, 
   const payloadSha256 = createHash("sha256").update(input.payload, "utf8").digest("hex");
   if (command.intent !== input.intent || command.payloadBytes !== payloadBytes || command.payloadSha256 !== payloadSha256) {
     throw new RoutingError("COMMAND_CONFLICT", "相同 commandId 但 intent 或 payload 指纹不一致；拒绝重放不同请求。");
+  }
+}
+
+function assertCommandPlannerOwnership(
+  identity: RoutingWorkspaceIdentity,
+  plannerFingerprint: string,
+  command: RoutingCommand,
+): void {
+  const planner = listRoutes(identity).find((route) => route.routeId === command.plannerRouteId);
+  if (!planner || planner.role !== "planner" || planner.platform !== "chatgpt_web" ||
+    planner.conversationId !== plannerFingerprint || JSON.stringify(planner.locator) !== "{}") {
+    throw new RoutingError(
+      "COMMAND_CONFLICT",
+      "相同 commandId 属于不同 MCP conversation principal；拒绝重放或同步 Desktop delivery。",
+    );
   }
 }
 
@@ -49,22 +64,21 @@ function readDurableDelivery(
 
 function assertCurrentRoutes(
   identity: RoutingWorkspaceIdentity,
+  plannerFingerprint: string,
   command: RoutingCommand,
   expectedBindingId?: string,
 ): { bindingId: string; threadId: string } {
-  const planner = resolveCurrentPlannerRoute(identity);
+  const planner = resolveCurrentPlannerRoute(identity, plannerFingerprint);
   const executor = resolveCurrentExecutorRoute(identity);
-  const candidates = projectLegacyRoutes(identity);
-  const plannerCandidate = candidates.plannerCandidate;
-  const executorCandidate = candidates.executorCandidate;
+  const executorCandidate = projectDesktopExecutorCandidate(identity);
   if (expectedBindingId !== undefined && executorCandidate &&
     executorCandidate.legacyReferenceId !== expectedBindingId) {
     throw new DesktopError("DESKTOP_BINDING_MISMATCH", "bindingId 已失效；不能自动切换到新的投递目标。" );
   }
-  if (!planner || !executor || !plannerCandidate || !executorCandidate ||
+  if (!planner || !executor || !executorCandidate ||
     planner.routeId !== command.plannerRouteId || executor.routeId !== command.executorRouteId ||
-    planner.platform !== plannerCandidate.platform || planner.conversationId !== plannerCandidate.conversationId ||
-    JSON.stringify(planner.locator) !== JSON.stringify(plannerCandidate.locator) ||
+    planner.platform !== "chatgpt_web" || planner.conversationId !== plannerFingerprint ||
+    JSON.stringify(planner.locator) !== "{}" ||
     executor.conversationId !== executorCandidate.conversationId ||
     JSON.stringify(executor.locator) !== JSON.stringify(executorCandidate.locator)) {
     throw new RoutingError(
@@ -78,6 +92,7 @@ function assertCurrentRoutes(
 /** 创建/回放当前 Command，并把原始 payload 交给现有 Desktop sender。 */
 export async function deliverCurrentCommand(
   identity: RoutingWorkspaceIdentity,
+  plannerFingerprint: string,
   input: Pick<CommandInput, "commandId" | "intent"> & { payload: string; userConfirmed: true },
   clientId: string,
   authorize: () => void,
@@ -88,6 +103,7 @@ export async function deliverCurrentCommand(
   const existing = listCommands(identity).find((item) => item.commandId === input.commandId);
   if (existing) {
     assertCommandReplay(existing, input);
+    assertCommandPlannerOwnership(identity, plannerFingerprint, existing);
     if (existing.deliveryStatus !== "pending") {
       if (expectedBindingId === undefined) return { command: existing, delivery: null };
       const delivery = readDurableDelivery(identity, existing, clientId);
@@ -112,7 +128,7 @@ export async function deliverCurrentCommand(
     }
   }
 
-  const command = existing ?? createCurrentCommand(identity, input);
+  const command = existing ?? createCurrentCommand(identity, plannerFingerprint, input);
 
   const priorDelivery = readDurableDelivery(identity, command, clientId);
   if (priorDelivery) {
@@ -127,7 +143,7 @@ export async function deliverCurrentCommand(
   }
 
   // 只有既有 routing/desktop 状态都无 durable outcome 时才要求 authority 仍 current。
-  const target = assertCurrentRoutes(identity, command, expectedBindingId);
+  const target = assertCurrentRoutes(identity, plannerFingerprint, command, expectedBindingId);
   const delivery = await sendDesktop(identity, {
     workspaceId: identity.id,
     bindingId: target.bindingId,

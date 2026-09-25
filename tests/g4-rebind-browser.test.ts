@@ -340,10 +340,22 @@ describe("G4c one-click connect orchestration", () => {
       type: "c2c.connect.page",
       generation: 1,
       safety: { composer: "empty", generation: "idle", safe: true },
+      tabId: 999,
+      documentId: "caller-document",
+      canonicalRoute: OLD_ROUTE,
+      href: OLD_ROUTE,
+      targetRoute: OLD_ROUTE,
+      frameId: 2,
+      lastSeen: -1,
     }, sender) as Record<string, any>;
 
     expect(result).toMatchObject({ ok: true, state: "WAITING_TAKEOVER" });
     expect(result.reason).not.toBe("cold_pair_required");
+    expect(worker.session.values.get(OWNER_KEY)).toMatchObject({
+      tabId: 7, documentId: "document-g4-rebind", canonicalRoute: ROUTE, generation: 1,
+    });
+    expect(worker.session.values.get(OWNER_KEY)).not.toHaveProperty("frameId");
+    expect(worker.local.values.get(LOCAL_KEY)).toMatchObject({ targetRoute: ROUTE });
     expect(worker.local.values.get(CONNECT_KEY)).toMatchObject({ state: "WAITING_TAKEOVER", challengeId: null });
     expect(worker.tabsSendMessage).toHaveBeenCalledTimes(1);
     expect(worker.tabsSendMessage.mock.calls[0][1]).toEqual({
@@ -352,6 +364,29 @@ describe("G4c one-click connect orchestration", () => {
       expectedGeneration: 1,
     });
     expect(worker.fetchMock.mock.calls.filter(([url]) => String(url).includes("/rebind/init"))).toHaveLength(1);
+  });
+
+  it("explicit Bind derives the same identity from MessageSender and ignores caller identity fields", async () => {
+    const worker = await loadWorker(responseBody());
+    const sender = {
+      tab: { id: 17 }, documentId: "actual-document", frameId: 0, url: ROUTE,
+    };
+    await worker.send({
+      type: "c2c.bind",
+      generation: 8,
+      tabId: 999,
+      documentId: "caller-document",
+      canonicalRoute: OLD_ROUTE,
+      href: OLD_ROUTE,
+      targetRoute: OLD_ROUTE,
+      frameId: 2,
+      lastSeen: -1,
+    }, sender);
+    expect(worker.session.values.get(OWNER_KEY)).toMatchObject({
+      tabId: 17, documentId: "actual-document", canonicalRoute: ROUTE, generation: 8,
+    });
+    expect(worker.session.values.get(OWNER_KEY)).not.toHaveProperty("frameId");
+    expect(worker.local.values.get(LOCAL_KEY)).toMatchObject({ targetRoute: ROUTE });
   });
 
   it("proven no-mutation bootstrap failure stays retryable only on a later explicit Connect", async () => {

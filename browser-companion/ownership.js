@@ -1,4 +1,7 @@
-import { areChatgptConversationRoutesEquivalent } from "./route-esm.js";
+import {
+  areChatgptConversationRoutesEquivalent,
+  parseChatgptConversationRoute,
+} from "./route-esm.js";
 
 /**
  * Pure ownership reducer for Edge/Chromium MV3 companion.
@@ -6,20 +9,20 @@ import { areChatgptConversationRoutesEquivalent } from "./route-esm.js";
  */
 
 /**
- * @typedef {Object} DocumentIdentity
+ * @typedef {Object} DocumentBindingIdentity
  * @property {number} tabId
  * @property {string} documentId
  * @property {string} canonicalRoute
- * @property {number} generation
- * @property {number} lastSeen
  */
+
+/** @typedef {DocumentBindingIdentity & { generation: number, lastSeen: number }} DocumentRuntimeState */
 
 /**
  * @typedef {Object} OwnerState
  * @property {number} schemaVersion
  * @property {string|null} targetRoute
- * @property {DocumentIdentity|null} owner
- * @property {DocumentIdentity[]} registry
+ * @property {DocumentRuntimeState|null} owner
+ * @property {DocumentRuntimeState[]} registry
  */
 
 export const OWNERSHIP_SCHEMA_VERSION = 1;
@@ -27,14 +30,14 @@ export const OWNERSHIP_SCHEMA_VERSION = 1;
 /**
  * Resolve document identity from MessageSender only.
  * Missing documentId is fail-closed: observe-only, never bind/owner.
- * @param {{ tab?: { id?: number }, frameId?: number, documentId?: string }} sender
+ * @param {{ tab?: { id?: number }, frameId?: number, documentId?: string, url?: string }} sender
  */
 export function resolveSenderDocumentIdentity(sender) {
-  if (!sender || sender.tab == null || typeof sender.tab.id !== "number") {
+  if (!sender || sender.tab == null || !Number.isSafeInteger(sender.tab.id) || sender.tab.id < 0) {
     return { ok: false, reason: "no_tab" };
   }
-  if (sender.frameId !== undefined && sender.frameId !== 0) {
-    return { ok: false, reason: "subframe" };
+  if (sender.frameId !== 0) {
+    return { ok: false, reason: sender.frameId === undefined ? "frame_id_unavailable" : "subframe" };
   }
   const documentId = sender.documentId;
   if (typeof documentId !== "string" || documentId.length === 0) {
@@ -45,7 +48,29 @@ export function resolveSenderDocumentIdentity(sender) {
       // No synthetic identity — caller may observe but must not bind.
     };
   }
-  return { ok: true, tabId: sender.tab.id, documentId, frameId: 0 };
+  return { ok: true, tabId: sender.tab.id, documentId };
+}
+
+/** Resolve the three-field current document identity from MessageSender only. */
+export function resolveCurrentDocumentBindingIdentity(sender) {
+  const resolved = resolveSenderDocumentIdentity(sender);
+  if (!resolved.ok) return resolved;
+  try {
+    const parsed = parseChatgptConversationRoute(sender.url, {
+      allowQueryOrHash: false,
+      conversationIdPolicy: "uuid",
+    });
+    return {
+      ok: true,
+      identity: {
+        tabId: resolved.tabId,
+        documentId: resolved.documentId,
+        canonicalRoute: parsed.canonical,
+      },
+    };
+  } catch {
+    return { ok: false, reason: "invalid_route" };
+  }
 }
 
 /** @returns {OwnerState} */
@@ -86,7 +111,7 @@ function isLive(doc, now, ttlMs) {
 
 /**
  * @param {OwnerState} state
- * @param {DocumentIdentity} observation
+ * @param {DocumentRuntimeState} observation
  * @param {{ now?: number, ttlMs?: number }} [opts]
  */
 export function observeDocument(state, observation, opts = {}) {
@@ -117,46 +142,57 @@ export function observeDocument(state, observation, opts = {}) {
 }
 
 /**
- * Explicit bind of CURRENT document as owner for targetRoute.
- * Fails closed if observation is not a valid matching document.
+ * Explicitly bind the current three-field document identity.
+ * Freshness metadata is separate and never changes that identity.
+ * @param {OwnerState} state
+ * @param {DocumentBindingIdentity} identity
+ * @param {{ generation?: number, now?: number }} [freshness]
  * @returns {{ ok: true, state: OwnerState } | { ok: false, reason: string, state: OwnerState }}
  */
-export function bindOwner(state, observation, targetRoute) {
-  if (!targetRoute || typeof targetRoute !== "string") {
-    return { ok: false, reason: "target_route_required", state };
+export function bindCurrentDocument(state, identity, freshness = {}) {
+  if (!identity) return { ok: false, reason: "invalid_identity", state };
+  if (Object.keys(identity).some((key) => !["tabId", "documentId", "canonicalRoute"].includes(key))) {
+    return { ok: false, reason: "invalid_identity", state };
   }
-  if (!observation || typeof observation.tabId !== "number" || observation.tabId < 0) {
+  if (!Number.isSafeInteger(identity.tabId) || identity.tabId < 0) {
     return { ok: false, reason: "invalid_tab", state };
   }
-  if (!observation.documentId || typeof observation.documentId !== "string") {
+  if (typeof identity.documentId !== "string" || identity.documentId.length === 0) {
     return { ok: false, reason: "document_id_required", state };
   }
-  if (observation.frameId !== undefined && observation.frameId !== 0) {
-    return { ok: false, reason: "subframe_forbidden", state };
+  let parsedRoute;
+  try {
+    parsedRoute = parseChatgptConversationRoute(identity.canonicalRoute, {
+      allowQueryOrHash: false,
+      conversationIdPolicy: "uuid",
+    });
+  } catch {
+    parsedRoute = null;
   }
-  if (!areChatgptConversationRoutesEquivalent(observation.canonicalRoute, targetRoute)) {
-    return { ok: false, reason: "route_mismatch", state };
+  if (!parsedRoute || parsedRoute.canonical !== identity.canonicalRoute) {
+    return { ok: false, reason: "invalid_route", state };
   }
+  const generation = freshness.generation ?? 1;
+  const now = freshness.now ?? Date.now();
+  if (!Number.isSafeInteger(generation) || generation < 1) {
+    return { ok: false, reason: "invalid_generation", state };
+  }
+  if (!Number.isFinite(now)) return { ok: false, reason: "invalid_timestamp", state };
+  const owner = {
+    tabId: identity.tabId,
+    documentId: identity.documentId,
+    canonicalRoute: identity.canonicalRoute,
+    generation,
+    lastSeen: now,
+  };
   // second tab does not silently steal: require explicit bind which replaces owner
-  const next = observeDocument(state, {
-    tabId: observation.tabId,
-    documentId: observation.documentId,
-    canonicalRoute: observation.canonicalRoute,
-    generation: observation.generation ?? 1,
-    lastSeen: observation.lastSeen ?? Date.now(),
-  }, { now: observation.lastSeen });
+  const next = observeDocument(state, owner, { now });
   return {
     ok: true,
     state: {
       ...next,
-      targetRoute,
-      owner: {
-        tabId: observation.tabId,
-        documentId: observation.documentId,
-        canonicalRoute: targetRoute,
-        generation: observation.generation ?? 1,
-        lastSeen: observation.lastSeen ?? Date.now(),
-      },
+      targetRoute: identity.canonicalRoute,
+      owner,
     },
   };
 }

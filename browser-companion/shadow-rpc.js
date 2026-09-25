@@ -43,6 +43,52 @@ export function buildShadowInspectRequest(owner, transport) {
   };
 }
 
+/** Exact-document, owner-local request for read-only diagnostics. */
+export function buildOwnerLocalShadowInspectRequest(owner) {
+  if (
+    !owner
+    || typeof owner.tabId !== "number"
+    || !Number.isFinite(owner.tabId)
+    || typeof owner.documentId !== "string"
+    || owner.documentId.length === 0
+    || typeof owner.canonicalRoute !== "string"
+    || !Number.isFinite(owner.generation)
+  ) {
+    return { ok: false, reason: "owner_document_invalid" };
+  }
+  return {
+    ok: true,
+    tabId: owner.tabId,
+    message: { type: "c2c.send.shadow.inspect" },
+    sendOptions: { documentId: owner.documentId },
+  };
+}
+
+/** Validate read-only evidence against the current owner, not transport state. */
+export function validateOwnerLocalShadowInspectResponse(response, owner) {
+  if (!response || typeof response !== "object") {
+    return { ok: false, reason: "malformed_shadow_response" };
+  }
+  if (response.mode !== "read_only") {
+    return { ok: false, reason: "shadow_response_invalid" };
+  }
+  if (
+    typeof owner?.canonicalRoute !== "string"
+    || !areChatgptConversationRoutesEquivalent(response.canonicalRoute, owner.canonicalRoute)
+    || !areChatgptConversationRoutesEquivalent(response.documentCanonicalRoute, owner.canonicalRoute)
+  ) {
+    return { ok: false, reason: "shadow_route_mismatch" };
+  }
+  if (
+    !Number.isFinite(owner.generation)
+    || !Number.isFinite(response.generation)
+    || response.generation !== owner.generation
+  ) {
+    return { ok: false, reason: "shadow_generation_mismatch" };
+  }
+  return { ok: true };
+}
+
 /** Validate CS shadow evidence against exact owner identity + transport route. */
 export function validateShadowInspectResponse(response, owner, transport) {
   if (!response || typeof response !== "object") {

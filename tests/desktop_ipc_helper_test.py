@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import sys
 import copy
+import ctypes
 import hashlib
 import io
 import json
 import os
 import tempfile
+from types import SimpleNamespace
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -345,6 +347,59 @@ class DesktopIpcHelperTests(unittest.TestCase):
         self.assertEqual(decoder.feed(frame[:3]), [])
         self.assertEqual(decoder.feed(frame[3:]), [payload])
         self.assert_code("DESKTOP_PROTOCOL_ERROR", lambda: decoder.feed(b"\x01\x00\x00\x00\xff"))
+        self.assert_code("DESKTOP_PROTOCOL_ERROR", lambda: helper._Decoder().feed(
+            (helper.MAX_FRAME_BYTES + 1).to_bytes(4, "little")))
+
+    def test_pipe_reads_large_multi_frame_backlog_in_bounded_chunks(self) -> None:
+        payloads = [{"type": "first", "text": "x" * (helper.MAX_FRAME_BYTES // 2)},
+                    {"type": "second", "text": "y" * (helper.MAX_FRAME_BYTES // 2)}]
+        raw = helper._frame(payloads[0]) + helper._frame(payloads[1])
+        self.assertGreater(len(raw), helper.MAX_FRAME_BYTES + 4)
+        position = 0
+        available_sizes = []
+        read_sizes = []
+
+        def peek(_handle, _buffer, _buffer_size, _read, available, _left) -> bool:
+            backlog = len(raw) - position
+            available_sizes.append(backlog)
+            ctypes.cast(available, ctypes.POINTER(helper.wintypes.DWORD))[0] = backlog
+            return True
+
+        def read_file(_handle, buffer, size, read, _overlapped) -> bool:
+            nonlocal position
+            read_sizes.append(size)
+            count = min(size, len(raw) - position)
+            ctypes.memmove(buffer, raw[position:position + count], count)
+            ctypes.cast(read, ctypes.POINTER(helper.wintypes.DWORD))[0] = count
+            position += count
+            return False  # 消息模式的部分读取返回 ERROR_MORE_DATA
+
+        kernel32 = SimpleNamespace(
+            PeekNamedPipe=peek,
+            CreateEventW=Mock(return_value=helper._HANDLE(2)),
+            ReadFile=read_file,
+            CloseHandle=Mock(),
+        )
+        pipe = object.__new__(helper._Pipe)
+        pipe.handle = helper._HANDLE(1)
+        decoder = helper._Decoder()
+        decoded_batches = []
+        with patch.object(helper, "_kernel32", kernel32), \
+                patch.object(helper.ctypes, "get_last_error", return_value=helper.ERROR_MORE_DATA, create=True):
+            decoded_count = 0
+            while decoded_count < len(payloads):
+                batch = decoder.feed(pipe.read(1.0))
+                if batch:
+                    decoded_batches.append((batch, position))
+                    decoded_count += len(batch)
+
+        self.assertGreater(available_sizes[0], helper.MAX_FRAME_BYTES + 4)
+        self.assertTrue(read_sizes)
+        self.assertLessEqual(max(read_sizes), helper.MAX_PIPE_READ_BYTES)
+        self.assertEqual([len(batch) for batch, _ in decoded_batches], [1, 1])
+        self.assertLess(decoded_batches[0][1], len(raw))
+        self.assertEqual([value for batch, _ in decoded_batches for value in batch], payloads)
+        self.assertEqual(decoder.data, bytearray())
 
     def test_state_requires_project_idle_resumed_and_known_terminal_turns(self) -> None:
         state = self.valid_state()

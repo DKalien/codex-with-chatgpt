@@ -851,9 +851,9 @@ H0 不抽象 Codex-specific result classification、terminal fence、receipt fin
 - 用户已在扩展 Reload 后实测 stale-warning 修复；源码提交 `ab79b6a` 已推送，测试/构建门禁通过。此前安装目标 `15c76d1…` 曾因 rollout pending 与 named identity mismatch 未收敛；最新稳定 launcher 已确认 runtime/installed build 一致、`runtimeUpgrade=current`，不把历史 pending 误记为当前阻塞。
 - 现役细节与运行时排障见 [phase-e-feedback.md](phase-e-feedback.md) 的 toolbar/sleep-wake 小节及 [troubleshooting.md](troubleshooting.md) 的 `named_unhealthy` 说明。
 
-## R3a — derived current planner route（2026-09-24，routing foundation 完成）
+## R3a — derived current planner route（2026-09-24，历史初版，已由 R3l 收敛）
 
-- 新增 `src/routing/current-planner-route.ts`：current planner route 只从现有 VERIFIED Companion
+- 当时新增 `src/routing/current-planner-route.ts`：current planner route 只从现有 VERIFIED Companion
   candidate 派生；只读解析精确匹配已注册 planner route，显式 ensure 复用 `registerRoute()` 并保持
   exact replay 无 revision/file rewrite。未验证时即使有历史 route 也返回 none；身份、损坏 state、
   role 或 locator 冲突 fail closed。ensure 注册后会 recheck authority；期间目标变化则抛
@@ -897,7 +897,8 @@ H0 不抽象 Codex-specific result classification、terminal fence、receipt fin
 - 必填 `bindingId` 显式核验：新/pending 无 Desktop durable record 时必须等于当前 binding；durable replay 必须等于
   原 delivery bindingId。匹配 replay 返回原 public delivery，不再 IPC send；错 binding 沿用
   `DESKTOP_BINDING_MISMATCH` / `DESKTOP_COMMAND_CONFLICT` 拒绝。
-- 新 Command 要求当前 Companion planner route VERIFIED；`RoutingError` 保留明确 code/message。workspace mismatch
+- 初版新 Command 要求当前 Companion planner route VERIFIED；此 planner authority 已于 2026-09-25 由 R3l
+  改为同一 MCP request 的官方 conversation principal。`RoutingError` 保留明确 code/message；workspace mismatch
   与 Desktop/OAuth 错误映射保持明确，不改变 `codex_desktop_status`。
 - 未新增 MCP tool、确认、队列或状态机；不接 feedback / ExecutionResult。Browser Companion 重连 UX
   由独立 R3f slice 提供，不改变本 slice 的 routing/send 边界。
@@ -926,3 +927,26 @@ H0 不抽象 Codex-specific result classification、terminal fence、receipt fin
 - 新 Chat live smoke 暴露 MV3 bootstrap sender URL 过严，以及 popup 仅凭旧 transport 的 VERIFIED 状态显示当前 Chat 已连接/可 Arm；现已改为 same-extension internal sender 检查，并要求当前页面 route 与 verified transport route 等价。
 - 代码 review 与自动化回归完成；本次构建部署后，真实新 Chat 单击 live smoke 仍待用户 reload 扩展验证。R3 整体仍未验收完成。
 - R3h closeout 全套回归暴露并已修复 Desktop stale-snapshot 并发分类问题；live smoke 仍 pending。
+
+## R3i — owner-local read-only shadow 诊断（代码/测试完成；live diagnosis 与独立 review pending；2026-09-25）
+
+- 新 Chat route 与旧 Companion transport 不同时，高级 Shadow Inspect 仅按当前 exact owner document 读取 bounded DOM capability evidence；不改变 bootstrap、Send 或 route authority。此前 live smoke 的 `generation_unknown` 尚未查明/修复；R3i 只解除只读诊断被 `owner_route_mismatch` 阻断的问题，不放宽 generation 门槛。
+
+## R3j — 网页绑定身份收敛（代码/测试完成，待独立 review；2026-09-25）
+
+- Popup 仍只发零参数固定命令；绑定身份仅为 `tabId/documentId/canonicalRoute`，三者由真实 MessageSender 及 `sender.url` 派生。`generation` 单独作为 freshness，`targetRoute` 与 `lastSeen` 内部派生。
+
+## R3k — Browser feedback return plane 边界（代码完成；可实施部分独立 review 通过；2026-09-25）
+
+- `companionApiUrl()` 仅允许当前 Browser Companion feedback endpoints；`/rebind/status` 只接受 canonical ChatGPT route 与 UUID `challengeId` 两个固定 query。未改变 Companion server contract。
+- 加入 Browser runtime 与 Desktop MCP/routing 的双向 source architecture gate；popup 将生产回写明确命名为 FEEDBACK DELIVERY，并说明只写回当前 Chat、不向 Codex 下发任务。
+- R3k 独立 review 指出当时的新 Command planner 仍依赖持久 VERIFIED Companion route；该缺口由 R3l 处理。
+
+## R3l — request-scoped task planner authority（代码完成；cross-principal replay review-fix 待独立 review；2026-09-25）
+
+- `codex_desktop_send` 从同一 MCP request 的官方 conversation principal 派生 planner route；缺少官方身份即明确拒绝，不从 Browser/feedback、历史 route、工具参数或 `sessionId` 回退。
+- Executor route 改为 Desktop-only 投影，仍严格要求当前 Desktop binding；Browser Companion / feedback state 不再参与新 Command 创建或首次发送前 current-authority 检查。
+- 旧 Companion-derived planner routes 保留为 routing history；不删除、不迁移、不覆盖。Browser/feedback 仍只负责 feedback return plane。
+- command34 review-fix 在读取任何旧终态或 Desktop durable delivery 前，校验既有 Command 的 planner route 属于当前 request principal；跨 principal replay 以 `COMMAND_CONFLICT` 拒绝，不写状态、不发送。
+- 验证通过：command34 focused routing/MCP/架构 4 files / 84 tests，full suite 99 files / 2134 tests，typecheck、build、`git diff --check` 均通过；R3i/j/k 浏览器与 feedback focused 14 files / 560 tests 通过。
+- 当前变更仍在未提交工作树，未 push/install；command34 未取得可信 Desktop execution receipt，独立 review 与部署后新 Chat live smoke 均 pending。2026-09-25 只读 `c2c status` 显示 Bridge runtime 与 installed build 一致、`runtimeUpgrade=current`；Desktop availability 返回 `DESKTOP_PROTOCOL_ERROR`，`unresolvedDelivery=false`。R3 整体不视为验收完成。

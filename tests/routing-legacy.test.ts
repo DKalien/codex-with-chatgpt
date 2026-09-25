@@ -6,10 +6,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Workspace } from "../src/workspace/manager.js";
 import { RoutingError } from "../src/routing/schema.js";
 import { projectLegacyRoutes, type LegacyRouteCandidate } from "../src/routing/legacy-adapter.js";
-import { ensureCurrentPlannerRoute, resolveCurrentPlannerRoute } from "../src/routing/current-planner-route.js";
+import {
+  ensureCurrentPlannerRoute as ensureRequestPlannerRoute,
+  resolveCurrentPlannerRoute as resolveRequestPlannerRoute,
+} from "../src/routing/current-planner-route.js";
 import { ensureCurrentExecutorRoute, resolveCurrentExecutorRoute } from "../src/routing/current-executor-route.js";
-import { createCurrentCommand } from "../src/routing/current-command.js";
-import { deliverCurrentCommand } from "../src/routing/current-command-transport.js";
+import { createCurrentCommand as createCommandForRequest } from "../src/routing/current-command.js";
+import { deliverCurrentCommand as deliverCommandForRequest } from "../src/routing/current-command-transport.js";
 import * as desktopService from "../src/desktop/service.js";
 import { desktopIpc } from "../src/desktop/ipc.js";
 import { readDesktop, updateDesktop, type DesktopDelivery } from "../src/desktop/store.js";
@@ -25,8 +28,35 @@ const CONVERSATION_ID = "018c0000-0000-7000-8000-00000000c2c1";
 const CONVERSATION_ID_2 = "018c0000-0000-7000-8000-00000000c2c2";
 const ROUTE_CANONICAL = `https://chatgpt.com/c/${CONVERSATION_ID}`;
 const HEX32 = "a".repeat(32);
+const HEX32_OTHER = "c".repeat(32);
 const HEX64 = "b".repeat(64);
 const CURRENT_PAYLOAD = "交付当前 route：中文 + ✅";
+
+// Existing transport coverage uses one stable request principal; dedicated tests exercise distinct fingerprints.
+function ensureCurrentPlannerRoute(workspace: RoutingWorkspaceIdentity, fingerprint = HEX32) {
+  return ensureRequestPlannerRoute(workspace, fingerprint);
+}
+
+function resolveCurrentPlannerRoute(workspace: RoutingWorkspaceIdentity, fingerprint = HEX32) {
+  return resolveRequestPlannerRoute(workspace, fingerprint);
+}
+
+function createCurrentCommand(
+  workspace: RoutingWorkspaceIdentity,
+  input: Parameters<typeof createCommandForRequest>[2],
+) {
+  return createCommandForRequest(workspace, HEX32, input);
+}
+
+function deliverCurrentCommand(
+  workspace: RoutingWorkspaceIdentity,
+  input: Parameters<typeof deliverCommandForRequest>[2],
+  clientId: string,
+  authorize: () => void,
+  expectedBindingId?: string,
+) {
+  return deliverCommandForRequest(workspace, HEX32, input, clientId, authorize, expectedBindingId);
+}
 
 let stateDir: string;
 let workspaceRoot: string;
@@ -231,15 +261,17 @@ describe("routing legacy projection", () => {
     expect(snapshotDir()).toBe(before);
   });
 
-  it("verified candidate 显式 ensure 注册，read-only resolution 返回精确 route", () => {
-    writeLegacyStates({ attestation: { status: "verified", verifiedAt: new Date().toISOString() } });
+  it("current planner 来自 request fingerprint；完全没有 feedback state 仍可解析和注册", () => {
+    writeLegacyStates();
+    const feedbackFile = path.join(stateDir, "feedback", `${identity.id}.json`);
+    fs.rmSync(feedbackFile);
     expect(resolveCurrentPlannerRoute(identity)).toBeNull();
     expect(fs.existsSync(routingFile(identity.id))).toBe(false);
     const registered = ensureCurrentPlannerRoute(identity);
     expect(registered).toMatchObject({
       role: "planner",
       platform: "chatgpt_web",
-      conversationId: CONVERSATION_ID,
+      conversationId: HEX32,
       locator: {},
     });
     expect(resolveCurrentPlannerRoute(identity)).toEqual(registered);
@@ -247,7 +279,8 @@ describe("routing legacy projection", () => {
   });
 
   it("exact ensure replay 不 bump revision 或重写 routing state 文件", () => {
-    writeLegacyStates({ attestation: { status: "verified", verifiedAt: new Date().toISOString() } });
+    writeLegacyStates();
+    fs.writeFileSync(path.join(stateDir, "feedback", `${identity.id}.json`), "broken feedback state");
     const first = ensureCurrentPlannerRoute(identity);
     const file = routingFile(identity.id);
     const before = fs.statSync(file, { bigint: true });
@@ -262,6 +295,7 @@ describe("routing legacy projection", () => {
 
   it("当前 Desktop binding 显式 ensure/只读解析精确 route，且不写 Desktop state", () => {
     writeLegacyStates({ desktopEnabled: false });
+    fs.writeFileSync(path.join(stateDir, "feedback", `${identity.id}.json`), "broken feedback must be irrelevant");
     const desktopFile = path.join(stateDir, "desktop-control", `${identity.id}.json`);
     const before = fs.readFileSync(desktopFile);
     expect(resolveCurrentExecutorRoute(identity)).toBeNull();
@@ -302,15 +336,16 @@ describe("routing legacy projection", () => {
 
   it("ensure 期间 Desktop binding 切换时 fail closed，旧 candidate 只保留为历史 route", () => {
     writeLegacyStates();
-    const initializedMarker = `${routingFile(identity.id)}.initialized`;
-    const existsSync = fs.existsSync.bind(fs);
+    const routeFile = routingFile(identity.id);
+    const renameSync = fs.renameSync.bind(fs);
     let switched = false;
-    const spy = vi.spyOn(fs, "existsSync").mockImplementation((file) => {
-      if (!switched && typeof file === "string" && file === initializedMarker) {
+    const spy = vi.spyOn(fs, "renameSync").mockImplementation((oldPath, newPath) => {
+      const result = renameSync(oldPath, newPath);
+      if (!switched && typeof newPath === "string" && newPath === routeFile) {
         switched = true;
         writeLegacyStates({ desktopThreadId: THREAD_ID_2, desktopProjectId: "proj_beta" });
       }
-      return existsSync(file);
+      return result;
     });
 
     try {
@@ -329,14 +364,11 @@ describe("routing legacy projection", () => {
   });
 
   it("current planner + executor 生成 pending Command，UTF-8 bytes/hash 正确且不写 legacy state", () => {
-    writeLegacyStates({
-      attestation: { status: "verified", verifiedAt: new Date().toISOString() },
-      desktopEnabled: false,
-    });
+    writeLegacyStates({ desktopEnabled: false });
     const desktopFile = path.join(stateDir, "desktop-control", `${identity.id}.json`);
     const feedbackFile = path.join(stateDir, "feedback", `${identity.id}.json`);
     const desktopBefore = fs.readFileSync(desktopFile);
-    const feedbackBefore = fs.readFileSync(feedbackFile);
+    fs.rmSync(feedbackFile);
     const payload = "修复当前路由：确认 ✅";
 
     const command = createCurrentCommand(identity, {
@@ -355,7 +387,7 @@ describe("routing legacy projection", () => {
       deliveryStatus: "pending",
     });
     expect(fs.readFileSync(desktopFile)).toEqual(desktopBefore);
-    expect(fs.readFileSync(feedbackFile)).toEqual(feedbackBefore);
+    expect(fs.existsSync(feedbackFile)).toBe(false);
   });
 
   it("current Command exact replay 不 bump revision 或重写 routing state 文件", () => {
@@ -375,7 +407,7 @@ describe("routing legacy projection", () => {
     expect(after.mtimeNs).toBe(before.mtimeNs);
   });
 
-  it("current Command 缺 planner authority 时不猜历史 route", () => {
+  it("current Command 不从历史 Companion planner route 猜测 request principal", () => {
     writeLegacyStates();
     registerRoute(identity, {
       role: "planner",
@@ -384,12 +416,15 @@ describe("routing legacy projection", () => {
       locator: {},
     });
 
-    expect(() => createCurrentCommand(identity, {
-      commandId: "r3c-no-planner",
+    const command = createCurrentCommand(identity, {
+      commandId: "r3l-request-planner",
       intent: "development_plan",
       payload: "payload",
-    })).toThrowError(expect.objectContaining({ code: "ROUTING_ROUTE_NOT_FOUND" }));
-    expect(listCommands(identity)).toHaveLength(0);
+    });
+    const requestPlanner = listRoutes(identity).find((route) => route.routeId === command.plannerRouteId);
+    expect(requestPlanner).toMatchObject({ role: "planner", conversationId: HEX32 });
+    expect(requestPlanner?.conversationId).not.toBe(CONVERSATION_ID);
+    expect(listRoutes(identity)).toHaveLength(3);
   });
 
   it("current Command 缺 executor binding 时不猜历史 route", () => {
@@ -428,7 +463,30 @@ describe("routing legacy projection", () => {
     expect(listCommands(identity)).toEqual([first]);
   });
 
-  it("没有 verified Companion 时历史 planner route 不会变成 current", () => {
+  it("同 commandId 从不同 request principal replay 仍是 route identity conflict", () => {
+    writeLegacyStates();
+    const input = { commandId: "r3l-principal-conflict", intent: "revision" as const, payload: "same payload" };
+    const first = createCommandForRequest(identity, HEX32, input);
+    expect(() => createCommandForRequest(identity, HEX32_OTHER, input)).toThrowError(
+      expect.objectContaining({ code: "COMMAND_CONFLICT" }),
+    );
+    expect(listCommands(identity)).toEqual([first]);
+  });
+
+  it("planner fingerprint 必须是 32 位小写十六进制", () => {
+    writeLegacyStates();
+    for (const invalid of ["A".repeat(32), "a".repeat(31), "g".repeat(32)]) {
+      expect(() => resolveRequestPlannerRoute(identity, invalid)).toThrowError(
+        expect.objectContaining({ code: "ROUTING_PLANNER_IDENTITY_INVALID" }),
+      );
+      expect(() => ensureRequestPlannerRoute(identity, invalid)).toThrowError(
+        expect.objectContaining({ code: "ROUTING_PLANNER_IDENTITY_INVALID" }),
+      );
+    }
+    expect(fs.existsSync(routingFile(identity.id))).toBe(false);
+  });
+
+  it("不同 request principal 分别注册 planner route；旧 planner 仅保留为历史", () => {
     registerRoute(identity, {
       role: "planner",
       platform: "chatgpt_web",
@@ -437,61 +495,23 @@ describe("routing legacy projection", () => {
     });
     writeLegacyStates();
     expect(resolveCurrentPlannerRoute(identity)).toBeNull();
-    expect(ensureCurrentPlannerRoute(identity)).toBeNull();
-    expect(listRoutes(identity)).toHaveLength(1);
-  });
-
-  it("Companion 切换 conversation 后旧 registered route 不再是 current", () => {
-    writeLegacyStates({ attestation: { status: "verified", verifiedAt: new Date().toISOString() } });
-    const oldRoute = ensureCurrentPlannerRoute(identity);
-    writeLegacyStates({
-      attestation: { status: "verified", verifiedAt: new Date().toISOString() },
-      routeCanonical: `https://chatgpt.com/c/${CONVERSATION_ID_2}`,
-    });
-    expect(resolveCurrentPlannerRoute(identity)).toBeNull();
-    const current = ensureCurrentPlannerRoute(identity);
-    expect(current?.conversationId).toBe(CONVERSATION_ID_2);
-    expect(current?.routeId).not.toBe(oldRoute?.routeId);
-    expect(resolveCurrentPlannerRoute(identity)).toEqual(current);
-  });
-
-  it("ensure 期间 authority 切换时 fail closed，旧 candidate 只保留为历史 route", () => {
-    writeLegacyStates({ attestation: { status: "verified", verifiedAt: new Date().toISOString() } });
-    const initializedMarker = `${routingFile(identity.id)}.initialized`;
-    const existsSync = fs.existsSync.bind(fs);
-    let switched = false;
-    const spy = vi.spyOn(fs, "existsSync").mockImplementation((file) => {
-      if (!switched && typeof file === "string" && file === initializedMarker) {
-        switched = true;
-        writeLegacyStates({
-          attestation: { status: "verified", verifiedAt: new Date().toISOString() },
-          routeCanonical: `https://chatgpt.com/c/${CONVERSATION_ID_2}`,
-        });
-      }
-      return existsSync(file);
-    });
-
-    try {
-      expect(() => ensureCurrentPlannerRoute(identity)).toThrowError(
-        expect.objectContaining({ code: "ROUTE_AUTHORITY_CHANGED" }),
-      );
-    } finally {
-      spy.mockRestore();
-    }
-
-    expect(switched).toBe(true);
-    expect(listRoutes(identity)).toMatchObject([
-      { role: "planner", platform: "chatgpt_web", conversationId: CONVERSATION_ID },
-    ]);
-    expect(resolveCurrentPlannerRoute(identity)).toBeNull();
+    const first = ensureCurrentPlannerRoute(identity);
+    const file = routingFile(identity.id);
+    const before = fs.statSync(file, { bigint: true });
+    expect(ensureCurrentPlannerRoute(identity)).toEqual(first);
+    const other = ensureRequestPlannerRoute(identity, HEX32_OTHER);
+    expect(resolveRequestPlannerRoute(identity, HEX32_OTHER)).toEqual(other);
+    expect(resolveCurrentPlannerRoute(identity)).toEqual(first);
+    expect(listRoutes(identity)).toHaveLength(3);
+    expect(fs.statSync(file, { bigint: true }).mtimeNs).toBeGreaterThan(before.mtimeNs);
   });
 
   it("同一 route identity 的 role 冲突 fail closed", () => {
-    writeLegacyStates({ attestation: { status: "verified", verifiedAt: new Date().toISOString() } });
+    writeLegacyStates();
     registerRoute(identity, {
       role: "executor",
       platform: "chatgpt_web",
-      conversationId: CONVERSATION_ID,
+      conversationId: HEX32,
       locator: {},
     });
     expect(() => resolveCurrentPlannerRoute(identity)).toThrowError(
@@ -503,11 +523,11 @@ describe("routing legacy projection", () => {
   });
 
   it("同一 route identity 的 locator 冲突 fail closed", () => {
-    writeLegacyStates({ attestation: { status: "verified", verifiedAt: new Date().toISOString() } });
+    writeLegacyStates();
     registerRoute(identity, {
       role: "planner",
       platform: "chatgpt_web",
-      conversationId: CONVERSATION_ID,
+      conversationId: HEX32,
       locator: { gptId: "g-previous" },
     });
     expect(() => resolveCurrentPlannerRoute(identity)).toThrowError(
@@ -519,7 +539,7 @@ describe("routing legacy projection", () => {
   });
 
   it("workspace mismatch 与损坏 routing state 均 fail closed", () => {
-    writeLegacyStates({ attestation: { status: "verified", verifiedAt: new Date().toISOString() } });
+    writeLegacyStates();
     const mismatched = { id: "000000000000", root: workspaceRoot };
     expect(() => resolveCurrentPlannerRoute(mismatched)).toThrowError(
       expect.objectContaining({ code: "ROUTING_WORKSPACE_IDENTITY_MISMATCH" }),
@@ -541,8 +561,9 @@ describe("routing legacy projection", () => {
   });
 
   it("current planner helper 从不写 feedback state", () => {
-    writeLegacyStates({ attestation: { status: "verified", verifiedAt: new Date().toISOString() } });
+    writeLegacyStates();
     const feedbackFile = path.join(stateDir, "feedback", `${identity.id}.json`);
+    fs.writeFileSync(feedbackFile, "damaged state must remain untouched");
     const before = fs.readFileSync(feedbackFile);
     const first = ensureCurrentPlannerRoute(identity);
     expect(resolveCurrentPlannerRoute(identity)).toEqual(first);
@@ -650,6 +671,86 @@ describe("routing legacy projection", () => {
     })).toThrowError(expect.objectContaining({ code: "ROUTING_COMMAND_NOT_FOUND" }));
     expect(fs.readFileSync(file)).toEqual(before);
     expect(fs.statSync(file, { bigint: true }).mtimeNs).toBe(beforeStat.mtimeNs);
+  });
+
+  it("terminal replay 先核对 planner principal；同主体返回原 delivery，其他主体只读冲突", async () => {
+    writeLegacyStates({ attestation: { status: "verified", verifiedAt: new Date().toISOString() } });
+    const input = {
+      commandId: "principal-terminal-replay",
+      intent: "revision" as const,
+      payload: CURRENT_PAYLOAD,
+      userConfirmed: true as const,
+    };
+    const send = vi.fn(async () => ({ threadId: THREAD_ID, turnId: randomUUID() }));
+    const prepare = vi.spyOn(desktopIpc, "prepare").mockResolvedValue({ send, close: vi.fn() } as never);
+    const first = await deliverCommandForRequest(identity, HEX32, input, "test-client", () => {}, BINDING_ID);
+    expect(first.command.deliveryStatus).toBe("accepted");
+    expect(first.delivery?.deliveryStatus).toBe("accepted");
+
+    const before = readRouting(identity);
+    const routesBefore = listRoutes(identity);
+    await expect(deliverCommandForRequest(identity, HEX32_OTHER, input, "test-client", () => {}, BINDING_ID))
+      .rejects.toMatchObject({ code: "COMMAND_CONFLICT" });
+    expect(readRouting(identity)).toEqual(before);
+    expect(listRoutes(identity)).toEqual(routesBefore);
+    expect(prepare).toHaveBeenCalledOnce();
+    expect(send).toHaveBeenCalledOnce();
+
+    const samePrincipalReplay = await deliverCommandForRequest(identity, HEX32, input, "test-client", () => {}, BINDING_ID);
+    expect(samePrincipalReplay).toEqual(first);
+    expect(prepare).toHaveBeenCalledOnce();
+    expect(send).toHaveBeenCalledOnce();
+  });
+
+  it("pending + Desktop durable delivery 只允许原 planner principal 同步一次", async () => {
+    writeLegacyStates({ attestation: { status: "verified", verifiedAt: new Date().toISOString() } });
+    const input = {
+      commandId: "principal-pending-durable-replay",
+      intent: "development_plan" as const,
+      payload: CURRENT_PAYLOAD,
+      userConfirmed: true as const,
+    };
+    const command = createCurrentCommand(identity, input);
+    const timestamp = new Date().toISOString();
+    const delivery: DesktopDelivery = {
+      commandId: input.commandId,
+      clientId: "test-client",
+      bindingId: BINDING_ID,
+      intent: input.intent,
+      messageSha256: command.payloadSha256,
+      messageBytes: command.payloadBytes,
+      threadId: THREAD_ID,
+      turnId: randomUUID(),
+      deliveryStatus: "accepted",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    };
+    updateDesktop(identity.id, (previous) => {
+      if (!previous) throw new Error("expected Desktop state");
+      return { state: { ...previous, deliveries: [...previous.deliveries, delivery] }, result: undefined };
+    });
+    const pending = readRouting(identity);
+    const routesBefore = listRoutes(identity);
+    const prepare = vi.spyOn(desktopIpc, "prepare");
+    const sender = vi.spyOn(desktopService, "sendDesktop");
+
+    await expect(deliverCommandForRequest(identity, HEX32_OTHER, input, "test-client", () => {}, BINDING_ID))
+      .rejects.toMatchObject({ code: "COMMAND_CONFLICT" });
+    expect(readRouting(identity)).toEqual(pending);
+    expect(listCommands(identity)).toMatchObject([{ commandId: input.commandId, deliveryStatus: "pending" }]);
+    expect(listRoutes(identity)).toEqual(routesBefore);
+    expect(prepare).not.toHaveBeenCalled();
+    expect(sender).not.toHaveBeenCalled();
+
+    const firstSync = await deliverCommandForRequest(identity, HEX32, input, "test-client", () => {}, BINDING_ID);
+    const afterSync = readRouting(identity);
+    const replay = await deliverCommandForRequest(identity, HEX32, input, "test-client", () => {}, BINDING_ID);
+    expect(firstSync.command.deliveryStatus).toBe("accepted");
+    expect(firstSync.delivery?.deliveryStatus).toBe("accepted");
+    expect(replay).toEqual(firstSync);
+    expect(readRouting(identity)?.revision).toBe(afterSync?.revision);
+    expect(prepare).not.toHaveBeenCalled();
+    expect(sender).not.toHaveBeenCalled();
   });
 
   it("Desktop durable result 后 routing sync 失败，重复 commandId 只收敛不二次发送", async () => {

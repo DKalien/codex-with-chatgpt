@@ -326,7 +326,7 @@ describe("G1a multi-thread projectChats map", () => {
     expect(input.conversation.chatBinding).toBe("same_thread");
     expect(input.conversation.chatKnown).toBe(true);
   });
-  it("requestPolicy.currentConversation allows this-turn work without durable chatKnown", () => {
+  it("local readiness does not depend on request conversation or durable chatKnown", () => {
     const withoutDurableChat = baseInput({
       conversation: {
         mode: "project",
@@ -342,7 +342,8 @@ describe("G1a multi-thread projectChats map", () => {
     expect(withRequest.conversation.chatKnown).toBe(false);
 
     const withoutRequest = resolveWorkflowReadiness(withoutDurableChat, { currentConversation: "unavailable" });
-    expect(withoutRequest.overall).toBe("needs_conversation");
+    expect(withoutRequest.overall).toBe("ready_local");
+    expect(withoutRequest.nextAction).toBe("reuse");
   });
 });
 
@@ -382,12 +383,16 @@ describe("G2 desktopRoute saved_binding vs current_context", () => {
       ...overrides,
     };
   }
-  function input(desktopFacts: WorkflowReadinessInput["desktop"], remote = remoteOffline()): WorkflowReadinessInput {
+  function input(
+    desktopFacts: WorkflowReadinessInput["desktop"],
+    remote = remoteOffline(),
+    conversation = healthyConversation(),
+  ): WorkflowReadinessInput {
     return {
       workspaceId: "2582910bf0d2",
       workspaceName: "ws",
       connection: connection(),
-      conversation: healthyConversation(),
+      conversation,
       desktop: desktopFacts,
       remote,
       now: 1,
@@ -411,10 +416,11 @@ describe("G2 desktopRoute saved_binding vs current_context", () => {
     expect(r.nextAction).toBe("bind_current");
   });
 
-  it("new current_context thread binds before opening its missing Project chat", () => {
+  it("new current_context thread binds locally without opening ChatGPT", () => {
     for (const desktopFacts of [
       desktop({ configured: false, enabled: false, currentTarget: "unavailable" }),
       desktop({ configured: true, enabled: false, currentTarget: "unavailable" }),
+      desktop({ configured: true, enabled: false, currentTarget: "exact", bindingAvailability: "available" }),
       desktop({ configured: true, enabled: true, currentTarget: "different" }),
     ]) {
       const r = resolveWorkflowReadiness(input(desktopFacts), { currentConversation: "unavailable" });
@@ -424,13 +430,29 @@ describe("G2 desktopRoute saved_binding vs current_context", () => {
     }
   });
 
-  it("exact local Desktop waits for the missing Project chat, without redundant bind", () => {
+  it("exact local Desktop is ready without a same-thread Project chat", () => {
     const r = resolveWorkflowReadiness(
-      input(desktop({ currentTarget: "exact", bindingAvailability: "available" })),
+      input(desktop({ currentTarget: "exact", bindingAvailability: "available" }), remoteOffline(), {
+        ...healthyConversation(),
+        chatBinding: "other_thread",
+      }),
       { currentConversation: "unavailable" },
     );
-    expect(r.overall).toBe("needs_conversation");
-    expect(r.nextAction).toBe("open_project_chat");
+    expect(r.overall).toBe("ready_local");
+    expect(r.nextAction).toBe("reuse");
+  });
+
+  it("missing first-time Project still requires bind_project before local readiness", () => {
+    const r = resolveWorkflowReadiness(
+      input(desktop({ currentTarget: "exact", bindingAvailability: "available" }), remoteOffline(), {
+        ...healthyConversation(),
+        projectReady: false,
+        chatBinding: "none",
+      }),
+      { currentConversation: "unavailable" },
+    );
+    expect(r.overall).toBe("needs_project");
+    expect(r.nextAction).toBe("bind_project");
   });
 
   it("unavailable current target binds before opening a missing Project chat", () => {
@@ -443,9 +465,9 @@ describe("G2 desktopRoute saved_binding vs current_context", () => {
     expect(r.blockers).toContainEqual({ code: "desktop_unavailable", detail: "available" });
   });
 
-  it("exact target preserves busy/unknown/unavailable delivery semantics before opening chat", () => {
+  it("exact target keeps busy/unknown strict and routes unavailable with a request conversation", () => {
     const busy = resolveWorkflowReadiness(
-      input(desktop({ currentTarget: "exact", bindingAvailability: "busy" })),
+      input(desktop({ currentTarget: "exact", bindingAvailability: "busy" }), remoteOnline()),
       { currentConversation: "unavailable" },
     );
     expect(busy.overall).toBe("busy");
@@ -454,7 +476,7 @@ describe("G2 desktopRoute saved_binding vs current_context", () => {
     expect(busy.nextAction).not.toBe("open_project_chat");
 
     const unknown = resolveWorkflowReadiness(
-      input(desktop({ currentTarget: "exact", bindingAvailability: "unknown" })),
+      input(desktop({ currentTarget: "exact", bindingAvailability: "unknown" }), remoteOnline()),
       { currentConversation: "unavailable" },
     );
     expect(unknown.overall).toBe("blocked");
@@ -462,21 +484,42 @@ describe("G2 desktopRoute saved_binding vs current_context", () => {
     expect(unknown.blockers).toContainEqual({ code: "desktop_delivery_unknown" });
 
     const unavailable = resolveWorkflowReadiness(
-      input(desktop({ currentTarget: "exact", bindingAvailability: "unavailable" })),
-      { currentConversation: "unavailable" },
+      input(desktop({ currentTarget: "exact", bindingAvailability: "unavailable" }), remoteOnline()),
+      { currentConversation: "available" },
     );
-    expect(unavailable.overall).toBe("blocked");
-    expect(unavailable.nextAction).toBe("stop_unknown");
-    expect(unavailable.blockers).toContainEqual({ code: "desktop_delivery_unavailable" });
+    expect(unavailable.overall).toBe("ready_remote");
+    expect(unavailable.nextAction).toBe("use_remote");
   });
 
-  it("exact unavailable with safely-ready Remote keeps the Remote/conversation strategy", () => {
+  it("exact unavailable uses safely-ready Remote with current request scopes", () => {
     const r = resolveWorkflowReadiness(
       input(desktop({ currentTarget: "exact", bindingAvailability: "unavailable" }), remoteOnline()),
-      { currentConversation: "unavailable", remoteControl: "current" },
+      { currentConversation: "available", remoteControl: "current" },
     );
-    expect(r.nextAction).toBe("open_project_chat");
-    expect(r.nextAction).not.toBe("bind_current");
+    expect(r.overall).toBe("ready_remote");
+    expect(r.nextAction).toBe("use_remote");
+  });
+
+  it("exact unavailable + Remote ready requires missing/incomplete request scopes", () => {
+    for (const remoteControl of ["none", "incomplete"] as const) {
+      const r = resolveWorkflowReadiness(
+        input(desktop({ currentTarget: "exact", bindingAvailability: "unavailable" }), remoteOnline()),
+        { currentConversation: "available", remoteControl },
+      );
+      expect(r.overall).toBe("needs_authorization");
+      expect(r.nextAction).toBe("resume_authorization");
+      expect(r.blockers.some((blocker) => blocker.code.startsWith("remote_request_scope_"))).toBe(true);
+    }
+  });
+
+  it("exact unavailable + Remote offline stays blocked", () => {
+    const r = resolveWorkflowReadiness(
+      input(desktop({ currentTarget: "exact", bindingAvailability: "unavailable" }), remoteOffline()),
+      { currentConversation: "available", remoteControl: "current" },
+    );
+    expect(r.overall).toBe("blocked");
+    expect(r.nextAction).toBe("stop_unknown");
+    expect(r.blockers).toContainEqual({ code: "desktop_delivery_unavailable" });
   });
 
   it("Remote-ready and saved_binding routes preserve their existing conversation strategy", () => {

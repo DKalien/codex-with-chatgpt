@@ -1,4 +1,4 @@
-import { projectLegacyRoutes } from "./legacy-adapter.js";
+import { projectDesktopExecutorCandidate } from "./desktop-adapter.js";
 import { RoutingError, type RoutingRoute } from "./schema.js";
 import { listRoutes, registerRoute, type RoutingWorkspaceIdentity } from "./store.js";
 
@@ -6,8 +6,8 @@ import { listRoutes, registerRoute, type RoutingWorkspaceIdentity } from "./stor
 export function resolveCurrentExecutorRoute(
   identity: RoutingWorkspaceIdentity,
 ): RoutingRoute | null {
-  const candidate = projectLegacyRoutes(identity).executorCandidate;
   const routes = listRoutes(identity);
+  const candidate = projectDesktopExecutorCandidate(identity);
   if (!candidate) return null;
 
   const route = routes.find(
@@ -33,9 +33,9 @@ export function resolveCurrentExecutorRoute(
 export function ensureCurrentExecutorRoute(
   identity: RoutingWorkspaceIdentity,
 ): RoutingRoute | null {
-  const candidate = projectLegacyRoutes(identity).executorCandidate;
   // 即使当前没有 binding，也读取 store，避免绕过损坏的 route history。
   listRoutes(identity);
+  const candidate = projectDesktopExecutorCandidate(identity);
   if (!candidate) return null;
   const registered = registerRoute(identity, {
     role: "executor",
