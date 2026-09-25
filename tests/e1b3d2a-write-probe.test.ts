@@ -41,13 +41,17 @@ function MESSAGE() {
   return "[C2C_CONTROL]\nSTATE: EXECUTED\nATTEMPT_ID: 22222222-2222-4222-8222-222222222222\n";
 }
 
-type Mode = "idle" | "send" | "stop" | "unknown" | "dirty";
+type Mode = "idle" | "send" | "stop" | "unknown" | "dirty" | "current-voice";
 
 function makeComposerDom(opts: {
   mode?: Mode;
   text?: string;
   href?: string;
   textarea?: boolean;
+  /** R3 2026-09-25 current-voice fixture controls (only for mode "current-voice"). */
+  currentVoiceClass?: string;
+  currentVoiceAria?: string;
+  currentVoiceDisabled?: boolean;
 } = {}) {
   const mode = opts.mode ?? "idle";
   const state = { text: opts.text ?? "" };
@@ -81,6 +85,25 @@ function makeComposerDom(opts: {
       clicks.n += 1;
     },
   };
+  // R3 2026-09-25 observed blank-composer voice control (real ChatGPT DOM):
+  // 4 form buttons, main control carries exact aria + both structural tokens.
+  const currentVoice = {
+    className:
+      opts.currentVoiceClass ?? "size-token-button-composer bg-composer-primary",
+    getAttribute: (n: string) =>
+      n === "aria-label" ? (opts.currentVoiceAria ?? "开始语音") : null,
+    hasAttribute: () => false,
+    disabled: opts.currentVoiceDisabled ?? false,
+    click: () => {
+      clicks.n += 1;
+    },
+  };
+  const currentVoiceFillers = [0, 1, 2].map(() => ({
+    className: "bg-token-button",
+    getAttribute: () => null,
+    hasAttribute: () => false,
+    disabled: false,
+  }));
 
   const form = {
     querySelector(selector: string) {
@@ -96,6 +119,13 @@ function makeComposerDom(opts: {
       return null;
     },
     querySelectorAll(selector: string) {
+      if (mode === "current-voice") {
+        if (selector === "button") return [...currentVoiceFillers, currentVoice];
+        if (selector === 'button[aria-label="开始语音"]') {
+          return (opts.currentVoiceAria ?? "开始语音") === "开始语音" ? [currentVoice] : [];
+        }
+        return [];
+      }
       if (selector !== "button") return [];
       if (mode === "idle") return [voice];
       if (mode === "send") return [send];
@@ -1500,5 +1530,61 @@ describe("E1b3d2a runtime packaging gates", () => {
     expect(build).toMatch(/must not expose unnamespaced resolveMutationCanonicalRoute/);
     expect(build).toMatch(/__c2cRunWriteProbe/);
     expect(build).toMatch(/must stay write-only/);
+  });
+});
+
+describe("E1b3d2a R3 current-voice idle adaptation", () => {
+  it("write capability accepts current-voice idle; voice control not retained; zero clicks", () => {
+    const { doc, clicks } = makeComposerDom({ mode: "current-voice" });
+    const cap = inspectComposerWriteCapability(doc, { routeValid: true });
+    expect(cap.ok).toBe(true);
+    if (cap.ok) {
+      expect(cap.action.kind).toBe("idle");
+      expect(cap.action.enabled).toBe(true);
+      expect(cap.action.evidence).toBe("current_voice_idle");
+      expect(cap.action.button).toBeNull();
+    }
+    expect(clicks.n).toBe(0);
+  });
+
+  it("aria matches but class token missing => capability fail-closed generation_unknown", () => {
+    const { doc } = makeComposerDom({
+      mode: "current-voice",
+      currentVoiceClass: "bg-composer-primary",
+    });
+    const cap = inspectComposerWriteCapability(doc, { routeValid: true });
+    expect(cap.ok).toBe(false);
+    if (!cap.ok) expect(cap.reason).toBe("generation_unknown");
+  });
+
+  it("different aria => capability fail-closed generation_unknown", () => {
+    const { doc } = makeComposerDom({
+      mode: "current-voice",
+      currentVoiceAria: "语音输入",
+    });
+    const cap = inspectComposerWriteCapability(doc, { routeValid: true });
+    expect(cap.ok).toBe(false);
+    if (!cap.ok) expect(cap.reason).toBe("generation_unknown");
+  });
+
+  it("disabled current voice => capability fail-closed (no disabled-idle this slice)", () => {
+    const { doc } = makeComposerDom({ mode: "current-voice", currentVoiceDisabled: true });
+    const cap = inspectComposerWriteCapability(doc, { routeValid: true });
+    expect(cap.ok).toBe(false);
+    if (!cap.ok) expect(cap.reason).toBe("generation_unknown");
+  });
+
+  it("write accepted on idle evidence; post-write send re-resolution fails closed with zero clicks", () => {
+    const { doc, clicks } = makeComposerDom({ mode: "current-voice" });
+    const w = writeCanonicalMessage(doc, MESSAGE(), { routeValid: true });
+    expect(w.ok).toBe(true);
+    const v = verifyCanonicalComposer(doc, MESSAGE(), { routeValid: true });
+    expect(v.ok).toBe(true);
+    // After write the click path must re-resolve the exact send-button; the
+    // static current fixture offers none, so send fails closed (no voice click).
+    const r = dispatchNativeSend(doc, MESSAGE(), { routeValid: true });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("send_action_not_ready");
+    expect(clicks.n).toBe(0);
   });
 });

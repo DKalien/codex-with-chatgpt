@@ -45,6 +45,9 @@ function makeSendDom(opts: {
   stop?: boolean;
   turns?: string[];
   sendThrows?: boolean;
+  /** R3 2026-09-25 current-voice blank-composer fixture. */
+  currentVoice?: boolean;
+  currentVoiceClass?: string;
 } = {}) {
   const parts = opts.blocks ?? [""];
   const state = {
@@ -81,6 +84,24 @@ function makeSendDom(opts: {
     hasAttribute: (n: string) => n === "data-testid",
     disabled: false,
   };
+  // R3 2026-09-25 observed blank-composer voice control (real ChatGPT DOM);
+  // post-write the real DOM swaps it for the send-button.
+  const currentVoiceBtn = {
+    className:
+      opts.currentVoiceClass ?? "size-token-button-composer bg-composer-primary",
+    getAttribute: (n: string) => (n === "aria-label" ? "开始语音" : null),
+    hasAttribute: () => false,
+    disabled: false,
+    click: () => {
+      state.clicks += 1;
+    },
+  };
+  const currentVoiceFillers = [0, 1, 2].map(() => ({
+    className: "bg-token-button",
+    getAttribute: () => null,
+    hasAttribute: () => false,
+    disabled: false,
+  }));
   const form = {
     querySelector(selector: string) {
       if (selector === 'button[data-testid="send-button"]') {
@@ -88,11 +109,21 @@ function makeSendDom(opts: {
       }
       if (selector === "button.composer-submit-button-color") {
         if (opts.stop) return stopBtn;
+        if (opts.currentVoice) return state.sendReady ? sendBtn : null;
         return state.sendReady ? sendBtn : voice;
       }
       return null;
     },
     querySelectorAll(selector: string) {
+      if (opts.currentVoice) {
+        if (selector === "button") {
+          return state.sendReady ? [sendBtn] : [...currentVoiceFillers, currentVoiceBtn];
+        }
+        if (selector === 'button[aria-label="开始语音"]') {
+          return state.sendReady ? [] : [currentVoiceBtn];
+        }
+        return [];
+      }
       if (selector !== "button") return [];
       if (opts.stop) return [stopBtn];
       return state.sendReady ? [sendBtn] : [voice];
@@ -1005,3 +1036,62 @@ describe("E1b3d3a runtime packaging", () => {
 
 // silence unused import in some environments
 void WRITE_PROBE_MESSAGE;
+
+describe("E1b3d3a R3 current-voice send probe", () => {
+  const gen = { value: 5 };
+  const optsBase = () => ({
+    expectedRoute: ROUTE,
+    expectedGeneration: 5,
+    probeMessage: PROBE,
+    attemptId: ATTEMPT,
+    locationHref: ROUTE,
+    parseRoute: sharedParse,
+    getCurrentGeneration: () => gen.value,
+    waitMs: noWait,
+    readyTimeoutMs: 1,
+    observeTimeoutMs: 1,
+    pollMs: 1,
+  });
+
+  it("pre-write idle gate accepted on current-voice fixture; post-write swap; click lands on send only", async () => {
+    gen.value = 5;
+    const { doc, state } = makeSendDom({
+      currentVoice: true,
+      becomeSendAfterWrite: true,
+      turns: [PROBE],
+    });
+    const r = await runRealSendProbe(doc, {
+      ...optsBase(),
+      getCurrentHref: () => ROUTE,
+      snapshotUserTurns: () => [],
+      findCanonicalUserTurn: () => ({ ok: true, turn: { text: PROBE } }),
+      observeTimeoutMs: 50,
+      readyTimeoutMs: 50,
+    });
+    expect(r.ok).toBe(true);
+    expect(r.clicked).toBe(true);
+    expect(r.observed).toBe(true);
+    // Exactly one click, and it was the exact send-button (voice never clicked).
+    expect(state.clicks).toBe(1);
+expect(state.sendReady).toBe(true);
+  });
+
+  it("static current fixture (no post-write swap) => write accepted, send poll times out, zero clicks", async () => {
+    gen.value = 5;
+    const { doc, state } = makeSendDom({ currentVoice: true });
+    const r = await runRealSendProbe(doc, {
+      ...optsBase(),
+      getCurrentHref: () => ROUTE,
+      readyTimeoutMs: 50,
+      observeTimeoutMs: 50,
+    });
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe("send_button_not_ready");
+    expect(r.mutationAttempted).toBe(true);
+    expect(r.wrote).toBe(true);
+    expect(r.verified).toBe(true);
+    expect(r.clickAttempted).toBe(false);
+    // Voice control was never a click target.
+    expect(state.clicks).toBe(0);
+  });
+});

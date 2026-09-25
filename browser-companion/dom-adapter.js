@@ -265,6 +265,74 @@ function buttonMatchesKnownStop(btn, dataTestId, ariaLabelRaw) {
 }
 
 /**
+ * Current (observed 2026-09-25) blank-composer voice control identity.
+ * Positive idle evidence requires the FULL structural match below; any partial
+ * match (exact aria but a missing class token, or disabled) fails closed to
+ * unknown upstream. The control is never a Send/click target.
+ */
+const CURRENT_VOICE_ARIA_LABEL = "开始语音";
+const CURRENT_VOICE_CLASS_TOKENS = [
+  "size-token-button-composer",
+  "bg-composer-primary",
+];
+/** Bounded candidate cap for the current-voice scan; overflow fails closed. */
+const CURRENT_VOICE_MAX_CANDIDATES = 4;
+
+/**
+ * Read-only match of the current-voice idle rule on one button.
+ * Must stay consistent with findCurrentVoiceIdleControl / resolveChatGptAction.
+ */
+function buttonMatchesCurrentVoiceIdle(btn, dataTestId, ariaLabelRaw) {
+  if (!btn) return false;
+  if (ariaLabelRaw !== CURRENT_VOICE_ARIA_LABEL) return false;
+  if (dataTestId === "send-button") return false;
+  if (buttonMatchesKnownStop(btn, dataTestId, ariaLabelRaw)) return false;
+  if (isDisabled(btn)) return false;
+  for (const token of CURRENT_VOICE_CLASS_TOKENS) {
+    try {
+      if (!hasClass(btn, token)) return false;
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Find the current-voice idle control inside the active editor form.
+ * Form-scoped, exact-aria candidates only; first full structural match wins.
+ * Bounded scan: overflow or hostile DOM fails closed (null → unknown upstream).
+ */
+function findCurrentVoiceIdleControl(editorForm) {
+  if (!editorForm || typeof editorForm.querySelectorAll !== "function") return null;
+  let nodes = null;
+  try {
+    nodes = editorForm.querySelectorAll(
+      `button[aria-label="${CURRENT_VOICE_ARIA_LABEL}"]`,
+    );
+  } catch {
+    return null;
+  }
+  if (!nodes || typeof nodes.length !== "number" || nodes.length === 0) return null;
+  if (nodes.length > CURRENT_VOICE_MAX_CANDIDATES) return null;
+  const limit = Math.min(nodes.length, CURRENT_VOICE_MAX_CANDIDATES);
+  for (let i = 0; i < limit; i++) {
+    const btn = nodes[i];
+    if (!btn) continue;
+    let testid = null;
+    let ariaLabelRaw = null;
+    try {
+      testid = btn.getAttribute?.("data-testid") ?? null;
+      ariaLabelRaw = btn.getAttribute?.("aria-label") ?? null;
+    } catch {
+      continue;
+    }
+    if (buttonMatchesCurrentVoiceIdle(btn, testid, ariaLabelRaw)) return btn;
+  }
+  return null;
+}
+
+/**
  * Safe attribute summary of one form button. No text/HTML/value/nodes.
  */
 function summarizeInventoryButton(btn, index) {
@@ -309,6 +377,7 @@ function summarizeInventoryButton(btn, index) {
     ariaDisabled: ariaDisabledRaw === "true" ? true : ariaDisabledRaw === "false" ? false : null,
     matchesKnownSend: dataTestIdRaw === "send-button",
     matchesKnownActionSlot: hasClass(btn, "composer-submit-button-color"),
+    matchesKnownVoiceIdle: buttonMatchesCurrentVoiceIdle(btn, dataTestIdRaw, ariaLabelRaw),
     matchesKnownStop: buttonMatchesKnownStop(btn, dataTestIdRaw, ariaLabelRaw),
   };
 }
@@ -572,6 +641,9 @@ export function inspectChatGptActionEvidence(doc, editor) {
  * Real Edge 2026-09-16 evidence:
  * - empty composer action slot (composer-submit-button-color + text-submit-btn-text) is
  *   voice control ("启动语音功能"), NOT Send.
+ * - current blank-composer voice control (observed 2026-09-25: exact aria-label
+ *   "开始语音" + size-token-button-composer + bg-composer-primary) is also idle,
+ *   never Send; partial structural match stays unknown (fail-closed).
  * - actual Send is form-scoped button[data-testid="send-button"] (localized aria).
  *
  * kind: "stop" | "send" | "idle" | "unknown"
@@ -657,6 +729,17 @@ export function resolveChatGptAction(doc, editor) {
       kind: "idle",
       enabled: false,
       evidence: "action_slot_idle_disabled",
+    };
+  }
+  // Current blank-composer voice control (observed 2026-09-25): narrow positive
+  // idle evidence; button stays null (never a Send/click target).
+  const currentVoiceBtn = editorForm ? findCurrentVoiceIdleControl(editorForm) : null;
+  if (currentVoiceBtn) {
+    return {
+      button: null,
+      kind: "idle",
+      enabled: true,
+      evidence: "current_voice_idle",
     };
   }
   return { button: null, kind: "unknown", enabled: false, evidence: null };

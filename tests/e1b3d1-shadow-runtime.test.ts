@@ -799,7 +799,8 @@ describe("E1b3d1 action inventory (read-only, no resolver change)", () => {
     expect(b).not.toHaveProperty("value");
     expect(b).not.toHaveProperty("focus");
     expect(b).not.toHaveProperty("click");
-    // Allowed keys only.
+    // Allowed keys only (matchesKnownVoiceIdle: current-voice read-only diagnostic
+    // boolean, authorized R3 slice; still no text/HTML/value).
     expect(Object.keys(b).sort()).toEqual([
       "ariaDisabled",
       "ariaLabel",
@@ -810,6 +811,7 @@ describe("E1b3d1 action inventory (read-only, no resolver change)", () => {
       "matchesKnownActionSlot",
       "matchesKnownSend",
       "matchesKnownStop",
+      "matchesKnownVoiceIdle",
       "name",
       "role",
       "title",
@@ -2007,5 +2009,91 @@ describe("user-turn observer still available for shadow", () => {
   it("snapshotUserTurns / findCanonicalUserTurn remain read-only exports", () => {
     expect(typeof snapshotUserTurns).toBe("function");
     expect(typeof findCanonicalUserTurn).toBe("function");
+  });
+});
+
+describe("E1b3d1 R3 current-voice shadow diagnostic (read-only)", () => {
+  // R3 2026-09-25 observed blank-composer voice control: 4 form buttons, the
+  // main control carries exact aria `开始语音` + both structural class tokens.
+  function makeCurrentVoiceShadowDom(
+    opts: { voiceClass?: string; voiceAria?: string; voiceDisabled?: boolean; text?: string } = {},
+  ) {
+    const voice = {
+      className: opts.voiceClass ?? "size-token-button-composer bg-composer-primary",
+      getAttribute: (n: string) => (n === "aria-label" ? (opts.voiceAria ?? "开始语音") : null),
+      hasAttribute: () => false,
+      disabled: opts.voiceDisabled ?? false,
+    };
+    const buttons = [
+      { className: "bg-token-button", getAttribute: () => null, hasAttribute: () => false, disabled: false },
+      { className: "bg-token-button", getAttribute: () => null, hasAttribute: () => false, disabled: false },
+      { className: "bg-token-button", getAttribute: () => null, hasAttribute: () => false, disabled: false },
+      voice,
+    ];
+    const form = {
+      querySelector: () => null,
+      querySelectorAll(sel: string) {
+        if (sel === "button") return buttons;
+        if (
+          sel === 'button[aria-label="开始语音"]'
+          && (opts.voiceAria ?? "开始语音") === "开始语音"
+        ) {
+          return [voice];
+        }
+        return [];
+      },
+    };
+    const editor = {
+      getAttribute: (n: string) => (n === "contenteditable" ? "true" : null),
+      hasAttribute: () => false,
+      className: "ProseMirror",
+      closest: (s: string) => (s === "form" ? form : null),
+    };
+    Object.defineProperty(editor, "textContent", {
+      get: () => opts.text ?? "",
+      set: () => {
+        throw new Error("no write");
+      },
+    });
+    const doc = {
+      querySelector(selector: string) {
+        if (selector.includes("ProseMirror") || selector === "#prompt-textarea") return editor;
+        if (selector === "body" || selector === "main") return {};
+        return null;
+      },
+      querySelectorAll: () => [],
+    };
+    return { doc: doc as never };
+  }
+
+  it("current fixture: action=idle/current_voice_idle, gen=idle, safe=true, inventory boolean true", () => {
+    const { doc } = makeCurrentVoiceShadowDom({});
+    const ev = inspectShadowEvidence(doc, { ...helpers, locationHref: ROUTE, now: 1 });
+    expect(ev.ok).toBe(true);
+    expect(ev.action.kind).toBe("idle");
+    expect(ev.action.enabled).toBe(true);
+    expect(ev.action.evidence).toBe("current_voice_idle");
+    expect(ev.action.hasExactSendButton).toBe(false);
+    expect(ev.safety.composer).toBe("empty");
+    expect(ev.safety.generation).toBe("idle");
+    expect(ev.safety.safe).toBe(true);
+    const voiceRow = ev.action.inventory.buttons.find(
+      (b: { ariaLabel?: string | null }) => b.ariaLabel === "开始语音",
+    );
+    expect(voiceRow?.matchesKnownVoiceIdle).toBe(true);
+    expect(voiceRow?.matchesKnownStop).toBe(false);
+  });
+
+  it("missing class token: shadow stays unknown, gen unknown, inventory boolean false", () => {
+    const { doc } = makeCurrentVoiceShadowDom({ voiceClass: "bg-composer-primary" });
+    const ev = inspectShadowEvidence(doc, { ...helpers, locationHref: ROUTE, now: 1 });
+    expect(ev.ok).toBe(true);
+    expect(ev.action.kind).toBe("unknown");
+    expect(ev.safety.generation).toBe("unknown");
+    expect(ev.safety.safe).toBe(false);
+    const voiceRow = ev.action.inventory.buttons.find(
+      (b: { ariaLabel?: string | null }) => b.ariaLabel === "开始语音",
+    );
+    expect(voiceRow?.matchesKnownVoiceIdle).toBe(false);
   });
 });

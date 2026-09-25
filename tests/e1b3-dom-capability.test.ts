@@ -39,9 +39,17 @@ type ClickSpy = { clicks: number; click: () => void };
  * - unknown: no action
  */
 function makeEdgeDom(opts: {
-  mode?: "idle" | "send" | "stop" | "unknown";
+  mode?: "idle" | "send" | "stop" | "unknown" | "current-voice";
   text?: string;
   editorKind?: "contenteditable" | "textarea";
+  /** R3 2026-09-25 current-voice fixture controls (only for mode "current-voice"). */
+  currentVoiceClass?: string;
+  currentVoiceAria?: string;
+  currentVoiceDisabled?: boolean;
+  currentVoicePlusSend?: boolean;
+  currentVoicePlusStop?: boolean;
+  /** Number of exact-aria candidates (default 1; > cap exercises fail-closed overflow). */
+  currentVoiceCandidates?: number;
 } = {}) {
   const mode = opts.mode ?? "idle";
   const editorKind = opts.editorKind ?? "contenteditable";
@@ -74,6 +82,16 @@ function makeEdgeDom(opts: {
     disabled: false,
     click: voiceClicks.click,
   };
+  // R3 2026-09-25 observed blank-composer voice control (real ChatGPT DOM).
+  const currentVoiceBtn = {
+    className:
+      opts.currentVoiceClass ?? "size-token-button-composer bg-composer-primary",
+    getAttribute: (n: string) =>
+      n === "aria-label" ? (opts.currentVoiceAria ?? "开始语音") : null,
+    hasAttribute: () => false,
+    disabled: opts.currentVoiceDisabled ?? false,
+    click: voiceClicks.click,
+  };
 
   const form = {
     querySelector(selector: string) {
@@ -86,7 +104,26 @@ function makeEdgeDom(opts: {
       if (mode === "stop" && selector === "button.composer-submit-button-color") {
         return stopBtn;
       }
+      if (
+        mode === "current-voice"
+        && opts.currentVoicePlusSend === true
+        && selector === 'button[data-testid="send-button"]'
+      ) {
+        return sendBtn;
+      }
       return null;
+    },
+    // R3 2026-09-25: form-scoped current-voice candidates (bounded scan in adapter).
+    querySelectorAll(selector: string) {
+      if (
+        mode === "current-voice"
+        && selector === 'button[aria-label="开始语音"]'
+        && (opts.currentVoiceAria ?? "开始语音") === "开始语音"
+      ) {
+        const n = opts.currentVoiceCandidates ?? 1;
+        return n <= 1 ? [currentVoiceBtn] : Array.from({ length: n }, () => ({ ...currentVoiceBtn }));
+      }
+      return [];
     },
   };
 
@@ -142,7 +179,10 @@ function makeEdgeDom(opts: {
         if (selector.includes("textarea")) return editor;
         if (selector === "body") return {};
         if (selector === "main") return {};
-        if (mode === "stop" && (selector.includes("stop-button") || selector.includes("Stop"))) {
+        if (
+          (mode === "stop" || (mode === "current-voice" && opts.currentVoicePlusStop === true))
+          && (selector.includes("stop-button") || selector.includes("Stop"))
+        ) {
           return { getAttribute: () => "Stop generating", hasAttribute: () => false, disabled: false };
         }
         return null;
@@ -208,7 +248,10 @@ function makeEdgeDom(opts: {
       if (selector.includes("textarea")) return null;
       if (selector === "body") return {};
       if (selector === "main") return {};
-      if (mode === "stop" && (selector.includes("stop-button") || selector.includes("Stop"))) {
+      if (
+        (mode === "stop" || (mode === "current-voice" && opts.currentVoicePlusStop === true))
+        && (selector.includes("stop-button") || selector.includes("Stop"))
+      ) {
         return { getAttribute: () => "Stop generating", hasAttribute: () => false, disabled: false };
       }
       return null;
@@ -652,5 +695,166 @@ describe("normalizeCanonicalDomText", () => {
   it("only CRLF/CR/NBSP", () => {
     expect(normalizeCanonicalDomText("a\r\nb\rc d")).toBe("a\nb\nc d");
     expect(normalizeCanonicalDomText("  keep  ")).toBe("  keep  ");
+  });
+});
+
+describe("R3 current-voice idle adaptation (observed 2026-09-25)", () => {
+  it("1. current blank composer voice control => idle/current_voice_idle, safety idle/safe, zero voice clicks", () => {
+    const { doc, voiceClicks } = makeEdgeDom({ mode: "current-voice", text: "" });
+    const { editor } = resolveChatGptComposer(doc);
+    const action = resolveChatGptAction(doc, editor);
+    expect(action.kind).toBe("idle");
+    expect(action.button).toBeNull();
+    expect(action.enabled).toBe(true);
+    expect(action.evidence).toBe("current_voice_idle");
+
+    const safety = observeChatGptSafety(doc, { routeValid: true });
+    expect(safety.composer).toBe("empty");
+    expect(safety.generation).toBe("idle");
+    expect(safety.safe).toBe(true);
+
+    // Voice control must never be a Send target.
+    const r = dispatchNativeSend(doc, MESSAGE, { routeValid: true });
+    expect(r.ok).toBe(false);
+    expect(voiceClicks.clicks).toBe(0);
+  });
+
+  it("2. missing size-token-button-composer => unknown (fail-closed)", () => {
+    const { doc } = makeEdgeDom({
+      mode: "current-voice",
+      currentVoiceClass: "bg-composer-primary",
+    });
+    const { editor } = resolveChatGptComposer(doc);
+    const action = resolveChatGptAction(doc, editor);
+    expect(action.kind).toBe("unknown");
+    expect(action.button).toBeNull();
+    const safety = observeChatGptSafety(doc, { routeValid: true });
+    expect(safety.generation).toBe("unknown");
+    expect(safety.safe).toBe(false);
+  });
+
+  it("3. missing bg-composer-primary => unknown (fail-closed)", () => {
+    const { doc } = makeEdgeDom({
+      mode: "current-voice",
+      currentVoiceClass: "size-token-button-composer",
+    });
+    const { editor } = resolveChatGptComposer(doc);
+    const action = resolveChatGptAction(doc, editor);
+    expect(action.kind).toBe("unknown");
+    expect(action.button).toBeNull();
+    const safety = observeChatGptSafety(doc, { routeValid: true });
+    expect(safety.generation).toBe("unknown");
+    expect(safety.safe).toBe(false);
+  });
+
+  it("4. same structure but different aria-label => unknown", () => {
+    const { doc } = makeEdgeDom({
+      mode: "current-voice",
+      currentVoiceAria: "语音输入",
+    });
+    const { editor } = resolveChatGptComposer(doc);
+    const action = resolveChatGptAction(doc, editor);
+    expect(action.kind).toBe("unknown");
+    expect(action.button).toBeNull();
+  });
+
+  it("5. disabled current voice => unknown (fail-closed; no disabled-idle this slice)", () => {
+    const { doc } = makeEdgeDom({ mode: "current-voice", currentVoiceDisabled: true });
+    const { editor } = resolveChatGptComposer(doc);
+    const action = resolveChatGptAction(doc, editor);
+    expect(action.kind).toBe("unknown");
+    expect(action.button).toBeNull();
+    const safety = observeChatGptSafety(doc, { routeValid: true });
+    expect(safety.generation).toBe("unknown");
+    expect(safety.safe).toBe(false);
+  });
+
+  it("6. exact send-button present => send wins; voice never clicked", () => {
+    const { doc, voiceClicks, sendClicks } = makeEdgeDom({
+      mode: "current-voice",
+      text: MESSAGE,
+      currentVoicePlusSend: true,
+    });
+    const { editor } = resolveChatGptComposer(doc);
+    const action = resolveChatGptAction(doc, editor);
+    expect(action.kind).toBe("send");
+    expect(action.evidence).toBe("form_send_button");
+    expect(action.button?.getAttribute("data-testid")).toBe("send-button");
+
+    const r = dispatchNativeSend(doc, MESSAGE, { routeValid: true });
+    expect(r.ok).toBe(true);
+    expect(sendClicks.clicks).toBe(1);
+    expect(voiceClicks.clicks).toBe(0);
+  });
+
+  it("7. explicit document stop present => stop wins over current voice", () => {
+    const { doc, voiceClicks } = makeEdgeDom({
+      mode: "current-voice",
+      currentVoicePlusStop: true,
+    });
+    const { editor } = resolveChatGptComposer(doc);
+    const action = resolveChatGptAction(doc, editor);
+    expect(action.kind).toBe("stop");
+    expect(action.evidence).toBe("legacy_stop");
+    const safety = observeChatGptSafety(doc, { routeValid: true });
+    expect(safety.generation).toBe("generating");
+    expect(safety.safe).toBe(false);
+    expect(voiceClicks.clicks).toBe(0);
+  });
+
+  it("8. write capability accepts current idle evidence without retaining voice control", () => {
+    const { doc, voiceClicks } = makeEdgeDom({ mode: "current-voice", text: "" });
+    const cap = inspectComposerWriteCapability(doc, { routeValid: true });
+    expect(cap.ok).toBe(true);
+    if (cap.ok) {
+      expect(cap.action.kind).toBe("idle");
+      expect(cap.action.evidence).toBe("current_voice_idle");
+      expect(cap.action.button).toBeNull();
+    }
+    expect(voiceClicks.clicks).toBe(0);
+  });
+
+  it("9. write then re-resolve: static current fixture stays idle => send fails closed, zero clicks", () => {
+    const { doc, voiceClicks, sendClicks } = makeEdgeDom({ mode: "current-voice", text: "" });
+    const cap = inspectComposerWriteCapability(doc, { routeValid: true });
+    expect(cap.ok).toBe(true);
+    const w = writeCanonicalMessage(doc, MESSAGE, { routeValid: true });
+    expect(w.ok).toBe(true);
+    const v = verifyCanonicalComposer(doc, MESSAGE, { routeValid: true });
+    expect(v.ok).toBe(true);
+    // After write the adapter must re-resolve the exact send-button; the static
+    // fixture still only offers the voice control, so send fails closed.
+    const r = dispatchNativeSend(doc, MESSAGE, { routeValid: true });
+    expect(r.ok).toBe(false);
+    expect((r as { reason?: string }).reason).toBe("send_action_not_ready");
+    expect(voiceClicks.clicks).toBe(0);
+    expect(sendClicks.clicks).toBe(0);
+  });
+});
+
+describe("R3 current-voice scan cap overflow (fail-closed)", () => {
+  it("5 exact-aria fully-qualified candidates exceed CURRENT_VOICE_MAX_CANDIDATES => unknown, safety unknown, zero clicks", () => {
+    const { doc, voiceClicks } = makeEdgeDom({
+      mode: "current-voice",
+      currentVoiceCandidates: 5,
+      text: "",
+    });
+    const { editor } = resolveChatGptComposer(doc);
+    // Every candidate is individually fully qualified (exact aria + both class
+    // tokens + enabled), but the count exceeds the bounded scan cap, so the
+    // adapter must refuse positive idle evidence entirely (fail-closed).
+    const action = resolveChatGptAction(doc, editor);
+    expect(action.kind).toBe("unknown");
+    expect(action.button).toBeNull();
+    expect(action.enabled).toBe(false);
+
+    const safety = observeChatGptSafety(doc, { routeValid: true });
+    expect(safety.composer).toBe("empty");
+    expect(safety.generation).toBe("unknown");
+    expect(safety.safe).toBe(false);
+
+    const r = dispatchNativeSend(doc, MESSAGE, { routeValid: true });
+    expect(r.ok).toBe(false);
+    expect(voiceClicks.clicks).toBe(0);
   });
 });

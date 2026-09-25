@@ -3,6 +3,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
 import { parseChatgptConversationRoute } from "../src/chatgpt/route.js";
+import { runRouteAttestationSend } from "../browser-companion/route-attestation-run.js";
 import {
   applyRouteAttestServerVerification,
   applyRouteAttestServerVerificationToFence,
@@ -1524,5 +1525,117 @@ describe("route observer has no querySelectorAll fallback", () => {
       challengeId: CHALLENGE,
     });
     expect(found.ok).toBe(true);
+  });
+});
+
+describe("R3 current-voice idle gate (real classifier, source runner)", () => {
+  const CHALLENGE_ID = "33333333-3333-4333-8333-333333333333";
+  const ATTEST_MESSAGE = [
+    "[C2C_ROUTE_ATTEST]",
+    `challengeId=${CHALLENGE_ID}`,
+    "challengeDigest=cafef00d",
+    "",
+    "这是 C2C delivery-route verification，不是新开发任务。",
+    "请在本对话调用 MCP 工具（参数必须与上方两行完全一致）：",
+    `feedback_companion_route_confirm(challengeId=${CHALLENGE_ID}, challengeDigest=cafef00d)`,
+  ].join("\n");
+
+  // Real (unmocked) current-voice blank-composer DOM, observed 2026-09-25.
+  function makeCurrentVoiceDoc() {
+    const state = { text: "" };
+    let clicks = 0;
+    const voice = {
+      className: "size-token-button-composer bg-composer-primary",
+      getAttribute: (n: string) => (n === "aria-label" ? "开始语音" : null),
+      hasAttribute: () => false,
+      disabled: false,
+      click: () => {
+        clicks += 1;
+      },
+    };
+    const fillers = [0, 1, 2].map(() => ({
+      className: "bg-token-button",
+      getAttribute: () => null,
+      hasAttribute: () => false,
+      disabled: false,
+    }));
+    const form = {
+      querySelector: () => null,
+      querySelectorAll(sel: string) {
+        if (sel === "button") return [...fillers, voice];
+        if (sel === 'button[aria-label="开始语音"]') return [voice];
+        return [];
+      },
+    };
+    const editor = {
+      tagName: "DIV",
+      id: "prompt-textarea",
+      className: "ProseMirror",
+      getAttribute: (n: string) => (n === "contenteditable" ? "true" : null),
+      hasAttribute: () => false,
+      closest: (s: string) => (s === "form" ? form : null),
+      focus: () => {},
+    };
+    Object.defineProperty(editor, "textContent", {
+      get: () => state.text,
+      set: (v: string) => {
+        state.text = v;
+      },
+    });
+    const doc = {
+      defaultView: {
+        getSelection: () => ({ removeAllRanges() {}, addRange() {} }),
+        Event: class {
+          type: string;
+          bubbles: boolean;
+          constructor(type: string, init: { bubbles?: boolean } = {}) {
+            this.type = type;
+            this.bubbles = Boolean(init?.bubbles);
+          }
+        },
+      },
+      createRange: () => ({ selectNodeContents() {} }),
+      execCommand: (_c: string, _u: boolean, v: string) => {
+        state.text = v;
+        return true;
+      },
+      queryCommandSupported: (c: string) => c === "insertText",
+      querySelector(selector: string) {
+        if (selector === "#prompt-textarea" || selector.includes("ProseMirror")) return editor;
+        if (selector === "body" || selector === "main") return {};
+        return null;
+      },
+      querySelectorAll: () => [],
+    };
+    return { doc, clicks };
+  }
+
+  it("current-voice idle evidence passes the attestation gate; static fixture then fails closed with zero clicks", async () => {
+    const { doc, clicks } = makeCurrentVoiceDoc();
+    const result = await runRouteAttestationSend(doc, {
+      attestationMessage: ATTEST_MESSAGE,
+      expectedRoute: "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111",
+      expectedGeneration: 1,
+      locationHref: "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111",
+      getCurrentHref: () => "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111",
+      parseRoute: (href: string) =>
+        parseChatgptConversationRoute(href, { allowQueryOrHash: false, conversationIdPolicy: "uuid" }),
+      getCurrentGeneration: () => 1,
+      waitMs: async () => {},
+      readyTimeoutMs: 100,
+      pollMs: 1,
+      observeTimeoutMs: 50,
+      snapshotUserTurns: () => [],
+    });
+    expect(result.ok).toBe(false);
+    // Gate ACCEPTED the current-voice idle evidence (not generation_unknown /
+    // route_attest_not_idle); the static fixture has no post-write send-button,
+    // so readiness times out fail-closed with zero clicks.
+    expect(result.reason).toBe("route_attest_send_not_ready");
+    expect(result.mutationAttempted).toBe(true);
+    expect(result.wrote).toBe(true);
+    expect(result.verified).toBe(true);
+    expect(result.clickAttempted).toBe(false);
+    expect(clicks).toBe(0);
   });
 });

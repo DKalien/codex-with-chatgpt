@@ -222,3 +222,103 @@ describe("content-script fixed feedback bootstrap sender", () => {
     });
   });
 });
+
+describe("R3 current-voice idle gate (real classifier, no mocks)", () => {
+  const sharedParse = (href: string) =>
+    parseChatgptConversationRoute(href, { allowQueryOrHash: false, conversationIdPolicy: "uuid" });
+
+  // Real (unmocked) current-voice blank-composer DOM, observed 2026-09-25.
+  function makeCurrentVoiceDom() {
+    const state = { text: "" };
+    let clicks = 0;
+    const voice = {
+      className: "size-token-button-composer bg-composer-primary",
+      getAttribute: (n: string) => (n === "aria-label" ? "开始语音" : null),
+      hasAttribute: () => false,
+      disabled: false,
+      click: () => {
+        clicks += 1;
+      },
+    };
+    const fillers = [0, 1, 2].map(() => ({
+      className: "bg-token-button",
+      getAttribute: () => null,
+      hasAttribute: () => false,
+      disabled: false,
+    }));
+    const form = {
+      querySelector: () => null,
+      querySelectorAll(sel: string) {
+        if (sel === "button") return [...fillers, voice];
+        if (sel === 'button[aria-label="开始语音"]') return [voice];
+        return [];
+      },
+    };
+    const editor = {
+      tagName: "DIV",
+      id: "prompt-textarea",
+      className: "ProseMirror",
+      getAttribute: (n: string) => (n === "contenteditable" ? "true" : null),
+      hasAttribute: () => false,
+      closest: (s: string) => (s === "form" ? form : null),
+      focus: () => {},
+    };
+    Object.defineProperty(editor, "textContent", {
+      get: () => state.text,
+      set: (v: string) => {
+        state.text = v;
+      },
+    });
+    const doc = {
+      defaultView: {
+        getSelection: () => ({ removeAllRanges() {}, addRange() {} }),
+        Event: class {
+          type: string;
+          bubbles: boolean;
+          constructor(type: string, init: { bubbles?: boolean } = {}) {
+            this.type = type;
+            this.bubbles = Boolean(init?.bubbles);
+          }
+        },
+      },
+      createRange: () => ({ selectNodeContents() {} }),
+      execCommand: (_c: string, _u: boolean, v: string) => {
+        state.text = v;
+        return true;
+      },
+      queryCommandSupported: (c: string) => c === "insertText",
+      querySelector(selector: string) {
+        if (selector === "#prompt-textarea" || selector.includes("ProseMirror")) return editor;
+        if (selector === "body" || selector === "main") return {};
+        return null;
+      },
+      querySelectorAll: () => [],
+    };
+    return { doc, clicks };
+  }
+
+  it("current-voice idle evidence passes the bootstrap gate; static fixture then fails closed with zero clicks", async () => {
+    const { doc, clicks } = makeCurrentVoiceDom();
+    const result = await runFeedbackBootstrapSend(doc, {
+      expectedRoute: ROUTE,
+      expectedGeneration: 4,
+      locationHref: ROUTE,
+      getCurrentGeneration: () => 4,
+      parseRoute: sharedParse,
+      waitMs: async () => {},
+      readyTimeoutMs: 100,
+      observeTimeoutMs: 50,
+      snapshotUserTurns: () => [],
+    });
+    expect(result.ok).toBe(false);
+    // Gate ACCEPTED the current-voice idle evidence (not generation_unknown /
+    // bootstrap_not_idle); the static fixture has no post-write send-button,
+    // so readiness times out fail-closed.
+    expect(result.reason).toBe("bootstrap_send_not_ready");
+    expect(result.mutationAttempted).toBe(true);
+    expect(result.wrote).toBe(true);
+    expect(result.verified).toBe(true);
+    expect(result.clickAttempted).toBe(false);
+    expect(clicks).toBe(0);
+  });
+});

@@ -494,29 +494,40 @@ describe("Desktop IPC wrapper（fake helper）", () => {
   });
 
   it("使用隔离、无 shell 的 helper，并保留中文多行正文直到接受回执", async () => {
-    const fake = fakeSpawner();
-    const client = makeClient(fake.spawnImpl);
-    const message = "请按已确认方案执行。\n\n```ts\nconst greeting = '你好';\n```";
+    const previousPython = process.env.C2C_DESKTOP_PYTHON;
+    delete process.env.C2C_DESKTOP_PYTHON;
 
-    const connection = await client.prepare(target);
-    await expect(connection.send(message)).resolves.toEqual({
-      threadId: target.threadId,
-      turnId: "01a00000-0000-7000-8000-000000000002",
-    });
-    connection.close();
+    try {
+      const fake = fakeSpawner();
+      const client = makeClient(fake.spawnImpl);
+      const message = "请按已确认方案执行。\n\n```ts\nconst greeting = '你好';\n```";
 
-    expect(fake.spawnImpl).toHaveBeenCalledWith(
-      "python",
-      ["-I", "-B", "-X", "utf8", resolveDesktopHelperPath()],
-      expect.objectContaining({ shell: false, windowsHide: true, stdio: ["pipe", "pipe", "ignore"] }),
-    );
-    expect(fake.requests.map(request => request.op)).toEqual(["prepare", "send"]);
-    expect(fake.requests[0]).toMatchObject({ op: "prepare", target });
-    expect(fake.requests[1]).toMatchObject({ op: "send", message });
-    expect(fake.requests[1]).not.toHaveProperty("model");
-    expect(fake.requests[1]).not.toHaveProperty("provider");
-    expect(fake.requests[1]).not.toHaveProperty("cwd");
-    expect(fake.requests[1]).not.toHaveProperty("sandbox");
+      const connection = await client.prepare(target);
+      await expect(connection.send(message)).resolves.toEqual({
+        threadId: target.threadId,
+        turnId: "01a00000-0000-7000-8000-000000000002",
+      });
+      connection.close();
+
+      expect(fake.spawnImpl).toHaveBeenCalledWith(
+        "python",
+        ["-I", "-B", "-X", "utf8", resolveDesktopHelperPath()],
+        expect.objectContaining({ shell: false, windowsHide: true, stdio: ["pipe", "pipe", "ignore"] }),
+      );
+      expect(fake.requests.map(request => request.op)).toEqual(["prepare", "send"]);
+      expect(fake.requests[0]).toMatchObject({ op: "prepare", target });
+      expect(fake.requests[1]).toMatchObject({ op: "send", message });
+      expect(fake.requests[1]).not.toHaveProperty("model");
+      expect(fake.requests[1]).not.toHaveProperty("provider");
+      expect(fake.requests[1]).not.toHaveProperty("cwd");
+      expect(fake.requests[1]).not.toHaveProperty("sandbox");
+    } finally {
+      if (previousPython === undefined) {
+        delete process.env.C2C_DESKTOP_PYTHON;
+      } else {
+        process.env.C2C_DESKTOP_PYTHON = previousPython;
+      }
+    }
   });
 
   it("支持 UUIDv7，并在输入边界拒绝额外字段、非法 Unicode 与超限正文", () => {
