@@ -14,10 +14,11 @@ import {
   resetSessionOwnership,
   resolveSenderDocumentIdentity,
   resolveCurrentDocumentBindingIdentity,
-  applyObserveOwnership,
+  resolveObservationRouteVerdict,
+  applyObservationRouteVerdict,
   OWNERSHIP_SCHEMA_VERSION,
 } from "./ownership.js";
-import { parseChatgptConversationRoute, areChatgptConversationRoutesEquivalent } from "./route-esm.js";
+import { areChatgptConversationRoutesEquivalent } from "./route-esm.js";
 import { parseBridgeOrigin, companionApiUrl, BridgeOriginError } from "./bridge-origin.js";
 import {
   emptyJournal,
@@ -514,17 +515,6 @@ async function persistSessionOwnership() {
   });
 }
 
-function parseRouteSafe(href) {
-  try {
-    return parseChatgptConversationRoute(href, {
-      allowQueryOrHash: false,
-      conversationIdPolicy: "uuid",
-    });
-  } catch {
-    return null;
-  }
-}
-
 function safeTransportSummary() {
   if (!transport) {
     return {
@@ -810,7 +800,8 @@ function requireProtectedTransport() {
 
 /**
  * Atomically apply sender identity plus runtime freshness/safety before any
- * owner-gated action; route authority comes only from MessageSender.url.
+ * owner-gated action; route authority is the browser tab URL, with the
+ * content-script canonicalRoute as a mandatory-equivalence witness (R3o).
  */
 async function refreshPageObservation(sender, message) {
   const identity = resolveSenderDocumentIdentity(sender);
@@ -819,17 +810,32 @@ async function refreshPageObservation(sender, message) {
   }
   const tabId = identity.ok || identity.reason === "document_id_unavailable" ? identity.tabId : null;
   const documentId = identity.ok ? identity.documentId : null;
-  const parsed = parseRouteSafe(sender?.url ?? "");
-  const canonical = parsed ? parsed.canonical : null;
   const generation = Number.isFinite(message?.generation) ? Number(message.generation) : 1;
-
-  ownerState = applyObserveOwnership(ownerState, {
+  const verdict = resolveObservationRouteVerdict(sender, message?.canonicalRoute ?? null);
+  const applied = applyObservationRouteVerdict(ownerState, {
     tabId: tabId ?? -1,
     documentId,
-    canonicalRoute: canonical,
+    verdict: verdict.verdict,
+    canonicalRoute: verdict.canonicalRoute ?? null,
     generation,
     now: Date.now(),
   });
+
+  if (applied.applied === "dropped") {
+    // Non-owner document failed the authority/witness check (R3o): preserve the
+    // current owner, evidence and owner proof untouched (stale-document guard).
+    return { ok: false, reason: "route_witness_mismatch", tabId, documentId };
+  }
+  ownerState = applied.state;
+  if (applied.applied === "owner_invalidated") {
+    // Exact owner document contradicted the browser authority (R3o): the owner
+    // goes away together with its runtime evidence and outstanding proof.
+    evidence = null;
+    ownerProof = null;
+    await persistSessionOwnership();
+    return { ok: false, reason: "route_witness_mismatch", tabId, documentId };
+  }
+  const canonical = verdict.verdict === "match" ? verdict.canonicalRoute : null;
 
   if (
     documentId
@@ -1677,7 +1683,7 @@ async function handleConnectPage(sender, message) {
     if (!autonomyOff.ok) {
       return { ok: false, reason: "autonomy_persist_failed", autonomy: "off", retryAllowed: true };
     }
-    const currentDocument = resolveCurrentDocumentBindingIdentity(sender);
+    const currentDocument = resolveCurrentDocumentBindingIdentity(sender, message?.canonicalRoute ?? null);
     if (!currentDocument.ok) return { ok: false, reason: currentDocument.reason };
     const identity = currentDocument.identity;
     const canonicalRoute = identity.canonicalRoute;
@@ -2277,7 +2283,7 @@ async function handleMessage(message, sender, { transportMutationHeld = false } 
     if (parseAutonomyPolicy(autonomyPolicy).mode === "armed") {
       return { ok: false, reason: "autonomy_armed" };
     }
-    return handleReservePage(sender, { generation, safety: message?.safety });
+    return handleReservePage(sender, { generation, safety: message?.safety, canonicalRoute: message?.canonicalRoute ?? null });
   }
   if (message.type === "c2c.release") return handleRelease();
   if (message.type === "c2c.recover") return handleRecover();
@@ -2295,7 +2301,7 @@ async function handleMessage(message, sender, { transportMutationHeld = false } 
     return runTransportMutation(() => handleConnectPage(sender, message));
   }
   if (message.type === "c2c.bind") {
-    const currentDocument = resolveCurrentDocumentBindingIdentity(sender);
+    const currentDocument = resolveCurrentDocumentBindingIdentity(sender, message?.canonicalRoute ?? null);
     if (!currentDocument.ok) return { ok: false, reason: currentDocument.reason };
     const { tabId, documentId, canonicalRoute } = currentDocument.identity;
     const generation = Number.isFinite(message.generation) ? Number(message.generation) : 1;
@@ -2313,9 +2319,11 @@ async function handleMessage(message, sender, { transportMutationHeld = false } 
   const tabId =
     identity.ok || identity.reason === "document_id_unavailable" ? identity.tabId : null;
   const documentId = identity.ok ? identity.documentId : null;
-  const parsed = parseRouteSafe(sender?.url ?? "");
-  const canonical = parsed ? parsed.canonical : null;
   const generation = Number.isFinite(message.generation) ? Number(message.generation) : 1;
+  // R3o: authority is the browser tab URL; the content-script canonicalRoute is a
+  // mandatory-equivalence witness. A non-matching canonical is never trusted below.
+  const observationVerdict = resolveObservationRouteVerdict(sender, message?.canonicalRoute ?? null);
+  const canonical = observationVerdict.verdict === "match" ? observationVerdict.canonicalRoute : null;
 
   if (
     message.type === "c2c.status.page"
@@ -2325,42 +2333,53 @@ async function handleMessage(message, sender, { transportMutationHeld = false } 
     if (!identity.ok && identity.reason !== "document_id_unavailable") {
       return { ok: false, reason: identity.reason };
     }
-    ownerState = applyObserveOwnership(ownerState, {
+    const applied = applyObservationRouteVerdict(ownerState, {
       tabId: tabId ?? -1,
       documentId,
-      canonicalRoute: canonical,
+      verdict: observationVerdict.verdict,
+      canonicalRoute: observationVerdict.canonicalRoute ?? null,
       generation,
       now: Date.now(),
     });
-    if (
-      documentId
-      && tabId != null
-      && isOwner(ownerState, tabId, documentId)
-      && message.safety
-    ) {
-      evidence = {
-        tabId,
-        documentId,
-        canonicalRoute: canonical,
-        observedAt: Date.now(),
-        composer: message.safety.composer,
-        generation: message.safety.generation,
-        safe: message.safety.safe === true,
-      };
-    } else if (evidence && tabId != null && evidence.tabId === tabId) {
-      if (!documentId || evidence.documentId !== documentId || !isOwner(ownerState, tabId, documentId)) {
+    if (applied.applied !== "dropped") {
+      ownerState = applied.state;
+      if (applied.applied === "owner_invalidated") {
+        // Exact owner document contradicted the browser authority (R3o): the
+        // owner goes away with its runtime evidence and outstanding proof.
         evidence = null;
+        ownerProof = null;
+      } else if (
+        documentId
+        && tabId != null
+        && isOwner(ownerState, tabId, documentId)
+        && message.safety
+      ) {
+        evidence = {
+          tabId,
+          documentId,
+          canonicalRoute: canonical,
+          observedAt: Date.now(),
+          composer: message.safety.composer,
+          generation: message.safety.generation,
+          safe: message.safety.safe === true,
+        };
+      } else if (evidence && tabId != null && evidence.tabId === tabId) {
+        if (!documentId || evidence.documentId !== documentId || !isOwner(ownerState, tabId, documentId)) {
+          evidence = null;
+        }
       }
+      // Invalidate owner proof when document changes.
+      if (
+        ownerProof
+        && tabId != null
+        && (!documentId || documentId !== ownerProof.documentId || tabId !== ownerProof.tabId)
+      ) {
+        ownerProof = null;
+      }
+      await persistSessionOwnership();
     }
-    // Invalidate owner proof when document changes.
-    if (
-      ownerProof
-      && tabId != null
-      && (!documentId || documentId !== ownerProof.documentId || tabId !== ownerProof.tabId)
-    ) {
-      ownerProof = null;
-    }
-    await persistSessionOwnership();
+    // dropped (R3o): stale/non-owner observation failed the authority/witness
+    // check — zero mutation; diagnostics below still run with canonical=null.
     // Only exact owner-document heartbeat may schedule autonomy.
     if (message.type === "c2c.heartbeat") {
       const ownerExact = isExactOwnerHeartbeat({

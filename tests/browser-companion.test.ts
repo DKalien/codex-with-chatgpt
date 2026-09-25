@@ -13,6 +13,10 @@ import {
   resetSessionOwnership,
   resolveSenderDocumentIdentity,
   resolveCurrentDocumentBindingIdentity,
+  resolveAuthorityRoute,
+  checkRouteWitness,
+  resolveObservationRouteVerdict,
+  applyObservationRouteVerdict,
   applyObserveOwnership,
 } from "../browser-companion/ownership.js";
 import { observeChatGptSafety, fakeDom } from "../browser-companion/dom-adapter.js";
@@ -109,24 +113,31 @@ describe("sender document identity (P1 fail-closed)", () => {
     expect(ok).toEqual({ ok: true, tabId: 9, documentId: "doc-9" });
   });
 
-  it("derives only tab/document/route from MessageSender and sender.url", () => {
-    const result = resolveCurrentDocumentBindingIdentity({
-      tab: { id: 9 }, documentId: "doc-9", frameId: 0,
-      url: ROUTE,
-      tabId: 99, canonicalRoute: ROUTE_B, href: ROUTE_B, targetRoute: ROUTE_B,
-    });
+  it("derives identity from MessageSender with tab.url as route authority (R3o)", () => {
+    // tab.url is the authority even when sender.url disagrees; witness must match it,
+    // and the persisted canonicalRoute is the authority's, never the witness value.
+    const result = resolveCurrentDocumentBindingIdentity(
+      {
+        tab: { id: 9, url: ROUTE }, documentId: "doc-9", frameId: 0,
+        url: ROUTE_B,
+        tabId: 99, canonicalRoute: ROUTE_B, href: ROUTE_B, targetRoute: ROUTE_B,
+      },
+      ROUTE,
+    );
     expect(result).toEqual({
       ok: true,
       identity: { tabId: 9, documentId: "doc-9", canonicalRoute: ROUTE },
     });
-    expect(resolveCurrentDocumentBindingIdentity({
-      tab: { id: 9 }, documentId: "doc-9", frameId: 0, url: "https://chatgpt.com/",
-    })).toMatchObject({ ok: false, reason: "invalid_route" });
+    // tab.url present but invalid: fail closed, never fall back to sender.url.
+    expect(resolveCurrentDocumentBindingIdentity(
+      { tab: { id: 9, url: "https://chatgpt.com/" }, documentId: "doc-9", frameId: 0, url: ROUTE },
+      ROUTE,
+    )).toMatchObject({ ok: false, reason: "invalid_route" });
   });
 });
 
 describe("popup-to-content identity boundary", () => {
-  it("forwards only fixed commands plus runtime freshness/evidence, never binding identity", () => {
+  it("forwards fixed commands plus runtime freshness/evidence/witness, never binding identity (R3o)", () => {
     const source = fs.readFileSync(path.join(projectRoot, "browser-companion", "content-script.js"), "utf8");
     const bindStart = source.indexOf('if (message.type === "c2c.bind.request")');
     const connectStart = source.indexOf('if (message.type === "c2c.connect.request")', bindStart);
@@ -136,10 +147,13 @@ describe("popup-to-content identity boundary", () => {
     expect(ownerProofStart).toBeGreaterThan(connectStart);
     const bindBranch = source.slice(bindStart, connectStart);
     const connectBranch = source.slice(connectStart, ownerProofStart);
-    expect(bindBranch).toMatch(/sendToWorker\(\{\s*type:\s*"c2c\.bind",\s*generation\s*\}\)/);
-    expect(connectBranch).toMatch(/sendToWorker\(\{\s*type:\s*"c2c\.connect\.page",\s*generation:\s*observation\.generation,\s*safety:\s*observation\.safety,?\s*\}\)/);
-    expect(bindBranch).not.toMatch(/(?:tabId|documentId|canonicalRoute|targetRoute|frameId|lastSeen|href):/);
-    expect(connectBranch).not.toMatch(/(?:tabId|documentId|canonicalRoute|targetRoute|frameId|lastSeen|href):/);
+    // R3o: the canonicalRoute witness is mandatory on bind/connect, derived only from
+    // the document's own location; tabId/documentId remain forbidden (identity still
+    // comes only from the forwarded MessageSender).
+    expect(bindBranch).toMatch(/canonicalRoute:\s*parseRoute\(location\.href\)\?\.canonical \?\? null/);
+    expect(connectBranch).toMatch(/canonicalRoute:\s*observation\.canonicalRoute,/);
+    expect(bindBranch).not.toMatch(/(?:tabId|documentId|targetRoute|frameId|lastSeen|href):/);
+    expect(connectBranch).not.toMatch(/(?:tabId|documentId|targetRoute|frameId|lastSeen|href):/);
   });
 });
 
@@ -435,5 +449,140 @@ describe("companion conversation id policy (P2)", () => {
         conversationIdPolicy: "uuid",
       }),
     ).not.toThrow();
+  });
+});
+
+describe("R3o trusted route authority + witness", () => {
+  const send = (tabUrl: string | undefined, senderUrl: string) => ({
+    tab: tabUrl === undefined ? { id: 9 } : { id: 9, url: tabUrl },
+    documentId: "doc-9",
+    frameId: 0,
+    url: senderUrl,
+  });
+
+  it("bind/connect witness: missing => route_witness_required, invalid => route_witness_invalid, mismatch => route_witness_mismatch", () => {
+    const sender = send(ROUTE, ROUTE);
+    expect(resolveCurrentDocumentBindingIdentity(sender, undefined))
+      .toMatchObject({ ok: false, reason: "route_witness_required" });
+    expect(resolveCurrentDocumentBindingIdentity(sender, null))
+      .toMatchObject({ ok: false, reason: "route_witness_required" });
+    expect(resolveCurrentDocumentBindingIdentity(sender, ""))
+      .toMatchObject({ ok: false, reason: "route_witness_required" });
+    expect(resolveCurrentDocumentBindingIdentity(sender, "not-a-route"))
+      .toMatchObject({ ok: false, reason: "route_witness_invalid" });
+    expect(resolveCurrentDocumentBindingIdentity(sender, ROUTE_B))
+      .toMatchObject({ ok: false, reason: "route_witness_mismatch" });
+  });
+
+  it("authority: tab.url wins over sender.url; persisted canonicalRoute is the authority's", () => {
+    const r = resolveCurrentDocumentBindingIdentity(send(ROUTE, ROUTE_B), ROUTE);
+    expect(r).toEqual({
+      ok: true,
+      identity: { tabId: 9, documentId: "doc-9", canonicalRoute: ROUTE },
+    });
+    expect(resolveAuthorityRoute(send(ROUTE, ROUTE_B)))
+      .toEqual({ ok: true, canonical: ROUTE, fallbackUsed: false });
+  });
+
+  it("authority: tab.url present but non-conversation fails closed even with valid sender.url and witness", () => {
+    expect(resolveAuthorityRoute(send("https://chatgpt.com/", ROUTE)))
+      .toEqual({ ok: false, reason: "invalid_route" });
+    expect(resolveCurrentDocumentBindingIdentity(send("https://chatgpt.com/", ROUTE), ROUTE))
+      .toMatchObject({ ok: false, reason: "invalid_route" });
+    // Empty-string tab.url is still a present string: no sender.url fallback.
+    expect(resolveAuthorityRoute(send("", ROUTE)))
+      .toEqual({ ok: false, reason: "invalid_route" });
+    expect(resolveCurrentDocumentBindingIdentity(send("", ROUTE), ROUTE))
+      .toMatchObject({ ok: false, reason: "invalid_route" });
+  });
+
+  it("authority: absent tab.url falls back to sender.url, still witness-checked", () => {
+    expect(resolveAuthorityRoute(send(undefined, ROUTE)))
+      .toEqual({ ok: true, canonical: ROUTE, fallbackUsed: true });
+    expect(resolveCurrentDocumentBindingIdentity(send(undefined, ROUTE), ROUTE))
+      .toEqual({ ok: true, identity: { tabId: 9, documentId: "doc-9", canonicalRoute: ROUTE } });
+    expect(resolveCurrentDocumentBindingIdentity(send(undefined, ROUTE), ROUTE_B))
+      .toMatchObject({ ok: false, reason: "route_witness_mismatch" });
+    expect(resolveCurrentDocumentBindingIdentity(send(undefined, "https://chatgpt.com/"), ROUTE))
+      .toMatchObject({ ok: false, reason: "invalid_route" });
+  });
+
+  it("witness check unit: requires a strictly-parsing witness equivalent to authority", () => {
+    expect(checkRouteWitness(ROUTE, undefined)).toMatchObject({ ok: false, reason: "route_witness_required" });
+    expect(checkRouteWitness(ROUTE, "https://chatgpt.com/c/not-a-uuid")).toMatchObject({ ok: false, reason: "route_witness_invalid" });
+    expect(checkRouteWitness(ROUTE, ROUTE_B)).toMatchObject({ ok: false, reason: "route_witness_mismatch" });
+    expect(checkRouteWitness(ROUTE, ROUTE)).toEqual({ ok: true });
+  });
+
+  it("TOCTOU bind: old sender.url + old witness + new tab.url => route_witness_mismatch, never bound", () => {
+    const state = emptyOwnerState();
+    const sender = { tab: { id: 1, url: ROUTE_B }, documentId: "old-doc", frameId: 0, url: ROUTE };
+    const resolved = resolveCurrentDocumentBindingIdentity(sender, ROUTE);
+    expect(resolved).toMatchObject({ ok: false, reason: "route_witness_mismatch" });
+    // The mismatch result carries the witness-free authority identity only: the old
+    // documentId is never bound to the new route, and nothing persists a witness value.
+    expect(isOwner(state, 1, "old-doc")).toBe(false);
+    expect(JSON.stringify(resolved)).not.toContain(ROUTE_B);
+  });
+
+  it("observe verdict: matching authority+witness keeps existing behavior", () => {
+    const bound = bindDoc(emptyOwnerState(), doc(1, "d1", ROUTE));
+    if (!bound.ok) throw new Error("setup bind failed");
+    const verdict = resolveObservationRouteVerdict(send(ROUTE, ROUTE), ROUTE);
+    expect(verdict).toEqual({ verdict: "match", canonicalRoute: ROUTE });
+    const applied = applyObservationRouteVerdict(bound.state, {
+      tabId: 1, documentId: "d1", verdict: verdict.verdict, canonicalRoute: verdict.canonicalRoute,
+    });
+    expect(applied.applied).toBe("observed");
+    expect(isOwner(applied.state, 1, "d1")).toBe(true);
+  });
+
+  it("observe verdict: exact owner document mismatch invalidates owner (SPA navigation)", () => {
+    const bound = bindDoc(emptyOwnerState(), doc(1, "d1", ROUTE));
+    if (!bound.ok) throw new Error("setup bind failed");
+    // Tab navigated to a new conversation; the document still reports the old route.
+    const verdict = resolveObservationRouteVerdict(send(ROUTE_B, ROUTE), ROUTE);
+    expect(verdict).toEqual({ verdict: "mismatch" });
+    const applied = applyObservationRouteVerdict(bound.state, { tabId: 1, documentId: "d1", verdict: verdict.verdict });
+    expect(applied.applied).toBe("owner_invalidated");
+    expect(applied.state.owner).toBeNull();
+  });
+
+  it("observe verdict: same-tab stale old-document mismatch heartbeat must NOT clear the new owner (DoS)", () => {
+    // Old document bound first, then a new document explicitly takes over the SAME tab.
+    const oldBound = bindDoc(emptyOwnerState(), doc(7, "old-doc", ROUTE_B));
+    if (!oldBound.ok) throw new Error("setup bind failed");
+    const rebound = bindDoc(oldBound.state, doc(7, "new-doc", ROUTE));
+    if (!rebound.ok) throw new Error("setup rebind failed");
+    expect(isOwner(rebound.state, 7, "new-doc")).toBe(true);
+    // Stale old document on tab 7: tab.url already the new route, document still
+    // reports the old route (sender.url and witness both stale).
+    const verdict = resolveObservationRouteVerdict(
+      { tab: { id: 7, url: ROUTE }, documentId: "old-doc", frameId: 0, url: ROUTE_B },
+      ROUTE_B,
+    );
+    expect(verdict).toEqual({ verdict: "mismatch" });
+    const applied = applyObservationRouteVerdict(rebound.state, { tabId: 7, documentId: "old-doc", verdict: verdict.verdict });
+    expect(applied.applied).toBe("dropped");
+    expect(isOwner(applied.state, 7, "new-doc")).toBe(true);
+    expect(applied.state.owner).toMatchObject({ tabId: 7, documentId: "new-doc", canonicalRoute: ROUTE });
+  });
+
+  it("observe verdict: off-route authority + null witness keeps existing null-route invalidation", () => {
+    const bound = bindDoc(emptyOwnerState(), doc(1, "d1", ROUTE));
+    if (!bound.ok) throw new Error("setup bind failed");
+    // Both the tab and the document agree the tab left every conversation.
+    const verdict = resolveObservationRouteVerdict(send("https://chatgpt.com/", "https://chatgpt.com/"), null);
+    expect(verdict).toEqual({ verdict: "off_route" });
+    const applied = applyObservationRouteVerdict(bound.state, { tabId: 1, documentId: "d1", verdict: verdict.verdict });
+    expect(applied.applied).toBe("observed");
+    expect(applied.state.owner).toBeNull();
+  });
+
+  it("observe verdict: conversation witness contradicts a non-conversation authority => mismatch", () => {
+    const verdict = resolveObservationRouteVerdict(send("https://chatgpt.com/", "https://chatgpt.com/"), ROUTE);
+    expect(verdict).toEqual({ verdict: "mismatch" });
+    // Same for a valid authority contradicted by an unparseable/null witness.
+    expect(resolveObservationRouteVerdict(send(ROUTE, ROUTE), null)).toEqual({ verdict: "mismatch" });
   });
 });

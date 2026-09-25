@@ -51,26 +51,137 @@ export function resolveSenderDocumentIdentity(sender) {
   return { ok: true, tabId: sender.tab.id, documentId };
 }
 
-/** Resolve the three-field current document identity from MessageSender only. */
-export function resolveCurrentDocumentBindingIdentity(sender) {
+/** Strict parse options shared by every trusted route resolution (R3o). */
+const STRICT_ROUTE_PARSE = { allowQueryOrHash: false, conversationIdPolicy: "uuid" };
+
+function parseStrictCanonical(href) {
+  return parseChatgptConversationRoute(href, STRICT_ROUTE_PARSE).canonical;
+}
+
+/**
+ * R3o: resolve the trusted browser-authority conversation route for a sender.
+ * - Primary: sender.tab.url, only when it is a string that strictly parses.
+ * - sender.url fallback ONLY when sender.tab.url is absent / not a string.
+ * - sender.tab.url present but invalid/non-conversation (including empty string):
+ *   fail closed, never fallback (prevents stale sender.url + stale witness from
+ *   being accepted after navigation).
+ */
+export function resolveAuthorityRoute(sender) {
+  const tabUrl = sender?.tab?.url;
+  if (typeof tabUrl === "string") {
+    try {
+      return { ok: true, canonical: parseStrictCanonical(tabUrl), fallbackUsed: false };
+    } catch {
+      return { ok: false, reason: "invalid_route" };
+    }
+  }
+  const senderUrl = sender?.url;
+  if (typeof senderUrl === "string" && senderUrl.length > 0) {
+    try {
+      return { ok: true, canonical: parseStrictCanonical(senderUrl), fallbackUsed: true };
+    } catch {
+      // fall through to fail-closed
+    }
+  }
+  return { ok: false, reason: "invalid_route" };
+}
+
+/**
+ * R3o: mandatory canonicalRoute witness check against the browser authority.
+ * The persisted identity always uses the authority canonical, never the witness value.
+ */
+export function checkRouteWitness(authorityCanonical, witnessRoute) {
+  if (typeof witnessRoute !== "string" || witnessRoute.length === 0) {
+    return { ok: false, reason: "route_witness_required" };
+  }
+  let witnessCanonical;
+  try {
+    witnessCanonical = parseStrictCanonical(witnessRoute);
+  } catch {
+    return { ok: false, reason: "route_witness_invalid" };
+  }
+  if (!areChatgptConversationRoutesEquivalent(authorityCanonical, witnessCanonical)) {
+    return { ok: false, reason: "route_witness_mismatch" };
+  }
+  return { ok: true };
+}
+
+/**
+ * Resolve the three-field current document identity from MessageSender plus a
+ * mandatory canonicalRoute witness (R3o). Failures are zero-mutation for
+ * owner/binding/connect flows.
+ */
+export function resolveCurrentDocumentBindingIdentity(sender, witnessRoute) {
   const resolved = resolveSenderDocumentIdentity(sender);
   if (!resolved.ok) return resolved;
-  try {
-    const parsed = parseChatgptConversationRoute(sender.url, {
-      allowQueryOrHash: false,
-      conversationIdPolicy: "uuid",
-    });
-    return {
-      ok: true,
-      identity: {
-        tabId: resolved.tabId,
-        documentId: resolved.documentId,
-        canonicalRoute: parsed.canonical,
-      },
-    };
-  } catch {
-    return { ok: false, reason: "invalid_route" };
+  const authority = resolveAuthorityRoute(sender);
+  if (!authority.ok) {
+    return { ok: false, reason: "invalid_route", tabId: resolved.tabId, documentId: resolved.documentId };
   }
+  const witness = checkRouteWitness(authority.canonical, witnessRoute);
+  if (!witness.ok) {
+    return { ok: false, reason: witness.reason, tabId: resolved.tabId, documentId: resolved.documentId };
+  }
+  return {
+    ok: true,
+    identity: {
+      tabId: resolved.tabId,
+      documentId: resolved.documentId,
+      canonicalRoute: authority.canonical,
+    },
+  };
+}
+
+/**
+ * R3o passive-observation route verdict from MessageSender + content-script witness.
+ * - match:    authority parses and the witness is strictly valid and equivalent.
+ * - mismatch: trust conflict (authority/witness disagree, or witness missing/unproven
+ *             while authority is a valid conversation route, or a non-conversation
+ *             authority contradicted by a conversation witness).
+ * - off_route: authority is not a conversation route AND the witness also does not
+ *             claim a conversation route — both sides agree the tab is off-target;
+ *             existing null-route invalidation behavior applies.
+ */
+export function resolveObservationRouteVerdict(sender, witnessRoute) {
+  const authority = resolveAuthorityRoute(sender);
+  let witnessCanonical = null;
+  if (typeof witnessRoute === "string" && witnessRoute.length > 0) {
+    try {
+      witnessCanonical = parseStrictCanonical(witnessRoute);
+    } catch {
+      witnessCanonical = null;
+    }
+  }
+  if (authority.ok) {
+    if (witnessCanonical && areChatgptConversationRoutesEquivalent(authority.canonical, witnessCanonical)) {
+      return { verdict: "match", canonicalRoute: authority.canonical };
+    }
+    return { verdict: "mismatch" };
+  }
+  if (witnessCanonical) return { verdict: "mismatch" };
+  return { verdict: "off_route" };
+}
+
+/**
+ * Apply a passive-observation route verdict to ownership state.
+ * - match/off_route keep existing applyObserveOwnership behavior.
+ * - mismatch from the exact current owner document invalidates that owner.
+ * - mismatch from any non-owner document is dropped with zero mutation
+ *   (a stale document must never clear an established new owner).
+ */
+export function applyObservationRouteVerdict(state, input) {
+  const { tabId, documentId = null, verdict, canonicalRoute = null, generation = 1, now = Date.now() } = input;
+  if (verdict === "mismatch") {
+    if (documentId != null && isOwner(state, tabId, documentId)) {
+      return { state: { ...state, owner: null }, applied: "owner_invalidated" };
+    }
+    return { state, applied: "dropped" };
+  }
+  const route = verdict === "match" ? canonicalRoute : null;
+  return {
+    state: applyObserveOwnership(state, { tabId, documentId, canonicalRoute: route, generation, now }),
+    applied: "observed",
+  };
 }
 
 /** @returns {OwnerState} */

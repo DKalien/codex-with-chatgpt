@@ -161,18 +161,26 @@
       return true;
     }
     if (message.type === "c2c.bind.request") {
-      // Identity comes only from the forwarded MessageSender; generation is freshness only.
-      void sendToWorker({ type: "c2c.bind", generation }).then((response) => {
+      // Identity still comes only from the forwarded MessageSender; generation is
+      // freshness only and canonicalRoute is the R3o witness, which must match the
+      // browser-authority tab URL or bind/connect fail closed.
+      void sendToWorker({
+        type: "c2c.bind",
+        generation,
+        canonicalRoute: parseRoute(location.href)?.canonical ?? null,
+      }).then((response) => {
         sendResponse(response);
       });
       return true;
     }
     if (message.type === "c2c.connect.request") {
-      // Identity comes from MessageSender; safety and generation are runtime evidence only.
+      // Identity comes from MessageSender; safety, generation and canonicalRoute are
+      // runtime evidence only (canonicalRoute is the R3o witness, never an authority).
       const observation = buildObserveMessage();
       void sendToWorker({
         type: "c2c.connect.page",
         generation: observation.generation,
+        canonicalRoute: observation.canonicalRoute,
         safety: observation.safety,
       }).then((response) => {
         sendResponse(response);

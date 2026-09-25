@@ -163,7 +163,7 @@ async function loadWorker(body: Record<string, unknown>, opts: {
     messageListener!(message, sender, resolve);
   });
   const ownerSender = { tab: { id: 7 }, documentId: "document-g4-rebind", frameId: 0, url: ROUTE };
-  const proof = await send({ type: "c2c.owner-proof.request", href: ROUTE, generation: 1 }, ownerSender) as {
+  const proof = await send({ type: "c2c.owner-proof.request", href: ROUTE, canonicalRoute: ROUTE, generation: 1 }, ownerSender) as {
     ok: boolean;
     proof?: { id: string };
   };
@@ -262,7 +262,7 @@ describe("G4c one-click connect orchestration", () => {
     });
     const sender = { tab: { id: 7 }, documentId: "document-g4-rebind", frameId: 0, url: ROUTE };
     const safety = { composer: "empty", generation: "idle", safe: true };
-    const connected = await worker.send({ type: "c2c.connect.page", generation: 1, safety }, sender) as {
+    const connected = await worker.send({ type: "c2c.connect.page", generation: 1, safety, canonicalRoute: ROUTE }, sender) as {
       ok: boolean; state?: string;
     };
     expect(connected).toMatchObject({ ok: true, state: "AWAITING_CONFIRMATION" });
@@ -276,14 +276,14 @@ describe("G4c one-click connect orchestration", () => {
     expect(worker.tabsSendMessage).toHaveBeenCalledTimes(1);
     expect(urls.filter(url => url.includes("/rebind/init"))).toHaveLength(1);
     const duplicate = await worker.send({
-      type: "c2c.connect.page", generation: 1, safety,
+      type: "c2c.connect.page", generation: 1, safety, canonicalRoute: ROUTE,
     }, sender) as Record<string, unknown>;
     expect(duplicate).toMatchObject({ ok: false, reason: "connect_active", retryAllowed: false });
     expect(urls.filter(url => url.includes("/rebind/init"))).toHaveLength(1);
     expect(worker.tabsSendMessage).toHaveBeenCalledTimes(1);
 
-    await worker.send({ type: "c2c.heartbeat", generation: 1, safety }, sender);
-    await worker.send({ type: "c2c.heartbeat", generation: 1, safety }, sender);
+    await worker.send({ type: "c2c.heartbeat", generation: 1, safety, canonicalRoute: ROUTE }, sender);
+    await worker.send({ type: "c2c.heartbeat", generation: 1, safety, canonicalRoute: ROUTE }, sender);
     expect(urls.filter(url => url.includes("/rebind/complete"))).toHaveLength(1);
     expect(worker.tabsSendMessage).toHaveBeenCalledTimes(1);
     expect(worker.local.values.get(TRANSPORT_KEY)).toMatchObject({
@@ -306,7 +306,7 @@ describe("G4c one-click connect orchestration", () => {
       expect((worker.local.values.get(AUTONOMY_KEY) as { armedAt: number }).armedAt).toBeGreaterThan(100);
     }
     const status = await worker.send({
-      type: "c2c.status.page", href: ROUTE, generation: 1, safety,
+      type: "c2c.status.page", href: ROUTE, canonicalRoute: ROUTE, generation: 1, safety,
     }, sender) as Record<string, any>;
     expect(status.connectState).toBe("DONE");
     expect(status.autonomy.mode).toBe(failRearmPersistence ? "off" : "armed");
@@ -342,7 +342,7 @@ describe("G4c one-click connect orchestration", () => {
       safety: { composer: "empty", generation: "idle", safe: true },
       tabId: 999,
       documentId: "caller-document",
-      canonicalRoute: OLD_ROUTE,
+      canonicalRoute: ROUTE,
       href: OLD_ROUTE,
       targetRoute: OLD_ROUTE,
       frameId: 2,
@@ -376,7 +376,7 @@ describe("G4c one-click connect orchestration", () => {
       generation: 8,
       tabId: 999,
       documentId: "caller-document",
-      canonicalRoute: OLD_ROUTE,
+      canonicalRoute: ROUTE,
       href: OLD_ROUTE,
       targetRoute: OLD_ROUTE,
       frameId: 2,
@@ -429,6 +429,7 @@ describe("G4c one-click connect orchestration", () => {
     const message = {
       type: "c2c.connect.page",
       generation: 1,
+      canonicalRoute: ROUTE,
       safety: { composer: "empty", generation: "idle", safe: true },
     };
 
@@ -456,15 +457,15 @@ describe("G4c one-click connect orchestration", () => {
     });
     const sender = { tab: { id: 7 }, documentId: "document-g4-rebind", frameId: 0, url: ROUTE };
     const safety = { composer: "empty", generation: "idle", safe: true };
-    await worker.send({ type: "c2c.connect.page", generation: 1, safety }, sender);
+    await worker.send({ type: "c2c.connect.page", generation: 1, safety, canonicalRoute: ROUTE }, sender);
     await worker.send({
-      type: "c2c.heartbeat", generation: 1, safety, feedbackBootstrapToolMissing: true,
+      type: "c2c.heartbeat", generation: 1, safety, canonicalRoute: ROUTE, feedbackBootstrapToolMissing: true,
     }, sender);
-    await worker.send({ type: "c2c.heartbeat", generation: 1, safety }, sender);
+    await worker.send({ type: "c2c.heartbeat", generation: 1, safety, canonicalRoute: ROUTE }, sender);
     expect(worker.tabsSendMessage).toHaveBeenCalledTimes(1);
     expect(worker.fetchMock.mock.calls.filter(([url]) => String(url).includes("/rebind/init"))).toHaveLength(3);
     expect(worker.local.values.get(CONNECT_KEY)).toMatchObject({ state: "WAITING_TAKEOVER" });
-    const status = await worker.send({ type: "c2c.status.page", href: ROUTE, generation: 1 }, sender) as Record<string, unknown>;
+    const status = await worker.send({ type: "c2c.status.page", href: ROUTE, canonicalRoute: ROUTE, generation: 1 }, sender) as Record<string, unknown>;
     expect(status.connectReason).toBe("bootstrap_tool_missing");
   });
 
@@ -487,8 +488,8 @@ describe("G4c one-click connect orchestration", () => {
     });
     const sender = { tab: { id: 7 }, documentId: "document-g4-rebind", frameId: 0, url: ROUTE };
     const safety = { composer: "empty", generation: "idle", safe: true };
-    await worker.send({ type: "c2c.connect.page", generation: 1, safety }, sender);
-    await worker.send({ type: "c2c.heartbeat", generation: 1, safety }, sender);
+    await worker.send({ type: "c2c.connect.page", generation: 1, safety, canonicalRoute: ROUTE }, sender);
+    await worker.send({ type: "c2c.heartbeat", generation: 1, safety, canonicalRoute: ROUTE }, sender);
     expect(worker.local.values.get(CONNECT_KEY)).toMatchObject({ state: "WAITING_TAKEOVER" });
     expect(worker.tabsSendMessage).toHaveBeenCalledTimes(1);
     expect(rebindCalls).toBe(2);
@@ -535,14 +536,14 @@ describe("G4c one-click connect orchestration", () => {
     });
     const sender = { tab: { id: 7 }, documentId: "document-g4-rebind", frameId: 0, url: ROUTE };
     const safety = { composer: "empty", generation: "idle", safe: true };
-    await worker.send({ type: "c2c.connect.page", generation: 1, safety }, sender);
-    await worker.send({ type: "c2c.heartbeat", generation: 1, safety }, sender);
+    await worker.send({ type: "c2c.connect.page", generation: 1, safety, canonicalRoute: ROUTE }, sender);
+    await worker.send({ type: "c2c.heartbeat", generation: 1, safety, canonicalRoute: ROUTE }, sender);
     expect(worker.tabsSendMessage.mock.calls.filter(([, message]) => message.type === "c2c.feedback.bootstrap.execute")).toHaveLength(1);
 
     takeoverDone = true;
-    await worker.send({ type: "c2c.heartbeat", generation: 1, safety }, sender);
+    await worker.send({ type: "c2c.heartbeat", generation: 1, safety, canonicalRoute: ROUTE }, sender);
     expect(worker.tabsSendMessage.mock.calls.filter(([, message]) => message.type === "c2c.route.attest.execute")).toHaveLength(1);
-    await worker.send({ type: "c2c.heartbeat", generation: 1, safety }, sender);
+    await worker.send({ type: "c2c.heartbeat", generation: 1, safety, canonicalRoute: ROUTE }, sender);
     expect(worker.local.values.get(CONNECT_KEY)).toMatchObject({ state: "DONE", bootstrapAutoResume: false });
     expect(worker.local.values.get(TRANSPORT_KEY)).toMatchObject({ routeVerification: "VERIFIED", rebindPending: false });
     expect(worker.local.values.get(AUTONOMY_KEY)).toMatchObject(rearmOnConnect
@@ -573,6 +574,7 @@ describe("G4c one-click connect orchestration", () => {
     const sender = { tab: { id: 7 }, documentId: "document-g4-rebind", frameId: 0, url: ROUTE };
     const result = await worker.send({
       type: "c2c.connect.page", generation: 1,
+      canonicalRoute: ROUTE,
       safety: { composer: "empty", generation: "idle", safe: true },
     }, sender);
     expect(result).toMatchObject({ ok: false, reason: "connect_outcome_unknown", state: "OUTCOME_UNKNOWN" });
@@ -622,6 +624,7 @@ describe("G4c one-click connect orchestration", () => {
     const result = await worker.send({
       type: "c2c.connect.page",
       generation: 1,
+      canonicalRoute: ROUTE,
       safety: { composer: "empty", generation: "idle", safe: true },
     }, sender);
     expect(result).toMatchObject({ ok: true, state: "CONNECTED", autonomy: "off" });
@@ -651,6 +654,7 @@ describe("G4c one-click connect orchestration", () => {
     const result = await worker.send({
       type: "c2c.connect.page",
       generation: 1,
+      canonicalRoute: ROUTE,
       safety: { composer: "empty", generation: "idle", safe: true },
     }, sender);
     expect(result).toMatchObject({ ok: true, state: "CONNECTED", autonomy: "off" });
@@ -707,6 +711,7 @@ describe("G4c one-click connect orchestration", () => {
     const connect = worker.send({
       type: "c2c.connect.page",
       generation: 1,
+      canonicalRoute: ROUTE,
       safety: { composer: "empty", generation: "idle", safe: true },
     }, sender);
     await vi.waitFor(() => expect(worker.tabsSendMessage).toHaveBeenCalledTimes(1));
@@ -747,6 +752,7 @@ describe("G4c one-click connect orchestration", () => {
     const result = await worker.send({
       type: "c2c.connect.page",
       generation: 1,
+      canonicalRoute: ROUTE,
       safety: { composer: "empty", generation: "idle", safe: true },
     }, sender);
     expect(result).toMatchObject({ ok: false, reason: "autonomy_persist_failed", autonomy: "off" });
@@ -774,6 +780,7 @@ describe("G4c one-click connect orchestration", () => {
     const unsafe = await worker.send({
       type: "c2c.connect.page",
       generation: 1,
+      canonicalRoute: ROUTE,
       safety: { composer: "filled", generation: "idle", safe: false },
     }, sender) as Record<string, unknown>;
     expect(unsafe).toMatchObject({ ok: false, state: "NONE", retryAllowed: true });
@@ -783,6 +790,7 @@ describe("G4c one-click connect orchestration", () => {
     await worker.send({
       type: "c2c.connect.page",
       generation: 1,
+      canonicalRoute: ROUTE,
       safety: { composer: "empty", generation: "idle", safe: true },
     }, sender);
     expect(worker.tabsSendMessage).toHaveBeenCalledTimes(1);
@@ -856,6 +864,7 @@ describe("G4c one-click connect orchestration", () => {
       const heartbeat = {
         type: "c2c.heartbeat",
         generation: 1,
+        canonicalRoute: ROUTE,
         safety: { composer: "empty", generation: "idle", safe: true },
       };
       await worker.send(heartbeat, sender);
@@ -883,6 +892,7 @@ describe("G4c one-click connect orchestration", () => {
     const result = await worker.send({
       type: "c2c.connect.page",
       generation: 1,
+      canonicalRoute: ROUTE,
       safety: { composer: "empty", generation: "idle", safe: true },
     }, sender);
     expect(result).toMatchObject({ ok: true, state: "CONNECTED", routeVerification: "VERIFIED" });
@@ -910,6 +920,7 @@ describe("G4c one-click connect orchestration", () => {
     const result = await worker.send({
       type: "c2c.connect.page",
       generation: 1,
+      canonicalRoute: bare,
       safety: { composer: "empty", generation: "idle", safe: true },
     }, { tab: { id: 7 }, documentId: "document-g4-rebind", frameId: 0, url: bare });
     expect(result).toMatchObject({ ok: true, state: "CONNECTED", routeVerification: "VERIFIED" });
@@ -924,6 +935,7 @@ describe("G4c one-click connect orchestration", () => {
     const result = await worker.send({
       type: "c2c.connect.page",
       generation: 1,
+      canonicalRoute: ROUTE,
       safety: { composer: "empty", generation: "idle", safe: true },
     }, sender);
     expect(result).toMatchObject({ ok: false, reason: "cold_pair_required" });
@@ -964,9 +976,9 @@ describe("G4c one-click connect orchestration", () => {
     });
     const sender = { tab: { id: 7 }, documentId: "document-g4-rebind", frameId: 0, url: ROUTE };
     const safety = { composer: "empty", generation: "idle", safe: true };
-    await worker.send({ type: "c2c.connect.page", generation: 1, safety }, sender);
-    await worker.send({ type: "c2c.heartbeat", generation: 1, safety }, sender);
-    await worker.send({ type: "c2c.heartbeat", generation: 1, safety }, sender);
+    await worker.send({ type: "c2c.connect.page", generation: 1, safety, canonicalRoute: ROUTE }, sender);
+    await worker.send({ type: "c2c.heartbeat", generation: 1, safety, canonicalRoute: ROUTE }, sender);
+    await worker.send({ type: "c2c.heartbeat", generation: 1, safety, canonicalRoute: ROUTE }, sender);
     expect(urls.filter(url => url.includes("/rebind/complete"))).toHaveLength(1);
     expect(worker.local.values.get(CONNECT_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN" });
     expect(worker.local.values.get(TRANSPORT_KEY)).toMatchObject({ credential: "old-companion-credential" });
@@ -1001,9 +1013,9 @@ describe("G4c one-click connect orchestration", () => {
     });
     const sender = { tab: { id: 7 }, documentId: "document-g4-rebind", frameId: 0, url: ROUTE };
     const safety = { composer: "empty", generation: "idle", safe: true };
-    await worker.send({ type: "c2c.connect.page", generation: 1, safety }, sender);
-    await worker.send({ type: "c2c.heartbeat", generation: 1, safety }, sender);
-    await worker.send({ type: "c2c.heartbeat", generation: 1, safety }, sender);
+    await worker.send({ type: "c2c.connect.page", generation: 1, safety, canonicalRoute: ROUTE }, sender);
+    await worker.send({ type: "c2c.heartbeat", generation: 1, safety, canonicalRoute: ROUTE }, sender);
+    await worker.send({ type: "c2c.heartbeat", generation: 1, safety, canonicalRoute: ROUTE }, sender);
     expect(urls.filter(url => url.includes("/rebind/complete"))).toHaveLength(1);
     expect(worker.local.values.get(CONNECT_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN" });
     expect(worker.local.values.get(TRANSPORT_KEY)).toMatchObject({ credential: "old-companion-credential" });
@@ -1047,7 +1059,7 @@ describe("G4c one-click connect orchestration", () => {
       });
       const sender = { tab: { id: 7 }, documentId: "document-g4-rebind", frameId: 0, url: ROUTE };
       const safety = { composer: "empty", generation: "idle", safe: true };
-      await worker.send({ type: "c2c.heartbeat", generation: 1, safety }, sender);
+      await worker.send({ type: "c2c.heartbeat", generation: 1, safety, canonicalRoute: ROUTE }, sender);
       expect(worker.fetchMock).not.toHaveBeenCalled();
       expect(worker.tabsSendMessage).not.toHaveBeenCalled();
       expect(worker.local.values.get(CONNECT_KEY)).toMatchObject({ state });
@@ -1097,6 +1109,7 @@ describe("G4c one-click connect orchestration", () => {
     await worker.send({
       type: "c2c.heartbeat",
       generation: 1,
+      canonicalRoute: ROUTE,
       safety: { composer: "empty", generation: "idle", safe: true },
     }, sender);
 
@@ -1215,5 +1228,155 @@ describe("G4 Browser rebind init response identity gate", () => {
       async json() { return responseBody(); },
     });
     expect(await rebind).toMatchObject({ ok: true });
+  });
+});
+
+describe("G4 R3o trusted route authority integration (live-like SPA topology)", () => {
+  function jsonResponse(status: number, body: Record<string, unknown>) {
+    return {
+      ok: status >= 200 && status < 300,
+      status,
+      async json() { return body; },
+    };
+  }
+
+  it("binds using the browser tab.url authority even when MessageSender.url is stale", async () => {
+    // Live-like SPA topology: the tab navigated OLD_ROUTE → ROUTE but MV3 still
+    // reports the stale sender.url. R3o binds the authority route from tab.url
+    // (witness must match) instead of trusting sender.url.
+    const worker = await loadWorker(responseBody());
+    const sender = { tab: { id: 7, url: ROUTE }, documentId: "document-g4-new-doc", frameId: 0, url: OLD_ROUTE };
+    const result = await worker.send(
+      { type: "c2c.bind", generation: 2, canonicalRoute: ROUTE },
+      sender,
+    ) as { ok: boolean; isOwner?: boolean; canonicalRoute?: string | null };
+
+    expect(result).toMatchObject({ ok: true, isOwner: true, canonicalRoute: ROUTE });
+    expect(worker.session.values.get(OWNER_KEY)).toMatchObject({
+      tabId: 7,
+      documentId: "document-g4-new-doc",
+      canonicalRoute: ROUTE,
+    });
+    expect(worker.local.values.get(LOCAL_KEY)).toMatchObject({ targetRoute: ROUTE, paired: true });
+  });
+
+  it("connect identity stage resolves the current tab route and starts the rebind flow", async () => {
+    // Same live-like topology: transport is still paired on OLD_ROUTE while the
+    // tab is on ROUTE and MessageSender.url is stale. R3o resolves the connect
+    // identity from tab.url + witness and proceeds with rebind init (previously
+    // the stale sender.url fed the identity stage and failed the flow).
+    const urls: string[] = [];
+    const worker = await loadWorker(responseBody(), {
+      oldRoute: OLD_ROUTE,
+      fetch: async (url) => {
+        const value = String(url);
+        urls.push(value);
+        if (value.includes("/rebind/init")) return jsonResponse(200, responseBody());
+        throw new Error(`unexpected URL ${value}`);
+      },
+      tabsSendMessage: async (_tabId, message) => message.type === "c2c.route.attest.execute"
+        ? { ok: true, observed: true, mutationAttempted: true, clickAttempted: true }
+        : { ok: true },
+    });
+    const sender = { tab: { id: 7, url: ROUTE }, documentId: "document-g4-rebind", frameId: 0, url: OLD_ROUTE };
+    const result = await worker.send({
+      type: "c2c.connect.page",
+      generation: 1,
+      safety: { composer: "empty", generation: "idle", safe: true },
+      canonicalRoute: ROUTE,
+    }, sender) as { ok: boolean; state?: string; reason?: string };
+
+    expect(result.ok).toBe(true);
+    expect(result.state).toBe("AWAITING_CONFIRMATION");
+    expect([
+      "invalid_route",
+      "route_witness_required",
+      "route_witness_invalid",
+      "route_witness_mismatch",
+    ]).not.toContain(result.reason);
+    expect(worker.session.values.get(OWNER_KEY)).toMatchObject({
+      tabId: 7,
+      documentId: "document-g4-rebind",
+      canonicalRoute: ROUTE,
+    });
+    expect(worker.local.values.get(TRANSPORT_KEY)).toMatchObject({
+      companionId: NEW_COMPANION,
+      bindingId: NEW_BINDING,
+      epoch: OLD_EPOCH + 1,
+      routeCanonical: ROUTE,
+      rebindPending: true,
+    });
+    expect(urls.filter((url) => url.includes("/rebind/init"))).toHaveLength(1);
+  });
+
+  it("drops a same-tab stale old-document heartbeat and preserves the new owner, evidence and proof", async () => {
+    // Dangerous topology (same tab, different documents): the SPA created a new
+    // document that became the owner; the stale old document in the SAME tab then
+    // sends a heartbeat whose sender.url and witness both claim OLD_ROUTE while
+    // the browser tab.url says ROUTE. The stale document is not the owner, so the
+    // observation must be dropped with zero mutation: owner, evidence and the
+    // in-memory owner proof must all survive untouched.
+    const worker = await loadWorker(responseBody());
+    const newDocSender = { tab: { id: 7, url: ROUTE }, documentId: "document-g4-new-doc", frameId: 0, url: ROUTE };
+    const safety = { composer: "empty", generation: "idle", safe: true };
+
+    // Explicitly establish the new document in the SAME tab as the current owner.
+    const bound = await worker.send(
+      { type: "c2c.bind", generation: 2, canonicalRoute: ROUTE },
+      newDocSender,
+    ) as { ok: boolean };
+    expect(bound.ok).toBe(true);
+
+    // Owner-exact heartbeat builds runtime evidence for the new document.
+    await worker.send({ type: "c2c.heartbeat", generation: 2, canonicalRoute: ROUTE, safety }, newDocSender);
+    expect(worker.session.values.get(OWNER_KEY)).toMatchObject({
+      tabId: 7,
+      documentId: "document-g4-new-doc",
+      canonicalRoute: ROUTE,
+    });
+    expect(worker.session.values.get(EVIDENCE_KEY)).toMatchObject({
+      tabId: 7,
+      documentId: "document-g4-new-doc",
+      canonicalRoute: ROUTE,
+    });
+
+    // Mint a live owner proof for the new owner (worker-internal, in-memory).
+    const proof = await worker.send(
+      { type: "c2c.owner-proof.request", href: ROUTE, canonicalRoute: ROUTE, generation: 2 },
+      newDocSender,
+    ) as { ok: boolean };
+    expect(proof.ok).toBe(true);
+
+    const ownerBefore = worker.session.values.get(OWNER_KEY);
+    const evidenceBefore = worker.session.values.get(EVIDENCE_KEY);
+    const registryBefore = worker.session.values.get(REGISTRY_KEY);
+    const stale = await worker.send({
+      type: "c2c.heartbeat",
+      generation: 1,
+      canonicalRoute: OLD_ROUTE,
+      safety,
+    }, { tab: { id: 7, url: ROUTE }, documentId: "document-g4-stale-old-doc", frameId: 0, url: OLD_ROUTE }) as {
+      ok: boolean;
+      canonicalRoute?: string | null;
+      evidence?: { documentId?: string } | null;
+      ownership?: {
+        hasOwner?: boolean;
+        isOwner?: boolean;
+        owner?: { tabId?: number; documentId?: string; canonicalRoute?: string } | null;
+      };
+    };
+
+    expect(stale.ownership).toMatchObject({ hasOwner: true, isOwner: false });
+    expect(stale.ownership?.owner).toMatchObject({
+      tabId: 7,
+      documentId: "document-g4-new-doc",
+      canonicalRoute: ROUTE,
+    });
+    // A mismatched observation never leaks its witness route as canonical.
+    expect(stale.canonicalRoute).toBeNull();
+    expect(stale.evidence).toMatchObject({ documentId: "document-g4-new-doc" });
+    expect(worker.session.values.get(OWNER_KEY)).toEqual(ownerBefore);
+    expect(worker.session.values.get(EVIDENCE_KEY)).toEqual(evidenceBefore);
+    expect(worker.session.values.get(REGISTRY_KEY)).toEqual(registryBefore);
   });
 });
