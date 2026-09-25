@@ -49,6 +49,8 @@
     autonomyDisable: document.getElementById("autonomy-disable"),
     retireUnknown: document.getElementById("retire-unknown"),
     retireUnknownConfirm: document.getElementById("retire-unknown-confirm"),
+    connectAbandon: document.getElementById("connect-abandon"),
+    connectAbandonConfirm: document.getElementById("connect-abandon-confirm"),
     shadowInspect: document.getElementById("shadow-inspect"),
     shadowEvidence: document.getElementById("shadow-evidence"),
     shadowControls: document.getElementById("shadow-controls"),
@@ -402,6 +404,14 @@
       && els.retireUnknownConfirm?.checked === true;
     if (els.retireUnknown) {
       els.retireUnknown.disabled = !canRetire;
+    }
+    // R3p: enable only for a proven OUTCOME_UNKNOWN connect fence + explicit confirm.
+    // Exact owner + matching route are enforced again inside the service worker.
+    if (els.connectAbandon) {
+      els.connectAbandon.disabled = !(
+        els.connectAbandonConfirm?.checked === true
+        && status?.connectState === "OUTCOME_UNKNOWN"
+      );
     }
     els.clearTransport.disabled = !transport;
 
@@ -981,6 +991,56 @@
           + `eventId=${res?.eventId ?? j.eventId ?? "-"} journal=${j.state ?? "-"} `
           + `zeroWrite=${res?.zeroWrite === true} zeroClick=${res?.zeroClick === true}`,
           res?.ok ? "ok" : "bad",
+        );
+        await refresh();
+      };
+    }
+
+    if (els.connectAbandon && els.connectAbandonConfirm) {
+      els.connectAbandonConfirm.addEventListener("change", () => {
+        // Re-evaluate against the latest status; exact owner + matching route
+        // are enforced inside the service worker via a fresh one-use owner
+        // proof minted from the current owner document (never from this popup).
+        els.connectAbandon.disabled = !(
+          els.connectAbandonConfirm.checked
+          && status?.connectState === "OUTCOME_UNKNOWN"
+        );
+      });
+      els.connectAbandon.onclick = async () => {
+        if (!els.connectAbandonConfirm.checked) return;
+        els.connectAbandon.disabled = true;
+        setText(els.bridgeState, "Abandoning connect unknown fence…", "warn");
+        // R3p review-fix: relay a one-use owner proof through the CURRENT active
+        // tab's content script. The SW validates the proof against the exact
+        // durable owner, so a popup from another Chat can never clear the fence.
+        const tabNow = await activeTab();
+        let proof = null;
+        try {
+          proof = tabNow?.id
+            ? await chrome.tabs.sendMessage(tabNow.id, { type: "c2c.owner-proof.request" })
+            : null;
+        } catch { /* owner document unreachable; SW will fail closed below. */ }
+        let res;
+        try {
+          // Identity (tab/document/route) always from durable SW state; the
+          // popup only relays the proof id minted by the owner document.
+          res = proof?.ok && proof.proof?.id
+            ? await chrome.runtime.sendMessage({
+                type: "c2c.connect.abandon.unknown",
+                ownerProofId: proof.proof.id,
+              })
+            : { ok: false, reason: proof?.reason || "owner_proof_missing" };
+        } catch (e) {
+          res = { ok: false, reason: e?.message || "runtime_error" };
+        }
+        setText(
+          els.bridgeState,
+          `abandon ok=${res?.ok === true} state=${res?.state ?? "-"} `
+          + `reason=${res?.reason ?? (res?.ok ? "fence_cleared" : "unknown")} `
+          + `zeroWrite=${res?.zeroWrite === true} zeroClick=${res?.zeroClick === true} `
+          + `zeroBridgeMutation=${res?.zeroBridgeMutation === true}`
+          + (res?.ok ? " — clear unsent composer text, then Connect again" : ""),
+          res?.ok ? "warn" : "bad",
         );
         await refresh();
       };

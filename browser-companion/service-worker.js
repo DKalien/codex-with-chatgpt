@@ -1526,15 +1526,52 @@ async function dispatchFeedbackBootstrap(identity) {
     return { ok: true, state: "WAITING_TAKEOVER", retryAllowed: false };
   }
 
+  // R3p review-fix: "proven no mutation" must be provable on every axis. A
+  // positive wrote === true already disproves no-mutation, so a missing
+  // mutationAttempted alongside wrote === true can never land here — it falls
+  // through to the OUTCOME_UNKNOWN fail-closed below. Only explicit
+  // mutationAttempted !== true AND wrote !== true (and no click/observe) is
+  // retryable without a dirty composer.
   const provenNoMutation = responseIdentityMatches
     && response.ok === false
     && response.mutationAttempted !== true
+    && response.wrote !== true
     && response.clickAttempted !== true
     && response.observed !== true;
   if (provenNoMutation) {
     connectFlow = previous;
     if (await persistConnectFlow()) {
       return { ok: false, reason: response.reason || "bootstrap_not_dispatched", state: connectFlow.state, retryAllowed: true };
+    }
+  }
+  // R3p (review-tightened): a PROVEN composer write that never reached the
+  // irreversible click boundary is recoverable — never upgrade it to
+  // OUTCOME_UNKNOWN. "Proven" requires positive mutationAttempted === true AND
+  // wrote === true; missing/malformed booleans can never enter this recoverable
+  // branch (they fall through to OUTCOME_UNKNOWN fail-closed). The fence rolls
+  // back to its pre-dispatch state; nothing is auto-resent; the user clears the
+  // dirty composer and Connects again explicitly.
+  const writtenUnsent = responseIdentityMatches
+    && response.ok === false
+    && response.mutationAttempted === true
+    && response.wrote === true
+    && response.clickAttempted !== true
+    && response.observed !== true;
+  if (writtenUnsent) {
+    const reason = response.reason === "bootstrap_send_not_ready"
+      || response.reason === "bootstrap_written_unsent"
+      ? response.reason
+      : "bootstrap_written_unsent";
+    connectFlow = previous;
+    if (await persistConnectFlow()) {
+      return {
+        ok: false,
+        reason,
+        responseReason: response.reason ?? null,
+        state: connectFlow.state,
+        retryAllowed: true,
+        composerDirty: true,
+      };
     }
   }
   connectFlow = finishConnectFlow(connectFlow, identity, "OUTCOME_UNKNOWN");
@@ -2296,6 +2333,18 @@ async function handleMessage(message, sender, { transportMutationHeld = false } 
   }
   if (message.type === "c2c.transport.clear") {
     return runTransportMutation(() => handleClearTransport());
+  }
+  if (message.type === "c2c.connect.abandon.unknown") {
+    // Manual popup-only advanced recovery. Content scripts must never trigger it.
+    if (!isExtensionInternalSender(sender)) {
+      return { ok: false, reason: "popup_sender_required" };
+    }
+    // R3p review-fix: Abandon mutates durable connectFlow, so it must share the
+    // same transport mutation gate as pair/rebind/attest/connect.page/transport.clear
+    // — it can never interleave with an in-flight Connect/Rebind/Attest transition.
+    return runTransportMutation(() =>
+      handleAbandonConnectUnknown(sender, message)
+    );
   }
   if (message.type === "c2c.connect.page") {
     return runTransportMutation(() => handleConnectPage(sender, message));
@@ -3729,6 +3778,69 @@ async function recoverProductionSendSide(inFlight) {
     productionSendInFlight = false;
     void refreshActionIndicator();
   }
+}
+
+/**
+ * R3p manual advanced recovery for a proven OUTCOME_UNKNOWN connect fence.
+ * Popup-only, explicit-confirm in the popup UI. Clears ONLY the connect
+ * bootstrap fence: zero composer write, zero click, zero bridge mutation —
+ * feedback journal, transport, binding and route-attest fence are untouched.
+ * It never marks connect successful and never retries anything.
+ * Identity (tab/document/route) always comes from durable SW state; the popup
+ * never supplies it. R3p review-fix: an internal popup sender alone proves
+ * nothing about WHICH page the user is on, so the popup must first relay a
+ * fresh one-use c2c.owner-proof.request through the CURRENT owner document
+ * (same mint/consume pattern as pair/rebind) and pass the resulting
+ * ownerProofId. The proof is consumed against the exact durable owner, so a
+ * popup opened from any other Chat can never clear this fence.
+ */
+async function handleAbandonConnectUnknown(sender, message) {
+  if (!isExtensionInternalSender(sender)) {
+    return { ok: false, reason: "popup_sender_required" };
+  }
+  await initPromise;
+  const abandoned = connectFlow;
+  if (abandoned.state !== "OUTCOME_UNKNOWN") {
+    return { ok: false, reason: "connect_not_outcome_unknown", state: abandoned.state };
+  }
+  const owner = ownerState.owner;
+  if (!owner || !isOwner(ownerState, owner.tabId, owner.documentId)) {
+    return { ok: false, reason: "not_exact_owner", state: abandoned.state };
+  }
+  if (!areChatgptConversationRoutesEquivalent(abandoned.routeCanonical, owner.canonicalRoute)) {
+    return { ok: false, reason: "connect_identity_mismatch", state: abandoned.state };
+  }
+  // One-use proof must have been minted from the real MessageSender of this
+  // exact owner document (fresh + unused + matching tab/document/route).
+  const proofCheck = consumeOwnerProof(ownerProof, {
+    tabId: owner.tabId,
+    documentId: owner.documentId,
+    routeCanonical: owner.canonicalRoute,
+  });
+  if (!proofCheck.ok) {
+    return { ok: false, reason: proofCheck.reason, state: abandoned.state };
+  }
+  if (message?.ownerProofId !== ownerProof.id) {
+    return { ok: false, reason: "owner_proof_mismatch", state: abandoned.state };
+  }
+  ownerProof = markProofUsed(ownerProof);
+  connectFlow = emptyConnectFlow();
+  if (!await persistConnectFlow()) {
+    // Never leave memory/durable disagreeing: restore the unknown fence.
+    connectFlow = abandoned;
+    await persistConnectFlow().catch(() => false);
+    return { ok: false, reason: "connect_fence_persist_failed", state: abandoned.state };
+  }
+  return {
+    ok: true,
+    abandoned: true,
+    // Explicitly NOT a connect success: the fence was cleared for manual recovery.
+    connectOutcome: "abandoned",
+    state: "NONE",
+    zeroWrite: true,
+    zeroClick: true,
+    zeroBridgeMutation: true,
+  };
 }
 
 /**

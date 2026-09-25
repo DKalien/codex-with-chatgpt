@@ -58,7 +58,22 @@ async function runWithDom(options: Record<string, any> = {}) {
   const click = await import("../browser-companion/send-click-adapter.js");
   const writeProbe = await import("../browser-companion/write-probe.js");
   const editor = { editor: true };
-  const button = { getAttribute: (key: string) => key === "data-testid" ? "send-button" : null };
+  // R3p: the ready gate checks the shared Send identity on the mocked action's
+  // button, so the fake must carry a real shape: legacy testid, current
+  // structural submit+tokens, or a partial shape the gate must refuse.
+  const shape = options.sendButtonShape === "current" || options.sendButtonShape === "current-partial"
+    ? options.sendButtonShape
+    : "legacy";
+  const button = shape === "legacy"
+    ? { getAttribute: (key: string) => key === "data-testid" ? "send-button" : null }
+    : {
+        className: shape === "current"
+          ? "size-token-button-composer bg-composer-primary"
+          : "size-token-button-composer",
+        getAttribute: (key: string) => (key === "type" ? "submit" : null),
+        hasAttribute: () => false,
+        disabled: false,
+      };
   let writtenText = "";
   let clicks = 0;
   let snapshots = 0;
@@ -159,6 +174,44 @@ describe("fixed feedback bootstrap DOM send", () => {
     expect(hasFeedbackBootstrapToolMissingReply({ querySelectorAll: () => [user, missing] } as any)).toBe(true);
     expect(hasFeedbackBootstrapToolMissingReply({ querySelectorAll: () => [missing, user] } as any)).toBe(false);
     expect(hasFeedbackBootstrapToolMissingReply({ querySelectorAll: () => [user, missing, user, normalAssistant] } as any)).toBe(false);
+  });
+});
+
+describe("R3p current structural send lifecycle", () => {
+  it("accepts the current structural submit Send and observes the takeover turn", async () => {
+    // Mocked classifier returns a structural send action (no data-testid); the
+    // real ready gate must accept it via the shared matcher, click once, and
+    // observe the bootstrap turn.
+    const { result, clicks, captured } = await runWithDom({ sendButtonShape: "current" });
+    expect(result).toMatchObject({
+      ok: true,
+      observed: true,
+      clicked: true,
+      clickAttempted: true,
+      mutationAttempted: true,
+      wrote: true,
+      verified: true,
+    });
+    expect(clicks).toBe(1);
+    expect(captured).toEqual([FEEDBACK_BOOTSTRAP_MESSAGE]);
+  });
+
+  it("partial structural shape never passes the ready gate; written but unsent stays recoverable", async () => {
+    // A submit button carrying only one composer token must never satisfy the
+    // shared identity: the runner times out BEFORE the irreversible click
+    // boundary (clickAttempted stays false) and reports the recoverable
+    // written-unsent reason instead of any unknown outcome.
+    const { result, clicks } = await runWithDom({ sendButtonShape: "current-partial" });
+    expect(result).toMatchObject({
+      ok: false,
+      reason: "bootstrap_send_not_ready",
+      mutationAttempted: true,
+      wrote: true,
+      verified: true,
+      clickAttempted: false,
+      clicked: false,
+    });
+    expect(clicks).toBe(0);
   });
 });
 

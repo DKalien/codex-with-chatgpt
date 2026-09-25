@@ -333,6 +333,109 @@ function findCurrentVoiceIdleControl(editorForm) {
 }
 
 /**
+ * Current (observed 2026-09-25) structural Send identity (no data-testid):
+ * active-composer form button[type="submit"] carrying BOTH composer class
+ * tokens below and no stop identity. The blank-composer current-voice control
+ * shares the class tokens but is excluded explicitly (idle rule stays
+ * authoritative; it must never become a click target).
+ */
+const CURRENT_SUBMIT_SEND_CLASS_TOKENS = [
+  "size-token-button-composer",
+  "bg-composer-primary",
+];
+/** Bounded candidate cap for the current submit-Send scan; overflow fails closed. */
+const CURRENT_SUBMIT_SEND_MAX_CANDIDATES = 8;
+
+/**
+ * Read-only match of the current structural Send rule on one button.
+ * Must stay consistent with findCurrentSubmitSend / resolveChatGptAction /
+ * matchesSendTargetIdentity. Stop identity always wins (fail closed to stop).
+ */
+function buttonMatchesCurrentSubmitSend(btn, dataTestId, ariaLabelRaw) {
+  if (!btn) return false;
+  // Legacy exact Send identity is its own branch; not this rule.
+  if (dataTestId === "send-button") return false;
+  // Stop identity always outranks structural Send (fail closed).
+  if (buttonMatchesKnownStop(btn, dataTestId, ariaLabelRaw)) return false;
+  // The blank-composer voice control is never a Send target, even if a future
+  // DOM shipped it as type=submit with identical class tokens.
+  if (ariaLabelRaw === CURRENT_VOICE_ARIA_LABEL) return false;
+  let type = null;
+  try {
+    type = btn.getAttribute?.("type") ?? null;
+  } catch {
+    return false;
+  }
+  if (type !== "submit") return false;
+  if (isDisabled(btn)) return false;
+  for (const token of CURRENT_SUBMIT_SEND_CLASS_TOKENS) {
+    try {
+      if (!hasClass(btn, token)) return false;
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Find the current structural Send inside the active editor form.
+ * Bounded full-form scan: exactly one complete candidate wins; zero or
+ * multiple complete candidates fail closed (null → unknown upstream).
+ */
+function findCurrentSubmitSend(editorForm) {
+  if (!editorForm || typeof editorForm.querySelectorAll !== "function") return null;
+  let nodes = null;
+  try {
+    nodes = editorForm.querySelectorAll("button");
+  } catch {
+    return null;
+  }
+  if (!nodes || typeof nodes.length !== "number" || nodes.length === 0) return null;
+  if (nodes.length > CURRENT_SUBMIT_SEND_MAX_CANDIDATES) return null;
+  const limit = Math.min(nodes.length, CURRENT_SUBMIT_SEND_MAX_CANDIDATES);
+  let match = null;
+  let complete = 0;
+  for (let i = 0; i < limit; i++) {
+    const btn = nodes[i];
+    if (!btn) continue;
+    let testid = null;
+    let ariaLabelRaw = null;
+    try {
+      testid = btn.getAttribute?.("data-testid") ?? null;
+      ariaLabelRaw = btn.getAttribute?.("aria-label") ?? null;
+    } catch {
+      continue;
+    }
+    if (buttonMatchesCurrentSubmitSend(btn, testid, ariaLabelRaw)) {
+      complete += 1;
+      if (complete > 1) return null;
+      match = btn;
+    }
+  }
+  return complete === 1 ? match : null;
+}
+
+/**
+ * Single Send-target identity rule shared by classification and the click
+ * adapter's second line of defense (R3p): legacy data-testid=send-button OR
+ * the current structural submit identity. One matcher, no dual-identity drift.
+ */
+export function matchesSendTargetIdentity(btn) {
+  if (!btn) return false;
+  let testid = null;
+  let ariaLabelRaw = null;
+  try {
+    testid = btn.getAttribute?.("data-testid") ?? null;
+    ariaLabelRaw = btn.getAttribute?.("aria-label") ?? null;
+  } catch {
+    return false;
+  }
+  if (testid === "send-button") return true;
+  return buttonMatchesCurrentSubmitSend(btn, testid, ariaLabelRaw);
+}
+
+/**
  * Safe attribute summary of one form button. No text/HTML/value/nodes.
  */
 function summarizeInventoryButton(btn, index) {
@@ -375,7 +478,8 @@ function summarizeInventoryButton(btn, index) {
     className,
     disabled,
     ariaDisabled: ariaDisabledRaw === "true" ? true : ariaDisabledRaw === "false" ? false : null,
-    matchesKnownSend: dataTestIdRaw === "send-button",
+    matchesKnownSend: dataTestIdRaw === "send-button"
+      || buttonMatchesCurrentSubmitSend(btn, dataTestIdRaw, ariaLabelRaw),
     matchesKnownActionSlot: hasClass(btn, "composer-submit-button-color"),
     matchesKnownVoiceIdle: buttonMatchesCurrentVoiceIdle(btn, dataTestIdRaw, ariaLabelRaw),
     matchesKnownStop: buttonMatchesKnownStop(btn, dataTestIdRaw, ariaLabelRaw),
@@ -644,11 +748,15 @@ export function inspectChatGptActionEvidence(doc, editor) {
  * - current blank-composer voice control (observed 2026-09-25: exact aria-label
  *   "开始语音" + size-token-button-composer + bg-composer-primary) is also idle,
  *   never Send; partial structural match stays unknown (fail-closed).
- * - actual Send is form-scoped button[data-testid="send-button"] (localized aria).
+ * - actual Send is form-scoped button[data-testid="send-button"] (localized aria)
+ *   or (R3p, observed 2026-09-25) the current structural submit identity:
+ *   active-form button[type="submit"] + full composer token pair + no stop
+ *   identity; bounded scan, multiple complete candidates fail closed.
  *
  * kind: "stop" | "send" | "idle" | "unknown"
  * - idle = positive generation idle evidence, MUST NOT be a click target
- * - send = only structural data-testid=send-button (click-capable)
+ * - send = structural Send identity (legacy data-testid or current submit);
+ *   classification and the click adapter share matchesSendTargetIdentity
  * @returns {{ button: object|null, kind: "stop"|"send"|"idle"|"unknown", enabled: boolean, evidence: string|null }}
  */
 export function resolveChatGptAction(doc, editor) {
@@ -712,6 +820,18 @@ export function resolveChatGptAction(doc, editor) {
       kind: "send",
       enabled: false,
       evidence: "form_send_button_disabled",
+    };
+  }
+  // Current structural Send (R3p, observed 2026-09-25): type=submit + full
+  // composer token pair inside the active form, no data-testid. Bounded scan;
+  // zero or multiple complete candidates fail closed (null → unknown upstream).
+  const currentSubmitSend = editorForm ? findCurrentSubmitSend(editorForm) : null;
+  if (currentSubmitSend) {
+    return {
+      button: currentSubmitSend,
+      kind: "send",
+      enabled: true,
+      evidence: "current_submit_send",
     };
   }
   // Idle evidence (e.g. voice control): generation idle, never a Send click target.

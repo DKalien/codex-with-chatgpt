@@ -147,6 +147,15 @@
       <span>I understand this permanently abandons this unknown event and will never retry it</span>
     </label>
     <button id="retire-unknown" class="secondary" disabled style="background:#c5221f;">Retire unknown — NEVER RETRY</button>
+    <hr />
+    <div class="note" style="color:#f28b82;font-weight:600;">
+      ABANDON CONNECT UNKNOWN — 仅清除 connect bootstrap fence（OUTCOME_UNKNOWN）。零写入、零点击、零 bridge 变更；不代表连接成功，也不会自动重试。请先手工清空未发送的 bootstrap 文本，再重新 Connect。
+    </div>
+    <label class="note" style="display:flex;gap:8px;align-items:flex-start;color:#f28b82;">
+      <input type="checkbox" id="connect-abandon-confirm" style="margin-top:2px;" />
+      <span>I understand this clears ONLY the connect bootstrap fence (connect is NOT marked successful); I will clear any unsent composer text myself, then Connect again</span>
+    </label>
+    <button id="connect-abandon" class="secondary" disabled style="background:#c5221f;">Abandon connect unknown — clears fence only</button>
     <button id="shadow-inspect" class="secondary">Inspect Send capability (read-only)</button>
     <div class="row">
       <div class="label">Shadow evidence — READ ONLY — no composer write / no Send</div>

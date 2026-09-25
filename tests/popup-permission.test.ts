@@ -34,6 +34,7 @@ async function loadPopup(
     productionSendConfirmed?: boolean;
     savedBridgeOrigin?: string;
     status?: Record<string, unknown>;
+    ownerProofResult?: unknown;
   } = {},
 ) {
   const html = fs.readFileSync(path.join(sourcePopup, "popup.html"), "utf8");
@@ -73,7 +74,7 @@ async function loadPopup(
         if (message.type === "c2c.owner-proof.request") {
           calls.order.push("owner-proof");
           calls.ownerProof += 1;
-          return { ok: true, proof: { id: "proof-1" } };
+          return options.ownerProofResult ?? { ok: true, proof: { id: "proof-1" } };
         }
         if (message.type === "c2c.connect.request") {
           calls.order.push("connect");
@@ -196,6 +197,55 @@ describe("popup Bridge permission and Pair separation", () => {
     await elements.get("bind")!.onclick!();
     expect(calls.page).toEqual([{ type: "c2c.bind.request" }]);
     expect(JSON.stringify(calls.page)).not.toMatch(/route|document|tab|generation|credential|principal|secret/);
+  });
+
+  it("abandon connect unknown relays a fresh owner proof id minted from the active owner document", async () => {
+    // R3p review-fix: the popup itself proves nothing about which page the user
+    // is on, so Abandon must first fetch a one-use owner proof through the
+    // current active tab's content script and relay only the proof id; the SW
+    // re-validates it against the exact durable owner.
+    const { calls, elements, fireChange } = await loadPopup(true, true, {
+      status: { connectState: "OUTCOME_UNKNOWN" },
+    });
+    elements.get("connect-abandon-confirm")!.checked = true;
+    fireChange("connect-abandon-confirm");
+    expect(elements.get("connect-abandon")!.disabled).toBe(false);
+
+    await elements.get("connect-abandon")!.onclick!();
+
+    // Proof first (owner document), then the fence-clearing message with the
+    // minted proof id. The popup never supplies tab/document/route identity.
+    expect(calls.ownerProof).toBe(1);
+    const abandonMessage = calls.runtime.find(
+      (message) => (message as { type?: string })?.type === "c2c.connect.abandon.unknown",
+    ) as Record<string, unknown> | undefined;
+    expect(abandonMessage).toMatchObject({
+      type: "c2c.connect.abandon.unknown",
+      ownerProofId: "proof-1",
+    });
+    expect(JSON.stringify(calls.runtime)).not.toMatch(/"tabId"|"documentId"|"routeCanonical"/);
+    expect(elements.get("bridge-state")!.textContent).toContain("abandon ok=true");
+  });
+
+  it("abandon without an owner proof fails closed without sending the abandon message", async () => {
+    // R3p review-fix: when the owner document cannot mint a proof, the popup
+    // must fail closed locally and never send the fence-clearing message.
+    const { calls, elements, fireChange } = await loadPopup(true, true, {
+      status: { connectState: "OUTCOME_UNKNOWN" },
+      ownerProofResult: { ok: false, reason: "owner_proof_missing" },
+    });
+    elements.get("connect-abandon-confirm")!.checked = true;
+    fireChange("connect-abandon-confirm");
+
+    await elements.get("connect-abandon")!.onclick!();
+
+    expect(calls.ownerProof).toBe(1);
+    expect(
+      calls.runtime.find(
+        (message) => (message as { type?: string })?.type === "c2c.connect.abandon.unknown",
+      ),
+    ).toBeUndefined();
+    expect(elements.get("bridge-state")!.textContent).toContain("owner_proof_missing");
   });
 
   it("reports bootstrap takeover waiting without exposing a body field", async () => {

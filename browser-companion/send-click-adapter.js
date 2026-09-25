@@ -7,6 +7,7 @@
 import {
   resolveChatGptComposer,
   resolveChatGptAction,
+  matchesSendTargetIdentity,
   normalizeCanonicalDomText,
 } from "./dom-adapter.js";
 import { readCanonicalComposerText } from "./composer-write-adapter.js";
@@ -40,7 +41,10 @@ export function dispatchNativeSend(doc, message, opts = {}) {
   if (!action.button || typeof action.button.click !== "function") {
     return fail("send_button_missing");
   }
-  if (action.button.getAttribute?.("data-testid") !== "send-button") {
+  // R3p: second line of defense uses the SAME Send-target identity rule as
+  // classification (legacy data-testid OR current structural submit identity),
+  // so the two layers can never drift into different identities.
+  if (!matchesSendTargetIdentity(action.button)) {
     return fail("send_target_invalid");
   }
 

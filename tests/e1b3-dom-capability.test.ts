@@ -4,6 +4,8 @@ import {
   resolveChatGptAction,
   observeChatGptSafety,
   normalizeCanonicalDomText,
+  matchesSendTargetIdentity,
+  inspectActiveComposerControls,
 } from "../browser-companion/dom-adapter.js";
 import {
   inspectComposerWriteCapability,
@@ -39,7 +41,7 @@ type ClickSpy = { clicks: number; click: () => void };
  * - unknown: no action
  */
 function makeEdgeDom(opts: {
-  mode?: "idle" | "send" | "stop" | "unknown" | "current-voice";
+  mode?: "idle" | "send" | "stop" | "unknown" | "current-voice" | "current-send";
   text?: string;
   editorKind?: "contenteditable" | "textarea";
   /** R3 2026-09-25 current-voice fixture controls (only for mode "current-voice"). */
@@ -50,6 +52,17 @@ function makeEdgeDom(opts: {
   currentVoicePlusStop?: boolean;
   /** Number of exact-aria candidates (default 1; > cap exercises fail-closed overflow). */
   currentVoiceCandidates?: number;
+  /** R3p 2026-09-25 current structural submit-Send fixture controls (mode "current-send"). */
+  currentSendClass?: string;
+  currentSendType?: string | null;
+  currentSendAria?: string | null;
+  currentSendTestId?: string | null;
+  currentSendDisabled?: boolean;
+  /** Number of complete structural candidates (default 1; >1 or > cap fails closed). */
+  currentSendCandidates?: number;
+  currentSendPlusStop?: boolean;
+  /** Current voice control may ship as type=submit with identical tokens (future DOM). */
+  currentVoiceType?: string;
 } = {}) {
   const mode = opts.mode ?? "idle";
   const editorKind = opts.editorKind ?? "contenteditable";
@@ -86,11 +99,31 @@ function makeEdgeDom(opts: {
   const currentVoiceBtn = {
     className:
       opts.currentVoiceClass ?? "size-token-button-composer bg-composer-primary",
-    getAttribute: (n: string) =>
-      n === "aria-label" ? (opts.currentVoiceAria ?? "开始语音") : null,
+    getAttribute: (n: string) => {
+      if (n === "aria-label") return opts.currentVoiceAria ?? "开始语音";
+      if (n === "type") return opts.currentVoiceType ?? null;
+      return null;
+    },
     hasAttribute: () => false,
     disabled: opts.currentVoiceDisabled ?? false,
     click: voiceClicks.click,
+  };
+  // R3p 2026-09-25 observed real Send: button[type="submit"] carrying BOTH
+  // composer class tokens, NO data-testid, enabled, inside the active form.
+  const currentSendBtn = {
+    className:
+      opts.currentSendClass ?? "size-token-button-composer bg-composer-primary",
+    getAttribute: (n: string) => {
+      if (n === "data-testid") return opts.currentSendTestId ?? null;
+      if (n === "aria-label") return opts.currentSendAria ?? null;
+      if (n === "type") return opts.currentSendType ?? "submit";
+      return null;
+    },
+    hasAttribute: (n: string) =>
+      opts.currentSendDisabled === true && n === "disabled",
+    disabled: opts.currentSendDisabled ?? false,
+    type: opts.currentSendType ?? "submit",
+    click: sendClicks.click,
   };
 
   const form = {
@@ -122,6 +155,15 @@ function makeEdgeDom(opts: {
       ) {
         const n = opts.currentVoiceCandidates ?? 1;
         return n <= 1 ? [currentVoiceBtn] : Array.from({ length: n }, () => ({ ...currentVoiceBtn }));
+      }
+      // R3p: bounded full-form scan candidates for the structural submit Send
+      // (and the future-voice-as-submit case on the current-voice fixture).
+      if (mode === "current-voice" && selector === "button") {
+        return [currentVoiceBtn];
+      }
+      if (mode === "current-send" && selector === "button") {
+        const n = opts.currentSendCandidates ?? 1;
+        return Array.from({ length: n }, () => ({ ...currentSendBtn, click: sendClicks.click }));
       }
       return [];
     },
@@ -180,7 +222,9 @@ function makeEdgeDom(opts: {
         if (selector === "body") return {};
         if (selector === "main") return {};
         if (
-          (mode === "stop" || (mode === "current-voice" && opts.currentVoicePlusStop === true))
+          (mode === "stop"
+            || (mode === "current-voice" && opts.currentVoicePlusStop === true)
+            || (mode === "current-send" && opts.currentSendPlusStop === true))
           && (selector.includes("stop-button") || selector.includes("Stop"))
         ) {
           return { getAttribute: () => "Stop generating", hasAttribute: () => false, disabled: false };
@@ -249,7 +293,9 @@ function makeEdgeDom(opts: {
       if (selector === "body") return {};
       if (selector === "main") return {};
       if (
-        (mode === "stop" || (mode === "current-voice" && opts.currentVoicePlusStop === true))
+        (mode === "stop"
+          || (mode === "current-voice" && opts.currentVoicePlusStop === true)
+          || (mode === "current-send" && opts.currentSendPlusStop === true))
         && (selector.includes("stop-button") || selector.includes("Stop"))
       ) {
         return { getAttribute: () => "Stop generating", hasAttribute: () => false, disabled: false };
@@ -855,6 +901,225 @@ describe("R3 current-voice scan cap overflow (fail-closed)", () => {
 
     const r = dispatchNativeSend(doc, MESSAGE, { routeValid: true });
     expect(r.ok).toBe(false);
+    expect(voiceClicks.clicks).toBe(0);
+  });
+});
+
+describe("R3p current structural Send (observed 2026-09-25)", () => {
+  it("1. type=submit + both composer tokens, no data-testid => send/current_submit_send, exactly one click", () => {
+    const { doc, sendClicks } = makeEdgeDom({ mode: "current-send", text: MESSAGE });
+    const { editor } = resolveChatGptComposer(doc);
+    const action = resolveChatGptAction(doc, editor);
+    expect(action.kind).toBe("send");
+    expect(action.enabled).toBe(true);
+    expect(action.evidence).toBe("current_submit_send");
+    expect(action.button?.getAttribute?.("data-testid")).toBeNull();
+
+    // The click adapter accepts the SAME identity (shared matcher, no dual rules).
+    const r = dispatchNativeSend(doc, MESSAGE, { routeValid: true });
+    expect(r.ok).toBe(true);
+    expect(r.clicked).toBe(1);
+    expect(sendClicks.clicks).toBe(1);
+  });
+
+  it.each([
+    ["missing size-token-button-composer", "bg-composer-primary"],
+    ["missing bg-composer-primary", "size-token-button-composer"],
+    ["plain submit without composer tokens", ""],
+  ])("2. %s => unknown (fail-closed), zero clicks", (_label, cls) => {
+    const { doc, sendClicks } = makeEdgeDom({
+      mode: "current-send",
+      text: MESSAGE,
+      currentSendClass: cls,
+    });
+    const { editor } = resolveChatGptComposer(doc);
+    const action = resolveChatGptAction(doc, editor);
+    expect(action.kind).toBe("unknown");
+    expect(action.button).toBeNull();
+
+    const r = dispatchNativeSend(doc, MESSAGE, { routeValid: true });
+    expect(r.ok).toBe(false);
+    expect(sendClicks.clicks).toBe(0);
+  });
+
+  it("3. localized aria-only Send (no type, no tokens) stays unknown", () => {
+    const { doc, sendClicks } = makeEdgeDom({
+      mode: "current-send",
+      text: MESSAGE,
+      currentSendAria: "发送",
+      currentSendType: null,
+      currentSendClass: "",
+    });
+    const { editor } = resolveChatGptComposer(doc);
+    const action = resolveChatGptAction(doc, editor);
+    expect(action.kind).toBe("unknown");
+    expect(action.button).toBeNull();
+
+    const r = dispatchNativeSend(doc, MESSAGE, { routeValid: true });
+    expect(r.ok).toBe(false);
+    expect(sendClicks.clicks).toBe(0);
+  });
+
+  it("4. two complete structural candidates fail closed with zero clicks", () => {
+    const { doc, sendClicks } = makeEdgeDom({
+      mode: "current-send",
+      text: MESSAGE,
+      currentSendCandidates: 2,
+    });
+    const { editor } = resolveChatGptComposer(doc);
+    const action = resolveChatGptAction(doc, editor);
+    expect(action.kind).toBe("unknown");
+    expect(action.button).toBeNull();
+
+    const r = dispatchNativeSend(doc, MESSAGE, { routeValid: true });
+    expect(r.ok).toBe(false);
+    expect(sendClicks.clicks).toBe(0);
+  });
+
+  it("5. bounded scan overflow (9 > CURRENT_SUBMIT_SEND_MAX_CANDIDATES) fails closed", () => {
+    const { doc, sendClicks } = makeEdgeDom({
+      mode: "current-send",
+      text: MESSAGE,
+      currentSendCandidates: 9,
+    });
+    const { editor } = resolveChatGptComposer(doc);
+    const action = resolveChatGptAction(doc, editor);
+    expect(action.kind).toBe("unknown");
+    expect(action.button).toBeNull();
+
+    const r = dispatchNativeSend(doc, MESSAGE, { routeValid: true });
+    expect(r.ok).toBe(false);
+    expect(sendClicks.clicks).toBe(0);
+  });
+
+  it("6. document Stop outranks structural Send; zero clicks, generation_active", () => {
+    const { doc, sendClicks } = makeEdgeDom({
+      mode: "current-send",
+      text: MESSAGE,
+      currentSendPlusStop: true,
+    });
+    const { editor } = resolveChatGptComposer(doc);
+    const action = resolveChatGptAction(doc, editor);
+    expect(action.kind).toBe("stop");
+    expect(action.evidence).toBe("legacy_stop");
+
+    const safety = observeChatGptSafety(doc, { routeValid: true });
+    expect(safety.generation).toBe("generating");
+    expect(safety.safe).toBe(false);
+
+    const r = dispatchNativeSend(doc, MESSAGE, { routeValid: true });
+    expect(r.reason).toBe("generation_active");
+    expect(sendClicks.clicks).toBe(0);
+  });
+
+  it("7. blank-composer voice with type=submit + identical tokens never becomes Send", () => {
+    // Future-DOM guard: the exact-aria voice rule stays authoritative even if a
+    // voice control shipped as a structural submit with the same class tokens.
+    const { doc, voiceClicks, sendClicks } = makeEdgeDom({
+      mode: "current-voice",
+      text: "",
+      currentVoiceType: "submit",
+    });
+    const { editor } = resolveChatGptComposer(doc);
+    const action = resolveChatGptAction(doc, editor);
+    expect(action.kind).toBe("idle");
+    expect(action.evidence).toBe("current_voice_idle");
+    expect(action.button).toBeNull();
+
+    const r = dispatchNativeSend(doc, MESSAGE, { routeValid: true });
+    expect(r.ok).toBe(false);
+    expect((r as { reason?: string }).reason).toBe("send_action_not_ready");
+    expect(voiceClicks.clicks).toBe(0);
+    expect(sendClicks.clicks).toBe(0);
+  });
+
+  it("8. disabled structural submit fails closed to unknown", () => {
+    const { doc, sendClicks } = makeEdgeDom({
+      mode: "current-send",
+      text: MESSAGE,
+      currentSendDisabled: true,
+    });
+    const { editor } = resolveChatGptComposer(doc);
+    const action = resolveChatGptAction(doc, editor);
+    expect(action.kind).toBe("unknown");
+    expect(action.button).toBeNull();
+
+    const r = dispatchNativeSend(doc, MESSAGE, { routeValid: true });
+    expect(r.ok).toBe(false);
+    expect(sendClicks.clicks).toBe(0);
+  });
+
+  it("9. matchesSendTargetIdentity: legacy + current pass; partial shapes refuse", () => {
+    const legacy = {
+      className: "composer-submit-button-color text-submit-btn-text",
+      getAttribute: (n: string) => (n === "data-testid" ? "send-button" : null),
+      hasAttribute: (n: string) => n === "data-testid",
+      disabled: false,
+      type: "submit",
+    };
+    const current = {
+      className: "size-token-button-composer bg-composer-primary",
+      getAttribute: (n: string) => (n === "type" ? "submit" : null),
+      hasAttribute: () => false,
+      disabled: false,
+    };
+    const missingType = { ...current, getAttribute: () => null };
+    const missingToken = { ...current, className: "size-token-button-composer" };
+    const disabledCurrent = { ...current, disabled: true };
+    const ariaDisabledCurrent = {
+      ...current,
+      getAttribute: (n: string) => (n === "type" ? "submit" : n === "aria-disabled" ? "true" : null),
+    };
+    const voiceAsSubmit = {
+      className: "size-token-button-composer bg-composer-primary",
+      getAttribute: (n: string) =>
+        n === "type" ? "submit" : n === "aria-label" ? "开始语音" : null,
+      hasAttribute: () => false,
+      disabled: false,
+    };
+    const stopShaped = {
+      className: "composer-submit-button-color composer-submit-btn",
+      getAttribute: (n: string) =>
+        n === "data-testid" ? "composer-stop-button" : n === "aria-label" ? "Stop generating" : null,
+      hasAttribute: (n: string) => n === "data-testid",
+      disabled: false,
+    };
+    expect(matchesSendTargetIdentity(legacy as never)).toBe(true);
+    expect(matchesSendTargetIdentity(current as never)).toBe(true);
+    expect(matchesSendTargetIdentity(missingType as never)).toBe(false);
+    expect(matchesSendTargetIdentity(missingToken as never)).toBe(false);
+    expect(matchesSendTargetIdentity(disabledCurrent as never)).toBe(false);
+    expect(matchesSendTargetIdentity(ariaDisabledCurrent as never)).toBe(false);
+    expect(matchesSendTargetIdentity(voiceAsSubmit as never)).toBe(false);
+    expect(matchesSendTargetIdentity(stopShaped as never)).toBe(false);
+    expect(matchesSendTargetIdentity(null as never)).toBe(false);
+  });
+
+  it("10. diagnostic inventory matchesKnownSend shares the same identity rule", () => {
+    const { doc } = makeEdgeDom({ mode: "current-send", text: MESSAGE });
+    const { editor } = resolveChatGptComposer(doc);
+    const diag = inspectActiveComposerControls(doc, editor);
+    expect(diag.formPresent).toBe(true);
+    expect(diag.buttons).toHaveLength(1);
+    expect(diag.buttons[0]).toMatchObject({
+      matchesKnownSend: true,
+      matchesKnownStop: false,
+      matchesKnownVoiceIdle: false,
+      type: "submit",
+    });
+  });
+
+  it("11. legacy send-button identity still classifies and clicks (no regression)", () => {
+    const { doc, sendClicks, voiceClicks } = makeEdgeDom({ mode: "send", text: MESSAGE });
+    const { editor } = resolveChatGptComposer(doc);
+    const action = resolveChatGptAction(doc, editor);
+    expect(action.kind).toBe("send");
+    expect(action.evidence).toBe("form_send_button");
+
+    const r = dispatchNativeSend(doc, MESSAGE, { routeValid: true });
+    expect(r.ok).toBe(true);
+    expect(r.clicked).toBe(1);
+    expect(sendClicks.clicks).toBe(1);
     expect(voiceClicks.clicks).toBe(0);
   });
 });

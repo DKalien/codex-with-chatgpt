@@ -3,6 +3,7 @@
 import {
   resolveChatGptComposer,
   resolveChatGptAction,
+  matchesSendTargetIdentity,
   normalizeCanonicalDomText,
 } from "./dom-adapter.js";
 import {
@@ -219,8 +220,10 @@ export async function runFeedbackBootstrapSend(doc, opts = {}) {
     }
     const nextAction = resolveChatGptAction(doc, current);
     if (nextAction.kind === "stop") return { ...base, ok: false, reason: "generation_active", mutationAttempted: true, wrote: true, verified: true };
+    // R3p: Send-ready gate uses the shared identity rule (legacy data-testid
+    // OR current structural submit identity) — same rule as classification.
     if (nextAction.kind === "send" && nextAction.enabled === true
-      && nextAction.button?.getAttribute?.("data-testid") === "send-button") break;
+      && matchesSendTargetIdentity(nextAction.button)) break;
     if (now() >= deadline) return { ...base, ok: false, reason: "bootstrap_send_not_ready", mutationAttempted: true, wrote: true, verified: true };
     await waitMs(pollMs);
   }
