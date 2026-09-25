@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Command } from "commander";
-import { desktopFile, readDesktop, updateDesktop } from "../src/desktop/store.js";
+import { desktopFile, DesktopError, readDesktop, updateDesktop } from "../src/desktop/store.js";
 import {
   getResolvedUnknownCommandIds,
   outcomeResolutionFile,
@@ -204,7 +204,41 @@ describe("Desktop outcome_unknown administrative resolution", () => {
         messageSha256: "b".repeat(64), messageBytes: 1, threadId, deliveryStatus: "outcome_unknown", createdAt: now, updatedAt: now });
       return { state: current, result: undefined };
     });
-    expect(() => unresolvedOutcomeUnknownCommandIds(workspace, before)).toThrow(/发生变化|未知结果/);
+    let failure: unknown;
+    try { unresolvedOutcomeUnknownCommandIds(workspace, before); } catch (error) { failure = error; }
+    expect(failure).toBeInstanceOf(DesktopError);
+    expect(failure).toMatchObject({ code: "DESKTOP_STORE_BUSY" });
+  });
+
+  it("同 revision 的稳定快照冲突仍保留 outcome-resolution conflict", () => {
+    seedUnknown();
+    const before = readDesktop(workspace.id);
+    if (!before) throw new Error("missing snapshot");
+    const disk = readDesktop(workspace.id);
+    if (!disk) throw new Error("missing disk state");
+    disk.deliveries[0].messageSha256 = "b".repeat(64);
+    fs.writeFileSync(desktopFile(workspace.id), JSON.stringify(disk));
+
+    let failure: unknown;
+    try { unresolvedOutcomeUnknownCommandIds(workspace, before); } catch (error) { failure = error; }
+    expect(failure).toBeInstanceOf(outcomeResolution.OutcomeResolutionError);
+    expect(failure).toMatchObject({ code: "DESKTOP_OUTCOME_RESOLUTION_CONFLICT" });
+  });
+
+  it("已有行政 resolution 与 delivery 事实冲突仍保留 outcome-resolution conflict", () => {
+    seedUnknown();
+    const preview = previewOutcomeResolution(workspace, "unknown_one");
+    resolveOutcomeUnknown(workspace, "unknown_one", preview.confirmationSha256);
+    updateDesktop(workspace.id, state => {
+      if (!state) throw new Error("missing state");
+      state.deliveries[0].messageSha256 = "b".repeat(64);
+      return { state, result: undefined };
+    });
+
+    let failure: unknown;
+    try { getResolvedUnknownCommandIds(workspace); } catch (error) { failure = error; }
+    expect(failure).toBeInstanceOf(outcomeResolution.OutcomeResolutionError);
+    expect(failure).toMatchObject({ code: "DESKTOP_OUTCOME_RESOLUTION_CONFLICT" });
   });
 
   it("已有 retirement 证据时 fail closed，不覆盖既有证据", () => {

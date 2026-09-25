@@ -371,8 +371,8 @@
       return true;
     }
     if (message.type === "c2c.feedback.bootstrap.execute") {
-      const workerUrl = chrome.runtime.getURL("service-worker.js");
-      if (sender?.id !== chrome.runtime.id || sender?.url !== workerUrl) {
+      // MV3 service-worker MessageSender.url is not stable; internal senders have no tab.
+      if (sender?.id !== chrome.runtime.id || sender?.tab != null) {
         sendResponse({ ok: false, reason: "bootstrap_sender_invalid", mutationAttempted: false });
         return false;
       }

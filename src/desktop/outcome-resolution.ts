@@ -319,7 +319,11 @@ export function unresolvedOutcomeUnknownCommandIds(workspaceRaw: OutcomeResoluti
     const matchesDisk = state === null && desktop === null ||
       state !== null && desktop !== null && JSON.stringify(state) === JSON.stringify(desktop) ||
       state !== null && desktop === null && JSON.stringify(state) === JSON.stringify(emptyState);
-    if (!matchesDisk) return conflict("Desktop 状态在 unresolved 检查期间发生变化；拒绝忽略未知结果。");
+    if (!matchesDisk) {
+      if (desktop && (desktop.revision ?? 0) > (state?.revision ?? 0))
+        throw new DesktopError("DESKTOP_STORE_BUSY", "Desktop 状态在 unresolved 检查期间发生变化；请重试。");
+      return conflict("Desktop 状态与 unresolved 检查快照不一致；拒绝忽略未知结果。");
+    }
   }
   if (desktop && desktop.workspaceRoot !== workspace.root) return conflict("Desktop workspace 根目录不一致；拒绝忽略未知结果。");
   const unknown = new Set((desktop?.deliveries ?? []).filter(item => item.deliveryStatus === "outcome_unknown").map(item => item.commandId));

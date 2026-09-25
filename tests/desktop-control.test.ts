@@ -81,6 +81,36 @@ describe("Desktop 持久化投递", () => {
     expect(readDesktop(workspace.id)?.deliveries.filter(item => item.commandId === "next_command")).toHaveLength(1);
   });
 
+  it("unresolved gate 把并发变更分类为 store busy 且不发送", async () => {
+    enableDesktop(workspace, bindingId);
+    const file = desktopFile(workspace.id);
+    const originalRead = fs.readFileSync.bind(fs) as (...args: any[]) => any;
+    let changed = false;
+    vi.spyOn(fs, "readFileSync").mockImplementation(((filename: any, ...args: any[]) => {
+      const contents = originalRead(filename, ...args);
+      if (!changed && String(filename) === file) {
+        changed = true;
+        updateDesktop(workspace.id, previous => {
+          if (!previous) throw new Error("Desktop state missing");
+          previous.deliveries.push({ commandId: "concurrent_unknown", clientId: "other_client", bindingId,
+            intent: "development_plan", messageSha256: "a".repeat(64), messageBytes: 1,
+            threadId: target.threadId, deliveryStatus: "outcome_unknown", createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString() });
+          return { state: previous, result: undefined };
+        });
+      }
+      return contents;
+    }) as typeof fs.readFileSync);
+
+    await expect(sendDesktop(workspace, input(), "client")).rejects.toMatchObject({ code: "DESKTOP_STORE_BUSY" });
+    expect(changed).toBe(true);
+    expect(desktopIpc.prepare).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+    expect(readDesktop(workspace.id)?.deliveries).toContainEqual(expect.objectContaining({
+      commandId: "concurrent_unknown", deliveryStatus: "outcome_unknown",
+    }));
+  });
+
   it("已解决的 unknown 不阻断 receipt-backed busy-tail settle", async () => {
     enableDesktop(workspace, bindingId);
     send.mockRejectedValueOnce(new Error("结果不明"));

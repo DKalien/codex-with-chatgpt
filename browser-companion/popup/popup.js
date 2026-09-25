@@ -73,7 +73,7 @@
     el.className = "value" + (cls ? " " + cls : "");
   }
 
-  function friendlyConnectState(transport, isOwner, connectReason, connectState) {
+  function friendlyConnectState(transport, isOwner, connectReason, connectState, routeMatches) {
     if (transport?.authStale) return ["连接需要修复", "bad"];
     if (connectReason === "bootstrap_tool_missing") {
       return ["当前对话缺少反馈连接工具", "bad"];
@@ -92,7 +92,7 @@
       return ["还差一步完成连接", "warn"];
     }
     if (transport?.connected && transport?.routeVerification === "VERIFIED") {
-      return isOwner === true
+      return isOwner === true && routeMatches === true
         ? ["当前对话已连接", "ok"]
         : ["当前页面需要重新连接", "warn"];
     }
@@ -113,6 +113,10 @@
         return "首次使用需要配对，请粘贴配对信息并点击一次完成连接。";
       case "bootstrap_tool_missing":
         return "当前对话缺少反馈连接工具，请检查 ChatGPT 工具连接后再继续。";
+      case "bootstrap_sender_invalid":
+        return "连接消息来源校验未通过，未发送；重新打开扩展后可再次连接。";
+      case "bootstrap_capability_missing":
+        return "固定连接组件尚未加载，未发送；刷新 ChatGPT 页面后可再次连接。";
       default:
         return "连接遇到问题，请展开连接设置查看详情。";
     }
@@ -341,6 +345,12 @@
     }
 
     const transport = status?.transport ?? null;
+    const routeMatchesTransport = Boolean(
+      parsed
+      && transport?.routeCanonical
+      && typeof globalThis.areChatgptConversationRoutesEquivalent === "function"
+      && globalThis.areChatgptConversationRoutesEquivalent(parsed.canonical, transport.routeCanonical) === true
+    );
     if (transport?.rebindPending) {
       setText(els.transportStatus, "rebind pending — verify route, confirm in ChatGPT, then complete", "warn");
     } else if (transport?.connected) {
@@ -404,6 +414,7 @@
       isOwner,
       status?.connectReason,
       status?.connectState,
+      routeMatchesTransport,
     );
     const ownerNeedsReconnect = connectionText === "当前页面需要重新连接";
     setText(els.userConnectionStatus, connectionText, connectionClass);
@@ -466,8 +477,10 @@
     }
     // Manual reserve/send must not race ARMED scheduler.
     // Reserve also disabled while route is not VERIFIED (server 409 remains authority).
-    const routeVerified = transport?.routeVerification === "VERIFIED"
-      || transport?.productionEligible === true;
+    const routeVerified = routeMatchesTransport && (
+      transport?.routeVerification === "VERIFIED"
+      || transport?.productionEligible === true
+    );
     if (els.reserve) {
       els.reserve.disabled = !hasTransport || !isOwner || armed || !routeVerified;
     }
@@ -518,6 +531,7 @@
         && !productionInFlight
         && pageIdleSafe
         && autonomyMode !== "armed"
+        && routeVerified
         && els.productionSendConfirm.checked;
       els.productionSend.disabled = !canProduction;
     }
@@ -1127,6 +1141,7 @@
           && jState === "RESERVED"
           && latch === "NONE"
           && !inFlight
+          && routeVerified
           && idleSafe
         );
       });

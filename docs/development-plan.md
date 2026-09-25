@@ -920,3 +920,9 @@ H0 不抽象 Codex-specific result classification、terminal fence、receipt fin
 - R3g 将 bootstrap dispatch/wait 纳入既有 durable connect-flow，固定消息经 exact user-turn observation
   后才等待；dispatch 歧义与浏览器重启均 fail closed、不自动重发。代码及自动化回归完成；真实新 Chat
   单击 live smoke 尚待用户重载扩展后验证，因此 R3 暂不宣称整体完成。
+
+## R3h — bootstrap sender 与 popup route 对齐（代码完成，live smoke pending；2026-09-25）
+
+- 新 Chat live smoke 暴露 MV3 bootstrap sender URL 过严，以及 popup 仅凭旧 transport 的 VERIFIED 状态显示当前 Chat 已连接/可 Arm；现已改为 same-extension internal sender 检查，并要求当前页面 route 与 verified transport route 等价。
+- 代码 review 与自动化回归完成；本次构建部署后，真实新 Chat 单击 live smoke 仍待用户 reload 扩展验证。R3 整体仍未验收完成。
+- R3h closeout 全套回归暴露并已修复 Desktop stale-snapshot 并发分类问题；live smoke 仍 pending。

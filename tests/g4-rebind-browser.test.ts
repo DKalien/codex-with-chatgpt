@@ -354,6 +354,59 @@ describe("G4c one-click connect orchestration", () => {
     expect(worker.fetchMock.mock.calls.filter(([url]) => String(url).includes("/rebind/init"))).toHaveLength(1);
   });
 
+  it("proven no-mutation bootstrap failure stays retryable only on a later explicit Connect", async () => {
+    let dispatches = 0;
+    const worker = await loadWorker(responseBody(), {
+      oldRoute: OLD_ROUTE,
+      transport: { routeVerification: "VERIFIED" },
+      fetch: async (url) => String(url).includes("/rebind/init")
+        ? jsonResponse(409, { error: "COMPANION_REBIND_NOT_SUCCESSOR" })
+        : Promise.reject(new Error(`unexpected URL ${String(url)}`)),
+      tabsSendMessage: async () => {
+        dispatches += 1;
+        if (dispatches === 1) {
+          return {
+            type: "c2c.feedback.bootstrap.result",
+            mode: "feedback_bootstrap_send",
+            ok: false,
+            reason: "bootstrap_sender_invalid",
+            mutationAttempted: false,
+            clickAttempted: false,
+            observed: false,
+            canonicalRoute: ROUTE,
+            generation: 1,
+          };
+        }
+        return {
+          type: "c2c.feedback.bootstrap.result",
+          mode: "feedback_bootstrap_send",
+          ok: true,
+          mutationAttempted: true,
+          clickAttempted: true,
+          clicked: true,
+          observed: true,
+          canonicalRoute: ROUTE,
+          generation: 1,
+        };
+      },
+    });
+    const sender = { tab: { id: 7 }, documentId: "document-g4-rebind", frameId: 0, url: ROUTE };
+    const message = {
+      type: "c2c.connect.page",
+      generation: 1,
+      safety: { composer: "empty", generation: "idle", safe: true },
+    };
+
+    const failed = await worker.send(message, sender) as Record<string, unknown>;
+    expect(failed).toMatchObject({ ok: false, reason: "bootstrap_sender_invalid", retryAllowed: true });
+    expect(worker.tabsSendMessage).toHaveBeenCalledTimes(1);
+    expect(worker.local.values.get(CONNECT_KEY)).toMatchObject({ state: "NONE" });
+
+    const retried = await worker.send(message, sender) as Record<string, unknown>;
+    expect(retried).toMatchObject({ ok: true, state: "WAITING_TAKEOVER" });
+    expect(worker.tabsSendMessage).toHaveBeenCalledTimes(2);
+  });
+
   it("C. repeated exact-owner heartbeat waits for takeover without resending bootstrap", async () => {
     const worker = await loadWorker(responseBody(), {
       oldRoute: OLD_ROUTE,

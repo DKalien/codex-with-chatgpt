@@ -3,6 +3,10 @@ import path from "node:path";
 import vm from "node:vm";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import {
+  areChatgptConversationRoutesEquivalent,
+  parseChatgptConversationRoute,
+} from "../src/chatgpt/route.js";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const sourcePopup = path.join(root, "browser-companion", "popup");
@@ -25,17 +29,23 @@ async function loadPopup(
     connectResult?: unknown;
     tabId?: number;
     tabIds?: number[];
+    pageUrl?: string;
+    autonomyArmConfirmed?: boolean;
+    productionSendConfirmed?: boolean;
     savedBridgeOrigin?: string;
     status?: Record<string, unknown>;
   } = {},
 ) {
   const html = fs.readFileSync(path.join(sourcePopup, "popup.html"), "utf8");
   const ids = [...html.matchAll(/\bid="([^"]+)"/g)].map(match => match[1]);
+  const listeners = new Map(ids.map(id => [id, [] as { type: string; handler: () => void }[]]));
   const elements = new Map(ids.map(id => [id, {
     value: "", textContent: "", className: "", disabled: false, checked: false,
     onclick: null as null | (() => Promise<void>),
-    addEventListener: () => undefined,
+    addEventListener: (type: string, handler: () => void) => { listeners.get(id)!.push({ type, handler }); },
   }]));
+  if (options.autonomyArmConfirmed) elements.get("autonomy-arm-confirm")!.checked = true;
+  if (options.productionSendConfirmed) elements.get("production-send-confirm")!.checked = true;
   const calls = {
     contains: [] as unknown[], request: [] as unknown[], ownerProof: 0,
     order: [] as string[],
@@ -46,7 +56,7 @@ async function loadPopup(
     tabs: {
       query: async () => {
         const id = options.tabIds?.shift() ?? options.tabId ?? 1;
-        return [{ id, url: route }];
+        return [{ id, url: options.pageUrl ?? route }];
       },
       sendMessage: async (_tabId: number, message: { type: string }) => {
         if (message.type === "c2c.popup.ping") {
@@ -109,7 +119,8 @@ async function loadPopup(
   const sandbox = {
     chrome,
     document: { getElementById: (id: string) => elements.get(id) },
-    parseChatgptConversationRoute: () => ({ canonical: route }),
+    parseChatgptConversationRoute,
+    areChatgptConversationRoutesEquivalent,
     URL,
     console,
   };
@@ -117,7 +128,12 @@ async function loadPopup(
   for (let i = 0; i < 10 && !elements.get("pair")?.onclick; i += 1) {
     await new Promise(resolve => setImmediate(resolve));
   }
-  return { calls, elements };
+  const fireChange = (id: string) => {
+    for (const listener of listeners.get(id) ?? []) {
+      if (listener.type === "change") listener.handler();
+    }
+  };
+  return { calls, elements, fireChange };
 }
 
 describe("popup classic packaging", () => {
@@ -141,7 +157,7 @@ describe("popup classic packaging", () => {
 
 describe("popup Bridge permission and Pair separation", () => {
   it("shows the saved auto-rearm preference and restores the pause prompt when cleared", async () => {
-    const transport = { connected: true, routeVerification: "VERIFIED", productionEligible: true };
+    const transport = { connected: true, routeCanonical: route, routeVerification: "VERIFIED", productionEligible: true };
     const saved = await loadPopup(true, true, {
       status: { transport, autonomy: { mode: "off", rearmOnConnect: true } },
     });
@@ -232,6 +248,7 @@ describe("popup Bridge permission and Pair separation", () => {
         isOwner: true,
         transport: {
           connected: true,
+          routeCanonical: route,
           routeVerification: "VERIFIED",
           rebindPending: false,
           authStale: false,
@@ -286,6 +303,63 @@ describe("popup Bridge permission and Pair separation", () => {
     expect(elements.get("user-connection-status")!.className).toContain("bad");
     expect(elements.get("user-connection-status")!.textContent).not.toContain("重新连接");
     expect(elements.get("user-action-hint")!.textContent).not.toContain("连接当前对话");
+  });
+
+  it("does not show or enable a verified old route for a new current page", async () => {
+    const oldRoute = "https://chatgpt.com/c/77777777-7777-4777-8777-777777777777";
+    const { elements, fireChange } = await loadPopup(true, true, {
+      pageUrl: route,
+      autonomyArmConfirmed: true,
+      productionSendConfirmed: true,
+      status: {
+        isOwner: true,
+        storageProtected: true,
+        transport: {
+          connected: true,
+          routeCanonical: oldRoute,
+          routeVerification: "VERIFIED",
+          productionEligible: true,
+          rebindPending: false,
+          authStale: false,
+        },
+        autonomy: { mode: "off", rearmOnConnect: true },
+        journal: { state: "RESERVED" },
+        sendProbeLatch: "NONE",
+        productionSendInFlight: false,
+      },
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    fireChange("autonomy-arm-confirm");
+    fireChange("production-send-confirm");
+    expect(elements.get("user-connection-status")!.textContent).toBe("当前页面需要重新连接");
+    expect(elements.get("user-connection-status")!.className).toContain("warn");
+    expect(elements.get("autonomy-arm")!.disabled).toBe(true);
+    expect(elements.get("reserve")!.disabled).toBe(true);
+    expect(elements.get("production-send")!.disabled).toBe(true);
+  });
+
+  it("keeps an equivalent current route healthy and armable", async () => {
+    const aliasPage = "https://www.chatgpt.com/c/11111111-1111-4111-8111-111111111111";
+    const { elements } = await loadPopup(true, true, {
+      pageUrl: aliasPage,
+      autonomyArmConfirmed: true,
+      status: {
+        isOwner: true,
+        storageProtected: true,
+        transport: {
+          connected: true,
+          routeCanonical: route,
+          routeVerification: "VERIFIED",
+          productionEligible: true,
+          rebindPending: false,
+          authStale: false,
+        },
+        autonomy: { mode: "off", rearmOnConnect: false },
+      },
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    expect(elements.get("user-connection-status")!.textContent).toBe("当前对话已连接");
+    expect(elements.get("autonomy-arm")!.disabled).toBe(false);
   });
 
   it("keeps rebind and route-pending warnings ahead of owner reconnect", async () => {

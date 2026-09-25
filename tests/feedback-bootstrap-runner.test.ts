@@ -1,3 +1,7 @@
+import fs from "node:fs";
+import path from "node:path";
+import vm from "node:vm";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import {
   FEEDBACK_BOOTSTRAP_MESSAGE,
@@ -7,8 +11,46 @@ import {
   runFeedbackBootstrapSend,
 } from "../browser-companion/feedback-bootstrap-run.js";
 import { normalizeCanonicalDomText } from "../browser-companion/dom-adapter.js";
+import { parseChatgptConversationRoute } from "../src/chatgpt/route.js";
 
 const ROUTE = "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111";
+const EXTENSION_ID = "c2c-test-extension";
+const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+function loadContentScript(runner?: (...args: any[]) => unknown) {
+  let onMessage: ((message: any, sender: any, sendResponse: (response: any) => void) => boolean) | undefined;
+  const document = { hidden: false, addEventListener: () => undefined };
+  const chrome = {
+    runtime: {
+      id: EXTENSION_ID,
+      lastError: null,
+      sendMessage: (_message: unknown, callback?: (response: unknown) => void) => callback?.({ ok: true }),
+      onMessage: { addListener: (listener: typeof onMessage) => { onMessage = listener; } },
+    },
+  };
+  const sandbox = {
+    chrome,
+    document,
+    location: { href: ROUTE },
+    window: { __c2cCompanionLoaded: false, addEventListener: () => undefined },
+    setInterval: () => 0,
+    parseChatgptConversationRoute,
+    __c2cRunFeedbackBootstrapSend: runner,
+  };
+  vm.runInNewContext(
+    fs.readFileSync(path.join(repositoryRoot, "browser-companion", "content-script.js"), "utf8"),
+    sandbox,
+  );
+  return {
+    async dispatch(message: unknown, sender: unknown) {
+      let response: unknown;
+      const returnValue = onMessage!(message, sender, value => { response = value; });
+      if (returnValue === true) await new Promise(resolve => setImmediate(resolve));
+      return { returnValue, response };
+    },
+    document,
+  };
+}
 
 async function runWithDom(options: Record<string, any> = {}) {
   const dom = await import("../browser-companion/dom-adapter.js");
@@ -117,5 +159,66 @@ describe("fixed feedback bootstrap DOM send", () => {
     expect(hasFeedbackBootstrapToolMissingReply({ querySelectorAll: () => [user, missing] } as any)).toBe(true);
     expect(hasFeedbackBootstrapToolMissingReply({ querySelectorAll: () => [missing, user] } as any)).toBe(false);
     expect(hasFeedbackBootstrapToolMissingReply({ querySelectorAll: () => [user, missing, user, normalAssistant] } as any)).toBe(false);
+  });
+});
+
+describe("content-script fixed feedback bootstrap sender", () => {
+  it.each([
+    ["missing sender URL", { id: EXTENSION_ID, tab: null }],
+    ["alternate internal extension URL", { id: EXTENSION_ID, tab: null, url: `chrome-extension://${EXTENSION_ID}/popup.html` }],
+  ])("accepts same-extension internal sender with %s", async (_label, sender) => {
+    const runner = vi.fn(async () => ({
+      ok: true, mutationAttempted: true, clickAttempted: true, clicked: true, observed: true,
+    }));
+    const harness = loadContentScript(runner);
+    const result = await harness.dispatch({
+      type: "c2c.feedback.bootstrap.execute",
+      expectedRoute: ROUTE,
+      expectedGeneration: 1,
+      message: "caller body must not be forwarded",
+      bootstrapMessage: "caller body must not be forwarded",
+    }, sender);
+
+    expect(result.returnValue).toBe(true);
+    expect(result.response).toMatchObject({ ok: true, mode: "feedback_bootstrap_send" });
+    expect(runner).toHaveBeenCalledTimes(1);
+    expect(runner.mock.calls[0][0]).toBe(harness.document);
+    expect(runner.mock.calls[0][1]).toMatchObject({
+      expectedRoute: ROUTE,
+      expectedGeneration: 1,
+      locationHref: ROUTE,
+    });
+    expect(runner.mock.calls[0][1]).not.toHaveProperty("message");
+    expect(runner.mock.calls[0][1]).not.toHaveProperty("bootstrapMessage");
+  });
+
+  it.each([
+    ["external extension", { id: "another-extension", tab: null }],
+    ["tab content script", { id: EXTENSION_ID, tab: { id: 7 }, url: ROUTE }],
+  ])("rejects %s before invoking the fixed runner", async (_label, sender) => {
+    const runner = vi.fn();
+    const harness = loadContentScript(runner);
+    const result = await harness.dispatch({ type: "c2c.feedback.bootstrap.execute" }, sender);
+    expect(result.returnValue).toBe(false);
+    expect(result.response).toMatchObject({
+      ok: false,
+      reason: "bootstrap_sender_invalid",
+      mutationAttempted: false,
+    });
+    expect(runner).not.toHaveBeenCalled();
+  });
+
+  it("reports a missing fixed runner without DOM mutation", async () => {
+    const harness = loadContentScript();
+    const result = await harness.dispatch(
+      { type: "c2c.feedback.bootstrap.execute" },
+      { id: EXTENSION_ID, tab: null },
+    );
+    expect(result.returnValue).toBe(false);
+    expect(result.response).toMatchObject({
+      ok: false,
+      reason: "bootstrap_capability_missing",
+      mutationAttempted: false,
+    });
   });
 });
