@@ -95,6 +95,23 @@ async function loadPopup(
           calls.order.push("pair");
           return options.pairResult ?? { ok: true };
         }
+        if (
+          typeof message === "object"
+          && message
+          && (message as { type?: string }).type === "c2c.route-attest.abandon.unknown"
+        ) {
+          // Byte-accurate success shape of handleAbandonRouteAttestUnknown so
+          // the popup display assertions exercise the real zero-mutation flags.
+          return {
+            ok: true,
+            abandoned: true,
+            connectOutcome: "abandoned",
+            state: "NONE",
+            zeroWrite: true,
+            zeroClick: true,
+            zeroBridgeMutation: true,
+          };
+        }
         return { ok: true };
       },
     },
@@ -243,6 +260,75 @@ describe("popup Bridge permission and Pair separation", () => {
     expect(
       calls.runtime.find(
         (message) => (message as { type?: string })?.type === "c2c.connect.abandon.unknown",
+      ),
+    ).toBeUndefined();
+    expect(elements.get("bridge-state")!.textContent).toContain("owner_proof_missing");
+  });
+
+  it("route-attest abandon enables only with confirm checkbox AND a durable OUTCOME_UNKNOWN attest fence", async () => {
+    // R3q: the popup gate is only a pre-filter; exact owner / rebind / challenge
+    // identity are re-validated inside the SW via a fresh one-use owner proof.
+    const armed = await loadPopup(true, true, {
+      status: { routeAttestFence: "OUTCOME_UNKNOWN" },
+    });
+    expect(armed.elements.get("route-attest-abandon")!.disabled).toBe(true);
+    armed.elements.get("route-attest-abandon-confirm")!.checked = true;
+    armed.fireChange("route-attest-abandon-confirm");
+    expect(armed.elements.get("route-attest-abandon")!.disabled).toBe(false);
+
+    const unhardened = await loadPopup(true, true, {
+      status: { routeAttestFence: "NONE" },
+    });
+    unhardened.elements.get("route-attest-abandon-confirm")!.checked = true;
+    unhardened.fireChange("route-attest-abandon-confirm");
+    expect(unhardened.elements.get("route-attest-abandon")!.disabled).toBe(true);
+
+    const missingStatus = await loadPopup(true, true);
+    missingStatus.elements.get("route-attest-abandon-confirm")!.checked = true;
+    missingStatus.fireChange("route-attest-abandon-confirm");
+    expect(missingStatus.elements.get("route-attest-abandon")!.disabled).toBe(true);
+  });
+
+  it("route-attest abandon relays a fresh owner proof id only (no tab/document/route authority)", async () => {
+    const { calls, elements, fireChange } = await loadPopup(true, true, {
+      status: { routeAttestFence: "OUTCOME_UNKNOWN" },
+    });
+    elements.get("route-attest-abandon-confirm")!.checked = true;
+    fireChange("route-attest-abandon-confirm");
+    expect(elements.get("route-attest-abandon")!.disabled).toBe(false);
+
+    await elements.get("route-attest-abandon")!.onclick!();
+
+    // Same proof relay as the connect abandon: one-use proof minted by the
+    // CURRENT active owner document; the popup never supplies tab/document/
+    // route/challenge identity.
+    expect(calls.ownerProof).toBe(1);
+    const abandonMessage = calls.runtime.find(
+      (message) => (message as { type?: string })?.type === "c2c.route-attest.abandon.unknown",
+    ) as Record<string, unknown> | undefined;
+    expect(abandonMessage).toMatchObject({
+      type: "c2c.route-attest.abandon.unknown",
+      ownerProofId: "proof-1",
+    });
+    expect(JSON.stringify(calls.runtime)).not.toMatch(/"tabId"|"documentId"|"routeCanonical"|challengeId/);
+    expect(elements.get("bridge-state")!.textContent).toContain("attest abandon ok=true");
+    expect(elements.get("bridge-state")!.textContent).toContain("zeroWrite=true");
+  });
+
+  it("route-attest abandon without an owner proof fails closed without sending the abandon message", async () => {
+    const { calls, elements, fireChange } = await loadPopup(true, true, {
+      status: { routeAttestFence: "OUTCOME_UNKNOWN" },
+      ownerProofResult: { ok: false, reason: "owner_proof_missing" },
+    });
+    elements.get("route-attest-abandon-confirm")!.checked = true;
+    fireChange("route-attest-abandon-confirm");
+
+    await elements.get("route-attest-abandon")!.onclick!();
+
+    expect(calls.ownerProof).toBe(1);
+    expect(
+      calls.runtime.find(
+        (message) => (message as { type?: string })?.type === "c2c.route-attest.abandon.unknown",
       ),
     ).toBeUndefined();
     expect(elements.get("bridge-state")!.textContent).toContain("owner_proof_missing");

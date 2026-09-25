@@ -8,6 +8,7 @@ import {
   resolveChatGptComposer,
   resolveChatGptAction,
   normalizeCanonicalDomText,
+  matchesSendTargetIdentity,
 } from "./dom-adapter.js";
 import {
   readCanonicalComposerText,
@@ -191,10 +192,14 @@ export async function runRouteAttestationSend(doc, opts = {}) {
         verified: true,
       };
     }
+    // R3q: Send parity with the feedback bootstrap / click adapters — the
+    // ready gate uses the SHARED structural Send matcher (legacy testid OR
+    // current type=submit + composer class tokens). Partial/multiple/disabled/
+    // Stop/voice shapes keep polling until timeout, never click.
     if (
       action.kind === "send"
       && action.enabled === true
-      && action.button?.getAttribute?.("data-testid") === "send-button"
+      && matchesSendTargetIdentity(action.button)
     ) {
       break;
     }

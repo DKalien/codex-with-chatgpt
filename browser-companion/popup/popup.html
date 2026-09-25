@@ -156,6 +156,13 @@
       <span>I understand this clears ONLY the connect bootstrap fence (connect is NOT marked successful); I will clear any unsent composer text myself, then Connect again</span>
     </label>
     <button id="connect-abandon" class="secondary" disabled style="background:#c5221f;">Abandon connect unknown — clears fence only</button>
+    <hr />
+    <div class="label" style="color:#f28b82;">Advanced recovery — hardened route-attest (written but never sent / unknown)</div>
+    <label class="note" style="display:flex;gap:8px;align-items:flex-start;color:#f28b82;">
+      <input type="checkbox" id="route-attest-abandon-confirm" style="margin-top:2px;" />
+      <span>I understand this clears ONLY the route-attest latch/fence and the pending connect flow (attestation is NOT marked successful, no route confirm is called); I will clear any unsent attestation composer text myself, then Connect again</span>
+    </label>
+    <button id="route-attest-abandon" class="secondary" disabled style="background:#c5221f;">Abandon route-attest unknown — clears latch/fence only</button>
     <button id="shadow-inspect" class="secondary">Inspect Send capability (read-only)</button>
     <div class="row">
       <div class="label">Shadow evidence — READ ONLY — no composer write / no Send</div>

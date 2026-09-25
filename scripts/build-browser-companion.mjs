@@ -87,6 +87,7 @@ globalThis.unsafeDomSafety = unsafeDomSafety;
 globalThis.resolveChatGptComposer = resolveChatGptComposer;
 globalThis.isExcludedEmbeddedEditor = isExcludedEmbeddedEditor;
 globalThis.resolveChatGptAction = resolveChatGptAction;
+globalThis.matchesSendTargetIdentity = matchesSendTargetIdentity;
 globalThis.normalizeCanonicalDomText = normalizeCanonicalDomText;
 globalThis.inspectChatGptActionEvidence = inspectChatGptActionEvidence;
 globalThis.inspectActiveComposerControls = inspectActiveComposerControls;
@@ -439,6 +440,7 @@ const areChatgptConversationRoutesEquivalent = globalThis.areChatgptConversation
 });
 const resolveChatGptComposer = globalThis.resolveChatGptComposer;
 const resolveChatGptAction = globalThis.resolveChatGptAction;
+const matchesSendTargetIdentity = globalThis.matchesSendTargetIdentity;
 const normalizeCanonicalDomText = globalThis.normalizeCanonicalDomText;
 const readCanonicalComposerText = globalThis.__c2cReadCanonicalComposerText;
 const writeCanonicalMessage = globalThis.__c2cWriteCanonicalMessage;
@@ -470,6 +472,14 @@ if (!/function runRouteAttestationSend|async function runRouteAttestationSend/.t
 if (!/globalThis\.__c2cResolveMutationCanonicalRoute/.test(routeAttestRunClassicText)) {
   fail("classic route-attestation-run-global must bind __c2cResolveMutationCanonicalRoute");
 }
+// R3q: the classic runner must consume the SHARED structural Send matcher,
+// never a local data-testid hardcode.
+if (!/matchesSendTargetIdentity\(/.test(routeAttestRunClassicText)) {
+  fail("classic route-attestation-run-global must consume the shared matchesSendTargetIdentity");
+}
+if (/data-testid.*send-button/.test(routeAttestRunClassicText)) {
+  fail("classic route-attestation-run-global must not hardcode data-testid send-button");
+}
 if (/globalThis\.resolveMutationCanonicalRoute\s*=/.test(routeAttestRunClassicText)) {
   fail("classic route-attestation-run-global must not expose unnamespaced resolveMutationCanonicalRoute");
 }
@@ -489,6 +499,7 @@ const areChatgptConversationRoutesEquivalent = globalThis.areChatgptConversation
 });
 const resolveChatGptComposer = globalThis.resolveChatGptComposer;
 const resolveChatGptAction = globalThis.resolveChatGptAction;
+const matchesSendTargetIdentity = globalThis.matchesSendTargetIdentity;
 const normalizeCanonicalDomText = globalThis.normalizeCanonicalDomText;
 const readCanonicalComposerText = globalThis.__c2cReadCanonicalComposerText;
 const writeCanonicalMessage = globalThis.__c2cWriteCanonicalMessage;

@@ -395,6 +395,29 @@ async function persistConnectAndRouteFence() {
   }
 }
 
+/**
+ * R3q review-fix (FIX_2): the managed written-unsent rollback commits the
+ * durable route-attest fence and the managed connectFlow in ONE
+ * chrome.storage.local.set — a half-cleared or half-hardened pair must never
+ * become durable. A cleared fence is stored as an explicit NONE object in the
+ * same commit (parseRouteAttestFence treats it identically to a missing key);
+ * the key-absent convention is restored best-effort afterwards.
+ */
+async function commitWrittenUnsentDurable(nextConnectFlow, nextFence) {
+  try {
+    await chrome.storage.local.set({
+      [CONNECT_FLOW_KEY]: nextConnectFlow,
+      [ROUTE_ATTEST_FENCE_KEY]: nextFence,
+    });
+    if (nextFence.state === "NONE" && !nextFence.challengeId) {
+      await chrome.storage.local.remove(ROUTE_ATTEST_FENCE_KEY).catch(() => undefined);
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function persistLocal() {
   await chrome.storage.local.set({ [LOCAL_KEY]: localState });
 }
@@ -1610,12 +1633,51 @@ async function dispatchConnectRouteAttestation({ resumeExisting = false } = {}) 
     return { ok: false, reason: "connect_fence_persist_failed", state: "OUTCOME_UNKNOWN", retryAllowed: false };
   }
 
+  const managedFlow = connectFlow;
+  const prevRouteAttestFence = routeAttestFence;
+  const prevRouteAttestLatch = routeAttestLatch;
   const attested = await handleMessage(
     { type: ROUTE_ATTEST_SEND_TYPE },
     {},
-    { transportMutationHeld: true },
+    { transportMutationHeld: true, managedAttestRollback: true },
   );
   if (!attested?.ok) {
+    // R3q: written-unsent route-attest is recoverable — the managed connectFlow
+    // and the durable route-attest fence roll back together in ONE commit
+    // (review-fix FIX_2: never a half-cleared pair); nothing is auto-resent.
+    if (attested?.writtenUnsent === true) {
+      routeAttestLatch = emptyRouteAttestLatch();
+      routeAttestFence = emptyRouteAttestFence();
+      connectFlow = emptyConnectFlow();
+      if (await commitWrittenUnsentDurable(connectFlow, routeAttestFence)
+        && await persistRouteAttestLatch()) {
+        return { ...attested, state: "NONE", retryAllowed: true };
+      }
+      // Fail closed TOGETHER, with the exact managed identity: finishing the
+      // EMPTY flow here would persist a null-identity OUTCOME_UNKNOWN that no
+      // abandon path can ever clear. The hardened fence is minted from THIS
+      // transport/challenge identity so the route-attest abandon stays a
+      // complete recovery path.
+      connectFlow = finishConnectFlow(managedFlow, flowIdentity, "OUTCOME_UNKNOWN");
+      routeAttestFence = markRouteAttestFenceState({
+        ...emptyRouteAttestFence(),
+        companionId: transport?.companionId ?? null,
+        challengeId: flowIdentity.challengeId,
+        routeCanonical: flowIdentity.routeCanonical,
+        challengeExpiresAt: typeof transport?.routeAttestationExpiresAt === "string"
+          ? transport.routeAttestationExpiresAt
+          : null,
+      }, "OUTCOME_UNKNOWN");
+      routeAttestLatch = { ...prevRouteAttestLatch, state: "OUTCOME_UNKNOWN" };
+      await commitWrittenUnsentDurable(connectFlow, routeAttestFence);
+      await persistRouteAttestLatch();
+      return {
+        ok: false,
+        reason: "connect_fence_persist_failed",
+        state: connectFlow.state,
+        retryAllowed: false,
+      };
+    }
     const noMutation = attested?.mutationAttempted !== true
       && attested?.clickAttempted !== true
       && routeAttestLatch.state === "NONE"
@@ -2135,7 +2197,7 @@ async function handleClearTransport() {
   };
 }
 
-async function handleMessage(message, sender, { transportMutationHeld = false } = {}) {
+async function handleMessage(message, sender, { transportMutationHeld = false, managedAttestRollback = false } = {}) {
   await initPromise;
   if (!message || typeof message !== "object") return { ok: false, reason: "bad_message" };
 
@@ -2302,6 +2364,72 @@ async function handleMessage(message, sender, { transportMutationHeld = false } 
         clickAttempted: false,
       };
     }
+    // R3q: a PROVEN composer write that never reached the irreversible click
+    // boundary is recoverable — never upgrade it to OUTCOME_UNKNOWN. "Proven"
+    // requires response.ok === false (an ok=true response that claims wrote=true
+    // without observed is inconsistent, not safe) plus positive
+    // mutationAttempted === true AND wrote === true; missing/malformed booleans
+    // fall through to the OUTCOME_UNKNOWN fail-closed below, and a real
+    // clickAttempted=true can never land here. Clears latch+fence to NONE; the
+    // managed connectFlow is cleared by the dispatch caller; nothing is
+    // auto-resent — the user clears the dirty composer and Connects again.
+    const routeAttestWrittenUnsent = response.ok === false
+      && response.mutationAttempted === true
+      && response.wrote === true
+      && response.clickAttempted !== true
+      && response.observed !== true;
+    if (routeAttestWrittenUnsent) {
+      if (managedAttestRollback === true) {
+        // R3q review-fix (FIX_2): the managed rollback must commit the durable
+        // route-attest fence and the managed connectFlow ATOMICALLY (one
+        // chrome.storage.local.set). The dispatch caller owns that combined
+        // commit, so no durable write happens here — memory is rolled back
+        // provisionally and the caller hardens everything together on failure.
+        // (transportMutationHeld alone cannot distinguish this caller: the
+        // direct wrapper recurses with it set to true as well.)
+        routeAttestLatch = emptyRouteAttestLatch();
+        routeAttestFence = emptyRouteAttestFence();
+        return {
+          ok: false,
+          reason: classified.reason,
+          writtenUnsent: true,
+          latchState: "NONE",
+          fenceState: "NONE",
+          retryAllowed: true,
+          composerDirty: true,
+          mutationAttempted: true,
+          clickAttempted: false,
+        };
+      }
+      routeAttestLatch = emptyRouteAttestLatch();
+      routeAttestFence = emptyRouteAttestFence();
+      if (!await persistRouteAttestBoth()) {
+        // Fail closed: durable clear failed — harden both stores instead.
+        routeAttestLatch = { ...intentLatch, state: "OUTCOME_UNKNOWN" };
+        routeAttestFence = markRouteAttestFenceState(intentFence, "OUTCOME_UNKNOWN");
+        await persistRouteAttestBoth();
+        return {
+          ok: false,
+          reason: "route_attest_written_unsent_persist_failed",
+          latchState: "OUTCOME_UNKNOWN",
+          fenceState: "OUTCOME_UNKNOWN",
+          retryAllowed: false,
+          mutationAttempted: true,
+          clickAttempted: false,
+        };
+      }
+      return {
+        ok: false,
+        reason: classified.reason,
+        writtenUnsent: true,
+        latchState: "NONE",
+        fenceState: "NONE",
+        retryAllowed: true,
+        composerDirty: true,
+        mutationAttempted: true,
+        clickAttempted: false,
+      };
+    }
     routeAttestLatch = { ...intentLatch, state: "OUTCOME_UNKNOWN" };
     routeAttestFence = markRouteAttestFenceState(intentFence, "OUTCOME_UNKNOWN");
     await persistRouteAttestBoth();
@@ -2344,6 +2472,17 @@ async function handleMessage(message, sender, { transportMutationHeld = false } 
     // — it can never interleave with an in-flight Connect/Rebind/Attest transition.
     return runTransportMutation(() =>
       handleAbandonConnectUnknown(sender, message)
+    );
+  }
+  if (message.type === "c2c.route-attest.abandon.unknown") {
+    // Manual popup-only advanced recovery (R3q). Content scripts must never
+    // trigger it, and it must share the transport mutation gate like every
+    // other durable-state mutation.
+    if (!isExtensionInternalSender(sender)) {
+      return { ok: false, reason: "popup_sender_required" };
+    }
+    return runTransportMutation(() =>
+      handleAbandonRouteAttestUnknown(sender, message)
     );
   }
   if (message.type === "c2c.connect.page") {
@@ -3835,6 +3974,108 @@ async function handleAbandonConnectUnknown(sender, message) {
     ok: true,
     abandoned: true,
     // Explicitly NOT a connect success: the fence was cleared for manual recovery.
+    connectOutcome: "abandoned",
+    state: "NONE",
+    zeroWrite: true,
+    zeroClick: true,
+    zeroBridgeMutation: true,
+  };
+}
+
+/**
+ * R3q: manual-only recovery for a hardened route-attest OUTCOME_UNKNOWN
+ * (attestation written but never clicked, or ambiguous). Zero DOM mutation.
+ * Requires: popup-only sender, exact current owner (via one-use owner proof),
+ * an in-flight rebind transport, and route/challenge/companion identity that
+ * exactly matches the durable OUTCOME_UNKNOWN fence. Success clears ONLY the
+ * route-attest latch + fence and the managed connectFlow; the epoch transport,
+ * rebind intent/challenge, credential, binding and journal are byte-identical.
+ * This is NOT attestation success and never calls route confirm.
+ */
+async function handleAbandonRouteAttestUnknown(sender, message) {
+  await initPromise;
+  const transportGate = requireProtectedTransport();
+  if (!transportGate.ok) return { ...transportGate, fenceState: routeAttestFence.state };
+  if (transport?.rebindPending !== true) {
+    return { ok: false, reason: "route_attest_not_rebind_pending", fenceState: routeAttestFence.state };
+  }
+  const fence = routeAttestFence;
+  if (fence.state !== "OUTCOME_UNKNOWN") {
+    return { ok: false, reason: "route_attest_not_outcome_unknown", fenceState: fence.state, latchState: routeAttestLatch.state };
+  }
+  const owner = ownerState.owner;
+  if (!owner || !isOwner(ownerState, owner.tabId, owner.documentId)) {
+    return { ok: false, reason: "not_exact_owner", fenceState: fence.state };
+  }
+  if (!fence.routeCanonical
+    || !areChatgptConversationRoutesEquivalent(fence.routeCanonical, owner.canonicalRoute)) {
+    return { ok: false, reason: "route_attest_identity_mismatch", fenceState: fence.state };
+  }
+  if ((transport.companionId ?? null) !== (fence.companionId ?? null)) {
+    return { ok: false, reason: "route_attest_identity_mismatch", fenceState: fence.state };
+  }
+  if (!fence.challengeId
+    || fence.challengeId !== extractRouteChallengeId(transport?.routeAttestationMessage)) {
+    return { ok: false, reason: "route_attest_identity_mismatch", fenceState: fence.state };
+  }
+  // R3q review-fix (FIX_1): a non-NONE managed connectFlow must be THIS
+  // transport's hardened attestation flow (OUTCOME_UNKNOWN + exact identity).
+  // Abandon never clears a foreign or still-live flow, and rejects BEFORE
+  // consuming the one-use proof — zero mutation on mismatch.
+  const prevConnectFlow = connectFlow;
+  if (prevConnectFlow.state !== "NONE") {
+    const flowIdentity = connectFlowIdentity(transport);
+    if (prevConnectFlow.state !== "OUTCOME_UNKNOWN"
+      || !flowIdentity
+      || !connectFlowMatches(prevConnectFlow, flowIdentity)) {
+      return {
+        ok: false,
+        reason: "connect_identity_mismatch",
+        fenceState: fence.state,
+        latchState: routeAttestLatch.state,
+      };
+    }
+  }
+  // One-use proof must have been minted from the real MessageSender of this
+  // exact owner document (fresh + unused + matching tab/document/route).
+  const proofCheck = consumeOwnerProof(ownerProof, {
+    tabId: owner.tabId,
+    documentId: owner.documentId,
+    routeCanonical: owner.canonicalRoute,
+  });
+  if (!proofCheck.ok) {
+    return { ok: false, reason: proofCheck.reason, fenceState: fence.state };
+  }
+  if (message?.ownerProofId !== ownerProof.id) {
+    return { ok: false, reason: "owner_proof_mismatch", fenceState: fence.state };
+  }
+  ownerProof = markProofUsed(ownerProof);
+  const prevLatch = routeAttestLatch;
+  const prevFence = routeAttestFence;
+  routeAttestLatch = emptyRouteAttestLatch();
+  routeAttestFence = emptyRouteAttestFence();
+  if (!await persistRouteAttestBoth()) {
+    routeAttestLatch = prevLatch;
+    routeAttestFence = prevFence;
+    await persistRouteAttestBoth();
+    return { ok: false, reason: "route_attest_fence_persist_failed", fenceState: routeAttestFence.state };
+  }
+  if (prevConnectFlow.state !== "NONE") {
+    connectFlow = emptyConnectFlow();
+    if (!await persistConnectFlow()) {
+      // Restore the hardened attest fence and the managed flow together.
+      routeAttestLatch = prevLatch;
+      routeAttestFence = prevFence;
+      await persistRouteAttestBoth();
+      connectFlow = prevConnectFlow;
+      await persistConnectFlow().catch(() => false);
+      return { ok: false, reason: "connect_fence_persist_failed", fenceState: prevFence.state };
+    }
+  }
+  return {
+    ok: true,
+    abandoned: true,
+    // Explicitly NOT attestation success; no route confirm is called.
     connectOutcome: "abandoned",
     state: "NONE",
     zeroWrite: true,

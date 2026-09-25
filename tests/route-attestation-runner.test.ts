@@ -15,7 +15,10 @@ import {
   hasExactRouteChallengeMarker,
   nextRouteAttestFenceAfterPair,
 } from "../browser-companion/route-attestation.js";
-import { normalizeCanonicalDomText } from "../browser-companion/dom-adapter.js";
+import {
+  matchesSendTargetIdentity,
+  normalizeCanonicalDomText,
+} from "../browser-companion/dom-adapter.js";
 import { formatRouteAttestationMessage } from "../src/feedback/store.js";
 
 const CHALLENGE = "11111111-1111-4111-8111-111111111111";
@@ -585,5 +588,122 @@ describe("route-attestation runner exact observation", () => {
       normalizeText: normalizeCanonicalDomText,
     });
     expect(canonical.ok).toBe(true);
+  });
+});
+
+describe("R3q route-attestation Send parity (shared structural matcher)", () => {
+  // Current structural Send shape (observed 2026-09-25): active editor form
+  // button[type=submit] with BOTH composer class tokens and no data-testid.
+  function currentStructuralSendButton(overrides: Record<string, unknown> = {}) {
+    return {
+      className: "size-token-button-composer bg-composer-primary",
+      disabled: false,
+      getAttribute: (name: string) => (name === "type" ? "submit" : null),
+      hasAttribute: () => false,
+      ...overrides,
+    };
+  }
+
+  function disabledSubmitButton() {
+    return currentStructuralSendButton({
+      getAttribute: (name: string) =>
+        name === "type" ? "submit" : name === "aria-disabled" ? "true" : null,
+    });
+  }
+
+  function stopIdentityButton() {
+    return currentStructuralSendButton({
+      getAttribute: (name: string) =>
+        name === "type" ? "submit" : name === "aria-label" ? "Stop generating" : null,
+    });
+  }
+
+  function currentVoiceButton() {
+    return currentStructuralSendButton({
+      getAttribute: (name: string) =>
+        name === "type" ? "submit" : name === "aria-label" ? "开始语音" : null,
+    });
+  }
+
+  it("shared matcher: legacy testid and current structural Send pass; every partial shape fails", () => {
+    expect(matchesSendTargetIdentity({
+      getAttribute: (name: string) => (name === "data-testid" ? "send-button" : null),
+    })).toBe(true);
+    expect(matchesSendTargetIdentity(currentStructuralSendButton())).toBe(true);
+    expect(matchesSendTargetIdentity(currentStructuralSendButton({
+      className: "size-token-button-composer",
+    }))).toBe(false);
+    expect(matchesSendTargetIdentity(currentStructuralSendButton({
+      className: "bg-composer-primary",
+    }))).toBe(false);
+    expect(matchesSendTargetIdentity(currentStructuralSendButton({
+      getAttribute: () => null,
+    }))).toBe(false);
+    expect(matchesSendTargetIdentity(disabledSubmitButton())).toBe(false);
+    expect(matchesSendTargetIdentity(stopIdentityButton())).toBe(false);
+    expect(matchesSendTargetIdentity(currentVoiceButton())).toBe(false);
+    expect(matchesSendTargetIdentity(null)).toBe(false);
+  });
+
+  it("current structural Send lifecycle → exactly-one click → observed", async () => {
+    const result = await runWithDom({
+      postWriteAction: {
+        kind: "send",
+        enabled: true,
+        button: currentStructuralSendButton(),
+        evidence: "current_submit_send",
+      },
+      runner: okDomDeps({ turnsAfterClick: [{ id: "t1", text: ATTEST }] }),
+    });
+    expect(result.ok).toBe(true);
+    expect(result.observed).toBe(true);
+    expect(result.clicked).toBe(true);
+    expect(result.__clicks).toBe(1);
+  });
+
+  it.each([
+    ["missing a class token", () => currentStructuralSendButton({
+      className: "size-token-button-composer",
+    })],
+    ["missing type=submit", () => currentStructuralSendButton({
+      getAttribute: () => null,
+    })],
+    ["disabled submit", disabledSubmitButton],
+    ["stop identity outranks structure", stopIdentityButton],
+    ["blank current-voice control", currentVoiceButton],
+  ])("partial structural (%s) polls to timeout → send_not_ready, zero click, written-unsent shape", async (
+    _label: string,
+    makeButton: () => Record<string, unknown>,
+  ) => {
+    const button = makeButton();
+    const result = await runWithDom({
+      postWriteAction: { kind: "send", enabled: true, button },
+      runner: okDomDeps({
+        turnsAfterClick: [{ id: "t1", text: ATTEST }],
+        readyTimeoutMs: 200,
+      }),
+    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("route_attest_send_not_ready");
+    expect(result.__clicks).toBe(0);
+    // Exactly the shape the SW R3q written-unsent branch recovers: proven
+    // write (mutationAttempted+wrote), never clicked, never observed.
+    expect(result.mutationAttempted).toBe(true);
+    expect(result.wrote).toBe(true);
+    expect(result.clickAttempted).toBe(false);
+    expect(result.observed).toBe(false);
+  });
+
+  it("click failure keeps clickAttempted=true (OUTCOME_UNKNOWN upstream, never written-unsent)", async () => {
+    const result = await runWithDom({
+      postWriteAction: { kind: "send", enabled: true, button: currentStructuralSendButton() },
+      clickResult: { ok: false, reason: "route_attest_click_failed" },
+      runner: okDomDeps({ turnsAfterClick: [{ id: "t1", text: ATTEST }] }),
+    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("route_attest_click_failed");
+    expect(result.clickAttempted).toBe(true);
+    expect(result.clicked).toBe(false);
+    expect(result.__clicks).toBe(1);
   });
 });

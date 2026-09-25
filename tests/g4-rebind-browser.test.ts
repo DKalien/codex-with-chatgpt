@@ -19,8 +19,15 @@ const EVIDENCE_KEY = "c2c_companion_evidence_v1";
 const CONNECT_KEY = "c2c_companion_connect_flow_v1";
 const AUTONOMY_KEY = "c2c_companion_autonomy_v1";
 
-function storageArea(initial: Record<string, unknown>, failAutonomyPersist = false, failArmedAutonomyPersist = false) {
+function storageArea(
+  initial: Record<string, unknown>,
+  failAutonomyPersist = false,
+  failArmedAutonomyPersist = false,
+  failRouteFenceClear = false,
+  failConnectFlowSetAt: number[] = [],
+) {
   const values = new Map(Object.entries(initial));
+  let connectFlowSetCount = 0;
   return {
     values,
     async get(keys?: string | string[]) {
@@ -35,10 +42,23 @@ function storageArea(initial: Record<string, unknown>, failAutonomyPersist = fal
       if (failArmedAutonomyPersist && (row[AUTONOMY_KEY] as { mode?: string } | undefined)?.mode === "armed") {
         throw new Error("armed autonomy storage unavailable");
       }
+      // Fails only the Nth (1-based) set whose row carries the connect flow,
+      // so the initial begin persist can succeed while a later rollback/harden
+      // commit is injected to fail.
+      if (failConnectFlowSetAt.length > 0 && Object.hasOwn(row, CONNECT_KEY)) {
+        connectFlowSetCount += 1;
+        if (failConnectFlowSetAt.includes(connectFlowSetCount)) {
+          throw new Error("connect flow storage unavailable");
+        }
+      }
       for (const [key, value] of Object.entries(row)) values.set(key, value);
     },
     async remove(keys: string | string[]) {
-      for (const key of (Array.isArray(keys) ? keys : [keys])) values.delete(key);
+      const list = Array.isArray(keys) ? keys : [keys];
+      if (failRouteFenceClear && list.includes(FENCE_KEY)) {
+        throw new Error("route attest fence clear unavailable");
+      }
+      for (const key of list) values.delete(key);
     },
     async setAccessLevel() {},
   };
@@ -108,6 +128,8 @@ async function loadWorker(body: Record<string, unknown>, opts: {
   routeFence?: Record<string, unknown>;
   failAutonomyPersist?: boolean;
   failArmedAutonomyPersist?: boolean;
+  failRouteFenceClear?: boolean;
+  failConnectFlowSetAt?: number[];
   autonomyPolicy?: Record<string, unknown>;
   fetch?: (url: unknown, init?: unknown) => Promise<unknown>;
   tabsSendMessage?: (tabId: number, message: Record<string, unknown>) => Promise<unknown>;
@@ -131,6 +153,8 @@ async function loadWorker(body: Record<string, unknown>, opts: {
     initial.local,
     opts.failAutonomyPersist === true,
     opts.failArmedAutonomyPersist === true,
+    opts.failRouteFenceClear === true,
+    opts.failConnectFlowSetAt ?? [],
   );
   const session = storageArea(initial.session);
   let messageListener: ((message: unknown, sender: unknown, sendResponse: (response: unknown) => void) => unknown) | null = null;
@@ -1875,5 +1899,825 @@ describe("G4 R3p recoverable written-unsent bootstrap + abandon connect unknown"
     ) as Record<string, unknown>;
     expect(result).toMatchObject({ ok: false, reason: "connect_identity_mismatch", state: "OUTCOME_UNKNOWN" });
     expect(worker.local.values.get(CONNECT_KEY)).toEqual(flowBefore);
+  });
+});
+
+describe("G4 R3q route-attest written-unsent recovery + abandon route-attest unknown", () => {
+  const LATCH_KEY = "c2c_route_attest_latch_v1";
+  const ATTEST_EXECUTE_TYPE = "c2c.route.attest.execute";
+  const ATTEST_MESSAGE = `[C2C_ROUTE_ATTEST]\nchallengeId=${CHALLENGE}`;
+  const OWNER_SENDER = { tab: { id: 7 }, documentId: "document-g4-rebind", frameId: 0, url: ROUTE };
+
+  function jsonResponse(status: number, body: Record<string, unknown>) {
+    return {
+      ok: status >= 200 && status < 300,
+      status,
+      async json() { return body; },
+    };
+  }
+
+  function routeAttestTransport(overrides: Record<string, unknown> = {}) {
+    return {
+      rebindPending: true,
+      routeVerification: "PENDING",
+      routeAttestationMessage: ATTEST_MESSAGE,
+      routeAttestationExpiresAt: "2099-01-01T00:00:00.000Z",
+      ...overrides,
+    };
+  }
+
+  function routeAttestUnknownFence(overrides: Record<string, unknown> = {}) {
+    return {
+      state: "OUTCOME_UNKNOWN",
+      companionId: OLD_COMPANION,
+      challengeId: CHALLENGE,
+      routeCanonical: ROUTE,
+      challengeExpiresAt: "2099-01-01T00:00:00.000Z",
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      ...overrides,
+    };
+  }
+
+  function connectOutcomeUnknownFlow(overrides: Record<string, unknown> = {}) {
+    return {
+      state: "OUTCOME_UNKNOWN",
+      workspaceId: WORKSPACE,
+      bindingId: NEW_BINDING,
+      epoch: OLD_EPOCH + 1,
+      companionId: NEW_COMPANION,
+      routeCanonical: ROUTE,
+      challengeId: null,
+      updatedAt: Date.now(),
+      ...overrides,
+    };
+  }
+
+  // The ONLY non-NONE flow the abandon may clear: THIS epoch transport's own
+  // hardened attestation flow (live epoch-7 incident shape).
+  function connectUnknownFlowMatchingTransport(overrides: Record<string, unknown> = {}) {
+    return {
+      state: "OUTCOME_UNKNOWN",
+      workspaceId: WORKSPACE,
+      bindingId: OLD_BINDING,
+      epoch: OLD_EPOCH,
+      companionId: OLD_COMPANION,
+      routeCanonical: ROUTE,
+      challengeId: CHALLENGE,
+      updatedAt: Date.now(),
+      ...overrides,
+    };
+  }
+
+  // A still-live managed flow with the exact same identity — identity alone
+  // must NOT authorize abandon; the state must also be OUTCOME_UNKNOWN.
+  function connectAttestRequestedFlowMatchingTransport(overrides: Record<string, unknown> = {}) {
+    return {
+      state: "ATTEST_REQUESTED",
+      workspaceId: WORKSPACE,
+      bindingId: OLD_BINDING,
+      epoch: OLD_EPOCH,
+      companionId: OLD_COMPANION,
+      routeCanonical: ROUTE,
+      challengeId: CHALLENGE,
+      updatedAt: Date.now(),
+      ...overrides,
+    };
+  }
+
+  function emptyConnectFlowShape() {
+    return {
+      state: "NONE",
+      workspaceId: null,
+      bindingId: null,
+      epoch: null,
+      companionId: null,
+      routeCanonical: null,
+      challengeId: null,
+      updatedAt: null,
+    };
+  }
+
+  // Runner-shaped content-script response: proven composer write that never
+  // reached the irreversible click boundary (R3q runner ready-gate timeout).
+  function routeAttestResult(overrides: Record<string, unknown> = {}) {
+    return {
+      ok: false,
+      reason: "route_attest_send_not_ready",
+      mutationAttempted: true,
+      wrote: true,
+      verified: true,
+      clickAttempted: false,
+      clicked: false,
+      observed: false,
+      ...overrides,
+    };
+  }
+
+  function attestWorker(
+    tabsResponse: Record<string, unknown> | ((count: number) => Record<string, unknown>),
+    opts: Parameters<typeof loadWorker>[1] = {},
+  ) {
+    let dispatches = 0;
+    return loadWorker(responseBody(), {
+      transport: routeAttestTransport(),
+      ...opts,
+      tabsSendMessage: opts.tabsSendMessage ?? (async (_tabId: number, message: { type: string }) => {
+        if (message.type !== ATTEST_EXECUTE_TYPE) return { ok: true };
+        dispatches += 1;
+        return typeof tabsResponse === "function" ? tabsResponse(dispatches) : tabsResponse;
+      }),
+    });
+  }
+
+  // The direct route-attest dispatch requires safe idle evidence; seed it the
+  // same way a live owner document heartbeat would.
+  async function seedOwnerEvidence(worker: Awaited<ReturnType<typeof loadWorker>>) {
+    return worker.send({
+      type: "c2c.observe",
+      canonicalRoute: ROUTE,
+      generation: 1,
+      safety: { composer: "empty", generation: "idle", safe: true },
+    }, OWNER_SENDER) as Record<string, unknown>;
+  }
+
+  it("written-unsent route-attest clears the session latch and durable fence and stays retryable", async () => {
+    const worker = await attestWorker(routeAttestResult());
+    expect((await seedOwnerEvidence(worker)).ok).toBe(true);
+
+    const result = await worker.send({ type: "c2c.route.attest.send" }, {}) as Record<string, unknown>;
+    expect(result).toMatchObject({
+      ok: false,
+      reason: "route_attest_send_not_ready",
+      writtenUnsent: true,
+      latchState: "NONE",
+      fenceState: "NONE",
+      retryAllowed: true,
+      composerDirty: true,
+      mutationAttempted: true,
+      clickAttempted: false,
+    });
+    // Durable fence removed (not NONE-with-identity) and session latch absent.
+    expect(worker.local.values.get(FENCE_KEY)).toBeUndefined();
+    expect(worker.session.values.get(LATCH_KEY)).toBeUndefined();
+    // The direct handler never touches the managed connect flow.
+    expect(worker.local.values.get(CONNECT_KEY)).toBeUndefined();
+  });
+
+  it("written-unsent route-attest via Connect rolls the managed connect flow back to NONE", async () => {
+    const worker = await attestWorker(routeAttestResult());
+    const result = await worker.send({
+      type: "c2c.connect.page",
+      generation: 1,
+      canonicalRoute: ROUTE,
+      safety: { composer: "empty", generation: "idle", safe: true },
+    }, OWNER_SENDER) as Record<string, unknown>;
+
+    expect(result).toMatchObject({
+      ok: false,
+      reason: "route_attest_send_not_ready",
+      state: "NONE",
+      retryAllowed: true,
+      composerDirty: true,
+      writtenUnsent: true,
+    });
+    expect(worker.local.values.get(CONNECT_KEY)).toEqual(emptyConnectFlowShape());
+    expect(worker.local.values.get(FENCE_KEY)).toBeUndefined();
+    expect(worker.tabsSendMessage).toHaveBeenCalledTimes(1);
+    // Zero collateral mutation: epoch transport survives byte-identical.
+    expect(worker.local.values.get(TRANSPORT_KEY)).toEqual(worker.initial.transport);
+    expect(worker.session.values.get(OWNER_KEY)).toMatchObject({
+      tabId: 7, documentId: "document-g4-rebind", canonicalRoute: ROUTE,
+    });
+  });
+
+  it("a click-attempted route-attest failure still hardens into OUTCOME_UNKNOWN", async () => {
+    const worker = await attestWorker(routeAttestResult({
+      ok: false,
+      reason: "route_attest_click_failed",
+      clickAttempted: true,
+      clicked: true,
+    }));
+    expect((await seedOwnerEvidence(worker)).ok).toBe(true);
+
+    const result = await worker.send({ type: "c2c.route.attest.send" }, {}) as Record<string, unknown>;
+    expect(result).toMatchObject({
+      ok: false,
+      reason: "route_attest_click_failed",
+      latchState: "OUTCOME_UNKNOWN",
+      fenceState: "OUTCOME_UNKNOWN",
+      retryAllowed: false,
+    });
+    expect(worker.local.values.get(FENCE_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN" });
+  });
+
+  it.each([
+    ["wrote missing", { wrote: undefined }],
+    ["wrote malformed truthy string", { wrote: "yes" }],
+    ["wrote malformed number", { wrote: 1 }],
+  ])("a route-attest response with %s is not classified written-unsent", async (
+    _label: string,
+    override: Record<string, unknown>,
+  ) => {
+    // Positive written-unsent requires POSITIVE wrote === true; missing or
+    // malformed booleans fall through to the OUTCOME_UNKNOWN fail-closed.
+    const worker = await attestWorker(routeAttestResult(override));
+    expect((await seedOwnerEvidence(worker)).ok).toBe(true);
+
+    const result = await worker.send({ type: "c2c.route.attest.send" }, {}) as Record<string, unknown>;
+    expect(result).toMatchObject({
+      ok: false,
+      latchState: "OUTCOME_UNKNOWN",
+      fenceState: "OUTCOME_UNKNOWN",
+      retryAllowed: false,
+    });
+    expect(result.composerDirty).toBeUndefined();
+    expect(result.writtenUnsent).toBeUndefined();
+    expect(worker.local.values.get(FENCE_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN" });
+  });
+
+  it("an observed route-attest failure (inconsistent) stays OUTCOME_UNKNOWN", async () => {
+    const worker = await attestWorker(routeAttestResult({
+      ok: false,
+      reason: "route_attest_outcome_ambiguous",
+      observed: true,
+    }));
+    expect((await seedOwnerEvidence(worker)).ok).toBe(true);
+
+    const result = await worker.send({ type: "c2c.route.attest.send" }, {}) as Record<string, unknown>;
+    expect(result).toMatchObject({
+      ok: false,
+      latchState: "OUTCOME_UNKNOWN",
+      fenceState: "OUTCOME_UNKNOWN",
+      retryAllowed: false,
+    });
+    expect(result.writtenUnsent).toBeUndefined();
+    expect(worker.local.values.get(FENCE_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN" });
+  });
+
+  // review-fix FIX_3: written-unsent requires response.ok === false. A
+  // malformed response that CLAIMS a full composer write (wrote=true) while
+  // reporting ok=true and observed=false is inconsistent evidence — it must
+  // harden OUTCOME_UNKNOWN, never ride the recoverable rollback.
+  it("an ok=true response claiming wrote=true without observed is inconsistent and hardens OUTCOME_UNKNOWN", async () => {
+    const worker = await attestWorker(routeAttestResult({ ok: true }));
+    expect((await seedOwnerEvidence(worker)).ok).toBe(true);
+
+    const result = await worker.send({ type: "c2c.route.attest.send" }, {}) as Record<string, unknown>;
+    expect(result).toMatchObject({
+      ok: false,
+      latchState: "OUTCOME_UNKNOWN",
+      fenceState: "OUTCOME_UNKNOWN",
+      retryAllowed: false,
+    });
+    expect(result.writtenUnsent).toBeUndefined();
+    expect(result.composerDirty).toBeUndefined();
+    expect(worker.local.values.get(FENCE_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN" });
+  });
+
+  it("written-unsent persist failure hardens both stores instead of drifting recoverable", async () => {
+    const worker = await attestWorker(routeAttestResult(), { failRouteFenceClear: true });
+    expect((await seedOwnerEvidence(worker)).ok).toBe(true);
+
+    const result = await worker.send({ type: "c2c.route.attest.send" }, {}) as Record<string, unknown>;
+    expect(result).toMatchObject({
+      ok: false,
+      reason: "route_attest_written_unsent_persist_failed",
+      latchState: "OUTCOME_UNKNOWN",
+      fenceState: "OUTCOME_UNKNOWN",
+      retryAllowed: false,
+      mutationAttempted: true,
+      clickAttempted: false,
+    });
+    // Fail-closed durable end state — never a silent NONE.
+    expect(worker.local.values.get(FENCE_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN" });
+    expect(worker.session.values.get(LATCH_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN" });
+  });
+
+  it("written-unsent route-attest is recoverable: a later explicit Connect completes the attestation", async () => {
+    const worker = await attestWorker((dispatches) => dispatches === 1
+      ? routeAttestResult()
+      : {
+        ok: true,
+        observed: true,
+        mutationAttempted: true,
+        clickAttempted: true,
+        clicked: true,
+      }, {
+      fetch: async (url) => {
+        if (String(url).includes("/state")) {
+          return jsonResponse(409, { error: "COMPANION_REPAIR_BLOCKED" });
+        }
+        throw new Error(`unexpected URL ${String(url)}`);
+      },
+    });
+    const message = {
+      type: "c2c.connect.page",
+      generation: 1,
+      canonicalRoute: ROUTE,
+      safety: { composer: "empty", generation: "idle", safe: true },
+    };
+
+    const first = await worker.send(message, OWNER_SENDER) as Record<string, unknown>;
+    expect(first).toMatchObject({
+      ok: false, reason: "route_attest_send_not_ready", state: "NONE", retryAllowed: true,
+    });
+    expect(worker.local.values.get(CONNECT_KEY)).toEqual(emptyConnectFlowShape());
+
+    const second = await worker.send(message, OWNER_SENDER) as Record<string, unknown>;
+    expect(second).toMatchObject({ ok: true, state: "AWAITING_CONFIRMATION" });
+    expect(worker.local.values.get(CONNECT_KEY)).toMatchObject({ state: "ATTEST_REQUESTED" });
+    expect(worker.local.values.get(FENCE_KEY)).toMatchObject({ state: "OBSERVED_PENDING_CONFIRM" });
+    expect(worker.tabsSendMessage).toHaveBeenCalledTimes(2);
+  });
+
+  // review-fix FIX_2, fault injection: the route-attest fence/latch rollback
+  // inside the managed dispatch commits TOGETHER with the connect flow. When
+  // that single combined commit fails once (set #2), the retry hardens BOTH
+  // durable keys in one commit with the EXACT managed identity — the pre-fix
+  // bug finished an EMPTY flow and persisted a null-identity OUTCOME_UNKNOWN
+  // no abandon path could ever clear. The hardened tail must remain fully
+  // recoverable through the route-attest abandon.
+  it("written-unsent rollback commit failure hardens fence+flow together with the exact managed identity", async () => {
+    const worker = await attestWorker(routeAttestResult(), { failConnectFlowSetAt: [2] });
+    const result = await worker.send({
+      type: "c2c.connect.page",
+      generation: 1,
+      canonicalRoute: ROUTE,
+      safety: { composer: "empty", generation: "idle", safe: true },
+    }, OWNER_SENDER) as Record<string, unknown>;
+
+    expect(result).toMatchObject({
+      ok: false,
+      reason: "connect_fence_persist_failed",
+      state: "OUTCOME_UNKNOWN",
+      retryAllowed: false,
+    });
+    // Never a null-identity OUTCOME_UNKNOWN: the durable flow carries the
+    // current epoch transport / challenge identity.
+    expect(worker.local.values.get(CONNECT_KEY)).toEqual({
+      state: "OUTCOME_UNKNOWN",
+      workspaceId: WORKSPACE,
+      bindingId: OLD_BINDING,
+      epoch: OLD_EPOCH,
+      companionId: OLD_COMPANION,
+      routeCanonical: ROUTE,
+      challengeId: CHALLENGE,
+      bootstrapAutoResume: false,
+      updatedAt: expect.any(Number),
+    });
+    // Hardened in the SAME commit, with identity — abandon stays possible.
+    expect(worker.local.values.get(FENCE_KEY)).toMatchObject({
+      state: "OUTCOME_UNKNOWN",
+      companionId: OLD_COMPANION,
+      challengeId: CHALLENGE,
+      routeCanonical: ROUTE,
+    });
+    const status = await worker.send({ type: "c2c.transport.status" }, {}) as Record<string, any>;
+    expect(status.routeAttestFence).toBe("OUTCOME_UNKNOWN");
+    expect(status.routeAttestLatch).toBe("OUTCOME_UNKNOWN");
+
+    // The hardened tail is a complete recovery path: the exact-owner abandon
+    // clears latch + fence + managed flow, nothing else.
+    const abandoned = await worker.send(
+      { type: "c2c.route-attest.abandon.unknown", ownerProofId: worker.proofId },
+      {},
+    ) as Record<string, unknown>;
+    expect(abandoned).toMatchObject({
+      ok: true,
+      abandoned: true,
+      connectOutcome: "abandoned",
+      state: "NONE",
+      zeroWrite: true,
+      zeroClick: true,
+      zeroBridgeMutation: true,
+    });
+    expect(worker.local.values.get(FENCE_KEY)).toBeUndefined();
+    expect(worker.local.values.get(CONNECT_KEY)).toEqual(emptyConnectFlowShape());
+  });
+
+  // review-fix FIX_2, sustained fault injection: even when BOTH the rollback
+  // clear (set #2) and the atomic harden (set #3) fail, the durable tail is
+  // the mid-dispatch pair the pre-RPC persists left behind — exact-identity
+  // ROUTE_ATTEST_DISPATCH fence + exact-identity ATTEST_REQUESTED flow —
+  // never one NONE plus one unknown, and never a null-identity
+  // OUTCOME_UNKNOWN. Memory stays fail-closed hardened with the same
+  // identity; the manual abandon still recovers the whole scene.
+  it("written-unsent rollback with sustained connect-flow storage failure stays identity-consistent and manually recoverable", async () => {
+    const worker = await attestWorker(routeAttestResult(), { failConnectFlowSetAt: [2, 3] });
+    const result = await worker.send({
+      type: "c2c.connect.page",
+      generation: 1,
+      canonicalRoute: ROUTE,
+      safety: { composer: "empty", generation: "idle", safe: true },
+    }, OWNER_SENDER) as Record<string, unknown>;
+
+    expect(result).toMatchObject({
+      ok: false,
+      reason: "connect_fence_persist_failed",
+      state: "OUTCOME_UNKNOWN",
+      retryAllowed: false,
+    });
+    // Durable tail: the pre-attest pair the begin persist left behind.
+    expect(worker.local.values.get(CONNECT_KEY)).toEqual({
+      state: "ATTEST_REQUESTED",
+      workspaceId: WORKSPACE,
+      bindingId: OLD_BINDING,
+      epoch: OLD_EPOCH,
+      companionId: OLD_COMPANION,
+      routeCanonical: ROUTE,
+      challengeId: CHALLENGE,
+      bootstrapAutoResume: false,
+      updatedAt: expect.any(Number),
+    });
+    expect(worker.local.values.get(FENCE_KEY)).toMatchObject({
+      state: "ROUTE_ATTEST_DISPATCH",
+      companionId: OLD_COMPANION,
+      challengeId: CHALLENGE,
+      routeCanonical: ROUTE,
+    });
+    // Memory is fail-closed hardened with the same identity.
+    const status = await worker.send({ type: "c2c.transport.status" }, {}) as Record<string, any>;
+    expect(status.routeAttestFence).toBe("OUTCOME_UNKNOWN");
+    expect(status.routeAttestLatch).toBe("OUTCOME_UNKNOWN");
+
+    // Manual abandon still recovers: memory fence/flow are identity-exact.
+    const abandoned = await worker.send(
+      { type: "c2c.route-attest.abandon.unknown", ownerProofId: worker.proofId },
+      {},
+    ) as Record<string, unknown>;
+    expect(abandoned).toMatchObject({ ok: true, abandoned: true, state: "NONE", zeroBridgeMutation: true });
+    expect(worker.local.values.get(FENCE_KEY)).toBeUndefined();
+    expect(worker.local.values.get(CONNECT_KEY)).toEqual(emptyConnectFlowShape());
+  });
+
+  it("abandon route-attest unknown clears only latch/fence/connectFlow with zero mutations (popup sender + exact-owner proof)", async () => {
+    // review-fix FIX_1: the managed connectFlow must be THIS transport's own
+    // hardened attestation flow — the live epoch-7 incident shape.
+    const worker = await loadWorker(responseBody(), {
+      transport: routeAttestTransport(),
+      routeFence: routeAttestUnknownFence(),
+      connectFlow: connectUnknownFlowMatchingTransport(),
+    });
+    const localBefore = Object.fromEntries(worker.local.values);
+    const sessionBefore = Object.fromEntries(worker.session.values);
+
+    const result = await worker.send(
+      { type: "c2c.route-attest.abandon.unknown", ownerProofId: worker.proofId },
+      {},
+    ) as Record<string, unknown>;
+    expect(result).toMatchObject({
+      ok: true,
+      abandoned: true,
+      connectOutcome: "abandoned",
+      state: "NONE",
+      zeroWrite: true,
+      zeroClick: true,
+      zeroBridgeMutation: true,
+    });
+    // Durable attest fence removed (key gone, not NONE-with-identity).
+    expect(worker.local.values.get(FENCE_KEY)).toBeUndefined();
+    expect(worker.session.values.get(LATCH_KEY)).toBeUndefined();
+    expect(worker.local.values.get(CONNECT_KEY)).toEqual(emptyConnectFlowShape());
+    // Byte-level proof: every other durable key is untouched. Clearing a
+    // pristine-NONE attest fence REMOVES the storage key, so the after-key set
+    // is exactly the before-set minus the fence.
+    const localAfter = Object.fromEntries(worker.local.values);
+    expect(Object.keys(localAfter).sort()).toEqual(
+      Object.keys(localBefore).filter(key => key !== FENCE_KEY).sort(),
+    );
+    for (const [key, value] of Object.entries(localBefore)) {
+      if (key === FENCE_KEY || key === CONNECT_KEY) continue;
+      expect(localAfter[key]).toEqual(value);
+    }
+    expect(Object.fromEntries(worker.session.values)).toEqual(sessionBefore);
+
+    // Epoch-7 transport with its rebind intent survives; attest stores read NONE.
+    const status = await worker.send({ type: "c2c.transport.status" }, {}) as Record<string, any>;
+    expect(status.routeAttestFence).toBe("NONE");
+    expect(status.routeAttestLatch).toBe("NONE");
+    expect(status.transport.rebindPending).toBe(true);
+    expect(status.transport.companionId).toBe(OLD_COMPANION);
+  });
+
+  // review-fix FIX_1: a foreign (non-managed) connect flow — different
+  // binding/companion/epoch — is collateral the abandon must never clear. The
+  // gate rejects BEFORE consuming the one-use proof: the retry with the same
+  // proof id fails on identity again, not on owner_proof_used.
+  it("abandon route-attest rejects a foreign connect flow without mutation and without burning the proof", async () => {
+    const foreignFlow = connectOutcomeUnknownFlow();
+    const worker = await loadWorker(responseBody(), {
+      transport: routeAttestTransport(),
+      routeFence: routeAttestUnknownFence(),
+      connectFlow: foreignFlow,
+    });
+
+    const first = await worker.send(
+      { type: "c2c.route-attest.abandon.unknown", ownerProofId: worker.proofId },
+      {},
+    ) as Record<string, unknown>;
+    expect(first).toMatchObject({
+      ok: false,
+      reason: "connect_identity_mismatch",
+      fenceState: "OUTCOME_UNKNOWN",
+    });
+    expect(worker.local.values.get(CONNECT_KEY)).toEqual(foreignFlow);
+    expect(worker.local.values.get(FENCE_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN" });
+
+    // The proof was not consumed by the rejected attempt.
+    const second = await worker.send(
+      { type: "c2c.route-attest.abandon.unknown", ownerProofId: worker.proofId },
+      {},
+    ) as Record<string, unknown>;
+    expect(second).toMatchObject({ ok: false, reason: "connect_identity_mismatch" });
+    expect(worker.local.values.get(CONNECT_KEY)).toEqual(foreignFlow);
+  });
+
+  // review-fix FIX_1: identity alone is not enough — a still-live managed flow
+  // (ATTEST_REQUESTED for exactly this transport) is not a hardened unknown and
+  // must never be cleared by the abandon.
+  it("abandon route-attest rejects a still-live managed flow even with matching identity", async () => {
+    const liveFlow = connectAttestRequestedFlowMatchingTransport();
+    const worker = await loadWorker(responseBody(), {
+      transport: routeAttestTransport(),
+      routeFence: routeAttestUnknownFence(),
+      connectFlow: liveFlow,
+    });
+
+    const result = await worker.send(
+      { type: "c2c.route-attest.abandon.unknown", ownerProofId: worker.proofId },
+      {},
+    ) as Record<string, unknown>;
+    expect(result).toMatchObject({
+      ok: false,
+      reason: "connect_identity_mismatch",
+      fenceState: "OUTCOME_UNKNOWN",
+    });
+    expect(worker.local.values.get(CONNECT_KEY)).toEqual(liveFlow);
+    expect(worker.local.values.get(FENCE_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN" });
+  });
+
+  // review-fix FIX_1: the direct/manual route-attest scenario has no managed
+  // flow at all — abandon must keep working and leave the flow untouched.
+  it("abandon route-attest succeeds with a NONE managed connect flow and leaves it untouched", async () => {
+    const worker = await loadWorker(responseBody(), {
+      transport: routeAttestTransport(),
+      routeFence: routeAttestUnknownFence(),
+    });
+
+    const result = await worker.send(
+      { type: "c2c.route-attest.abandon.unknown", ownerProofId: worker.proofId },
+      {},
+    ) as Record<string, unknown>;
+    expect(result).toMatchObject({
+      ok: true,
+      abandoned: true,
+      connectOutcome: "abandoned",
+      state: "NONE",
+      zeroWrite: true,
+      zeroClick: true,
+      zeroBridgeMutation: true,
+    });
+    expect(worker.local.values.get(FENCE_KEY)).toBeUndefined();
+    expect(worker.local.values.get(CONNECT_KEY)).toBeUndefined();
+  });
+
+  it("abandon route-attest rejects a transport without a pending rebind and keeps the fence", async () => {
+    const worker = await loadWorker(responseBody(), {
+      transport: routeAttestTransport({ rebindPending: false }),
+      routeFence: routeAttestUnknownFence(),
+    });
+    const fenceBefore = worker.local.values.get(FENCE_KEY);
+
+    const result = await worker.send(
+      { type: "c2c.route-attest.abandon.unknown", ownerProofId: worker.proofId },
+      {},
+    ) as Record<string, unknown>;
+    expect(result).toMatchObject({
+      ok: false,
+      reason: "route_attest_not_rebind_pending",
+      fenceState: "OUTCOME_UNKNOWN",
+    });
+    expect(worker.local.values.get(FENCE_KEY)).toEqual(fenceBefore);
+  });
+
+  it("abandon route-attest rejects when the attest fence is not OUTCOME_UNKNOWN", async () => {
+    const worker = await loadWorker(responseBody(), { transport: routeAttestTransport() });
+    const result = await worker.send(
+      { type: "c2c.route-attest.abandon.unknown", ownerProofId: worker.proofId },
+      {},
+    ) as Record<string, unknown>;
+    expect(result).toMatchObject({
+      ok: false,
+      reason: "route_attest_not_outcome_unknown",
+      fenceState: "NONE",
+    });
+    expect(worker.local.values.get(FENCE_KEY)).toBeUndefined();
+  });
+
+  it.each([
+    ["route mismatch", { routeCanonical: OLD_ROUTE }],
+    ["companion mismatch", { companionId: NEW_COMPANION }],
+    ["challenge mismatch", { challengeId: "66666666-6666-4666-8666-666666666666" }],
+    ["missing challenge", { challengeId: null }],
+  ])("abandon route-attest rejects a %s between fence and epoch transport", async (
+    _label: string,
+    fenceOverride: Record<string, unknown>,
+  ) => {
+    const worker = await loadWorker(responseBody(), {
+      transport: routeAttestTransport(),
+      routeFence: routeAttestUnknownFence(fenceOverride),
+    });
+    const fenceBefore = worker.local.values.get(FENCE_KEY);
+
+    const result = await worker.send(
+      { type: "c2c.route-attest.abandon.unknown", ownerProofId: worker.proofId },
+      {},
+    ) as Record<string, unknown>;
+    expect(result).toMatchObject({
+      ok: false,
+      reason: "route_attest_identity_mismatch",
+      fenceState: "OUTCOME_UNKNOWN",
+    });
+    expect(worker.local.values.get(FENCE_KEY)).toEqual(fenceBefore);
+  });
+
+  it("abandon route-attest without relaying the fresh proof fails closed and keeps the fence", async () => {
+    const worker = await loadWorker(responseBody(), {
+      transport: routeAttestTransport(),
+      routeFence: routeAttestUnknownFence(),
+    });
+    const result = await worker.send(
+      { type: "c2c.route-attest.abandon.unknown" },
+      {},
+    ) as Record<string, unknown>;
+    expect(result).toMatchObject({ ok: false, reason: "owner_proof_mismatch", fenceState: "OUTCOME_UNKNOWN" });
+    expect(worker.local.values.get(FENCE_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN" });
+  });
+
+  it("a popup from a non-owner Chat cannot mint a proof nor clear the attest fence", async () => {
+    const worker = await loadWorker(responseBody(), {
+      transport: routeAttestTransport(),
+      routeFence: routeAttestUnknownFence(),
+    });
+    const foreignProof = await worker.send(
+      { type: "c2c.owner-proof.request", href: ROUTE, canonicalRoute: ROUTE, generation: 1 },
+      { tab: { id: 8 }, documentId: "document-foreign-chat", frameId: 0, url: ROUTE },
+    ) as { ok: boolean; reason?: string };
+    expect(foreignProof).toMatchObject({ ok: false, reason: "not_exact_owner" });
+
+    const result = await worker.send(
+      { type: "c2c.route-attest.abandon.unknown", ownerProofId: "op_forged_id" },
+      {},
+    ) as Record<string, unknown>;
+    expect(result).toMatchObject({ ok: false, reason: "owner_proof_missing", fenceState: "OUTCOME_UNKNOWN" });
+    expect(worker.local.values.get(FENCE_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN" });
+  });
+
+  it("abandon route-attest rejects a replayed (used) proof and keeps the fence durable", async () => {
+    const worker = await loadWorker(responseBody(), {
+      transport: routeAttestTransport(),
+      routeFence: routeAttestUnknownFence(),
+      fetch: async (url) => String(url).includes("/rebind/init")
+        ? jsonResponse(409, { error: "COMPANION_REBIND_NOT_SUCCESSOR" })
+        : Promise.reject(new Error(`unexpected URL ${String(url)}`)),
+    });
+    // Consume the one-use proof through the rebind-start flow first.
+    const rebind = await worker.send(
+      { type: "c2c.rebind.start", ownerProofId: worker.proofId },
+      {},
+    ) as { ok: boolean; reason?: string };
+    expect(rebind.ok).toBe(false);
+    expect(rebind.reason).toBe("COMPANION_REBIND_NOT_SUCCESSOR");
+
+    const result = await worker.send(
+      { type: "c2c.route-attest.abandon.unknown", ownerProofId: worker.proofId },
+      {},
+    ) as Record<string, unknown>;
+    expect(result).toMatchObject({ ok: false, reason: "owner_proof_used", fenceState: "OUTCOME_UNKNOWN" });
+    expect(worker.local.values.get(FENCE_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN" });
+  });
+
+  it("abandon route-attest rejects an expired proof and keeps the fence durable", async () => {
+    const worker = await loadWorker(responseBody(), {
+      transport: routeAttestTransport(),
+      routeFence: routeAttestUnknownFence(),
+    });
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(Date.now() + 13_000);
+      const result = await worker.send(
+        { type: "c2c.route-attest.abandon.unknown", ownerProofId: worker.proofId },
+        {},
+      ) as Record<string, unknown>;
+      expect(result).toMatchObject({ ok: false, reason: "owner_proof_expired", fenceState: "OUTCOME_UNKNOWN" });
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(worker.local.values.get(FENCE_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN" });
+  });
+
+  it("abandon route-attest rejects a proof whose document no longer matches the exact owner", async () => {
+    const worker = await loadWorker(responseBody(), {
+      transport: routeAttestTransport(),
+      routeFence: routeAttestUnknownFence(),
+    });
+    // Same tab, but the SPA created a new document that re-bound as the owner;
+    // the previously minted proof belongs to the old document.
+    const rebound = await worker.send(
+      { type: "c2c.bind", generation: 2, canonicalRoute: ROUTE },
+      { tab: { id: 7 }, documentId: "document-new-doc", frameId: 0, url: ROUTE },
+    ) as { ok: boolean };
+    expect(rebound.ok).toBe(true);
+
+    const result = await worker.send(
+      { type: "c2c.route-attest.abandon.unknown", ownerProofId: worker.proofId },
+      {},
+    ) as Record<string, unknown>;
+    expect(result).toMatchObject({
+      ok: false,
+      reason: "owner_proof_document_mismatch",
+      fenceState: "OUTCOME_UNKNOWN",
+    });
+    expect(worker.local.values.get(FENCE_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN" });
+  });
+
+  it("abandon route-attest rejects content-script senders without touching the fence", async () => {
+    const worker = await loadWorker(responseBody(), {
+      transport: routeAttestTransport(),
+      routeFence: routeAttestUnknownFence(),
+    });
+    const fenceBefore = worker.local.values.get(FENCE_KEY);
+
+    const result = await worker.send(
+      { type: "c2c.route-attest.abandon.unknown", ownerProofId: worker.proofId },
+      OWNER_SENDER,
+    ) as Record<string, unknown>;
+    expect(result).toMatchObject({ ok: false, reason: "popup_sender_required" });
+    expect(worker.local.values.get(FENCE_KEY)).toEqual(fenceBefore);
+  });
+
+  it("abandon route-attest is serialized behind an in-flight transport mutation (no proof burn, no fence write)", async () => {
+    // Like every durable-state mutation, the attest abandon must queue behind
+    // the transport mutation gate: while a rebind holds the gate, abandon is
+    // rejected BEFORE its handler runs; the durable OUTCOME_UNKNOWN fence is
+    // untouched and no proof is consumed — a proof minted while the gate is
+    // held still clears the fence afterwards.
+    let releaseInit!: (value: unknown) => void;
+    const pendingInit = new Promise(resolve => { releaseInit = resolve; });
+    const worker = await loadWorker(responseBody(), {
+      transport: routeAttestTransport(),
+      routeFence: routeAttestUnknownFence(),
+      fetch: async (url) => {
+        if (String(url).includes("/rebind/init")) return pendingInit;
+        throw new Error(`unexpected URL ${String(url)}`);
+      },
+    });
+
+    // An in-flight Rebind holds the transport mutation gate.
+    const rebind = worker.send({ type: "c2c.rebind.start", ownerProofId: worker.proofId }, {});
+    await vi.waitFor(() => expect(worker.fetchMock).toHaveBeenCalledTimes(1));
+
+    const blocked = await worker.send(
+      { type: "c2c.route-attest.abandon.unknown", ownerProofId: worker.proofId },
+      {},
+    ) as Record<string, unknown>;
+    expect(blocked).toMatchObject({
+      ok: false,
+      reason: "transport_mutation_in_flight",
+      retryAllowed: true,
+    });
+    // The gate-held abandon wrote nothing: the fence still shows the barrier
+    // the rebind itself persisted before its pending fetch.
+    expect(worker.local.values.get(FENCE_KEY)).toMatchObject({ state: "PAIRING_TRANSITION" });
+
+    // A proof minted through the exact owner while the gate is still held.
+    const minted = await worker.send(
+      { type: "c2c.owner-proof.request", href: ROUTE, canonicalRoute: ROUTE, generation: 1 },
+      OWNER_SENDER,
+    ) as { ok: boolean; proof?: { id: string } };
+    expect(minted.ok).toBe(true);
+    expect(minted.proof?.id).toBeTruthy();
+
+    // Rebind finishes (409: barrier restored, fence untouched, gate released).
+    releaseInit(jsonResponse(409, { error: "COMPANION_REBIND_NOT_SUCCESSOR" }));
+    expect(await rebind).toMatchObject({ ok: false, reason: "COMPANION_REBIND_NOT_SUCCESSOR" });
+    expect(worker.local.values.get(FENCE_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN" });
+
+    // The gate-held abandon consumed nothing: the fresh proof clears the fence.
+    const result = await worker.send(
+      { type: "c2c.route-attest.abandon.unknown", ownerProofId: minted.proof!.id },
+      {},
+    ) as Record<string, unknown>;
+    expect(result).toMatchObject({
+      ok: true,
+      abandoned: true,
+      connectOutcome: "abandoned",
+      state: "NONE",
+      zeroWrite: true,
+      zeroClick: true,
+      zeroBridgeMutation: true,
+    });
+    expect(worker.local.values.get(FENCE_KEY)).toBeUndefined();
   });
 });
