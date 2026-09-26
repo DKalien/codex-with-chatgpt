@@ -30,6 +30,7 @@ const sha256 = z.string().regex(/^[a-f0-9]{64}$/);
 
 const strictRetirementEntrySchema = z.object({
   commandId: desktopId,
+  deliveryId: uuid.optional(),
   deliverySha256: sha256,
   observedMissingAt: canonicalTimestamp,
 }).strict();
@@ -37,6 +38,7 @@ const strictRetirementEntrySchema = z.object({
 const ownerlessRetirementEntrySchema = z.object({
   kind: z.literal("ownerless"),
   commandId: desktopId,
+  deliveryId: uuid.optional(),
   deliverySha256: sha256,
   observedOwnerlessAt: canonicalTimestamp,
   maintenanceThreadId: uuid,
@@ -232,6 +234,7 @@ export function readLegacyRetirements(workspaceId: string): LegacyRetirementEvid
 function deliverySummary(delivery: DesktopDelivery): Record<string, unknown> {
   return {
     commandId: delivery.commandId,
+    ...(delivery.deliveryId === undefined ? {} : { deliveryId: delivery.deliveryId }),
     clientId: delivery.clientId,
     bindingId: delivery.bindingId,
     intent: delivery.intent ?? null,
@@ -565,17 +568,22 @@ export async function retireLegacyAccepted(
         if (prior.deliverySha256 !== lockedFacts.deliverySha256) {
           return conflict("已有 retirement 证据与当前 delivery 摘要冲突；不覆盖旧证据。");
         }
+        if (prior.deliveryId !== lockedFacts.delivery.deliveryId) {
+          return conflict("已有 retirement deliveryId 与当前 delivery 不一致；不覆盖旧证据。");
+        }
         return { status: "already_retired", commandId };
       }
       const evidence: LegacyRetirementEvidence = ownerless ? {
         kind: "ownerless",
         commandId,
+        ...(lockedFacts.delivery.deliveryId === undefined ? {} : { deliveryId: lockedFacts.delivery.deliveryId }),
         deliverySha256: lockedFacts.deliverySha256,
         observedOwnerlessAt: confirmation.observedAt,
         maintenanceThreadId: maintenance!.threadId,
         maintenanceTurnId: maintenance!.resultTurnId,
       } : {
         commandId,
+        ...(lockedFacts.delivery.deliveryId === undefined ? {} : { deliveryId: lockedFacts.delivery.deliveryId }),
         deliverySha256: lockedFacts.deliverySha256,
         observedMissingAt: confirmation.observedAt,
       };
@@ -612,7 +620,7 @@ export function getRetiredLegacyCommandIds(workspaceRaw: LegacyRetirementWorkspa
       throw new LegacyRetirementError("LEGACY_RETIREMENT_CONFLICT", "已有 retirement 证据与当前 Desktop 或本地事实冲突；拒绝忽略。");
     }
     // maintenance thread/turn 是创建时的审计事实；当前 binding 的资格由 eligibleFacts 重验。
-    if (entry.deliverySha256 !== facts.deliverySha256) {
+    if (entry.deliverySha256 !== facts.deliverySha256 || entry.deliveryId !== facts.delivery.deliveryId) {
       return conflict("已有 retirement 证据与当前 delivery 摘要冲突；拒绝忽略。");
     }
     retired.add(entry.commandId);

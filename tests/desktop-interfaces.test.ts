@@ -230,8 +230,13 @@ describe("Desktop MCP 与本地接口", () => {
     const prefix = "中文计划\n\n";
     const message = prefix + "中".repeat(21000) + "x";
     const send = vi.fn(async (sent: string) => {
-      expect(JSON.parse(sent)).toEqual({ type: "C2C_DESKTOP_TASK", version: 1, workspaceId: bridge.workspace.id,
-        commandId: "accepted_command", intent, message });
+      const durable = JSON.parse(fs.readFileSync(desktopFile(bridge.workspace.id), "utf8")) as {
+        deliveries: { commandId: string; deliveryId?: string }[];
+      };
+      const storedDeliveryId = durable.deliveries.find(item => item.commandId === "accepted_command")?.deliveryId;
+      expect(storedDeliveryId).toMatch(/^[0-9a-f-]{36}$/i);
+      expect(JSON.parse(sent)).toStrictEqual({ type: "C2C_DESKTOP_TASK", version: 2, workspaceId: bridge.workspace.id,
+        commandId: "accepted_command", intent, deliveryId: storedDeliveryId, message });
       return { threadId: THREAD_ID, turnId: "01a00000-0000-7000-8000-000000000002" };
     });
     vi.spyOn(desktopIpc, "prepare").mockResolvedValue({ send, close: vi.fn() } as never);

@@ -52,12 +52,15 @@ class DesktopIpcHelperTests(unittest.TestCase):
         }
 
     def reconcile_fixture(self, *, message: str = "只读 Desktop 任务", turn_id: str = "01a00000-0000-7000-8000-000000000011",
+                          version: int = 1, delivery_id: str | None = None,
                           **envelope_overrides: object) -> tuple[dict[str, object], dict[str, object]]:
         envelope = {
-            "type": "C2C_DESKTOP_TASK", "version": 1, "workspaceId": "workspace_test",
+            "type": "C2C_DESKTOP_TASK", "version": version, "workspaceId": "workspace_test",
             "commandId": "command_test", "intent": "development_plan", "message": message,
             **envelope_overrides,
         }
+        if delivery_id is not None:
+            envelope["deliveryId"] = delivery_id
         text = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
         state = self.valid_state()
         state["title"] = "synthetic Desktop result"
@@ -73,6 +76,8 @@ class DesktopIpcHelperTests(unittest.TestCase):
         expected = {"workspaceId": "workspace_test", "commandId": "command_test", "intent": "development_plan",
                     "messageBytes": len(message.encode("utf-8")),
                     "messageSha256": hashlib.sha256(message.encode("utf-8")).hexdigest()}
+        if delivery_id is not None:
+            expected["deliveryId"] = delivery_id
         return state, expected
 
     def ownership_fixture(self, *, hops: int = 1, trigger: str | list[str] = "capacity_retry_automatic",
@@ -146,6 +151,63 @@ class DesktopIpcHelperTests(unittest.TestCase):
 
         return Session()
 
+    def run_ownership(self, state: dict[str, object], expected: dict[str, object]):
+        with patch.object(helper, "_current_target", return_value=TARGET), \
+                patch.object(helper, "_prepare", return_value=(self.ownership_session(state), {})), \
+                patch.object(helper, "_verify_process_identity"), patch.object(helper, "_verify_current_runner_ancestor"):
+            return helper._current_result_ownership(TARGET["workspaceRoot"], expected)
+
+    def delivery_alias_fixture(self, *, hops: int = 2, version: int = 2, origin_status: str = "interrupted",
+                               origin_trigger: str = "edit_user_message",
+                               triggers: list[str] | None = None, user_input_on_resume: bool = False,
+                               user_message_on_resume: bool = False, exhausted: bool = True
+                               ) -> tuple[dict[str, object], dict[str, object], list[str]]:
+        message = "synthetic re-materialized origin"
+        delivery_id = "01a00000-0000-7000-8000-000000000200"
+        accepted_id = "01a00000-0000-7000-8000-000000000099"
+        origin_id = "01a00000-0000-7000-8000-000000000201"
+        ids = [origin_id] + [f"01a00000-0000-7000-8000-{201 + index:012d}" for index in range(1, hops + 1)]
+        envelope = {"type": "C2C_DESKTOP_TASK", "version": version, "workspaceId": "workspace_test",
+                    "commandId": "command_test", "intent": "development_plan", "message": message}
+        if version == 2:
+            envelope["deliveryId"] = delivery_id
+        text = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+        origin_item = {"type": "text", "text": text, "text_elements": []}
+        turns: dict[str, object] = {
+            "turn-0": {"turnId": origin_id, "status": origin_status,
+                       "params": {"threadId": THREAD, "turnTrigger": origin_trigger, "input": [origin_item]},
+                       "items": [{"type": "userMessage", "content": [origin_item]}]},
+        }
+        entries = [{"value": "turn-0"}]
+        triggers = triggers or ["resume_interrupted_task"] + ["capacity_retry_automatic"] * max(0, hops - 1)
+        for index in range(1, hops + 1):
+            key = f"turn-{index}"
+            trigger = triggers[index - 1]
+            params: dict[str, object] = {"threadId": THREAD, "turnTrigger": trigger, "input": []}
+            items: list[dict[str, object]] = [{"type": "agentMessage"}]
+            if index == 1 and user_input_on_resume:
+                params["input"] = [{"type": "text", "text": "unexpected", "text_elements": []}]
+            if index == 1 and user_message_on_resume:
+                items = [{"type": "userMessage"}]
+            turns[key] = {"turnId": ids[index], "status": "completed" if index == hops else "interrupted",
+                          "params": params, "items": items}
+            entries.append({"value": key})
+        state = self.valid_state()
+        state["title"] = "synthetic Desktop result"
+        state["threadRuntimeStatus"] = {"type": "idle"}
+        state.pop("turns")
+        state["turnHistory"] = {"kind": "canonical", "history": {
+            "islands": [{"entries": entries, "newerBoundary": {"status": "exhausted" if exhausted else "loading"}}],
+            "entitiesByKey": turns,
+        }}
+        expected = {"workspaceId": "workspace_test", "commandId": "command_test", "intent": "development_plan",
+                    "messageBytes": len(message.encode("utf-8")),
+                    "messageSha256": hashlib.sha256(message.encode("utf-8")).hexdigest(),
+                    "originTurnId": accepted_id}
+        if version == 2:
+            expected["deliveryId"] = delivery_id
+        return state, expected, ids
+
     def test_reconcile_unknown_requires_one_exact_envelope_and_hash(self) -> None:
         state, expected = self.reconcile_fixture()
         self.assertEqual(helper._reconcile_turn_ids(state, expected), ["01a00000-0000-7000-8000-000000000011"])
@@ -194,6 +256,39 @@ class DesktopIpcHelperTests(unittest.TestCase):
         entity["items"][0]["content"][0]["text"] = "different rendered input"  # type: ignore[index]
         self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: helper._reconcile_turn_ids(mismatched, expected))
 
+    def test_reconcile_v2_binds_exact_delivery_id_and_v1_stays_v1_only(self) -> None:
+        delivery_id = "01a00000-0000-7000-8000-000000000200"
+        state, expected = self.reconcile_fixture(version=2, delivery_id=delivery_id)
+        self.assertEqual(helper._reconcile_turn_ids(state, expected), ["01a00000-0000-7000-8000-000000000011"])
+        self.assertEqual(helper._reconcile_expectation(expected)["deliveryId"], delivery_id)
+        self.assertEqual(helper._reconcile_turn_ids(state, {key: value for key, value in expected.items() if key != "deliveryId"}), [])
+        self.assertEqual(helper._reconcile_turn_ids(state, {**expected, "deliveryId": "01a00000-0000-7000-8000-000000000201"}), [])
+
+        missing_id, v1_expected = self.reconcile_fixture(version=2)
+        self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: helper._reconcile_turn_ids(missing_id, v1_expected))
+        extra_v1, v1_expected = self.reconcile_fixture(version=1, deliveryId=delivery_id)
+        self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: helper._reconcile_turn_ids(extra_v1, v1_expected))
+
+    def test_reconcile_v2_rejects_noncanonical_or_duplicate_delivery_id(self) -> None:
+        delivery_id = "01a00000-0000-7000-8000-000000000200"
+        for text in (
+            '{"type":"C2C_DESKTOP_TASK","version":2,"workspaceId":"workspace_test","commandId":"command_test","intent":"development_plan","message":"只读 Desktop 任务"}',
+            '{"type":"C2C_DESKTOP_TASK","version":2,"workspaceId":"workspace_test","commandId":"command_test","intent":"development_plan","message":"只读 Desktop 任务","deliveryId":"BAD"}',
+            '{"type":"C2C_DESKTOP_TASK","version":2,"workspaceId":"workspace_test","commandId":"command_test","intent":"development_plan","message":"只读 Desktop 任务","deliveryId":"01A00000-0000-7000-8000-000000000200"}',
+            '{"type":"C2C_DESKTOP_TASK","version":2,"workspaceId":"workspace_test","commandId":"command_test","intent":"development_plan","message":"只读 Desktop 任务","deliveryId":"01a00000-0000-7000-8000-000000000200","deliveryId":"01a00000-0000-7000-8000-000000000200"}',
+        ):
+            state, expected = self.reconcile_fixture(version=2, delivery_id=delivery_id)
+            turn = state["turnHistory"]["history"]["entitiesByKey"]["turn-1"]  # type: ignore[index]
+            item = {"type": "text", "text": text, "text_elements": []}
+            turn["params"]["input"] = [item]  # type: ignore[index]
+            turn["items"][0]["content"] = [item]  # type: ignore[index]
+            with self.subTest(text=text):
+                self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: helper._reconcile_turn_ids(state, expected))
+
+        bad_expectation = {"workspaceId": "workspace_test", "commandId": "command_test", "intent": "development_plan",
+                           "messageBytes": 1, "messageSha256": "0" * 64, "deliveryId": "01A00000-0000-7000-8000-000000000200"}
+        self.assert_code("DESKTOP_INVALID_REQUEST", lambda: helper._reconcile_expectation(bad_expectation))
+
     def test_reconcile_unknown_requires_canonical_complete_history_and_exact_thread_root(self) -> None:
         state, expected = self.reconcile_fixture()
         flat = self.valid_state()
@@ -206,6 +301,82 @@ class DesktopIpcHelperTests(unittest.TestCase):
         self.assert_code("DESKTOP_TARGET_NOT_FOUND", lambda: helper._validate_observed_state(wrong_thread, TARGET, OWNER))
         wrong_root = dict(state, cwd=r"D:\other-workspace")
         self.assert_code("DESKTOP_PROJECT_MISMATCH", lambda: helper._validate_observed_state(wrong_root, TARGET, OWNER))
+
+    def test_current_result_ownership_accepts_only_exact_v2_edit_delivery_alias(self) -> None:
+        state, expected, ids = self.delivery_alias_fixture()
+        result = self.run_ownership(state, expected)
+        self.assertEqual(result["ownership"], "native_continuation")
+        self.assertEqual(result["originTurnId"], ids[0])
+        self.assertEqual(result["originAlias"], "edit_user_message_v2_delivery")
+        self.assertEqual(result["deliveryId"], expected["deliveryId"])
+        self.assertEqual(result["chainTurnIds"], ids)
+        self.assertEqual(result["chainSignatures"], ["resume_interrupted_task", "capacity_retry_automatic"])
+
+    def test_inspect_result_ownership_uses_explicit_target_without_runner_context(self) -> None:
+        state, expected, ids = self.delivery_alias_fixture()
+        session = self.ownership_session(state)
+        with patch.dict(os.environ, {}, clear=True), \
+                patch.object(helper, "_prepare", return_value=(session, {})) as prepare, \
+                patch.object(helper, "_verify_process_identity") as verify_identity, \
+                patch.object(helper, "_verify_current_runner_ancestor") as verify_runner:
+            result = helper._inspect_result_ownership(TARGET, expected)
+        prepare.assert_called_once_with(TARGET, purpose="observe")
+        verify_identity.assert_called_once_with(session.pipe, TARGET, session.process)
+        verify_runner.assert_not_called()
+        self.assertEqual(result["ownership"], "native_continuation")
+        self.assertEqual(result["originTurnId"], ids[0])
+        self.assertEqual(result["originAlias"], "edit_user_message_v2_delivery")
+        self.assertEqual(result["deliveryId"], expected["deliveryId"])
+        self.assertEqual(result["chainSignatures"], ["resume_interrupted_task", "capacity_retry_automatic"])
+
+    def test_current_result_ownership_alias_fails_closed_for_wrong_or_ambiguous_identity(self) -> None:
+        cases = {
+            "v1_never_aliases": {"version": 1},
+            "wrong_trigger": {"origin_trigger": "resume_interrupted_task"},
+            "wrong_status": {"origin_status": "failed"},
+            "no_immediate_resume": {"triggers": ["capacity_retry_automatic", "capacity_retry_automatic"]},
+            "resume_user_input": {"user_input_on_resume": True},
+            "resume_user_message": {"user_message_on_resume": True},
+            "incomplete_boundary": {"exhausted": False},
+        }
+        for name, kwargs in cases.items():
+            state, expected, _ = self.delivery_alias_fixture(**kwargs)
+            with self.subTest(case=name):
+                self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: self.run_ownership(state, expected))
+
+        state, expected, _ = self.delivery_alias_fixture()
+        self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: self.run_ownership(
+            state, {**expected, "deliveryId": "01a00000-0000-7000-8000-000000000202"}))
+        self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: self.run_ownership(
+            state, {key: value for key, value in expected.items() if key != "deliveryId"}))
+        self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: self.run_ownership(
+            state, {**expected, "commandId": "different_command"}))
+
+    def test_current_result_ownership_alias_rejects_duplicate_and_cross_island_delivery_ids(self) -> None:
+        state, expected, _ = self.delivery_alias_fixture(hops=1)
+        history = state["turnHistory"]["history"]  # type: ignore[index]
+        duplicate = copy.deepcopy(history["entitiesByKey"]["turn-0"])  # type: ignore[index]
+        duplicate["turnId"] = "01a00000-0000-7000-8000-000000000203"
+        history["entitiesByKey"]["duplicate"] = duplicate  # type: ignore[index]
+        history["islands"].append({"entries": [{"value": "duplicate"}], "newerBoundary": {"status": "exhausted"}})  # type: ignore[index]
+        self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: self.run_ownership(state, expected))
+
+        state, expected, _ = self.delivery_alias_fixture(hops=1)
+        history = state["turnHistory"]["history"]  # type: ignore[index]
+        history["islands"] = [  # type: ignore[index]
+            {"entries": [{"value": "turn-0"}], "newerBoundary": {"status": "exhausted"}},
+            {"entries": [{"value": "turn-1"}], "newerBoundary": {"status": "exhausted"}},
+        ]
+        self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: self.run_ownership(state, expected))
+
+    def test_current_result_ownership_prefers_exact_v2_origin_without_alias(self) -> None:
+        state, expected, ids = self.delivery_alias_fixture(hops=1)
+        expected["originTurnId"] = ids[0]
+        result = self.run_ownership(state, expected)
+        self.assertEqual(result["originTurnId"], ids[0])
+        self.assertIsNone(result["originAlias"])
+        self.assertEqual(result["deliveryId"], expected["deliveryId"])
+        self.assertEqual(result["chainSignatures"], ["resume_interrupted_task"])
 
     def test_current_result_ownership_accepts_native_capacity_retry_chain(self) -> None:
         state, expected, ids = self.ownership_fixture()

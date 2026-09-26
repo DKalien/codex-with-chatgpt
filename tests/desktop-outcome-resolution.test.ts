@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Command } from "commander";
 import { desktopFile, DesktopError, readDesktop, updateDesktop } from "../src/desktop/store.js";
@@ -27,6 +28,8 @@ import { cleanup, makeTmpDir } from "./helpers.js";
 const threadId = "01a00000-0000-7000-8000-000000000001";
 const bindingId = "01a00000-0000-7000-8000-000000000002";
 const turnId = "01a00000-0000-7000-8000-000000000003";
+const deliveryIdA = "01a00000-0000-7000-8000-000000000004";
+const deliveryIdB = "01a00000-0000-7000-8000-000000000005";
 const now = "2026-09-20T00:00:00.000Z";
 
 let root: string;
@@ -66,7 +69,7 @@ async function runCli(args: string[]): Promise<{ exitCode: number; stdout: strin
   }
 }
 
-function seedUnknown(commandId = "unknown_one", status: "outcome_unknown" | "accepted" = "outcome_unknown"): void {
+function seedUnknown(commandId = "unknown_one", status: "outcome_unknown" | "accepted" = "outcome_unknown", deliveryId?: string): void {
   updateDesktop(workspace.id, () => ({
     state: {
       version: 1,
@@ -74,12 +77,19 @@ function seedUnknown(commandId = "unknown_one", status: "outcome_unknown" | "acc
       workspaceRoot: workspace.root,
       enabled: true,
       binding: { threadId, hostId: "local" as const, projectId: "project", bindingId, title: "bound", boundAt: now },
-      deliveries: [{ commandId, clientId: "client", bindingId, intent: "development_plan" as const,
+      deliveries: [{ commandId, ...(deliveryId === undefined ? {} : { deliveryId }), clientId: "client", bindingId, intent: "development_plan" as const,
         messageSha256: "a".repeat(64), messageBytes: 1, threadId,
         ...(status === "accepted" ? { turnId, deliveryStatus: "accepted" as const } : { deliveryStatus: "outcome_unknown" as const }),
         createdAt: now, updatedAt: now }],
     }, result: undefined,
   }));
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  return `{${Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b))
+    .map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`).join(",")}}`;
 }
 
 function deferred<T>() {
@@ -106,6 +116,38 @@ describe("Desktop outcome_unknown administrative resolution", () => {
     expect(getResolvedUnknownCommandIds(workspace)).toEqual(new Set(["unknown_one"]));
     expect(fs.existsSync(path.join(stateDir, "executions"))).toBe(false);
     expect(fs.existsSync(path.join(stateDir, "execution-outputs"))).toBe(false);
+  });
+
+  it("v1 confirmation 保持旧摘要字节与 delivery 形状", () => {
+    seedUnknown();
+    const preview = previewOutcomeResolution(workspace, "unknown_one");
+    const delivery = {
+      commandId: "unknown_one", clientId: "client", bindingId, intent: "development_plan",
+      messageSha256: "a".repeat(64), messageBytes: 1, threadId, deliveryStatus: "outcome_unknown",
+      createdAt: now, updatedAt: now,
+    };
+    const expected = createHash("sha256").update(canonicalJson({
+      purpose: "desktop-outcome-resolution-v1", workspaceId: workspace.id, workspaceRoot: workspace.root, delivery,
+    }), "utf8").digest("hex");
+    expect(preview.confirmationSha256).toBe(expected);
+
+    resolveOutcomeUnknown(workspace, "unknown_one", preview.confirmationSha256);
+    expect(readOutcomeResolutions(workspace.id)[0]!.delivery).not.toHaveProperty("deliveryId");
+  });
+
+  it("v2 deliveryId 绑定 confirmation，漂移后拒绝旧摘要", () => {
+    seedUnknown("unknown_one", "outcome_unknown", deliveryIdA);
+    const preview = previewOutcomeResolution(workspace, "unknown_one");
+    updateDesktop(workspace.id, state => {
+      if (!state) throw new Error("missing state");
+      state.deliveries[0]!.deliveryId = deliveryIdB;
+      return { state, result: undefined };
+    });
+    expect(previewOutcomeResolution(workspace, "unknown_one").confirmationSha256).not.toBe(preview.confirmationSha256);
+    expect(() => resolveOutcomeUnknown(workspace, "unknown_one", preview.confirmationSha256)).toThrowError(
+      expect.objectContaining({ code: "DESKTOP_OUTCOME_RESOLUTION_CONFIRMATION_MISMATCH" }),
+    );
+    expect(readOutcomeResolutions(workspace.id)).toEqual([]);
   });
 
   it("错误 confirmation、错误 command、非 unknown 和 corrupt evidence 都 fail closed", () => {

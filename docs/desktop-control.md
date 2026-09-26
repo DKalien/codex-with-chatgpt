@@ -22,18 +22,20 @@ ChatGPT 讨论并确认完整方案
 
 ## 自动验收记录
 
-投递层为已确认正文添加固定 `C2C_DESKTOP_TASK` 内部 envelope，携带 workspaceId、commandId、
-intent；调用方不能覆盖内部字段。replay/hash 仍以原正文为准，完整 wire（包括 envelope 的
-JSON 转义）必须满足 64 KiB 限额，外层 IPC JSON 控制行也按现有 512 KiB 限额精确校验；
-超限拒绝，不截断。Skill 据此在最终回复前记录本轮结果。
+投递层为已确认正文添加 `C2C_DESKTOP_TASK` 内部 envelope。历史 v1 envelope 继续可读；新发送使用
+严格 v2 字段 `type/version/workspaceId/commandId/intent/deliveryId/message`。`deliveryId` 是 C2C
+生成的 UUID，与 `outcome_unknown` durable commit 一起先落盘，再以相同 ID 投递；调用方不能提供或覆盖它，
+重放既有 command 不会生成新 ID 或重发。它只是跨 turn 的来源关联标识，不是授权凭证。replay/hash
+仍以原正文为准，完整 wire（包括 envelope 的 JSON 转义）必须满足 64 KiB 限额，外层 IPC JSON 控制行也按
+现有 512 KiB 限额精确校验；超限拒绝，不截断。Skill 据此在最终回复前记录本轮结果。
 
 统一入口为隐藏本机命令 `c2c record -w <workspace> --iteration 1 --changed-files "<文件列表>"
 --tests "<本轮摘要或 not run>" --exit-status <ok|failed|blocked> --json`。在真实 accepted
 Desktop turn 内它依据 canonical 当前 turn 自动发现唯一当前 delivery，并复用现有受控 Desktop IPC 和
 实时状态验证真实 thread/workspace/root、owner/project、live behavioral 状态、执行进程来源以及当前
 result turnId；`inProgress` 只进入 pending terminal fence，只有 canonical history 中完整的
-terminal turn 才能写 trusted receipt。所有情况均必须同时匹配原 delivery.threadId 和 delivery.turnId。
-不接受调用方传入 turnId；仅伪造环境变量不足以记录。same thread 的后续 turn、无/多个/
+terminal turn 才能写 trusted receipt。所有情况均严格匹配原 delivery.threadId；v1 和未触发 alias 的 v2
+还必须匹配原 delivery.turnId。不接受调用方传入 turnId；仅伪造环境变量不足以记录。same thread 的后续 turn、无/多个/
 未知 active turn、状态读取失败及 turnId mismatch 都拒绝，且不写 record/output。
 disable/rebind 不阻止原 active accepted turn 在最终回复前收尾，其他 turn 不能代记；
 写入前和幂等返回前都重新验证 exact result context；只对短暂 STATE_UNAVAILABLE 做有界重试。
@@ -352,8 +354,8 @@ workspace（包括重新绑定后的目标）暂停后续投递，不能换一�
 当本次 Desktop result turn 仍可由当前进程精确确认时，`record-result` 会先对自己的
 `outcome_unknown` delivery 执行一次有界、严格的 self-reconcile：它要求与手动核对相同的
 exact workspace/binding/thread 一致、Desktop canonical history 最新边界完整且为 `exhausted`、唯一真实
-turn 的完整 `C2C_DESKTOP_TASK` envelope 与原 delivery 的 workspaceId/commandId/intent/message
-完全一致，且 message UTF-8 bytes/SHA-256 相符，并且唯一候选必须等于当前 `resultTurnId` 时，才将
+turn 的完整 `C2C_DESKTOP_TASK` envelope 与原 delivery 的 workspaceId/commandId/intent/message 完全一致，
+v2 时还须匹配 durable `deliveryId`，且 message UTF-8 bytes/SHA-256 相符，并且唯一候选必须等于当前 `resultTurnId` 时，才将
 `outcome_unknown` 恢复为 `accepted + exact turnId` 并继续写入本次 receipt。0 个候选、多个候选、
 malformed/truncated history、wrong turn、当前 context 漂移或核对期间身份/状态漂移均 fail closed；
 不会写 output/record，也不会把后续 turn 当成当前结果，更不会重发 Desktop task 或凭空发明执行事实。
@@ -381,6 +383,22 @@ origin 到 result tip 必须位于同一个 canonical island，不能把 island 
 不创建后台队列、不重发原任务。P0.5 只负责新 send 的 receipt-backed busy-tail settle；
 P0.6 只负责判断哪个 native continuation tip 可以写入旧 command 的唯一 receipt，二者独立。
 
+### v2 delivery provenance alias
+
+Desktop 在手动 Stop→Continue 时可能以 `edit_user_message` 重物化原消息，并让原 accepted turn 从
+canonical history 消失。只有新 v2 envelope 才可使用 `edit_user_message_v2_delivery` alias：完整且 exhausted
+的 history 中 `deliveryId` 候选必须唯一；重物化 turn 必须精确匹配 v2 workspace/command/intent/message bytes+SHA
+和 durable `deliveryId`，trigger 必须精确为 `edit_user_message` 且 status 为 `interrupted`；其紧邻 successor
+必须满足上面的 `resume_interrupted_task` 规则，且当前结果链必须包含该边。IPC 明确返回 alias enum，保留
+实际重物化 `originTurnId`；accepted delivery 的原 `turnId` 不改写。v1、普通 edit、复制到普通新 user turn、
+重复/畸形候选及任何含糊关系仍按 exact turn 规则拒绝。
+
+新 pending receipt 使用 draft v3，在不保存消息正文的前提下持久化首次 ownership snapshot（包括 origin alias、
+deliveryId、result tip 和完整 continuation 签名链）。终态 fence 到达 `safe_terminal` 后，detached worker 通过
+精确 Desktop target 做只读 ownership re-attestation；只有整份 snapshot 与当前 canonical history 一致，且 durable
+accepted delivery 的原 turnId/deliveryId 在写入前仍一致，才可写 output/receipt。v1/v2 draft 仍按原 schema 与
+原 finalizer 语义读取，不补造历史 ownership 证据、不迁移或改写旧 draft。
+
 已存在的 `outcome_unknown` 仍按原始 C2C envelope 的严格 reconciliation 处理；行政 resolution
 只允许在 IPC/历史不可用时独立停止等待，不能恢复为 accepted，也不能进入 P0.6 continuation ownership。
 只有严格 reconciliation 恢复为 accepted origin 后，才允许进入 P0.6 continuation ownership。已有 trusted receipt 仍按原有
@@ -391,7 +409,7 @@ digest/idempotency 规则只读恢复，不能生成第二条 execution record�
 
 ## 防重复与恢复
 
-C2C 自有状态会保存 `commandId`、OAuth `clientId`、`bindingId`、原文摘要、投递阶段及
+C2C 自有状态会保存 `commandId`、v2 delivery 的 `deliveryId`、OAuth `clientId`、`bindingId`、原文摘要、投递阶段及
 真实 `threadId`/`turnId`。状态使用跨进程锁和原子写入；损坏时拒绝继续发送，不清空
 历史、不重置计数。
 

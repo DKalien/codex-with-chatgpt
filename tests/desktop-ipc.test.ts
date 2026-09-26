@@ -366,7 +366,7 @@ describe("Desktop IPC wrapper（fake helper）", () => {
           ...target, title: "结果分类会话", cwd: target.workspaceRoot, runtimeStatus: "active",
           resultTurnId, resultTurnStatus: "inProgress", classification: "applicable",
           ...attestation, ownership: "origin", originTurnId: resultTurnId,
-          chainTurnIds: [resultTurnId], chainLength: 0, chainSignatures: [], signature: null,
+          originAlias: null, chainTurnIds: [resultTurnId], chainLength: 0, chainSignatures: [], signature: null,
         },
       } : { ok: true, value: {} });
     const result = await makeClient(fake.spawnImpl).currentResultClassification(target.workspaceRoot);
@@ -388,7 +388,7 @@ describe("Desktop IPC wrapper（fake helper）", () => {
         resultTurnId, resultTurnStatus: "completed", classification: "applicable",
         workspaceId: "workspace_test", commandId: "desktop_command_test", intent: "development_plan",
         messageBytes: 3, messageSha256: "a".repeat(64), ownership: "native_continuation",
-        originTurnId, chainTurnIds: [originTurnId, resultTurnId], chainLength: 1,
+        originTurnId, originAlias: null, chainTurnIds: [originTurnId, resultTurnId], chainLength: 1,
         chainSignatures: ["resume_interrupted_task"],
         signature: "resume_interrupted_task",
       },
@@ -409,7 +409,7 @@ describe("Desktop IPC wrapper（fake helper）", () => {
       resultTurnId, resultTurnStatus: "completed", classification: "applicable",
       workspaceId: "workspace_test", commandId: "desktop_command_test", intent: "development_plan",
       messageBytes: 3, messageSha256: "a".repeat(64), ownership: "native_continuation",
-      originTurnId, chainTurnIds: [originTurnId, middleTurnId, resultTurnId], chainLength: 2,
+      originTurnId, originAlias: null, chainTurnIds: [originTurnId, middleTurnId, resultTurnId], chainLength: 2,
       chainSignatures: ["capacity_retry_automatic", "resume_interrupted_task"],
       signature: "resume_interrupted_task",
     };
@@ -423,6 +423,43 @@ describe("Desktop IPC wrapper（fake helper）", () => {
     } finally { vi.unstubAllEnvs(); }
   });
 
+  it("currentResultClassification 只接受与 v2 deliveryId 绑定的 edit alias 形态", async () => {
+    vi.stubEnv("CODEX_THREAD_ID", target.threadId); vi.stubEnv("CODEX_SESSION_ID", target.threadId);
+    const deliveryId = randomUUID();
+    const originTurnId = "01a00000-0000-7000-8000-000000000004";
+    const resultTurnId = "01a00000-0000-7000-8000-000000000005";
+    const valid = {
+      ...target, title: "v2 alias 会话", cwd: target.workspaceRoot, runtimeStatus: "idle",
+      resultTurnId, resultTurnStatus: "completed", classification: "applicable",
+      workspaceId: "workspace_test", commandId: "desktop_command_test", intent: "development_plan",
+      messageBytes: 3, messageSha256: "a".repeat(64), deliveryId,
+      ownership: "native_continuation", originTurnId, originAlias: "edit_user_message_v2_delivery",
+      chainTurnIds: [originTurnId, resultTurnId], chainLength: 1,
+      chainSignatures: ["resume_interrupted_task"], signature: "resume_interrupted_task",
+    };
+    const fake = fakeSpawner(request => request.op === "current_result_classification"
+      ? { ok: true, value: valid } : { ok: true, value: {} });
+    try {
+      await expect(makeClient(fake.spawnImpl).currentResultClassification(target.workspaceRoot)).resolves.toMatchObject({
+        classification: "applicable", deliveryId, originAlias: "edit_user_message_v2_delivery",
+      });
+      const malformed = [
+        { ...valid, deliveryId: "not-a-uuid" },
+        { ...valid, deliveryId: undefined },
+        { ...valid, originAlias: "arbitrary_alias" },
+        { ...valid, ownership: "origin" },
+        { ...valid, chainSignatures: ["capacity_retry_automatic"] },
+        (() => { const copy: Record<string, unknown> = { ...valid }; delete copy.originAlias; return copy; })(),
+      ];
+      for (const broken of malformed) {
+        const invalid = fakeSpawner(request => request.op === "current_result_classification"
+          ? { ok: true, value: broken } : { ok: true, value: {} });
+        await expect(makeClient(invalid.spawnImpl).currentResultClassification(target.workspaceRoot))
+          .rejects.toMatchObject({ code: "DESKTOP_PROTOCOL_ERROR" });
+      }
+    } finally { vi.unstubAllEnvs(); }
+  });
+
   it("result classification 拒绝 origin 非空签名和 not_applicable ownership 字段", async () => {
     vi.stubEnv("CODEX_THREAD_ID", target.threadId); vi.stubEnv("CODEX_SESSION_ID", target.threadId);
     const resultTurnId = "01a00000-0000-7000-8000-000000000003";
@@ -431,7 +468,7 @@ describe("Desktop IPC wrapper（fake helper）", () => {
       resultTurnId, resultTurnStatus: "inProgress", classification: "applicable",
       workspaceId: "workspace_test", commandId: "desktop_command_test", intent: "development_plan",
       messageBytes: 3, messageSha256: "a".repeat(64), ownership: "origin", originTurnId: resultTurnId,
-      chainTurnIds: [resultTurnId], chainLength: 0, chainSignatures: [], signature: null,
+      originAlias: null, chainTurnIds: [resultTurnId], chainLength: 0, chainSignatures: [], signature: null,
     };
     const cases = [
       { ...origin, chainSignatures: ["capacity_retry_automatic"] },
@@ -519,7 +556,7 @@ describe("Desktop IPC wrapper（fake helper）", () => {
     const value = {
       ...target, title: "结果会话", cwd: target.workspaceRoot, runtimeStatus: "active",
       resultTurnId, resultTurnStatus: "inProgress", ownership: "native_continuation",
-      originTurnId, chainTurnIds: [originTurnId, resultTurnId], chainLength: 1,
+      originTurnId, originAlias: null, chainTurnIds: [originTurnId, resultTurnId], chainLength: 1,
       chainSignatures: ["resume_interrupted_task"],
       signature: "resume_interrupted_task",
     };
@@ -560,6 +597,96 @@ describe("Desktop IPC wrapper（fake helper）", () => {
         .rejects.toMatchObject({ code: expect.stringMatching(/DESKTOP_(PROTOCOL_ERROR|STATE_UNAVAILABLE|TARGET_NOT_FOUND|RECONCILIATION_CONFLICT)/) });
     }
     vi.unstubAllEnvs();
+  });
+
+  it("currentResultOwnership 允许 alias turn 与 accepted origin 不同但必须精确匹配 v2 ID", async () => {
+    vi.stubEnv("CODEX_THREAD_ID", target.threadId); vi.stubEnv("CODEX_SESSION_ID", target.threadId);
+    const deliveryId = randomUUID();
+    const acceptedTurnId = "01a00000-0000-7000-8000-000000000004";
+    const materializedTurnId = "01a00000-0000-7000-8000-000000000005";
+    const resultTurnId = "01a00000-0000-7000-8000-000000000006";
+    const expectation = {
+      workspaceId: "workspace_test", commandId: "command_test", intent: "development_plan" as const,
+      messageBytes: 10, messageSha256: "a".repeat(64), originTurnId: acceptedTurnId, deliveryId,
+    };
+    const value = {
+      ...target, title: "v2 alias ownership", cwd: target.workspaceRoot, runtimeStatus: "idle",
+      resultTurnId, resultTurnStatus: "completed", ownership: "native_continuation",
+      originTurnId: materializedTurnId, deliveryId, originAlias: "edit_user_message_v2_delivery",
+      chainTurnIds: [materializedTurnId, resultTurnId], chainLength: 1,
+      chainSignatures: ["resume_interrupted_task"], signature: "resume_interrupted_task",
+    };
+    const fake = fakeSpawner(request => request.op === "current_result_ownership"
+      ? { ok: true, value } : { ok: true, value: {} });
+    try {
+      await expect(makeClient(fake.spawnImpl).currentResultOwnership(target.workspaceRoot, expectation))
+        .resolves.toMatchObject({ deliveryId, originTurnId: materializedTurnId, originAlias: "edit_user_message_v2_delivery" });
+      const mismatch = fakeSpawner(request => request.op === "current_result_ownership"
+        ? { ok: true, value: { ...value, deliveryId: randomUUID() } } : { ok: true, value: {} });
+      await expect(makeClient(mismatch.spawnImpl).currentResultOwnership(target.workspaceRoot, expectation))
+        .rejects.toMatchObject({ code: "DESKTOP_RECONCILIATION_CONFLICT" });
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it("inspectResultOwnership uses an explicit target and rejects malformed expectations/results", async () => {
+    const originTurnId = "01a00000-0000-7000-8000-000000000004";
+    const expectation = {
+      workspaceId: "workspace_test", commandId: "command_test", intent: "revision" as const,
+      messageBytes: 10, messageSha256: "a".repeat(64), originTurnId,
+    };
+    const valid = {
+      ...target, title: "Target-scoped result", cwd: target.workspaceRoot, runtimeStatus: "idle",
+      resultTurnId: originTurnId, resultTurnStatus: "completed", ownership: "origin", originTurnId,
+      originAlias: null, chainTurnIds: [originTurnId], chainLength: 0, chainSignatures: [], signature: null,
+    };
+    const fake = fakeSpawner(request => request.op === "inspect_result_ownership"
+      ? { ok: true, value: valid } : { ok: true, value: {} });
+    const result = await makeClient(fake.spawnImpl).inspectResultOwnership(target, expectation);
+    expect(result).toMatchObject({ ownership: "origin", originTurnId, chainSignatures: [] });
+    expect(fake.requests).toHaveLength(1);
+    expect(Object.keys(fake.requests[0]).sort()).toEqual(["expectation", "id", "op", "target"]);
+    expect(fake.requests[0]).toMatchObject({ op: "inspect_result_ownership", target, expectation });
+
+    const deliveryId = randomUUID();
+    const v2Expectation = { ...expectation, deliveryId };
+    const v2Origin = { ...valid, deliveryId };
+    await expect(makeClient(fakeSpawner(request => request.op === "inspect_result_ownership"
+      ? { ok: true, value: v2Origin } : { ok: true, value: {} }).spawnImpl)
+      .inspectResultOwnership(target, v2Expectation)).resolves.toMatchObject({ deliveryId });
+    for (const mismatchedDelivery of [
+      (() => { const value = { ...v2Origin } as Record<string, unknown>; delete value.deliveryId; return value; })(),
+      { ...v2Origin, deliveryId: randomUUID() },
+    ]) {
+      await expect(makeClient(fakeSpawner(request => request.op === "inspect_result_ownership"
+        ? { ok: true, value: mismatchedDelivery } : { ok: true, value: {} }).spawnImpl)
+        .inspectResultOwnership(target, v2Expectation)).rejects.toMatchObject({ code: "DESKTOP_RECONCILIATION_CONFLICT" });
+    }
+    await expect(makeClient(fakeSpawner(request => request.op === "inspect_result_ownership"
+      ? { ok: true, value: { ...valid, deliveryId } } : { ok: true, value: {} }).spawnImpl)
+      .inspectResultOwnership(target, expectation)).rejects.toMatchObject({ code: "DESKTOP_RECONCILIATION_CONFLICT" });
+
+    const malformedRequest = fakeSpawner();
+    await expect(makeClient(malformedRequest.spawnImpl).inspectResultOwnership(
+      target, { ...expectation, ignored: true } as never,
+    )).rejects.toMatchObject({ code: "DESKTOP_INVALID_REQUEST" });
+    expect(malformedRequest.requests).toEqual([]);
+
+    const wrongTarget = fakeSpawner(request => request.op === "inspect_result_ownership"
+      ? { ok: true, value: { ...valid, threadId: randomUUID() } } : { ok: true, value: {} });
+    await expect(makeClient(wrongTarget.spawnImpl).inspectResultOwnership(target, expectation))
+      .rejects.toMatchObject({ code: "DESKTOP_TARGET_NOT_FOUND" });
+
+    for (const broken of [
+      { ...valid, originAlias: "arbitrary_alias" },
+      { ...valid, chainSignatures: ["unknown"] },
+      { ...valid, signature: "capacity_retry_automatic" },
+      (() => { const value = { ...valid } as Record<string, unknown>; delete value.chainSignatures; return value; })(),
+    ]) {
+      const malformedResponse = fakeSpawner(request => request.op === "inspect_result_ownership"
+        ? { ok: true, value: broken } : { ok: true, value: {} });
+      await expect(makeClient(malformedResponse.spawnImpl).inspectResultOwnership(target, expectation))
+        .rejects.toMatchObject({ code: "DESKTOP_PROTOCOL_ERROR" });
+    }
   });
 
   it("diagnose validator 拒绝未知字段、缺字段和坏诊断值", () => {

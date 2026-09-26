@@ -66,6 +66,7 @@ export interface DesktopResultTerminalFence extends DesktopResultContext {
 
 export type DesktopResultOwnershipKind = "origin" | "native_continuation";
 export type NativeContinuationSignature = "capacity_retry_automatic" | "resume_interrupted_task";
+export type DesktopOriginAlias = "edit_user_message_v2_delivery";
 
 export interface DesktopResultOwnershipExpectation extends DesktopUnknownReconcileExpectation {
   originTurnId: string;
@@ -74,6 +75,8 @@ export interface DesktopResultOwnershipExpectation extends DesktopUnknownReconci
 export interface DesktopResultOwnership extends DesktopResultContext {
   ownership: DesktopResultOwnershipKind;
   originTurnId: string;
+  deliveryId?: string;
+  originAlias: DesktopOriginAlias | null;
   chainTurnIds: string[];
   chainLength: number;
   chainSignatures: NativeContinuationSignature[];
@@ -93,6 +96,7 @@ export interface DesktopUnknownReconcileExpectation {
   intent: "development_plan" | "revision";
   messageBytes: number;
   messageSha256: string;
+  deliveryId?: string;
 }
 
 export interface DesktopUnknownReconcileObservation {
@@ -103,7 +107,7 @@ export interface DesktopUnknownReconcileObservation {
   candidates: string[];
 }
 
-const MAX_RESULT_CONTINUATION_CHAIN = 8;
+export const MAX_RESULT_CONTINUATION_CHAIN = 8;
 const MAX_RESULT_ACTIVITY_ITEMS = 4096;
 const RESULT_ACTIVITY_ITEM_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$/u;
 
@@ -428,13 +432,17 @@ export function validateDesktopDiagnosis(value: unknown): DesktopDiagnosis {
 function validateResultOwnershipExpectation(value: DesktopResultOwnershipExpectation): DesktopResultOwnershipExpectation {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw error("DESKTOP_INVALID_REQUEST");
   const keys = Object.keys(value).sort();
-  if (keys.join(",") !== ["commandId", "intent", "messageBytes", "messageSha256", "originTurnId", "workspaceId"].join(",")) {
+  const baseKeys = ["commandId", "intent", "messageBytes", "messageSha256", "originTurnId", "workspaceId"].sort().join(",");
+  const deliveryKeys = ["commandId", "deliveryId", "intent", "messageBytes", "messageSha256", "originTurnId", "workspaceId"].sort().join(",");
+  if (keys.join(",") !== baseKeys &&
+      (keys.join(",") !== deliveryKeys || !Object.prototype.hasOwnProperty.call(value, "deliveryId"))) {
     throw error("DESKTOP_INVALID_REQUEST");
   }
   if (!/^[A-Za-z0-9_-]{1,128}$/u.test(value.workspaceId) || !/^[A-Za-z0-9_-]{1,128}$/u.test(value.commandId) ||
       !["development_plan", "revision"].includes(value.intent) || !isUuid(value.originTurnId) ||
       !Number.isSafeInteger(value.messageBytes) || value.messageBytes < 1 || value.messageBytes > MAX_MESSAGE_BYTES ||
-      !/^[a-f0-9]{64}$/u.test(value.messageSha256)) {
+      !/^[a-f0-9]{64}$/u.test(value.messageSha256) ||
+      (Object.prototype.hasOwnProperty.call(value, "deliveryId") && !isUuid(value.deliveryId))) {
     throw error("DESKTOP_INVALID_REQUEST");
   }
   return { ...value };
@@ -446,17 +454,25 @@ function validateResultOwnership(value: unknown, target: DesktopTarget): Desktop
   const allowed = new Set([
     "threadId", "hostId", "projectId", "workspaceRoot", "title", "cwd", "workspaceKind", "resumeState",
     "runtimeStatus", "requestsCount", "ownerClientId",
-    "resultTurnId", "resultTurnStatus", "ownership", "originTurnId", "chainTurnIds", "chainLength", "chainSignatures", "signature",
+    "resultTurnId", "resultTurnStatus", "ownership", "originTurnId", "deliveryId", "originAlias",
+    "chainTurnIds", "chainLength", "chainSignatures", "signature",
   ]);
   if (Object.keys(input).some(key => !allowed.has(key))) throw error("DESKTOP_PROTOCOL_ERROR");
   const context = validateResultContext(value, target);
   const ownership = input.ownership;
   const originTurnId = input.originTurnId;
+  const deliveryId = input.deliveryId;
+  const originAlias = input.originAlias;
   const chainTurnIds = input.chainTurnIds;
   const chainLength = input.chainLength;
   const chainSignatures = input.chainSignatures;
   const signature = input.signature;
-  if (ownership !== "origin" && ownership !== "native_continuation") throw error("DESKTOP_PROTOCOL_ERROR");
+  if ((ownership !== "origin" && ownership !== "native_continuation") ||
+      !Object.prototype.hasOwnProperty.call(input, "originAlias") ||
+      (originAlias !== null && originAlias !== "edit_user_message_v2_delivery") ||
+      (Object.prototype.hasOwnProperty.call(input, "deliveryId") && !isUuid(deliveryId))) {
+    throw error("DESKTOP_PROTOCOL_ERROR");
+  }
   if (!isUuid(originTurnId) || !Array.isArray(chainTurnIds) ||
       chainTurnIds.length < 1 || chainTurnIds.length > MAX_RESULT_CONTINUATION_CHAIN + 1 ||
       !chainTurnIds.every(isUuid) || new Set(chainTurnIds).size !== chainTurnIds.length ||
@@ -469,21 +485,41 @@ function validateResultOwnership(value: unknown, target: DesktopTarget): Desktop
     throw error("DESKTOP_PROTOCOL_ERROR");
   }
   if (ownership === "origin") {
-    if (chainLength !== 0 || chainSignatures.length !== 0 || signature !== null || context.resultTurnId !== originTurnId) {
+    if (chainLength !== 0 || chainSignatures.length !== 0 || signature !== null || context.resultTurnId !== originTurnId || originAlias !== null) {
       throw error("DESKTOP_PROTOCOL_ERROR");
     }
   } else if (chainLength < 1 || signature !== chainSignatures[chainSignatures.length - 1] || context.resultTurnId === originTurnId) {
+    throw error("DESKTOP_PROTOCOL_ERROR");
+  }
+  if (originAlias !== null &&
+      (!Object.prototype.hasOwnProperty.call(input, "deliveryId") || ownership !== "native_continuation" ||
+       chainSignatures[0] !== "resume_interrupted_task")) {
     throw error("DESKTOP_PROTOCOL_ERROR");
   }
   return {
     ...context,
     ownership,
     originTurnId,
+    ...(Object.prototype.hasOwnProperty.call(input, "deliveryId") ? { deliveryId: deliveryId as string } : {}),
+    originAlias: originAlias as DesktopOriginAlias | null,
     chainTurnIds: [...chainTurnIds],
     chainLength,
     chainSignatures: [...chainSignatures],
     signature: signature as NativeContinuationSignature | null,
   };
+}
+
+function assertResultOwnershipExpectation(
+  value: DesktopResultOwnership,
+  expectation: DesktopResultOwnershipExpectation,
+): DesktopResultOwnership {
+  if (value.deliveryId !== expectation.deliveryId) throw error("DESKTOP_RECONCILIATION_CONFLICT");
+  if (value.originAlias === null) {
+    if (value.originTurnId !== expectation.originTurnId) throw error("DESKTOP_RECONCILIATION_CONFLICT");
+  } else if (!expectation.deliveryId || value.originTurnId === expectation.originTurnId) {
+    throw error("DESKTOP_RECONCILIATION_CONFLICT");
+  }
+  return value;
 }
 
 function validateResultClassification(value: unknown, target: DesktopTarget): DesktopResultClassification {
@@ -493,12 +529,13 @@ function validateResultClassification(value: unknown, target: DesktopTarget): De
     "threadId", "hostId", "projectId", "workspaceRoot", "title", "cwd", "workspaceKind", "resumeState",
     "runtimeStatus", "requestsCount", "ownerClientId",
     "resultTurnId", "resultTurnStatus", "classification", "workspaceId", "commandId", "intent",
-    "messageBytes", "messageSha256", "ownership", "originTurnId", "chainTurnIds", "chainLength", "chainSignatures", "signature",
+    "messageBytes", "messageSha256", "deliveryId", "ownership", "originTurnId", "originAlias",
+    "chainTurnIds", "chainLength", "chainSignatures", "signature",
   ]);
   if (Object.keys(input).some(key => !allowed.has(key))) throw error("DESKTOP_PROTOCOL_ERROR");
   const context = validateResultContext(value, target);
   if (input.classification === "not_applicable") {
-    if (["workspaceId", "commandId", "intent", "messageBytes", "messageSha256", "ownership", "originTurnId", "chainTurnIds", "chainLength", "chainSignatures", "signature"]
+    if (["workspaceId", "commandId", "intent", "messageBytes", "messageSha256", "deliveryId", "ownership", "originTurnId", "originAlias", "chainTurnIds", "chainLength", "chainSignatures", "signature"]
       .some(key => Object.prototype.hasOwnProperty.call(input, key))) {
       throw error("DESKTOP_PROTOCOL_ERROR");
     }
@@ -515,6 +552,7 @@ function validateResultClassification(value: unknown, target: DesktopTarget): De
       intent: input.intent,
       messageBytes: input.messageBytes,
       messageSha256: input.messageSha256,
+      ...(Object.prototype.hasOwnProperty.call(input, "deliveryId") ? { deliveryId: input.deliveryId as string } : {}),
     } as DesktopUnknownReconcileExpectation);
   } catch {
     throw error("DESKTOP_PROTOCOL_ERROR");
@@ -529,13 +567,17 @@ function validateResultClassification(value: unknown, target: DesktopTarget): De
 function validateUnknownReconcileExpectation(value: DesktopUnknownReconcileExpectation): DesktopUnknownReconcileExpectation {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw error("DESKTOP_INVALID_REQUEST");
   const keys = Object.keys(value).sort();
-  if (keys.join(",") !== ["commandId", "intent", "messageBytes", "messageSha256", "workspaceId"].join(",")) {
+  const baseKeys = ["commandId", "intent", "messageBytes", "messageSha256", "workspaceId"].sort().join(",");
+  const exactDeliveryKeys = ["commandId", "deliveryId", "intent", "messageBytes", "messageSha256", "workspaceId"].sort().join(",");
+  if (keys.join(",") !== baseKeys &&
+      (keys.join(",") !== exactDeliveryKeys || !Object.prototype.hasOwnProperty.call(value, "deliveryId"))) {
     throw error("DESKTOP_INVALID_REQUEST");
   }
   if (!/^[A-Za-z0-9_-]{1,128}$/u.test(value.workspaceId) || !/^[A-Za-z0-9_-]{1,128}$/u.test(value.commandId) ||
       !["development_plan", "revision"].includes(value.intent) ||
       !Number.isSafeInteger(value.messageBytes) || value.messageBytes < 1 || value.messageBytes > MAX_MESSAGE_BYTES ||
-      !/^[a-f0-9]{64}$/u.test(value.messageSha256)) {
+      !/^[a-f0-9]{64}$/u.test(value.messageSha256) ||
+      (Object.prototype.hasOwnProperty.call(value, "deliveryId") && !isUuid(value.deliveryId))) {
     throw error("DESKTOP_INVALID_REQUEST");
   }
   return { ...value };
@@ -801,8 +843,21 @@ export class DesktopIpcClient {
   ): Promise<DesktopResultOwnership> {
     const expectation = validateResultOwnershipExpectation(rawExpectation);
     const value = await this.currentOperation("current_result_ownership", workspaceRoot, validateResultOwnership, { expectation }) as unknown as DesktopResultOwnership;
-    if (value.originTurnId !== expectation.originTurnId) throw error("DESKTOP_RECONCILIATION_CONFLICT");
-    return value as DesktopResultOwnership;
+    return assertResultOwnershipExpectation(value, expectation);
+  }
+
+  /** Detached receipt finalizer's explicit-target, read-only ownership re-attestation. */
+  async inspectResultOwnership(
+    rawTarget: DesktopTarget,
+    rawExpectation: DesktopResultOwnershipExpectation,
+  ): Promise<DesktopResultOwnership> {
+    const target = validateTarget(rawTarget);
+    const expectation = validateResultOwnershipExpectation(rawExpectation);
+    const session = this.open();
+    try {
+      const value = await session.request("inspect_result_ownership", { target, expectation });
+      return assertResultOwnershipExpectation(validateResultOwnership(value, target), expectation);
+    } finally { session.close(); }
   }
 
   /** 在单次 current-result 观测中读取 Desktop 自证 envelope，并由调用方与 durable delivery 精确匹配。 */

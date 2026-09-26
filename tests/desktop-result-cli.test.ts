@@ -321,7 +321,7 @@ describe("desktop record-result CLI", () => {
     vi.mocked(desktopIpc.currentResultContext).mockResolvedValue(currentResultContext(continuationTurnId) as never);
     const ownership = vi.spyOn(desktopIpc, "currentResultOwnership").mockResolvedValue({
       ...(currentResultContext(continuationTurnId) as never),
-      ownership: "native_continuation", originTurnId,
+      ownership: "native_continuation", originTurnId, originAlias: null,
       chainTurnIds: [originTurnId, continuationTurnId], chainLength: 1,
       chainSignatures: ["capacity_retry_automatic"],
       signature: "capacity_retry_automatic",

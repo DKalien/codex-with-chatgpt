@@ -16,6 +16,7 @@ const notice = "仅停止等待并接受结果不明；不代表已投递、已�
 
 const deliverySchema = z.object({
   commandId: desktopId,
+  deliveryId: uuid.optional(),
   clientId: z.string().min(1).max(256),
   bindingId: uuid,
   intent: z.union([z.literal("development_plan"), z.literal("revision"), z.null()]),
@@ -153,7 +154,9 @@ function canonicalDelivery(delivery: DesktopDelivery): z.infer<typeof deliverySc
     return conflict("指定 delivery 不是无错误的 outcome_unknown；拒绝行政 resolution。");
   }
   return deliverySchema.parse({
-    commandId: delivery.commandId, clientId: delivery.clientId, bindingId: delivery.bindingId,
+    commandId: delivery.commandId,
+    ...(delivery.deliveryId === undefined ? {} : { deliveryId: delivery.deliveryId }),
+    clientId: delivery.clientId, bindingId: delivery.bindingId,
     intent: delivery.intent ?? null, messageSha256: delivery.messageSha256, messageBytes: delivery.messageBytes,
     threadId: delivery.threadId, deliveryStatus: "outcome_unknown", createdAt: delivery.createdAt, updatedAt: delivery.updatedAt,
   });

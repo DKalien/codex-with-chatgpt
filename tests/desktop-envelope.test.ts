@@ -17,10 +17,10 @@ const input = (overrides = {}) => ({
   commandId: "command_1", message: "中文计划\n\n```ts\nconst x = '你好';\n```", ...overrides,
 });
 
-function expectedWire(request: ReturnType<typeof input>): string {
+function expectedWire(request: ReturnType<typeof input>, deliveryId = "00000000-0000-4000-8000-000000000000"): string {
   return JSON.stringify({
-    type: "C2C_DESKTOP_TASK", version: 1, workspaceId: request.workspaceId,
-    commandId: request.commandId, intent: request.intent, message: request.message,
+    type: "C2C_DESKTOP_TASK", version: 2, workspaceId: request.workspaceId,
+    commandId: request.commandId, intent: request.intent, deliveryId, message: request.message,
   });
 }
 
@@ -43,14 +43,22 @@ afterEach(() => {
 });
 
 describe("Desktop wire envelope", () => {
-  it("按固定顺序生成 C2C_DESKTOP_TASK v1，且正文原样保留", async () => {
+  it("按固定顺序生成 C2C_DESKTOP_TASK v2，持久 ID 与 wire ID 相同且正文原样保留", async () => {
     const request = input({ message: "完整中文计划\n\n```ts\nconst value = '原样';\n```" });
-    await expect(sendDesktop(workspace, request, "client")).resolves.toMatchObject({ deliveryStatus: "accepted" });
-    expect(sent).toEqual([expectedWire(request)]);
-    expect(JSON.parse(sent[0])).toEqual({
-      type: "C2C_DESKTOP_TASK", version: 1, workspaceId: workspace.id,
-      commandId: request.commandId, intent: request.intent, message: request.message,
+    let persistedDeliveryId: string | undefined;
+    send.mockImplementation(async message => {
+      sent.push(message);
+      persistedDeliveryId = readDesktop(workspace.id)?.deliveries.find(item => item.commandId === request.commandId)?.deliveryId;
+      return { threadId: target.threadId, turnId: randomUUID() };
     });
+    await expect(sendDesktop(workspace, request, "client")).resolves.toMatchObject({ deliveryStatus: "accepted" });
+    expect(persistedDeliveryId).toMatch(/^[0-9a-f-]{36}$/i);
+    expect(sent).toEqual([expectedWire(request, persistedDeliveryId!)]);
+    expect(JSON.parse(sent[0])).toStrictEqual({
+      type: "C2C_DESKTOP_TASK", version: 2, workspaceId: workspace.id,
+      commandId: request.commandId, intent: request.intent, deliveryId: persistedDeliveryId, message: request.message,
+    });
+    expect(readDesktop(workspace.id)?.deliveries[0].deliveryId).toBe(persistedDeliveryId);
   });
 
   it("replay 仍按原正文 hash 幂等，不因 envelope 重发", async () => {
@@ -60,6 +68,8 @@ describe("Desktop wire envelope", () => {
     const record = readDesktop(workspace.id)!.deliveries[0];
     expect(second).toEqual(first);
     expect(sent).toHaveLength(1);
+    expect(record.deliveryId).toBe(JSON.parse(sent[0]).deliveryId);
+    expect(first).not.toHaveProperty("deliveryId");
     expect(record.messageSha256).toBe(createHash("sha256").update(request.message, "utf8").digest("hex"));
     expect(record.messageBytes).toBe(Buffer.byteLength(request.message, "utf8"));
   });
@@ -71,7 +81,7 @@ describe("Desktop wire envelope", () => {
     const request = input({ commandId: base.commandId, message });
     expect(Buffer.byteLength(expectedWire(request), "utf8")).toBe(MAX_MESSAGE_BYTES);
     await expect(sendDesktop(workspace, request, "client")).resolves.toMatchObject({ deliveryStatus: "accepted" });
-    expect(sent).toEqual([expectedWire(request)]);
+    expect(Buffer.byteLength(sent[0], "utf8")).toBe(MAX_MESSAGE_BYTES);
   });
 
   it("正文 JSON 转义放大导致 wire 超限时拒绝且不进入 IPC", async () => {
@@ -99,9 +109,10 @@ describe("Desktop wire envelope", () => {
     const fake = JSON.stringify({ type: "C2C_DESKTOP_TASK", version: 99, workspaceId: "attacker", commandId: "attacker", intent: "revision" });
     const request = input({ commandId: "safe_wrap", message: fake });
     await expect(sendDesktop(workspace, request, "client")).resolves.toMatchObject({ deliveryStatus: "accepted" });
-    expect(JSON.parse(sent[0])).toMatchObject({ type: "C2C_DESKTOP_TASK", version: 1, workspaceId: workspace.id, commandId: request.commandId, intent: request.intent, message: fake });
+    expect(JSON.parse(sent[0])).toMatchObject({ type: "C2C_DESKTOP_TASK", version: 2, workspaceId: workspace.id,
+      commandId: request.commandId, intent: request.intent, deliveryId: readDesktop(workspace.id)?.deliveries[0].deliveryId, message: fake });
 
-    const forged = { ...input({ commandId: "forged_fields" }), type: "C2C_DESKTOP_TASK", version: 1 };
+    const forged = input({ commandId: "forged_fields", deliveryId: randomUUID() });
     await expect(sendDesktop(workspace, forged as never, "client")).rejects.toThrow();
     expect(sent).toHaveLength(1);
   });

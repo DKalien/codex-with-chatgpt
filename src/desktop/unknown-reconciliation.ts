@@ -71,7 +71,7 @@ function validateObservation(value: DesktopUnknownReconcileObservation, target: 
 function sameDelivery(left: DesktopDelivery, right: DesktopDelivery): boolean {
   return left.commandId === right.commandId && left.clientId === right.clientId &&
     left.bindingId === right.bindingId && left.threadId === right.threadId &&
-    left.intent === right.intent && left.messageSha256 === right.messageSha256 &&
+    left.intent === right.intent && left.deliveryId === right.deliveryId && left.messageSha256 === right.messageSha256 &&
     left.messageBytes === right.messageBytes && left.deliveryStatus === right.deliveryStatus &&
     left.turnId === right.turnId;
 }
@@ -117,6 +117,7 @@ export async function reconcileUnknownDesktopDelivery(
     intent: delivery.intent,
     messageBytes: delivery.messageBytes,
     messageSha256: delivery.messageSha256,
+    ...(delivery.deliveryId === undefined ? {} : { deliveryId: delivery.deliveryId }),
   });
   const candidates = validateObservation(observation, target);
   if (candidates.length === 0) {

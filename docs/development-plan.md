@@ -850,6 +850,25 @@ G3 修复 Browser Companion 误绑错误 ChatGPT conversation 后 production Sen
   仍只服务新 send，两者不改变彼此的 fail-closed 语义。P0.6 不新增 MCP 工具、不公开链内部、
   不重发 Desktop task、不产生第二条 receipt。
 
+### P0.7 — v2 Desktop delivery provenance 与严格 re-materialization alias（本轮实现）
+
+- 新 send 使用精确 v2 `C2C_DESKTOP_TASK` envelope；C2C 自行生成 UUID `deliveryId`，在
+  `outcome_unknown` durable commit 中持久化后才发送，wire 与状态共用同一值。状态 version 1 继续读取，
+  旧 v1 delivery 不回填 ID，command replay 不重新生成或发送。
+- `deliveryId` 是 provenance identity，不是授权凭证，也不公开到 MCP delivery projection。unknown
+  reconciliation 与本机 delivery identity 比较纳入该字段；仅当字段存在时加入既有证据摘要，因此历史 v1
+  confirmation/proof 的 canonical bytes 不变。
+- 唯一 turn alias 是 `edit_user_message_v2_delivery`：v2 envelope 在 exhausted canonical history 中唯一，
+  replacement turn exact-match deliveryId 和原始 envelope bytes/hash，trigger=`edit_user_message`、
+  status=`interrupted`，并立即接续一个通过 P0.6 `resume_interrupted_task` 规则的 successor。
+  originTurnId 保留为实际 replacement turn；durable accepted turnId 不变。v1 精确 turn 规则及普通新 user
+  turn、复制 envelope、重复候选、未知 trigger 和所有历史/身份 fail-closed 门禁不变。
+- `current_result_classification` 与 ownership IPC 通过严格 alias enum 明示该关系；receipt 写前复核比较
+  deliveryId、alias 和完整逐边签名链。未知版本、额外字段、坏 UUID、错 ID 或关系漂移均拒绝。
+- 为覆盖 `inProgress → pending draft → detached finalizer` 时间窗，新 pending draft 升为 v3 并固化首次
+  ownership snapshot；`safe_terminal` 后由 exact-target 只读 IPC 重验整条 ownership，再于 output/receipt 写入前
+  确认 durable accepted turnId/deliveryId 未变。既有 v1/v2 drafts 保持原读取与收敛语义，不回填证据。
+
 ### P0.6a — outcome_unknown 行政 resolution（已实现并完成独立 Review）
 
 - 增加显式 `desktop resolve-unknown --command-id` 两阶段入口：preview 只读，confirm 只写独立
@@ -861,6 +880,16 @@ G3 修复 Browser Companion 误绑错误 ChatGPT conversation 后 production Sen
 - 原始 `outcome_unknown` 保持不变；history 用 `resolved_unknown`、status 用
   `administratively_resolved`，workflow/rollout 仅对有严格匹配证据的 unknown 解除阻塞，其他
   unknown 继续阻断。原有 reconcile、self-reconcile、P0.5/P0.6 和 commandId 防重放语义不变。
+
+### 未来方向（非当前实施）：ChatGPT 侧本机管理能力面
+
+- 仅在出现具体恢复需求时，评估向 ChatGPT 暴露一组小型、allowlist 化、按能力划分的 MCP 管理动作，
+  例如对现有 `resolve-unknown` 两阶段语义提供受限 wrapper；不得提供任意 shell/命令执行工具。
+- 每个动作仍须有严格参数 schema、workspace binding、OAuth scope 与当前 conversation principal 校验，
+  保留 preview/confirm 或等价的有界授权、幂等与审计证据，并对损坏、漂移和歧义 fail closed。
+- `resolve-unknown` wrapper 必须原样保留语义告知：行政 resolution 仅停止等待/解除阻塞，
+  不代表已投递、已接受、已完成或成功。其他候选能力只在出现明确 workflow 需求后逐项评估；
+  当前不实现、不改变 R4/R5 范围，也不建设 generic exec 工具。
 
 ## H0 — Executor Core foundation（2026-09-23，本轮）
 

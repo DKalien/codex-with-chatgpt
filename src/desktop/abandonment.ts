@@ -35,6 +35,7 @@ const CURRENT_CONTEXT_RETRY_DELAY_MS = 25;
 
 const deliverySummarySchema = z.object({
   commandId: desktopId,
+  deliveryId: uuid.optional(),
   clientId: z.string().min(1).max(256),
   bindingId: uuid,
   intent: z.union([z.literal("development_plan"), z.literal("revision"), z.null()]),
@@ -289,6 +290,7 @@ function deliverySummary(delivery: DesktopDelivery): AbandonmentDeliverySummary 
   }
   return {
     commandId: delivery.commandId,
+    ...(delivery.deliveryId === undefined ? {} : { deliveryId: delivery.deliveryId }),
     clientId: delivery.clientId,
     bindingId: delivery.bindingId,
     intent: delivery.intent ?? null,

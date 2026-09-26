@@ -14,6 +14,7 @@ import {
 import {
   desktopIpc,
   DESKTOP_RESULT_ACTIVITY_ITEM_TYPES,
+  MAX_RESULT_CONTINUATION_CHAIN,
   type DesktopResultActivityMarker,
   type DesktopResultTerminalFence,
   type DesktopTarget,
@@ -79,14 +80,79 @@ const receiptFinalizationDraftV2Schema = z.object({
   expiresAt: z.string().datetime(),
 }).strict();
 
+const receiptFinalizationOwnershipSnapshotSchema = z.object({
+  workspaceId: z.string().regex(DESKTOP_ID),
+  commandId: z.string().regex(DESKTOP_ID),
+  threadId: UUID,
+  hostId: z.literal("local"),
+  projectId: z.string().min(1).max(128),
+  workspaceRoot: z.string().min(1).max(32_768),
+  intent: z.enum(["development_plan", "revision"]),
+  messageBytes: z.number().int().safe().min(1).max(65_536),
+  messageSha256: z.string().regex(/^[a-f0-9]{64}$/),
+  ownership: z.enum(["origin", "native_continuation"]),
+  originTurnId: UUID,
+  deliveryId: UUID.optional(),
+  originAlias: z.enum(["edit_user_message_v2_delivery"]).nullable(),
+  resultTurnId: UUID,
+  chainTurnIds: z.array(UUID).min(1).max(MAX_RESULT_CONTINUATION_CHAIN + 1),
+  chainLength: z.number().int().safe().min(0).max(MAX_RESULT_CONTINUATION_CHAIN),
+  chainSignatures: z.array(z.enum(["capacity_retry_automatic", "resume_interrupted_task"]))
+    .max(MAX_RESULT_CONTINUATION_CHAIN),
+  signature: z.enum(["capacity_retry_automatic", "resume_interrupted_task"]).nullable(),
+}).strict().superRefine((snapshot, context) => {
+  if (snapshot.chainLength !== snapshot.chainTurnIds.length - 1 ||
+      new Set(snapshot.chainTurnIds).size !== snapshot.chainTurnIds.length ||
+      snapshot.chainTurnIds[0] !== snapshot.originTurnId ||
+      snapshot.chainTurnIds[snapshot.chainTurnIds.length - 1] !== snapshot.resultTurnId ||
+      snapshot.chainSignatures.length !== snapshot.chainLength) {
+    context.addIssue({ code: "custom", message: "ownership chain shape is inconsistent" });
+  }
+  if (snapshot.ownership === "origin") {
+    if (snapshot.chainLength !== 0 || snapshot.originAlias !== null || snapshot.signature !== null ||
+        snapshot.resultTurnId !== snapshot.originTurnId) {
+      context.addIssue({ code: "custom", message: "origin ownership shape is inconsistent" });
+    }
+  } else if (snapshot.chainLength < 1 ||
+      snapshot.signature !== snapshot.chainSignatures[snapshot.chainSignatures.length - 1] ||
+      snapshot.resultTurnId === snapshot.originTurnId) {
+    context.addIssue({ code: "custom", message: "continuation ownership shape is inconsistent" });
+  }
+  if (snapshot.originAlias !== null &&
+      (snapshot.deliveryId === undefined || snapshot.ownership !== "native_continuation" ||
+       snapshot.chainSignatures[0] !== "resume_interrupted_task")) {
+    context.addIssue({ code: "custom", message: "origin alias ownership shape is inconsistent" });
+  }
+});
+
+const receiptFinalizationDraftV3Schema = receiptFinalizationDraftV2Schema.extend({
+  version: z.literal(3),
+  ownershipSnapshot: receiptFinalizationOwnershipSnapshotSchema,
+}).strict().superRefine((draft, context) => {
+  if (draft.input.rawSummary === undefined) {
+    context.addIssue({ code: "custom", message: "new receipt finalization draft requires rawSummary" });
+  }
+  const snapshot = draft.ownershipSnapshot;
+  if (snapshot.workspaceId !== draft.workspaceId || snapshot.commandId !== draft.commandId ||
+      snapshot.threadId !== draft.threadId || snapshot.workspaceRoot !== draft.workspaceRoot ||
+      (snapshot.originAlias === null && snapshot.originTurnId !== draft.originTurnId) ||
+      (snapshot.originAlias !== null && snapshot.originTurnId === draft.originTurnId) ||
+      snapshot.resultTurnId !== draft.resultTurnId) {
+    context.addIssue({ code: "custom", message: "ownership snapshot does not match draft identity" });
+  }
+});
+
 export const receiptFinalizationDraftSchema = z.union([
   receiptFinalizationDraftV1Schema,
   receiptFinalizationDraftV2Schema,
+  receiptFinalizationDraftV3Schema,
 ]);
 
 export type ReceiptFinalizationInput = z.infer<typeof receiptFinalizationInputSchema>;
 export type ReceiptFinalizationMarker = DesktopResultActivityMarker;
 export type ReceiptFinalizationFenceResult = DesktopResultTerminalFence;
+export type ReceiptFinalizationOwnershipSnapshot = z.infer<typeof receiptFinalizationOwnershipSnapshotSchema>;
+export type ReceiptFinalizationMarkedDraft = Extract<ReceiptFinalizationDraft, { version: 2 | 3 }>;
 
 type ReceiptFinalizationIpc = typeof desktopIpc;
 const markerIpc = desktopIpc as ReceiptFinalizationIpc;
@@ -114,8 +180,10 @@ function parseMarker(value: unknown): ReceiptFinalizationMarker {
 
 function draftMarkerEqual(left: ReceiptFinalizationDraft, right: ReceiptFinalizationDraft): boolean {
   if (left.version !== right.version) return false;
-  return left.version === 1 || !("marker" in left) || !("marker" in right) ||
-    JSON.stringify(left.marker) === JSON.stringify(right.marker);
+  if (left.version === 1) return true;
+  if (!("marker" in left) || !("marker" in right) || JSON.stringify(left.marker) !== JSON.stringify(right.marker)) return false;
+  return left.version !== 3 || (right.version === 3 &&
+    JSON.stringify(left.ownershipSnapshot) === JSON.stringify(right.ownershipSnapshot));
 }
 
 /** 只把 output 交给现有 sanitizer；draft 永远不落原始敏感输出。 */
@@ -281,26 +349,32 @@ export function listReceiptFinalizationAlerts(stateDir = getStateDir()): Receipt
 }
 
 export function stageReceiptFinalization(
-  input: Omit<ReceiptFinalizationDraft, "version" | "draftId" | "createdAt" | "expiresAt" | "inputDigest" | "input" | "marker"> &
-    ({ inputMaterial: string } | { input: ReceiptFinalizationInput; marker: ReceiptFinalizationMarker }),
+  input: Omit<ReceiptFinalizationDraft, "version" | "draftId" | "createdAt" | "expiresAt" | "inputDigest" | "input" | "marker" | "ownershipSnapshot"> &
+    ({ inputMaterial: string } | {
+      input: ReceiptFinalizationInput;
+      marker: ReceiptFinalizationMarker;
+      ownershipSnapshot: ReceiptFinalizationOwnershipSnapshot;
+    }),
   options: { stateDir?: string; nowMs?: number } = {},
 ): ReceiptFinalizationDraft {
   const stateDir = options.stateDir ?? getStateDir();
   const now = options.nowMs ?? Date.now();
-  const isV2 = !("inputMaterial" in input);
+  const isV3 = !("inputMaterial" in input);
   let sanitizedInput: ReceiptFinalizationInput | undefined;
   let marker: ReceiptFinalizationMarker | undefined;
+  let ownershipSnapshot: ReceiptFinalizationOwnershipSnapshot | undefined;
   let inputMaterial: string;
   if ("inputMaterial" in input) {
     inputMaterial = input.inputMaterial;
   } else {
     sanitizedInput = sanitizeReceiptFinalizationInput(input.input);
     marker = parseMarker(input.marker);
+    ownershipSnapshot = receiptFinalizationOwnershipSnapshotSchema.parse(input.ownershipSnapshot);
     inputMaterial = canonicalReceiptFinalizationInput(sanitizedInput);
   }
   const digest = createHash("sha256").update(inputMaterial, "utf8").digest("hex");
   const draft = receiptFinalizationDraftSchema.parse({
-    version: isV2 ? 2 : 1,
+    version: isV3 ? 3 : 1,
     draftId: randomUUID(),
     workspaceId: input.workspaceId,
     workspaceRoot: input.workspaceRoot,
@@ -309,7 +383,7 @@ export function stageReceiptFinalization(
     resultTurnId: input.resultTurnId,
     commandId: input.commandId,
     inputDigest: digest,
-    ...(sanitizedInput && marker ? { input: sanitizedInput, marker } : {}),
+    ...(sanitizedInput && marker && ownershipSnapshot ? { input: sanitizedInput, marker, ownershipSnapshot } : {}),
     createdAt: new Date(now).toISOString(),
     expiresAt: new Date(now + RECEIPT_FINALIZER_MAX_LIFETIME_MS).toISOString(),
   });
@@ -431,8 +505,8 @@ function removeAlert(stateDir: string, draft: ReceiptFinalizationDraft): void {
   if (current?.alertId === draft.draftId) fs.rmSync(file, { force: true });
 }
 
-function isV2Draft(draft: ReceiptFinalizationDraft): draft is Extract<ReceiptFinalizationDraft, { version: 2 }> {
-  return draft.version === 2;
+function hasMarkerDraft(draft: ReceiptFinalizationDraft): draft is ReceiptFinalizationMarkedDraft {
+  return draft.version === 2 || draft.version === 3;
 }
 
 function assertFenceIdentity(fence: ReceiptFinalizationFenceResult, draft: ReceiptFinalizationDraft, target: DesktopTarget): void {
@@ -466,7 +540,7 @@ export async function runReceiptFinalizer(
       attemptedObservation = true;
       try {
         const target = finalizerTarget(draft);
-        if (isV2Draft(draft)) {
+        if (hasMarkerDraft(draft)) {
           const fence = await markerIpc.inspectResultTerminalFence(target, draft.marker);
           assertFenceIdentity(fence, draft, target);
           if (fence.fence === "post_record_activity") {
@@ -491,7 +565,11 @@ export async function runReceiptFinalizer(
             removeDraft(stateDir, draft);
             removeAlert(stateDir, draft);
             return receipt;
-          } catch {
+          } catch (error) {
+            if (error instanceof DesktopError &&
+                ["DESKTOP_RESULT_CURRENT_EXECUTION", "DESKTOP_RESULT_THREAD"].includes(error.code)) {
+              return writeReceiptFinalizationAlert(draft, "identity_drift", { stateDir });
+            }
             return writeReceiptFinalizationAlert(draft, "terminality_unknown", { stateDir });
           }
         }

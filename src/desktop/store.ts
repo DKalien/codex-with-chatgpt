@@ -21,7 +21,7 @@ export const statusInput = z.object({ workspaceId: desktopId, commandId: desktop
 export const targetInput = z.object({ threadId: z.string().uuid(), hostId: z.literal("local"), projectId: desktopId }).strict();
 const bindingSchema = targetInput.extend({ bindingId: z.string().uuid(), title: z.string().min(1).max(300), boundAt: z.string().datetime() }).strict();
 const deliverySchema = z.object({
-  commandId: desktopId, clientId: z.string().min(1).max(256), bindingId: z.string().uuid(),
+  commandId: desktopId, deliveryId: z.string().uuid().optional(), clientId: z.string().min(1).max(256), bindingId: z.string().uuid(),
   // 兼容旧记录：缺失表示历史未记录意图，不回填、不推断确认或授权。
   intent: desktopIntent.optional(),
   messageSha256: z.string().regex(/^[a-f0-9]{64}$/), messageBytes: z.number().int().positive().max(MAX_MESSAGE_BYTES),

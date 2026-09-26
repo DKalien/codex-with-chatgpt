@@ -19,6 +19,8 @@ import {
   runReceiptFinalizer,
   spawnReceiptFinalizerWorker,
   stageReceiptFinalization,
+  type ReceiptFinalizationDraft,
+  type ReceiptFinalizationOwnershipSnapshot,
 } from "../src/desktop/receipt-finalizer.js";
 import { Workspace } from "../src/workspace/manager.js";
 
@@ -45,13 +47,41 @@ function marker(turnId = resultTurnId) {
   return { ...value, itemSha256: receiptFinalizationMarkerDigest(value) };
 }
 
-function v2Draft(stateDir: string, output = "safe output") {
+function ownershipSnapshot(overrides: Partial<ReceiptFinalizationOwnershipSnapshot> = {}): ReceiptFinalizationOwnershipSnapshot {
+  return {
+    workspaceId: "desktop_receipt_test",
+    commandId: "desktop_receipt_command",
+    threadId,
+    hostId: "local",
+    projectId: "project",
+    workspaceRoot: process.cwd(),
+    intent: "revision",
+    messageBytes: 1,
+    messageSha256: "a".repeat(64),
+    ownership: "origin",
+    originTurnId,
+    originAlias: null,
+    resultTurnId,
+    chainTurnIds: [originTurnId],
+    chainLength: 0,
+    chainSignatures: [],
+    signature: null,
+    ...overrides,
+  };
+}
+
+function v3Draft(
+  stateDir: string,
+  output = "safe output",
+  snapshot = ownershipSnapshot({ resultTurnId: originTurnId, chainTurnIds: [originTurnId] }),
+) {
+  const resultId = snapshot.resultTurnId;
   return stageReceiptFinalization({
     workspaceId: "desktop_receipt_test",
     workspaceRoot: process.cwd(),
     threadId,
     originTurnId,
-    resultTurnId,
+    resultTurnId: resultId,
     commandId: "desktop_receipt_command",
     input: {
       commandId: "desktop_receipt_command",
@@ -62,29 +92,29 @@ function v2Draft(stateDir: string, output = "safe output") {
       command: "pnpm test",
       output,
     },
-    marker: marker(),
+    marker: marker(resultId),
+    ownershipSnapshot: snapshot,
   }, { stateDir, nowMs: Date.now() });
 }
 
+function v2Draft(stateDir: string, output = "safe output") {
+  const staged = v3Draft(stateDir, output, ownershipSnapshot({
+    ownership: "native_continuation",
+    chainTurnIds: [originTurnId, resultTurnId],
+    chainLength: 1,
+    chainSignatures: ["capacity_retry_automatic"],
+    signature: "capacity_retry_automatic",
+  }));
+  const { ownershipSnapshot: _ownershipSnapshot, ...oldFields } = staged;
+  const legacy = { ...oldFields, version: 2 as const };
+  fs.writeFileSync(receiptFinalizationDraftPath(stateDir, staged.workspaceId, staged.commandId), JSON.stringify(legacy), "utf8");
+  const persisted = readReceiptFinalizationDraft(stateDir, staged.workspaceId, staged.commandId);
+  if (!persisted || persisted.version !== 2) throw new Error("expected a persisted v2 draft");
+  return persisted;
+}
+
 function preR4aV2Draft(stateDir: string) {
-  const pending = stageReceiptFinalization({
-    workspaceId: "desktop_receipt_test",
-    workspaceRoot: process.cwd(),
-    threadId,
-    originTurnId,
-    resultTurnId,
-    commandId: "desktop_receipt_command",
-    input: {
-      commandId: "desktop_receipt_command",
-      changedFiles: ["src/legacy.ts"],
-      tests: "1 passed",
-      exitStatus: "ok",
-      command: "pnpm test",
-      output: "safe output",
-    },
-    marker: marker(),
-  }, { stateDir, nowMs: Date.now() });
-  if (pending.version !== 2) throw new Error("expected a v2 draft");
+  const pending = v2Draft(stateDir);
 
   // 固定 pre-R4a 的 canonical 字段顺序与字段集合，刻意省略 rawSummary。
   const legacyCanonical = JSON.stringify({
@@ -98,8 +128,10 @@ function preR4aV2Draft(stateDir: string) {
     outputRestrictedReason: pending.input.outputRestrictedReason ?? null,
     exitCode: pending.input.exitCode ?? null,
   });
+  const { rawSummary: _rawSummary, ...legacyInput } = pending.input;
   const fixture = {
     ...pending,
+    input: legacyInput,
     inputDigest: createHash("sha256").update(legacyCanonical, "utf8").digest("hex"),
   };
   fs.writeFileSync(receiptFinalizationDraftPath(stateDir, pending.workspaceId, pending.commandId), JSON.stringify(fixture), "utf8");
@@ -111,7 +143,7 @@ function preR4aV2Draft(stateDir: string) {
 function mockDurableState(pending: ReturnType<typeof draft>) {
   const bindingId = "00000000-0000-4000-8000-000000000111";
   const timestamp = new Date().toISOString();
-  vi.spyOn(desktopStore, "readDesktop").mockReturnValue({
+  const state: NonNullable<ReturnType<typeof desktopStore.readDesktop>> = {
     version: 1,
     workspaceId: pending.workspaceId,
     workspaceRoot: pending.workspaceRoot,
@@ -129,15 +161,61 @@ function mockDurableState(pending: ReturnType<typeof draft>) {
       clientId: "client",
       bindingId,
       intent: "revision",
-      messageSha256: "a".repeat(64),
-      messageBytes: 1,
+      messageSha256: pending.version === 3 ? pending.ownershipSnapshot.messageSha256 : "a".repeat(64),
+      messageBytes: pending.version === 3 ? pending.ownershipSnapshot.messageBytes : 1,
+      ...(pending.version === 3 && pending.ownershipSnapshot.deliveryId !== undefined
+        ? { deliveryId: pending.ownershipSnapshot.deliveryId }
+        : {}),
       threadId,
       turnId: pending.originTurnId,
       deliveryStatus: "accepted",
       createdAt: timestamp,
       updatedAt: timestamp,
     }],
-  });
+  };
+  vi.spyOn(desktopStore, "readDesktop").mockReturnValue(state);
+  return state;
+}
+
+function ownershipResult(
+  pending: Extract<ReceiptFinalizationDraft, { version: 3 }>,
+  overrides: Partial<ReceiptFinalizationOwnershipSnapshot> = {},
+) {
+  const snapshot = { ...pending.ownershipSnapshot, ...overrides };
+  return {
+    threadId: snapshot.threadId,
+    hostId: snapshot.hostId,
+    projectId: snapshot.projectId,
+    workspaceRoot: snapshot.workspaceRoot,
+    title: "test",
+    cwd: snapshot.workspaceRoot,
+    runtimeStatus: "idle",
+    resultTurnId: snapshot.resultTurnId,
+    resultTurnStatus: "completed" as const,
+    ownership: snapshot.ownership,
+    originTurnId: snapshot.originTurnId,
+    ...(snapshot.deliveryId === undefined ? {} : { deliveryId: snapshot.deliveryId }),
+    originAlias: snapshot.originAlias,
+    chainTurnIds: snapshot.chainTurnIds,
+    chainLength: snapshot.chainLength,
+    chainSignatures: snapshot.chainSignatures,
+    signature: snapshot.signature,
+  };
+}
+
+function safeTerminalFence(pending: Extract<ReceiptFinalizationDraft, { version: 2 | 3 }>) {
+  return {
+    threadId,
+    hostId: "local",
+    projectId: "project",
+    workspaceRoot: pending.workspaceRoot,
+    title: "test",
+    cwd: pending.workspaceRoot,
+    runtimeStatus: "idle",
+    resultTurnId: pending.resultTurnId,
+    resultTurnStatus: "completed" as const,
+    fence: "safe_terminal" as const,
+  };
 }
 
 describe("Desktop receipt terminal fence", () => {
@@ -194,6 +272,7 @@ describe("Desktop receipt terminal fence", () => {
         messageSha256: "a".repeat(64),
         ownership: "origin",
         originTurnId: pending.originTurnId,
+        originAlias: null,
         chainTurnIds: [pending.originTurnId],
         chainLength: 0,
         chainSignatures: [],
@@ -263,6 +342,183 @@ describe("Desktop receipt terminal fence", () => {
     }
   });
 
+  it.each([
+    ["origin", ownershipSnapshot({ resultTurnId: originTurnId, chainTurnIds: [originTurnId] })],
+    ["native continuation", ownershipSnapshot({
+      ownership: "native_continuation",
+      chainTurnIds: [originTurnId, "00000000-0000-4000-8000-000000000104", resultTurnId],
+      chainLength: 2,
+      chainSignatures: ["capacity_retry_automatic", "resume_interrupted_task"],
+      signature: "resume_interrupted_task",
+    })],
+  ] as const)("v3 %s safe_terminal re-attests ownership before writing receipt", async (_label, snapshot) => {
+    stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "c2c-receipt-finalizer-"));
+    const pending = v3Draft(stateDir, "safe output", snapshot);
+    mockDurableState(pending);
+    const previousStateDir = process.env.C2C_STATE_DIR;
+    process.env.C2C_STATE_DIR = stateDir;
+    try {
+      vi.spyOn(desktopIpc, "inspectResultTerminalFence").mockResolvedValue(safeTerminalFence(pending));
+      const ownership = vi.spyOn(desktopIpc, "inspectResultOwnership").mockResolvedValue(ownershipResult(pending));
+      const result = await runReceiptFinalizer(pending, { stateDir });
+      expect(result).toMatchObject({ record: { commandId: pending.commandId } });
+      expect(ownership).toHaveBeenCalledOnce();
+      expect(ownership).toHaveBeenCalledWith(
+        { threadId, hostId: "local", projectId: "project", workspaceRoot: pending.workspaceRoot },
+        {
+          workspaceId: pending.workspaceId,
+          commandId: pending.commandId,
+          intent: "revision",
+          messageBytes: 1,
+          messageSha256: "a".repeat(64),
+          originTurnId,
+        },
+      );
+      expect(readExecutionRecordsStrict(pending.workspaceId)).toHaveLength(1);
+      expect(listExecutionOutputs(pending.workspaceId, Number.MAX_SAFE_INTEGER)).toHaveLength(1);
+    } finally {
+      if (previousStateDir === undefined) delete process.env.C2C_STATE_DIR;
+      else process.env.C2C_STATE_DIR = previousStateDir;
+    }
+  });
+
+  it("v3 edit_user_message_v2_delivery alias safely finalizes only after exact re-attestation", async () => {
+    stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "c2c-receipt-finalizer-"));
+    const deliveryId = "00000000-0000-4000-8000-000000000105";
+    const materializedOrigin = "00000000-0000-4000-8000-000000000106";
+    const snapshot = ownershipSnapshot({
+      ownership: "native_continuation",
+      originTurnId: materializedOrigin,
+      deliveryId,
+      originAlias: "edit_user_message_v2_delivery",
+      chainTurnIds: [materializedOrigin, resultTurnId],
+      chainLength: 1,
+      chainSignatures: ["resume_interrupted_task"],
+      signature: "resume_interrupted_task",
+    });
+    const pending = v3Draft(stateDir, "safe output", snapshot);
+    mockDurableState(pending);
+    const previousStateDir = process.env.C2C_STATE_DIR;
+    process.env.C2C_STATE_DIR = stateDir;
+    try {
+      vi.spyOn(desktopIpc, "inspectResultTerminalFence").mockResolvedValue(safeTerminalFence(pending));
+      const ownership = vi.spyOn(desktopIpc, "inspectResultOwnership").mockResolvedValue(ownershipResult(pending));
+      await expect(runReceiptFinalizer(pending, { stateDir })).resolves.toMatchObject({
+        record: { commandId: pending.commandId, desktopOriginTurnId: originTurnId, desktopResultTurnId: resultTurnId },
+      });
+      expect(ownership).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ originTurnId, deliveryId }));
+      expect(isTrustedDesktopReceipt(readExecutionRecordsStrict(pending.workspaceId)[0], pending.commandId)).toBe(true);
+    } finally {
+      if (previousStateDir === undefined) delete process.env.C2C_STATE_DIR;
+      else process.env.C2C_STATE_DIR = previousStateDir;
+    }
+  });
+
+  it("v3 earlier continuation signature drift with unchanged tip fails before output/receipt write", async () => {
+    stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "c2c-receipt-finalizer-"));
+    const middleTurnId = "00000000-0000-4000-8000-000000000104";
+    const snapshot = ownershipSnapshot({
+      ownership: "native_continuation",
+      chainTurnIds: [originTurnId, middleTurnId, resultTurnId],
+      chainLength: 2,
+      chainSignatures: ["capacity_retry_automatic", "resume_interrupted_task"],
+      signature: "resume_interrupted_task",
+    });
+    const pending = v3Draft(stateDir, "safe output", snapshot);
+    mockDurableState(pending);
+    const previousStateDir = process.env.C2C_STATE_DIR;
+    process.env.C2C_STATE_DIR = stateDir;
+    try {
+      vi.spyOn(desktopIpc, "inspectResultTerminalFence").mockResolvedValue(safeTerminalFence(pending));
+      const inspect = vi.spyOn(desktopIpc, "inspectResultOwnership").mockResolvedValue(ownershipResult(pending, {
+        chainSignatures: ["resume_interrupted_task", "resume_interrupted_task"],
+      }));
+      const alert = await runReceiptFinalizer(pending, { stateDir });
+      expect(inspect).toHaveBeenCalledOnce();
+      expect(alert).toMatchObject({ reason: "identity_drift" });
+      expect(readExecutionRecordsStrict(pending.workspaceId)).toEqual([]);
+      expect(listExecutionOutputs(pending.workspaceId, Number.MAX_SAFE_INTEGER)).toEqual([]);
+      expect(readReceiptFinalizationDraft(stateDir, pending.workspaceId, pending.commandId)?.draftId).toBe(pending.draftId);
+    } finally {
+      if (previousStateDir === undefined) delete process.env.C2C_STATE_DIR;
+      else process.env.C2C_STATE_DIR = previousStateDir;
+    }
+  });
+
+  it("v3 alias, origin, or deliveryId drift fails closed before output/receipt write", async () => {
+    for (const drift of ["origin", "delivery", "alias"] as const) {
+      stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "c2c-receipt-finalizer-"));
+      const deliveryId = "00000000-0000-4000-8000-000000000105";
+      const materializedOrigin = "00000000-0000-4000-8000-000000000106";
+      const snapshot = ownershipSnapshot({
+        ownership: "native_continuation",
+        originTurnId: materializedOrigin,
+        deliveryId,
+        originAlias: "edit_user_message_v2_delivery",
+        chainTurnIds: [materializedOrigin, resultTurnId],
+        chainLength: 1,
+        chainSignatures: ["resume_interrupted_task"],
+        signature: "resume_interrupted_task",
+      });
+      const pending = v3Draft(stateDir, "safe output", snapshot);
+      mockDurableState(pending);
+      const previousStateDir = process.env.C2C_STATE_DIR;
+      process.env.C2C_STATE_DIR = stateDir;
+      try {
+        vi.spyOn(desktopIpc, "inspectResultTerminalFence").mockResolvedValue(safeTerminalFence(pending));
+        const changed = drift === "origin" ? { originTurnId: "00000000-0000-4000-8000-000000000107" }
+          : drift === "delivery" ? { deliveryId: "00000000-0000-4000-8000-000000000108" }
+            : { originAlias: null };
+        vi.spyOn(desktopIpc, "inspectResultOwnership").mockResolvedValue(ownershipResult(pending, changed));
+        const alert = await runReceiptFinalizer(pending, { stateDir });
+        expect(alert).toMatchObject({ reason: "identity_drift" });
+        expect(readExecutionRecordsStrict(pending.workspaceId)).toEqual([]);
+        expect(listExecutionOutputs(pending.workspaceId, Number.MAX_SAFE_INTEGER)).toEqual([]);
+      } finally {
+        if (previousStateDir === undefined) delete process.env.C2C_STATE_DIR;
+        else process.env.C2C_STATE_DIR = previousStateDir;
+        vi.restoreAllMocks();
+        fs.rmSync(stateDir, { recursive: true, force: true });
+      }
+    }
+    stateDir = "";
+  });
+
+  it.each(["turnId", "deliveryId"] as const)("v3 durable accepted %s drift fails before ownership inspect or write", async field => {
+    stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "c2c-receipt-finalizer-"));
+    const snapshot = ownershipSnapshot({
+      resultTurnId: originTurnId,
+      chainTurnIds: [originTurnId],
+      deliveryId: "00000000-0000-4000-8000-000000000105",
+    });
+    const pending = v3Draft(stateDir, "safe output", snapshot);
+    const durable = mockDurableState(pending);
+    const delivery = durable.deliveries[0]!;
+    vi.mocked(desktopStore.readDesktop).mockReturnValue({
+      ...durable,
+      deliveries: [{
+        ...delivery,
+        ...(field === "turnId"
+          ? { turnId: "00000000-0000-4000-8000-000000000107" }
+          : { deliveryId: "00000000-0000-4000-8000-000000000108" }),
+      }],
+    });
+    const previousStateDir = process.env.C2C_STATE_DIR;
+    process.env.C2C_STATE_DIR = stateDir;
+    try {
+      vi.spyOn(desktopIpc, "inspectResultTerminalFence").mockResolvedValue(safeTerminalFence(pending));
+      const inspect = vi.spyOn(desktopIpc, "inspectResultOwnership");
+      const alert = await runReceiptFinalizer(pending, { stateDir });
+      expect(alert).toMatchObject({ reason: "identity_drift" });
+      expect(inspect).not.toHaveBeenCalled();
+      expect(readExecutionRecordsStrict(pending.workspaceId)).toEqual([]);
+      expect(listExecutionOutputs(pending.workspaceId, Number.MAX_SAFE_INTEGER)).toEqual([]);
+    } finally {
+      if (previousStateDir === undefined) delete process.env.C2C_STATE_DIR;
+      else process.env.C2C_STATE_DIR = previousStateDir;
+    }
+  });
+
   it("pre-R4a v2 safe_terminal finalizes with its legacy digest and no fabricated rawSummary", async () => {
     stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "c2c-receipt-finalizer-"));
     const pending = preR4aV2Draft(stateDir);
@@ -307,8 +563,8 @@ describe("Desktop receipt terminal fence", () => {
 
   it("pending digest 包含 rawSummary，不能以不同摘要重放同一 command", () => {
     stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "c2c-receipt-finalizer-"));
-    const first = v2Draft(stateDir);
-    if (first.version !== 2) throw new Error("expected a v2 draft");
+    const first = v3Draft(stateDir);
+    if (first.version !== 3) throw new Error("expected a v3 draft");
     const changedInput = { ...first.input, rawSummary: "另一份最终摘要" };
     expect(canonicalReceiptFinalizationInput(changedInput)).not.toBe(canonicalReceiptFinalizationInput(first.input));
     expect(() => stageReceiptFinalization({
@@ -320,6 +576,7 @@ describe("Desktop receipt terminal fence", () => {
       commandId: first.commandId,
       input: changedInput,
       marker: first.marker,
+      ownershipSnapshot: first.ownershipSnapshot,
     }, { stateDir })).toThrow(/不一致/);
   });
 
@@ -347,7 +604,7 @@ describe("Desktop receipt terminal fence", () => {
       .toBe(fenceKind === "post_record_activity" ? "post_record_activity" : "post_record_activity_unprovable");
   });
 
-  it("v2 draft persists sanitized input rather than raw secret output", () => {
+  it("new v3 draft persists sanitized input rather than raw secret output", () => {
     stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "c2c-receipt-finalizer-"));
     const pending = stageReceiptFinalization({
       workspaceId: "desktop_receipt_test",
@@ -365,9 +622,48 @@ describe("Desktop receipt terminal fence", () => {
         output: "password=super-secret",
       },
       marker: marker(),
+      ownershipSnapshot: ownershipSnapshot({
+        commandId: "desktop_receipt_command",
+        ownership: "native_continuation",
+        originTurnId,
+        resultTurnId,
+        chainTurnIds: [originTurnId, resultTurnId],
+        chainLength: 1,
+        chainSignatures: ["capacity_retry_automatic"],
+        signature: "capacity_retry_automatic",
+      }),
     }, { stateDir });
-    expect(pending.version).toBe(2);
+    expect(pending.version).toBe(3);
     expect(JSON.stringify(pending)).not.toContain("super-secret");
+  });
+
+  it("new v3 draft refuses to stage without Codex rawSummary", () => {
+    stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "c2c-receipt-finalizer-"));
+    expect(() => stageReceiptFinalization({
+      workspaceId: "desktop_receipt_test",
+      workspaceRoot: process.cwd(),
+      threadId,
+      originTurnId,
+      resultTurnId,
+      commandId: "desktop_receipt_command",
+      input: {
+        commandId: "desktop_receipt_command",
+        changedFiles: [],
+        tests: "not run",
+        exitStatus: "blocked",
+      },
+      marker: marker(),
+      ownershipSnapshot: ownershipSnapshot({
+        ownership: "native_continuation",
+        originTurnId,
+        resultTurnId,
+        chainTurnIds: [originTurnId, resultTurnId],
+        chainLength: 1,
+        chainSignatures: ["capacity_retry_automatic"],
+        signature: "capacity_retry_automatic",
+      }),
+    }, { stateDir })).toThrow();
+    expect(fs.existsSync(receiptFinalizationDraftPath(stateDir, "desktop_receipt_test", "desktop_receipt_command"))).toBe(false);
   });
 
   it("v2 safe_terminal preserves restricted output metadata without storing the rejected body", async () => {

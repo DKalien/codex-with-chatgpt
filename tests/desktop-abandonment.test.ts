@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { desktopIpc } from "../src/desktop/ipc.js";
 import { legacyReconciliationFile } from "../src/desktop/legacy-reconciliation.js";
@@ -16,7 +17,7 @@ import {
 } from "../src/desktop/abandonment.js";
 import { appendExecutionRecord } from "../src/execution/records.js";
 import { MAX_OUTPUT_RECORDS, saveExecutionOutput } from "../src/execution/output.js";
-import { updateDesktop } from "../src/desktop/store.js";
+import { readDesktop, updateDesktop } from "../src/desktop/store.js";
 import { Workspace } from "../src/workspace/manager.js";
 import { cleanup, makeTmpDir } from "./helpers.js";
 
@@ -27,6 +28,8 @@ const deliveryBindingId = "01a00000-0000-7000-8000-000000000004";
 const turnA = "01a00000-0000-7000-8000-000000000005";
 const turnB = "01a00000-0000-7000-8000-000000000006";
 const maintenanceTurn = "01a00000-0000-7000-8000-000000000007";
+const deliveryIdA = "01a00000-0000-7000-8000-000000000008";
+const deliveryIdB = "01a00000-0000-7000-8000-000000000009";
 const acceptedAt = "2026-01-01T00:00:00.000Z";
 
 let root: string;
@@ -114,6 +117,17 @@ function clearExecutionFacts(): void {
   fs.rmSync(path.join(stateDir, "execution-outputs"), { recursive: true, force: true });
 }
 
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  return `{${Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b))
+    .map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`).join(",")}}`;
+}
+
+function sha256Of(value: unknown): string {
+  return createHash("sha256").update(canonicalJson(value), "utf8").digest("hex");
+}
+
 function writeLegacyEvidence(kind: "reconciliation" | "retirement", commandId: string): void {
   const file = kind === "reconciliation" ? legacyReconciliationFile(workspace.id) : legacyRetirementFile(workspace.id);
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -148,6 +162,40 @@ describe("desktop abandonment", () => {
     expect(fs.existsSync(abandonmentDir())).toBe(false);
   });
 
+  it("v1 confirmation 保持旧 delivery 摘要", () => {
+    seedDeliveries();
+    const preview = previewAbandonment(workspace, ["a_waiting"]);
+    const deliverySummary = {
+      commandId: "a_waiting", clientId: "client", bindingId: deliveryBindingId, intent: null,
+      messageSha256: "0".repeat(64), messageBytes: 1, threadId: oldThreadId, turnId: turnB,
+      deliveryStatus: "accepted", errorCode: null, errorMessage: null, createdAt: acceptedAt, updatedAt: acceptedAt,
+    };
+    const binding = readDesktop(workspace.id)?.binding;
+    expect(binding).toBeTruthy();
+    expect(preview.confirmationSha256).toBe(sha256Of({
+      workspaceId: workspace.id, workspaceRoot: workspace.root, binding, commandIds: ["a_waiting"],
+      deliveries: [deliverySummary], execution: [], outputs: [], existingEvidence: { reconciliation: [], retirement: [] },
+    }));
+  });
+
+  it("v2 deliveryId 绑定 confirmation，漂移后拒绝旧摘要", async () => {
+    seedDeliveries();
+    updateDesktop(workspace.id, state => ({
+      state: { ...state!, deliveries: state!.deliveries.map(item => item.commandId === "a_waiting" ? { ...item, deliveryId: deliveryIdA } : item) },
+      result: undefined,
+    }));
+    const preview = previewAbandonment(workspace, ["a_waiting"]);
+    updateDesktop(workspace.id, state => ({
+      state: { ...state!, deliveries: state!.deliveries.map(item => item.commandId === "a_waiting" ? { ...item, deliveryId: deliveryIdB } : item) },
+      result: undefined,
+    }));
+    expect(previewAbandonment(workspace, ["a_waiting"]).confirmationSha256).not.toBe(preview.confirmationSha256);
+    await expect(abandonHistoricalAccepted(workspace, preview.commandIds, preview.confirmationSha256)).rejects.toMatchObject({
+      code: "DESKTOP_ABANDONMENT_CONFIRMATION_MISMATCH",
+    });
+    expect(readAbandonments(workspace.id)).toEqual([]);
+  });
+
   it("批量写入独立证据、保留源状态并可用原 confirmation 幂等重试", async () => {
     seedDeliveries();
     const desktopFile = path.join(stateDir, "desktop-control", `${workspace.id}.json`);
@@ -175,6 +223,7 @@ describe("desktop abandonment", () => {
     ]);
     expect(JSON.parse(fs.readFileSync(evidenceFile, "utf8")).batches[0].confirmationSha256)
       .toBe(preview.confirmationSha256);
+    expect(JSON.parse(fs.readFileSync(evidenceFile, "utf8")).batches[0].deliveries[0]).not.toHaveProperty("deliveryId");
     expect(vi.mocked(desktopIpc.currentResultContext)).toHaveBeenCalledTimes(4);
   });
 

@@ -85,14 +85,39 @@ afterEach(() => {
 describe("Desktop outcome_unknown reconciliation", () => {
   it("唯一精确候选只恢复 turnId，不写 execution receipt", async () => {
     seedDelivery();
-    vi.spyOn(desktopIpc, "reconcileUnknown").mockResolvedValue(observation([turnId]));
+    const reconcile = vi.spyOn(desktopIpc, "reconcileUnknown").mockResolvedValue(observation([turnId]));
 
     await expect(reconcileUnknownDesktopDelivery(workspace, commandId)).resolves.toEqual({
       status: "accepted", commandId, deliveryStatus: "accepted", turnId,
     });
     expect(readDesktop(workspace.id)?.deliveries[0]).toMatchObject({ deliveryStatus: "accepted", turnId });
+    expect(reconcile.mock.calls[0]?.[1]).not.toHaveProperty("deliveryId");
     expect(readExecutionRecords(workspace.id)).toEqual([]);
     expect(listExecutionOutputs(workspace.id)).toEqual([]);
+  });
+
+  it("v2 outcome_unknown 将 deliveryId 纳入自助 reconciliation 身份并检测观察期间漂移", async () => {
+    const deliveryId = "00000000-0000-4000-8000-000000000099";
+    seedDelivery({ deliveryId });
+    const reconcile = vi.spyOn(desktopIpc, "reconcileUnknown").mockImplementation(async (target, expectation) => {
+      expect(expectation).toMatchObject({ deliveryId });
+      updateDesktop(workspace.id, current => {
+        if (!current) throw new Error("missing state");
+        return {
+          state: { ...current, deliveries: current.deliveries.map(item => ({
+            ...item,
+            ...(item.commandId === commandId ? { deliveryId: "00000000-0000-4000-8000-000000000098" } : {}),
+          })) },
+          result: undefined,
+        };
+      });
+      return observation([turnId], target);
+    });
+
+    await expect(reconcileUnknownDesktopDelivery(workspace, commandId))
+      .rejects.toMatchObject({ code: "DESKTOP_RECONCILIATION_CONFLICT" });
+    expect(reconcile).toHaveBeenCalledTimes(1);
+    expect(readDesktop(workspace.id)?.deliveries[0]).toMatchObject({ deliveryStatus: "outcome_unknown", deliveryId: "00000000-0000-4000-8000-000000000098" });
   });
 
   it("expectedTurnId 不匹配时保持 outcome_unknown 且不修改状态", async () => {

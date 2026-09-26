@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { Command } from "commander";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { appendExecutionRecord } from "../src/execution/records.js";
@@ -204,6 +205,15 @@ describe("legacy accepted retirement", () => {
       deliverySha256: expect.stringMatching(/^[a-f0-9]{64}$/),
       observedMissingAt: expect.stringMatching(/^\d{4}-\d\d-\d\dT/),
     }]);
+    const legacyDeliverySummary = {
+      commandId, clientId: "legacy-client", bindingId: "01a00000-0000-7000-8000-000000000005",
+      intent: null, messageSha256: "0".repeat(64), messageBytes: 1, threadId: oldThreadId, turnId,
+      deliveryStatus: "accepted", errorCode: null, errorMessage: null, createdAt: acceptedAt, updatedAt: acceptedAt,
+    };
+    expect(readLegacyRetirements(workspace.id)[0]!.deliverySha256).toBe(
+      createHash("sha256").update(JSON.stringify(legacyDeliverySummary), "utf8").digest("hex"),
+    );
+    expect(readLegacyRetirements(workspace.id)[0]).not.toHaveProperty("deliveryId");
     expect(getRetiredLegacyCommandIds(workspace)).toEqual(new Set([commandId]));
     expect(fs.readFileSync(file, "utf8")).toBe(before);
     expect(vi.mocked(desktopIpc.inspect).mock.calls.map(([target]) => target.threadId)).toEqual([
@@ -212,7 +222,7 @@ describe("legacy accepted retirement", () => {
   });
 
   it("ownerless 只接受明确 NO_OWNER，并记录 maintenance thread/turn；重试幂等", async () => {
-    seedDelivery();
+    seedDelivery({ deliveryId: "01a00000-0000-7000-8000-000000000007" });
     vi.mocked(desktopIpc.inspect).mockRejectedValue(Object.assign(new Error("owner missing"), { code: "DESKTOP_NO_OWNER" }));
     vi.spyOn(desktopIpc, "currentResultContext").mockResolvedValue(ownerlessContext() as never);
 
@@ -226,6 +236,7 @@ describe("legacy accepted retirement", () => {
     expect(readLegacyRetirements(workspace.id)).toMatchObject([{
       kind: "ownerless",
       commandId,
+      deliveryId: "01a00000-0000-7000-8000-000000000007",
       deliverySha256: expect.stringMatching(/^[a-f0-9]{64}$/),
       observedOwnerlessAt: expect.stringMatching(/^\d{4}-\d\d-\d\dT/),
       maintenanceThreadId: currentThreadId,
@@ -238,6 +249,23 @@ describe("legacy accepted retirement", () => {
     ]);
     expect(fs.existsSync(path.join(stateDir, "executions", `${workspace.id}.jsonl`))).toBe(false);
     expect(fs.existsSync(path.join(stateDir, "execution-outputs", workspace.id, "index.json"))).toBe(false);
+  });
+
+  it("v2 deliveryId 写入 retirement 证据并在漂移时冲突", async () => {
+    const deliveryIdA = "01a00000-0000-7000-8000-000000000008";
+    const deliveryIdB = "01a00000-0000-7000-8000-000000000009";
+    seedDelivery({ deliveryId: deliveryIdA });
+    await retireLegacyAccepted(workspace, commandId);
+    expect(readLegacyRetirements(workspace.id)[0]).toMatchObject({ deliveryId: deliveryIdA });
+
+    updateDesktop(workspace.id, state => {
+      if (!state) throw new Error("missing state");
+      state.deliveries[0]!.deliveryId = deliveryIdB;
+      return { state, result: undefined };
+    });
+    expect(() => getRetiredLegacyCommandIds(workspace)).toThrowError(
+      expect.objectContaining({ code: "LEGACY_RETIREMENT_CONFLICT" }),
+    );
   });
 
   it("CLI --ownerless 转发显式模式并保持非完成语义", async () => {

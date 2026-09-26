@@ -101,13 +101,14 @@ function replay(state: DesktopState, input: z.infer<typeof sendInput>, clientId:
   return prior;
 }
 
-function desktopTaskEnvelope(input: z.infer<typeof sendInput>): string {
+function desktopTaskEnvelope(input: z.infer<typeof sendInput>, deliveryId: string): string {
   return JSON.stringify({
     type: "C2C_DESKTOP_TASK",
-    version: 1,
+    version: 2,
     workspaceId: input.workspaceId,
     commandId: input.commandId,
     intent: input.intent,
+    deliveryId,
     message: input.message,
   });
 }
@@ -194,7 +195,8 @@ export async function sendDesktop(workspace: LocalWorkspace, raw: z.infer<typeof
   const digest = createHash("sha256").update(input.message, "utf8").digest("hex");
   const prior = replay(snapshot, input, clientId, digest);
   if (prior) return publicDelivery(prior);
-  const wireMessage = validateDesktopWireMessage(desktopTaskEnvelope(input));
+  // UUID is fixed-width, so this validates the exact envelope byte size before the send commit.
+  validateDesktopWireMessage(desktopTaskEnvelope(input, "00000000-0000-4000-8000-000000000000"));
   assertNoUncertainDelivery(workspace, snapshot);
   const connection = await prepareWithPostResultSettle(workspace, snapshot.binding, authorize, settleOptions, executor);
   try {
@@ -207,7 +209,7 @@ export async function sendDesktop(workspace: LocalWorkspace, raw: z.infer<typeof
       if (existing) return { state, result: { record: existing, attempt: false } };
       assertNoUncertainDelivery(workspace, state);
       const now = new Date().toISOString();
-      const record: DesktopDelivery = { commandId: input.commandId, clientId, bindingId: input.bindingId,
+      const record: DesktopDelivery = { commandId: input.commandId, deliveryId: randomUUID(), clientId, bindingId: input.bindingId,
         intent: input.intent,
         messageSha256: digest, messageBytes: Buffer.byteLength(input.message, "utf8"), threadId: state.binding.threadId,
         deliveryStatus: "outcome_unknown", createdAt: now, updatedAt: now };
@@ -225,6 +227,7 @@ export async function sendDesktop(workspace: LocalWorkspace, raw: z.infer<typeof
       throw failure;
     }
     if (!committed.attempt) return publicDelivery(committed.record);
+    const wireMessage = validateDesktopWireMessage(desktopTaskEnvelope(input, committed.record.deliveryId!));
     try {
       // 上面的 fsync/原子替换是本地提交点。此后 disable 不能撤回在途消息，任何不明结果均不重发。
       const receipt = z.object({ threadId: z.string().uuid(), turnId: z.string().uuid() }).strict().parse(await connection.send(wireMessage));

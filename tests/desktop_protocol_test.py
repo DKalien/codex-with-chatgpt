@@ -1377,6 +1377,72 @@ class ProtocolTests(unittest.TestCase):
             h._main()
         self.assertEqual(json.loads(output.buffer.getvalue())["code"], "DESKTOP_INVALID_REQUEST")
 
+    def test_inspect_result_ownership_dispatch_is_exact_and_target_scoped(self):
+        message = "explicit target ownership"
+        delivery_id = "01a00000-0000-7000-8000-000000000200"
+        envelope = {"type": "C2C_DESKTOP_TASK", "version": 2, "workspaceId": "workspace_test",
+                    "commandId": "command_test", "intent": "development_plan", "message": message,
+                    "deliveryId": delivery_id}
+        text = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+        item = {"type": "text", "text": text, "text_elements": []}
+        turn = {"turnId": NEW_TURN, "status": "completed", "params": {"threadId": THREAD, "input": [item]},
+                "items": [{"type": "userMessage", "content": [item]}]}
+        self.pipe.state["threadRuntimeStatus"] = {"type": "idle"}
+        self.pipe.state.pop("turns")
+        self.pipe.state["turnHistory"] = {"kind": "canonical", "history": {
+            "islands": [{"entries": [{"value": "origin"}], "newerBoundary": {"status": "exhausted"}}],
+            "entitiesByKey": {"origin": turn},
+        }}
+        expectation = {"workspaceId": "workspace_test", "commandId": "command_test",
+                       "intent": "development_plan", "messageBytes": len(message.encode("utf-8")),
+                       "messageSha256": hashlib.sha256(message.encode("utf-8")).hexdigest(),
+                       "originTurnId": NEW_TURN, "deliveryId": delivery_id}
+
+        def response_for(candidate):
+            source = SimpleNamespace(buffer=io.BytesIO(h._json_bytes(candidate) + b"\n"))
+            output = SimpleNamespace(buffer=io.BytesIO())
+            with patch.object(sys, "stdin", source), patch.object(sys, "stdout", output):
+                h._main()
+            return json.loads(output.buffer.getvalue())
+
+        request = {"id": CLIENT, "op": "inspect_result_ownership", "target": self.target,
+                   "expectation": expectation}
+        with patch.dict(os.environ, {}, clear=True), \
+                patch.object(h, "_verify_current_runner_ancestor", side_effect=AssertionError("runner check called")), \
+                patch.object(h, "_current_target", side_effect=AssertionError("current target used")):
+            response = response_for(request)
+        self.assertEqual(response["id"], CLIENT)
+        self.assertTrue(response["ok"])
+        self.assertEqual(response["value"]["ownership"], "origin")
+        self.assertEqual(response["value"]["originTurnId"], NEW_TURN)
+        self.assertEqual(response["value"]["originAlias"], None)
+        self.assertEqual(response["value"]["deliveryId"], delivery_id)
+        self.assertEqual(response["value"]["chainSignatures"], [])
+
+        invalid_requests = [
+            {key: value for key, value in request.items() if key != "expectation"},
+            {**request, "extra": True},
+            {**request, "target": {**self.target, "extra": True}},
+            {**request, "expectation": {key: value for key, value in expectation.items() if key != "originTurnId"}},
+            {**request, "expectation": {**expectation, "deliveryId": "BAD"}},
+        ]
+        for invalid in invalid_requests:
+            with self.subTest(invalid=invalid):
+                response = response_for(invalid)
+                self.assertFalse(response["ok"])
+                self.assertEqual(response["code"], "DESKTOP_INVALID_REQUEST")
+
+        invalid_targets = [
+            {**self.target, "threadId": "01a00000-0000-7000-8000-000000000006"},
+            {**self.target, "projectId": "other_project"},
+            {**self.target, "workspaceRoot": str(Path(self.temp.name) / "other")},
+        ]
+        for target in invalid_targets:
+            with self.subTest(target=target):
+                response = response_for({**request, "target": target})
+                self.assertFalse(response["ok"])
+                self.assertIn(response["code"], {"DESKTOP_TARGET_NOT_FOUND", "DESKTOP_PROJECT_MISMATCH"})
+
     def _activity_state(self, *, runtime: str = "idle", status: str = "completed", items=None):
         items = items or [
             {"id": "item-1", "type": "userMessage", "content": []},
@@ -1500,15 +1566,22 @@ class ProtocolTests(unittest.TestCase):
 
 class ClassificationTests(unittest.TestCase):
 
-    def _classification_case(self, text, *, turn_id=NEW_TURN, continuation=False, trigger=None, predecessor_status="failed", intermediate_status="failed", hops=1, boundary="exhausted", ordinary_origin=False, ordinary_successor=False, machine_input=None, machine_items=None, thread_id=None):
+    def _classification_case(self, text, *, turn_id=NEW_TURN, continuation=False, trigger=None, predecessor_status="failed", intermediate_status="failed", hops=1, boundary="exhausted", ordinary_origin=False, ordinary_successor=False, machine_input=None, machine_items=None, thread_id=None, version=1, delivery_id=None, origin_trigger=None):
         with tempfile.TemporaryDirectory(prefix="c2c-classification-") as directory:
             target = {"threadId": THREAD, "hostId": "local", "projectId": "project_test",
                       "workspaceRoot": directory}
             pipe = FakePipe(target)
             if continuation:
-                origin_text = "ordinary" if ordinary_origin else '{"type":"C2C_DESKTOP_TASK","version":1,"workspaceId":"workspace","commandId":"cmd-classify","intent":"development_plan","message":"x"}'
+                origin_envelope = {"type": "C2C_DESKTOP_TASK", "version": version, "workspaceId": "workspace",
+                                   "commandId": "cmd-classify", "intent": "development_plan", "message": "x"}
+                if delivery_id is not None:
+                    origin_envelope["deliveryId"] = delivery_id
+                origin_text = "ordinary" if ordinary_origin else json.dumps(origin_envelope, separators=(",", ":"))
                 origin_item = {"type": "text", "text": origin_text, "text_elements": []}
-                origin = {"turnId": OLD_TURN, "status": predecessor_status, "params": {"input": [origin_item]},
+                origin_params = {"input": [origin_item]}
+                if origin_trigger is not None:
+                    origin_params["turnTrigger"] = origin_trigger
+                origin = {"turnId": OLD_TURN, "status": predecessor_status, "params": origin_params,
                           "items": [{"type": "userMessage", "content": [origin_item]}]}
                 turns = [origin]
                 if ordinary_successor:
@@ -1566,6 +1639,7 @@ class ClassificationTests(unittest.TestCase):
         self.assertEqual(result["chainLength"], 0)
         self.assertEqual(result["chainSignatures"], [])
         self.assertIsNone(result["signature"])
+        self.assertIsNone(result["originAlias"])
         for key in ("text", "message", "envelope", "history", "params", "items"):
             self.assertNotIn(key, result)
 
@@ -1581,6 +1655,51 @@ class ClassificationTests(unittest.TestCase):
             with self.subTest(text=text), self.assertRaises(h.DesktopIpcError) as caught:
                 self._classification_case(text)
             self.assertEqual(caught.exception.code, "DESKTOP_STATE_UNAVAILABLE")
+
+    def test_result_classification_v2_requires_and_returns_exact_delivery_id(self):
+        delivery_id = "01a00000-0000-7000-8000-000000000200"
+        text = json.dumps({"type": "C2C_DESKTOP_TASK", "version": 2, "workspaceId": "workspace",
+                           "commandId": "cmd-v2", "intent": "revision", "message": "hello",
+                           "deliveryId": delivery_id}, separators=(",", ":"))
+        result = self._classification_case(text)
+        self.assertEqual(result["classification"], "applicable")
+        self.assertEqual(result["deliveryId"], delivery_id)
+        self.assertIsNone(result["originAlias"])
+
+        invalid = (
+            '{"type":"C2C_DESKTOP_TASK","version":2,"workspaceId":"workspace","commandId":"x","intent":"revision","message":"x"}',
+            '{"type":"C2C_DESKTOP_TASK","version":2,"workspaceId":"workspace","commandId":"x","intent":"revision","message":"x","deliveryId":"BAD"}',
+            '{"type":"C2C_DESKTOP_TASK","version":2,"workspaceId":"workspace","commandId":"x","intent":"revision","message":"x","deliveryId":"01a00000-0000-7000-8000-000000000200","deliveryId":"01a00000-0000-7000-8000-000000000200"}',
+            '{"type":"C2C_DESKTOP_TASK","version":1,"workspaceId":"workspace","commandId":"x","intent":"revision","message":"x","deliveryId":"01a00000-0000-7000-8000-000000000200"}',
+        )
+        for malformed in invalid:
+            with self.subTest(malformed=malformed), self.assertRaises(h.DesktopIpcError) as caught:
+                self._classification_case(malformed)
+            self.assertEqual(caught.exception.code, "DESKTOP_STATE_UNAVAILABLE")
+
+    def test_result_classification_marks_only_immediate_v2_edit_resume_as_alias(self):
+        delivery_id = "01a00000-0000-7000-8000-000000000200"
+        result = self._classification_case(
+            "", continuation=True, trigger="resume_interrupted_task", predecessor_status="interrupted",
+            version=2, delivery_id=delivery_id, origin_trigger="edit_user_message")
+        self.assertEqual(result["originAlias"], "edit_user_message_v2_delivery")
+        self.assertEqual(result["deliveryId"], delivery_id)
+        self.assertEqual(result["chainSignatures"], ["resume_interrupted_task"])
+
+        no_alias = self._classification_case(
+            "", continuation=True, trigger="capacity_retry_automatic", predecessor_status="interrupted",
+            version=2, delivery_id=delivery_id, origin_trigger="edit_user_message")
+        self.assertIsNone(no_alias["originAlias"])
+        wrong_trigger = self._classification_case(
+            "", continuation=True, trigger="resume_interrupted_task", predecessor_status="interrupted",
+            version=2, delivery_id=delivery_id, origin_trigger="user")
+        self.assertIsNone(wrong_trigger["originAlias"])
+
+        v1 = self._classification_case(
+            "", continuation=True, trigger="resume_interrupted_task", predecessor_status="interrupted",
+            version=1, origin_trigger="edit_user_message")
+        self.assertIsNone(v1["originAlias"])
+        self.assertNotIn("deliveryId", v1)
 
     def test_result_classification_malformed_or_c2c_shaped_is_fail_closed(self):
         cases = ["{malformed", '{"type":"C2C_DESKTOP_TASK"}']

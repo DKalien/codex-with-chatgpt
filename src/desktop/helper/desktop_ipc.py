@@ -1119,7 +1119,9 @@ def _turns(state: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _reconcile_expectation(value: Any) -> dict[str, Any]:
-    if not isinstance(value, dict) or set(value) != {"workspaceId", "commandId", "intent", "messageBytes", "messageSha256"}:
+    base_keys = {"workspaceId", "commandId", "intent", "messageBytes", "messageSha256"}
+    if (not isinstance(value, dict) or
+            frozenset(value) not in {frozenset(base_keys), frozenset(base_keys | {"deliveryId"})}):
         raise _error("DESKTOP_INVALID_REQUEST")
     for key in ("workspaceId", "commandId"):
         item = value.get(key)
@@ -1131,7 +1133,13 @@ def _reconcile_expectation(value: Any) -> dict[str, Any]:
             not isinstance(value.get("messageSha256"), str) or
             re.fullmatch(r"[a-f0-9]{64}", value["messageSha256"]) is None):
         raise _error("DESKTOP_INVALID_REQUEST")
-    return dict(value)
+    result = dict(value)
+    if "deliveryId" in result:
+        delivery_id = _uuid(result["deliveryId"])
+        if delivery_id is None:
+            raise _error("DESKTOP_INVALID_REQUEST")
+        result["deliveryId"] = delivery_id
+    return result
 
 
 def _turn_text_for_reconciliation(turn: dict[str, Any]) -> str | None:
@@ -1260,8 +1268,70 @@ def _strict_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
+_DESKTOP_TASK_V1_KEYS = frozenset({"type", "version", "workspaceId", "commandId", "intent", "message"})
+_DESKTOP_TASK_V2_KEYS = _DESKTOP_TASK_V1_KEYS | {"deliveryId"}
+
+
+def _parse_desktop_task(text: str) -> dict[str, Any] | None:
+    """Parse the exact v1/v2 envelope without retaining or logging its message."""
+    if not text.lstrip().startswith("{"):
+        return None
+    try:
+        if len(text.encode("utf-8", "strict")) > MAX_MESSAGE_BYTES * 6 + 512:
+            raise ValueError("envelope too large")
+        envelope = json.loads(text, object_pairs_hook=_strict_json_object)
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError, RecursionError):
+        raise _error("DESKTOP_STATE_UNAVAILABLE")
+    if not isinstance(envelope, dict):
+        raise _error("DESKTOP_STATE_UNAVAILABLE")
+    if envelope.get("type") != "C2C_DESKTOP_TASK":
+        return None
+    version = envelope.get("version")
+    if type(version) is not int or version not in {1, 2}:
+        raise _error("DESKTOP_STATE_UNAVAILABLE")
+    expected_keys = _DESKTOP_TASK_V1_KEYS if version == 1 else _DESKTOP_TASK_V2_KEYS
+    if set(envelope) != expected_keys:
+        raise _error("DESKTOP_STATE_UNAVAILABLE")
+    workspace_id = envelope.get("workspaceId")
+    command_id = envelope.get("commandId")
+    intent = envelope.get("intent")
+    message = envelope.get("message")
+    if (not isinstance(workspace_id, str) or re.fullmatch(r"[A-Za-z0-9_-]{1,128}", workspace_id) is None
+            or not isinstance(command_id, str) or re.fullmatch(r"[A-Za-z0-9_-]{1,128}", command_id) is None
+            or not isinstance(intent, str) or intent not in {"development_plan", "revision"}
+            or not isinstance(message, str) or not message):
+        raise _error("DESKTOP_STATE_UNAVAILABLE")
+    try:
+        encoded = message.encode("utf-8", "strict")
+    except UnicodeEncodeError:
+        raise _error("DESKTOP_STATE_UNAVAILABLE")
+    if len(encoded) > MAX_MESSAGE_BYTES:
+        raise _error("DESKTOP_STATE_UNAVAILABLE")
+    result = {
+        "version": version,
+        "workspaceId": workspace_id,
+        "commandId": command_id,
+        "intent": intent,
+        "messageBytes": len(encoded),
+        "messageSha256": hashlib.sha256(encoded).hexdigest(),
+    }
+    if version == 2:
+        delivery_id = _uuid(envelope.get("deliveryId"))
+        if delivery_id is None:
+            raise _error("DESKTOP_STATE_UNAVAILABLE")
+        result["deliveryId"] = delivery_id
+    return result
+
+
+def _desktop_task_matches(expectation: dict[str, Any], envelope: dict[str, Any]) -> bool:
+    version = 2 if "deliveryId" in expectation else 1
+    return (envelope.get("version") == version and
+            all(envelope.get(key) == expectation.get(key) for key in
+                ("workspaceId", "commandId", "intent", "messageBytes", "messageSha256")) and
+            (version == 1 or envelope.get("deliveryId") == expectation["deliveryId"]))
+
+
 def _reconcile_turn_ids(state: dict[str, Any], expectation: dict[str, Any]) -> list[str]:
-    expected_keys = {"type", "version", "workspaceId", "commandId", "intent", "message"}
     candidates: list[str] = []
     # reconciliation 只接受 canonical、已 exhaust 的完整历史；flat turns
     # 没有完整性边界，不能证明“零候选”是真实零候选。
@@ -1269,32 +1339,8 @@ def _reconcile_turn_ids(state: dict[str, Any], expectation: dict[str, Any]) -> l
         text = _turn_text_for_reconciliation(turn)
         if text is None:
             continue
-        stripped = text.lstrip()
-        try:
-            envelope = json.loads(text, object_pairs_hook=_strict_json_object)
-        except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
-            # 普通 user text 不是候选；但一个以 JSON object 开头的截断 envelope
-            # 不能被当成“没有找到”，必须保持 fail-closed。
-            if stripped.startswith("{"):
-                raise _error("DESKTOP_STATE_UNAVAILABLE")
-            continue
-        if not isinstance(envelope, dict) or envelope.get("type") != "C2C_DESKTOP_TASK":
-            continue
-        if set(envelope) != expected_keys or not isinstance(envelope.get("message"), str):
-            raise _error("DESKTOP_STATE_UNAVAILABLE")
-        if envelope.get("version") != 1:
-            continue
-        message = envelope["message"]
-        try:
-            message_bytes = len(message.encode("utf-8", "strict"))
-            message_sha256 = hashlib.sha256(message.encode("utf-8", "strict")).hexdigest()
-        except UnicodeEncodeError:
-            raise _error("DESKTOP_STATE_UNAVAILABLE")
-        if (envelope.get("workspaceId") != expectation["workspaceId"] or
-                envelope.get("commandId") != expectation["commandId"] or
-                envelope.get("intent") != expectation["intent"] or
-                message_bytes != expectation["messageBytes"] or
-                message_sha256 != expectation["messageSha256"]):
+        envelope = _parse_desktop_task(text)
+        if envelope is None or not _desktop_task_matches(expectation, envelope):
             continue
         turn_id = _uuid(turn.get("turnId"))
         if turn_id is None:
@@ -2036,11 +2082,13 @@ _NATIVE_CONTINUATION_PREDECESSOR_STATUSES = {
 
 
 def _continuation_expectation(value: Any) -> dict[str, Any]:
-    if not isinstance(value, dict) or set(value) != {
-        "workspaceId", "commandId", "intent", "messageBytes", "messageSha256", "originTurnId"
-    }:
+    base_keys = {"workspaceId", "commandId", "intent", "messageBytes", "messageSha256", "originTurnId"}
+    if (not isinstance(value, dict) or
+            frozenset(value) not in {frozenset(base_keys), frozenset(base_keys | {"deliveryId"})}):
         raise _error("DESKTOP_INVALID_REQUEST")
     base = {key: value[key] for key in ("workspaceId", "commandId", "intent", "messageBytes", "messageSha256")}
+    if "deliveryId" in value:
+        base["deliveryId"] = value["deliveryId"]
     result = _reconcile_expectation(base)
     origin_turn_id = _uuid(value.get("originTurnId"))
     if origin_turn_id is None:
@@ -2053,22 +2101,8 @@ def _origin_matches_expectation(turn: dict[str, Any], expectation: dict[str, Any
     text = _turn_text_for_reconciliation(turn)
     if text is None:
         raise _error("DESKTOP_STATE_UNAVAILABLE")
-    try:
-        envelope = json.loads(text, object_pairs_hook=_strict_json_object)
-    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
-        raise _error("DESKTOP_STATE_UNAVAILABLE")
-    if (not isinstance(envelope, dict) or
-            set(envelope) != {"type", "version", "workspaceId", "commandId", "intent", "message"} or
-            envelope.get("type") != "C2C_DESKTOP_TASK" or envelope.get("version") != 1 or
-            envelope.get("workspaceId") != expectation["workspaceId"] or
-            envelope.get("commandId") != expectation["commandId"] or
-            envelope.get("intent") != expectation["intent"] or
-            not isinstance(envelope.get("message"), str)):
-        raise _error("DESKTOP_STATE_UNAVAILABLE")
-    message = envelope["message"]
-    message_bytes = len(message.encode("utf-8", "strict"))
-    message_sha256 = hashlib.sha256(message.encode("utf-8", "strict")).hexdigest()
-    if message_bytes != expectation["messageBytes"] or message_sha256 != expectation["messageSha256"]:
+    envelope = _parse_desktop_task(text)
+    if envelope is None or not _desktop_task_matches(expectation, envelope):
         raise _error("DESKTOP_STATE_UNAVAILABLE")
     params = turn.get("params")
     if isinstance(params, dict) and params.get("threadId") not in {None, target["threadId"]}:
@@ -2079,35 +2113,13 @@ def _observed_desktop_origin(turn: dict[str, Any], target: dict[str, str]) -> di
     text = _turn_text_for_reconciliation(turn)
     if text is None or not text.lstrip().startswith("{"):
         return None
-    try:
-        envelope = json.loads(text, object_pairs_hook=_strict_json_object)
-    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
-        raise _error("DESKTOP_STATE_UNAVAILABLE")
-    if not isinstance(envelope, dict):
-        raise _error("DESKTOP_STATE_UNAVAILABLE")
-    if envelope.get("type") != "C2C_DESKTOP_TASK":
+    envelope = _parse_desktop_task(text)
+    if envelope is None:
         return None
-    if set(envelope) != {"type", "version", "workspaceId", "commandId", "intent", "message"} or envelope.get("version") != 1:
-        raise _error("DESKTOP_STATE_UNAVAILABLE")
-    workspace_id = envelope.get("workspaceId")
-    command_id = envelope.get("commandId")
-    intent = envelope.get("intent")
-    message = envelope.get("message")
-    if (not isinstance(workspace_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", workspace_id)
-            or not isinstance(command_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", command_id)
-            or intent not in {"development_plan", "revision"} or not isinstance(message, str) or not message):
-        raise _error("DESKTOP_STATE_UNAVAILABLE")
-    try:
-        encoded = message.encode("utf-8", "strict")
-    except UnicodeEncodeError:
-        raise _error("DESKTOP_STATE_UNAVAILABLE")
-    if len(encoded) > MAX_MESSAGE_BYTES:
-        raise _error("DESKTOP_STATE_UNAVAILABLE")
     params = turn.get("params")
     if isinstance(params, dict) and params.get("threadId") not in {None, target["threadId"]}:
         raise _error("DESKTOP_TARGET_NOT_FOUND")
-    return {"workspaceId": workspace_id, "commandId": command_id, "intent": intent,
-            "messageBytes": len(encoded), "messageSha256": hashlib.sha256(encoded).hexdigest()}
+    return {key: value for key, value in envelope.items() if key != "version"}
 
 
 def _native_successor(turn: dict[str, Any], target: dict[str, str]) -> str:
@@ -2136,6 +2148,139 @@ def _native_continuation_edge(predecessor: dict[str, Any], successor: dict[str, 
     return trigger
 
 
+_EDIT_DELIVERY_ORIGIN_TRIGGER = "edit_user_message"
+_EDIT_DELIVERY_ORIGIN_ALIAS = "edit_user_message_v2_delivery"
+
+
+def _delivery_id_origins(turns: list[dict[str, Any]], target: dict[str, str], delivery_id: str) -> list[dict[str, Any]]:
+    matches: list[dict[str, Any]] = []
+    for turn in turns:
+        params = turn.get("params")
+        raw_input = params.get("input") if isinstance(params, dict) else None
+        if not isinstance(raw_input, list):
+            continue
+        possible_envelope = any(
+            isinstance(item, dict) and isinstance(item.get("text"), str) and item["text"].lstrip().startswith("{")
+            for item in raw_input
+        )
+        if not possible_envelope:
+            continue
+        observed = _observed_desktop_origin(turn, target)
+        if observed is not None and observed.get("deliveryId") == delivery_id:
+            matches.append(turn)
+    return matches
+
+
+def _delivery_alias_edge(origin: dict[str, Any], successor: dict[str, Any], target: dict[str, str]) -> str:
+    observed = _observed_desktop_origin(origin, target)
+    params = origin.get("params")
+    if (observed is None or "deliveryId" not in observed or origin.get("status") != "interrupted"
+            or not isinstance(params, dict) or params.get("turnTrigger") != _EDIT_DELIVERY_ORIGIN_TRIGGER):
+        raise _error("DESKTOP_STATE_UNAVAILABLE")
+    if _native_continuation_edge(origin, successor, target) != "resume_interrupted_task":
+        raise _error("DESKTOP_STATE_UNAVAILABLE")
+    return "resume_interrupted_task"
+
+
+def _classification_origin_alias(state: dict[str, Any], origin: dict[str, Any], successor: dict[str, Any],
+                                 observed: dict[str, Any], target: dict[str, str]) -> str | None:
+    params = origin.get("params")
+    if ("deliveryId" not in observed or origin.get("status") != "interrupted"
+            or not isinstance(params, dict) or params.get("turnTrigger") != _EDIT_DELIVERY_ORIGIN_TRIGGER):
+        return None
+    if _native_continuation_edge(origin, successor, target) != "resume_interrupted_task":
+        return None
+    all_turns = _complete_result_turns(state)
+    matches = _delivery_id_origins(all_turns, target, observed["deliveryId"])
+    if len(matches) != 1 or matches[0].get("turnId") != origin.get("turnId"):
+        raise _error("DESKTOP_STATE_UNAVAILABLE")
+    return _EDIT_DELIVERY_ORIGIN_ALIAS
+
+
+def _evaluate_result_ownership(state: dict[str, Any], target: dict[str, str],
+                               expectation: dict[str, Any], client: _IpcClient) -> dict[str, Any]:
+    all_turns = _complete_result_turns(state)
+    ids = [turn.get("turnId") for turn in all_turns]
+    origin_id = expectation["originTurnId"]
+    origin_indices = [index for index, turn_id in enumerate(ids) if turn_id == origin_id]
+    origin_alias: str | None = None
+    if len(origin_indices) == 1:
+        # The accepted turn ID remains authoritative whenever present.
+        _origin_matches_expectation(all_turns[origin_indices[0]], expectation, target)
+    elif not origin_indices and "deliveryId" in expectation:
+        aliases = _delivery_id_origins(all_turns, target, expectation["deliveryId"])
+        if len(aliases) != 1:
+            raise _error("DESKTOP_STATE_UNAVAILABLE")
+        _origin_matches_expectation(aliases[0], expectation, target)
+        origin_id = _uuid(aliases[0].get("turnId"))
+        if origin_id is None:
+            raise _error("DESKTOP_STATE_UNAVAILABLE")
+        origin_indices = [index for index, turn in enumerate(all_turns) if turn is aliases[0]]
+        if len(origin_indices) != 1:
+            raise _error("DESKTOP_STATE_UNAVAILABLE")
+        origin_alias = _EDIT_DELIVERY_ORIGIN_ALIAS
+    else:
+        raise _error("DESKTOP_STATE_UNAVAILABLE")
+    result_id, result_status = _result_turn_context(state)
+    turns = _ownership_island_turns(state, origin_id, result_id)
+    ids = [turn.get("turnId") for turn in turns]
+    origin_indices = [index for index, turn_id in enumerate(ids) if turn_id == origin_id]
+    result_indices = [index for index, turn_id in enumerate(ids) if turn_id == result_id]
+    if len(origin_indices) != 1 or len(result_indices) != 1:
+        raise _error("DESKTOP_STATE_UNAVAILABLE")
+    origin_index = origin_indices[0]
+    result_index = result_indices[0]
+    if result_index < origin_index:
+        raise _error("DESKTOP_STATE_UNAVAILABLE")
+    if result_index == origin_index:
+        if origin_alias is not None:
+            raise _error("DESKTOP_STATE_UNAVAILABLE")
+        return {
+            **_public_info(state, target, client),
+            "resultTurnId": result_id,
+            "resultTurnStatus": result_status,
+            "ownership": "origin",
+            "originTurnId": origin_id,
+            "originAlias": None,
+            **({"deliveryId": expectation["deliveryId"]} if "deliveryId" in expectation else {}),
+            "chainTurnIds": [origin_id],
+            "chainLength": 0,
+            "chainSignatures": [],
+            "signature": None,
+        }
+    chain_length = result_index - origin_index
+    if chain_length > MAX_RESULT_OWNERSHIP_CHAIN:
+        raise _error("DESKTOP_STATE_UNAVAILABLE")
+    chain = [origin_id]
+    chain_signatures = []
+    for index in range(origin_index, result_index):
+        predecessor = turns[index]
+        successor = turns[index + 1]
+        successor_id = _uuid(successor.get("turnId"))
+        if successor_id is None:
+            raise _error("DESKTOP_STATE_UNAVAILABLE")
+        if origin_alias is not None and index == origin_index:
+            chain_signatures.append(_delivery_alias_edge(predecessor, successor, target))
+        else:
+            chain_signatures.append(_native_continuation_edge(predecessor, successor, target))
+        chain.append(successor_id)
+    if chain[-1] != result_id:
+        raise _error("DESKTOP_STATE_UNAVAILABLE")
+    return {
+        **_public_info(state, target, client),
+        "resultTurnId": result_id,
+        "resultTurnStatus": result_status,
+        "ownership": "native_continuation",
+        "originTurnId": origin_id,
+        "originAlias": origin_alias,
+        **({"deliveryId": expectation["deliveryId"]} if "deliveryId" in expectation else {}),
+        "chainTurnIds": chain,
+        "chainLength": chain_length,
+        "chainSignatures": chain_signatures,
+        "signature": chain_signatures[-1],
+    }
+
+
 def _current_result_ownership(workspace_root: Any, expectation_value: Any) -> dict[str, Any]:
     target = _current_target(workspace_root)
     expectation = _continuation_expectation(expectation_value)
@@ -2162,63 +2307,35 @@ def _current_result_ownership(workspace_root: Any, expectation_value: Any) -> di
             if time.monotonic() >= freshness_deadline or session.client.snapshot_age() > MAX_OBSERVATION_AGE_SECONDS:
                 raise _error("DESKTOP_STATE_UNAVAILABLE")
             _validate_observed_state(state, target, session.client.owner or "")
+        return _evaluate_result_ownership(state, target, expectation, session.client)
+    finally:
+        session.close()
 
-        all_turns = _complete_result_turns(state)
-        ids = [turn.get("turnId") for turn in all_turns]
-        origin_id = expectation["originTurnId"]
-        origin_indices = [index for index, turn_id in enumerate(ids) if turn_id == origin_id]
-        if len(origin_indices) != 1:
+
+def _inspect_result_ownership(target: dict[str, str], expectation_value: Any) -> dict[str, Any]:
+    expectation = _continuation_expectation(expectation_value)
+    session, _ = _prepare(target, purpose="observe")
+    try:
+        session.client.drain(0.1)
+        state = session.client.current_state()
+        if state is None or session.client.snapshot_age() > MAX_OBSERVATION_AGE_SECONDS:
             raise _error("DESKTOP_STATE_UNAVAILABLE")
-        _origin_matches_expectation(all_turns[origin_indices[0]], expectation, target)
-        result_id, result_status = _result_turn_context(state)
-        turns = _ownership_island_turns(state, origin_id, result_id)
-        ids = [turn.get("turnId") for turn in turns]
-        origin_indices = [index for index, turn_id in enumerate(ids) if turn_id == origin_id]
-        result_indices = [index for index, turn_id in enumerate(ids) if turn_id == result_id]
-        if len(origin_indices) != 1 or len(result_indices) != 1:
-            raise _error("DESKTOP_STATE_UNAVAILABLE")
-        origin_index = origin_indices[0]
-        result_index = result_indices[0]
-        if result_index < origin_index:
-            raise _error("DESKTOP_STATE_UNAVAILABLE")
-        if result_index == origin_index:
-            return {
-                **_public_info(state, target, session.client),
-                "resultTurnId": result_id,
-                "resultTurnStatus": result_status,
-                "ownership": "origin",
-                "originTurnId": origin_id,
-                "chainTurnIds": [origin_id],
-                "chainLength": 0,
-                "chainSignatures": [],
-                "signature": None,
-            }
-        chain_length = result_index - origin_index
-        if chain_length > MAX_RESULT_OWNERSHIP_CHAIN:
-            raise _error("DESKTOP_STATE_UNAVAILABLE")
-        chain = [origin_id]
-        chain_signatures = []
-        for index in range(origin_index, result_index):
-            predecessor = turns[index]
-            successor = turns[index + 1]
-            successor_id = _uuid(successor.get("turnId"))
-            if successor_id is None:
+        _validate_observed_state(state, target, session.client.owner or "")
+        freshness_deadline = time.monotonic() + SNAPSHOT_TIMEOUT_SECONDS
+        _verify_process_identity(session.pipe, target, session.process)
+        if session.client.snapshot_age() > MAX_OBSERVATION_AGE_SECONDS:
+            if time.monotonic() >= freshness_deadline:
                 raise _error("DESKTOP_STATE_UNAVAILABLE")
-            chain_signatures.append(_native_continuation_edge(predecessor, successor, target))
-            chain.append(successor_id)
-        if chain[-1] != result_id:
-            raise _error("DESKTOP_STATE_UNAVAILABLE")
-        return {
-            **_public_info(state, target, session.client),
-            "resultTurnId": result_id,
-            "resultTurnStatus": result_status,
-            "ownership": "native_continuation",
-            "originTurnId": origin_id,
-            "chainTurnIds": chain,
-            "chainLength": chain_length,
-            "chainSignatures": chain_signatures,
-            "signature": chain_signatures[-1],
-        }
+            session.pipe.verify_server()
+            previous_serial = session.client.snapshot_serial
+            state = session.client.snapshot()
+            if session.client.snapshot_serial <= previous_serial:
+                raise _error("DESKTOP_STATE_UNAVAILABLE")
+            _verify_process_identity(session.pipe, target, session.process)
+            if time.monotonic() >= freshness_deadline or session.client.snapshot_age() > MAX_OBSERVATION_AGE_SECONDS:
+                raise _error("DESKTOP_STATE_UNAVAILABLE")
+            _validate_observed_state(state, target, session.client.owner or "")
+        return _evaluate_result_ownership(state, target, expectation, session.client)
     finally:
         session.close()
 
@@ -2291,7 +2408,8 @@ def _current_result_classification(workspace_root: Any) -> dict[str, Any]:
             if observed is None:
                 return {**base, "classification": "not_applicable"}
             return {**base, **observed, "classification": "applicable", "ownership": "origin",
-                    "originTurnId": result_id, "chainTurnIds": [result_id], "chainLength": 0,
+                    "originTurnId": result_id, "originAlias": None,
+                    "chainTurnIds": [result_id], "chainLength": 0,
                     "chainSignatures": [], "signature": None}
         chain = [result_id]
         cursor = indexes[0]
@@ -2316,8 +2434,9 @@ def _current_result_classification(workspace_root: Any) -> dict[str, Any]:
             observed = _observed_desktop_origin(predecessor, target)
             if observed is None:
                 return {**base, "classification": "not_applicable"}
+            origin_alias = _classification_origin_alias(state, predecessor, successor, observed, target)
             return {**base, **observed, "classification": "applicable", "ownership": "native_continuation",
-                    "originTurnId": predecessor_id, "chainTurnIds": chain,
+                    "originTurnId": predecessor_id, "originAlias": origin_alias, "chainTurnIds": chain,
                     "chainLength": len(chain) - 1, "chainSignatures": list(reversed(reverse_chain_signatures)),
                     "signature": reverse_chain_signatures[0]}
         raise _error("DESKTOP_STATE_UNAVAILABLE")
@@ -2407,6 +2526,12 @@ def _main() -> int:
                     raise _error("DESKTOP_INVALID_REQUEST")
                 _reply({"id": request_id, "ok": True,
                         "value": _current_result_ownership(request.get("workspaceRoot"), request.get("expectation"))})
+            elif op == "inspect_result_ownership":
+                if set(request) != {"id", "op", "target", "expectation"} or prepared is not None:
+                    raise _error("DESKTOP_INVALID_REQUEST")
+                target = _target(request.get("target"))
+                _reply({"id": request_id, "ok": True,
+                        "value": _inspect_result_ownership(target, request.get("expectation"))})
             elif op == "current_result_classification":
                 if set(request) != {"id", "op", "workspaceRoot"} or prepared is not None:
                     raise _error("DESKTOP_INVALID_REQUEST")

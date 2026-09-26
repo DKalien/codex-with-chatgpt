@@ -335,9 +335,12 @@ describe("Desktop 持久化投递", () => {
     const request = { ...input(), intent };
     const first = await sendDesktop(workspace, request, "client");
     expect(first.intent).toBe(intent);
-    expect(JSON.parse(send.mock.calls[0][0])).toEqual({ type: "C2C_DESKTOP_TASK", version: 1,
-      workspaceId: workspace.id, commandId: request.commandId, intent, message: request.message });
-    expect(readDesktop(workspace.id)?.deliveries[0].intent).toBe(intent);
+    const stored = readDesktop(workspace.id)?.deliveries[0];
+    expect(JSON.parse(send.mock.calls[0][0])).toStrictEqual({ type: "C2C_DESKTOP_TASK", version: 2,
+      workspaceId: workspace.id, commandId: request.commandId, intent, deliveryId: stored?.deliveryId, message: request.message });
+    expect(stored?.intent).toBe(intent);
+    expect(stored?.deliveryId).toMatch(/^[0-9a-f-]{36}$/i);
+    expect(first).not.toHaveProperty("deliveryId");
     expect(await sendDesktop(workspace, request, "client")).toEqual(first);
     await expect(sendDesktop(workspace, { ...request, intent: intent === "revision" ? "development_plan" : "revision" }, "client"))
       .rejects.toMatchObject({ code: "DESKTOP_COMMAND_CONFLICT" });
@@ -349,14 +352,17 @@ describe("Desktop 持久化投递", () => {
     await sendDesktop(workspace, input(), "client");
     const file = desktopFile(workspace.id);
     const old = JSON.parse(fs.readFileSync(file, "utf8"));
+    expect(old.version).toBe(1);
     const record = old.deliveries[0];
     delete record.intent;
+    delete record.deliveryId;
     record.deliveryStatus = deliveryStatus;
     if (deliveryStatus !== "accepted") delete record.turnId;
     if (deliveryStatus === "rejected") { record.errorCode = "DESKTOP_BUSY"; record.errorMessage = "目标忙"; }
     fs.writeFileSync(file, JSON.stringify(old));
     const original = fs.readFileSync(file, "utf8");
     expect(readDesktop(workspace.id)?.deliveries[0].intent).toBeUndefined();
+    expect(readDesktop(workspace.id)?.deliveries[0].deliveryId).toBeUndefined();
     expect((await desktopStatus(workspace, "command_1")).delivery).toMatchObject({ deliveryStatus, intent: undefined });
     await expect(sendDesktop(workspace, input(), "client")).rejects.toMatchObject({ code: "DESKTOP_COMMAND_CONFLICT" });
     expect(fs.readFileSync(file, "utf8")).toBe(original);
@@ -410,6 +416,30 @@ describe("Desktop 持久化投递", () => {
     const status = JSON.stringify(await desktopStatus(workspace, "command_1"));
     expect(status).not.toContain("messageSha256");
     expect(status).not.toContain("clientId");
+    expect(status).not.toContain("deliveryId");
+  });
+
+  it("并发预提交命中已有记录时复用唯一 deliveryId 且只发送一次", async () => {
+    enableDesktop(workspace, bindingId);
+    const bothPrepared = deferred<void>();
+    const release = deferred<void>();
+    let prepareCount = 0;
+    vi.mocked(desktopIpc.prepare).mockImplementation(async () => {
+      if (++prepareCount === 2) bothPrepared.resolve();
+      await release.promise;
+      return { send, close };
+    });
+
+    const requests = [sendDesktop(workspace, input(), "client"), sendDesktop(workspace, input(), "client")];
+    await bothPrepared.promise;
+    release.resolve();
+    const results = await Promise.all(requests);
+    const deliveries = readDesktop(workspace.id)?.deliveries.filter(item => item.commandId === "command_1") ?? [];
+    expect(deliveries).toHaveLength(1);
+    expect(deliveries[0].deliveryId).toMatch(/^[0-9a-f-]{36}$/i);
+    expect(JSON.parse(send.mock.calls[0][0]).deliveryId).toBe(deliveries[0].deliveryId);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(results.every(result => !Object.hasOwn(result, "deliveryId"))).toBe(true);
   });
 
   it("重新绑定生成新 ID 且关闭；旧请求不切换目标，同command不同binding拒绝", async () => {

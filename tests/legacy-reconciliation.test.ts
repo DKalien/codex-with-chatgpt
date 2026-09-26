@@ -1,11 +1,12 @@
 import fs from "node:fs";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { Command } from "commander";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { desktopIpc } from "../src/desktop/ipc.js";
 import { legacyRetirementFile } from "../src/desktop/legacy-retirement.js";
 import { appendExecutionRecord, isTrustedDesktopReceipt, readExecutionRecordsStrict } from "../src/execution/records.js";
-import { MAX_OUTPUT_RECORDS, saveExecutionOutput } from "../src/execution/output.js";
+import { MAX_OUTPUT_RECORDS, readExecutionOutputMetadataStrict, saveExecutionOutput } from "../src/execution/output.js";
 import {
   getReconciledLegacyCommandIds,
   legacyReconciliationFile,
@@ -14,7 +15,7 @@ import {
   reconcileLegacyAccepted,
   LegacyReconciliationError,
 } from "../src/desktop/legacy-reconciliation.js";
-import { updateDesktop } from "../src/desktop/store.js";
+import { readDesktop, updateDesktop } from "../src/desktop/store.js";
 import { registerDesktopCommands } from "../src/cli/desktop.js";
 import { Workspace } from "../src/workspace/manager.js";
 import { cleanup, makeTmpDir } from "./helpers.js";
@@ -27,6 +28,8 @@ const commandId = "pre_receipt_command";
 const threadId = "01a00000-0000-7000-8000-000000000001";
 const turnId = "01a00000-0000-7000-8000-000000000002";
 const acceptedAt = "2026-01-01T00:00:00.000Z";
+const deliveryIdA = "01a00000-0000-7000-8000-000000000004";
+const deliveryIdB = "01a00000-0000-7000-8000-000000000005";
 
 beforeEach(() => {
   root = makeTmpDir("legacy-reconciliation-workspace");
@@ -388,6 +391,38 @@ describe("legacy accepted reconciliation", () => {
     expect(readLegacyReconciliations(workspace.id)).toHaveLength(1);
     expect(getReconciledLegacyCommandIds(workspace)).toEqual(new Set([commandId]));
     expect(fs.existsSync(legacyReconciliationFile(workspace.id))).toBe(true);
+    const delivery = readDesktop(workspace.id)!.deliveries[0]!;
+    const record = readExecutionRecordsStrict(workspace.id)[0]!;
+    const output = readExecutionOutputMetadataStrict(workspace.id)[0]!;
+    const legacyProofSource = {
+      delivery: {
+        commandId: delivery.commandId, clientId: delivery.clientId, bindingId: delivery.bindingId,
+        messageSha256: delivery.messageSha256, messageBytes: delivery.messageBytes, threadId: delivery.threadId,
+        turnId: delivery.turnId, deliveryStatus: delivery.deliveryStatus,
+        createdAt: delivery.createdAt, updatedAt: delivery.updatedAt,
+      },
+      record,
+      output,
+    };
+    expect(first.proofSha256).toBe(createHash("sha256").update(JSON.stringify(legacyProofSource), "utf8").digest("hex"));
+    expect(readLegacyReconciliations(workspace.id)[0]).not.toHaveProperty("deliveryId");
+  });
+
+  it("v2 deliveryId 写入 reconciliation 证据并在漂移时冲突", () => {
+    seedDelivery({ deliveryId: deliveryIdA });
+    seedEvidenceSources();
+    reconcileLegacyAccepted(workspace, commandId);
+    expect(readLegacyReconciliations(workspace.id)[0]).toMatchObject({ deliveryId: deliveryIdA });
+
+    updateDesktop(workspace.id, state => {
+      if (!state) throw new Error("missing state");
+      state.deliveries[0]!.deliveryId = deliveryIdB;
+      return { state, result: undefined };
+    });
+    expect(listLegacyReconciliations(workspace)).toEqual([{ commandId, status: "conflict" }]);
+    expect(() => getReconciledLegacyCommandIds(workspace)).toThrowError(
+      expect.objectContaining({ code: "LEGACY_RECONCILIATION_CONFLICT" }),
+    );
   });
 
   it("intent 已存在时永远拒绝 legacy reconciliation", () => {

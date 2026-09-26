@@ -30,6 +30,7 @@ const outputSnapshotSchema = z.object({
 
 const evidenceEntrySchema = z.object({
   commandId: desktopId,
+  deliveryId: uuid.optional(),
   taskId: z.string().min(1).max(256),
   iteration: z.number().int().nonnegative().safe(),
   outputId: z.number().int().positive().safe(),
@@ -282,6 +283,7 @@ export function legacyReconciliationProof(
   const source = {
     delivery: {
       commandId: delivery.commandId,
+      ...(delivery.deliveryId === undefined ? {} : { deliveryId: delivery.deliveryId }),
       clientId: delivery.clientId,
       bindingId: delivery.bindingId,
       messageSha256: delivery.messageSha256,
@@ -305,7 +307,7 @@ export function readLegacyReconciliations(workspaceId: string): LegacyReconcilia
 
 function verifyEvidence(sources: DesktopFactsSources, entry: LegacyReconciliationEvidence): void {
   const facts = factsFromSources(sources, entry.commandId, entry);
-  if (entry.taskId !== facts.record.taskId || entry.iteration !== facts.record.iteration ||
+  if (entry.deliveryId !== facts.delivery.deliveryId || entry.taskId !== facts.record.taskId || entry.iteration !== facts.record.iteration ||
       entry.outputId !== facts.record.outputId || entry.acceptedAt !== facts.delivery.updatedAt ||
       entry.executionTimestamp !== facts.record.timestamp || entry.outputTimestamp !== facts.output.timestamp ||
       entry.proofSha256 !== facts.proofSha256) {
@@ -410,7 +412,7 @@ export function reconcileLegacyAccepted(
       throw new LegacyReconciliationError("LEGACY_RECONCILIATION_CONFLICT", "reconciliation 输入事实在校验期间发生变化；拒绝写入证据。");
     }
     if (prior) {
-      if (prior.taskId !== current.record.taskId || prior.iteration !== current.record.iteration ||
+      if (prior.deliveryId !== current.delivery.deliveryId || prior.taskId !== current.record.taskId || prior.iteration !== current.record.iteration ||
           prior.outputId !== current.record.outputId || prior.acceptedAt !== current.delivery.updatedAt ||
           prior.executionTimestamp !== current.record.timestamp || prior.outputTimestamp !== current.output.timestamp ||
           prior.proofSha256 !== current.proofSha256) {
@@ -420,6 +422,7 @@ export function reconcileLegacyAccepted(
     }
     const evidence: LegacyReconciliationEvidence = {
       commandId,
+      ...(current.delivery.deliveryId === undefined ? {} : { deliveryId: current.delivery.deliveryId }),
       taskId: current.record.taskId,
       iteration: current.record.iteration,
       outputId: current.record.outputId!,
