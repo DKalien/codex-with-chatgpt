@@ -11,6 +11,7 @@ import {
   runFeedbackBootstrapSend,
 } from "../browser-companion/feedback-bootstrap-run.js";
 import { normalizeCanonicalDomText } from "../browser-companion/dom-adapter.js";
+import { snapshotUserTurns } from "../browser-companion/turn-observer.js";
 import { parseChatgptConversationRoute } from "../src/chatgpt/route.js";
 
 const ROUTE = "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111";
@@ -92,9 +93,10 @@ async function runWithDom(options: Record<string, any> = {}) {
   vi.spyOn(write, "verifyCanonicalComposer").mockReturnValue({ ok: true } as any);
   vi.spyOn(click, "dispatchNativeSend").mockImplementation(async () => {
     clicks += 1;
+    options.onClick?.();
     return { ok: true, clicked: 1 } as any;
   });
-  const result = await runFeedbackBootstrapSend({}, {
+  const result = await runFeedbackBootstrapSend(options.doc ?? {}, {
     expectedRoute: ROUTE,
     expectedGeneration: 4,
     locationHref: ROUTE,
@@ -113,6 +115,33 @@ async function runWithDom(options: Record<string, any> = {}) {
   });
   vi.restoreAllMocks();
   return { result, clicks, captured };
+}
+
+function makeModernUserTurnDom() {
+  const nodes: unknown[] = [];
+  return {
+    doc: {
+      querySelectorAll: (selector: string) => selector.includes("data-user-message-bubble")
+        ? nodes.filter((node: any) => node.getAttribute?.("data-user-message-bubble") === "true")
+        : [],
+    },
+    appendTurn(id: string, text: string) {
+      const section = {
+        tagName: "DIV",
+        getAttribute: (name: string) => name === "data-turn-key" ? id : null,
+        querySelector: () => null,
+      };
+      const bubble = {
+        tagName: "DIV",
+        getAttribute: (name: string) => name === "data-user-message-bubble" ? "true" : null,
+        querySelector: () => null,
+        closest: (selector: string) => selector === "[data-turn-key]" ? section : null,
+        innerText: text,
+        textContent: text,
+      };
+      nodes.push(section, bubble);
+    },
+  };
 }
 
 describe("fixed feedback bootstrap DOM send", () => {
@@ -212,6 +241,20 @@ describe("R3p current structural send lifecycle", () => {
       clicked: false,
     });
     expect(clicks).toBe(0);
+  });
+});
+
+describe("R3s modern DOM observer path", () => {
+  it("observes the nested user turn through the shared snapshot", async () => {
+    const liveDom = makeModernUserTurnDom();
+    const { result, clicks, captured } = await runWithDom({
+      doc: liveDom.doc,
+      onClick: () => liveDom.appendTurn("modern-1", FEEDBACK_BOOTSTRAP_MESSAGE),
+      runner: { snapshotUserTurns },
+    });
+    expect(result).toMatchObject({ ok: true, observed: true, clicked: true });
+    expect(clicks).toBe(1);
+    expect(captured).toEqual([FEEDBACK_BOOTSTRAP_MESSAGE]);
   });
 });
 

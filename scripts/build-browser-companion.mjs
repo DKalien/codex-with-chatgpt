@@ -680,6 +680,18 @@ if (!/globalThis\.collectBoundedDescendants\s*=/.test(distTurnGlobal)) {
 if (!/globalThis\.snapshotUserTurns\s*=/.test(distTurnGlobal)) {
   fail("turn-observer-global.js must expose snapshotUserTurns");
 }
+for (const [name, observer] of [
+  ["source", turnObserver], ["ESM", distTurnEsm], ["classic", distTurnGlobal],
+]) {
+  const code = observer.replace(/\/\*[\s\S]*?\*\/|^\s*\/\/.*$/gm, "");
+  if (!code.includes('[data-user-message-bubble="true"]')
+    || !code.includes('getAttribute?.("data-user-message-bubble")')) {
+    fail(`${name} turn-observer must discover exact modern USER bubbles`);
+  }
+  if (/\.(?:click|dispatchEvent|setAttribute|removeAttribute|appendChild|removeChild|replaceChild|insertBefore|replaceChildren|scrollIntoView|focus)\s*\(|\.(?:innerText|textContent|innerHTML|outerHTML|value)\s*=|querySelectorAll\s*\(\s*["'`]\*["'`]\s*\)/.test(code)) {
+    fail(`${name} turn-observer must stay read-only and use bounded scans`);
+  }
+}
 
 // G3 content_scripts packaging: classic only; ESM SW modules stay off the CS chain.
 const csJs = (manifest.content_scripts ?? []).flatMap((cs) => cs.js ?? []);

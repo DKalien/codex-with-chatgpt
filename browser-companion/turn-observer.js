@@ -28,6 +28,7 @@ function textOf(el) {
 
 function isUserTurn(el) {
   if (!el) return false;
+  if (el.getAttribute?.("data-user-message-bubble") === "true") return true;
   const role =
     el.getAttribute?.("data-message-author-role")
     || el.getAttribute?.("data-turn-author-role")
@@ -39,12 +40,16 @@ function isUserTurn(el) {
   return false;
 }
 
+function turnKeyOf(el) {
+  return el.closest?.("[data-turn-key]")?.getAttribute?.("data-turn-key") || null;
+}
+
 function turnCandidates(doc) {
   if (!doc || typeof doc.querySelectorAll !== "function") return [];
   // Real Edge: SECTION[data-testid^="conversation-turn"]; keep article fallback.
   const turns = queryAll(
     doc,
-    'section[data-testid^="conversation-turn"], article[data-testid^="conversation-turn"], [data-testid="conversation-turn"], [data-message-author-role]',
+    'section[data-testid^="conversation-turn"], article[data-testid^="conversation-turn"], [data-testid="conversation-turn"], [data-message-author-role], [data-user-message-bubble="true"]',
   );
   const unique = [];
   const seen = new Set();
@@ -54,16 +59,33 @@ function turnCandidates(doc) {
     seen.add(t);
     unique.push(t);
   }
-  // Prefer nodes that themselves carry the user role attribute (message body).
-  const direct = unique.filter((el) =>
+  // Keep legacy preference within legacy candidates; modern bubbles carry their own USER proof.
+  const legacy = unique.filter((el) => el.getAttribute?.("data-user-message-bubble") !== "true");
+  const direct = legacy.filter((el) =>
     (el.getAttribute?.("data-message-author-role") || el.getAttribute?.("data-turn-author-role")) === "user");
-  return direct.length > 0 ? direct : unique;
+  const preferred = [...(direct.length > 0 ? direct : legacy),
+    ...unique.filter((el) => el.getAttribute?.("data-user-message-bubble") === "true")];
+  const byTurnKey = new Map();
+  const deduped = [];
+  for (const el of preferred) {
+    const key = turnKeyOf(el);
+    const index = key ? byTurnKey.get(key) : undefined;
+    if (index === undefined) {
+      if (key) byTurnKey.set(key, deduped.length);
+      deduped.push(el);
+    } else if (el.getAttribute?.("data-user-message-bubble") === "true"
+      && deduped[index].getAttribute?.("data-user-message-bubble") !== "true") {
+      deduped[index] = el;
+    }
+  }
+  return deduped;
 }
 
 export function snapshotUserTurns(doc) {
   const turns = turnCandidates(doc);
   return turns.map((el, index) => ({
     id: el.getAttribute?.("data-turn-id")
+      || turnKeyOf(el)
       || el.closest?.('[data-testid^="conversation-turn"]')?.getAttribute?.("data-testid")
       || el.getAttribute?.("data-testid")
       || `idx-${index}`,

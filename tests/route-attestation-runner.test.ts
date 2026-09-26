@@ -19,6 +19,7 @@ import {
   matchesSendTargetIdentity,
   normalizeCanonicalDomText,
 } from "../browser-companion/dom-adapter.js";
+import { snapshotUserTurns } from "../browser-companion/turn-observer.js";
 import { formatRouteAttestationMessage } from "../src/feedback/store.js";
 
 const CHALLENGE = "11111111-1111-4111-8111-111111111111";
@@ -106,7 +107,7 @@ async function runWithDom(opts) {
   });
 
   try {
-    const result = await runRouteAttestationSend(makeDoc(), opts.runner);
+    const result = await runRouteAttestationSend(opts.doc ?? makeDoc(), opts.runner);
     return { ...result, __clicks: clicks };
   } finally {
     vi.restoreAllMocks();
@@ -119,6 +120,33 @@ function makeDescendant(innerText) {
 function makeTurnNode({ children }) {
   // Production collectBoundedDescendants uses children BFS only — never querySelectorAll("*").
   return { children };
+}
+
+function makeModernUserTurnDom() {
+  const nodes = [];
+  return {
+    doc: {
+      querySelectorAll: (selector) => selector.includes("data-user-message-bubble")
+        ? nodes.filter((node) => node.getAttribute?.("data-user-message-bubble") === "true")
+        : [],
+    },
+    appendTurn(id, text) {
+      const section = {
+        tagName: "DIV",
+        getAttribute: (name) => name === "data-turn-key" ? id : null,
+        querySelector: () => null,
+      };
+      const bubble = {
+        tagName: "DIV",
+        getAttribute: (name) => name === "data-user-message-bubble" ? "true" : null,
+        querySelector: () => null,
+        closest: (selector) => selector === "[data-turn-key]" ? section : null,
+        innerText: text,
+        textContent: text,
+      };
+      nodes.push(section, bubble);
+    },
+  };
 }
 
 function ownerFixture() {
@@ -264,6 +292,18 @@ describe("route-attestation runner exact observation", () => {
     expect(result.ok).toBe(true);
     expect(result.observed).toBe(true);
     expect(result.clicked).toBe(true);
+  });
+
+  it("modern turn-key/user-bubble turn is observed through the shared snapshot", async () => {
+    const liveDom = makeModernUserTurnDom();
+    const result = await runWithDom({
+      doc: liveDom.doc,
+      onClick: () => liveDom.appendTurn("modern-1", ATTEST),
+      runner: { ...okDomDeps(), snapshotUserTurns },
+    });
+    expect(result.ok).toBe(true);
+    expect(result.observed).toBe(true);
+    expect(result.__clicks).toBe(1);
   });
 
   it("multiple matching turns → ambiguous fail closed", async () => {

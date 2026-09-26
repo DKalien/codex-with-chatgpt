@@ -3315,6 +3315,104 @@ describe("E1b3d3b2 exact message-body observation", () => {
     return { querySelectorAll: () => nodes } as never;
   }
 
+  function modernTurn(text: string, key: string, legacyRole = false) {
+    const host = {
+      tagName: "DIV",
+      innerText: `你说：\n${text}`,
+      textContent: `你说：\n${text}`,
+      children: [] as unknown[],
+      getAttribute: (name: string) => name === "data-turn-key" ? key
+        : name === "data-message-author-role" && legacyRole ? "user" : null,
+      closest: (selector: string) => selector === "[data-turn-key]" ? host : null,
+      querySelector: () => null,
+    };
+    const bubble = {
+      tagName: "DIV",
+      innerText: text,
+      textContent: text,
+      children: [] as unknown[],
+      getAttribute: (name: string) => name === "data-user-message-bubble" ? "true" : null,
+      closest: (selector: string) => selector === "[data-turn-key]" ? host : null,
+    };
+    return { host, bubble };
+  }
+
+  it("R3s. modern USER bubble is one exact candidate with turn-key identity", () => {
+    const { host, bubble } = modernTurn(MESSAGE, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+    const doc = docOf([host, bubble]);
+    const turns = snapshotUserTurns(doc);
+    expect(turns).toHaveLength(1);
+    expect(turns[0]).toMatchObject({ id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", text: canonical, node: bubble });
+    const rec = findCanonicalUserTurn(doc, { message: MESSAGE, attemptId: ATTEMPT, baseline: [] });
+    expect(rec.ok).toBe(true);
+    expect(rec.diagnostic?.candidateCount).toBe(1);
+  });
+
+  it("R3s. different modern ATTEMPT_ID lines select only the exact target", () => {
+    const first = modernTurn(MESSAGE, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+    const second = modernTurn(MESSAGE.replace(ATTEMPT, "33333333-3333-4333-8333-333333333333"),
+      "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
+    const rec = findCanonicalUserTurn(docOf([first.host, first.bubble, second.host, second.bubble]), {
+      message: MESSAGE, attemptId: ATTEMPT, baseline: [],
+    });
+    expect(rec.ok).toBe(true);
+    expect(rec.turn?.node).toBe(first.bubble);
+    expect(rec.diagnostic?.candidateCount).toBe(2);
+    expect(rec.diagnostic?.exactAttemptMarkerCount).toBe(1);
+  });
+
+  it("R3s. identical modern USER bubbles on different turns fail ambiguous", () => {
+    const first = modernTurn(MESSAGE, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+    const second = modernTurn(MESSAGE, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
+    const rec = findCanonicalUserTurn(docOf([first.host, first.bubble, second.host, second.bubble]), {
+      message: MESSAGE, attemptId: ATTEMPT, baseline: [],
+    });
+    expect(rec.ok).toBe(false);
+    expect(rec.reason).toBe("ambiguous");
+    expect(rec.diagnostic?.candidateCount).toBe(2);
+  });
+
+  it("R3s. virtualized ghost without USER bubble has zero candidates", () => {
+    const { host } = modernTurn(MESSAGE, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+    const rec = findCanonicalUserTurn(docOf([host]), {
+      message: MESSAGE, attemptId: ATTEMPT, baseline: [],
+    });
+    expect(rec.ok).toBe(false);
+    expect(rec.reason).toBe("not_observed");
+    expect(rec.diagnostic?.candidateCount).toBe(0);
+  });
+
+  it("R3s. hybrid legacy and modern nodes under one turn-key are one bubble candidate", () => {
+    const { host, bubble } = modernTurn(MESSAGE, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", true);
+    const turns = snapshotUserTurns(docOf([host, bubble]));
+    expect(turns).toHaveLength(1);
+    expect(turns[0]?.node).toBe(bubble);
+    expect(turns[0]?.text).toBe(canonical);
+  });
+
+  it("R3s. OUTCOME_UNKNOWN modern bubble recovers by ACK without sending", async () => {
+    const { host, bubble } = modernTurn(MESSAGE, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+    const spy = makeSpies({
+      journal: markOutcomeUnknown(claimedJournal(), {}),
+      inFlight: {
+        status: "outcome_unknown",
+        eventId: EVENT_ID,
+        reservationId: RES_ID,
+        attemptId: ATTEMPT,
+        message: MESSAGE,
+        messageSha256: MESSAGE_SHA,
+      },
+      doc: docOf([host, bubble]),
+      findCanonicalUserTurn,
+    });
+    const result = await recoverProductionSend(spy);
+    expect(result.ok).toBe(true);
+    expect(result.action).toBe("late_positive_observed_then_acked");
+    expect(result.diagnostic?.candidateCount).toBe(1);
+    expect(spy.calls).toMatchObject({ write: 0, click: 0, beginSend: 0, ack: 1 });
+    expect(spy.journal.state).toBe("NONE");
+  });
+
   it("A. parent exact fast path still succeeds", () => {
     const parent = userNode({ innerText: canonical, textContent: canonical });
     const rec = findCanonicalUserTurn(docOf([parent]), {
