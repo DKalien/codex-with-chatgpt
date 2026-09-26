@@ -65,6 +65,7 @@ export interface DesktopResultTerminalFence extends DesktopResultContext {
 }
 
 export type DesktopResultOwnershipKind = "origin" | "native_continuation";
+export type NativeContinuationSignature = "capacity_retry_automatic" | "resume_interrupted_task";
 
 export interface DesktopResultOwnershipExpectation extends DesktopUnknownReconcileExpectation {
   originTurnId: string;
@@ -75,25 +76,16 @@ export interface DesktopResultOwnership extends DesktopResultContext {
   originTurnId: string;
   chainTurnIds: string[];
   chainLength: number;
-  signature: "capacity_retry_automatic" | null;
+  chainSignatures: NativeContinuationSignature[];
+  signature: NativeContinuationSignature | null;
 }
 
 export type DesktopResultClassificationKind = "applicable" | "not_applicable";
 
 /** 当前 canonical result turn 的一次性 self-attestation 分类结果。 */
-export interface DesktopResultClassification extends DesktopResultContext {
-  classification: DesktopResultClassificationKind;
-  workspaceId?: string;
-  commandId?: string;
-  intent?: DesktopUnknownReconcileExpectation["intent"];
-  messageBytes?: number;
-  messageSha256?: string;
-  ownership?: DesktopResultOwnershipKind;
-  originTurnId?: string;
-  chainTurnIds?: string[];
-  chainLength?: number;
-  signature?: "capacity_retry_automatic" | null;
-}
+export type DesktopResultClassification =
+  | (DesktopResultContext & { classification: "not_applicable" })
+  | (DesktopResultOwnership & DesktopUnknownReconcileExpectation & { classification: "applicable" });
 
 export interface DesktopUnknownReconcileExpectation {
   workspaceId: string;
@@ -454,7 +446,7 @@ function validateResultOwnership(value: unknown, target: DesktopTarget): Desktop
   const allowed = new Set([
     "threadId", "hostId", "projectId", "workspaceRoot", "title", "cwd", "workspaceKind", "resumeState",
     "runtimeStatus", "requestsCount", "ownerClientId",
-    "resultTurnId", "resultTurnStatus", "ownership", "originTurnId", "chainTurnIds", "chainLength", "signature",
+    "resultTurnId", "resultTurnStatus", "ownership", "originTurnId", "chainTurnIds", "chainLength", "chainSignatures", "signature",
   ]);
   if (Object.keys(input).some(key => !allowed.has(key))) throw error("DESKTOP_PROTOCOL_ERROR");
   const context = validateResultContext(value, target);
@@ -462,6 +454,7 @@ function validateResultOwnership(value: unknown, target: DesktopTarget): Desktop
   const originTurnId = input.originTurnId;
   const chainTurnIds = input.chainTurnIds;
   const chainLength = input.chainLength;
+  const chainSignatures = input.chainSignatures;
   const signature = input.signature;
   if (ownership !== "origin" && ownership !== "native_continuation") throw error("DESKTOP_PROTOCOL_ERROR");
   if (!isUuid(originTurnId) || !Array.isArray(chainTurnIds) ||
@@ -470,14 +463,16 @@ function validateResultOwnership(value: unknown, target: DesktopTarget): Desktop
       typeof chainLength !== "number" || !Number.isSafeInteger(chainLength) ||
       chainLength < 0 || chainLength > MAX_RESULT_CONTINUATION_CHAIN ||
       chainLength !== chainTurnIds.length - 1 || chainTurnIds[0] !== originTurnId ||
-      chainTurnIds[chainTurnIds.length - 1] !== context.resultTurnId) {
+      chainTurnIds[chainTurnIds.length - 1] !== context.resultTurnId ||
+      !Array.isArray(chainSignatures) || chainSignatures.length !== chainLength ||
+      !chainSignatures.every(item => item === "capacity_retry_automatic" || item === "resume_interrupted_task")) {
     throw error("DESKTOP_PROTOCOL_ERROR");
   }
   if (ownership === "origin") {
-    if (chainLength !== 0 || signature !== null || context.resultTurnId !== originTurnId) {
+    if (chainLength !== 0 || chainSignatures.length !== 0 || signature !== null || context.resultTurnId !== originTurnId) {
       throw error("DESKTOP_PROTOCOL_ERROR");
     }
-  } else if (chainLength < 1 || signature !== "capacity_retry_automatic" || context.resultTurnId === originTurnId) {
+  } else if (chainLength < 1 || signature !== chainSignatures[chainSignatures.length - 1] || context.resultTurnId === originTurnId) {
     throw error("DESKTOP_PROTOCOL_ERROR");
   }
   return {
@@ -486,7 +481,8 @@ function validateResultOwnership(value: unknown, target: DesktopTarget): Desktop
     originTurnId,
     chainTurnIds: [...chainTurnIds],
     chainLength,
-    signature,
+    chainSignatures: [...chainSignatures],
+    signature: signature as NativeContinuationSignature | null,
   };
 }
 
@@ -497,12 +493,12 @@ function validateResultClassification(value: unknown, target: DesktopTarget): De
     "threadId", "hostId", "projectId", "workspaceRoot", "title", "cwd", "workspaceKind", "resumeState",
     "runtimeStatus", "requestsCount", "ownerClientId",
     "resultTurnId", "resultTurnStatus", "classification", "workspaceId", "commandId", "intent",
-    "messageBytes", "messageSha256", "ownership", "originTurnId", "chainTurnIds", "chainLength", "signature",
+    "messageBytes", "messageSha256", "ownership", "originTurnId", "chainTurnIds", "chainLength", "chainSignatures", "signature",
   ]);
   if (Object.keys(input).some(key => !allowed.has(key))) throw error("DESKTOP_PROTOCOL_ERROR");
   const context = validateResultContext(value, target);
   if (input.classification === "not_applicable") {
-    if (["workspaceId", "commandId", "intent", "messageBytes", "messageSha256", "ownership", "originTurnId", "chainTurnIds", "chainLength", "signature"]
+    if (["workspaceId", "commandId", "intent", "messageBytes", "messageSha256", "ownership", "originTurnId", "chainTurnIds", "chainLength", "chainSignatures", "signature"]
       .some(key => Object.prototype.hasOwnProperty.call(input, key))) {
       throw error("DESKTOP_PROTOCOL_ERROR");
     }

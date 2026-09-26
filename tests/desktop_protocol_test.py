@@ -1500,7 +1500,7 @@ class ProtocolTests(unittest.TestCase):
 
 class ClassificationTests(unittest.TestCase):
 
-    def _classification_case(self, text, *, turn_id=NEW_TURN, continuation=False, trigger=None, predecessor_status="failed", hops=1, boundary="exhausted", ordinary_origin=False, machine_input=None, machine_items=None, thread_id=None):
+    def _classification_case(self, text, *, turn_id=NEW_TURN, continuation=False, trigger=None, predecessor_status="failed", intermediate_status="failed", hops=1, boundary="exhausted", ordinary_origin=False, ordinary_successor=False, machine_input=None, machine_items=None, thread_id=None):
         with tempfile.TemporaryDirectory(prefix="c2c-classification-") as directory:
             target = {"threadId": THREAD, "hostId": "local", "projectId": "project_test",
                       "workspaceRoot": directory}
@@ -1511,14 +1511,20 @@ class ClassificationTests(unittest.TestCase):
                 origin = {"turnId": OLD_TURN, "status": predecessor_status, "params": {"input": [origin_item]},
                           "items": [{"type": "userMessage", "content": [origin_item]}]}
                 turns = [origin]
-                for index in range(hops):
-                    params = {"turnTrigger": trigger or h._NATIVE_CONTINUATION_TRIGGER,
-                              "input": []}
-                    hop_id = turn_id if index == hops - 1 else f"01a00000-0000-7000-8000-{index + 6:012d}"
-                    turns.append({"turnId": hop_id,
-                                  "status": "completed" if index == hops - 1 else "failed",
-                                  "params": {**params, **({"input": machine_input} if machine_input is not None else {}), **({"threadId": thread_id} if thread_id is not None else {})},
-                                  "items": machine_items if machine_items is not None else []})
+                if ordinary_successor:
+                    ordinary_item = {"type": "text", "text": "ordinary user turn", "text_elements": []}
+                    turns.append({"turnId": turn_id, "status": "completed",
+                                  "params": {"input": [ordinary_item]},
+                                  "items": [{"type": "userMessage", "content": [ordinary_item]}]})
+                else:
+                    triggers = trigger if isinstance(trigger, list) else [trigger or h._NATIVE_CONTINUATION_TRIGGER] * hops
+                    for index in range(hops):
+                        params = {"turnTrigger": triggers[index], "input": []}
+                        hop_id = turn_id if index == hops - 1 else f"01a00000-0000-7000-8000-{index + 6:012d}"
+                        turns.append({"turnId": hop_id,
+                                      "status": "completed" if index == hops - 1 else intermediate_status,
+                                      "params": {**params, **({"input": machine_input} if machine_input is not None else {}), **({"threadId": thread_id} if thread_id is not None else {})},
+                                      "items": machine_items if machine_items is not None else []})
             else:
                 item = {"type": "text", "text": text, "text_elements": []}
                 turn = {"turnId": turn_id, "status": "completed", "params": {"input": [item]},
@@ -1558,6 +1564,7 @@ class ClassificationTests(unittest.TestCase):
         self.assertEqual(result["originTurnId"], result["resultTurnId"])
         self.assertEqual(result["chainTurnIds"], [result["resultTurnId"]])
         self.assertEqual(result["chainLength"], 0)
+        self.assertEqual(result["chainSignatures"], [])
         self.assertIsNone(result["signature"])
         for key in ("text", "message", "envelope", "history", "params", "items"):
             self.assertNotIn(key, result)
@@ -1589,12 +1596,59 @@ class ClassificationTests(unittest.TestCase):
         self.assertEqual(result["ownership"], "native_continuation")
         self.assertEqual(result["chainTurnIds"], [OLD_TURN, NEW_TURN])
         self.assertEqual(result["chainLength"], 1)
+        self.assertEqual(result["chainSignatures"], ["capacity_retry_automatic"])
         self.assertEqual(result["signature"], h._NATIVE_CONTINUATION_TRIGGER)
         self.assertEqual(result["workspaceId"], "workspace")
         self.assertEqual(result["commandId"], "cmd-classify")
         self.assertEqual(result["intent"], "development_plan")
         self.assertEqual(result["messageBytes"], 1)
         self.assertEqual(result["messageSha256"], hashlib.sha256(b"x").hexdigest())
+
+    def test_result_classification_manual_resume_requires_interrupted_predecessor(self):
+        for status in ("failed", "interrupted"):
+            with self.subTest(capacity_predecessor=status):
+                capacity = self._classification_case(
+                    "", continuation=True, trigger="capacity_retry_automatic", predecessor_status=status)
+                self.assertEqual(capacity["classification"], "applicable")
+        result = self._classification_case(
+            "", continuation=True, trigger="resume_interrupted_task", predecessor_status="interrupted")
+        self.assertEqual(result["classification"], "applicable")
+        self.assertEqual(result["chainSignatures"], ["resume_interrupted_task"])
+        self.assertEqual(result["signature"], "resume_interrupted_task")
+        for status in ("failed", "completed", "cancelled"):
+            with self.subTest(predecessor=status), self.assertRaises(h.DesktopIpcError) as caught:
+                self._classification_case(
+                    "", continuation=True, trigger="resume_interrupted_task", predecessor_status=status)
+            self.assertEqual(caught.exception.code, "DESKTOP_STATE_UNAVAILABLE")
+
+        for kwargs in (
+            {"machine_input": [{"type": "text", "text": "ordinary input", "text_elements": []}]},
+            {"machine_items": [{"type": "userMessage"}]},
+        ):
+            with self.subTest(manual_successor=kwargs), self.assertRaises(h.DesktopIpcError) as caught:
+                self._classification_case(
+                    "", continuation=True, trigger="resume_interrupted_task", predecessor_status="interrupted", **kwargs)
+            self.assertEqual(caught.exception.code, "DESKTOP_STATE_UNAVAILABLE")
+
+    def test_result_classification_validates_each_mixed_chain_edge_and_tip_signature(self):
+        result = self._classification_case(
+            "", continuation=True, hops=2,
+            trigger=["capacity_retry_automatic", "resume_interrupted_task"],
+            predecessor_status="interrupted", intermediate_status="interrupted")
+        self.assertEqual(result["chainLength"], 2)
+        self.assertEqual(result["chainSignatures"], ["capacity_retry_automatic", "resume_interrupted_task"])
+        self.assertEqual(result["signature"], "resume_interrupted_task")
+
+        with self.assertRaises(h.DesktopIpcError) as caught:
+            self._classification_case(
+                "", continuation=True, hops=2,
+                trigger=["capacity_retry_automatic", "resume_interrupted_task"],
+                predecessor_status="interrupted", intermediate_status="failed")
+        self.assertEqual(caught.exception.code, "DESKTOP_STATE_UNAVAILABLE")
+
+    def test_result_classification_ordinary_adjacent_user_turn_is_not_applicable(self):
+        result = self._classification_case("", continuation=True, ordinary_successor=True)
+        self.assertEqual(result["classification"], "not_applicable")
 
     def test_result_classification_max_unique_hops_and_ordinary_origin(self):
         result = self._classification_case("", continuation=True, hops=h.MAX_RESULT_OWNERSHIP_CHAIN)

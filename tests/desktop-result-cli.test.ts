@@ -323,6 +323,7 @@ describe("desktop record-result CLI", () => {
       ...(currentResultContext(continuationTurnId) as never),
       ownership: "native_continuation", originTurnId,
       chainTurnIds: [originTurnId, continuationTurnId], chainLength: 1,
+      chainSignatures: ["capacity_retry_automatic"],
       signature: "capacity_retry_automatic",
     } as never);
 

@@ -75,7 +75,8 @@ class DesktopIpcHelperTests(unittest.TestCase):
                     "messageSha256": hashlib.sha256(message.encode("utf-8")).hexdigest()}
         return state, expected
 
-    def ownership_fixture(self, *, hops: int = 1, trigger: str = "capacity_retry_automatic",
+    def ownership_fixture(self, *, hops: int = 1, trigger: str | list[str] = "capacity_retry_automatic",
+                          predecessor_status: str = "failed", intermediate_status: str = "failed",
                           user_input_on_successor: bool = False, exhausted: bool = True) -> tuple[dict[str, object], dict[str, object], list[str]]:
         message = "synthetic P0.6 origin"
         envelope = {
@@ -91,18 +92,19 @@ class DesktopIpcHelperTests(unittest.TestCase):
             entries.append({"value": key})
             if index == 0:
                 turns[key] = {
-                    "turnId": turn_id, "status": "failed",
+                    "turnId": turn_id, "status": predecessor_status,
                     "params": {"threadId": THREAD, "input": [{"type": "text", "text": text, "text_elements": []}]},
                     "items": [{"type": "userMessage", "content": [{"type": "text", "text": text, "text_elements": []}]}],
                 }
             else:
-                params: dict[str, object] = {"threadId": THREAD, "turnTrigger": trigger}
+                hop_trigger = trigger[index - 1] if isinstance(trigger, list) else trigger
+                params: dict[str, object] = {"threadId": THREAD, "turnTrigger": hop_trigger}
                 items: list[dict[str, object]] = [{"type": "agentMessage"}]
                 if user_input_on_successor and index == 1:
                     params["input"] = [{"type": "text", "text": "ordinary user input", "text_elements": []}]
                     items = [{"type": "userMessage", "content": params["input"]}]
                 turns[key] = {
-                    "turnId": turn_id, "status": "completed" if index == hops else "failed",
+                    "turnId": turn_id, "status": "completed" if index == hops else intermediate_status,
                     "params": params, "items": items,
                 }
         state = self.valid_state()
@@ -217,9 +219,33 @@ class DesktopIpcHelperTests(unittest.TestCase):
         self.assertEqual(result["resultTurnId"], ids[-1])
         self.assertEqual(result["chainTurnIds"], ids)
         self.assertEqual(result["chainLength"], 1)
+        self.assertEqual(result["chainSignatures"], ["capacity_retry_automatic"])
         self.assertEqual(result["signature"], "capacity_retry_automatic")
         self.assertNotIn("message", result)
         self.assertNotIn("history", result)
+
+    def test_current_result_ownership_preserves_capacity_statuses_and_accepts_manual_resume(self) -> None:
+        for status in ("failed", "interrupted"):
+            state, expected, _ = self.ownership_fixture(predecessor_status=status)
+            with self.subTest(capacity_predecessor=status), \
+                    patch.object(helper, "_current_target", return_value=TARGET), \
+                    patch.object(helper, "_prepare", return_value=(self.ownership_session(state), {})), \
+                    patch.object(helper, "_verify_process_identity"), patch.object(helper, "_verify_current_runner_ancestor"):
+                result = helper._current_result_ownership(TARGET["workspaceRoot"], expected)
+            self.assertEqual(result["signature"], "capacity_retry_automatic")
+            self.assertEqual(result["chainSignatures"], ["capacity_retry_automatic"])
+
+        state, expected, ids = self.ownership_fixture(
+            trigger="resume_interrupted_task", predecessor_status="interrupted")
+        successor = state["turnHistory"]["history"]["entitiesByKey"]["turn-1"]  # type: ignore[index]
+        successor["params"]["input"] = []  # type: ignore[index]
+        with patch.object(helper, "_current_target", return_value=TARGET), \
+                patch.object(helper, "_prepare", return_value=(self.ownership_session(state), {})), \
+                patch.object(helper, "_verify_process_identity"), patch.object(helper, "_verify_current_runner_ancestor"):
+            result = helper._current_result_ownership(TARGET["workspaceRoot"], expected)
+        self.assertEqual(result["chainTurnIds"], ids)
+        self.assertEqual(result["chainSignatures"], ["resume_interrupted_task"])
+        self.assertEqual(result["signature"], "resume_interrupted_task")
 
     def test_current_result_ownership_rejects_cross_island_chain(self) -> None:
         state, expected, _ = self.ownership_fixture()
@@ -269,11 +295,15 @@ class DesktopIpcHelperTests(unittest.TestCase):
         self.assertEqual(result["ownership"], "origin")
         self.assertEqual(result["chainTurnIds"], ids)
         self.assertEqual(result["chainLength"], 0)
+        self.assertEqual(result["chainSignatures"], [])
         self.assertIsNone(result["signature"])
 
     def test_current_result_ownership_rejects_non_native_or_user_successors(self) -> None:
         for name, kwargs in {
             "wrong_trigger": {"trigger": "manual_continue"},
+            "manual_from_failed": {"trigger": "resume_interrupted_task", "predecessor_status": "failed"},
+            "manual_from_completed": {"trigger": "resume_interrupted_task", "predecessor_status": "completed"},
+            "manual_from_cancelled": {"trigger": "resume_interrupted_task", "predecessor_status": "cancelled"},
             "user_input": {"user_input_on_successor": True},
             "incomplete_history": {"exhausted": False},
         }.items():
@@ -283,6 +313,55 @@ class DesktopIpcHelperTests(unittest.TestCase):
                         patch.object(helper, "_prepare", return_value=(self.ownership_session(state), {})), \
                         patch.object(helper, "_verify_process_identity"), patch.object(helper, "_verify_current_runner_ancestor"):
                     self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: helper._current_result_ownership(TARGET["workspaceRoot"], expected))
+
+        for mutation in ("nonempty_input", "user_message"):
+            state, expected, _ = self.ownership_fixture(
+                trigger="resume_interrupted_task", predecessor_status="interrupted")
+            successor = state["turnHistory"]["history"]["entitiesByKey"]["turn-1"]  # type: ignore[index]
+            if mutation == "nonempty_input":
+                successor["params"]["input"] = [{"type": "text", "text": "not canonical user input"}]  # type: ignore[index]
+            else:
+                successor["items"] = [{"type": "userMessage"}]  # type: ignore[index]
+            with self.subTest(manual_mutation=mutation), \
+                    patch.object(helper, "_current_target", return_value=TARGET), \
+                    patch.object(helper, "_prepare", return_value=(self.ownership_session(state), {})), \
+                    patch.object(helper, "_verify_process_identity"), patch.object(helper, "_verify_current_runner_ancestor"):
+                self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: helper._current_result_ownership(TARGET["workspaceRoot"], expected))
+
+    def test_current_result_ownership_validates_each_mixed_chain_edge(self) -> None:
+        valid, expected, ids = self.ownership_fixture(
+            hops=2, trigger=["capacity_retry_automatic", "resume_interrupted_task"],
+            predecessor_status="interrupted", intermediate_status="interrupted")
+        with patch.object(helper, "_current_target", return_value=TARGET), \
+                patch.object(helper, "_prepare", return_value=(self.ownership_session(valid), {})), \
+                patch.object(helper, "_verify_process_identity"), patch.object(helper, "_verify_current_runner_ancestor"):
+            result = helper._current_result_ownership(TARGET["workspaceRoot"], expected)
+        self.assertEqual(result["chainTurnIds"], ids)
+        self.assertEqual(result["chainSignatures"], ["capacity_retry_automatic", "resume_interrupted_task"])
+        self.assertEqual(result["signature"], "resume_interrupted_task")
+
+        invalid, expected, _ = self.ownership_fixture(
+            hops=2, trigger=["capacity_retry_automatic", "resume_interrupted_task"],
+            predecessor_status="interrupted", intermediate_status="failed")
+        with patch.object(helper, "_current_target", return_value=TARGET), \
+                patch.object(helper, "_prepare", return_value=(self.ownership_session(invalid), {})), \
+                patch.object(helper, "_verify_process_identity"), patch.object(helper, "_verify_current_runner_ancestor"):
+            self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: helper._current_result_ownership(TARGET["workspaceRoot"], expected))
+
+    def test_current_result_ownership_rejects_duplicate_or_malformed_history(self) -> None:
+        for mutation in ("duplicate_turn_id", "missing_entity"):
+            state, expected, _ = self.ownership_fixture(
+                trigger="resume_interrupted_task", predecessor_status="interrupted")
+            history = state["turnHistory"]["history"]  # type: ignore[index]
+            if mutation == "duplicate_turn_id":
+                history["entitiesByKey"]["turn-1"]["turnId"] = history["entitiesByKey"]["turn-0"]["turnId"]  # type: ignore[index]
+            else:
+                del history["entitiesByKey"]["turn-1"]  # type: ignore[index]
+            with self.subTest(manual_history=mutation), \
+                    patch.object(helper, "_current_target", return_value=TARGET), \
+                    patch.object(helper, "_prepare", return_value=(self.ownership_session(state), {})), \
+                    patch.object(helper, "_verify_process_identity"), patch.object(helper, "_verify_current_runner_ancestor"):
+                self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: helper._current_result_ownership(TARGET["workspaceRoot"], expected))
 
     def test_current_result_ownership_rejects_malformed_zero_input_proof(self) -> None:
         for malformed_input in (None, {"type": "text"}, [{"type": "text", "text": "unexpected"}]):

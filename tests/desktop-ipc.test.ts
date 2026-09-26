@@ -366,14 +366,88 @@ describe("Desktop IPC wrapper（fake helper）", () => {
           ...target, title: "结果分类会话", cwd: target.workspaceRoot, runtimeStatus: "active",
           resultTurnId, resultTurnStatus: "inProgress", classification: "applicable",
           ...attestation, ownership: "origin", originTurnId: resultTurnId,
-          chainTurnIds: [resultTurnId], chainLength: 0, signature: null,
+          chainTurnIds: [resultTurnId], chainLength: 0, chainSignatures: [], signature: null,
         },
       } : { ok: true, value: {} });
-      const result = await makeClient(fake.spawnImpl).currentResultClassification(target.workspaceRoot);
-      expect(result).toMatchObject({ classification: "applicable", ...attestation,
-        ownership: "origin", resultTurnId });
+    const result = await makeClient(fake.spawnImpl).currentResultClassification(target.workspaceRoot);
+    expect(result).toMatchObject({ classification: "applicable", ...attestation,
+      ownership: "origin", resultTurnId, chainSignatures: [] });
       expect(fake.requests).toHaveLength(1);
       expect(Object.keys(fake.requests[0]).sort()).toEqual(["id", "op", "workspaceRoot"]);
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it("currentResultClassification 接受严格 allowlist 内的 manual resume signature", async () => {
+    vi.stubEnv("CODEX_THREAD_ID", target.threadId); vi.stubEnv("CODEX_SESSION_ID", target.threadId);
+    const originTurnId = "01a00000-0000-7000-8000-000000000004";
+    const resultTurnId = "01a00000-0000-7000-8000-000000000005";
+    const fake = fakeSpawner(request => request.op === "current_result_classification" ? {
+      ok: true,
+      value: {
+        ...target, title: "结果分类会话", cwd: target.workspaceRoot, runtimeStatus: "idle",
+        resultTurnId, resultTurnStatus: "completed", classification: "applicable",
+        workspaceId: "workspace_test", commandId: "desktop_command_test", intent: "development_plan",
+        messageBytes: 3, messageSha256: "a".repeat(64), ownership: "native_continuation",
+        originTurnId, chainTurnIds: [originTurnId, resultTurnId], chainLength: 1,
+        chainSignatures: ["resume_interrupted_task"],
+        signature: "resume_interrupted_task",
+      },
+    } : { ok: true, value: {} });
+    try {
+      await expect(makeClient(fake.spawnImpl).currentResultClassification(target.workspaceRoot))
+        .resolves.toMatchObject({ ownership: "native_continuation", signature: "resume_interrupted_task", originTurnId, resultTurnId });
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it("currentResultClassification 保留 mixed chain 的逐边签名顺序", async () => {
+    vi.stubEnv("CODEX_THREAD_ID", target.threadId); vi.stubEnv("CODEX_SESSION_ID", target.threadId);
+    const originTurnId = "01a00000-0000-7000-8000-000000000004";
+    const middleTurnId = "01a00000-0000-7000-8000-000000000005";
+    const resultTurnId = "01a00000-0000-7000-8000-000000000006";
+    const value = {
+      ...target, title: "混合 continuation 会话", cwd: target.workspaceRoot, runtimeStatus: "idle",
+      resultTurnId, resultTurnStatus: "completed", classification: "applicable",
+      workspaceId: "workspace_test", commandId: "desktop_command_test", intent: "development_plan",
+      messageBytes: 3, messageSha256: "a".repeat(64), ownership: "native_continuation",
+      originTurnId, chainTurnIds: [originTurnId, middleTurnId, resultTurnId], chainLength: 2,
+      chainSignatures: ["capacity_retry_automatic", "resume_interrupted_task"],
+      signature: "resume_interrupted_task",
+    };
+    const fake = fakeSpawner(request => request.op === "current_result_classification"
+      ? { ok: true, value } : { ok: true, value: {} });
+    try {
+      await expect(makeClient(fake.spawnImpl).currentResultClassification(target.workspaceRoot))
+        .resolves.toMatchObject({ chainTurnIds: [originTurnId, middleTurnId, resultTurnId],
+          chainSignatures: ["capacity_retry_automatic", "resume_interrupted_task"],
+          signature: "resume_interrupted_task" });
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it("result classification 拒绝 origin 非空签名和 not_applicable ownership 字段", async () => {
+    vi.stubEnv("CODEX_THREAD_ID", target.threadId); vi.stubEnv("CODEX_SESSION_ID", target.threadId);
+    const resultTurnId = "01a00000-0000-7000-8000-000000000003";
+    const origin = {
+      ...target, title: "结果分类会话", cwd: target.workspaceRoot, runtimeStatus: "active",
+      resultTurnId, resultTurnStatus: "inProgress", classification: "applicable",
+      workspaceId: "workspace_test", commandId: "desktop_command_test", intent: "development_plan",
+      messageBytes: 3, messageSha256: "a".repeat(64), ownership: "origin", originTurnId: resultTurnId,
+      chainTurnIds: [resultTurnId], chainLength: 0, chainSignatures: [], signature: null,
+    };
+    const cases = [
+      { ...origin, chainSignatures: ["capacity_retry_automatic"] },
+      { ...origin, chainSignatures: ["unknown"] },
+      { ...origin, extra: true },
+      { ...target, title: "普通结果", cwd: target.workspaceRoot, runtimeStatus: "idle",
+        resultTurnId, resultTurnStatus: "completed", classification: "not_applicable",
+        chainSignatures: [] },
+    ];
+    try {
+      for (const value of cases) {
+        const fake = fakeSpawner(request => request.op === "current_result_classification"
+          ? { ok: true, value } : { ok: true, value: {} });
+        await expect(makeClient(fake.spawnImpl).currentResultClassification(target.workspaceRoot))
+          .rejects.toMatchObject({ code: "DESKTOP_PROTOCOL_ERROR" });
+      }
     } finally { vi.unstubAllEnvs(); }
   });
 
@@ -446,20 +520,35 @@ describe("Desktop IPC wrapper（fake helper）", () => {
       ...target, title: "结果会话", cwd: target.workspaceRoot, runtimeStatus: "active",
       resultTurnId, resultTurnStatus: "inProgress", ownership: "native_continuation",
       originTurnId, chainTurnIds: [originTurnId, resultTurnId], chainLength: 1,
-      signature: "capacity_retry_automatic",
+      chainSignatures: ["resume_interrupted_task"],
+      signature: "resume_interrupted_task",
     };
     const fake = fakeSpawner(request => request.op === "current_result_ownership"
       ? { ok: true, value }
       : { ok: true, value: { ...target, title: "Fake Desktop 会话", cwd: target.workspaceRoot, runtimeStatus: "idle" } });
     const result = await makeClient(fake.spawnImpl).currentResultOwnership(target.workspaceRoot, expectation);
-    expect(result).toMatchObject({ ownership: "native_continuation", originTurnId, resultTurnId, chainLength: 1 });
+    expect(result).toMatchObject({ ownership: "native_continuation", originTurnId, resultTurnId, chainLength: 1,
+      signature: "resume_interrupted_task" });
     expect(fake.requests).toHaveLength(1);
     expect(Object.keys(fake.requests[0]).sort()).toEqual(["expectation", "id", "op", "workspaceRoot"]);
     expect(fake.requests[0]).toMatchObject({ op: "current_result_ownership", workspaceRoot: target.workspaceRoot, expectation });
 
+    const capacity = fakeSpawner(request => request.op === "current_result_ownership"
+      ? { ok: true, value: { ...value, chainSignatures: ["capacity_retry_automatic"], signature: "capacity_retry_automatic" } }
+      : { ok: true, value: { ...target, title: "Fake Desktop 会话", cwd: target.workspaceRoot, runtimeStatus: "idle" } });
+    await expect(makeClient(capacity.spawnImpl).currentResultOwnership(target.workspaceRoot, expectation))
+      .resolves.toMatchObject({ signature: "capacity_retry_automatic" });
+
+    const missingChainSignatures = { ...value } as Record<string, unknown>;
+    delete missingChainSignatures.chainSignatures;
     for (const broken of [
+      missingChainSignatures,
       { ...value, chainTurnIds: [originTurnId], chainLength: 0 },
+      { ...value, chainSignatures: [] },
+      { ...value, chainSignatures: ["unknown"] },
+      { ...value, chainSignatures: ["capacity_retry_automatic"] },
       { ...value, signature: "wrong" },
+      { ...value, extra: true },
       { ...value, resultTurnId: randomUUID() },
       { ...value, runtimeStatus: "idle", resultTurnStatus: "inProgress" },
       { ...value, threadId: randomUUID() },

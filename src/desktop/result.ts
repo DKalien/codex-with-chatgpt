@@ -141,6 +141,7 @@ async function assertCurrentResultContext(
       originTurnId: accepted.turnId,
       chainTurnIds: [accepted.turnId],
       chainLength: 0,
+      chainSignatures: [],
       signature: null,
     };
   }
@@ -177,7 +178,8 @@ function sameOwnership(left: DesktopResultOwnership, right: DesktopResultOwnersh
   return left.ownership === right.ownership && left.originTurnId === right.originTurnId &&
     left.resultTurnId === right.resultTurnId && left.chainLength === right.chainLength &&
     left.signature === right.signature &&
-    JSON.stringify(left.chainTurnIds) === JSON.stringify(right.chainTurnIds);
+    JSON.stringify(left.chainTurnIds) === JSON.stringify(right.chainTurnIds) &&
+    JSON.stringify(left.chainSignatures) === JSON.stringify(right.chainSignatures);
 }
 
 async function readCurrentResultContext(workspace: DesktopResultWorkspace, expectedThreadId: string): Promise<DesktopResultContext> {
@@ -255,7 +257,8 @@ export async function discoverCurrentDesktopDelivery(
   const candidates = state.deliveries.filter(item => item.threadId === threadId && item.deliveryStatus === "accepted");
   if (!classification.workspaceId || !classification.commandId || !classification.intent ||
       classification.messageBytes === undefined || !classification.messageSha256 || !classification.ownership || !classification.originTurnId ||
-      !classification.chainTurnIds || classification.chainLength === undefined || classification.signature === undefined) {
+      !classification.chainTurnIds || classification.chainLength === undefined || !classification.chainSignatures ||
+      classification.signature === undefined) {
     throw new DesktopResultError("DESKTOP_RESULT_CURRENT_EXECUTION", "当前 Desktop result classification 不完整；拒绝回退通用记录。");
   }
   if (classification.threadId !== threadId || classification.workspaceRoot !== workspace.root || classification.workspaceId !== workspace.id) {

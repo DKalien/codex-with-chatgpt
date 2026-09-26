@@ -158,7 +158,7 @@ describe("Desktop execution result", () => {
     vi.spyOn(desktopIpc, "currentResultClassification").mockResolvedValue({
       ...validResultContext(), classification: "applicable", workspaceId: workspace.id, commandId,
       intent: "development_plan", messageBytes: 10, messageSha256: "a".repeat(64),
-      ownership: "origin", originTurnId: turnId, chainTurnIds: [turnId], chainLength: 0, signature: null,
+      ownership: "origin", originTurnId: turnId, chainTurnIds: [turnId], chainLength: 0, chainSignatures: [], signature: null,
     } satisfies DesktopResultClassification);
     await expect(discoverCurrentDesktopDelivery(workspace)).resolves.toMatchObject({
       commandId,
@@ -175,7 +175,8 @@ describe("Desktop execution result", () => {
       classification: "applicable", workspaceId: workspace.id, commandId,
       intent: "development_plan", messageBytes: 10, messageSha256: "a".repeat(64),
       ownership: "native_continuation", originTurnId,
-      chainTurnIds: [originTurnId, continuationTurnId], chainLength: 1, signature: "capacity_retry_automatic",
+      chainTurnIds: [originTurnId, continuationTurnId], chainLength: 1,
+      chainSignatures: ["capacity_retry_automatic"], signature: "capacity_retry_automatic",
     } satisfies DesktopResultClassification);
     await expect(discoverCurrentDesktopDelivery(workspace)).resolves.toMatchObject({
       commandId, threadId, turnId: continuationTurnId,
@@ -192,7 +193,7 @@ describe("Desktop execution result", () => {
     vi.spyOn(desktopIpc, "currentResultClassification").mockResolvedValue({
       ...validResultContext(), classification: "applicable", workspaceId: workspace.id, commandId,
       intent: "development_plan", messageBytes: 10, messageSha256: "a".repeat(64),
-      ownership: "origin", originTurnId: turnId, chainTurnIds: [turnId], chainLength: 0, signature: null,
+      ownership: "origin", originTurnId: turnId, chainTurnIds: [turnId], chainLength: 0, chainSignatures: [], signature: null,
     } satisfies DesktopResultClassification);
 
     await expect(discoverCurrentDesktopDelivery(workspace)).resolves.toMatchObject({ commandId, turnId });
@@ -203,7 +204,7 @@ describe("Desktop execution result", () => {
     vi.spyOn(desktopIpc, "currentResultClassification").mockResolvedValue({
       ...validResultContext(), classification: "applicable", workspaceId: workspace.id, commandId,
       intent: "development_plan", messageBytes: 10, messageSha256: "b".repeat(64),
-      ownership: "origin", originTurnId: turnId, chainTurnIds: [turnId], chainLength: 0, signature: null,
+      ownership: "origin", originTurnId: turnId, chainTurnIds: [turnId], chainLength: 0, chainSignatures: [], signature: null,
     } satisfies DesktopResultClassification);
 
     await expect(discoverCurrentDesktopDelivery(workspace))
@@ -230,7 +231,7 @@ describe("Desktop execution result", () => {
     vi.spyOn(desktopIpc, "currentResultClassification").mockResolvedValue({
       ...validResultContext(), classification: "applicable", workspaceId: workspace.id, commandId,
       intent: "development_plan", messageBytes: 10, messageSha256: "a".repeat(64),
-      ownership: "origin", originTurnId: turnId, chainTurnIds: [turnId], chainLength: 0, signature: null,
+      ownership: "origin", originTurnId: turnId, chainTurnIds: [turnId], chainLength: 0, chainSignatures: [], signature: null,
     } satisfies DesktopResultClassification);
     await expect(discoverCurrentDesktopDelivery(workspace)).rejects.toMatchObject({ code: "DESKTOP_RESULT_CURRENT_EXECUTION" });
   });
@@ -292,7 +293,7 @@ describe("Desktop execution result", () => {
     const ownership = vi.spyOn(desktopIpc, "currentResultOwnership").mockResolvedValue({
       ...validResultContext({ runtimeStatus: "idle", resultTurnId: continuationTurnId, resultTurnStatus: "completed" }),
       ownership: "native_continuation", originTurnId, chainTurnIds: [originTurnId, continuationTurnId],
-      chainLength: 1, signature: "capacity_retry_automatic",
+      chainLength: 1, chainSignatures: ["capacity_retry_automatic"], signature: "capacity_retry_automatic",
     });
 
     const result = await recordDesktopResult(workspace, input());
@@ -304,7 +305,93 @@ describe("Desktop execution result", () => {
     expect(listExecutionOutputs(workspace.id)).toHaveLength(1);
   });
 
-  it("重复 native continuation chain 在 bounded limit 内可写 receipt", async () => {
+  it("manual resume exact ownership 写 receipt 且保留 immutable origin", async () => {
+    writeDesktopState({ deliveries: [delivery({ turnId: originTurnId })] });
+    vi.mocked(desktopIpc.currentResultContext).mockResolvedValue(validResultContext({
+      runtimeStatus: "idle", resultTurnId: continuationTurnId, resultTurnStatus: "completed",
+    }));
+    const ownership = vi.spyOn(desktopIpc, "currentResultOwnership").mockResolvedValue({
+      ...validResultContext({ runtimeStatus: "idle", resultTurnId: continuationTurnId, resultTurnStatus: "completed" }),
+      ownership: "native_continuation", originTurnId, chainTurnIds: [originTurnId, continuationTurnId],
+      chainLength: 1, chainSignatures: ["resume_interrupted_task"], signature: "resume_interrupted_task",
+    });
+
+    const result = await recordDesktopResult(workspace, input());
+
+    expect(result.record.commandId).toBe(commandId);
+    expect(ownership).toHaveBeenCalledTimes(2);
+    expect(ownership.mock.calls[0]?.[1]).toMatchObject({ workspaceId: workspace.id, commandId, originTurnId });
+    expect(readDesktop(workspace.id)?.deliveries[0]).toMatchObject({ deliveryStatus: "accepted", turnId: originTurnId });
+    expect(readExecutionRecords(workspace.id)).toHaveLength(1);
+    expect(listExecutionOutputs(workspace.id)).toHaveLength(1);
+  });
+
+  it("manual resume 第二次 ownership 证明漂移时 fail closed", async () => {
+    writeDesktopState({ deliveries: [delivery({ turnId: originTurnId })] });
+    vi.mocked(desktopIpc.currentResultContext).mockResolvedValue(validResultContext({
+      runtimeStatus: "idle", resultTurnId: continuationTurnId, resultTurnStatus: "completed",
+    }));
+    const exact = {
+      ...validResultContext({ runtimeStatus: "idle", resultTurnId: continuationTurnId, resultTurnStatus: "completed" }),
+      ownership: "native_continuation" as const, originTurnId,
+      chainTurnIds: [originTurnId, continuationTurnId], chainLength: 1,
+      chainSignatures: ["resume_interrupted_task" as const],
+      signature: "resume_interrupted_task" as const,
+    };
+    const ownership = vi.spyOn(desktopIpc, "currentResultOwnership")
+      .mockResolvedValueOnce(exact)
+      .mockResolvedValueOnce({ ...exact, chainTurnIds: [originTurnId, continuationTurnId2, continuationTurnId], chainLength: 2,
+        chainSignatures: ["resume_interrupted_task", "resume_interrupted_task"] });
+
+    await expect(recordDesktopResult(workspace, input())).rejects.toMatchObject({ code: "DESKTOP_RESULT_CURRENT_EXECUTION" });
+    expect(ownership).toHaveBeenCalledTimes(2);
+    expect(readDesktop(workspace.id)?.deliveries[0]).toMatchObject({ deliveryStatus: "accepted", turnId: originTurnId });
+    expect(readExecutionRecords(workspace.id)).toEqual([]);
+    expect(listExecutionOutputs(workspace.id)).toEqual([]);
+  });
+
+  it("同一 mixed chain 的早期 edge 签名漂移时不写 output 或 receipt", async () => {
+    writeDesktopState({ deliveries: [delivery({ turnId: originTurnId })] });
+    vi.mocked(desktopIpc.currentResultContext).mockResolvedValue(validResultContext({
+      runtimeStatus: "idle", resultTurnId: continuationTurnId2, resultTurnStatus: "completed",
+    }));
+    const exact = {
+      ...validResultContext({ runtimeStatus: "idle", resultTurnId: continuationTurnId2, resultTurnStatus: "completed" }),
+      ownership: "native_continuation" as const,
+      originTurnId,
+      chainTurnIds: [originTurnId, continuationTurnId, continuationTurnId2],
+      chainLength: 2,
+      chainSignatures: ["capacity_retry_automatic", "resume_interrupted_task"] as const,
+      signature: "resume_interrupted_task" as const,
+    };
+    const ownership = vi.spyOn(desktopIpc, "currentResultOwnership")
+      .mockResolvedValueOnce(exact)
+      .mockResolvedValueOnce({ ...exact, chainSignatures: ["resume_interrupted_task", "resume_interrupted_task"] });
+
+    await expect(recordDesktopResult(workspace, input()))
+      .rejects.toMatchObject({ code: "DESKTOP_RESULT_CURRENT_EXECUTION" });
+    expect(ownership).toHaveBeenCalledTimes(2);
+    expect(readDesktop(workspace.id)?.deliveries[0]).toMatchObject({ deliveryStatus: "accepted", turnId: originTurnId });
+    expect(readExecutionRecords(workspace.id)).toEqual([]);
+    expect(listExecutionOutputs(workspace.id)).toEqual([]);
+  });
+
+  it("manual resume ownership 存在歧义时 fail closed", async () => {
+    writeDesktopState({ deliveries: [delivery({ turnId: originTurnId })] });
+    vi.mocked(desktopIpc.currentResultContext).mockResolvedValue(validResultContext({
+      runtimeStatus: "idle", resultTurnId: continuationTurnId, resultTurnStatus: "completed",
+    }));
+    vi.spyOn(desktopIpc, "currentResultOwnership").mockRejectedValue(
+      new DesktopError("DESKTOP_STATE_UNAVAILABLE", "ambiguous continuation history"),
+    );
+
+    await expect(recordDesktopResult(workspace, input())).rejects.toMatchObject({ code: "DESKTOP_RESULT_CURRENT_EXECUTION" });
+    expect(readDesktop(workspace.id)?.deliveries[0]).toMatchObject({ deliveryStatus: "accepted", turnId: originTurnId });
+    expect(readExecutionRecords(workspace.id)).toEqual([]);
+    expect(listExecutionOutputs(workspace.id)).toEqual([]);
+  });
+
+  it("逐边相同的 mixed continuation chain 在 bounded limit 内可写 receipt", async () => {
     writeDesktopState({ deliveries: [delivery({ turnId: originTurnId })] });
     vi.mocked(desktopIpc.currentResultContext).mockResolvedValue(validResultContext({
       runtimeStatus: "idle", resultTurnId: continuationTurnId2, resultTurnStatus: "completed",
@@ -313,10 +400,12 @@ describe("Desktop execution result", () => {
       ...validResultContext({ runtimeStatus: "idle", resultTurnId: continuationTurnId2, resultTurnStatus: "completed" }),
       ownership: "native_continuation", originTurnId,
       chainTurnIds: [originTurnId, continuationTurnId, continuationTurnId2], chainLength: 2,
-      signature: "capacity_retry_automatic",
+      chainSignatures: ["capacity_retry_automatic", "resume_interrupted_task"],
+      signature: "resume_interrupted_task",
     });
 
     await expect(recordDesktopResult(workspace, input())).resolves.toMatchObject({ record: { commandId } });
+    expect(desktopIpc.currentResultOwnership).toHaveBeenCalledTimes(2);
     expect(readExecutionRecords(workspace.id)).toHaveLength(1);
     expect(readDesktop(workspace.id)?.deliveries[0].turnId).toBe(originTurnId);
   });
@@ -329,7 +418,7 @@ describe("Desktop execution result", () => {
     vi.spyOn(desktopIpc, "currentResultOwnership").mockResolvedValue({
       ...validResultContext({ runtimeStatus: "idle", resultTurnId: continuationTurnId, resultTurnStatus: "completed" }),
       ownership: "native_continuation", originTurnId, chainTurnIds: [originTurnId, continuationTurnId],
-      chainLength: 1, signature: "capacity_retry_automatic",
+      chainLength: 1, chainSignatures: ["capacity_retry_automatic"], signature: "capacity_retry_automatic",
     });
 
     await expect(recordDesktopResult(workspace, input())).rejects.toMatchObject({ code: "DESKTOP_RESULT_CURRENT_EXECUTION" });

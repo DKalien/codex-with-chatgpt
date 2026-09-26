@@ -361,18 +361,20 @@ malformed/truncated history、wrong turn、当前 context 漂移或核对期间�
 `c2c desktop reconcile-unknown -w <workspace> --command-id <id> --json`；它只恢复唯一真实
 turn，不写 execution receipt，是 advanced fallback。手动核对未提供 expected turn 时保持原行为。
 
-### P0.6：capacity-retry continuation receipt ownership
+### P0.6：Desktop native continuation receipt ownership
 
-当 accepted delivery 的原始 turn 已结束而 Desktop 产生了机器自动的 capacity retry 时，
+当 accepted delivery 的原始 turn 已结束而 Desktop 产生了可严格证明的 native continuation 时，
 `record-result` 只允许通过一次新的、只读的 current-result ownership attestation 接管结果归属。
 原始 `delivery.turnId` 永远是 immutable origin，不会被后继 turn 覆盖，也不会把后继 turn
 伪装成原始任务的 self-reconcile 候选。
 
 attestation 只接受 canonical、`newerBoundary=exhausted`、turn ID 唯一且身份完全匹配的历史：
-每一跳必须是紧邻 successor，successor 必须没有任何 canonical user input，且
-`params.turnTrigger` 精确等于 `capacity_retry_automatic`；origin 到 result tip 必须位于同一个
-canonical island，不能把 island 边界当作连续 successor。successor 的 item 结构若无法证明为
-字典且无用户输入也会拒绝。任意普通 `failed`、同线程相邻、
+每一跳必须是紧邻 successor，successor 必须没有任何 canonical user input，且 trigger 必须命中
+行为信号 allowlist：`capacity_retry_automatic` 的 predecessor 状态只能是 `failed` 或 `interrupted`；
+`resume_interrupted_task` 的 predecessor 状态必须是 `interrupted`。这些是观测到的 behavioral signal
+allowlist，不宣称上游提供稳定 enum；新信号或信号变化继续 fail closed，重新观测和审查后才可更新 allowlist。
+origin 到 result tip 必须位于同一个 canonical island，不能把 island 边界当作连续 successor。successor 的 item 结构若无法证明为
+字典且无用户输入也会拒绝。任意未被对应信号规则允许的 predecessor 状态、同线程相邻、
 时间接近、summary、普通“continue/resume”文本、未知 trigger、插入新的 C2C/user turn、
 历史不完整或链长超过上限均 fail closed；不把任意 `failed` 自动视为可续接中断。
 服务重启后重新读取并验证整条 bounded chain，不持久化或公开 continuation internals，

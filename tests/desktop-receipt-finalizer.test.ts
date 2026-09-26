@@ -196,6 +196,7 @@ describe("Desktop receipt terminal fence", () => {
         originTurnId: pending.originTurnId,
         chainTurnIds: [pending.originTurnId],
         chainLength: 0,
+        chainSignatures: [],
         signature: null,
       });
     const alert = await runReceiptFinalizer(pending, { stateDir, pollMs: 1000 });

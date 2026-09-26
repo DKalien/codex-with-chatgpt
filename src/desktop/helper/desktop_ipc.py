@@ -2029,6 +2029,10 @@ def _current_result_context(workspace_root: Any) -> dict[str, Any]:
 
 
 _NATIVE_CONTINUATION_TRIGGER = "capacity_retry_automatic"
+_NATIVE_CONTINUATION_PREDECESSOR_STATUSES = {
+    "capacity_retry_automatic": {"failed", "interrupted"},
+    "resume_interrupted_task": {"interrupted"},
+}
 
 
 def _continuation_expectation(value: Any) -> dict[str, Any]:
@@ -2106,13 +2110,14 @@ def _observed_desktop_origin(turn: dict[str, Any], target: dict[str, str]) -> di
             "messageBytes": len(encoded), "messageSha256": hashlib.sha256(encoded).hexdigest()}
 
 
-def _native_successor(turn: dict[str, Any], target: dict[str, str]) -> None:
+def _native_successor(turn: dict[str, Any], target: dict[str, str]) -> str:
     params = turn.get("params")
     items = turn.get("items")
     if not isinstance(params, dict) or not isinstance(items, list):
         raise _error("DESKTOP_STATE_UNAVAILABLE")
     raw_input = params.get("input")
-    if params.get("turnTrigger") != _NATIVE_CONTINUATION_TRIGGER or (
+    trigger = params.get("turnTrigger")
+    if not isinstance(trigger, str) or trigger not in _NATIVE_CONTINUATION_PREDECESSOR_STATUSES or (
             "input" in params and (not isinstance(raw_input, list) or raw_input)):
         raise _error("DESKTOP_STATE_UNAVAILABLE")
     if params.get("threadId") not in {None, target["threadId"]}:
@@ -2121,6 +2126,14 @@ def _native_successor(turn: dict[str, Any], target: dict[str, str]) -> None:
         raise _error("DESKTOP_STATE_UNAVAILABLE")
     if any(item.get("type") == "userMessage" for item in items):
         raise _error("DESKTOP_STATE_UNAVAILABLE")
+    return trigger
+
+
+def _native_continuation_edge(predecessor: dict[str, Any], successor: dict[str, Any], target: dict[str, str]) -> str:
+    trigger = _native_successor(successor, target)
+    if predecessor.get("status") not in _NATIVE_CONTINUATION_PREDECESSOR_STATUSES[trigger]:
+        raise _error("DESKTOP_STATE_UNAVAILABLE")
+    return trigger
 
 
 def _current_result_ownership(workspace_root: Any, expectation_value: Any) -> dict[str, Any]:
@@ -2177,21 +2190,21 @@ def _current_result_ownership(workspace_root: Any, expectation_value: Any) -> di
                 "originTurnId": origin_id,
                 "chainTurnIds": [origin_id],
                 "chainLength": 0,
+                "chainSignatures": [],
                 "signature": None,
             }
         chain_length = result_index - origin_index
         if chain_length > MAX_RESULT_OWNERSHIP_CHAIN:
             raise _error("DESKTOP_STATE_UNAVAILABLE")
         chain = [origin_id]
+        chain_signatures = []
         for index in range(origin_index, result_index):
             predecessor = turns[index]
             successor = turns[index + 1]
-            if predecessor.get("status") not in {"failed", "interrupted"}:
-                raise _error("DESKTOP_STATE_UNAVAILABLE")
             successor_id = _uuid(successor.get("turnId"))
             if successor_id is None:
                 raise _error("DESKTOP_STATE_UNAVAILABLE")
-            _native_successor(successor, target)
+            chain_signatures.append(_native_continuation_edge(predecessor, successor, target))
             chain.append(successor_id)
         if chain[-1] != result_id:
             raise _error("DESKTOP_STATE_UNAVAILABLE")
@@ -2203,7 +2216,8 @@ def _current_result_ownership(workspace_root: Any, expectation_value: Any) -> di
             "originTurnId": origin_id,
             "chainTurnIds": chain,
             "chainLength": chain_length,
-            "signature": _NATIVE_CONTINUATION_TRIGGER,
+            "chainSignatures": chain_signatures,
+            "signature": chain_signatures[-1],
         }
     finally:
         session.close()
@@ -2277,17 +2291,18 @@ def _current_result_classification(workspace_root: Any) -> dict[str, Any]:
             if observed is None:
                 return {**base, "classification": "not_applicable"}
             return {**base, **observed, "classification": "applicable", "ownership": "origin",
-                    "originTurnId": result_id, "chainTurnIds": [result_id], "chainLength": 0, "signature": None}
+                    "originTurnId": result_id, "chainTurnIds": [result_id], "chainLength": 0,
+                    "chainSignatures": [], "signature": None}
         chain = [result_id]
         cursor = indexes[0]
+        reverse_chain_signatures = []
         while cursor > 0:
             if len(chain) - 1 >= MAX_RESULT_OWNERSHIP_CHAIN:
                 raise _error("DESKTOP_STATE_UNAVAILABLE")
             successor = island[cursor]
             predecessor = island[cursor - 1]
-            _native_successor(successor, target)
-            if predecessor.get("status") not in {"failed", "interrupted"}:
-                raise _error("DESKTOP_STATE_UNAVAILABLE")
+            trigger = _native_continuation_edge(predecessor, successor, target)
+            reverse_chain_signatures.append(trigger)
             predecessor_id = _uuid(predecessor.get("turnId"))
             if predecessor_id is None:
                 raise _error("DESKTOP_STATE_UNAVAILABLE")
@@ -2303,7 +2318,8 @@ def _current_result_classification(workspace_root: Any) -> dict[str, Any]:
                 return {**base, "classification": "not_applicable"}
             return {**base, **observed, "classification": "applicable", "ownership": "native_continuation",
                     "originTurnId": predecessor_id, "chainTurnIds": chain,
-                    "chainLength": len(chain) - 1, "signature": _NATIVE_CONTINUATION_TRIGGER}
+                    "chainLength": len(chain) - 1, "chainSignatures": list(reversed(reverse_chain_signatures)),
+                    "signature": reverse_chain_signatures[0]}
         raise _error("DESKTOP_STATE_UNAVAILABLE")
     finally:
         session.close()
