@@ -2,7 +2,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { spawnSync } from "node:child_process";
+import { EventEmitter } from "node:events";
+import { spawnSync, type ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { listExecutionOutputs } from "../src/execution/output.js";
@@ -318,8 +319,8 @@ describe("Desktop receipt terminal fence", () => {
       hostId: "local",
       projectId: "project",
       workspaceRoot: pending.workspaceRoot,
-      resultTurnId: pending.resultTurnId,
-      resultTurnStatus: "completed",
+      resultTurnId: fenceKind === "unprovable" ? "00000000-0000-4000-8000-000000000199" : pending.resultTurnId,
+      resultTurnStatus: fenceKind === "unprovable" ? "inProgress" : "completed",
       fence: fenceKind,
     });
     const alert = await runReceiptFinalizer(pending, { stateDir });
@@ -439,19 +440,70 @@ describe("Desktop receipt terminal fence", () => {
     expect((await first)?.reason).toBe("timeout");
   });
 
-  it("detached worker does not inherit or forge runner environment", () => {
+  it("surfaces claim storage failures instead of treating them as contention", async () => {
     stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "c2c-receipt-finalizer-"));
     const pending = draft(stateDir);
-    const child = { unref: vi.fn(), once: vi.fn() } as never;
-    const spawnImpl = vi.fn((_command: string, _args: string[], options: { env?: NodeJS.ProcessEnv }) => {
+    const blocker = path.join(stateDir, "not-a-directory");
+    fs.writeFileSync(blocker, "x", "utf8");
+    await expect(runReceiptFinalizer(pending, { stateDir: path.join(blocker, "state") }))
+      .rejects.toThrow();
+  });
+
+  it("detached worker loads source TypeScript and reports unknown terminality on abnormal exit", () => {
+    stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "c2c-receipt-finalizer-"));
+    const pending = draft(stateDir);
+    const child = Object.assign(new EventEmitter(), { unref: vi.fn() }) as unknown as ChildProcess;
+    const spawnImpl = vi.fn((_command: string, args: string[], options: { env?: NodeJS.ProcessEnv }) => {
       expect(options.env?.CODEX_THREAD_ID).toBeUndefined();
       expect(options.env?.CODEX_SESSION_ID).toBeUndefined();
       expect(options.env?.C2C_STARTUP_LEASE).toBeUndefined();
       expect(options.env?.C2C_RECEIPT_FINALIZER_STATE_DIR).toBe(path.resolve(stateDir));
       return child;
     });
-    spawnReceiptFinalizerWorker(pending, { stateDir, spawnImpl, entry: "worker-entry.js" });
+    spawnReceiptFinalizerWorker(pending, { stateDir, spawnImpl, entry: "worker-entry.ts" });
     expect(spawnImpl).toHaveBeenCalledOnce();
+    expect(spawnImpl.mock.calls[0]?.[1]).toEqual([
+      "--import", "tsx", "worker-entry.ts", "desktop-receipt-finalizer", "run",
+      "-w", pending.workspaceRoot, "--draft", pending.draftId,
+    ]);
+    child.emit("exit", 1, null);
+    expect(readReceiptFinalizationAlert(stateDir, pending.workspaceId, pending.commandId))
+      .toMatchObject({ reason: "terminality_unknown" });
+  });
+
+  it("does not emit a terminality alert after a trusted receipt was committed", () => {
+    stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "c2c-receipt-finalizer-"));
+    const pending = draft(stateDir);
+    const completed = stageReceiptFinalization({
+      workspaceId: pending.workspaceId,
+      workspaceRoot: pending.workspaceRoot,
+      threadId: pending.threadId,
+      originTurnId: pending.originTurnId,
+      resultTurnId: pending.resultTurnId,
+      commandId: "desktop_receipt_worker_committed",
+      inputMaterial: "committed receipt",
+    }, { stateDir });
+    fs.mkdirSync(path.join(stateDir, "executions"), { recursive: true });
+    fs.writeFileSync(path.join(stateDir, "executions", `${completed.workspaceId}.jsonl`), `${JSON.stringify({
+      taskId: `desktop_${completed.commandId}`,
+      iteration: 1,
+      changedFiles: [],
+      tests: "1 passed",
+      exitStatus: "ok",
+      timestamp: new Date().toISOString(),
+      commandId: completed.commandId,
+      desktopReceiptSha256: "a".repeat(64),
+      desktopThreadId: completed.threadId,
+      desktopOriginTurnId: completed.originTurnId,
+      desktopResultTurnId: completed.resultTurnId,
+      desktopBindingId: "00000000-0000-4000-8000-000000000104",
+    })}\n`, "utf8");
+
+    const child = Object.assign(new EventEmitter(), { unref: vi.fn() }) as unknown as ChildProcess;
+    spawnReceiptFinalizerWorker(completed, { stateDir, spawnImpl: vi.fn(() => child), entry: "worker-entry.js" });
+    child.emit("exit", 1, null);
+
+    expect(readReceiptFinalizationAlert(stateDir, completed.workspaceId, completed.commandId)).toBeNull();
   });
 
   it("损坏的 draft、alert、claim 不按 missing 处理", async () => {

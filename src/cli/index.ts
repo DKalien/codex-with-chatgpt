@@ -89,7 +89,11 @@ import { registerFeedbackProbeCommands } from "./feedback-probe.js";
 import { isWriteProbeEnabled, readWriteProbeStatus, WRITE_PROBE_SCOPE } from "../mcp/write-probe.js";
 import { registerDesktopCommands } from "./desktop.js";
 import { DesktopResultError, DesktopResultPendingError, discoverCurrentDesktopDelivery, recordDesktopResult } from "../desktop/result.js";
-import { findReceiptFinalizationDraft, runReceiptFinalizer } from "../desktop/receipt-finalizer.js";
+import {
+  findReceiptFinalizationDraft,
+  runReceiptFinalizer,
+  writeReceiptFinalizationWorkerFailureAlert,
+} from "../desktop/receipt-finalizer.js";
 import { repairForwardFeedbackControlEvents } from "../feedback/store.js";
 import { registerWorkflowCommands } from "./workflow.js";
 import { registerRuntimePruneCommands } from "./runtime-prune.js";
@@ -203,9 +207,21 @@ drf.command("run").requiredOption("-w, --workspace <path>").requiredOption("--dr
   const workspace = new Workspace(path.resolve(opts.workspace));
   const stateDir = process.env.C2C_RECEIPT_FINALIZER_STATE_DIR ?? getStateDir();
   const draft = findReceiptFinalizationDraft(stateDir, workspace.id, opts.draft);
-  if (!draft) { process.exitCode = 1; return; }
-  const result = await runReceiptFinalizer(draft, { stateDir });
-  if (!result) { process.exitCode = 1; return; }
+  if (!draft) return;
+  let result: Awaited<ReturnType<typeof runReceiptFinalizer>>;
+  try { result = await runReceiptFinalizer(draft, { stateDir }); }
+  catch {
+    try {
+      say(JSON.stringify(writeReceiptFinalizationWorkerFailureAlert(draft, { stateDir })));
+      return;
+    } catch {
+      process.exitCode = 1;
+      return;
+    }
+  }
+  // Missing claim ownership means another worker is already responsible; treat it as a no-op,
+  // so the parent does not misreport ordinary claim contention as worker failure.
+  if (!result) return;
   if ("record" in result) {
     say(JSON.stringify({ ok: true, finalized: true, commandId: result.record.commandId,
       taskId: result.record.taskId, outputId: result.record.outputId }));

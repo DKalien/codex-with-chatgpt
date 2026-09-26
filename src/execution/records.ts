@@ -211,8 +211,8 @@ export function appendExecutionRecord(workspaceId: string, record: ExecutionReco
  * 在已持有 execution 锁时严格读取全部 JSONL。任何空文件、缺少尾换行、坏 JSON
  * 或 schema 不合法都停止调用方，避免把部分落盘当作可继续追加的历史。
  */
-export function readExecutionRecordsStrict(workspaceId: string): StoredExecutionRecord[] {
-  const file = path.join(getStateDir(), "executions", `${workspaceId}.jsonl`);
+export function readExecutionRecordsStrict(workspaceId: string, stateDir = getStateDir()): StoredExecutionRecord[] {
+  const file = path.join(stateDir, "executions", `${workspaceId}.jsonl`);
   let raw: string;
   try {
     raw = fs.readFileSync(file, "utf8");

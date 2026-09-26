@@ -5,7 +5,12 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { z } from "zod";
 import { ensureDir, getStateDir } from "../config/paths.js";
 import { sanitizeExecutionOutput } from "../execution/sanitize.js";
-import { executionSummarySchema, sanitizeExecutionSummary } from "../execution/records.js";
+import {
+  executionSummarySchema,
+  isTrustedDesktopReceipt,
+  readExecutionRecordsStrict,
+  sanitizeExecutionSummary,
+} from "../execution/records.js";
 import {
   desktopIpc,
   DESKTOP_RESULT_ACTIVITY_ITEM_TYPES,
@@ -348,6 +353,20 @@ export function writeReceiptFinalizationAlert(
   return alert;
 }
 
+export function writeReceiptFinalizationWorkerFailureAlert(
+  draft: ReceiptFinalizationDraft,
+  options: { stateDir?: string } = {},
+): ReceiptFinalizationAlert | null {
+  const stateDir = options.stateDir ?? getStateDir();
+  // Reuse the existing v1 reason so older strict alert readers remain compatible.
+  try {
+    const records = readExecutionRecordsStrict(draft.workspaceId, stateDir)
+      .filter(record => record.commandId === draft.commandId);
+    if (records.length === 1 && isTrustedDesktopReceipt(records[0]!, draft.commandId)) return null;
+  } catch { /* Unable to prove a receipt; keep the bounded alert. */ }
+  return writeReceiptFinalizationAlert(draft, "terminality_unknown", { stateDir });
+}
+
 function claimPath(stateDir: string, draft: ReceiptFinalizationDraft): string {
   return receiptFinalizationClaimPath(stateDir, draft.workspaceId, draft.commandId);
 }
@@ -359,16 +378,16 @@ const claimSchema = z.object({
 function acquireClaim(stateDir: string, draft: ReceiptFinalizationDraft): boolean {
   const file = claimPath(stateDir, draft);
   const claim = { version: 1, draftId: draft.draftId, pid: process.pid, claimedAt: new Date().toISOString() };
-  try {
-    if (writeExclusive(file, claim)) return true;
-    const prior = readRegular(file, claimSchema);
-    if (prior && Date.now() - Date.parse(prior.claimedAt) < 2 * 60_000) return false;
+  if (writeExclusive(file, claim)) return true;
+  const prior = readRegular(file, claimSchema);
+  if (prior && Date.now() - Date.parse(prior.claimedAt) < 2 * 60_000) return false;
+  if (prior) {
     fs.rmSync(file, { force: true });
-    return writeExclusive(file, claim);
-  } catch (error) {
-    if (error instanceof ReceiptFinalizationStateError) throw error;
-    return false;
   }
+  if (writeExclusive(file, claim)) return true;
+  const raced = readRegular(file, claimSchema);
+  if (raced && Date.now() - Date.parse(raced.claimedAt) < 2 * 60_000) return false;
+  throw new Error("receipt finalization claim changed while acquiring it");
 }
 
 function releaseClaim(stateDir: string, draft: ReceiptFinalizationDraft): void {
@@ -418,7 +437,7 @@ function isV2Draft(draft: ReceiptFinalizationDraft): draft is Extract<ReceiptFin
 
 function assertFenceIdentity(fence: ReceiptFinalizationFenceResult, draft: ReceiptFinalizationDraft, target: DesktopTarget): void {
   if (fence.threadId !== target.threadId || fence.hostId !== target.hostId || fence.projectId !== target.projectId ||
-      fence.workspaceRoot !== target.workspaceRoot || fence.resultTurnId !== draft.resultTurnId) {
+      fence.workspaceRoot !== target.workspaceRoot) {
     throw new DesktopError("DESKTOP_PROCESS_CHANGED", "Desktop receipt terminal fence identity changed.");
   }
   if (!["inProgress", "completed", "failed", "interrupted", "cancelled"].includes(fence.resultTurnStatus)) {
@@ -445,15 +464,18 @@ export async function runReceiptFinalizer(
         if (isV2Draft(draft)) {
           const fence = await markerIpc.inspectResultTerminalFence(target, draft.marker);
           assertFenceIdentity(fence, draft, target);
-          if (fence.fence === "inProgress") {
-            await new Promise(resolve => setTimeout(resolve, pollMs));
-            continue;
-          }
           if (fence.fence === "post_record_activity") {
             return writeReceiptFinalizationAlert(draft, "post_record_activity", { stateDir });
           }
           if (fence.fence === "unprovable") {
             return writeReceiptFinalizationAlert(draft, "post_record_activity_unprovable", { stateDir });
+          }
+          if (fence.resultTurnId !== draft.resultTurnId) {
+            return writeReceiptFinalizationAlert(draft, "identity_drift", { stateDir });
+          }
+          if (fence.fence === "inProgress") {
+            await new Promise(resolve => setTimeout(resolve, pollMs));
+            continue;
           }
           if (fence.fence !== "safe_terminal") {
             return writeReceiptFinalizationAlert(draft, "terminality_unknown", { stateDir });
@@ -511,13 +533,18 @@ export function spawnReceiptFinalizerWorker(
   delete env.C2C_STARTUP_LEASE;
   env.C2C_RECEIPT_FINALIZER_STATE_DIR = path.resolve(stateDir);
   env.C2C_STATE_DIR = path.resolve(stateDir);
-  const child = spawnFn(process.execPath, [entry, "desktop-receipt-finalizer", "run", "-w", draft.workspaceRoot, "--draft", draft.draftId], {
+  const runtimeArgs = path.extname(entry).toLowerCase() === ".ts" ? ["--import", "tsx"] : [];
+  const child = spawnFn(process.execPath, [...runtimeArgs, entry, "desktop-receipt-finalizer", "run", "-w", draft.workspaceRoot, "--draft", draft.draftId], {
     detached: true,
     stdio: "ignore",
     windowsHide: true,
     env,
   });
-  child.unref();
   child.once("error", () => { try { writeReceiptFinalizationAlert(draft, "worker_spawn_failed", { stateDir }); } catch { /* bounded fallback */ } });
+  child.once("exit", (code, signal) => {
+    if (code === 0 && signal === null) return;
+    try { writeReceiptFinalizationWorkerFailureAlert(draft, { stateDir }); } catch { /* bounded fallback */ }
+  });
+  child.unref();
   return child;
 }

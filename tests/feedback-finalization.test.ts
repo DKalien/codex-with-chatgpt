@@ -27,40 +27,42 @@ describe("FINAL_RECEIPT_REQUIRED feedback", () => {
     if (root) cleanup(root);
   });
 
-  it("projects a bounded alert once and never as C2C_EXECUTED", () => {
-    stateDir = isolateStateDir();
-    root = makeTmpDir("final-receipt-ws");
-    const workspace = new Workspace(root);
-    const draft = stageReceiptFinalization({
-      workspaceId: workspace.id,
-      workspaceRoot: root,
-      threadId: "11111111-1111-4111-8111-111111111111",
-      originTurnId: "22222222-2222-4222-8222-222222222222",
-      resultTurnId: "33333333-3333-4333-8333-333333333333",
-      commandId: "desktop_finalization_command",
-      inputMaterial: "safe summary",
-    }, { stateDir });
-    writeReceiptFinalizationAlert(draft, "post_record_activity_unprovable", { stateDir });
+  it.each(["post_record_activity_unprovable", "terminality_unknown"] as const)(
+    "projects bounded %s once and never as C2C_EXECUTED", reason => {
+      stateDir = isolateStateDir();
+      root = makeTmpDir("final-receipt-ws");
+      const workspace = new Workspace(root);
+      const draft = stageReceiptFinalization({
+        workspaceId: workspace.id,
+        workspaceRoot: root,
+        threadId: "11111111-1111-4111-8111-111111111111",
+        originTurnId: "22222222-2222-4222-8222-222222222222",
+        resultTurnId: "33333333-3333-4333-8333-333333333333",
+        commandId: "desktop_finalization_command",
+        inputMaterial: "safe summary",
+      }, { stateDir });
+      writeReceiptFinalizationAlert(draft, reason, { stateDir });
 
-    const first = reconcileFeedbackOutbox(workspace.id, stateDir);
-    expect(first.projected).toBe(1);
-    expect(first.state.events).toHaveLength(1);
-    const event = first.state.events[0]!;
-    expect(event.kind).toBe("FINAL_RECEIPT_REQUIRED");
-    expect(event.taskId).toBe(`desktop_finalization_${draft.commandId}`);
-    expect(event.changedFilesSummary).toEqual([]);
-    expect(event.testsSummary).toBe("");
-    expect(event.outputAvailable).toBe(false);
-    const message = formatProductionFeedbackMessage({ ...event, attemptId: "44444444-4444-4444-8444-444444444444" });
-    expect(message).toContain("STATE: FINAL_RECEIPT_REQUIRED");
-    expect(message).toContain("post_record_activity_unprovable");
-    expect(message).not.toContain("C2C_EXECUTED");
+      const first = reconcileFeedbackOutbox(workspace.id, stateDir);
+      expect(first.projected).toBe(1);
+      expect(first.state.events).toHaveLength(1);
+      const event = first.state.events[0]!;
+      expect(event.kind).toBe("FINAL_RECEIPT_REQUIRED");
+      expect(event.taskId).toBe(`desktop_finalization_${draft.commandId}`);
+      expect(event.changedFilesSummary).toEqual([]);
+      expect(event.testsSummary).toBe("");
+      expect(event.outputAvailable).toBe(false);
+      const message = formatProductionFeedbackMessage({ ...event, attemptId: "44444444-4444-4444-8444-444444444444" });
+      expect(message).toContain("STATE: FINAL_RECEIPT_REQUIRED");
+      expect(message).toContain(reason);
+      expect(message).not.toContain("C2C_EXECUTED");
 
-    const second = reconcileFeedbackOutbox(workspace.id, stateDir);
-    expect(second.projected).toBe(0);
-    expect(second.state.events).toHaveLength(1);
-    fs.rmSync(stateDir, { recursive: true, force: true });
-  });
+      const second = reconcileFeedbackOutbox(workspace.id, stateDir);
+      expect(second.projected).toBe(0);
+      expect(second.state.events).toHaveLength(1);
+      fs.rmSync(stateDir, { recursive: true, force: true });
+    },
+  );
 
   it("compatibility repair quarantines only alert-backed control events and preserves legacy state", () => {
     stateDir = isolateStateDir();
