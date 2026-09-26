@@ -983,14 +983,15 @@ envelope 是单个 JSON 对象：`{"type":"C2C_DESKTOP_TASK","version":1,"worksp
 
 1. 开始时记住本轮实际修改/创建文件，保留已有 dirty workspace；不要 reset/stash。
    收尾结合本轮操作与最终 git 状态列出 changed-files，不能直接复制整个脏工作区文件列表。
-   在 notes 说明已有未提交改动及本轮范围。
+   在 notes 说明已有未提交改动及本轮范围；另写 Codex 自己的明确最终执行摘要 `rawSummary`，概述本轮结果与验证/阻塞，不能复用 notes、粘贴 raw transcript 或命令输出。
 2. 在最终回复前必须完成 execution receipt，成功、失败和 blocked 均记录，分别使用
    `--exit-status ok|failed|blocked`。没有运行测试时必须填 `--tests "not run"`，不能沿用旧测试。
    已运行 test/build/lint/typecheck/ruff/pytest 等则保存本轮真实摘要，尽量把已运行命令的最终/
    汇总输出保存为本地 UTF-8 文件，通过现有 execution_output 过滤机制记录；不要伪造退出码。
 3. 运行本机隐藏入口（不是网页 MCP 工具），并把它作为本轮最后一个工具/命令动作：
-   `c2c record -w <workspace> --iteration 1 --changed-files "<本轮文件逗号列表；无修改为空>" --tests "<本轮摘要或 not run>" --exit-status <ok|failed|blocked> --notes "<范围/已有脏状态>" --json`。
+   `c2c record -w <workspace> --iteration 1 --changed-files "<本轮文件逗号列表；无修改为空>" --tests "<本轮摘要或 not run>" --exit-status <ok|failed|blocked> --notes "<范围/已有脏状态>" --raw-summary "<Codex 明确撰写的本轮最终执行摘要>" --json`。
    在 accepted Desktop turn 内，该命令会基于 canonical 当前 turn 自动发现唯一 delivery；终态已被可靠核验时才写入 trusted `desktop_<commandId>` receipt。`inProgress` 只创建 pending draft；不得在 record 后继续编辑、测试或检查。普通非 Desktop record 行为保持不变，Desktop 证据损坏或歧义不会回退。
+   `rawSummary` 与 notes 分开保存，最多 8192 UTF-8 bytes；凭据会脱敏，私钥或超限摘要会拒绝。不要把对话 transcript、原始日志或凭据放入摘要。
    有输出时追加 `--command "<已执行命令描述>" --output-file <本轮汇总文件> --exit-code <真实退出码>`。
    该入口只消费输出，不执行 command；输出文件超过 256 KiB 时先生成真实汇总，不能静默截断。
    不手动指定 taskId/iteration/thread：自动派生 `desktop_<commandId>` / `1`，并写入 commandId。

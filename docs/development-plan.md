@@ -3,6 +3,39 @@
 本文件是本 workspace 持续维护的开发事实源，不是一次性 handoff。阶段完成、设计修正、
 新风险或 `NEXT_EXPECTED_STEP` 变化时必须同步更新；历史观察与当前实现分开记录。
 
+## R0→R5 recovered authoritative roadmap（截至 2026-09-26）
+
+本路线收敛当前产品阶段；它优先于下方历史记录中的旧 `NEXT_EXPECTED_STEP` 和各 R3 slice
+当时的 pending 状态。C/A/D/B、Phase E/F/G/H 仍是保留的历史实现记录，不再覆盖 R0→R5 的阶段顺序。
+
+| 阶段 | 目标 | 当前状态 |
+| --- | --- | --- |
+| R0 | 清理实验分支，建立可信基线 | done |
+| R1 | Project 是 workspace 内的容器，可关联多个带 planner/executor role 的 Route；Route identity 为 `{workspaceId, platform, conversationId}`；随机 `bindingId` / `routeId` / `resultId` 仅作引用；Command 与最小 ExecutionResult durable model | foundation done |
+| R2 | 以 Desktop behavioral adapter 取代生产 build/hash/catalog gates | done |
+| R3 | Browser Companion“设备授权一次 + 当前网址一键绑定”的 Web adapter 与 feedback return plane | done；真实 live E2E PASS |
+| R4 | 将 Codex terminal truth（machine facts + Codex 自己的 final summary）写成 canonical ExecutionResult，经 `Command.plannerRouteId` 的 durable outbox 返回；不做第二次 AI rewrite | R4a done；独立 review PASS。下一步 R4b：接通 canonical ExecutionResult → `Command.plannerRouteId` durable outbox；production delivery 尚未完成 |
+| R5 | Bridge lifecycle 与 conversation execution state 完全解耦，不再由 Desktop busy、`approval_pending` 或 self-turn post-turn-finalizer 耦合 | planned |
+
+### 历史兼容债务与阶段边界
+
+- R3 live E2E 通过后，现有 `pairingIntent`、`epoch`、`principalFingerprint`、`routeAttestation`、
+  rebind predecessor/successor 语义冻结；R4 不简化或重写这些状态。
+- 现有 feedback outbox 仍按 `bindingId / epoch / principalFingerprint` 定向接收，状态沿用
+  `queued → ready → reserved → claimed → observed / outcome_unknown / retired_unknown`。
+  R4 最终迁到 planner-route durable result delivery；R4b/c 渐进迁移并保留 R3 合同。
+- `/state` 与 `/reserve` 当前都会调用 `reconcileFeedbackOutbox()`。R4a 保持该调用和旧路径不变；
+  最终 R4 不应依靠 pull 来创建 semantic ExecutionResult 或 outbox entry。
+- 旧 Companion-derived planner routes 及 legacy `bindingId` 只保留为历史 route/reference；当前
+  planner authority 来自同一 MCP request 的官方 conversation principal。不能删除、迁移或把旧记录
+  提升为当前 authority。
+- R5 的已知债务位于 `rollout.ts`：`assessRolloutIdle()` 会被 Desktop busy、`approval_pending` 等状态
+  阻断，并可能为 self-turn 安排 post-turn-finalizer；这是待解耦的生命周期耦合，不代表 R5 已实现。
+- H0 / Claude E1a 是独立的 executor extensibility 支线，不属于 R5，也不改变 R0→R5 的阶段顺序。
+
+R4a 已建立显式 `rawSummary` 的 Desktop receipt 与 read-only trusted receipt → canonical
+`ResultInput` 投影接缝，并通过独立 review；未自动 append result、创建 outbox、改 Browser production transport，亦未触碰 R5 lifecycle。下一步为 R4b：将 canonical ExecutionResult 接入 `Command.plannerRouteId` durable outbox。
+
 ## Baseline（2026-09-13）
 
 - 首轮开始 HEAD：`6c93f326eeac781af26eec1797b6c22c330ae33a`，工作区干净。
@@ -15,9 +48,10 @@
   源码构建不等于安装，安装不等于运行 Bridge 已升级。
 - 本轮仅执行 C；不安装机器 Core、不重启当前 Bridge、不实现 D/A/B、不 push。
 
-## 目标、顺序与共享机制
+## Machine Core 历史阶段：C→A→D1→D2→B
 
-执行顺序固定为 **C → A → D1 → D2 → B**（原 C→D→A→B 已因真实终态回流缺口调整）。
+以下记录 2026-09-13 开始的 Machine Core 阶段顺序，作为历史实现证据保留；它不是当前 R0→R5 路线。
+当时顺序为 **C → A → D1 → D2 → B**（原 C→D→A→B 已因真实终态回流缺口调整）。
 
 | 阶段 | 目标 | 状态 | 完成证据 |
 | --- | --- | --- | --- |
@@ -950,3 +984,9 @@ H0 不抽象 Codex-specific result classification、terminal fence、receipt fin
 - command34 review-fix 在读取任何旧终态或 Desktop durable delivery 前，校验既有 Command 的 planner route 属于当前 request principal；跨 principal replay 以 `COMMAND_CONFLICT` 拒绝，不写状态、不发送。
 - 验证通过：command34 focused routing/MCP/架构 4 files / 84 tests，full suite 99 files / 2134 tests，typecheck、build、`git diff --check` 均通过；R3i/j/k 浏览器与 feedback focused 14 files / 560 tests 通过。
 - 当前变更仍在未提交工作树，未 push/install；command34 未取得可信 Desktop execution receipt，独立 review 与部署后新 Chat live smoke 均 pending。2026-09-25 只读 `c2c status` 显示 Bridge runtime 与 installed build 一致、`runtimeUpgrade=current`；Desktop availability 返回 `DESKTOP_PROTOCOL_ERROR`，`unresolvedDelivery=false`。R3 整体不视为验收完成。
+
+## R3 aggregate live E2E closeout（截至 2026-09-26）
+
+R3 已通过真实 live E2E，阶段状态为 **done**。R3a–R3l 条目保留各 slice 当时的实现与审查证据；
+其中“live smoke pending”“R3 整体不视为验收完成”等均为历史快照，已由本节及顶部 R0→R5
+roadmap supersede，不再表示当前阻塞。R4 是当前下一阶段；R3 pairing、feedback 与 route 兼容债务见上节。

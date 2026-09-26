@@ -70,7 +70,7 @@ import {
   type ProtocolState,
   type WaitingFor,
 } from "../session/state.js";
-import { appendExecutionRecord, executionRecordSchema } from "../execution/records.js";
+import { appendExecutionRecord, executionRecordSchema, sanitizeExecutionSummary } from "../execution/records.js";
 import { saveExecutionOutput } from "../execution/output.js";
 import { checkForUpdates } from "./update-check.js";
 import { registerWebControlCommands } from "./web-control.js";
@@ -1297,6 +1297,7 @@ program
   .option("--tests <summary>", "e.g. '27 passed'")
   .option("--exit-status <status>", "ok | failed | blocked", "ok")
   .option("--notes <text>")
+  .option("--raw-summary <text>", "Codex 本轮明确最终执行摘要（最多 8192 UTF-8 bytes）")
   .option("--control-session-id <id>", "Web Control session metadata (local only)")
   .option("--command-id <id>", "关联命令 ID（本地执行记录）")
   .option("--command <text>", "command whose output may be offered to ChatGPT")
@@ -1313,6 +1314,7 @@ program
       tests?: string;
       exitStatus: string;
       notes?: string;
+      rawSummary?: string;
       controlSessionId?: string;
       commandId?: string;
       command?: string;
@@ -1336,6 +1338,7 @@ program
         }
         const tests = opts.tests?.trim();
         if (!tests) throw new Error("Desktop 自动 receipt 要求非空 tests；未运行请填写 not run。");
+        if (!opts.rawSummary?.trim()) throw new Error("Desktop 自动 receipt 要求非空 --raw-summary；填写 Codex 自己的最终执行摘要，不要传 notes 或 transcript。");
         let rawOutput = opts.output;
         if (opts.outputFile !== undefined) {
           const fd = fs.openSync(path.resolve(opts.outputFile), "r");
@@ -1358,6 +1361,7 @@ program
             tests,
             exitStatus: opts.exitStatus as "ok" | "failed" | "blocked",
             ...(opts.notes === undefined ? {} : { notes: opts.notes.slice(0, 400) }),
+            rawSummary: opts.rawSummary,
             ...(opts.command === undefined ? {} : { command: opts.command }),
             ...(rawOutput === undefined ? {} : { output: rawOutput }),
             ...(opts.exitCode === undefined ? {} : { exitCode: opts.exitCode }),
@@ -1387,6 +1391,7 @@ program
         exitStatus: opts.exitStatus,
         timestamp: new Date().toISOString(),
         notes: opts.notes?.slice(0, 400),
+        ...(opts.rawSummary === undefined ? {} : { rawSummary: sanitizeExecutionSummary(opts.rawSummary) }),
         controlSessionId: opts.controlSessionId,
         commandId: opts.commandId,
       });

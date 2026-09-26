@@ -5,6 +5,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { z } from "zod";
 import { ensureDir, getStateDir } from "../config/paths.js";
 import { sanitizeExecutionOutput } from "../execution/sanitize.js";
+import { executionSummarySchema, sanitizeExecutionSummary } from "../execution/records.js";
 import {
   desktopIpc,
   DESKTOP_RESULT_ACTIVITY_ITEM_TYPES,
@@ -27,6 +28,8 @@ const receiptFinalizationInputSchema = z.object({
   tests: z.string().min(1).max(16_384),
   exitStatus: z.enum(["ok", "failed", "blocked"]),
   notes: z.string().max(16_384).optional(),
+  // 新 receipt 必须提供；旧 v2 draft 保留缺失字段与原 canonical digest。
+  rawSummary: executionSummarySchema.optional(),
   command: z.string().max(16_384).optional(),
   output: z.string().max(256 * 1024).optional(),
   outputRestrictedReason: z.string().max(128).optional(),
@@ -113,11 +116,18 @@ function draftMarkerEqual(left: ReceiptFinalizationDraft, right: ReceiptFinaliza
 /** 只把 output 交给现有 sanitizer；draft 永远不落原始敏感输出。 */
 export function sanitizeReceiptFinalizationInput(value: unknown): ReceiptFinalizationInput {
   const input = receiptFinalizationInputSchema.parse(value);
-  if (input.output === undefined) return input;
+  const rawSummary = input.rawSummary === undefined ? undefined : sanitizeExecutionSummary(input.rawSummary);
+  if (input.output === undefined) {
+    return rawSummary === undefined ? input : { ...input, rawSummary };
+  }
   const sanitized = sanitizeExecutionOutput(input.output);
-  return sanitized.allowed
-    ? { ...input, output: sanitized.text, outputRestrictedReason: undefined }
-    : { ...input, output: undefined, outputRestrictedReason: sanitized.reason };
+  return {
+    ...input,
+    ...(rawSummary === undefined ? {} : { rawSummary }),
+    ...(sanitized.allowed
+      ? { output: sanitized.text, outputRestrictedReason: undefined }
+      : { output: undefined, outputRestrictedReason: sanitized.reason }),
+  };
 }
 
 export function canonicalReceiptFinalizationInput(input: ReceiptFinalizationInput): string {
@@ -127,6 +137,7 @@ export function canonicalReceiptFinalizationInput(input: ReceiptFinalizationInpu
     tests: input.tests,
     exitStatus: input.exitStatus,
     notes: input.notes ?? null,
+    ...(input.rawSummary === undefined ? {} : { rawSummary: input.rawSummary }),
     command: input.command ?? null,
     output: input.output ?? null,
     outputRestrictedReason: input.outputRestrictedReason ?? null,

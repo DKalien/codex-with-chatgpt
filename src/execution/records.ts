@@ -2,6 +2,25 @@ import fs from "node:fs";
 import path from "node:path";
 import { z } from "zod";
 import { ensureDir, getStateDir } from "../config/paths.js";
+import { sanitizeExecutionOutput } from "./sanitize.js";
+
+export const MAX_EXECUTION_SUMMARY_BYTES = 8 * 1024;
+export const executionSummarySchema = z.string().min(1).refine(
+  value => value.trim().length > 0,
+  "rawSummary 不能为空。",
+).refine(
+  value => Buffer.byteLength(value, "utf8") <= MAX_EXECUTION_SUMMARY_BYTES,
+  "rawSummary 不能为空且 UTF-8 编码不得超过 8192 bytes。",
+);
+
+export function sanitizeExecutionSummary(value: string): string {
+  const summary = executionSummarySchema.parse(value);
+  const sanitized = sanitizeExecutionOutput(summary);
+  if (!sanitized.allowed || sanitized.truncated || Buffer.byteLength(sanitized.text, "utf8") > MAX_EXECUTION_SUMMARY_BYTES) {
+    throw new Error("rawSummary 包含不允许的内容或超过 8192 bytes；请提交简短摘要，不要包含 transcript 或私钥。");
+  }
+  return executionSummarySchema.parse(sanitized.text);
+}
 
 /**
  * Lightweight execution records written by the Codex harness after each
@@ -16,6 +35,7 @@ export const executionRecordSchema = z.object({
   exitStatus: z.string(),
   timestamp: z.string(),
   notes: z.string().optional(),
+  rawSummary: executionSummarySchema.optional(),
   outputId: z.number().int().positive().optional(),
   outputAvailable: z.boolean().optional(),
   controlSessionId: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/).optional(),
@@ -26,6 +46,10 @@ export type ExecutionRecord = z.infer<typeof executionRecordSchema>;
 // Desktop receipt 的防重放摘要只存在本机 JSONL；不加入公开 execution_summary schema。
 const storedExecutionRecordSchema = executionRecordSchema.extend({
   desktopReceiptSha256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+  desktopThreadId: z.string().uuid().optional(),
+  desktopOriginTurnId: z.string().uuid().optional(),
+  desktopResultTurnId: z.string().uuid().optional(),
+  desktopBindingId: z.string().uuid().optional(),
 }).strict();
 export type StoredExecutionRecord = z.infer<typeof storedExecutionRecordSchema>;
 
@@ -166,7 +190,11 @@ export async function withExecutionRecordsLockAsync<T>(workspaceId: string, acti
 /** 仅供已持有 withExecutionRecordsLock 的事务追加；普通调用请用 appendExecutionRecord。 */
 export function appendExecutionRecordLocked(workspaceId: string, record: StoredExecutionRecord): void {
   const file = recordsFile(workspaceId);
-  const serialized = JSON.stringify(storedExecutionRecordSchema.parse(record)) + "\n";
+  const parsed = storedExecutionRecordSchema.parse(record);
+  const safe = parsed.rawSummary === undefined
+    ? parsed
+    : { ...parsed, rawSummary: sanitizeExecutionSummary(parsed.rawSummary) };
+  const serialized = JSON.stringify(safe) + "\n";
   const fd = fs.openSync(file, "a", 0o600);
   try {
     fs.writeFileSync(fd, serialized, "utf8");

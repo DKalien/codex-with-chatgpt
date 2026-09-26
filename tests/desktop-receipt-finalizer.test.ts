@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -11,7 +12,9 @@ import * as desktopStore from "../src/desktop/store.js";
 import {
   readReceiptFinalizationAlert,
   readReceiptFinalizationDraft,
+  canonicalReceiptFinalizationInput,
   receiptFinalizationMarkerDigest,
+  receiptFinalizationDraftPath,
   runReceiptFinalizer,
   spawnReceiptFinalizerWorker,
   stageReceiptFinalization,
@@ -54,11 +57,54 @@ function v2Draft(stateDir: string, output = "safe output") {
       changedFiles: ["src/desktop/result.ts"],
       tests: "1 passed",
       exitStatus: "ok",
+      rawSummary: "本轮已完成实现，定向测试通过。",
       command: "pnpm test",
       output,
     },
     marker: marker(),
   }, { stateDir, nowMs: Date.now() });
+}
+
+function preR4aV2Draft(stateDir: string) {
+  const pending = stageReceiptFinalization({
+    workspaceId: "desktop_receipt_test",
+    workspaceRoot: process.cwd(),
+    threadId,
+    originTurnId,
+    resultTurnId,
+    commandId: "desktop_receipt_command",
+    input: {
+      commandId: "desktop_receipt_command",
+      changedFiles: ["src/legacy.ts"],
+      tests: "1 passed",
+      exitStatus: "ok",
+      command: "pnpm test",
+      output: "safe output",
+    },
+    marker: marker(),
+  }, { stateDir, nowMs: Date.now() });
+  if (pending.version !== 2) throw new Error("expected a v2 draft");
+
+  // 固定 pre-R4a 的 canonical 字段顺序与字段集合，刻意省略 rawSummary。
+  const legacyCanonical = JSON.stringify({
+    commandId: pending.input.commandId,
+    changedFiles: [...pending.input.changedFiles],
+    tests: pending.input.tests,
+    exitStatus: pending.input.exitStatus,
+    notes: pending.input.notes ?? null,
+    command: pending.input.command ?? null,
+    output: pending.input.output ?? null,
+    outputRestrictedReason: pending.input.outputRestrictedReason ?? null,
+    exitCode: pending.input.exitCode ?? null,
+  });
+  const fixture = {
+    ...pending,
+    inputDigest: createHash("sha256").update(legacyCanonical, "utf8").digest("hex"),
+  };
+  fs.writeFileSync(receiptFinalizationDraftPath(stateDir, pending.workspaceId, pending.commandId), JSON.stringify(fixture), "utf8");
+  const persisted = readReceiptFinalizationDraft(stateDir, pending.workspaceId, pending.commandId);
+  if (!persisted || persisted.version !== 2) throw new Error("expected a persisted v2 draft");
+  return persisted;
 }
 
 function mockDurableState(pending: ReturnType<typeof draft>) {
@@ -182,6 +228,13 @@ describe("Desktop receipt terminal fence", () => {
       expect(readExecutionRecordsStrict(pending.workspaceId)).toHaveLength(1);
       const records = readExecutionRecordsStrict(pending.workspaceId);
       expect(isTrustedDesktopReceipt(records[0], pending.commandId)).toBe(true);
+      expect(records[0]).toMatchObject({
+        rawSummary: "本轮已完成实现，定向测试通过。",
+        desktopThreadId: threadId,
+        desktopOriginTurnId: originTurnId,
+        desktopResultTurnId: resultTurnId,
+        desktopBindingId: "00000000-0000-4000-8000-000000000111",
+      });
       expect(listExecutionOutputs(pending.workspaceId, Number.MAX_SAFE_INTEGER))
         .toMatchObject([{ taskId: `desktop_${pending.commandId}`, iteration: 1, allowed: true }]);
       expect(readReceiptFinalizationDraft(stateDir, pending.workspaceId, pending.commandId)).toBeNull();
@@ -194,6 +247,66 @@ describe("Desktop receipt terminal fence", () => {
       if (previousStateDir === undefined) delete process.env.C2C_STATE_DIR;
       else process.env.C2C_STATE_DIR = previousStateDir;
     }
+  });
+
+  it("pre-R4a v2 safe_terminal finalizes with its legacy digest and no fabricated rawSummary", async () => {
+    stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "c2c-receipt-finalizer-"));
+    const pending = preR4aV2Draft(stateDir);
+    expect(pending.input.rawSummary).toBeUndefined();
+    mockDurableState(pending);
+    const previousStateDir = process.env.C2C_STATE_DIR;
+    process.env.C2C_STATE_DIR = stateDir;
+    try {
+      const fence = vi.spyOn(desktopIpc, "inspectResultTerminalFence").mockResolvedValue({
+        threadId,
+        hostId: "local",
+        projectId: "project",
+        workspaceRoot: pending.workspaceRoot,
+        title: "test",
+        cwd: pending.workspaceRoot,
+        workspaceKind: "project",
+        resumeState: "resumed",
+        runtimeStatus: "idle",
+        requestsCount: 0,
+        desktopVersion: "26.915.4065.0",
+        appServerVersion: "0.155.0-alpha.9.2",
+        profile: "desktop-ipc-v1",
+        ownerClientId: "client",
+        resultTurnId: pending.resultTurnId,
+        resultTurnStatus: "completed",
+        fence: "safe_terminal",
+      });
+      const result = await runReceiptFinalizer(pending, { stateDir });
+      const records = readExecutionRecordsStrict(pending.workspaceId);
+      expect(fence).toHaveBeenCalledOnce();
+      expect(result).toMatchObject({ record: { commandId: pending.commandId, desktopReceiptSha256: pending.inputDigest } });
+      expect(records).toHaveLength(1);
+      expect(records[0]!.rawSummary).toBeUndefined();
+      expect(Object.hasOwn(records[0]!, "rawSummary")).toBe(false);
+      expect(isTrustedDesktopReceipt(records[0]!, pending.commandId)).toBe(true);
+      expect(readReceiptFinalizationDraft(stateDir, pending.workspaceId, pending.commandId)).toBeNull();
+    } finally {
+      if (previousStateDir === undefined) delete process.env.C2C_STATE_DIR;
+      else process.env.C2C_STATE_DIR = previousStateDir;
+    }
+  });
+
+  it("pending digest 包含 rawSummary，不能以不同摘要重放同一 command", () => {
+    stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "c2c-receipt-finalizer-"));
+    const first = v2Draft(stateDir);
+    if (first.version !== 2) throw new Error("expected a v2 draft");
+    const changedInput = { ...first.input, rawSummary: "另一份最终摘要" };
+    expect(canonicalReceiptFinalizationInput(changedInput)).not.toBe(canonicalReceiptFinalizationInput(first.input));
+    expect(() => stageReceiptFinalization({
+      workspaceId: first.workspaceId,
+      workspaceRoot: first.workspaceRoot,
+      threadId: first.threadId,
+      originTurnId: first.originTurnId,
+      resultTurnId: first.resultTurnId,
+      commandId: first.commandId,
+      input: changedInput,
+      marker: first.marker,
+    }, { stateDir })).toThrow(/不一致/);
   });
 
   it.each(["post_record_activity", "unprovable"] as const)("v2 %s writes bounded alert and keeps draft", async fenceKind => {
@@ -234,6 +347,7 @@ describe("Desktop receipt terminal fence", () => {
         changedFiles: [],
         tests: "not run",
         exitStatus: "blocked",
+        rawSummary: "本轮被阻塞，未运行测试。",
         output: "password=super-secret",
       },
       marker: marker(),

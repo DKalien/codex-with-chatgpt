@@ -48,6 +48,38 @@ describe("c2c record", () => {
     });
   });
 
+  it("将 rawSummary 独立保存并脱敏，notes 仍保留范围说明", () => {
+    withRecordEnvironment((root, workspace) => {
+      const result = runRecord(root, [
+        "--iteration", "1", "--changed-files", "", "--tests", "not run",
+        "--notes", "范围说明",
+        "--raw-summary", "本轮完成；token=ghp_abcdefghijklmnopqrstuv",
+      ]);
+
+      expect(result.status).toBe(0);
+      expect(readExecutionRecords(workspace.id)[0]).toMatchObject({
+        notes: "范围说明",
+        rawSummary: "本轮完成；token=[REDACTED]",
+      });
+      expect(fs.readFileSync(path.join(process.env.C2C_STATE_DIR!, "executions", `${workspace.id}.jsonl`), "utf8"))
+        .not.toContain("ghp_abcdefghijklmnopqrstuv");
+    });
+  });
+
+  it("超过 8192 UTF-8 bytes 的 rawSummary 在输出落盘前拒绝", () => {
+    withRecordEnvironment((root, workspace) => {
+      const result = runRecord(root, [
+        "--iteration", "1", "--changed-files", "", "--tests", "not run",
+        "--raw-summary", "字".repeat(2731),
+        "--command", "pnpm test", "--output", "should not be saved",
+      ]);
+
+      expect(result.status).toBe(1);
+      expect(readExecutionRecords(workspace.id)).toEqual([]);
+      expect(listExecutionOutputs(workspace.id)).toEqual([]);
+    });
+  });
+
   it("records valid numeric options and command output", () => {
     withRecordEnvironment((root, workspace) => {
       const result = runRecord(root, [

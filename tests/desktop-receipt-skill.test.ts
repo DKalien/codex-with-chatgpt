@@ -7,7 +7,8 @@ const receipt = skill.split("### Desktop-delivered turn：最终回复前自动�
 it("Desktop envelope 触发专属收尾，不重复 Activation 或规划", () => {
   expect(skill.split("---")[1]).toContain("C2C_DESKTOP_TASK");
   for (const text of ["C2C_DESKTOP_TASK", "不再进入 Activation", "最终回复前必须完成 execution receipt",
-    "--exit-status ok|failed|blocked", '--tests "not run"', "不能沿用旧测试", "execution_output"])
+    "--exit-status ok|failed|blocked", '--tests "not run"', "不能沿用旧测试", "execution_output",
+    "--raw-summary", "不能复用 notes", "raw transcript", "8192 UTF-8 bytes"])
     expect(receipt).toContain(text);
 });
 

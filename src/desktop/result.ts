@@ -3,6 +3,7 @@ import { z } from "zod";
 import { listExecutionOutputs, saveExecutionOutput, saveRestrictedExecutionOutput, type ExecutionOutputMeta } from "../execution/output.js";
 import {
   appendExecutionRecordLocked,
+  executionSummarySchema,
   isTrustedDesktopReceipt,
   readExecutionRecordsStrict,
   withExecutionRecordsLockAsync,
@@ -47,6 +48,7 @@ export const desktopResultInput = z.object({
   tests: z.string().refine(value => value.trim().length > 0, "tests 不能为空；未运行测试请填写 not run。"),
   exitStatus: z.enum(["ok", "failed", "blocked"]),
   notes: z.string().optional(),
+  rawSummary: executionSummarySchema,
   command: z.string().optional(),
   output: z.string().optional(),
   exitCode: z.number().int().safe().optional(),
@@ -281,11 +283,11 @@ export async function discoverCurrentDesktopDelivery(
   };
 }
 
-function canonicalInput(input: DesktopResultInput): string {
+function canonicalInput(input: ReceiptFinalizationInput): string {
   return canonicalReceiptFinalizationInput(sanitizeReceiptFinalizationInput(input));
 }
 
-function receiptHash(input: DesktopResultInput): string {
+function receiptHash(input: ReceiptFinalizationInput): string {
   return createHash("sha256").update(canonicalInput(input), "utf8").digest("hex");
 }
 
@@ -336,7 +338,7 @@ function assertFinalizationDelivery(
   workspace: DesktopResultWorkspace,
   draft: Extract<ReceiptFinalizationDraft, { version: 2 }>,
   target: { threadId: string; hostId: string; projectId: string; workspaceRoot: string },
-): void {
+): DesktopDelivery {
   if (draft.workspaceId !== workspace.id || draft.workspaceRoot !== workspace.root || draft.threadId !== target.threadId ||
       target.workspaceRoot !== workspace.root || draft.resultTurnId !== draft.marker.resultTurnId) {
     throw new DesktopResultError("DESKTOP_RESULT_THREAD", "pending receipt 的 terminal fence 身份不一致；拒绝写入结果。 ");
@@ -351,6 +353,7 @@ function assertFinalizationDelivery(
   if (deliveries.length !== 1) {
     throw new DesktopResultError("DESKTOP_RESULT_THREAD", "pending receipt 没有唯一匹配的 accepted delivery；拒绝写入结果。 ");
   }
+  return deliveries[0]!;
 }
 
 function assertFinalizationFence(
@@ -379,7 +382,7 @@ export async function finalizeReceiptFinalizationDraft(
   }
   const taskId = `desktop_${draft.commandId}`;
   return withExecutionRecordsLockAsync(workspace.id, async () => {
-    assertFinalizationDelivery(workspace, draft, target);
+    const accepted = assertFinalizationDelivery(workspace, draft, target);
     let records: StoredExecutionRecord[];
     try { records = readExecutionRecordsStrict(workspace.id); }
     catch (error) { throw new DesktopResultError("DESKTOP_RESULT_RECORDS_CORRUPT", error instanceof Error ? error.message : "执行记录损坏；拒绝继续。 "); }
@@ -425,9 +428,14 @@ export async function finalizeReceiptFinalizationDraft(
       exitStatus: input.exitStatus,
       timestamp: new Date().toISOString(),
       ...(input.notes === undefined ? {} : { notes: input.notes }),
+      ...(input.rawSummary === undefined ? {} : { rawSummary: input.rawSummary }),
       ...(output === null ? {} : { outputId: output.id, outputAvailable: output.allowed }),
       commandId: draft.commandId,
       desktopReceiptSha256: digest,
+      desktopThreadId: draft.threadId,
+      desktopOriginTurnId: draft.originTurnId,
+      desktopResultTurnId: draft.resultTurnId,
+      desktopBindingId: accepted.bindingId,
     };
     appendExecutionRecordLocked(workspace.id, record);
     const committed = readExecutionRecordsStrict(workspace.id)
@@ -501,6 +509,10 @@ export async function recordDesktopResult(
     }
 
     const firstOwnership = await assertCurrentResultContext(workspace, acceptedNow);
+    const rawSummary = input.rawSummary;
+    if (rawSummary === undefined) {
+      throw new DesktopResultError("DESKTOP_RESULT_INVALID", "Desktop execution receipt 必须包含 rawSummary。");
+    }
     if (firstOwnership.resultTurnStatus === "inProgress" && options.allowInProgress !== true) {
       let draft: ReceiptFinalizationDraft;
       const durable = readDesktop(workspace.id);
@@ -581,9 +593,14 @@ export async function recordDesktopResult(
       exitStatus: input.exitStatus,
       timestamp: new Date().toISOString(),
       ...(input.notes === undefined ? {} : { notes: input.notes }),
+      rawSummary,
       ...(output === null ? {} : { outputId: output.id, outputAvailable: output.allowed }),
       commandId: input.commandId,
       desktopReceiptSha256: digest,
+      desktopThreadId: threadId,
+      desktopOriginTurnId: acceptedNow.turnId!,
+      desktopResultTurnId: firstOwnership.resultTurnId,
+      desktopBindingId: acceptedNow.bindingId,
     };
     appendExecutionRecordLocked(workspace.id, record);
     return { record, output };

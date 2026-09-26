@@ -127,14 +127,15 @@ export function registerDesktopCommands(program: Command): void {
     .requiredOption("--changed-files <files>", "本轮实际修改文件，逗号分隔；无修改传空字符串")
     .requiredOption("--tests <summary>", "本轮测试摘要；未运行填 not run")
     .requiredOption("--exit-status <status>", "ok / failed / blocked")
+    .requiredOption("--raw-summary <text>", "Codex 本轮明确最终执行摘要，最多 8192 UTF-8 bytes；不得传 transcript")
     .option("--notes <text>", "本轮说明")
     .option("--command <text>", "已执行命令的描述，不执行此文本")
     .option("--output <text>", "已执行命令的输出")
     .option("--output-file <path>", "已执行命令的 UTF-8 汇总输出文件，最多 256 KiB")
     .option("--exit-code <code>", "已执行命令的退出码")
     .option("--json", "输出机器可读结果", false)
-    .action(async (opts: { workspace?: string; commandId: string; changedFiles: string; tests: string;
-      exitStatus: "ok" | "failed" | "blocked"; notes?: string; command?: string; output?: string;
+  .action(async (opts: { workspace?: string; commandId: string; changedFiles: string; tests: string;
+      exitStatus: "ok" | "failed" | "blocked"; rawSummary: string; notes?: string; command?: string; output?: string;
       outputFile?: string; exitCode?: string; json: boolean }) => {
       try {
         if (opts.output !== undefined && opts.outputFile !== undefined) {
@@ -155,7 +156,7 @@ export function registerDesktopCommands(program: Command): void {
         }
         const result = await recordDesktopResult(new Workspace(workspaceRoot(opts.workspace)), {
           commandId: opts.commandId, changedFiles: opts.changedFiles.split(",").map(file => file.trim()).filter(Boolean),
-          tests: opts.tests, exitStatus: opts.exitStatus, notes: opts.notes, command: opts.command,
+          tests: opts.tests, exitStatus: opts.exitStatus, rawSummary: opts.rawSummary, notes: opts.notes, command: opts.command,
           output, exitCode: opts.exitCode === undefined ? undefined : Number(opts.exitCode),
         }, { allowInProgress: true });
         print({ ok: true, ...result }, opts.json, "本轮 Desktop execution receipt 已记录。");

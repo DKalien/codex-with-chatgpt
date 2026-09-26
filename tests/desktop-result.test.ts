@@ -103,6 +103,7 @@ function input(overrides: Partial<DesktopResultInput> = {}): DesktopResultInput 
     changedFiles: ["src/desktop/result.ts"],
     tests: "pnpm vitest run tests/desktop-result.test.ts",
     exitStatus: "ok",
+    rawSummary: "本轮完成 Desktop receipt 摘要实现并通过定向验证。",
     command: "pnpm test",
     output: "1 passed\n",
     ...overrides,
@@ -475,7 +476,11 @@ describe("Desktop execution result", () => {
       title: "已重绑的 Desktop 会话",
       boundAt: "2026-09-12T00:00:00.000Z",
     } });
-    const result = await recordDesktopResult(workspace, input({ tests: "not run", exitStatus: "blocked" }));
+    const result = await recordDesktopResult(workspace, input({
+      tests: "not run",
+      exitStatus: "blocked",
+      rawSummary: "本轮因环境限制 blocked，未运行测试。",
+    }));
     expect(result.record).toMatchObject({
       taskId: `desktop_${commandId}`,
       iteration: 1,
@@ -483,8 +488,16 @@ describe("Desktop execution result", () => {
       changedFiles: ["src/desktop/result.ts"],
       tests: "not run",
       exitStatus: "blocked",
+      rawSummary: "本轮因环境限制 blocked，未运行测试。",
     });
     expect(result.record.desktopReceiptSha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(result.record).toMatchObject({
+      rawSummary: "本轮因环境限制 blocked，未运行测试。",
+      desktopThreadId: threadId,
+      desktopOriginTurnId: turnId,
+      desktopResultTurnId: turnId,
+      desktopBindingId: bindingId,
+    });
     expect(result.output).toMatchObject({ allowed: true, taskId: `desktop_${commandId}`, iteration: 1 });
     expect(readExecutionRecords(workspace.id)[0]).toMatchObject({ taskId: `desktop_${commandId}`, commandId });
     expect(readExecutionRecords(workspace.id)[0]).not.toHaveProperty("desktopReceiptSha256");
@@ -619,6 +632,7 @@ describe("Desktop execution result", () => {
     await expect(recordDesktopResult(workspace, input({ output: "changed" }))).rejects.toThrow(/不一致/);
     await expect(recordDesktopResult(workspace, input({ command: "pnpm lint" }))).rejects.toThrow(/不一致/);
     await expect(recordDesktopResult(workspace, input({ exitCode: 1 }))).rejects.toThrow(/不一致/);
+    await expect(recordDesktopResult(workspace, input({ rawSummary: "不同的最终摘要" }))).rejects.toThrow(/不一致/);
     expect(fs.readFileSync(recordsFile(), "utf8")).toBe(recordsBefore);
     expect(listExecutionOutputs(workspace.id)).toEqual(outputsBefore);
 
@@ -713,6 +727,24 @@ describe("Desktop execution result", () => {
     const result = await recordDesktopResult(workspace, input({ output: undefined, command: "pnpm test" }));
     expect(result.output).toBeNull();
     expect(listExecutionOutputs(workspace.id)).toEqual([]);
+  });
+
+  it("rawSummary 与 notes 分开保存，凭据脱敏，超限或私钥拒绝", async () => {
+    writeDesktopState();
+    const summary = await recordDesktopResult(workspace, input({
+      notes: "范围说明",
+      rawSummary: "已完成；token=ghp_abcdefghijklmnopqrstuv",
+      output: undefined,
+      command: undefined,
+    }));
+    expect(summary.record.notes).toBe("范围说明");
+    expect(summary.record.rawSummary).toBe("已完成；token=[REDACTED]");
+    expect(fs.readFileSync(recordsFile(), "utf8")).not.toContain("ghp_abcdefghijklmnopqrstuv");
+
+    await expect(recordDesktopResult(workspace, input({ commandId: "oversized_summary", rawSummary: "x".repeat(8193) })))
+      .rejects.toThrow(/8192/);
+    await expect(recordDesktopResult(workspace, input({ commandId: "private_key_summary", rawSummary: "-----BEGIN PRIVATE KEY-----" })))
+      .rejects.toThrow(/rawSummary/);
   });
 
   it("追加记录中断后识别孤立 output，保留 fail-closed 边界", async () => {

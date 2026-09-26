@@ -6,7 +6,10 @@ import { Workspace } from "../src/workspace/manager.js";
 import {
   RoutingError,
   commandInputSchema,
+  resultInputSchema,
+  resultSchema,
   routingStateSchema,
+  type ResultInput,
 } from "../src/routing/schema.js";
 import {
   appendResult,
@@ -74,6 +77,19 @@ function commandInput(plannerRouteId: string, executorRouteId: string, commandId
     intent: "development_plan" as const,
     payloadBytes: 42,
     payloadSha256: HEX64,
+  };
+}
+
+function resultInput(commandId: string, executorRouteId: string, iteration = 1, status: ResultInput["status"] = "ok"): ResultInput {
+  return {
+    commandId, executorRouteId, iteration, status, rawSummary: "Codex 已完成本轮实现与验证。",
+    machineEvidence: {
+      version: 1, source: "codex_desktop_receipt", desktopReceiptSha256: HEX64,
+      taskId: `desktop_${commandId}`, iteration, status,
+      threadId: EXECUTOR_THREAD_1, originTurnId: EXECUTOR_THREAD_2,
+      resultTurnId: EXECUTOR_THREAD_2, bindingId: "01a00000-0000-7000-8000-000000000103",
+      changedFiles: ["src/a.ts"], testsSummary: "1 passed",
+    },
   };
 }
 
@@ -254,21 +270,21 @@ describe("routing result", () => {
     const command = createCommand(identityA, commandInput(planner.routeId, executor.routeId));
     expect(
       routingErrorCode(() =>
-        appendResult(identityA, { commandId: "cmd-missing", executorRouteId: executor.routeId, iteration: 1, status: "ok" }),
+        appendResult(identityA, resultInput("cmd-missing", executor.routeId)),
       ),
     ).toBe("ROUTING_COMMAND_NOT_FOUND");
     expect(
       routingErrorCode(() =>
-        appendResult(identityA, { commandId: command.commandId, executorRouteId: planner.routeId, iteration: 2, status: "ok" }),
+        appendResult(identityA, resultInput(command.commandId, planner.routeId, 2)),
       ),
     ).toBe("ROUTING_RESULT_ROUTE_MISMATCH");
     expect(listResults(identityA)).toHaveLength(0);
   });
 
-  it("18. result exact replay 幂等：同 commandId+iteration+executor+status 返回既有", () => {
+  it("18. result exact replay 幂等：canonical 字段完全一致返回既有", () => {
     const { planner, executor } = setupRoutes();
     const command = createCommand(identityA, commandInput(planner.routeId, executor.routeId));
-    const input = { commandId: command.commandId, executorRouteId: executor.routeId, iteration: 1, status: "ok" as const };
+    const input = resultInput(command.commandId, executor.routeId);
     const first = appendResult(identityA, input);
     const replay = appendResult(identityA, input);
     expect(replay).toEqual(first);
@@ -278,24 +294,91 @@ describe("routing result", () => {
   it("19. 同 (commandId, iteration) 已存在但 executor/status 不同 → RESULT_CONFLICT", () => {
     const { planner, executor } = setupRoutes();
     const command = createCommand(identityA, commandInput(planner.routeId, executor.routeId));
-    appendResult(identityA, { commandId: command.commandId, executorRouteId: executor.routeId, iteration: 1, status: "ok" });
+    appendResult(identityA, resultInput(command.commandId, executor.routeId));
     // status 不同 → RESULT_CONFLICT。
     expect(
       routingErrorCode(() =>
-        appendResult(identityA, { commandId: command.commandId, executorRouteId: executor.routeId, iteration: 1, status: "failed" }),
+        appendResult(identityA, resultInput(command.commandId, executor.routeId, 1, "failed")),
       ),
     ).toBe("RESULT_CONFLICT");
     // executor 不同（即使 status 相同）→ RESULT_CONFLICT，而非 ROUTE_MISMATCH。
     expect(
       routingErrorCode(() =>
-        appendResult(identityA, { commandId: command.commandId, executorRouteId: planner.routeId, iteration: 1, status: "ok" }),
+        appendResult(identityA, resultInput(command.commandId, planner.routeId)),
       ),
     ).toBe("RESULT_CONFLICT");
     expect(listResults(identityA)).toHaveLength(1);
     // 不同 iteration 是新结果，不冲突。
-    const second = appendResult(identityA, { commandId: command.commandId, executorRouteId: executor.routeId, iteration: 2, status: "failed" });
+    const second = appendResult(identityA, resultInput(command.commandId, executor.routeId, 2, "failed"));
     expect(second.iteration).toBe(2);
     expect(listResults(identityA)).toHaveLength(2);
+  });
+
+  it("同一 result 的 rawSummary 或 machineEvidence 漂移均冲突，严格 schema 拒绝不一致事实", () => {
+    const { planner, executor } = setupRoutes();
+    const command = createCommand(identityA, commandInput(planner.routeId, executor.routeId));
+    const input = resultInput(command.commandId, executor.routeId);
+    appendResult(identityA, input);
+    expect(routingErrorCode(() => appendResult(identityA, { ...input, rawSummary: "另一个摘要" }))).toBe("RESULT_CONFLICT");
+    expect(routingErrorCode(() => appendResult(identityA, {
+      ...input, machineEvidence: { ...input.machineEvidence, testsSummary: "2 passed" },
+    }))).toBe("RESULT_CONFLICT");
+    expect(() => appendResult(identityA, {
+      ...input, machineEvidence: { ...input.machineEvidence, status: "failed" },
+    })).toThrow();
+    expect(listResults(identityA)).toHaveLength(1);
+  });
+
+  it("version:1 R1 磁盘结果可原样读取；partial pair 拒绝，冲突不改写旧记录", () => {
+    const { planner, executor } = setupRoutes();
+    const command = createCommand(identityA, commandInput(planner.routeId, executor.routeId, "cmd-r1"));
+    appendResult(identityA, resultInput(command.commandId, executor.routeId));
+    const nextCommand = createCommand(identityA, commandInput(planner.routeId, executor.routeId, "cmd-next"));
+    const file = routingFile(identityA.id);
+    const fixture = JSON.parse(fs.readFileSync(file, "utf8")) as {
+      version: number;
+      results: Array<Record<string, unknown>>;
+    };
+    const legacyResult = fixture.results[0]!;
+    delete legacyResult.rawSummary;
+    delete legacyResult.machineEvidence;
+    const fixtureContent = JSON.stringify(fixture);
+    fs.writeFileSync(file, fixtureContent);
+
+    expect(fixture.version).toBe(1);
+    expect(routingStateSchema.safeParse(fixture).success).toBe(true);
+    expect(resultSchema.safeParse(legacyResult).success).toBe(true);
+    for (const partialResult of [
+      { ...legacyResult, rawSummary: "legacy 摘要" },
+      { ...legacyResult, machineEvidence: resultInput(command.commandId, executor.routeId).machineEvidence },
+    ]) {
+      expect(routingStateSchema.safeParse({ ...fixture, results: [partialResult] }).success).toBe(false);
+    }
+    expect(resultInputSchema.safeParse({
+      commandId: legacyResult.commandId,
+      executorRouteId: legacyResult.executorRouteId,
+      iteration: legacyResult.iteration,
+      status: legacyResult.status,
+    }).success).toBe(false);
+
+    const beforeRead = stateSnapshot(identityA);
+    const listedLegacy = listResults(identityA)[0]!;
+    expect(readRouting(identityA)?.results[0]).toEqual(legacyResult);
+    expect(listedLegacy).toEqual(legacyResult);
+    expect(listedLegacy).not.toHaveProperty("rawSummary");
+    expect(listedLegacy).not.toHaveProperty("machineEvidence");
+    expect(stateSnapshot(identityA)).toEqual(beforeRead);
+
+    expect(routingErrorCode(() => appendResult(identityA, resultInput(command.commandId, executor.routeId))))
+      .toBe("RESULT_CONFLICT");
+    expect(stateSnapshot(identityA)).toEqual(beforeRead);
+
+    appendResult(identityA, resultInput(nextCommand.commandId, executor.routeId));
+    const afterUnrelatedAppend = listResults(identityA);
+    expect(afterUnrelatedAppend).toHaveLength(2);
+    expect(afterUnrelatedAppend[0]).toEqual(legacyResult);
+    expect(afterUnrelatedAppend[0]).not.toHaveProperty("rawSummary");
+    expect(afterUnrelatedAppend[0]).not.toHaveProperty("machineEvidence");
   });
 });
 
@@ -419,12 +502,7 @@ describe("routing durable store", () => {
     it("result exact replay → revision 与文件 mtime 不变", () => {
       const { planner, executor } = setupRoutes();
       const command = createCommand(identityA, commandInput(planner.routeId, executor.routeId));
-      const input = {
-        commandId: command.commandId,
-        executorRouteId: executor.routeId,
-        iteration: 1,
-        status: "ok" as const,
-      };
+      const input = resultInput(command.commandId, executor.routeId);
       appendResult(identityA, input);
       const before = stateSnapshot(identityA);
       const replay = appendResult(identityA, input);

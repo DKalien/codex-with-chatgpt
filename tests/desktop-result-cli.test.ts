@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { registerDesktopCommands } from "../src/cli/desktop.js";
 import { desktopIpc } from "../src/desktop/ipc.js";
 import { listExecutionOutputs, readExecutionOutput } from "../src/execution/output.js";
-import { readExecutionRecords } from "../src/execution/records.js";
+import { readExecutionRecords, readExecutionRecordsStrict } from "../src/execution/records.js";
 import { Workspace } from "../src/workspace/manager.js";
 import { desktopFile, readDesktop, updateDesktop } from "../src/desktop/store.js";
 import { cleanup, makeTmpDir } from "./helpers.js";
@@ -114,7 +114,7 @@ function rejectSeededDelivery(): void {
   });
 }
 
-async function runRecord(extra: string[]): Promise<{ exitCode: number; stdout: string }> {
+async function runRecord(extra: string[], rawSummary = "本轮已完成修改并通过所列验证。"): Promise<{ exitCode: number; stdout: string }> {
   const previousExitCode = process.exitCode;
   process.exitCode = 0;
   let stdout = "";
@@ -131,6 +131,7 @@ async function runRecord(extra: string[]): Promise<{ exitCode: number; stdout: s
       "--changed-files", "src/index.ts",
       "--tests", "not run",
       "--exit-status", "ok",
+      "--raw-summary", rawSummary,
       "--json",
       ...extra,
     ]);
@@ -176,8 +177,18 @@ describe("desktop record-result CLI", () => {
       iteration: 1,
       commandId,
       outputId: expect.any(Number),
+      rawSummary: "本轮已完成修改并通过所列验证。",
+    });
+    expect(readExecutionRecordsStrict(workspace.id)[0]).toMatchObject({
+      desktopThreadId: threadId,
+      desktopOriginTurnId: acceptedTurnId,
+      desktopResultTurnId: acceptedTurnId,
+      desktopBindingId: expect.any(String),
     });
     expect(fs.existsSync(sentinel)).toBe(false);
+    const conflict = await runRecord(args, "不同的最终执行摘要");
+    expect(conflict.exitCode).toBe(1);
+    expect(json(conflict.stdout)).toMatchObject({ ok: false, error: "DESKTOP_RESULT_CONFLICT" });
   });
 
   it("CLI 在 native continuation tip 上一次写入 receipt，保留 immutable origin turn", async () => {
@@ -275,7 +286,7 @@ describe("desktop record-result CLI", () => {
     registerDesktopCommands(program);
     const desktop = program.commands.find(command => command.name() === "desktop")!;
     const record = desktop.commands.find(command => command.name() === "record-result")!;
-    for (const flag of ["--command-id", "--changed-files", "--tests", "--exit-status"]) {
+    for (const flag of ["--command-id", "--changed-files", "--tests", "--exit-status", "--raw-summary"]) {
       expect(record.options.find(option => option.long === flag)?.mandatory).toBe(true);
     }
     for (const flag of ["--command", "--output", "--output-file", "--exit-code", "--notes", "--json"]) {

@@ -160,24 +160,68 @@ export type CommandDeliveryTransitionInput = z.infer<typeof commandDeliveryTrans
 export const resultStatusSchema = z.enum(["ok", "failed", "blocked"]);
 export type ResultStatus = z.infer<typeof resultStatusSchema>;
 
-export const resultSchema = z
-  .object({
-    resultId: routingUuidSchema,
-    commandId: routingCommandIdSchema,
-    executorRouteId: routingUuidSchema,
-    iteration: z.number().int().positive(),
-    status: resultStatusSchema,
-    createdAt: z.string().datetime(),
-    updatedAt: z.string().datetime(),
-  })
-  .strict();
-export type RoutingResult = z.infer<typeof resultSchema>;
+/** R4 canonical envelope 只保留本机可信事实，不保存 output body。 */
+export const machineEvidenceSchema = z.object({
+  version: z.literal(1),
+  source: z.literal("codex_desktop_receipt"),
+  desktopReceiptSha256: z.string().regex(HEX64),
+  taskId: z.string().regex(/^desktop_[A-Za-z0-9_-]{1,128}$/),
+  iteration: z.number().int().positive(),
+  status: resultStatusSchema,
+  threadId: routingUuidSchema,
+  originTurnId: routingUuidSchema,
+  resultTurnId: routingUuidSchema,
+  bindingId: routingUuidSchema,
+  changedFiles: z.array(z.string().min(1).max(4096)).max(10_000),
+  testsSummary: z.string().min(1).max(16_384),
+  output: z.object({ outputId: z.number().int().positive().safe(), outputAvailable: z.boolean() }).strict().optional(),
+}).strict();
+
+const resultIdentityFields = {
+  commandId: routingCommandIdSchema,
+  executorRouteId: routingUuidSchema,
+  iteration: z.number().int().positive(),
+  status: resultStatusSchema,
+};
+
+const resultFields = {
+  ...resultIdentityFields,
+  rawSummary: z.string().min(1).refine(value => value.trim().length > 0 && Buffer.byteLength(value, "utf8") <= 8192,
+    "rawSummary 必须非空且不超过 8192 UTF-8 bytes"),
+  machineEvidence: machineEvidenceSchema,
+};
+
+function checkResultConsistency(value: z.infer<z.ZodObject<typeof resultFields>>, ctx: z.RefinementCtx): void {
+  if (value.machineEvidence.taskId !== `desktop_${value.commandId}` ||
+      value.machineEvidence.iteration !== value.iteration ||
+      value.machineEvidence.status !== value.status) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "ExecutionResult 与 machineEvidence 身份或终态不一致" });
+  }
+}
 
 /** resultId 由 store 生成；(commandId, iteration) 承担幂等身份。 */
-export const resultInputSchema = resultSchema
-  .omit({ resultId: true, createdAt: true, updatedAt: true })
-  .strict();
+export const resultInputSchema = z.object(resultFields).strict().superRefine(checkResultConsistency);
 export type ResultInput = z.infer<typeof resultInputSchema>;
+
+const resultEnvelopeFields = {
+  resultId: routingUuidSchema,
+  createdAt: z.string().datetime(),
+  updatedAt: z.string().datetime(),
+};
+
+const canonicalResultSchema = z.object({
+  ...resultFields,
+  ...resultEnvelopeFields,
+}).strict().superRefine(checkResultConsistency);
+
+const legacyResultSchema = z.object({
+  ...resultIdentityFields,
+  ...resultEnvelopeFields,
+}).strict();
+
+/** 持久化兼容 R1（两字段皆无）与 R4 canonical（两字段皆有），拒绝半成品。 */
+export const resultSchema = z.union([legacyResultSchema, canonicalResultSchema]);
+export type RoutingResult = z.infer<typeof resultSchema>;
 
 export const routingStateSchema = z
   .object({

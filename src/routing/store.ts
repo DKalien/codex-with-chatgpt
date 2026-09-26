@@ -368,7 +368,7 @@ export function transitionCommandDelivery(
 
 /**
  * ExecutionResult 幂等：(commandId, iteration) 是幂等身份，resultId 只是引用 ID。
- * - 同 commandId + iteration + executorRouteId + status 完全一致 → 返回既有 result；
+ * - 同 commandId + iteration + executorRouteId + status + summary + evidence 完全一致 → 返回既有 result；
  * - 同 (commandId, iteration) 但内容不同 → RESULT_CONFLICT；
  * - 不因每次生成新 resultId 让同一 execution receipt 重放成两条结果。
  */
@@ -392,10 +392,13 @@ export function appendResult(
         (item) => item.commandId === parsed.commandId && item.iteration === parsed.iteration,
       );
       if (existing) {
-        if (existing.executorRouteId !== parsed.executorRouteId || existing.status !== parsed.status) {
+        if (existing.executorRouteId !== parsed.executorRouteId || existing.status !== parsed.status ||
+            !("rawSummary" in existing) || !("machineEvidence" in existing) ||
+            existing.rawSummary !== parsed.rawSummary ||
+            JSON.stringify(existing.machineEvidence) !== JSON.stringify(parsed.machineEvidence)) {
           throw new RoutingError(
             "RESULT_CONFLICT",
-            "相同 (commandId, iteration) 但 executor/status 不一致；拒绝覆盖既有 execution receipt。",
+            "相同 (commandId, iteration) 但 executor/status/summary/evidence 不一致；拒绝覆盖既有 execution receipt。",
           );
         }
         return { state, result: existing, noWrite: true };

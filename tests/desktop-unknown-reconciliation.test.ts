@@ -118,7 +118,7 @@ describe("Desktop outcome_unknown reconciliation", () => {
     });
 
     await expect(recordDesktopResult(workspace, {
-      commandId, changedFiles: [], tests: "not run", exitStatus: "ok",
+      commandId, changedFiles: [], tests: "not run", exitStatus: "ok", rawSummary: "恢复投递后验证当前执行上下文。",
     })).rejects.toMatchObject({ code: "DESKTOP_RESULT_CURRENT_EXECUTION" });
     expect(readExecutionRecords(workspace.id)).toEqual([]);
     expect(listExecutionOutputs(workspace.id)).toEqual([]);
