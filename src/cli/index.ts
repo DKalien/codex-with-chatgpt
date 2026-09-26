@@ -89,6 +89,8 @@ import { registerFeedbackProbeCommands } from "./feedback-probe.js";
 import { isWriteProbeEnabled, readWriteProbeStatus, WRITE_PROBE_SCOPE } from "../mcp/write-probe.js";
 import { registerDesktopCommands } from "./desktop.js";
 import { DesktopResultError, DesktopResultPendingError, discoverCurrentDesktopDelivery, recordDesktopResult } from "../desktop/result.js";
+import { reconcileTrustedDesktopExecutionResult } from "../routing/execution-result-reconciler.js";
+import { prepareResultReconciliation } from "../routing/result-outbox-store.js";
 import {
   findReceiptFinalizationDraft,
   runReceiptFinalizer,
@@ -209,7 +211,13 @@ drf.command("run").requiredOption("-w, --workspace <path>").requiredOption("--dr
   const draft = findReceiptFinalizationDraft(stateDir, workspace.id, opts.draft);
   if (!draft) return;
   let result: Awaited<ReturnType<typeof runReceiptFinalizer>>;
-  try { result = await runReceiptFinalizer(draft, { stateDir }); }
+  try {
+    result = await runReceiptFinalizer(draft, {
+      stateDir,
+      beforeReceiptCommit: receiptAlreadyExists =>
+        prepareResultReconciliation({ id: workspace.id, root: workspace.root }, draft.commandId, receiptAlreadyExists),
+    });
+  }
   catch {
     try {
       say(JSON.stringify(writeReceiptFinalizationWorkerFailureAlert(draft, { stateDir })));
@@ -223,8 +231,12 @@ drf.command("run").requiredOption("-w, --workspace <path>").requiredOption("--dr
   // so the parent does not misreport ordinary claim contention as worker failure.
   if (!result) return;
   if ("record" in result) {
-    say(JSON.stringify({ ok: true, finalized: true, commandId: result.record.commandId,
-      taskId: result.record.taskId, outputId: result.record.outputId }));
+    const resultOutbox = reconcileTrustedDesktopExecutionResult({ id: workspace.id, root: workspace.root }, draft.commandId);
+    const reconciliationNeeded = resultOutbox.status === "reconciliation_needed";
+    say(JSON.stringify({ ok: !reconciliationNeeded, finalized: true, commandId: draft.commandId,
+      taskId: result.record.taskId, outputId: result.record.outputId, resultOutbox }));
+    // Keep the trusted receipt committed; non-zero only signals the independent R4 reconciliation gap.
+    if (reconciliationNeeded) process.exitCode = 1;
     return;
   }
   // Worker 只写入 durable alert；feedback projector 在受控 reconcile 路径统一消费。
@@ -1381,6 +1393,9 @@ program
             ...(opts.command === undefined ? {} : { command: opts.command }),
             ...(rawOutput === undefined ? {} : { output: rawOutput }),
             ...(opts.exitCode === undefined ? {} : { exitCode: opts.exitCode }),
+          }, {
+            beforeReceiptCommit: receiptAlreadyExists =>
+              prepareResultReconciliation({ id: workspace.id, root: workspace.root }, discovered.commandId, receiptAlreadyExists),
           });
         } catch (error) {
           if (!(error instanceof DesktopResultPendingError)) throw error;
@@ -1395,7 +1410,13 @@ program
           return;
         }
         const result = { ok: true, autoPromotedDesktop: true, commandId: discovered.commandId, taskId: receipt.record.taskId, outputId: receipt.record.outputId };
-        if (opts.json) say(JSON.stringify(result)); else check("已自动记录 Desktop execution receipt");
+        const resultOutbox = reconcileTrustedDesktopExecutionResult({ id: workspace.id, root: workspace.root }, discovered.commandId);
+        const reconciliationNeeded = resultOutbox.status === "reconciliation_needed";
+        if (opts.json) say(JSON.stringify({ ...result, ok: !reconciliationNeeded, receiptCommitted: true, resultOutbox }));
+        else check(resultOutbox.status === "reconciliation_needed"
+          ? "Desktop trusted execution receipt 已记录；canonical RoutingResult 需本机重试对账。"
+          : "已自动记录 Desktop execution receipt");
+        if (reconciliationNeeded) process.exitCode = 1;
         return;
       }
       if (!opts.task) throw new Error("普通执行记录必须提供 --task；当前 turn 不是 Desktop delivery。");

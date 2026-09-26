@@ -5,6 +5,8 @@ import { bindCurrentDesktop, bindDesktop, desktopStatus, disableDesktop, enableD
 import { desktopIpc, DESKTOP_IPC_ERROR_MESSAGES } from "../desktop/ipc.js";
 import { DesktopError, targetInput } from "../desktop/store.js";
 import { recordDesktopResult } from "../desktop/result.js";
+import { reconcileTrustedDesktopExecutionResult } from "../routing/execution-result-reconciler.js";
+import { listResultReconciliationNeeded, prepareResultReconciliation } from "../routing/result-outbox-store.js";
 import { reconcileUnknownDesktopDelivery } from "../desktop/unknown-reconciliation.js";
 import { LegacyReconciliationError, listLegacyReconciliations, reconcileLegacyAccepted } from "../desktop/legacy-reconciliation.js";
 import { retireLegacyAccepted } from "../desktop/legacy-retirement.js";
@@ -154,16 +156,61 @@ export function registerDesktopCommands(program: Command): void {
         if (opts.exitCode !== undefined && (!/^-?\d+$/.test(opts.exitCode) || !Number.isSafeInteger(Number(opts.exitCode)))) {
           throw new DesktopError("DESKTOP_RESULT_INVALID", "exit-code 必须为安全整数。");
         }
-        const result = await recordDesktopResult(new Workspace(workspaceRoot(opts.workspace)), {
+        const workspace = new Workspace(workspaceRoot(opts.workspace));
+        const result = await recordDesktopResult(workspace, {
           commandId: opts.commandId, changedFiles: opts.changedFiles.split(",").map(file => file.trim()).filter(Boolean),
           tests: opts.tests, exitStatus: opts.exitStatus, rawSummary: opts.rawSummary, notes: opts.notes, command: opts.command,
           output, exitCode: opts.exitCode === undefined ? undefined : Number(opts.exitCode),
-        }, { allowInProgress: true });
-        print({ ok: true, ...result }, opts.json, "本轮 Desktop execution receipt 已记录。");
+        }, {
+          allowInProgress: true,
+          beforeReceiptCommit: receiptAlreadyExists =>
+            prepareResultReconciliation(workspace, opts.commandId, receiptAlreadyExists),
+        });
+        const resultOutbox = reconcileTrustedDesktopExecutionResult(workspace, opts.commandId);
+        const reconciliationNeeded = resultOutbox.status === "reconciliation_needed";
+        print({ ...result, ok: !reconciliationNeeded, receiptCommitted: true, resultOutbox }, opts.json,
+          reconciliationNeeded
+            ? "Desktop trusted execution receipt 已记录；canonical RoutingResult 需本机重试对账。"
+            : "本轮 Desktop execution receipt 已记录。");
+        if (reconciliationNeeded) process.exitCode = 1;
       } catch (error) {
         const code = error instanceof DesktopError ? error.code : "DESKTOP_RESULT_INVALID";
         const message = error instanceof DesktopError ? error.message : "执行结果记录失败；未确认验收闭环完成。";
         print({ ok: false, error: code, message }, opts.json, message);
+        process.exitCode = 1;
+      }
+    });
+
+  desktop.command("reconcile-result")
+    .description("从本机 trusted Desktop receipt 幂等恢复 canonical RoutingResult 与 planner-route outbox")
+    .option("-w, --workspace <path>", "workspace 根目录")
+    .requiredOption("--command-id <id>", "原 Routing Command commandId")
+    .option("--json", "输出机器可读结果", false)
+    .action((opts: { workspace?: string; commandId: string; json: boolean }) => {
+      const workspace = new Workspace(workspaceRoot(opts.workspace));
+      const result = reconcileTrustedDesktopExecutionResult(workspace, opts.commandId);
+      const message = result.status === "reconciled"
+        ? "canonical RoutingResult 与 planner-route outbox 已核对。"
+        : result.status === "reconciliation_needed"
+          ? "reconciliation-needed 已记录；保留原 trusted receipt，请核对原因后重试。"
+          : "此 receipt 不适用于 canonical R4 outbox；未改写 legacy 或 generic 记录。";
+      print({ ok: result.status !== "reconciliation_needed", workspaceId: workspace.id, ...result }, opts.json, message);
+      if (result.status === "reconciliation_needed") process.exitCode = 1;
+    });
+
+  desktop.command("result-reconciliation-status")
+    .description("只读列出尚未收敛的 canonical RoutingResult 对账项")
+    .option("-w, --workspace <path>", "workspace 根目录")
+    .option("--json", "输出机器可读结果", false)
+    .action((opts: { workspace?: string; json: boolean }) => {
+      try {
+        const workspace = new Workspace(workspaceRoot(opts.workspace));
+        const entries = listResultReconciliationNeeded(workspace);
+        print({ ok: true, workspaceId: workspace.id, count: entries.length, entries }, opts.json,
+          entries.length === 0 ? "没有待收敛的 canonical RoutingResult。" : `有 ${entries.length} 条待收敛的 canonical RoutingResult。`);
+      } catch (error) {
+        const failure = safeCliError(error, "RESULT_RECONCILIATION_STATE_CORRUPT", "R4 reconciliation queue 读取失败；保留原文件。");
+        print({ ok: false, error: failure.code, message: failure.message }, opts.json, failure.message);
         process.exitCode = 1;
       }
     });

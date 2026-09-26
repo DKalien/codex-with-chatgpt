@@ -447,7 +447,12 @@ function assertFenceIdentity(fence: ReceiptFinalizationFenceResult, draft: Recei
 
 export async function runReceiptFinalizer(
   draft: ReceiptFinalizationDraft,
-  options: { stateDir?: string; pollMs?: number; nowMs?: () => number } = {},
+  options: {
+    stateDir?: string;
+    pollMs?: number;
+    nowMs?: () => number;
+    beforeReceiptCommit?: (receiptAlreadyExists: boolean) => void;
+  } = {},
 ): Promise<ReceiptFinalizationAlert | DesktopResultReceipt | null> {
   const stateDir = options.stateDir ?? getStateDir();
   if (!acquireClaim(stateDir, draft)) return null;
@@ -482,7 +487,7 @@ export async function runReceiptFinalizer(
           }
           try {
             const { finalizeReceiptFinalizationDraft } = await import("./result.js");
-            const receipt = await finalizeReceiptFinalizationDraft(draft, target, fence);
+            const receipt = await finalizeReceiptFinalizationDraft(draft, target, fence, options.beforeReceiptCommit);
             removeDraft(stateDir, draft);
             removeAlert(stateDir, draft);
             return receipt;

@@ -10,6 +10,14 @@ import { readExecutionRecords, readExecutionRecordsStrict } from "../src/executi
 import { Workspace } from "../src/workspace/manager.js";
 import { desktopFile, readDesktop, updateDesktop } from "../src/desktop/store.js";
 import { cleanup, makeTmpDir } from "./helpers.js";
+import { createCommand, readRouting, registerRoute, transitionCommandDelivery } from "../src/routing/store.js";
+import {
+  listResultOutboxEntries,
+  listResultReconciliationNeeded,
+  resultOutboxFile,
+  resultReconciliationQueueFile,
+} from "../src/routing/result-outbox-store.js";
+import { reconcileTrustedDesktopExecutionResult } from "../src/routing/execution-result-reconciler.js";
 
 const threadId = "01a00000-0000-7000-8000-000000000001";
 const commandId = "desktop_result_command";
@@ -189,6 +197,117 @@ describe("desktop record-result CLI", () => {
     const conflict = await runRecord(args, "不同的最终执行摘要");
     expect(conflict.exitCode).toBe(1);
     expect(json(conflict.stdout)).toMatchObject({ ok: false, error: "DESKTOP_RESULT_CONFLICT" });
+  });
+
+  it("receipt 写入后立即归并 canonical RoutingResult 与原 planner-route outbox", async () => {
+    const planner = registerRoute(workspace, {
+      role: "planner", platform: "chatgpt_web", conversationId: "desktop-result-cli-planner", locator: {},
+    });
+    const executor = registerRoute(workspace, {
+      role: "executor", platform: "codex_desktop", conversationId: threadId,
+      locator: { hostId: "local", executorProjectId: "desktop_result_project" },
+    });
+    createCommand(workspace, {
+      commandId,
+      plannerRouteId: planner.routeId,
+      executorRouteId: executor.routeId,
+      intent: "development_plan",
+      payloadBytes: 1,
+      payloadSha256: "0".repeat(64),
+    });
+    transitionCommandDelivery(workspace, { commandId, deliveryStatus: "accepted" });
+
+    const result = await runRecord(["--output", "outbox trigger output"]);
+    const payload = json(result.stdout);
+    const entries = listResultOutboxEntries(workspace);
+
+    expect(result.exitCode).toBe(0);
+    expect(payload).toMatchObject({
+      ok: true,
+      resultOutbox: { status: "reconciled", plannerRouteId: planner.routeId, resultReplayed: false, outboxReplayed: false },
+    });
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({ commandId, plannerRouteId: planner.routeId, deliveryStatus: "pending" });
+    expect(fs.existsSync(path.join(stateDir, "feedback"))).toBe(false);
+  });
+
+  it("recovery intent 无法落盘时先停止，不写 output 或 trusted receipt", async () => {
+    const planner = registerRoute(workspace, {
+      role: "planner", platform: "chatgpt_web", conversationId: "desktop-result-cli-precommit-planner", locator: {},
+    });
+    const executor = registerRoute(workspace, {
+      role: "executor", platform: "codex_desktop", conversationId: threadId,
+      locator: { hostId: "local", executorProjectId: "desktop_result_project" },
+    });
+    createCommand(workspace, {
+      commandId,
+      plannerRouteId: planner.routeId,
+      executorRouteId: executor.routeId,
+      intent: "development_plan",
+      payloadBytes: 1,
+      payloadSha256: "0".repeat(64),
+    });
+    transitionCommandDelivery(workspace, { commandId, deliveryStatus: "accepted" });
+    const queueLock = `${resultReconciliationQueueFile(workspace.id)}.lock`;
+    fs.mkdirSync(path.dirname(queueLock), { recursive: true });
+    fs.writeFileSync(queueLock, "held");
+
+    const blocked = await runRecord(["--output", "must not be saved"]);
+    expect(blocked.exitCode).toBe(1);
+    expect(json(blocked.stdout)).toMatchObject({ ok: false, error: "DESKTOP_RESULT_RECONCILIATION_PENDING" });
+    expect(readExecutionRecordsStrict(workspace.id, stateDir)).toEqual([]);
+    expect(listExecutionOutputs(workspace.id)).toEqual([]);
+
+    fs.rmSync(queueLock);
+    const retried = await runRecord(["--output", "saved after intent"]);
+    expect(retried.exitCode).toBe(0);
+    expect(json(retried.stdout)).toMatchObject({ ok: true, receiptCommitted: true,
+      resultOutbox: { status: "reconciled", plannerRouteId: planner.routeId } });
+    expect(listResultReconciliationNeeded(workspace)).toEqual([]);
+  });
+
+  it("outbox 不可写时显式报告 reconciliation-needed，但保留已提交 receipt 与 canonical result", async () => {
+    const planner = registerRoute(workspace, {
+      role: "planner", platform: "chatgpt_web", conversationId: "desktop-result-cli-outbox-failure", locator: {},
+    });
+    const executor = registerRoute(workspace, {
+      role: "executor", platform: "codex_desktop", conversationId: threadId,
+      locator: { hostId: "local", executorProjectId: "desktop_result_project" },
+    });
+    createCommand(workspace, {
+      commandId,
+      plannerRouteId: planner.routeId,
+      executorRouteId: executor.routeId,
+      intent: "development_plan",
+      payloadBytes: 1,
+      payloadSha256: "0".repeat(64),
+    });
+    transitionCommandDelivery(workspace, { commandId, deliveryStatus: "accepted" });
+    fs.writeFileSync(`${resultOutboxFile(workspace.id)}.lock`, "held");
+
+    const result = await runRecord(["--output", "outbox unavailable output"]);
+    const payload = json(result.stdout);
+
+    expect(result.exitCode).toBe(1);
+    expect(payload).toMatchObject({
+      ok: false,
+      receiptCommitted: true,
+      resultOutbox: {
+        status: "reconciliation_needed",
+        reasonCode: "RESULT_OUTBOX_BUSY",
+        issuePersisted: true,
+      },
+    });
+    expect(readExecutionRecordsStrict(workspace.id, stateDir).filter(item => item.commandId === commandId)).toHaveLength(1);
+    expect(readRouting(workspace)?.results).toHaveLength(1);
+    expect(listResultOutboxEntries(workspace)).toEqual([]);
+    expect(listResultReconciliationNeeded(workspace)).toMatchObject([
+      { commandId, reasonCode: "RESULT_OUTBOX_BUSY" },
+    ]);
+
+    fs.rmSync(`${resultOutboxFile(workspace.id)}.lock`);
+    expect(reconcileTrustedDesktopExecutionResult(workspace, commandId)).toMatchObject({ status: "reconciled" });
+    expect(listResultReconciliationNeeded(workspace)).toEqual([]);
   });
 
   it("CLI 在 native continuation tip 上一次写入 receipt，保留 immutable origin turn", async () => {

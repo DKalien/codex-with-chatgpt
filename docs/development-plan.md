@@ -14,7 +14,7 @@
 | R1 | Project 是 workspace 内的容器，可关联多个带 planner/executor role 的 Route；Route identity 为 `{workspaceId, platform, conversationId}`；随机 `bindingId` / `routeId` / `resultId` 仅作引用；Command 与最小 ExecutionResult durable model | foundation done |
 | R2 | 以 Desktop behavioral adapter 取代生产 build/hash/catalog gates | done |
 | R3 | Browser Companion“设备授权一次 + 当前网址一键绑定”的 Web adapter 与 feedback return plane | done；真实 live E2E PASS |
-| R4 | 将 Codex terminal truth（machine facts + Codex 自己的 final summary）写成 canonical ExecutionResult，经 `Command.plannerRouteId` 的 durable outbox 返回；不做第二次 AI rewrite | R4a done；独立 review PASS。下一步 R4b：接通 canonical ExecutionResult → `Command.plannerRouteId` durable outbox；production delivery 尚未完成 |
+| R4 | 将 Codex terminal truth（machine facts + Codex 自己的 final summary）写成 canonical ExecutionResult，经 `Command.plannerRouteId` 的 durable outbox 返回；不做第二次 AI rewrite | R4a、R4b done；独立 review PASS。trusted receipt → canonical RoutingResult → planner-route Result Outbox 已接通；下一步 R4c 消费新 outbox 并渐进迁移旧 Browser feedback delivery |
 | R5 | Bridge lifecycle 与 conversation execution state 完全解耦，不再由 Desktop busy、`approval_pending` 或 self-turn post-turn-finalizer 耦合 | planned |
 
 ### 历史兼容债务与阶段边界
@@ -23,9 +23,15 @@
   rebind predecessor/successor 语义冻结；R4 不简化或重写这些状态。
 - 现有 feedback outbox 仍按 `bindingId / epoch / principalFingerprint` 定向接收，状态沿用
   `queued → ready → reserved → claimed → observed / outcome_unknown / retired_unknown`。
-  R4 最终迁到 planner-route durable result delivery；R4b/c 渐进迁移并保留 R3 合同。
+  R4b 建立独立的 planner-route Result Outbox 且保持该 R3 合同不变；R4c 渐进迁移旧 delivery。
 - `/state` 与 `/reserve` 当前都会调用 `reconcileFeedbackOutbox()`。R4a 保持该调用和旧路径不变；
   最终 R4 不应依靠 pull 来创建 semantic ExecutionResult 或 outbox entry。
+- R4b 的 Result Outbox 只使用原 persisted `Command.plannerRouteId`；不读取 Browser、feedback、
+  current binding/state、`/reserve` 或 Companion，也不改 R3 feedback schema/state lifecycle。R4c 才消费
+  新 planner-route outbox，并渐进迁移旧 Browser feedback delivery。
+- R4b 的 reconciliation-needed 状态存于单独 routing recovery queue；本机只读 status 可发现异步失败，
+  新 canonical Desktop receipt/output 写入前先发布 recovery intent；显式 reconcile-result 按 trusted receipt
+  幂等恢复，且在 execution-record 锁内清除无 receipt/result/outbox 的孤立 intent。该诊断队列不投影为 Browser/feedback event。
 - 旧 Companion-derived planner routes 及 legacy `bindingId` 只保留为历史 route/reference；当前
   planner authority 来自同一 MCP request 的官方 conversation principal。不能删除、迁移或把旧记录
   提升为当前 authority。
@@ -34,7 +40,11 @@
 - H0 / Claude E1a 是独立的 executor extensibility 支线，不属于 R5，也不改变 R0→R5 的阶段顺序。
 
 R4a 已建立显式 `rawSummary` 的 Desktop receipt 与 read-only trusted receipt → canonical
-`ResultInput` 投影接缝，并通过独立 review；未自动 append result、创建 outbox、改 Browser production transport，亦未触碰 R5 lifecycle。下一步为 R4b：将 canonical ExecutionResult 接入 `Command.plannerRouteId` durable outbox。
+`ResultInput` 投影接缝，并通过独立 review；它本身不自动 append result，也不改 Browser production
+transport 或 R5 lifecycle。R4b 已完成并通过独立 review：本机可信 receipt 收敛接线先持久化 canonical
+RoutingResult，再由 routing-owned Result Outbox 引用它，并只按原 Command 的 persisted `plannerRouteId`
+建立投递目标。该 receipt → result → outbox 生成路径已接入生产记录/finalizer 边界；新 outbox 的 Browser
+消费与旧 Browser feedback delivery 渐进迁移尚未开始，属于 R4c。
 
 ## Baseline（2026-09-13）
 

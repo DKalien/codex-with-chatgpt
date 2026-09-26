@@ -55,4 +55,16 @@ describe("task delivery / feedback return architecture boundary", () => {
     expect(desktopAdapter).toMatch(/from ["']\.\.\/desktop\/store\.js["']/);
     expect(desktopAdapter).not.toMatch(/feedback|legacy-adapter|browser-companion/i);
   });
+
+  it("canonical Result Outbox and trusted receipt reconciliation are independent of Browser/feedback runtime", () => {
+    for (const relative of [
+      "src/routing/result-outbox-schema.ts",
+      "src/routing/result-outbox-store.ts",
+      "src/routing/execution-result-reconciler.ts",
+    ]) {
+      const source = fs.readFileSync(path.join(projectRoot, relative), "utf8");
+      expect(source, relative).not.toMatch(/(?:from\s*|import\s*\()\s*["'][^"']*(?:browser-companion|(?:^|\/)feedback(?:\/|$))[^"]*["']/i);
+      expect(source, relative).not.toMatch(/\b(?:reconcileFeedbackOutbox|sendDesktop|reserveFeedback|ackFeedback)\s*\(/);
+    }
+  });
 });

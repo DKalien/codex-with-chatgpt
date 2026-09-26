@@ -366,11 +366,26 @@ function assertFinalizationFence(
   }
 }
 
+function prepareReceiptCommit(
+  beforeReceiptCommit: ((receiptAlreadyExists: boolean) => void) | undefined,
+  receiptAlreadyExists: boolean,
+): void {
+  try {
+    beforeReceiptCommit?.(receiptAlreadyExists);
+  } catch {
+    throw new DesktopResultError(
+      "DESKTOP_RESULT_RECONCILIATION_PENDING",
+      "无法在 Desktop receipt 提交前持久化 Routing reconciliation intent；未写入新 output/receipt。",
+    );
+  }
+}
+
 /** Detached finalizer 的唯一写入口；复用 execution lock、output sanitizer 和 command 幂等。 */
 export async function finalizeReceiptFinalizationDraft(
   draft: Extract<ReceiptFinalizationDraft, { version: 2 }>,
   target: { threadId: string; hostId: string; projectId: string; workspaceRoot: string },
   fence: ReceiptFinalizationFenceResult,
+  beforeReceiptCommit?: (receiptAlreadyExists: boolean) => void,
 ): Promise<DesktopResultReceipt> {
   const workspace = workspaceInput.parse({ id: draft.workspaceId, root: draft.workspaceRoot });
   assertFinalizationFence(draft, fence);
@@ -398,11 +413,13 @@ export async function finalizeReceiptFinalizationDraft(
           (prior.outputId !== undefined && matchingOutputs.length !== 1)) {
         throw new DesktopResultError("DESKTOP_RESULT_PARTIAL", "已有 Desktop receipt 的 output 数量不唯一；拒绝重放。 ");
       }
+      if (prior.rawSummary !== undefined) prepareReceiptCommit(beforeReceiptCommit, true);
       return { record: prior, output };
     }
     if (hasPartialOutput(workspace.id, taskId)) {
       throw new DesktopResultError("DESKTOP_RESULT_PARTIAL", "已有未完成的 Desktop 结果输出但缺少执行记录；拒绝追加。 ");
     }
+    if (input.rawSummary !== undefined) prepareReceiptCommit(beforeReceiptCommit, false);
     const output = input.output !== undefined
       ? saveExecutionOutput(workspace.id, {
           command: input.command ?? `Desktop result ${draft.commandId}`,
@@ -463,7 +480,10 @@ export async function finalizeReceiptFinalizationDraft(
 export async function recordDesktopResult(
   workspaceRaw: DesktopResultWorkspace,
   rawInput: DesktopResultInput,
-  options: { allowInProgress?: boolean } = {},
+  options: {
+    allowInProgress?: boolean;
+    beforeReceiptCommit?: (receiptAlreadyExists: boolean) => void;
+  } = {},
 ): Promise<DesktopResultReceipt> {
   const workspace = workspaceInput.parse(workspaceRaw);
   const input = sanitizeReceiptFinalizationInput(desktopResultInput.parse(rawInput));
@@ -502,7 +522,9 @@ export async function recordDesktopResult(
 
     const prior = existingRecord(records, input.commandId, taskId, digest);
     if (prior) {
-      return recoverPriorDesktopResult(workspace, acceptedNow, prior);
+      const recovered = await recoverPriorDesktopResult(workspace, acceptedNow, prior);
+      if (prior.rawSummary !== undefined) prepareReceiptCommit(options.beforeReceiptCommit, true);
+      return recovered;
     }
     if (hasPartialOutput(workspace.id, taskId)) {
       return failClosed("DESKTOP_RESULT_PARTIAL", "已有未完成的 Desktop 结果输出但缺少执行记录；拒绝追加或覆盖，请人工核对。");
@@ -567,6 +589,7 @@ export async function recordDesktopResult(
         return failClosed("DESKTOP_RESULT_CURRENT_EXECUTION", "Desktop continuation 在写入前发生漂移；拒绝写入结果。");
       }
     }
+    prepareReceiptCommit(options.beforeReceiptCommit, false);
     // 输出先提交；若随后记录追加中断，下次会通过 taskId 发现孤立 output 并 fail closed。
     const output = input.output !== undefined
       ? saveExecutionOutput(workspace.id, {

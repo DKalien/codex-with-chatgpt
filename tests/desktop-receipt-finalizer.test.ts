@@ -149,6 +149,14 @@ describe("Desktop receipt terminal fence", () => {
     if (workspaceRoot) fs.rmSync(workspaceRoot, { recursive: true, force: true });
   });
 
+  it("detached safe_terminal CLI routes committed receipts through the local result reconciler", () => {
+    const source = fs.readFileSync(cliEntry, "utf8");
+    expect(source).toMatch(/if\s*\(\s*["']record["']\s+in\s+result\s*\)\s*\{[\s\S]*?reconcileTrustedDesktopExecutionResult\([\s\S]*?draft\.commandId/);
+    expect(source).toMatch(/runReceiptFinalizer\(draft,\s*\{[\s\S]*?beforeReceiptCommit:\s*receiptAlreadyExists\s*=>\s*prepareResultReconciliation/);
+    expect(source).toMatch(/const reconciliationNeeded\s*=\s*resultOutbox\.status\s*===\s*["']reconciliation_needed["'][\s\S]*?if\s*\(\s*reconciliationNeeded\s*\)\s*process\.exitCode\s*=\s*1/);
+    expect(source).not.toMatch(/reconcileTrustedDesktopExecutionResult[\s\S]{0,300}reconcileFeedbackOutbox/);
+  });
+
   it("stages a strict pending draft and refuses conflicting overwrite", () => {
     stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "c2c-receipt-finalizer-"));
     const first = draft(stateDir);
@@ -223,8 +231,11 @@ describe("Desktop receipt terminal fence", () => {
         resultTurnStatus: "completed",
         fence: "safe_terminal",
       });
-      const result = await runReceiptFinalizer(pending, { stateDir });
+      const beforeReceiptCommit = vi.fn();
+      const result = await runReceiptFinalizer(pending, { stateDir, beforeReceiptCommit });
       expect(result).toMatchObject({ record: { commandId: pending.commandId, taskId: `desktop_${pending.commandId}` } });
+      expect(beforeReceiptCommit).toHaveBeenCalledOnce();
+      expect(beforeReceiptCommit).toHaveBeenCalledWith(false);
       expect(fence).toHaveBeenCalledOnce();
       expect(readExecutionRecordsStrict(pending.workspaceId)).toHaveLength(1);
       const records = readExecutionRecordsStrict(pending.workspaceId);
@@ -240,8 +251,9 @@ describe("Desktop receipt terminal fence", () => {
         .toMatchObject([{ taskId: `desktop_${pending.commandId}`, iteration: 1, allowed: true }]);
       expect(readReceiptFinalizationDraft(stateDir, pending.workspaceId, pending.commandId)).toBeNull();
       expect(fs.existsSync(path.join(stateDir, "desktop-receipt-finalization", "claims"))).toBe(true);
-      const retry = await runReceiptFinalizer(pending, { stateDir });
+      const retry = await runReceiptFinalizer(pending, { stateDir, beforeReceiptCommit });
       expect(retry).toMatchObject({ record: { commandId: pending.commandId, taskId: `desktop_${pending.commandId}` } });
+      expect(beforeReceiptCommit).toHaveBeenLastCalledWith(true);
       expect(readExecutionRecordsStrict(pending.workspaceId)).toHaveLength(1);
       expect(listExecutionOutputs(pending.workspaceId, Number.MAX_SAFE_INTEGER)).toHaveLength(1);
     } finally {

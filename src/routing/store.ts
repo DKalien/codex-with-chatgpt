@@ -372,13 +372,16 @@ export function transitionCommandDelivery(
  * - 同 (commandId, iteration) 但内容不同 → RESULT_CONFLICT；
  * - 不因每次生成新 resultId 让同一 execution receipt 重放成两条结果。
  */
-export function appendResult(
+export type AppendResultOutcome = { result: RoutingResult; replayed: boolean };
+
+/** 与 appendResult 相同的事务，同时标明结果是精确重放还是首次追加。 */
+export function appendResultWithReplay(
   identity: RoutingWorkspaceIdentity,
   input: ResultInput,
   stateDir = getStateDir(),
-): RoutingResult {
+): AppendResultOutcome {
   const parsed = resultInputSchema.parse(input);
-  return updateRouting(
+  return updateRouting<AppendResultOutcome>(
     identity,
     (previous) => {
       const state = previous ?? emptyState(identity);
@@ -401,7 +404,7 @@ export function appendResult(
             "相同 (commandId, iteration) 但 executor/status/summary/evidence 不一致；拒绝覆盖既有 execution receipt。",
           );
         }
-        return { state, result: existing, noWrite: true };
+        return { state, result: { result: existing, replayed: true }, noWrite: true };
       }
       if (command.executorRouteId !== parsed.executorRouteId) {
         throw new RoutingError(
@@ -411,10 +414,18 @@ export function appendResult(
       }
       const now = new Date().toISOString();
       const result: RoutingResult = { ...parsed, resultId: randomUUID(), createdAt: now, updatedAt: now };
-      return { state: { ...state, results: [...state.results, result] }, result };
+      return { state: { ...state, results: [...state.results, result] }, result: { result, replayed: false } };
     },
     stateDir,
   );
+}
+
+export function appendResult(
+  identity: RoutingWorkspaceIdentity,
+  input: ResultInput,
+  stateDir = getStateDir(),
+): RoutingResult {
+  return appendResultWithReplay(identity, input, stateDir).result;
 }
 
 export function listRoutes(

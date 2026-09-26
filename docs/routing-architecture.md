@@ -1,4 +1,4 @@
-# Routing Architecture（R1 foundation + R3 live-complete；R4a reviewed）
+# Routing Architecture（R1 foundation + R3 live-complete；R4a/R4b reviewed）
 
 Routing 是 C2C 的新语义身份层：以 `{workspaceId, platform, conversationId}` 标识
 workspace 内特定平台上的对话。Route 另有注册后不可变的 planner / executor role；
@@ -9,7 +9,7 @@ store，不接任何生产调用方。
 
 权威阶段定义与完整历史见[长期开发计划](development-plan.md)。当前状态：R0 基线、R1 Routing
 foundation、R2 Desktop behavioral adapter、R3 Browser Companion Web adapter / feedback return plane
-均已完成，R3 真实 live E2E 已通过；R4a canonical result envelope 已完成且独立 review PASS，下一步 R4b 接通 planner-route durable outbox；R5 尚未开始。
+均已完成，R3 真实 live E2E 已通过；R4a canonical result envelope 与 R4b receipt → canonical RoutingResult → routing-owned Result Outbox 均已完成且独立 review PASS；R4c 下一步消费新 outbox 并渐进迁移旧 Browser feedback delivery；R5 尚未开始。
 
 | 阶段 | Routing 相关目标 | 状态 |
 | --- | --- | --- |
@@ -17,7 +17,7 @@ foundation、R2 Desktop behavioral adapter、R3 Browser Companion Web adapter / 
 | R1 | Project 容器、核心身份为 `{workspaceId, platform, conversationId}` 的 Route、Command、最小 ExecutionResult durable model | foundation done |
 | R2 | Desktop 生产信任基于 live behavioral proof | done |
 | R3 | Web adapter、当前网址绑定与 feedback return plane | live E2E PASS |
-| R4 | canonical ExecutionResult + `Command.plannerRouteId` durable outbox；机器事实与 Codex 自己的 final summary 一并回流，不做第二次 AI rewrite | R4a done / independent review PASS；R4b next，outbox delivery 未接通 |
+| R4 | canonical ExecutionResult + `Command.plannerRouteId` durable outbox；机器事实与 Codex 自己的 final summary 一并回流，不做第二次 AI rewrite | R4a/R4b done / independent review PASS；R4c next：消费 planner-route outbox 并渐进迁移旧 Browser feedback delivery |
 | R5 | Bridge lifecycle 与会话执行状态解耦 | planned; 不属于 H0 / Claude E1a |
 
 ## 术语
@@ -187,7 +187,7 @@ R3e 将现有 `codex_desktop_send` 接到 R3d adapter；底层仍复用原 Deskt
   上述 slice 已由真实 live E2E 收官；各 slice 内更早的 pending 记录以 `development-plan.md` 的 R3 aggregate
   closeout 为准。
 
-## R4 ExecutionResult outbox（R4a 完成；R4b 下一步）
+## R4 ExecutionResult outbox（R4a、R4b 完成；R4c 下一步）
 
 - R1 的 `RoutingState.results[]` / `appendResult()` 原先只保存最小结果身份与状态。
   R4a 扩充为 bounded `rawSummary` + versioned `machineEvidence`：来源是显式 Codex final summary
@@ -198,14 +198,67 @@ R3e 将现有 `codex_desktop_send` 接到 R3d adapter；底层仍复用原 Deskt
   唯一 trusted receipt 与 output metadata 后产生 `ResultInput` 候选；它不调用 `appendResult()`，
   不创建 outbox entry，不触碰 Browser/feedback 或 Desktop send。旧 generic/历史 receipt 读取兼容，
   但缺显式 summary/provenance 的记录不能成为新 canonical machine evidence。
-- R4a 已完成并通过独立 review；下一步 R4b 将 canonical ExecutionResult 接入 `Command.plannerRouteId` durable outbox。
+- R4a 与 R4b 均已完成并通过独立 review；trusted Desktop receipt → canonical RoutingResult → routing-owned durable Result Outbox 已接入本机生产收敛边界。R4c 的 outbox consumer 与 Browser delivery 迁移尚未接通。
 - R4 将 canonical ExecutionResult 绑定原 Command，经其 `plannerRouteId` durable outbox 返回；复用 Codex
-  自己的 final summary，不再让第二个 AI 重写结果。R4 尚未接通此生产交付。
+  自己的 final summary，不再让第二个 AI 重写结果。R4b 已接通 receipt-to-outbox 的生产生成路径；R4c
+  尚未接通从新 outbox 到 Browser feedback consumer 的生产交付。
 - R3 pairing / feedback 身份字段及状态机已由真实 live E2E 验收，应保持兼容。当前 feedback outbox 以
   `bindingId / epoch / principalFingerprint` 为接收者，状态为
-  `queued → ready → reserved → claimed → observed / outcome_unknown / retired_unknown`；R4b/c 渐进迁移。
-- `/state` 与 `/reserve` 当前调用 `reconcileFeedbackOutbox()`；R4a 保持现有调用。最终语义结果与 outbox
-  entry 不应依赖 pull 才创建。
+  `queued → ready → reserved → claimed → observed / outcome_unknown / retired_unknown`；R4b 不修改此 schema
+  或 lifecycle，R4c 再渐进迁移旧 Browser feedback delivery。
+- `/state` 与 `/reserve` 当前调用 `reconcileFeedbackOutbox()`；R4a 保持现有调用。canonical Result 与新
+  Result Outbox entry 不依赖 pull 才创建，也不调用这条 feedback reconciliation 路径。
+
+### R4b routing-owned Result Outbox（已完成；不含 R4c consumer）
+
+R4b 把 R4a projector 验证出的 `ResultInput` 先交给 Routing store，持久化 canonical RoutingResult；只有拿到
+持久化结果后，才原子写入独立的 per-workspace Result Outbox：
+`<stateDir>/routing/<workspaceId>.result-outbox.json`。Outbox 只存引用与摘要，不复制 result 内容：
+
+```text
+{
+  version: 1,
+  workspaceId,
+  workspaceRoot,
+  revision,
+  entries: [{
+    version: 1, outboxEntryId, workspaceId, plannerRouteId, commandId,
+    resultId, executorRouteId, iteration, status, resultSha256,
+    createdAt, deliveryStatus: "pending"
+  }]
+}
+```
+
+- `version` 必须精确为当前 schema 版本；未知版本、额外字段或缺字段均 fail closed。`workspaceId` 与 canonical
+  `workspaceRoot` 必须和打开的 workspace identity 完全匹配；persisted `revision` 必须是正的安全整数，首次写入为 1，
+  且每次真实 mutation 单调递增。outbox 主文件不存在时按空 outbox（瞬态 `revision: 0`）处理；已存在文件损坏、
+  identity 不匹配或 revision 无效时保留原文件并 fail closed，不重置历史。
+- 每条 entry 严格限定为上列字段；`outboxEntryId` 是对
+  `[workspaceId, commandId, iteration]` 的确定性 SHA-256，entry digest 是规范 canonical RoutingResult 的 SHA-256。
+  entry 必须解析到同一 workspace 中的
+  canonical RoutingResult、其原 persisted Command 及该 Command 的 planner Route。`plannerRouteId` 只能复制自该
+  persisted Command，不能从 current route、binding 或 Companion 重新推导。digest 绑定 entry 引用及 canonical
+  Result 的完整 summary、machine evidence 与身份；重复语义键或摘要不匹配按损坏/冲突拒绝。
+- entry 数量不超过 Routing `results` 的既有上限 10,000，字段长度与 UUID / digest 使用现有 schema 的严格约束；
+  Outbox metadata 不包含 `rawSummary`、machine evidence、feedback 或任何 Browser / Companion 字段。
+- Result Outbox 由 Routing 自己持有，使用独立单文件；在工作区锁内写临时文件、fsync 后原子 rename 发布。精确重放
+  不增加 revision、不重写文件。不能把尚未提交的 Result 和 Outbox entry 合并成一次写入：Outbox entry 必须引用已持久化
+  canonical Result。
+- 若 Result 已提交但 Outbox 写入失败，不消费或清理原 trusted receipt；保留 canonical Result，并返回有界的
+  `reconciliation-needed` 结果，并将 reason code 写入使用独立文件与写锁的 routing recovery queue：
+  `<stateDir>/routing/<workspaceId>.result-reconciliation.json`。因此 Outbox 锁竞争不会阻止记录恢复项，队列有严格
+  workspace identity、revision 与 10,000 项上限。`desktop result-reconciliation-status` 可只读发现待办；
+  `desktop reconcile-result --command-id` 幂等重试并在收敛后清除对应恢复项。
+  对应的 recovery intent 会在新的 canonical receipt/output 首次提交前先写入该独立队列；无法持久化 intent 时，
+  不先写 output/receipt。`c2c record`、`desktop record-result` 与 detached safe-terminal receipt finalizer
+  共用此提交前钩子，并在 receipt 成功后调用同一 reconciler。若此前置 intent 后未产生 receipt，reconciler
+  会在 execution-record 锁内确认无 receipt、canonical Result 或 Outbox entry 后清除孤立 intent；后续 writer
+  会在自己的 receipt 提交前重新发布。恢复命令只需历史 trusted receipt，不要求当前 Desktop binding。
+  `appendResultWithReplay()` exact replay 取得原 result 后补齐缺少的 Outbox entry；原子 rename 前崩溃留下的 temp 不会被当作主状态，
+  重试仍可收敛；原子发布后的 caller retry 返回原 entry，不重复生成 Result 或投递目标。
+- 本切片不依赖 Browser、feedback state、current binding/state、`/state`、`/reserve` 或 Companion，也不修改 R3
+  feedback schema、状态迁移或 transport。R4c 才消费新 planner-route Result Outbox，并渐进迁移旧 Browser feedback
+  delivery；R4c 未在本切片实现。
 
 ## R5 Bridge lifecycle decoupling（规划中）
 
