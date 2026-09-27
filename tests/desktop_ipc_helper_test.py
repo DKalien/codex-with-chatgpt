@@ -268,13 +268,43 @@ class DesktopIpcHelperTests(unittest.TestCase):
             "01a00000-0000-7000-8000-000000000011",
         ])
 
-    def test_reconcile_unknown_rejects_mismatched_multi_input_mirror(self) -> None:
+    def test_reconcile_unknown_skips_non_mirrored_multi_input_composer_turn(self) -> None:
+        """回归（真实观察 shape index16/23）：多输入 composer turn 的物化
+        userMessage 不再镜像 params.input（inputLen=2 而 userMessage=1），
+        对账扫描必须跳过它而不是 fail closed；C2C wire 恒为单输入，
+        跳过多输入历史不会掩盖任何真实 origin。"""
         state, expected = self.reconcile_fixture(version=2, delivery_id="01a00000-0000-7000-8000-000000000200")
         history = state["turnHistory"]["history"]  # type: ignore[index]
         origin = history["entitiesByKey"]["turn-1"]  # type: ignore[index]
         extra_item = {"type": "text", "text": "ordinary composer input", "text_elements": []}
         origin["params"]["input"] = [origin["params"]["input"][0], extra_item]  # type: ignore[index]
-        self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: helper._reconcile_turn_ids(state, expected, TARGET))
+        self.assertEqual(helper._reconcile_turn_ids(state, expected, TARGET), [])
+
+    def test_reconcile_unknown_skips_multi_input_desktop_materialization(self) -> None:
+        """回归（真实观察 shape index16）：多输入 composer turn 的 items 以
+        非镜像方式物化（单 userMessage + 大量活动项），扫描跳过且不误报。"""
+        state, expected = self.reconcile_fixture(version=2, delivery_id="01a00000-0000-7000-8000-000000000200")
+        history = state["turnHistory"]["history"]  # type: ignore[index]
+        history["entitiesByKey"]["turn-noise"] = {  # type: ignore[index]
+            "turnId": "01a00000-0000-7000-8000-000000000013",
+            "status": "completed",
+            "params": {
+                "threadId": THREAD, "turnTrigger": "composer",
+                "input": [
+                    {"type": "text", "text": "第一段输入", "text_elements": []},
+                    {"type": "image", "text": "", "text_elements": []},
+                ],
+            },
+            "items": [
+                {"type": "userMessage", "content": [{"type": "text", "text": "第一段输入", "text_elements": []}]},
+                {"type": "reasoning"},
+                {"type": "agentMessage"},
+                {"type": "commandExecution"},
+            ],
+        }
+        history["islands"][0]["entries"].append({"value": "turn-noise"})  # type: ignore[index]
+        candidates = helper._reconcile_turn_ids(state, expected, TARGET)
+        self.assertEqual(candidates, ["01a00000-0000-7000-8000-000000000011"])
 
     def test_reconcile_unknown_rejects_empty_input_mirror(self) -> None:
         state, expected = self.reconcile_fixture(version=2, delivery_id="01a00000-0000-7000-8000-000000000200")

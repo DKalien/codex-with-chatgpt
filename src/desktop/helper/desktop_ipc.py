@@ -1155,18 +1155,20 @@ def _turn_text_for_reconciliation(turn: dict[str, Any]) -> str | None:
     items = turn.get("items")
     if not isinstance(params, dict) or not isinstance(raw_input, list) or not isinstance(items, list):
         raise _error("DESKTOP_STATE_UNAVAILABLE")
-    user_messages = [item for item in items if isinstance(item, dict) and item.get("type") == "userMessage"]
-    if len(user_messages) != 1 or user_messages[0].get("content") != raw_input:
-        raise _error("DESKTOP_STATE_UNAVAILABLE")
-    if len(raw_input) == 0:
-        raise _error("DESKTOP_STATE_UNAVAILABLE")
-    # C2C wire sends exactly one input. Only a strictly mirrored multi-input
-    # composer turn is therefore known non-C2C history, not malformed state.
+    # C2C wire sends exactly one input. A multi-input composer turn is
+    # therefore known non-C2C history, not malformed state：Desktop 物化
+    # 一次 composer 提交时，items 里的 userMessage 可能不再镜像 params.input
+    # （实测 inputLen=2 而 userMessage=1），因此 skip 必须先于镜像检查。
     if len(raw_input) > 1:
         if (any(not isinstance(item, dict) for item in raw_input)
                 or any(not isinstance(item, dict) for item in items)):
             raise _error("DESKTOP_STATE_UNAVAILABLE")
         return None
+    user_messages = [item for item in items if isinstance(item, dict) and item.get("type") == "userMessage"]
+    if len(user_messages) != 1 or user_messages[0].get("content") != raw_input:
+        raise _error("DESKTOP_STATE_UNAVAILABLE")
+    if len(raw_input) == 0:
+        raise _error("DESKTOP_STATE_UNAVAILABLE")
     item = raw_input[0]
     if (not isinstance(item, dict) or set(item) != {"type", "text", "text_elements"}
             or item.get("type") != "text" or item.get("text_elements") != []):
