@@ -155,6 +155,9 @@ function modelVisibleMeta(extra?: Record<string, unknown>): Record<string, unkno
  * status/claim 前 reconcile，恢复 crash gap。
  */
 export function registerFeedbackTools(server: McpServer, workspace: Workspace): void {
+  // MCP 与 Bridge 统一走带 workspace root 的 reconcile 路径。
+  const reconcileWorkspaceFeedback = () => reconcileFeedbackOutbox(workspace.id, undefined, workspace.root);
+
   server.registerTool(
     "feedback_bootstrap_status",
     {
@@ -218,7 +221,7 @@ export function registerFeedbackTools(server: McpServer, workspace: Workspace): 
       if (denied) return denied;
       try {
         const principal = principalFromExtra(extra);
-        const reconciled = reconcileFeedbackOutbox(workspace.id);
+        const reconciled = reconcileWorkspaceFeedback();
         return ok({
           ...feedbackStatusSummary(reconciled.state, principal.fingerprint),
           projected: reconciled.projected,
@@ -252,7 +255,7 @@ export function registerFeedbackTools(server: McpServer, workspace: Workspace): 
       if (denied) return denied;
       try {
         const principal = principalFromExtra(extra);
-        reconcileFeedbackOutbox(workspace.id);
+        reconcileWorkspaceFeedback();
         const state = enableReceiver({
           workspaceId: workspace.id,
           principal,
@@ -295,7 +298,7 @@ export function registerFeedbackTools(server: McpServer, workspace: Workspace): 
       if (denied) return denied;
       try {
         const principal = principalFromExtra(extra);
-        reconcileFeedbackOutbox(workspace.id);
+        reconcileWorkspaceFeedback();
         const result = takeoverReceiver({
           workspaceId: workspace.id,
           principal,
@@ -334,7 +337,7 @@ export function registerFeedbackTools(server: McpServer, workspace: Workspace): 
       if (denied) return denied;
       try {
         const principal = principalFromExtra(extra);
-        reconcileFeedbackOutbox(workspace.id);
+        reconcileWorkspaceFeedback();
         const claimed = claimNext({
           workspaceId: workspace.id,
           principal,
@@ -430,7 +433,7 @@ export function registerFeedbackTools(server: McpServer, workspace: Workspace): 
       try {
         const principal = principalFromExtra(extra);
         const bridgeOrigin = await companionBridgeOrigin(workspace.id);
-        reconcileFeedbackOutbox(workspace.id);
+        reconcileWorkspaceFeedback();
         const intent = createPairingIntent({
           workspaceId: workspace.id,
           principal,
@@ -507,7 +510,7 @@ export function registerFeedbackTools(server: McpServer, workspace: Workspace): 
       if (denied) return denied;
       try {
         const principal = principalFromExtra(extra);
-        reconcileFeedbackOutbox(workspace.id);
+        reconcileWorkspaceFeedback();
         return ok(companionStatusForPrincipal({
           workspaceId: workspace.id,
           principal,

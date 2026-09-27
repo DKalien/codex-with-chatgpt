@@ -268,7 +268,10 @@ export async function discoverCurrentDesktopDelivery(
   if (!state) {
     throw new DesktopResultError("DESKTOP_RESULT_CURRENT_EXECUTION", "当前 Desktop result 已自证为 delivery，但 durable workspace 状态缺失；拒绝回退通用记录。");
   }
-  const candidates = state.deliveries.filter(item => item.threadId === threadId && item.deliveryStatus === "accepted");
+  // outcome_unknown 仍是未完成投递；这里只允许它作为当前 self-attested
+  // command 的入口候选，后续必须经过 reconcileUnknownDesktopDelivery 才能变为 accepted。
+  const candidates = state.deliveries.filter(item => item.threadId === threadId &&
+    (item.deliveryStatus === "accepted" || item.deliveryStatus === "outcome_unknown"));
   if (!classification.workspaceId || !classification.commandId || !classification.intent ||
       classification.messageBytes === undefined || !classification.messageSha256 || !classification.ownership || !classification.originTurnId ||
       !classification.chainTurnIds || classification.chainLength === undefined || !classification.chainSignatures ||
@@ -282,7 +285,8 @@ export async function discoverCurrentDesktopDelivery(
       item.threadId === classification.threadId && item.intent === classification.intent &&
       item.messageBytes === classification.messageBytes && item.messageSha256 === classification.messageSha256 &&
       item.deliveryId === classification.deliveryId && classification.workspaceId === workspace.id);
-  const exactOrigin = !!accepted && classification.originAlias === null && classification.originTurnId === accepted.turnId;
+  const exactOrigin = !!accepted && classification.originAlias === null &&
+    (accepted.deliveryStatus === "outcome_unknown" || classification.originTurnId === accepted.turnId);
   const editAlias = !!accepted && accepted.deliveryId !== undefined &&
     classification.deliveryId === accepted.deliveryId && classification.originAlias === "edit_user_message_v2_delivery" &&
     classification.ownership === "native_continuation" &&

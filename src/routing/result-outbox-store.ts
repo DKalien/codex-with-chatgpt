@@ -9,6 +9,7 @@ import {
   routingCommandIdSchema,
   routingWorkspaceIdSchema,
   type RoutingResult,
+  type RoutingRoute,
 } from "./schema.js";
 import {
   readRouting,
@@ -299,6 +300,33 @@ export function listResultOutboxEntries(
   const routing = state.entries.length ? readRouting(resolved, stateDir) : null;
   validateReferences(state, routing);
   return state.entries;
+}
+
+/** Resolve outbox references without consulting feedback/browser state. */
+export function resolveResultOutboxEntries(
+  identity: RoutingWorkspaceIdentity,
+  stateDir = getStateDir(),
+): Array<{ entry: ResultOutboxEntry; result: RoutingResult; plannerRoute: RoutingRoute }> {
+  const resolved = resolveWorkspaceIdentity(identity);
+  const entries = listResultOutboxEntries(resolved, stateDir);
+  if (!entries.length) return [];
+  const routing = readRouting(resolved, stateDir);
+  if (!routing) throw outboxError("RESULT_OUTBOX_DANGLING", "Result Outbox 缺少 Routing state。");
+  return entries.map((entry) => {
+    const command = routing.commands.find((item) => item.commandId === entry.commandId);
+    const result = routing.results.find((item) => item.resultId === entry.resultId);
+    const plannerRoute = command && routing.routes.find((item) => item.routeId === command.plannerRouteId);
+    if (!command || !result || !plannerRoute || plannerRoute.role !== "planner" || command.plannerRouteId !== entry.plannerRouteId) {
+      throw outboxError("RESULT_OUTBOX_DANGLING", "Result Outbox 引用无法解析到唯一 planner/result。");
+    }
+    if (plannerRoute.platform !== "chatgpt_web" || !/^[a-f0-9]{32}$/.test(plannerRoute.conversationId)) {
+      throw outboxError("RESULT_OUTBOX_PLANNER_INVALID", "R4 planner route 必须是 chatgpt_web 且使用 32 位 principal fingerprint。");
+    }
+    if (result.commandId !== entry.commandId || result.iteration !== entry.iteration || canonicalRoutingResultDigest(result) !== entry.resultSha256) {
+      throw outboxError("RESULT_OUTBOX_CONFLICT", "Result Outbox 引用的 canonical result 已漂移。");
+    }
+    return { entry, result, plannerRoute };
+  });
 }
 
 /** Independent discovery surface: unlike the outbox writer, this queue uses its own file and lock. */

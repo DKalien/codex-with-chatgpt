@@ -339,6 +339,22 @@ describe("desktop record-result CLI", () => {
 
   it("outcome_unknown 当前 turn 一次 CLI 调用完成严格 self-reconcile 和 receipt", async () => {
     seedUnknownDelivery();
+    vi.spyOn(desktopIpc, "currentResultClassification").mockResolvedValue({
+      ...currentResultContext(acceptedTurnId),
+      classification: "applicable",
+      workspaceId: workspace.id,
+      commandId,
+      intent: "development_plan",
+      messageBytes: 1,
+      messageSha256: "0".repeat(64),
+      ownership: "origin",
+      originTurnId: acceptedTurnId,
+      originAlias: null,
+      chainTurnIds: [acceptedTurnId],
+      chainLength: 0,
+      chainSignatures: [],
+      signature: null,
+    } as never);
     const reconcile = vi.spyOn(desktopIpc, "reconcileUnknown").mockResolvedValue({
       threadId,
       hostId: "local",

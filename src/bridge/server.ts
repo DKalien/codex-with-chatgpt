@@ -184,7 +184,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   // 不使用 admin token / OAuth bearer；不代理 MCP/Desktop。
   app.use(
     "/api/companion/v1",
-    createCompanionRouter({ workspaceId: workspace.id }),
+    createCompanionRouter({ workspaceId: workspace.id, workspaceRoot: workspace.root }),
   );
 
   // ---- Admin API (loopback + admin token only; used by the CLI/Skill) --------

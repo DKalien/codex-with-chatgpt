@@ -10,9 +10,13 @@ import {
   readFeedbackState,
   stopReceiver,
   takeoverReceiver,
+  applyProjection,
+  ensureFeedbackState,
+  feedbackEventId,
+  feedbackEventSchema,
   type FeedbackEvent,
 } from "../src/feedback/store.js";
-import { reconcileFeedbackOutbox } from "../src/feedback/projector.js";
+import { reconcileCanonicalResultOutbox, reconcileFeedbackOutbox } from "../src/feedback/projector.js";
 import {
   resolveConversationPrincipal,
   ConversationPrincipalError,
@@ -29,6 +33,8 @@ import { createMcpServer } from "../src/mcp/server.js";
 import { getSupportedScopes } from "../src/auth/store.js";
 import { Workspace } from "../src/workspace/manager.js";
 import { cleanup, isolateStateDir, makeTmpDir } from "./helpers.js";
+import { appendResult, createCommand, registerRoute } from "../src/routing/store.js";
+import { enqueueResultOutboxEntry } from "../src/routing/result-outbox-store.js";
 
 let stateDir: string;
 let wsRoot: string;
@@ -155,6 +161,151 @@ describe("conversation principal 共享模块", () => {
 });
 
 describe("projection cursor baseline", () => {
+  it("routed Command 在 canonical outbox 尚未就绪时禁止 legacy fallback", () => {
+    const planner = registerRoute(workspace, {
+      role: "planner", platform: "chatgpt_web", conversationId: principalA().fingerprint, locator: {},
+    }, stateDir);
+    const executor = registerRoute(workspace, {
+      role: "executor", platform: "codex_desktop", conversationId: "11111111-1111-4111-8111-111111111111",
+      locator: { hostId: "local", executorProjectId: "r4c2-project" },
+    }, stateDir);
+    createCommand(workspace, {
+      commandId: "r4c2-routed-pending", plannerRouteId: planner.routeId, executorRouteId: executor.routeId,
+      intent: "development_plan", payloadBytes: 1, payloadSha256: "a".repeat(64),
+    }, stateDir);
+    seedTrustedReceipt("r4c2-routed-pending");
+
+    const result = reconcileFeedbackOutbox(workspace.id, stateDir, workspace.root);
+    expect(result.projected).toBe(0);
+    expect(result.state.events).toHaveLength(0);
+    expect(result.state.projectionCursor).toBe(1);
+  });
+
+  it("canonical planner pin 不会被不同 principal 的当前 binding 接管", () => {
+    ensureFeedbackState(workspace.id, 0, stateDir);
+    const principal = principalA();
+    enableReceiver({ workspaceId: workspace.id, principal, widgetId: "w", stateDir });
+    const event = {
+      version: 1 as const, eventId: "abcdef0123456789abcdef0123456789", kind: "C2C_EXECUTED" as const,
+      workspaceId: workspace.id, source: "desktop" as const, commandId: "canonical-pin",
+      taskId: "desktop_canonical-pin", iteration: 1, result: "ok" as const, changedFilesSummary: [],
+      testsSummary: "passed", outputAvailable: false, occurredAt: new Date().toISOString(),
+      createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      targetBindingId: null, targetEpoch: null, targetPrincipalFingerprint: null, status: "queued" as const,
+      plannerRouteId: "55555555-5555-4555-8555-555555555555",
+      plannerPrincipalFingerprint: "e".repeat(32), resultId: "66666666-6666-4666-8666-666666666666",
+      resultSha256: "a".repeat(64), rawSummary: "done",
+      machineEvidence: {
+        version: 1 as const, source: "codex_desktop_receipt" as const, desktopReceiptSha256: "b".repeat(64),
+        taskId: "desktop_canonical-pin", iteration: 1, status: "ok" as const,
+        threadId: "77777777-7777-4777-8777-777777777777", originTurnId: "88888888-8888-4888-8888-888888888888",
+        resultTurnId: "99999999-9999-4999-8999-999999999999", bindingId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        changedFiles: [], testsSummary: "passed",
+      },
+    } as never;
+    const result = applyProjection({ workspaceId: workspace.id, stateDir, nextCursor: 0, newEvents: [event] });
+    expect(result.events[0]!.status).toBe("queued");
+    expect(result.events[0]!.targetBindingId).toBeNull();
+    const matching = applyProjection({
+      workspaceId: workspace.id,
+      stateDir,
+      nextCursor: 0,
+      newEvents: [{ ...event, eventId: "1234567890abcdef1234567890abcdef", plannerPrincipalFingerprint: principal.fingerprint }],
+    });
+    expect(matching.events[1]!.status).toBe("ready");
+    expect(matching.events[1]!.targetPrincipalFingerprint).toBe(principal.fingerprint);
+  });
+
+  it("R4c 按 commandId+iteration 兼容精确 legacy event，并对元数据漂移 fail closed", () => {
+    const commandId = "r4c-legacy-compat";
+    const receiptHash = "b".repeat(64);
+    const executorThread = "11111111-1111-4111-8111-111111111111";
+    const turnId = "22222222-2222-4222-8222-222222222222";
+    const bindingId = "33333333-3333-4333-8333-333333333333";
+    const planner = registerRoute(workspace, {
+      role: "planner",
+      platform: "chatgpt_web",
+      conversationId: principalA().fingerprint,
+      locator: {},
+    }, stateDir);
+    const executor = registerRoute(workspace, {
+      role: "executor",
+      platform: "codex_desktop",
+      conversationId: executorThread,
+      locator: { hostId: "local", executorProjectId: "r4c-project" },
+    }, stateDir);
+    createCommand(workspace, {
+      commandId,
+      plannerRouteId: planner.routeId,
+      executorRouteId: executor.routeId,
+      intent: "development_plan",
+      payloadBytes: 1,
+      payloadSha256: "a".repeat(64),
+    }, stateDir);
+    const machineEvidence = {
+      version: 1 as const,
+      source: "codex_desktop_receipt" as const,
+      desktopReceiptSha256: receiptHash,
+      taskId: `desktop_${commandId}`,
+      iteration: 1,
+      status: "ok" as const,
+      threadId: executorThread,
+      originTurnId: turnId,
+      resultTurnId: turnId,
+      bindingId,
+      changedFiles: ["src/r4c.ts"],
+      testsSummary: "1 passed",
+    };
+    const result = appendResult(workspace, {
+      commandId,
+      executorRouteId: executor.routeId,
+      iteration: 1,
+      status: "ok",
+      rawSummary: "done",
+      machineEvidence,
+    }, stateDir);
+    enqueueResultOutboxEntry(workspace, { commandId, iteration: 1 }, stateDir);
+    ensureFeedbackState(workspace.id, 0, stateDir);
+    const legacy = feedbackEventSchema.parse({
+      version: 1,
+      eventId: feedbackEventId({
+        workspaceId: workspace.id,
+        commandId,
+        taskId: machineEvidence.taskId,
+        iteration: 1,
+        desktopReceiptSha256: receiptHash,
+      }),
+      kind: "C2C_EXECUTED",
+      workspaceId: workspace.id,
+      source: "desktop",
+      commandId,
+      taskId: machineEvidence.taskId,
+      iteration: 1,
+      result: "ok",
+      changedFilesSummary: machineEvidence.changedFiles,
+      testsSummary: machineEvidence.testsSummary,
+      outputAvailable: false,
+      occurredAt: result.createdAt,
+      createdAt: result.createdAt,
+      updatedAt: result.createdAt,
+      targetBindingId: null,
+      targetEpoch: null,
+      targetPrincipalFingerprint: null,
+      status: "queued",
+    });
+    applyProjection({ workspaceId: workspace.id, stateDir, nextCursor: 0, newEvents: [legacy] });
+
+    expect(reconcileCanonicalResultOutbox(workspace.root, workspace.id, stateDir).projected).toBe(0);
+    expect(readFeedbackState(workspace.id, stateDir).events).toHaveLength(1);
+
+    const feedbackFile = feedbackStateFile(workspace.id, stateDir);
+    const state = JSON.parse(fs.readFileSync(feedbackFile, "utf8")) as { events: Array<Record<string, unknown>> };
+    state.events[0]!.outputId = 99;
+    fs.writeFileSync(feedbackFile, JSON.stringify(state));
+    expect(() => reconcileCanonicalResultOutbox(workspace.root, workspace.id, stateDir))
+      .toThrow(/CANONICAL_ROUTE_CONFLICT|历史 feedback 事件与 canonical result 冲突/);
+  });
+
   it("首次 state 不投历史 receipt；baseline 后新 receipt 产生 1 event；重复 reconcile 仍 1", () => {
     seedTrustedReceipt("hist-cmd");
     const first = reconcileFeedbackOutbox(workspace.id, stateDir);
@@ -780,6 +931,33 @@ describe("trusted MCP late-positive ACK (ackObserved)", () => {
 });
 
 describe("MCP production feedback tools", () => {
+  it("feedback_status 传递 workspace.root，routed receipt 在 canonical outbox 就绪前不走 legacy fallback", async () => {
+    const planner = registerRoute(workspace, {
+      role: "planner", platform: "chatgpt_web", conversationId: principalA().fingerprint, locator: {},
+    }, stateDir);
+    const executor = registerRoute(workspace, {
+      role: "executor", platform: "codex_desktop", conversationId: "11111111-1111-4111-8111-111111111111",
+      locator: { hostId: "local", executorProjectId: "r4c2-mcp" },
+    }, stateDir);
+    createCommand(workspace, {
+      commandId: "r4c2-mcp-routed-pending", plannerRouteId: planner.routeId, executorRouteId: executor.routeId,
+      intent: "development_plan", payloadBytes: 1, payloadSha256: "a".repeat(64),
+    }, stateDir);
+    seedTrustedReceipt("r4c2-mcp-routed-pending");
+
+    const server = createMcpServer({ workspace, logger: { info() {}, error() {}, warn() {}, debug() {} } as never });
+    const tools = (server as unknown as {
+      _registeredTools?: Record<string, { handler: (a: unknown, e: unknown) => Promise<{ structuredContent?: Record<string, unknown> }> }>;
+    })._registeredTools ?? {};
+    const result = await tools.feedback_status!.handler({}, {
+      authInfo: { token: "t", clientId: "client-A", scopes: [CODEX_FEEDBACK_SCOPE] },
+      _meta: { "openai/session": "sess-A" },
+      sessionId: "session-A",
+    });
+    expect(result.structuredContent?.projected).toBe(0);
+    expect((result.structuredContent?.events as unknown[] | undefined) ?? []).toHaveLength(0);
+  });
+
   it("注册 feedback_* 且无 emit/model_confirm；scope 校验", async () => {
     const server = createMcpServer({ workspace, logger: { info() {}, error() {}, warn() {}, debug() {} } as never });
     const tools = (server as unknown as { _registeredTools?: Record<string, unknown> })._registeredTools ?? {};

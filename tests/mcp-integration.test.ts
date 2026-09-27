@@ -463,4 +463,11 @@ describe("MCP tools over Streamable HTTP", () => {
 
     git(root, "reset", "--hard", "HEAD");
   });
+
+  it("feedback reconciliation entrypoints remain workspace-root aware", () => {
+    const source = fs.readFileSync(path.resolve(process.cwd(), "src/mcp/feedback.ts"), "utf8");
+    expect(source).toContain("reconcileFeedbackOutbox(workspace.id, undefined, workspace.root)");
+    expect(source).not.toMatch(/reconcileFeedbackOutbox\(workspace\.id\)\s*[;)]/);
+    expect((source.match(/reconcileWorkspaceFeedback\(\)/g) ?? []).length).toBe(6);
+  });
 });

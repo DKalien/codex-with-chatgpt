@@ -107,6 +107,7 @@ function bearerCredential(req: Request): string | null {
 
 export interface CompanionRouterOptions {
   workspaceId: string;
+  workspaceRoot?: string;
   stateDir?: string;
 }
 
@@ -207,7 +208,7 @@ export function createCompanionRouter(opts: CompanionRouterOptions): Router {
       // Auth first: unauthenticated must 401 without touching projector.
       const ctx = auth(req);
       // E1b2 autonomous reconcile: browser can pull outbox without MCP kick.
-      reconcileFeedbackOutbox(opts.workspaceId, opts.stateDir);
+      reconcileFeedbackOutbox(opts.workspaceId, opts.stateDir, opts.workspaceRoot);
       res.json(companionPublicState({
         workspaceId: opts.workspaceId,
         ctx,
@@ -223,7 +224,7 @@ export function createCompanionRouter(opts: CompanionRouterOptions): Router {
       const ctx = auth(req);
       const body = routeBodySchema.parse(req.body);
       // Project newly landed trusted receipts before reserving.
-      reconcileFeedbackOutbox(opts.workspaceId, opts.stateDir);
+      reconcileFeedbackOutbox(opts.workspaceId, opts.stateDir, opts.workspaceRoot);
       const result = companionReserveNext({
         workspaceId: opts.workspaceId,
         ctx,

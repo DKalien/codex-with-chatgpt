@@ -8,6 +8,7 @@ import {
   type ConversationPrincipal,
 } from "../mcp/conversation-principal.js";
 import { listReceiptFinalizationAlerts } from "../desktop/receipt-finalizer.js";
+import { machineEvidenceSchema } from "../routing/schema.js";
 
 /** production feedback 永久 scope；与 synthetic feedback.probe 分离。 */
 export const CODEX_FEEDBACK_SCOPE = "codex.feedback";
@@ -83,7 +84,25 @@ export const c2cExecutedEventSchema = z.object({
   reservedAt: z.string().datetime().optional(),
   reservedBy: z.string().regex(UUID).optional(),
   retiredAt: z.string().datetime().optional(),
-}).strict();
+  plannerRouteId: z.string().uuid().optional(),
+  plannerPrincipalFingerprint: z.string().regex(HEX32).optional(),
+  resultId: z.string().uuid().optional(),
+  resultSha256: z.string().regex(HEX64).optional(),
+  rawSummary: z.string().min(1).refine((value) => Buffer.byteLength(value, "utf8") <= 8192, "rawSummary 超过 8192 UTF-8 bytes").optional(),
+  machineEvidence: machineEvidenceSchema.optional(),
+}).strict().superRefine((event, ctx) => {
+  const canonicalKeys = ["plannerRouteId", "plannerPrincipalFingerprint", "resultId", "resultSha256", "rawSummary", "machineEvidence"] as const;
+  const present = canonicalKeys.filter((key) => event[key] !== undefined).length;
+  if (present !== 0 && present !== canonicalKeys.length) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "canonical feedback 元数据必须全部存在或全部缺失" });
+    return;
+  }
+  if (present === 0) return;
+  if (event.taskId !== `desktop_${event.commandId}` || event.machineEvidence?.taskId !== event.taskId
+    || event.machineEvidence?.iteration !== event.iteration || event.machineEvidence?.status !== event.result) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "canonical feedback 身份与 machineEvidence 不一致" });
+  }
+});
 
 const feedbackEventLifecycleSchema = {
   version: z.literal(1),
@@ -465,6 +484,18 @@ function requireActiveBinding(state: FeedbackState, principal: ConversationPrinc
   return state.binding;
 }
 
+function eventMayBind(event: FeedbackEvent, binding: FeedbackBinding): boolean {
+  return !("plannerPrincipalFingerprint" in event)
+    || event.plannerPrincipalFingerprint === binding.principalFingerprint;
+}
+
+function retargetEvent(event: FeedbackEvent, binding: FeedbackBinding, now: string): FeedbackEvent {
+  if (eventMayBind(event, binding)) {
+    return { ...event, status: "ready", targetBindingId: binding.bindingId, targetEpoch: binding.epoch, targetPrincipalFingerprint: binding.principalFingerprint, updatedAt: now };
+  }
+  return { ...event, status: "queued", targetBindingId: null, targetEpoch: null, targetPrincipalFingerprint: null, updatedAt: now };
+}
+
 export function enableReceiver(input: {
   workspaceId: string;
   principal: ConversationPrincipal;
@@ -503,16 +534,7 @@ export function enableReceiver(input: {
       rebindIntent: null,
       rebindPredecessor: null,
       events: recovered.events.map((event) =>
-        event.status === "queued" || event.status === "ready"
-          ? {
-              ...event,
-              status: "ready" as const,
-              targetBindingId: binding.bindingId,
-              targetEpoch: binding.epoch,
-              targetPrincipalFingerprint: binding.principalFingerprint,
-              updatedAt: new Date(now).toISOString(),
-            }
-          : event,
+        event.status === "queued" || event.status === "ready" ? retargetEvent(event, binding, new Date(now).toISOString()) : event,
       ),
     };
     writeState(input.workspaceId, stateDir, next);
@@ -580,16 +602,7 @@ export function takeoverReceiver(input: {
           }
         : null,
       events: recovered.events.map((event) =>
-        event.status === "queued" || event.status === "ready"
-          ? {
-              ...event,
-              status: "ready" as const,
-              targetBindingId: binding.bindingId,
-              targetEpoch: binding.epoch,
-              targetPrincipalFingerprint: binding.principalFingerprint,
-              updatedAt: new Date(now).toISOString(),
-            }
-          : event,
+        event.status === "queued" || event.status === "ready" ? retargetEvent(event, binding, new Date(now).toISOString()) : event,
       ),
     };
     writeState(input.workspaceId, stateDir, next);
@@ -639,7 +652,8 @@ export function applyProjection(input: {
     const added = input.newEvents
       .filter((event) => !existing.has(event.eventId))
       .map((event) => {
-        if (binding) {
+        const pinned = "plannerPrincipalFingerprint" in event ? event.plannerPrincipalFingerprint : undefined;
+        if (binding && (!pinned || pinned === binding.principalFingerprint)) {
           return {
             ...event,
             status: "ready" as const,
@@ -688,7 +702,10 @@ export function claimNext(input: {
       throw new FeedbackError("FEEDBACK_EPOCH_STALE", "旧绑定不能领取事件");
     }
     const ready = recovered.events
-      .filter((e) => e.status === "ready")
+      .filter((e) => e.status === "ready"
+        && e.targetBindingId === input.bindingId
+        && e.targetEpoch === input.epoch
+        && e.targetPrincipalFingerprint === input.principal.fingerprint)
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
     if (ready.length === 0) {
       throw new FeedbackError("FEEDBACK_NO_READY_EVENT", "没有可领取的 ready 事件");
@@ -818,7 +835,10 @@ export function reserveNext(input: {
       );
     }
     const ready = recovered.events
-      .filter((e) => e.status === "ready")
+      .filter((e) => e.status === "ready"
+        && e.targetBindingId === input.bindingId
+        && e.targetEpoch === input.epoch
+        && e.targetPrincipalFingerprint === input.principalFingerprint)
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
     if (ready.length === 0) {
       throw new FeedbackError("FEEDBACK_NO_READY_EVENT", "没有可预占的 ready 事件");

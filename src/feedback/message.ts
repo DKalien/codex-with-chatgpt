@@ -39,6 +39,13 @@ function safeInline(
   return clamp(normalizeInline(String(text ?? "")), max);
 }
 
+function oneLineJson(value: unknown): string {
+  return JSON.stringify(value)
+    .replace(/\u2028/g, "\\u2028")
+    .replace(/\u2029/g, "\\u2029")
+    .replace(/[\r\n\t]/g, (char) => char === "\r" ? "\\r" : char === "\n" ? "\\n" : "\\t");
+}
+
 function formatChangedFiles(files: readonly string[] | undefined): string {
   const list = Array.isArray(files) ? files : [];
   const normalized = list.map((f) => clamp(normalizeInline(f), MAX_CHANGED_FILE_PATH_CHARS));
@@ -87,6 +94,15 @@ export function formatProductionFeedbackMessage(event: ProductionFeedbackMessage
     `CHANGED_FILES: ${formatChangedFiles(event.changedFilesSummary)}`,
     `TESTS: ${tests}`,
     `OUTPUT_AVAILABLE: ${event.outputAvailable}`,
+    ...(event.rawSummary ? [`RAW_SUMMARY_JSON: ${oneLineJson(event.rawSummary)}`] : []),
+    ...(event.machineEvidence ? [`MACHINE_EVIDENCE_JSON: ${oneLineJson({
+      version: event.machineEvidence.version,
+      source: event.machineEvidence.source,
+      status: event.machineEvidence.status,
+      changedFiles: event.machineEvidence.changedFiles.slice(0, 200),
+      testsSummary: event.machineEvidence.testsSummary,
+      output: event.machineEvidence.output,
+    })}`] : []),
     `INSTRUCTION: ${PRODUCTION_FEEDBACK_INSTRUCTION}`,
   ].join("\n");
 }

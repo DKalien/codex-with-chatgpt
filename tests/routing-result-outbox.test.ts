@@ -24,6 +24,7 @@ import {
   markResultReconciliationNeeded,
   resultOutboxFile,
   resultReconciliationQueueFile,
+  resolveResultOutboxEntries,
 } from "../src/routing/result-outbox-store.js";
 import {
   resultOutboxStateSchema,
@@ -236,6 +237,33 @@ describe("routing result outbox", () => {
     expect(result).not.toHaveProperty("machineEvidence");
     expect(result.outboxEntryId).toBe(createHash("sha256")
       .update(JSON.stringify([identity.id, "cmd-001", 1]), "utf8").digest("hex"));
+  });
+
+  it("resolves a pending entry to the exact canonical result and persisted planner route", () => {
+    const { plannerRouteId } = commandAndResult("cmd-001", planner("a".repeat(32)).routeId);
+    enqueueResultOutboxEntry(identity, { commandId: "cmd-001", iteration: 1 }, stateDir);
+    const resolved = resolveResultOutboxEntries(identity, stateDir);
+    expect(resolved).toHaveLength(1);
+    expect(resolved[0]!.entry.plannerRouteId).toBe(plannerRouteId);
+    expect(resolved[0]!.result.commandId).toBe("cmd-001");
+    expect(resolved[0]!.plannerRoute.role).toBe("planner");
+  });
+
+  it.each([
+    ["platform", (route: Record<string, unknown>) => {
+      route.platform = "codex_desktop";
+      route.conversationId = "01a00000-0000-7000-8000-000000000199";
+      route.locator = { hostId: "local", executorProjectId: "planner-project" };
+    }],
+    ["principal", (route: Record<string, unknown>) => { route.conversationId = "not-a-32-hex-principal"; }],
+  ] as const)("rejects invalid planner route %s with stable error", (_name, mutate) => {
+    commandAndResult("invalid-planner");
+    enqueueResultOutboxEntry(identity, { commandId: "invalid-planner", iteration: 1 }, stateDir);
+    mutateRouting((state) => {
+      const routeId = state.commands.find((item) => item.commandId === "invalid-planner")!.plannerRouteId;
+      mutate(state.routes.find((route) => route.routeId === routeId)! as unknown as Record<string, unknown>);
+    });
+    expect(errorCode(() => resolveResultOutboxEntries(identity, stateDir))).toBe("RESULT_OUTBOX_PLANNER_INVALID");
   });
 
   it.each(["summary", "evidence", "plannerRouteId", "resultId", "status"] as const)(
