@@ -1148,11 +1148,20 @@ def _turn_text_for_reconciliation(turn: dict[str, Any]) -> str | None:
     params = turn.get("params")
     raw_input = params.get("input") if isinstance(params, dict) else None
     items = turn.get("items")
-    if not isinstance(raw_input, list) or len(raw_input) != 1 or not isinstance(items, list):
+    if not isinstance(params, dict) or not isinstance(raw_input, list) or not isinstance(items, list):
         raise _error("DESKTOP_STATE_UNAVAILABLE")
     user_messages = [item for item in items if isinstance(item, dict) and item.get("type") == "userMessage"]
     if len(user_messages) != 1 or user_messages[0].get("content") != raw_input:
         raise _error("DESKTOP_STATE_UNAVAILABLE")
+    if len(raw_input) == 0:
+        raise _error("DESKTOP_STATE_UNAVAILABLE")
+    # C2C wire sends exactly one input. Only a strictly mirrored multi-input
+    # composer turn is therefore known non-C2C history, not malformed state.
+    if len(raw_input) > 1:
+        if (any(not isinstance(item, dict) for item in raw_input)
+                or any(not isinstance(item, dict) for item in items)):
+            raise _error("DESKTOP_STATE_UNAVAILABLE")
+        return None
     item = raw_input[0]
     if (not isinstance(item, dict) or set(item) != {"type", "text", "text_elements"}
             or item.get("type") != "text" or item.get("text_elements") != []):
@@ -1337,11 +1346,35 @@ def _reconcile_turn_ids(state: dict[str, Any], expectation: dict[str, Any], targ
     candidates: list[str] = []
     # reconciliation 只接受 canonical、已 exhaust 的完整历史；flat turns
     # 没有完整性边界，不能证明“零候选”是真实零候选。
-    for turn in _complete_result_turns(state):
+    turns = _complete_result_turns(state)
+    predecessors: dict[str, dict[str, Any]] = {}
+    history = state["turnHistory"]["history"]
+    entities = history["entitiesByKey"]
+    for island in history["islands"]:
+        previous: dict[str, Any] | None = None
+        for entry in island["entries"]:
+            turn = entities[entry["value"]]
+            turn_id = _uuid(turn.get("turnId"))
+            if turn_id is None:
+                raise _error("DESKTOP_STATE_UNAVAILABLE")
+            if previous is not None:
+                predecessors[turn_id] = previous
+            previous = turn
+    for turn in turns:
         try:
             text = _turn_text_for_reconciliation(turn)
         except DesktopIpcError:
-            _native_successor(turn, target)
+            turn_id = _uuid(turn.get("turnId"))
+            predecessor = predecessors.get(turn_id) if turn_id is not None else None
+            if predecessor is None:
+                raise
+            items = turn.get("items")
+            if (not isinstance(items, list) or any(
+                    not isinstance(item, dict)
+                    or item.get("type") not in RESULT_ACTIVITY_ITEM_TYPES | {"toolResult"}
+                    for item in items)):
+                raise
+            _native_continuation_edge(predecessor, turn, target)
             continue
         if text is None:
             continue

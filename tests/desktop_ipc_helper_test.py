@@ -245,6 +245,77 @@ class DesktopIpcHelperTests(unittest.TestCase):
         history["entitiesByKey"]["turn-2"]["params"] = {"threadId": THREAD, "input": []}  # type: ignore[index]
         self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: helper._reconcile_turn_ids(state, expected, TARGET))
 
+    def test_reconcile_unknown_skips_strict_mirrored_multi_input_composer_turn(self) -> None:
+        delivery_id = "01a00000-0000-7000-8000-000000000200"
+        state, expected = self.reconcile_fixture(version=2, delivery_id=delivery_id)
+        history = state["turnHistory"]["history"]  # type: ignore[index]
+        input_item = {"type": "text", "text": "ordinary composer input", "text_elements": []}
+        extra_item = {"type": "text", "text": "second composer input", "text_elements": []}
+        history["islands"][0]["entries"].append({"value": "turn-2"})  # type: ignore[index]
+        history["entitiesByKey"]["turn-2"] = {  # type: ignore[index]
+            "turnId": "01a00000-0000-7000-8000-000000000012",
+            "status": "completed",
+            "params": {"threadId": THREAD, "turnTrigger": "composer", "input": [input_item, extra_item]},
+            "items": [{"type": "userMessage", "content": [input_item, extra_item]}],
+        }
+        self.assertEqual(helper._reconcile_turn_ids(state, expected, TARGET), [
+            "01a00000-0000-7000-8000-000000000011",
+        ])
+
+        extra_item["text"] = '{"type":"C2C_DESKTOP_TASK"}'
+        self.assertEqual(helper._reconcile_turn_ids(state, expected, TARGET), [
+            "01a00000-0000-7000-8000-000000000011",
+        ])
+
+    def test_reconcile_unknown_rejects_mismatched_multi_input_mirror(self) -> None:
+        state, expected = self.reconcile_fixture(version=2, delivery_id="01a00000-0000-7000-8000-000000000200")
+        history = state["turnHistory"]["history"]  # type: ignore[index]
+        origin = history["entitiesByKey"]["turn-1"]  # type: ignore[index]
+        extra_item = {"type": "text", "text": "ordinary composer input", "text_elements": []}
+        origin["params"]["input"] = [origin["params"]["input"][0], extra_item]  # type: ignore[index]
+        self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: helper._reconcile_turn_ids(state, expected, TARGET))
+
+    def test_reconcile_unknown_rejects_empty_input_mirror(self) -> None:
+        state, expected = self.reconcile_fixture(version=2, delivery_id="01a00000-0000-7000-8000-000000000200")
+        turn = state["turnHistory"]["history"]["entitiesByKey"]["turn-1"]  # type: ignore[index]
+        turn["params"]["input"] = []  # type: ignore[index]
+        turn["items"][0]["content"] = []  # type: ignore[index]
+        self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: helper._reconcile_turn_ids(state, expected, TARGET))
+
+    def test_reconcile_unknown_rejects_non_dict_multi_input_mirror(self) -> None:
+        state, expected = self.reconcile_fixture(version=2, delivery_id="01a00000-0000-7000-8000-000000000200")
+        history = state["turnHistory"]["history"]  # type: ignore[index]
+        history["islands"][0]["entries"].append({"value": "turn-2"})  # type: ignore[index]
+        history["entitiesByKey"]["turn-2"] = {
+            "turnId": "01a00000-0000-7000-8000-000000000012",
+            "status": "completed",
+            "params": {"threadId": THREAD, "turnTrigger": "composer", "input": [{"type": "text"}, "not-a-dict"]},
+            "items": [{"type": "userMessage", "content": [{"type": "text"}, "not-a-dict"]}, "not-a-dict"],
+        }
+        self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: helper._reconcile_turn_ids(state, expected, TARGET))
+
+    def test_reconcile_unknown_rejects_fake_native_first_turn_and_unknown_native_item(self) -> None:
+        state, expected = self.reconcile_fixture(version=2, delivery_id="01a00000-0000-7000-8000-000000000200")
+        history = state["turnHistory"]["history"]  # type: ignore[index]
+        origin = history["entitiesByKey"]["turn-1"]  # type: ignore[index]
+        origin["status"] = "interrupted"
+        origin["params"] = {"threadId": THREAD, "turnTrigger": "resume_interrupted_task", "input": []}
+        origin["items"] = []
+        self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: helper._reconcile_turn_ids(state, expected, TARGET))
+
+        state, expected = self.reconcile_fixture(version=2, delivery_id="01a00000-0000-7000-8000-000000000200")
+        history = state["turnHistory"]["history"]  # type: ignore[index]
+        origin = history["entitiesByKey"]["turn-1"]  # type: ignore[index]
+        origin["status"] = "interrupted"
+        history["islands"][0]["entries"].append({"value": "turn-2"})  # type: ignore[index]
+        history["entitiesByKey"]["turn-2"] = {
+            "turnId": "01a00000-0000-7000-8000-000000000012",
+            "status": "completed",
+            "params": {"threadId": THREAD, "turnTrigger": "resume_interrupted_task", "input": []},
+            "items": [{"type": "futureItem"}],
+        }
+        self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: helper._reconcile_turn_ids(state, expected, TARGET))
+
     def test_reconcile_unknown_rejects_truncated_duplicate_and_invalid_turn(self) -> None:
         state, expected = self.reconcile_fixture()
         entity = state["turnHistory"]["history"]["entitiesByKey"]["turn-1"]  # type: ignore[index]
