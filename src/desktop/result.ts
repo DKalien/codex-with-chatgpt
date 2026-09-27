@@ -636,12 +636,10 @@ export async function recordDesktopResult(
   if (initial.deliveryStatus === "accepted") {
     accepted = initial;
   } else if (initial.deliveryStatus === "outcome_unknown" && initial.intent !== undefined) {
-    const current = await readCurrentResultContext(workspace, threadId);
-    const reconciled = await reconcileUnknownDesktopDelivery(workspace, input.commandId, {
-      expectedTurnId: current.resultTurnId,
-    });
-    if (reconciled.status !== "accepted" || reconciled.turnId !== current.resultTurnId) {
-      throw new DesktopResultError("DESKTOP_RESULT_THREAD", "当前 Desktop result turn 没有唯一精确的 canonical history 候选；未记录执行结果。");
+    await readCurrentResultContext(workspace, threadId);
+    const reconciled = await reconcileUnknownDesktopDelivery(workspace, input.commandId);
+    if (reconciled.status !== "accepted") {
+      throw new DesktopResultError("DESKTOP_RESULT_THREAD", "Desktop 投递没有唯一精确的 canonical history origin 候选；未记录执行结果。");
     }
     accepted = assertDesktopResultContext(workspace, input.commandId, threadId);
   } else {

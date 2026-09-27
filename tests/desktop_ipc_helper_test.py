@@ -210,7 +210,7 @@ class DesktopIpcHelperTests(unittest.TestCase):
 
     def test_reconcile_unknown_requires_one_exact_envelope_and_hash(self) -> None:
         state, expected = self.reconcile_fixture()
-        self.assertEqual(helper._reconcile_turn_ids(state, expected), ["01a00000-0000-7000-8000-000000000011"])
+        self.assertEqual(helper._reconcile_turn_ids(state, expected, TARGET), ["01a00000-0000-7000-8000-000000000011"])
         for name, overrides in {
             "wrong_command": {"commandId": "other_command"},
             "wrong_workspace": {"workspaceId": "other_workspace"},
@@ -218,56 +218,76 @@ class DesktopIpcHelperTests(unittest.TestCase):
         }.items():
             with self.subTest(name=name):
                 changed, same_expected = self.reconcile_fixture(**overrides)
-                self.assertEqual(helper._reconcile_turn_ids(changed, same_expected), [])
+                self.assertEqual(helper._reconcile_turn_ids(changed, same_expected, TARGET), [])
 
         wrong_hash = dict(expected, messageSha256="0" * 64)
-        self.assertEqual(helper._reconcile_turn_ids(state, wrong_hash), [])
+        self.assertEqual(helper._reconcile_turn_ids(state, wrong_hash, TARGET), [])
         wrong_body, _ = self.reconcile_fixture(message="不同正文")
-        self.assertEqual(helper._reconcile_turn_ids(wrong_body, expected), [])
+        self.assertEqual(helper._reconcile_turn_ids(wrong_body, expected, TARGET), [])
+
+    def test_reconcile_unknown_skips_only_strict_native_continuation(self) -> None:
+        delivery_id = "01a00000-0000-7000-8000-000000000200"
+        state, expected = self.reconcile_fixture(version=2, delivery_id=delivery_id)
+        history = state["turnHistory"]["history"]  # type: ignore[index]
+        origin = history["entitiesByKey"]["turn-1"]  # type: ignore[index]
+        origin["status"] = "interrupted"
+        history["islands"][0]["entries"].append({"value": "turn-2"})  # type: ignore[index]
+        history["entitiesByKey"]["turn-2"] = {  # type: ignore[index]
+            "turnId": "01a00000-0000-7000-8000-000000000012",
+            "status": "completed",
+            "params": {"threadId": THREAD, "turnTrigger": "resume_interrupted_task", "input": []},
+            "items": [{"type": "agentMessage"}],
+        }
+        self.assertEqual(helper._reconcile_turn_ids(state, expected, TARGET), [
+            "01a00000-0000-7000-8000-000000000011",
+        ])
+
+        history["entitiesByKey"]["turn-2"]["params"] = {"threadId": THREAD, "input": []}  # type: ignore[index]
+        self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: helper._reconcile_turn_ids(state, expected, TARGET))
 
     def test_reconcile_unknown_rejects_truncated_duplicate_and_invalid_turn(self) -> None:
         state, expected = self.reconcile_fixture()
         entity = state["turnHistory"]["history"]["entitiesByKey"]["turn-1"]  # type: ignore[index]
         entity["params"]["input"][0]["text"] = '{"type":"C2C_DESKTOP_TASK"}'  # type: ignore[index]
         entity["items"][0]["content"] = entity["params"]["input"]  # type: ignore[index]
-        self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: helper._reconcile_turn_ids(state, expected))
+        self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: helper._reconcile_turn_ids(state, expected, TARGET))
 
         state, expected = self.reconcile_fixture()
         entity = state["turnHistory"]["history"]["entitiesByKey"]["turn-1"]  # type: ignore[index]
         entity["params"]["input"][0]["text"] = '{"type":"C2C_DESKTOP_TASK","type":"C2C_DESKTOP_TASK"}'  # type: ignore[index]
         entity["items"][0]["content"] = entity["params"]["input"]  # type: ignore[index]
-        self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: helper._reconcile_turn_ids(state, expected))
+        self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: helper._reconcile_turn_ids(state, expected, TARGET))
 
         state, expected = self.reconcile_fixture()
         history = state["turnHistory"]["history"]  # type: ignore[index]
         history["islands"].append({"entries": [{"value": "turn-2"}], "newerBoundary": {"status": "exhausted"}})  # type: ignore[index]
         history["entitiesByKey"]["turn-2"] = copy.deepcopy(history["entitiesByKey"]["turn-1"])  # type: ignore[index]
         history["entitiesByKey"]["turn-2"]["turnId"] = "01a00000-0000-7000-8000-000000000012"  # type: ignore[index]
-        self.assertEqual(helper._reconcile_turn_ids(state, expected), [
+        self.assertEqual(helper._reconcile_turn_ids(state, expected, TARGET), [
             "01a00000-0000-7000-8000-000000000011",
             "01a00000-0000-7000-8000-000000000012",
         ])
 
         invalid, expected = self.reconcile_fixture(turn_id="not-a-uuid")
-        self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: helper._reconcile_turn_ids(invalid, expected))
+        self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: helper._reconcile_turn_ids(invalid, expected, TARGET))
 
         mismatched, expected = self.reconcile_fixture()
         entity = mismatched["turnHistory"]["history"]["entitiesByKey"]["turn-1"]  # type: ignore[index]
         entity["items"][0]["content"][0]["text"] = "different rendered input"  # type: ignore[index]
-        self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: helper._reconcile_turn_ids(mismatched, expected))
+        self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: helper._reconcile_turn_ids(mismatched, expected, TARGET))
 
     def test_reconcile_v2_binds_exact_delivery_id_and_v1_stays_v1_only(self) -> None:
         delivery_id = "01a00000-0000-7000-8000-000000000200"
         state, expected = self.reconcile_fixture(version=2, delivery_id=delivery_id)
-        self.assertEqual(helper._reconcile_turn_ids(state, expected), ["01a00000-0000-7000-8000-000000000011"])
+        self.assertEqual(helper._reconcile_turn_ids(state, expected, TARGET), ["01a00000-0000-7000-8000-000000000011"])
         self.assertEqual(helper._reconcile_expectation(expected)["deliveryId"], delivery_id)
-        self.assertEqual(helper._reconcile_turn_ids(state, {key: value for key, value in expected.items() if key != "deliveryId"}), [])
-        self.assertEqual(helper._reconcile_turn_ids(state, {**expected, "deliveryId": "01a00000-0000-7000-8000-000000000201"}), [])
+        self.assertEqual(helper._reconcile_turn_ids(state, {key: value for key, value in expected.items() if key != "deliveryId"}, TARGET), [])
+        self.assertEqual(helper._reconcile_turn_ids(state, {**expected, "deliveryId": "01a00000-0000-7000-8000-000000000201"}, TARGET), [])
 
         missing_id, v1_expected = self.reconcile_fixture(version=2)
-        self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: helper._reconcile_turn_ids(missing_id, v1_expected))
+        self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: helper._reconcile_turn_ids(missing_id, v1_expected, TARGET))
         extra_v1, v1_expected = self.reconcile_fixture(version=1, deliveryId=delivery_id)
-        self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: helper._reconcile_turn_ids(extra_v1, v1_expected))
+        self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: helper._reconcile_turn_ids(extra_v1, v1_expected, TARGET))
 
     def test_reconcile_v2_rejects_noncanonical_or_duplicate_delivery_id(self) -> None:
         delivery_id = "01a00000-0000-7000-8000-000000000200"
@@ -283,7 +303,7 @@ class DesktopIpcHelperTests(unittest.TestCase):
             turn["params"]["input"] = [item]  # type: ignore[index]
             turn["items"][0]["content"] = [item]  # type: ignore[index]
             with self.subTest(text=text):
-                self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: helper._reconcile_turn_ids(state, expected))
+                self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: helper._reconcile_turn_ids(state, expected, TARGET))
 
         bad_expectation = {"workspaceId": "workspace_test", "commandId": "command_test", "intent": "development_plan",
                            "messageBytes": 1, "messageSha256": "0" * 64, "deliveryId": "01A00000-0000-7000-8000-000000000200"}
@@ -292,10 +312,10 @@ class DesktopIpcHelperTests(unittest.TestCase):
     def test_reconcile_unknown_requires_canonical_complete_history_and_exact_thread_root(self) -> None:
         state, expected = self.reconcile_fixture()
         flat = self.valid_state()
-        self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: helper._reconcile_turn_ids(flat, expected))
+        self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: helper._reconcile_turn_ids(flat, expected, TARGET))
         incomplete = copy.deepcopy(state)
         incomplete["turnHistory"]["history"]["islands"][-1]["newerBoundary"]["status"] = "loading"  # type: ignore[index]
-        self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: helper._reconcile_turn_ids(incomplete, expected))
+        self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: helper._reconcile_turn_ids(incomplete, expected, TARGET))
 
         wrong_thread = dict(state, id="01a00000-0000-7000-8000-000000000099")
         self.assert_code("DESKTOP_TARGET_NOT_FOUND", lambda: helper._validate_observed_state(wrong_thread, TARGET, OWNER))

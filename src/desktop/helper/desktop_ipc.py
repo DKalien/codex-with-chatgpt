@@ -1333,12 +1333,16 @@ def _desktop_task_matches(expectation: dict[str, Any], envelope: dict[str, Any])
             (version == 1 or envelope.get("deliveryId") == expectation["deliveryId"]))
 
 
-def _reconcile_turn_ids(state: dict[str, Any], expectation: dict[str, Any]) -> list[str]:
+def _reconcile_turn_ids(state: dict[str, Any], expectation: dict[str, Any], target: dict[str, str]) -> list[str]:
     candidates: list[str] = []
     # reconciliation 只接受 canonical、已 exhaust 的完整历史；flat turns
     # 没有完整性边界，不能证明“零候选”是真实零候选。
     for turn in _complete_result_turns(state):
-        text = _turn_text_for_reconciliation(turn)
+        try:
+            text = _turn_text_for_reconciliation(turn)
+        except DesktopIpcError:
+            _native_successor(turn, target)
+            continue
         if text is None:
             continue
         envelope = _parse_desktop_task(text)
@@ -1360,11 +1364,11 @@ def _reconcile_unknown(target: dict[str, str], expectation_value: Any) -> dict[s
         if before is None or session.client.snapshot_age() > MAX_OBSERVATION_AGE_SECONDS:
             raise _error("DESKTOP_STATE_UNAVAILABLE")
         _validate_observed_state(before, target, session.client.owner or "")
-        before_candidates = _reconcile_turn_ids(before, expectation)
+        before_candidates = _reconcile_turn_ids(before, expectation, target)
         _verify_process_identity(session.pipe, target, session.process)
         after = session.client.snapshot()
         _validate_observed_state(after, target, session.client.owner or "")
-        after_candidates = _reconcile_turn_ids(after, expectation)
+        after_candidates = _reconcile_turn_ids(after, expectation, target)
         _verify_process_identity(session.pipe, target, session.process)
         if before_candidates != after_candidates:
             raise _error("DESKTOP_RECONCILIATION_CONFLICT")
