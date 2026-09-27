@@ -598,7 +598,33 @@ class DesktopIpcHelperTests(unittest.TestCase):
         self.assertEqual(decoder.feed(frame[3:]), [payload])
         self.assert_code("DESKTOP_PROTOCOL_ERROR", lambda: decoder.feed(b"\x01\x00\x00\x00\xff"))
         self.assert_code("DESKTOP_PROTOCOL_ERROR", lambda: helper._Decoder().feed(
-            (helper.MAX_FRAME_BYTES + 1).to_bytes(4, "little")))
+            (helper.MAX_INBOUND_FRAME_BYTES + 1).to_bytes(4, "little")))
+
+    def test_decoder_accepts_large_inbound_frame_in_bounded_chunks(self) -> None:
+        text_size = helper.MAX_OUTBOUND_FRAME_BYTES + 1024
+        body = b'{"type":"snapshot","text":"' + b"x" * text_size + b'"}'
+        self.assertGreater(len(body), helper.MAX_OUTBOUND_FRAME_BYTES)
+        self.assertLessEqual(len(body), helper.MAX_INBOUND_FRAME_BYTES)
+        frame = len(body).to_bytes(4, "little") + body
+
+        decoder = helper._Decoder()
+        decoded = []
+        for offset in range(0, len(frame), helper.MAX_PIPE_READ_BYTES):
+            decoded.extend(decoder.feed(frame[offset:offset + helper.MAX_PIPE_READ_BYTES]))
+
+        self.assertEqual(len(decoded), 1)
+        self.assertEqual(decoded[0]["type"], "snapshot")
+        self.assertEqual(len(decoded[0]["text"]), text_size)
+        self.assertEqual(decoder.data, bytearray())
+
+    def test_outbound_frame_limit_remains_16_mib(self) -> None:
+        self.assert_code("DESKTOP_PROTOCOL_ERROR", lambda: helper._frame(
+            {"text": "x" * helper.MAX_OUTBOUND_FRAME_BYTES}))
+
+        pipe = object.__new__(helper._Pipe)
+        with patch.object(helper._Pipe, "verify_server"):
+            self.assert_code("DESKTOP_PROTOCOL_ERROR", lambda: pipe.write(
+                b"x" * (helper.MAX_OUTBOUND_FRAME_BYTES + 5)))
 
     def test_pipe_reads_large_multi_frame_backlog_in_bounded_chunks(self) -> None:
         payloads = [{"type": "first", "text": "x" * (helper.MAX_FRAME_BYTES // 2)},

@@ -35,7 +35,9 @@ from typing import Any, Literal
 
 PIPE_NAME = r"\\.\pipe\codex-ipc"
 MAX_MESSAGE_BYTES = 64 * 1024
-MAX_FRAME_BYTES = 16 * 1024 * 1024
+MAX_OUTBOUND_FRAME_BYTES = 16 * 1024 * 1024
+MAX_INBOUND_FRAME_BYTES = 32 * 1024 * 1024
+MAX_FRAME_BYTES = MAX_OUTBOUND_FRAME_BYTES  # 兼容旧名称；仍表示 outbound 帧上限
 MAX_PIPE_READ_BYTES = 1024 * 1024
 MAX_CONTROL_LINE_BYTES = 512 * 1024
 WRITE_TIMEOUT_SECONDS = 5.0
@@ -181,7 +183,7 @@ def _json_bytes(value: object) -> bytes:
         payload = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8", "strict")
     except (TypeError, UnicodeEncodeError, ValueError):
         raise _error("DESKTOP_PROTOCOL_ERROR")
-    if len(payload) > MAX_FRAME_BYTES:
+    if len(payload) > MAX_OUTBOUND_FRAME_BYTES:
         raise _error("DESKTOP_PROTOCOL_ERROR")
     return payload
 
@@ -200,7 +202,7 @@ class _Decoder:
         result: list[dict[str, Any]] = []
         while len(self.data) >= 4:
             size = struct.unpack_from("<I", self.data)[0]
-            if not 0 < size <= MAX_FRAME_BYTES:
+            if not 0 < size <= MAX_INBOUND_FRAME_BYTES:
                 raise _error("DESKTOP_PROTOCOL_ERROR")
             if len(self.data) < size + 4:
                 break
@@ -397,7 +399,7 @@ class _Pipe:
 
     def write(self, data: bytes) -> None:
         self.verify_server()
-        if not isinstance(data, bytes) or len(data) > MAX_FRAME_BYTES + 4:
+        if not isinstance(data, bytes) or len(data) > MAX_OUTBOUND_FRAME_BYTES + 4:
             raise _error("DESKTOP_PROTOCOL_ERROR")
         handle = self._require_handle()
         event = _kernel32.CreateEventW(None, True, False, None)
