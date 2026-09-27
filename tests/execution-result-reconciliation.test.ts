@@ -146,6 +146,55 @@ function createAcceptedCommand(options: {
   return stored;
 }
 
+function createOutcomeUnknownCommand(options: {
+  commandId: string;
+  message: string;
+  deliveryStatus?: "accepted" | "outcome_unknown";
+  messageSha256?: string;
+}) {
+  createCommand(workspace, {
+    commandId: options.commandId,
+    plannerRouteId,
+    executorRouteId,
+    intent: "development_plan",
+    payloadBytes: Buffer.byteLength(options.message),
+    payloadSha256: sha256(options.message),
+  });
+  transitionCommandDelivery(workspace, {
+    commandId: options.commandId,
+    deliveryStatus: "outcome_unknown",
+  });
+  if (options.deliveryStatus === "accepted") {
+    const now = new Date().toISOString();
+    updateDesktop(workspace.id, previous => ({
+      state: {
+        ...previous!,
+        deliveries: [...previous!.deliveries, {
+          commandId: options.commandId,
+          clientId: "client-r4c3",
+          bindingId: BINDING,
+          intent: "development_plan",
+          messageSha256: options.messageSha256 ?? sha256(options.message),
+          messageBytes: Buffer.byteLength(options.message),
+          threadId: THREAD,
+          turnId: TURN_2,
+          deliveryStatus: "accepted",
+          createdAt: now,
+          updatedAt: now,
+        }],
+      },
+      result: undefined,
+    }));
+    appendRecord(receipt({
+      commandId: options.commandId,
+      summary: `Codex completed ${options.commandId}.`,
+      threadId: THREAD,
+      turnId: TURN_2,
+      bindingId: BINDING,
+    }));
+  }
+}
+
 function reconcile(commandId = COMMAND) {
   return reconcileTrustedDesktopExecutionResult(workspace, commandId);
 }
@@ -205,6 +254,38 @@ afterEach(() => {
 });
 
 describe("R4b trusted Desktop execution result reconciliation", () => {
+  it("outcome_unknown Command 在唯一 Desktop accepted proof 后收敛并生成 canonical result/outbox", () => {
+    const commandId = "r4c3-outcome-unknown-recovery";
+    createOutcomeUnknownCommand({ commandId, message: "recover R4c3" , deliveryStatus: "accepted" });
+
+    expect(reconcile(commandId)).toMatchObject({ status: "reconciled", plannerRouteId });
+    expect(readRouting(workspace)?.commands.find(command => command.commandId === commandId)?.deliveryStatus)
+      .toBe("accepted");
+    expect(readRouting(workspace)?.results.filter(result => result.commandId === commandId)).toHaveLength(1);
+    expect(listResultOutboxEntries(workspace).filter(entry => entry.commandId === commandId)).toHaveLength(1);
+    expect(reconcile(commandId)).toMatchObject({ status: "reconciled", resultReplayed: true, outboxReplayed: true });
+  });
+
+  it("Desktop 仍为 outcome_unknown 时不改写 Routing Command", () => {
+    const commandId = "r4c3-outcome-unknown-still-unknown";
+    createOutcomeUnknownCommand({ commandId, message: "still unknown" });
+    expect(reconcile(commandId)).toMatchObject({
+      status: "reconciliation_needed", reasonCode: "ROUTING_COMMAND_DESKTOP_PROOF_CONFLICT", issuePersisted: true,
+    });
+    expect(readRouting(workspace)?.commands.find(command => command.commandId === commandId)?.deliveryStatus)
+      .toBe("outcome_unknown");
+  });
+
+  it("Desktop accepted proof 的 payload 漂移 fail closed 且不改写 Routing Command", () => {
+    const commandId = "r4c3-outcome-unknown-digest-drift";
+    createOutcomeUnknownCommand({ commandId, message: "digest drift", deliveryStatus: "accepted", messageSha256: sha256("other") });
+    expect(reconcile(commandId)).toMatchObject({
+      status: "reconciliation_needed", reasonCode: "ROUTING_COMMAND_DESKTOP_PROOF_CONFLICT", issuePersisted: true,
+    });
+    expect(readRouting(workspace)?.commands.find(command => command.commandId === commandId)?.deliveryStatus)
+      .toBe("outcome_unknown");
+  });
+
   it("accepted Command 与可信 Desktop receipt 生成 canonical result 和原 planner route 的 outbox", () => {
     const result = reconcile();
     const routing = readRouting(workspace);

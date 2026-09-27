@@ -1,5 +1,11 @@
 import { isTrustedDesktopReceipt, readExecutionRecordsStrict, withExecutionRecordsLock } from "../execution/records.js";
-import { appendResultWithReplay, readRouting, type RoutingWorkspaceIdentity } from "./store.js";
+import { readDesktop } from "../desktop/store.js";
+import {
+  appendResultWithReplay,
+  readRouting,
+  reconcileCommandDeliveryFromDesktopProof,
+  type RoutingWorkspaceIdentity,
+} from "./store.js";
 import { projectTrustedDesktopExecutionResult } from "./execution-result-projector.js";
 import {
   clearResultReconciliationNeeded,
@@ -35,6 +41,41 @@ function recordFailure(
   }
 }
 
+function synchronizeUnknownCommandDelivery(
+  identity: RoutingWorkspaceIdentity,
+  commandId: string,
+  state: NonNullable<ReturnType<typeof readRouting>>,
+): void {
+  const command = state.commands.find(item => item.commandId === commandId);
+  if (!command || command.deliveryStatus !== "outcome_unknown") return;
+
+  const desktop = readDesktop(identity.id);
+  if (!desktop || desktop.workspaceRoot !== identity.root) {
+    throw new RoutingError("ROUTING_COMMAND_DESKTOP_PROOF_CONFLICT", "Desktop workspace identity 不匹配。");
+  }
+  const deliveries = desktop.deliveries.filter(item => item.commandId === commandId);
+  if (deliveries.length !== 1) {
+    throw new RoutingError("ROUTING_COMMAND_DESKTOP_PROOF_CONFLICT", "Desktop delivery 缺失或不唯一。");
+  }
+  const delivery = deliveries[0]!;
+  if (delivery.deliveryStatus !== "accepted" || !delivery.turnId || delivery.intent === undefined) {
+    throw new RoutingError("ROUTING_COMMAND_NOT_ACCEPTED", "Desktop delivery 尚未确认 accepted。");
+  }
+  const executor = state.routes.find(route => route.routeId === command.executorRouteId);
+  if (!executor || executor.role !== "executor" || executor.platform !== "codex_desktop" ||
+      executor.conversationId !== delivery.threadId) {
+    throw new RoutingError("ROUTING_COMMAND_DESKTOP_PROOF_CONFLICT", "Desktop delivery 与 executor route 不一致。");
+  }
+  reconcileCommandDeliveryFromDesktopProof(identity, {
+    commandId,
+    intent: delivery.intent,
+    payloadBytes: delivery.messageBytes,
+    payloadSha256: delivery.messageSha256,
+    executorRouteId: command.executorRouteId,
+    threadId: delivery.threadId,
+  });
+}
+
 /**
  * Local post-receipt seam: use only the accepted Command captured at delivery time and its
  * trusted local receipt. Receipt, RoutingResult and Result Outbox are separate durable commits;
@@ -50,9 +91,15 @@ export function reconcileTrustedDesktopExecutionResult(
   }
 
   try {
-    const state = readRouting(identity);
-    const command = state?.commands.find(item => item.commandId === parsedCommandId.data);
+    let state = readRouting(identity);
+    let command = state?.commands.find(item => item.commandId === parsedCommandId.data);
     if (!command) return { status: "not_applicable", reason: "routing_command_missing" };
+    if (command.deliveryStatus === "outcome_unknown") {
+      synchronizeUnknownCommandDelivery(identity, command.commandId, state!);
+      state = readRouting(identity);
+      command = state?.commands.find(item => item.commandId === parsedCommandId.data);
+      if (!command) return { status: "not_applicable", reason: "routing_command_missing" };
+    }
     if (command.deliveryStatus !== "accepted") {
       throw new RoutingError("ROUTING_COMMAND_NOT_ACCEPTED", "canonical result 只接受已确认 Desktop delivery 的 Command。");
     }

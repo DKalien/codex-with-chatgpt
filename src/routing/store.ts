@@ -9,6 +9,7 @@ import {
   commandInputSchema,
   resultInputSchema,
   routeRegistrationSchema,
+  routingCommandIdSchema,
   routingStateSchema,
   routingWorkspaceIdSchema,
   type CommandInput,
@@ -361,6 +362,49 @@ export function transitionCommandDelivery(
         ...state,
         commands: state.commands.map((item) => item.commandId === parsed.commandId ? updated : item),
       },
+      result: updated,
+    };
+  }, stateDir);
+}
+
+/**
+ * 仅供 trusted Desktop canonical-result recovery 使用的 outcome_unknown 收敛。
+ * 普通 delivery transition 仍保持首个终态不可覆盖；调用方必须先证明本机
+ * Desktop accepted delivery 与 Command/executor route 的全部不可变事实一致。
+ */
+export function reconcileCommandDeliveryFromDesktopProof(
+  identity: RoutingWorkspaceIdentity,
+  input: {
+    commandId: string;
+    intent: RoutingCommand["intent"];
+    payloadBytes: number;
+    payloadSha256: string;
+    executorRouteId: string;
+    threadId: string;
+  },
+  stateDir = getStateDir(),
+): RoutingCommand {
+  const commandId = routingCommandIdSchema.parse(input.commandId);
+  return updateRouting(identity, (previous) => {
+    const state = previous ?? emptyState(identity);
+    const command = state.commands.find(item => item.commandId === commandId);
+    if (!command) throw new RoutingError("ROUTING_COMMAND_NOT_FOUND", "Desktop recovery 引用的 Command 不存在。");
+    if (command.intent !== input.intent || command.payloadBytes !== input.payloadBytes ||
+        command.payloadSha256 !== input.payloadSha256 || command.executorRouteId !== input.executorRouteId) {
+      throw new RoutingError("ROUTING_COMMAND_DESKTOP_PROOF_CONFLICT", "Desktop accepted proof 与 Routing Command 身份不一致。");
+    }
+    const executor = state.routes.find(route => route.routeId === command.executorRouteId);
+    if (!executor || executor.role !== "executor" || executor.platform !== "codex_desktop" ||
+        executor.conversationId !== input.threadId) {
+      throw new RoutingError("ROUTING_COMMAND_DESKTOP_PROOF_CONFLICT", "Desktop accepted proof 与 executor route 不一致。");
+    }
+    if (command.deliveryStatus === "accepted") return { state, result: command, noWrite: true };
+    if (command.deliveryStatus !== "outcome_unknown") {
+      throw new RoutingError("ROUTING_COMMAND_NOT_ACCEPTED", "只有 outcome_unknown Command 可由 trusted Desktop recovery 收敛。");
+    }
+    const updated: RoutingCommand = { ...command, deliveryStatus: "accepted", updatedAt: new Date().toISOString() };
+    return {
+      state: { ...state, commands: state.commands.map(item => item.commandId === commandId ? updated : item) },
       result: updated,
     };
   }, stateDir);
