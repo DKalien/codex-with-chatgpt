@@ -939,7 +939,6 @@ class _IpcClient:
             raise _error("DESKTOP_STATE_UNAVAILABLE")
         old = self.states.get(source)
         change_type = change.get("type")
-        now = time.monotonic()
         if change_type == "snapshot":
             state = change.get("conversationState")
             revision = change.get("revision")
@@ -947,15 +946,21 @@ class _IpcClient:
                 raise _error("DESKTOP_STATE_UNAVAILABLE")
             if old and revision < old[1]:
                 raise _error("DESKTOP_STATE_UNAVAILABLE")
+            # 陈旧度以"接收处理完成"为基准：解析/深拷贝大 snapshot 的耗时
+            # 是观察者自身开销，不应计入 freshness 窗口；否则大历史会因
+            # 客户端处理慢被误判为状态不可用。
+            state_copy = copy.deepcopy(state)
+            received_done = time.monotonic()
             self.snapshot_serial += 1
-            self.snapshot_meta[source] = (self.snapshot_serial, now)
-            self.states[source] = (copy.deepcopy(state), revision, now)
+            self.snapshot_meta[source] = (self.snapshot_serial, received_done)
+            self.states[source] = (state_copy, revision, received_done)
             self.state_change_kind = "snapshot"
         elif change_type == "patches" and old:
             revision = change.get("revision")
             if change.get("baseRevision") != old[1] or type(revision) is not int or revision <= old[1] or not isinstance(change.get("patches"), list):
                 raise _error("DESKTOP_STATE_UNAVAILABLE")
-            self.states[source] = (_patch_state(old[0], change["patches"]), revision, now)
+            patched_state = _patch_state(old[0], change["patches"])
+            self.states[source] = (patched_state, revision, time.monotonic())
             self.state_change_kind = "patches"
 
     def _pump(self, timeout: float) -> None:
@@ -1634,8 +1639,12 @@ def _prepare(target: dict[str, str], *, purpose: str = "send",
         info = _public_info(state, target, client)
         if purpose == "observe":
             client.drain(0.1)
+            # freshness 判定先于整份深拷贝：current_state 的拷贝开销属于
+            # 观察者自身，不应计入被观察状态的陈旧度。
+            if client.snapshot_age() > MAX_OBSERVATION_AGE_SECONDS:
+                raise _error("DESKTOP_STATE_UNAVAILABLE")
             state = client.current_state()
-            if state is None or client.snapshot_age() > MAX_OBSERVATION_AGE_SECONDS:
+            if state is None:
                 raise _error("DESKTOP_STATE_UNAVAILABLE")
             _validate_observed_state(state, target, client.owner or "")
             info = _public_info(state, target, client)

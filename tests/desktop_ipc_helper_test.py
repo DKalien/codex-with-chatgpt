@@ -10,6 +10,7 @@ import io
 import json
 import os
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from pathlib import Path
@@ -1059,6 +1060,104 @@ class DesktopIpcHelperTests(unittest.TestCase):
         self.assertEqual(replies[-1]["code"], "DESKTOP_OUTCOME_UNKNOWN")
         self.assertFalse(replies[-1]["notSent"])
 
+
+    def _slow_snapshot_frame(self, *, revision: int = 1) -> dict[str, object]:
+        return {
+            "type": "broadcast",
+            "method": "thread-stream-state-changed",
+            "version": 11,
+            "sourceClientId": OWNER,
+            "params": {
+                "conversationId": THREAD,
+                "hostId": "local",
+                "change": {
+                    "type": "snapshot",
+                    "revision": revision,
+                    "conversationState": self.valid_state(),
+                },
+            },
+        }
+
+    def test_snapshot_age_baseline_excludes_observer_processing_time(self) -> None:
+        """回归：snapshot 深拷贝耗时不应计入 freshness 陈旧度。
+
+        旧实现在帧处理开始时刻取时间戳，大 snapshot 的 deepcopy/解析耗时
+        全部被算进 snapshot_age，导致负载波动下被误判为状态不可用。
+        """
+        client = helper._IpcClient(Mock(), THREAD, "local")
+        client.owner = OWNER  # 离线测试直接建立 owner 归属；真实流程由 discover() 设置
+        frame = self._slow_snapshot_frame()
+        real_deepcopy = copy.deepcopy
+
+        def slow_deepcopy(value):
+            time.sleep(0.3)
+            return real_deepcopy(value)
+
+        with patch.object(helper.copy, "deepcopy", side_effect=slow_deepcopy):
+            client._handle(frame)
+        # 基准在处理完成之后：age 应几乎为零，而不是 ≥ deepcopy 耗时。
+        self.assertLess(client.snapshot_age(), 0.15)
+
+    def test_large_snapshot_handling_stays_inside_freshness_window(self) -> None:
+        """回归：大 snapshot / 慢 observe 场景，观察者自身拷贝不挤压窗口。"""
+        client = helper._IpcClient(Mock(), THREAD, "local")
+        client.owner = OWNER  # 离线测试直接建立 owner 归属；真实流程由 discover() 设置
+        frame = self._slow_snapshot_frame()
+        real_deepcopy = copy.deepcopy
+
+        def slow_deepcopy(value):
+            time.sleep(0.4)
+            return real_deepcopy(value)
+
+        with patch.object(helper.copy, "deepcopy", side_effect=slow_deepcopy):
+            client._handle(frame)
+            age_after_frame = client.snapshot_age()
+            state = client.current_state()
+            age_after_copy = client.snapshot_age()
+        self.assertIsNotNone(state)
+        self.assertLess(age_after_frame, 0.2)
+        # 只包含 current_state 拷贝期间的真实流逝，不含两段处理耗时。
+        self.assertLess(age_after_copy, 0.6)
+
+    def test_prepare_observe_checks_freshness_before_full_state_copy(self) -> None:
+        """回归：observe 编排先判新鲜度再做整份深拷贝，观察者开销不自我惩罚。"""
+        order: list[str] = []
+        state = self.valid_state()
+        state["title"] = "synthetic Desktop result"
+
+        class Client:
+            owner = OWNER
+
+            def initialize(self) -> None:
+                pass
+
+            def discover(self) -> str:
+                return OWNER
+
+            def drain(self, _seconds: float) -> None:
+                pass
+
+            def snapshot(self) -> dict[str, object]:
+                return copy.deepcopy(state)
+
+            def current_state(self) -> dict[str, object]:
+                order.append("current_state")
+                return copy.deepcopy(state)
+
+            def snapshot_age(self) -> float:
+                order.append("snapshot_age")
+                return 0.0
+
+        with patch.object(helper, "_query_standard_token"), \
+                patch.object(helper, "_Pipe", return_value=Mock()), \
+                patch.object(helper, "_verify_process_identity", return_value={"desktopPid": 100, "appServerPid": 101}), \
+                patch.object(helper, "_IpcClient", return_value=Client()):
+            prepared, info = helper._prepare(TARGET, purpose="observe")
+
+        self.assertIsNotNone(prepared)
+        self.assertEqual(info["ownerClientId"], OWNER)
+        self.assertEqual(order[0], "snapshot_age")
+        self.assertIn("current_state", order)
 
 if __name__ == "__main__":
     unittest.main()
