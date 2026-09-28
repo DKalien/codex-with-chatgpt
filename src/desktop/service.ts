@@ -7,7 +7,7 @@ import { DESKTOP_IPC_ERROR_MESSAGES, validateDesktopWireMessage } from "./ipc.js
 import { DesktopError, desktopId, publicDelivery, readDesktop, sendInput, targetInput, updateDesktop,
   type DesktopBinding, type DesktopDelivery, type DesktopState } from "./store.js";
 import { unresolvedOutcomeUnknownCommandIds, isOutcomeUnknownAdministrativelyResolved, assertNoOutcomeResolutionForCommand } from "./outcome-resolution.js";
-import { withEvidenceLock } from "./legacy-reconciliation.js";
+import { withEvidenceLock } from "./recovery-evidence.js";
 
 type LocalWorkspace = Pick<Workspace, "id" | "root">;
 const POST_RESULT_SETTLE_TIMEOUT_MS = 30_000;

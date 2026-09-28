@@ -17,7 +17,8 @@ import {
   type DesktopDelivery,
   type DesktopState,
 } from "./store.js";
-import { readLegacyReconciliations, withEvidenceLock } from "./legacy-reconciliation.js";
+import { readLegacyReconciliations } from "./legacy-reconciliation.js";
+import { withEvidenceLock } from "./recovery-evidence.js";
 import { readAbandonedCommandIds } from "./abandonment.js";
 import { unresolvedOutcomeUnknownCommandIds } from "./outcome-resolution.js";
 

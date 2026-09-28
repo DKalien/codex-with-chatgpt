@@ -13,7 +13,7 @@ import {
   type DesktopState,
 } from "./store.js";
 import { assertNoOutcomeResolutionForCommand } from "./outcome-resolution.js";
-import { withEvidenceLock } from "./legacy-reconciliation.js";
+import { withEvidenceLock } from "./recovery-evidence.js";
 
 export interface UnknownReconciliationWorkspace {
   id: string;

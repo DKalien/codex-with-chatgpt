@@ -13,6 +13,8 @@ import { listExecutionOutputs, readExecutionOutputMetadataStrict, MAX_OUTPUT_REC
 import { DesktopError, desktopId, readDesktop, type DesktopDelivery } from "./store.js";
 import { getRetiredLegacyCommandIds, readLegacyRetirements } from "./legacy-retirement.js";
 import { getAbandonedCommandIds, readAbandonedCommandIds } from "./abandonment.js";
+import { LegacyReconciliationError, withEvidenceLock } from "./recovery-evidence.js";
+export { LegacyReconciliationError, withEvidenceLock } from "./recovery-evidence.js";
 
 const terminalStatuses = new Set(["ok", "failed", "blocked"]);
 const uuid = z.string().uuid();
@@ -56,13 +58,6 @@ const evidenceStateSchema = z.object({
 
 export type LegacyReconciliationEvidence = z.infer<typeof evidenceEntrySchema>;
 
-export class LegacyReconciliationError extends DesktopError {
-  constructor(code: string, message: string, readonly discoveryStatus: "missing_execution" | "missing_output" | "conflict" = "conflict") {
-    super(code, message);
-    this.name = "LegacyReconciliationError";
-  }
-}
-
 export interface LegacyReconciliationWorkspace {
   id: string;
   root: string;
@@ -100,9 +95,6 @@ function markerFile(workspaceId: string): string {
   return `${legacyReconciliationFile(workspaceId)}.initialized`;
 }
 
-function lockFile(workspaceId: string): string {
-  return `${legacyReconciliationFile(workspaceId)}.lock`;
-}
 
 function hasTemporaryEvidence(workspaceId: string): boolean {
   const dir = path.dirname(legacyReconciliationFile(workspaceId));
@@ -156,27 +148,6 @@ function writeEvidenceState(workspaceId: string, state: { version: 1; workspaceI
       finally { fs.closeSync(markerFd); }
     }
   } finally { fs.rmSync(temporary, { force: true }); }
-}
-
-export function withEvidenceLock<T>(workspaceId: string, action: () => T): T {
-  const file = lockFile(workspaceId);
-  ensureDir(path.dirname(file));
-  let fd: number;
-  try { fd = fs.openSync(file, "wx", 0o600); }
-  catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-      throw new LegacyReconciliationError("LEGACY_RECONCILIATION_BUSY", "遗留 reconciliation 写锁繁忙；请稍后重试。");
-    }
-    throw error;
-  }
-  try {
-    fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, createdAt: Date.now() }));
-    fs.fsyncSync(fd);
-    return action();
-  } finally {
-    try { fs.closeSync(fd); }
-    finally { fs.unlinkSync(file); }
-  }
 }
 
 function canonical(value: unknown): value is string {

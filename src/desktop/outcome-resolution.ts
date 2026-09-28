@@ -6,7 +6,8 @@ import { ensureDir, getStateDir } from "../config/paths.js";
 import { isTrustedDesktopReceipt, readExecutionRecordsStrict, type StoredExecutionRecord } from "../execution/records.js";
 import { readExecutionOutputMetadataStrict, type ExecutionOutputMeta } from "../execution/output.js";
 import { readAbandonments } from "./abandonment.js";
-import { readLegacyReconciliations, withEvidenceLock } from "./legacy-reconciliation.js";
+import { readLegacyReconciliations } from "./legacy-reconciliation.js";
+import { withEvidenceLock } from "./recovery-evidence.js";
 import { readLegacyRetirements } from "./legacy-retirement.js";
 import { DesktopError, desktopId, readDesktop, type DesktopDelivery, type DesktopState } from "./store.js";
 
