@@ -43,7 +43,6 @@ import {
   validateUnknownReconcileObservation,
 } from "./ipc-validation.js";
 import { openHelperSession, resolveDesktopHelperPath } from "./ipc-transport.js";
-import type { HelperSession } from "./ipc-transport.js";
 
 export class DesktopIpcClient {
   private readonly spawnImpl: NonNullable<DesktopIpcOptions["spawnImpl"]>;
@@ -220,7 +219,7 @@ export class DesktopIpcClient {
     }
   }
 
-  private open(): HelperSession {
+  private open(): ReturnType<typeof openHelperSession> {
     return openHelperSession(
       this.platform,
       this.helperPath,

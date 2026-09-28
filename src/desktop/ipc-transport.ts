@@ -41,7 +41,7 @@ export function resolveDesktopHelperPath(moduleUrl = import.meta.url): string {
   return found ?? candidates[0];
 }
 
-export class HelperSession {
+class HelperSession {
   private readonly child: ChildProcess;
   private readonly pending = new Map<string, Pending>();
   private buffer = "";
@@ -158,8 +158,6 @@ export class HelperSession {
     }
   }
 }
-
-
 
 export function openHelperSession(
   platform: NodeJS.Platform,

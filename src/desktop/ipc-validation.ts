@@ -377,7 +377,7 @@ export function validateUnknownReconcileObservation(value: unknown, target: Desk
   return { ...target, hostId: "local", candidates: [...candidates] };
 }
 
-export function normalizePath(value: string): string {
+function normalizePath(value: string): string {
   const normalized = value.trim().replace(/\\/g, "/").replace(/\/+$/, "");
   return /^[A-Za-z]:\//.test(normalized) || normalized.startsWith("//") ? normalized.toLowerCase() : normalized;
 }

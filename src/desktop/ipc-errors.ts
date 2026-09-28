@@ -7,7 +7,7 @@ export const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
 // helper 仍处于合法 bounded proof window 时先杀掉它，制造不必要的
 // durable outcome_unknown。
 export const DEFAULT_SEND_TIMEOUT_MS = 90_000;
-export const MAX_TIMEOUT_MS = 120_000;
+const MAX_TIMEOUT_MS = 120_000;
 export const MAX_CONTROL_FRAME_BYTES = 512 * 1024;
 export const SEND_REQUEST_ID_PLACEHOLDER = "00000000-0000-0000-0000-000000000000";
 
@@ -69,7 +69,7 @@ export const ERROR_MESSAGES: Record<string, string> = {
   DESKTOP_RECONCILIATION_CONFLICT: "Desktop 历史无法唯一核对；未恢复结果或修改投递状态。",
 };
 
-export function messageFor(code: string, fallback = "DESKTOP_INTERNAL_ERROR"): string {
+function messageFor(code: string, fallback = "DESKTOP_INTERNAL_ERROR"): string {
   return ERROR_MESSAGES[code] ?? ERROR_MESSAGES[fallback] ?? "Desktop Control 暂时不可用。";
 }
 
