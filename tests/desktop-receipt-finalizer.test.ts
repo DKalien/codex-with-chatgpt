@@ -29,6 +29,7 @@ const originTurnId = "00000000-0000-4000-8000-000000000102";
 const resultTurnId = "00000000-0000-4000-8000-000000000103";
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const cliEntry = path.join(projectRoot, "src/cli/index.ts");
+const receiptFinalizerCliSource = path.join(projectRoot, "src/cli/desktop-receipt-finalizer.ts");
 
 function draft(stateDir: string) {
   return stageReceiptFinalization({
@@ -228,7 +229,7 @@ describe("Desktop receipt terminal fence", () => {
   });
 
   it("detached safe_terminal CLI routes committed receipts through the local result reconciler", () => {
-    const source = fs.readFileSync(cliEntry, "utf8");
+    const source = fs.readFileSync(receiptFinalizerCliSource, "utf8");
     expect(source).toMatch(/if\s*\(\s*["']record["']\s+in\s+result\s*\)\s*\{[\s\S]*?reconcileTrustedDesktopExecutionResult\([\s\S]*?draft\.commandId/);
     expect(source).toMatch(/runReceiptFinalizer\(draft,\s*\{[\s\S]*?beforeReceiptCommit:\s*receiptAlreadyExists\s*=>\s*prepareResultReconciliation/);
     expect(source).toMatch(/const reconciliationNeeded\s*=\s*resultOutbox\.status\s*===\s*["']reconciliation_needed["'][\s\S]*?if\s*\(\s*reconciliationNeeded\s*\)\s*process\.exitCode\s*=\s*1/);
