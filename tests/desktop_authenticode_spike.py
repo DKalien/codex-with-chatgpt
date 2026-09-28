@@ -13,7 +13,7 @@ import unicodedata
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src/desktop/helper"))
-import desktop_ipc
+from c2c_desktop_ipc.identity import _processes
 
 
 _VERIFY_V2 = 0x00AAC56B, 0xCD44, 0x11D0, (0x8C, 0xC2, 0x00, 0xC0, 0x4F, 0xC2, 0x95, 0xEE)
@@ -74,7 +74,7 @@ class _CertificateContext(ctypes.Structure):
 
 
 def _runtime_paths() -> tuple[str, str] | None:
-    rows = desktop_ipc._processes()
+    rows = _processes()
     desktops = [row for row in rows if row.get("name", "").casefold() == "chatgpt.exe"]
     pairs = []
     for desktop in desktops:

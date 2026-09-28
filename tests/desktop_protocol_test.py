@@ -13,7 +13,15 @@ from unittest.mock import Mock, patch
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src/desktop/helper"))
-import desktop_ipc as h
+from c2c_desktop_ipc import (  # noqa: E402
+    common as protocol_common,
+    dispatch as protocol_dispatch,
+    history as protocol_history,
+    identity as protocol_identity,
+    operations as protocol_operations,
+    result as protocol_result,
+    transport as protocol_transport,
+)
 
 THREAD = "01a00000-0000-7000-8000-000000000001"
 OWNER = "01a00000-0000-7000-8000-000000000002"
@@ -45,19 +53,19 @@ class FakePipe:
         pass
 
     def write(self, raw):
-        value = h._Decoder().feed(raw)[0]
+        value = protocol_transport._Decoder().feed(raw)[0]
         self.frames.append(value)
         method = value.get("method")
         if method in self.suppressed:
             return
         if method in self.response_errors and "requestId" in value:
-            self.pending.append(h._frame({"type": "response", "requestId": value["requestId"],
+            self.pending.append(protocol_transport._frame({"type": "response", "requestId": value["requestId"],
                 "resultType": "error", "error": self.response_errors[method]}))
             return
         if method == "thread-stream-following-changed":
             if self.start_seen and method in self.suppress_after_start:
                 return
-            self.pending.append(h._frame({"type": "broadcast", "method": "thread-stream-state-changed", "version": 11,
+            self.pending.append(protocol_transport._frame({"type": "broadcast", "method": "thread-stream-state-changed", "version": 11,
                 "sourceClientId": OWNER, "params": {"conversationId": THREAD, "hostId": "local",
                 "change": {"type": "snapshot", "conversationState": copy.deepcopy(self.state), "revision": 1}}}))
             return
@@ -67,11 +75,11 @@ class FakePipe:
         if method == "thread-follower-start-turn":
             self.start_seen = True
             if self.failure == "partial_write":
-                raise h.DesktopIpcError("DESKTOP_IPC_UNAVAILABLE", "敏感底层正文", not_sent=True)
+                raise protocol_common.DesktopIpcError("DESKTOP_IPC_UNAVAILABLE", "敏感底层正文", not_sent=True)
             if self.failure == "lost_receipt":
                 return
             result = {"result": {"turn": {"id": self.turn_id, "status": "inProgress"}}}
-        self.pending.append(h._frame({"type": "response", "method": method, "version": value["version"],
+        self.pending.append(protocol_transport._frame({"type": "response", "method": method, "version": value["version"],
             "requestId": value["requestId"], "resultType": "success", "handledByClientId": self.owner, "result": result}))
 
     def read(self, timeout):
@@ -100,10 +108,13 @@ class ProtocolTests(unittest.TestCase):
             "thread-project-assignments": {THREAD: {"projectKind": "local", "projectId": "project_test"}},
             "local-projects": {"project_test": {"rootPaths": [self.temp.name]}},
         }), encoding="utf-8")
-        for name, replacement in (("_Pipe", Mock(return_value=self.pipe)), ("_query_standard_token", Mock()),
-                                  ("_processes", Mock(return_value=rows)),
-                                  ("_global_state_path", Mock(return_value=self.state_file))):
-            active = patch.object(h, name, replacement)
+        for module, name, replacement in (
+            (protocol_operations, "_Pipe", Mock(return_value=self.pipe)),
+            (protocol_operations, "_query_standard_token", Mock()),
+            (protocol_identity, "_processes", Mock(return_value=rows)),
+            (protocol_identity, "_global_state_path", Mock(return_value=self.state_file)),
+        ):
+            active = patch.object(module, name, replacement)
             active.start()
             self.addCleanup(active.stop)
 
@@ -155,28 +166,28 @@ class ProtocolTests(unittest.TestCase):
     def test_observe_allows_active_and_pending_states_without_start(self):
         self.pipe.state["threadRuntimeStatus"] = {"type": "active"}
         self.pipe.state["turns"] = [{"turnId": OLD_TURN, "status": "inProgress"}]
-        session, info = h._prepare(self.target, purpose="observe")
+        session, info = protocol_operations._prepare(self.target, purpose="observe")
         self.assertEqual(info["runtimeStatus"], "active")
         self.assertEqual(self.pipe.starts(), [])
         session.close()
 
         self.pipe.state["requests"] = [{"kind": "approval"}]
-        session, info = h._prepare(self.target, purpose="observe")
+        session, info = protocol_operations._prepare(self.target, purpose="observe")
         self.assertEqual(info["requestsCount"], 1)
         self.assertEqual(self.pipe.starts(), [])
         session.close()
 
     def test_prepare_rejects_invalid_turn_status_even_when_observing(self):
         self.pipe.state["turns"] = [{"turnId": OLD_TURN, "status": "futureStatus"}]
-        with self.assertRaises(h.DesktopIpcError) as caught:
-            h._prepare(self.target, purpose="observe")
+        with self.assertRaises(protocol_common.DesktopIpcError) as caught:
+            protocol_operations._prepare(self.target, purpose="observe")
         self.assertEqual(caught.exception.code, "DESKTOP_STATE_UNAVAILABLE")
         self.assertEqual(self.pipe.starts(), [])
 
     def test_prepare_send_gate_rejects_active_and_pending_with_busy(self):
         self.pipe.state["threadRuntimeStatus"] = {"type": "active"}
-        with self.assertRaises(h.DesktopIpcError) as caught:
-            h._prepare(self.target)
+        with self.assertRaises(protocol_common.DesktopIpcError) as caught:
+            protocol_operations._prepare(self.target)
         self.assertEqual(caught.exception.code, "DESKTOP_BUSY")
         self.assertEqual(self.pipe.starts(), [])
 
@@ -186,10 +197,10 @@ class ProtocolTests(unittest.TestCase):
         self.pipe.state["requests"] = [{"kind": "approval"}]
         self.pipe.state["turns"] = [{"turnId": OLD_TURN, "status": "inProgress"}]
         request = {"id": CLIENT, "op": "inspect", "target": self.target}
-        source = SimpleNamespace(buffer=io.BytesIO(h._json_bytes(request) + b"\n"))
+        source = SimpleNamespace(buffer=io.BytesIO(protocol_common._json_bytes(request) + b"\n"))
         output = SimpleNamespace(buffer=io.BytesIO())
         with patch.object(sys, "stdin", source), patch.object(sys, "stdout", output):
-            h._main()
+            protocol_dispatch._main()
         response = json.loads(output.buffer.getvalue())
         self.assertTrue(response["ok"])
         self.assertEqual(response["value"]["runtimeStatus"], "active")
@@ -199,15 +210,15 @@ class ProtocolTests(unittest.TestCase):
     def test_prepare_send_purpose_gates_active_and_pending(self):
         # 同一状态：send purpose 的 prepare 分别被 BUSY / APPROVAL_PENDING 拒绝。
         self.pipe.state["threadRuntimeStatus"] = {"type": "active"}
-        with self.assertRaises(h.DesktopIpcError) as caught:
-            h._prepare(self.target, purpose="send")
+        with self.assertRaises(protocol_common.DesktopIpcError) as caught:
+            protocol_operations._prepare(self.target, purpose="send")
         self.assertEqual(caught.exception.code, "DESKTOP_BUSY")
         self.assertEqual(self.pipe.starts(), [])
 
         self.pipe.state["threadRuntimeStatus"] = {"type": "idle"}
         self.pipe.state["requests"] = [{"kind": "approval"}]
-        with self.assertRaises(h.DesktopIpcError) as caught:
-            h._prepare(self.target, purpose="send")
+        with self.assertRaises(protocol_common.DesktopIpcError) as caught:
+            protocol_operations._prepare(self.target, purpose="send")
         self.assertEqual(caught.exception.code, "DESKTOP_APPROVAL_PENDING")
         self.assertEqual(self.pipe.starts(), [])
 
@@ -229,26 +240,26 @@ class ProtocolTests(unittest.TestCase):
             },
         }}
         request = {"id": CLIENT, "op": "inspect", "target": self.target}
-        source = SimpleNamespace(buffer=io.BytesIO(h._json_bytes(request) + b"\n"))
+        source = SimpleNamespace(buffer=io.BytesIO(protocol_common._json_bytes(request) + b"\n"))
         output = SimpleNamespace(buffer=io.BytesIO())
         with patch.object(sys, "stdin", source), patch.object(sys, "stdout", output):
-            h._main()
+            protocol_dispatch._main()
         response = json.loads(output.buffer.getvalue())
         self.assertTrue(response["ok"])
         self.assertEqual(response["value"]["runtimeStatus"], "active")
         self.assertEqual(self.pipe.starts(), [])
 
-        self.assertEqual(h._active_turn_id(self.pipe.state), NEW_TURN)
-        session, info = h._prepare(self.target, purpose="observe")
+        self.assertEqual(protocol_result._active_turn_id(self.pipe.state), NEW_TURN)
+        session, info = protocol_operations._prepare(self.target, purpose="observe")
         self.assertEqual(info["runtimeStatus"], "active")
         session.close()
-        with self.assertRaises(h.DesktopIpcError) as caught:
-            h._prepare(self.target, purpose="send")
+        with self.assertRaises(protocol_common.DesktopIpcError) as caught:
+            protocol_operations._prepare(self.target, purpose="send")
         self.assertEqual(caught.exception.code, "DESKTOP_BUSY")
         self.assertEqual(self.pipe.starts(), [])
 
     def test_send_attestation_accepts_when_ack_turn_matches_envelope(self):
-        session, _ = h._prepare(self.target)
+        session, _ = protocol_operations._prepare(self.target)
         message = "完整中文方案\n```python\nprint('你好')\n```"
         item = {"type": "text", "text": message, "text_elements": []}
         turn = {"turnId": NEW_TURN, "status": "inProgress", "params": {"input": [item]},
@@ -259,18 +270,18 @@ class ProtocolTests(unittest.TestCase):
         session.close()
 
     def test_post_start_waits_for_unique_inprogress_user_message_mirror(self):
-        session, _ = h._prepare(self.target)
+        session, _ = protocol_operations._prepare(self.target)
         message = "完整方案"
         item = {"type": "text", "text": message, "text_elements": []}
         partial = {"turnId": NEW_TURN, "status": "inProgress", "params": {"input": [item]},
                    "items": [{"type": "userMessage"}]}
         complete = {**partial, "items": [{"type": "userMessage", "content": [item]}]}
         observations = {"count": 0}
-        with self._inject_on_start([partial]), patch.object(h, "POST_START_STATE_DEADLINE_SECONDS", 2.0):
+        with self._inject_on_start([partial]), patch.object(protocol_operations, "POST_START_STATE_DEADLINE_SECONDS", 2.0):
             original_write = self.pipe.write
 
             def write_complete_on_second_snapshot(raw):
-                value = h._Decoder().feed(raw)[0]
+                value = protocol_transport._Decoder().feed(raw)[0]
                 if self.pipe.start_seen and value.get("method") == "thread-stream-following-changed":
                     observations["count"] += 1
                     if observations["count"] == 2:
@@ -285,11 +296,11 @@ class ProtocolTests(unittest.TestCase):
         session.close()
 
     def test_post_start_complete_wrong_params_input_is_immediately_unknown(self):
-        session, _ = h._prepare(self.target)
+        session, _ = protocol_operations._prepare(self.target)
         wrong = {"type": "text", "text": "错误正文", "text_elements": []}
         partial = {"turnId": NEW_TURN, "status": "inProgress", "params": {"input": [wrong]}}
-        with patch.object(h, "POST_START_STATE_DEADLINE_SECONDS", 2.0), self._inject_on_start([partial]):
-            with self.assertRaises(h.DesktopIpcError) as caught:
+        with patch.object(protocol_operations, "POST_START_STATE_DEADLINE_SECONDS", 2.0), self._inject_on_start([partial]):
+            with self.assertRaises(protocol_common.DesktopIpcError) as caught:
                 session.send("完整方案")
         self.assertEqual(caught.exception.code, "DESKTOP_OUTCOME_UNKNOWN")
         self.assertFalse(caught.exception.not_sent)
@@ -297,11 +308,11 @@ class ProtocolTests(unittest.TestCase):
         session.close()
 
     def test_post_start_terminal_ack_with_incomplete_mirror_is_unknown(self):
-        session, _ = h._prepare(self.target)
+        session, _ = protocol_operations._prepare(self.target)
         item = {"type": "text", "text": "完整方案", "text_elements": []}
         terminal = {"turnId": NEW_TURN, "status": "completed", "params": {"input": [item]}}
         with self._inject_on_start([terminal]):
-            with self.assertRaises(h.DesktopIpcError) as caught:
+            with self.assertRaises(protocol_common.DesktopIpcError) as caught:
                 session.send("完整方案")
         self.assertEqual(caught.exception.code, "DESKTOP_OUTCOME_UNKNOWN")
         self.assertFalse(caught.exception.not_sent)
@@ -325,10 +336,10 @@ class ProtocolTests(unittest.TestCase):
                 self.pipe.start_seen = False
                 self.pipe.state["turns"] = [{"turnId": OLD_TURN, "status": "completed"}]
                 self.pipe.state.pop("turnHistory", None)
-                session, _ = h._prepare(self.target)
-                with patch.object(h, "POST_START_STATE_DEADLINE_SECONDS", 0.1), \
+                session, _ = protocol_operations._prepare(self.target)
+                with patch.object(protocol_operations, "POST_START_STATE_DEADLINE_SECONDS", 0.1), \
                         self._inject_on_start(injected):
-                    with self.assertRaises(h.DesktopIpcError) as caught:
+                    with self.assertRaises(protocol_common.DesktopIpcError) as caught:
                         session.send("完整方案")
                 self.assertEqual(caught.exception.code, "DESKTOP_OUTCOME_UNKNOWN")
                 self.assertFalse(caught.exception.not_sent)
@@ -338,14 +349,14 @@ class ProtocolTests(unittest.TestCase):
     def test_post_start_state_unavailable_becomes_outcome_unknown(self):
         # 硬验收：mutation boundary 之后收到的普通 DESKTOP_STATE_UNAVAILABLE
         # 必须对外收敛为 OUTCOME_UNKNOWN / notSent=false，且 start-turn 恰好一次。
-        session, _ = h._prepare(self.target)
+        session, _ = protocol_operations._prepare(self.target)
         message = "完整方案"
         item = {"type": "text", "text": message, "text_elements": []}
         turn = {"turnId": NEW_TURN, "status": "inProgress", "params": {"input": [item]},
                 "items": [{"type": "userMessage", "content": [item]}]}
         self.pipe.suppress_after_start.add("thread-stream-following-changed")
-        with patch.object(h, "SNAPSHOT_TIMEOUT_SECONDS", 0.05), self._inject_on_start([turn]):
-            with self.assertRaises(h.DesktopIpcError) as caught:
+        with patch.object(protocol_transport, "SNAPSHOT_TIMEOUT_SECONDS", 0.05), self._inject_on_start([turn]):
+            with self.assertRaises(protocol_common.DesktopIpcError) as caught:
                 session.send(message)
         self.assertEqual(caught.exception.code, "DESKTOP_OUTCOME_UNKNOWN")
         self.assertFalse(caught.exception.not_sent)
@@ -354,10 +365,10 @@ class ProtocolTests(unittest.TestCase):
     def test_pre_start_state_unavailable_keeps_not_sent_and_zero_starts(self):
         # 硬验收：同样的 DESKTOP_STATE_UNAVAILABLE 发生在 start-turn 之前时，
         # 必须保持 notSent=true 且 start-turn 计数为 0。
-        session, _ = h._prepare(self.target)
+        session, _ = protocol_operations._prepare(self.target)
         self.pipe.suppressed.add("thread-stream-following-changed")
-        with patch.object(h, "SNAPSHOT_TIMEOUT_SECONDS", 0.05):
-            with self.assertRaises(h.DesktopIpcError) as caught:
+        with patch.object(protocol_transport, "SNAPSHOT_TIMEOUT_SECONDS", 0.05):
+            with self.assertRaises(protocol_common.DesktopIpcError) as caught:
                 session.send("完整方案")
         self.assertEqual(caught.exception.code, "DESKTOP_STATE_UNAVAILABLE")
         self.assertTrue(caught.exception.not_sent)
@@ -366,7 +377,7 @@ class ProtocolTests(unittest.TestCase):
     def test_send_attestation_rejects_mixed_duplicate_turn_id(self):
         # 同一 turnId 出现两次：一个正文精确、一个正文错误。先按 turnId 判重
         # （必须恰好 1 个 occurrence），因此必须收敛 OUTCOME_UNKNOWN。
-        session, _ = h._prepare(self.target)
+        session, _ = protocol_operations._prepare(self.target)
         message = "完整方案"
         item = {"type": "text", "text": message, "text_elements": []}
         exact = {"turnId": NEW_TURN, "status": "inProgress", "params": {"input": [item]},
@@ -389,7 +400,7 @@ class ProtocolTests(unittest.TestCase):
                 }}
 
         with patch.object(self.pipe, "write", write_with_mixed):
-            with self.assertRaises(h.DesktopIpcError) as caught:
+            with self.assertRaises(protocol_common.DesktopIpcError) as caught:
                 session.send(message)
         self.assertEqual(caught.exception.code, "DESKTOP_OUTCOME_UNKNOWN")
         self.assertFalse(caught.exception.not_sent)
@@ -410,7 +421,7 @@ class ProtocolTests(unittest.TestCase):
             }],
             "entitiesByKey": {"turn-old": {"turnId": OLD_TURN, "status": "completed"}},
         }}
-        session, _ = h._prepare(self.target)
+        session, _ = protocol_operations._prepare(self.target)
         message = "完整方案"
         item = {"type": "text", "text": message, "text_elements": []}
         turn = {"turnId": NEW_TURN, "status": "inProgress", "params": {"input": [item]},
@@ -435,7 +446,7 @@ class ProtocolTests(unittest.TestCase):
                         },
                     }}
 
-        with patch.object(h, "POST_START_STATE_DEADLINE_SECONDS", 2.0), \
+        with patch.object(protocol_operations, "POST_START_STATE_DEADLINE_SECONDS", 2.0), \
                 patch.object(self.pipe, "write", write_with_late_turn):
             self.assertEqual(session.send(message), {"threadId": THREAD, "turnId": NEW_TURN})
         self.assertEqual(len(self.pipe.starts()), 1)
@@ -443,7 +454,7 @@ class ProtocolTests(unittest.TestCase):
 
     def test_post_start_bounded_wait_expires_as_outcome_unknown(self):
         # 有界等待内 canonical state 始终没有 ACK turn → OUTCOME_UNKNOWN，且不重发。
-        session, _ = h._prepare(self.target)
+        session, _ = protocol_operations._prepare(self.target)
         message = "完整方案"
         original_write = self.pipe.write
 
@@ -459,10 +470,10 @@ class ProtocolTests(unittest.TestCase):
                     "entitiesByKey": {"turn-old": {"turnId": OLD_TURN, "status": "completed"}},
                 }}
 
-        with patch.object(h, "POST_START_STATE_DEADLINE_SECONDS", 1.0), \
-                patch.object(h, "SNAPSHOT_TIMEOUT_SECONDS", 0.05), \
+        with patch.object(protocol_operations, "POST_START_STATE_DEADLINE_SECONDS", 1.0), \
+                patch.object(protocol_transport, "SNAPSHOT_TIMEOUT_SECONDS", 0.05), \
                 patch.object(self.pipe, "write", write_without_turn):
-            with self.assertRaises(h.DesktopIpcError) as caught:
+            with self.assertRaises(protocol_common.DesktopIpcError) as caught:
                 session.send(message)
         self.assertEqual(caught.exception.code, "DESKTOP_OUTCOME_UNKNOWN")
         self.assertFalse(caught.exception.not_sent)
@@ -470,7 +481,7 @@ class ProtocolTests(unittest.TestCase):
         session.close()
 
     def test_post_start_process_drift_is_outcome_unknown(self):
-        session, _ = h._prepare(self.target)
+        session, _ = protocol_operations._prepare(self.target)
         message = "完整方案"
         item = {"type": "text", "text": message, "text_elements": []}
         turn = {"turnId": NEW_TURN, "status": "inProgress", "params": {"input": [item]},
@@ -482,29 +493,29 @@ class ProtocolTests(unittest.TestCase):
         def processes():
             return [] if self.pipe.start_seen else rows
 
-        with patch.object(h, "_processes", side_effect=processes), self._inject_on_start([turn]):
-            with self.assertRaises(h.DesktopIpcError) as caught:
+        with patch.object(protocol_identity, "_processes", side_effect=processes), self._inject_on_start([turn]):
+            with self.assertRaises(protocol_common.DesktopIpcError) as caught:
                 session.send(message)
         self.assertEqual(caught.exception.code, "DESKTOP_OUTCOME_UNKNOWN")
         self.assertFalse(caught.exception.not_sent)
         self.assertEqual(len(self.pipe.starts()), 1)
 
     def test_post_start_owner_drift_is_outcome_unknown(self):
-        session, _ = h._prepare(self.target)
+        session, _ = protocol_operations._prepare(self.target)
         message = "完整方案"
         item = {"type": "text", "text": message, "text_elements": []}
         turn = {"turnId": NEW_TURN, "status": "inProgress", "params": {"input": [item]},
                 "items": [{"type": "userMessage", "content": [item]}]}
-        with patch.object(h._IpcClient, "discover", side_effect=[None, None, h._error("DESKTOP_OWNER_CHANGED")]), \
+        with patch.object(protocol_transport._IpcClient, "discover", side_effect=[None, None, protocol_common._error("DESKTOP_OWNER_CHANGED")]), \
                 self._inject_on_start([turn]):
-            with self.assertRaises(h.DesktopIpcError) as caught:
+            with self.assertRaises(protocol_common.DesktopIpcError) as caught:
                 session.send(message)
         self.assertEqual(caught.exception.code, "DESKTOP_OUTCOME_UNKNOWN")
         self.assertFalse(caught.exception.not_sent)
         self.assertEqual(len(self.pipe.starts()), 1)
 
     def test_real_protocol_flow_keeps_text_and_only_accepts_without_completion(self):
-        session, info = h._prepare(self.target)
+        session, info = protocol_operations._prepare(self.target)
         text = "完整中文方案\n```python\nprint('你好')\n```"
         item = {"type": "text", "text": text, "text_elements": []}
         turn = {"turnId": NEW_TURN, "status": "inProgress", "params": {"input": [item]},
@@ -527,9 +538,9 @@ class ProtocolTests(unittest.TestCase):
         session.close()
 
     def test_last_check_busy_is_definitely_not_sent(self):
-        session, _ = h._prepare(self.target)
+        session, _ = protocol_operations._prepare(self.target)
         self.pipe.state["threadRuntimeStatus"] = {"type": "active"}
-        with self.assertRaises(h.DesktopIpcError) as caught:
+        with self.assertRaises(protocol_common.DesktopIpcError) as caught:
             session.send("已确认计划")
         self.assertEqual(caught.exception.code, "DESKTOP_BUSY")
         self.assertTrue(caught.exception.not_sent)
@@ -539,10 +550,10 @@ class ProtocolTests(unittest.TestCase):
         # boundary authority：pre-start targeted discover 超时（request 层默认
         # not_sent=False）必须在 send() 边界被强制重投影为 notSent=true，且
         # start-turn 计数为 0。
-        session, _ = h._prepare(self.target)
+        session, _ = protocol_operations._prepare(self.target)
         self.pipe.suppressed.add("thread-owner-discovery")
-        with patch.object(h, "DISCOVERY_TIMEOUT_SECONDS", 0.05):
-            with self.assertRaises(h.DesktopIpcError) as caught:
+        with patch.object(protocol_transport, "DISCOVERY_TIMEOUT_SECONDS", 0.05):
+            with self.assertRaises(protocol_common.DesktopIpcError) as caught:
                 session.send("完整方案")
         self.assertEqual(caught.exception.code, "DESKTOP_IPC_TIMEOUT")
         self.assertTrue(caught.exception.not_sent)
@@ -553,7 +564,7 @@ class ProtocolTests(unittest.TestCase):
         # 第一份 post-start snapshot 的 conversationState 本体指向错误 target
         # （广播帧参数匹配、body id/hostId 错误）且恰好包含 exact turn →
         # OUTCOME_UNKNOWN，start-turn 恰好一次。
-        session, _ = h._prepare(self.target)
+        session, _ = protocol_operations._prepare(self.target)
         message = "完整方案"
         item = {"type": "text", "text": message, "text_elements": []}
         turn = {"turnId": NEW_TURN, "status": "inProgress", "params": {"input": [item]},
@@ -578,7 +589,7 @@ class ProtocolTests(unittest.TestCase):
                 }}
 
         with patch.object(self.pipe, "write", write_with_wrong_target):
-            with self.assertRaises(h.DesktopIpcError) as caught:
+            with self.assertRaises(protocol_common.DesktopIpcError) as caught:
                 session.send(message)
         self.assertEqual(caught.exception.code, "DESKTOP_OUTCOME_UNKNOWN")
         self.assertFalse(caught.exception.not_sent)
@@ -588,10 +599,10 @@ class ProtocolTests(unittest.TestCase):
     def test_pre_start_owner_drift_after_final_state_check_is_not_sent(self):
         # 最后一次状态检查之后的 targeted owner fence 发现漂移 → 具体错误 + notSent=true，
         # start-turn 计数为 0；post-start final fence 不受影响。
-        session, _ = h._prepare(self.target)
-        with patch.object(h._IpcClient, "discover",
-                          side_effect=[None, h._error("DESKTOP_OWNER_CHANGED")]), \
-                self.assertRaises(h.DesktopIpcError) as caught:
+        session, _ = protocol_operations._prepare(self.target)
+        with patch.object(protocol_transport._IpcClient, "discover",
+                          side_effect=[None, protocol_common._error("DESKTOP_OWNER_CHANGED")]), \
+                self.assertRaises(protocol_common.DesktopIpcError) as caught:
             session.send("完整方案")
         self.assertEqual(caught.exception.code, "DESKTOP_OWNER_CHANGED")
         self.assertTrue(caught.exception.not_sent)
@@ -607,9 +618,9 @@ class ProtocolTests(unittest.TestCase):
         self.pipe.state["threadRuntimeStatus"] = {"type": "active"}
         self.pipe.state["turns"] = [{"turnId": OLD_TURN, "status": "inProgress"}]
         with patch.dict(os.environ, {"CODEX_THREAD_ID": THREAD, "CODEX_SESSION_ID": THREAD}, clear=False), \
-                patch.object(h, "_global_state_path", return_value=state_file), \
-                patch.object(h, "_verify_current_runner_ancestor") as ancestor:
-            info = h._current_identity(self.temp.name)
+                patch.object(protocol_identity, "_global_state_path", return_value=state_file), \
+                patch.object(protocol_operations, "_verify_current_runner_ancestor") as ancestor:
+            info = protocol_operations._current_identity(self.temp.name)
         self.assertEqual(info["threadId"], THREAD)
         self.assertEqual(info["projectId"], "project_test")
         self.assertEqual(info["runtimeStatus"], "active")
@@ -633,15 +644,15 @@ class ProtocolTests(unittest.TestCase):
             }}}),
         ]
         with patch.dict(os.environ, {"CODEX_THREAD_ID": THREAD, "CODEX_SESSION_ID": THREAD}, clear=False), \
-                patch.object(h, "_global_state_path", return_value=state_file), \
-                patch.object(h, "_verify_current_runner_ancestor"):
+                patch.object(protocol_identity, "_global_state_path", return_value=state_file), \
+                patch.object(protocol_operations, "_verify_current_runner_ancestor"), patch.object(protocol_result, "_verify_current_runner_ancestor"):
             for shape, turns in cases:
                 with self.subTest(shape=shape):
                     self.pipe.state.pop("turns", None)
                     self.pipe.state.pop("turnHistory", None)
                     self.pipe.state["threadRuntimeStatus"] = {"type": "active"}
                     self.pipe.state.update(copy.deepcopy(turns))
-                    info = h._current_execution(self.temp.name)
+                    info = protocol_result._current_execution(self.temp.name)
                     self.assertEqual(info["activeTurnId"], NEW_TURN)
                     self.assertEqual(info["runtimeStatus"], "active")
         self.assertEqual(self.pipe.starts(), [])
@@ -664,15 +675,15 @@ class ProtocolTests(unittest.TestCase):
                               "threadRuntimeStatus": {"type": "idle"}}),
         ]
         with patch.dict(os.environ, {"CODEX_THREAD_ID": THREAD, "CODEX_SESSION_ID": THREAD}, clear=False), \
-                patch.object(h, "_global_state_path", return_value=state_file), \
-                patch.object(h, "_verify_current_runner_ancestor"):
+                patch.object(protocol_identity, "_global_state_path", return_value=state_file), \
+                patch.object(protocol_operations, "_verify_current_runner_ancestor"), patch.object(protocol_result, "_verify_current_runner_ancestor"):
             for name, update in cases:
                 with self.subTest(case=name):
                     self.pipe.state.pop("turnHistory", None)
                     self.pipe.state["threadRuntimeStatus"] = {"type": "active"}
                     self.pipe.state.update(copy.deepcopy(update))
-                    with self.assertRaises(h.DesktopIpcError) as caught:
-                        h._current_execution(self.temp.name)
+                    with self.assertRaises(protocol_common.DesktopIpcError) as caught:
+                        protocol_result._current_execution(self.temp.name)
                     self.assertEqual(caught.exception.code, "DESKTOP_STATE_UNAVAILABLE")
         self.assertEqual(self.pipe.starts(), [])
 
@@ -684,12 +695,12 @@ class ProtocolTests(unittest.TestCase):
         }), encoding="utf-8")
         self.pipe.state["threadRuntimeStatus"] = {"type": "active"}
         self.pipe.state["turns"] = [{"turnId": NEW_TURN, "status": "inProgress"}]
-        failure = h._error("DESKTOP_CURRENT_CONTEXT_INVALID")
+        failure = protocol_common._error("DESKTOP_CURRENT_CONTEXT_INVALID")
         with patch.dict(os.environ, {"CODEX_THREAD_ID": THREAD, "CODEX_SESSION_ID": THREAD}, clear=False), \
-                patch.object(h, "_global_state_path", return_value=state_file), \
-                patch.object(h, "_verify_current_runner_ancestor", side_effect=failure) as ancestor:
-            with self.assertRaises(h.DesktopIpcError) as caught:
-                h._current_execution(self.temp.name)
+                patch.object(protocol_identity, "_global_state_path", return_value=state_file), \
+                patch.object(protocol_operations, "_verify_current_runner_ancestor", side_effect=failure) as ancestor:
+            with self.assertRaises(protocol_common.DesktopIpcError) as caught:
+                protocol_result._current_execution(self.temp.name)
         self.assertEqual(caught.exception.code, "DESKTOP_CURRENT_CONTEXT_INVALID")
         process = {"desktopPid": 100, "desktopExe": str(Path(self.temp.name) / "ChatGPT.exe"),
                    "desktopCreation": 10, "appServerPid": 101,
@@ -703,8 +714,8 @@ class ProtocolTests(unittest.TestCase):
             "islands": [{"entries": [{"value": "turn-1"}], "newerBoundary": {"status": "exhausted"}}],
             "entitiesByKey": {"turn-1": turn},
         }}
-        with patch.object(h, "_verify_current_runner_ancestor", side_effect=AssertionError("detached worker must not use runner proof")):
-            result = h._inspect_result_context(self.target)
+        with patch.object(protocol_result, "_verify_current_runner_ancestor", side_effect=AssertionError("detached worker must not use runner proof")):
+            result = protocol_result._inspect_result_context(self.target)
         self.assertEqual(result["threadId"], THREAD)
         self.assertEqual(result["resultTurnId"], OLD_TURN)
         self.assertEqual(result["resultTurnStatus"], "completed")
@@ -718,18 +729,18 @@ class ProtocolTests(unittest.TestCase):
         }), encoding="utf-8")
         self.pipe.state["threadRuntimeStatus"] = {"type": "active"}
         self.pipe.state["turns"] = [{"turnId": NEW_TURN, "status": "inProgress"}]
-        ages = iter([0.0, 0.0, 0.0, h.MAX_OBSERVATION_AGE_SECONDS + 1.0,
-                     h.MAX_OBSERVATION_AGE_SECONDS + 1.0])
+        ages = iter([0.0, 0.0, 0.0, protocol_common.MAX_OBSERVATION_AGE_SECONDS + 1.0,
+                     protocol_common.MAX_OBSERVATION_AGE_SECONDS + 1.0])
         with patch.dict(os.environ, {"CODEX_THREAD_ID": THREAD, "CODEX_SESSION_ID": THREAD}, clear=False), \
-                patch.object(h, "_global_state_path", return_value=state_file), \
-                patch.object(h, "_verify_current_runner_ancestor"), \
-                patch.object(h._IpcClient, "snapshot_age", side_effect=lambda: next(ages)):
-            with self.assertRaises(h.DesktopIpcError) as caught:
-                h._current_execution(self.temp.name)
+                patch.object(protocol_identity, "_global_state_path", return_value=state_file), \
+                patch.object(protocol_operations, "_verify_current_runner_ancestor"), patch.object(protocol_result, "_verify_current_runner_ancestor"), \
+                patch.object(protocol_transport._IpcClient, "snapshot_age", side_effect=lambda: next(ages)):
+            with self.assertRaises(protocol_common.DesktopIpcError) as caught:
+                protocol_result._current_execution(self.temp.name)
         self.assertEqual(caught.exception.code, "DESKTOP_STATE_UNAVAILABLE")
         self.assertEqual(self.pipe.starts(), [])
 
-    def _current_execution_fixture(self, *, new_turn=NEW_TURN, ages=(0.0, h.MAX_OBSERVATION_AGE_SECONDS + 1.0, 0.0),
+    def _current_execution_fixture(self, *, new_turn=NEW_TURN, ages=(0.0, protocol_common.MAX_OBSERVATION_AGE_SECONDS + 1.0, 0.0),
                                     advance_serial=True):
         target = self.target
         old = {"id": THREAD, "hostId": "local", "cwd": target["workspaceRoot"], "title": "测试会话",
@@ -769,13 +780,13 @@ class ProtocolTests(unittest.TestCase):
 
     def test_current_execution_freshness_refreshes_same_active_turn(self):
         target, session, client, pipe = self._current_execution_fixture()
-        with patch.object(h, "_current_target", return_value=target), \
-                patch.object(h, "_prepare", return_value=(session, {})), \
-                patch.object(h, "_validate_observed_state") as validate, \
-                patch.object(h, "_verify_process_identity", return_value=PROCESS) as verify_process, \
-                patch.object(h, "_verify_current_runner_ancestor") as runner, \
-                patch.object(h, "_public_info", return_value={}):
-            result = h._current_execution(target["workspaceRoot"])
+        with patch.object(protocol_result, "_current_target", return_value=target), \
+                patch.object(protocol_result, "_prepare", return_value=(session, {})), \
+                patch.object(protocol_result, "_validate_observed_state") as validate, \
+                patch.object(protocol_result, "_verify_process_identity", return_value=PROCESS) as verify_process, \
+                patch.object(protocol_operations, "_verify_current_runner_ancestor"), patch.object(protocol_result, "_verify_current_runner_ancestor") as runner, \
+                patch.object(protocol_result, "_public_info", return_value={}):
+            result = protocol_result._current_execution(target["workspaceRoot"])
         self.assertEqual(result["activeTurnId"], NEW_TURN)
         self.assertEqual(client.snapshot_calls, 1)
         self.assertEqual(pipe.verify_server.call_count, 1)
@@ -786,13 +797,13 @@ class ProtocolTests(unittest.TestCase):
 
     def test_current_execution_freshness_refresh_returns_new_active_turn(self):
         target, session, client, pipe = self._current_execution_fixture(new_turn="01a00000-0000-7000-8000-000000000006")
-        with patch.object(h, "_current_target", return_value=target), \
-                patch.object(h, "_prepare", return_value=(session, {})), \
-                patch.object(h, "_validate_observed_state"), \
-                patch.object(h, "_verify_process_identity", return_value=PROCESS) as verify_process, \
-                patch.object(h, "_verify_current_runner_ancestor") as runner, \
-                patch.object(h, "_public_info", return_value={}):
-            result = h._current_execution(target["workspaceRoot"])
+        with patch.object(protocol_result, "_current_target", return_value=target), \
+                patch.object(protocol_result, "_prepare", return_value=(session, {})), \
+                patch.object(protocol_result, "_validate_observed_state"), \
+                patch.object(protocol_result, "_verify_process_identity", return_value=PROCESS) as verify_process, \
+                patch.object(protocol_operations, "_verify_current_runner_ancestor"), patch.object(protocol_result, "_verify_current_runner_ancestor") as runner, \
+                patch.object(protocol_result, "_public_info", return_value={}):
+            result = protocol_result._current_execution(target["workspaceRoot"])
         self.assertEqual(result["activeTurnId"], "01a00000-0000-7000-8000-000000000006")
         self.assertNotEqual(result["activeTurnId"], OLD_TURN)
         self.assertEqual(client.snapshot_calls, 1)
@@ -802,60 +813,60 @@ class ProtocolTests(unittest.TestCase):
 
     def test_current_execution_freshness_refresh_fail_closed(self):
         cases = {
-            "timeout": (0.0, h.MAX_OBSERVATION_AGE_SECONDS + 1.0, 0.0),
-            "stale_after_refresh": (0.0, h.MAX_OBSERVATION_AGE_SECONDS + 1.0,
-                                     h.MAX_OBSERVATION_AGE_SECONDS + 1.0),
-            "serial_not_advanced": (0.0, h.MAX_OBSERVATION_AGE_SECONDS + 1.0),
+            "timeout": (0.0, protocol_common.MAX_OBSERVATION_AGE_SECONDS + 1.0, 0.0),
+            "stale_after_refresh": (0.0, protocol_common.MAX_OBSERVATION_AGE_SECONDS + 1.0,
+                                     protocol_common.MAX_OBSERVATION_AGE_SECONDS + 1.0),
+            "serial_not_advanced": (0.0, protocol_common.MAX_OBSERVATION_AGE_SECONDS + 1.0),
         }
         for name, ages in cases.items():
             with self.subTest(case=name):
                 target, session, client, pipe = self._current_execution_fixture(
                     ages=ages, advance_serial=name != "serial_not_advanced")
                 if name == "timeout":
-                    clock = iter([0.0, h.SNAPSHOT_TIMEOUT_SECONDS + 1.0])
-                    monotonic = patch.object(h.time, "monotonic", side_effect=lambda: next(clock))
+                    clock = iter([0.0, protocol_common.SNAPSHOT_TIMEOUT_SECONDS + 1.0])
+                    monotonic = patch.object(protocol_transport.time, "monotonic", side_effect=lambda: next(clock))
                 else:
-                    monotonic = patch.object(h.time, "monotonic", wraps=h.time.monotonic)
+                    monotonic = patch.object(protocol_transport.time, "monotonic", wraps=protocol_transport.time.monotonic)
                 with monotonic, \
-                        patch.object(h, "_current_target", return_value=target), \
-                        patch.object(h, "_prepare", return_value=(session, {})), \
-                        patch.object(h, "_validate_observed_state"), \
-                        patch.object(h, "_verify_process_identity", return_value=PROCESS), \
-                        patch.object(h, "_verify_current_runner_ancestor"), \
-                        patch.object(h, "_public_info", return_value={}):
-                    with self.assertRaises(h.DesktopIpcError) as caught:
-                        h._current_execution(target["workspaceRoot"])
+                        patch.object(protocol_result, "_current_target", return_value=target), \
+                        patch.object(protocol_result, "_prepare", return_value=(session, {})), \
+                        patch.object(protocol_result, "_validate_observed_state"), \
+                        patch.object(protocol_result, "_verify_process_identity", return_value=PROCESS), \
+                        patch.object(protocol_operations, "_verify_current_runner_ancestor"), patch.object(protocol_result, "_verify_current_runner_ancestor"), \
+                        patch.object(protocol_result, "_public_info", return_value={}):
+                    with self.assertRaises(protocol_common.DesktopIpcError) as caught:
+                        protocol_result._current_execution(target["workspaceRoot"])
                 self.assertEqual(caught.exception.code, "DESKTOP_STATE_UNAVAILABLE")
                 self.assertLessEqual(client.snapshot_calls, 1)
                 self.assertEqual(pipe.starts(), [])
 
     def test_current_execution_freshness_refresh_rechecks_security_guards(self):
         cases = {
-            "pipe": ("_pipe", h._error("DESKTOP_PROCESS_CHANGED")),
-            "process": ("_process", h._error("DESKTOP_PROCESS_CHANGED")),
-            "state": ("_state", h._error("DESKTOP_PROJECT_MISMATCH")),
-            "owner": ("_state", h._error("DESKTOP_NO_OWNER")),
-            "runner": ("_runner", h._error("DESKTOP_CURRENT_CONTEXT_INVALID")),
+            "pipe": ("_pipe", protocol_common._error("DESKTOP_PROCESS_CHANGED")),
+            "process": ("_process", protocol_common._error("DESKTOP_PROCESS_CHANGED")),
+            "state": ("_state", protocol_common._error("DESKTOP_PROJECT_MISMATCH")),
+            "owner": ("_state", protocol_common._error("DESKTOP_NO_OWNER")),
+            "runner": ("_runner", protocol_common._error("DESKTOP_CURRENT_CONTEXT_INVALID")),
         }
         for name, (guard, failure) in cases.items():
             with self.subTest(guard=name):
                 target, session, client, pipe = self._current_execution_fixture()
                 if guard == "_pipe":
                     pipe.verify_server.side_effect = failure
-                with patch.object(h, "_current_target", return_value=target), \
-                        patch.object(h, "_prepare", return_value=(session, {})), \
-                        patch.object(h, "_validate_observed_state") as default_validate, \
-                        patch.object(h, "_verify_process_identity", return_value=PROCESS) as default_process, \
-                        patch.object(h, "_verify_current_runner_ancestor") as default_runner, \
-                        patch.object(h, "_public_info", return_value={}):
+                with patch.object(protocol_result, "_current_target", return_value=target), \
+                        patch.object(protocol_result, "_prepare", return_value=(session, {})), \
+                        patch.object(protocol_result, "_validate_observed_state") as default_validate, \
+                        patch.object(protocol_result, "_verify_process_identity", return_value=PROCESS) as default_process, \
+                        patch.object(protocol_operations, "_verify_current_runner_ancestor"), patch.object(protocol_result, "_verify_current_runner_ancestor") as default_runner, \
+                        patch.object(protocol_result, "_public_info", return_value={}):
                     if guard == "_process":
                         default_process.side_effect = [PROCESS, failure]
                     elif guard == "_state":
                         default_validate.side_effect = [None, failure]
                     elif guard == "_runner":
                         default_runner.side_effect = [None, failure]
-                    with self.assertRaises(h.DesktopIpcError) as caught:
-                        h._current_execution(target["workspaceRoot"])
+                    with self.assertRaises(protocol_common.DesktopIpcError) as caught:
+                        protocol_result._current_execution(target["workspaceRoot"])
                 self.assertEqual(caught.exception.code, failure.code)
                 self.assertLessEqual(client.snapshot_calls, 1)
                 self.assertEqual(pipe.starts(), [])
@@ -880,18 +891,18 @@ class ProtocolTests(unittest.TestCase):
             }},
         }
         with patch.dict(os.environ, {"CODEX_THREAD_ID": THREAD, "CODEX_SESSION_ID": THREAD}, clear=False), \
-                patch.object(h, "_global_state_path", return_value=state_file), \
-                patch.object(h, "_verify_current_runner_ancestor"):
+                patch.object(protocol_identity, "_global_state_path", return_value=state_file), \
+                patch.object(protocol_operations, "_verify_current_runner_ancestor"), patch.object(protocol_result, "_verify_current_runner_ancestor"):
             self.pipe.state.pop("turns", None)
             self.pipe.state.update(copy.deepcopy(canonical))
-            result = h._current_result_context(self.temp.name)
+            result = protocol_result._current_result_context(self.temp.name)
             self.assertEqual(result["runtimeStatus"], "idle")
             self.assertEqual(result["resultTurnId"], NEW_TURN)
             self.assertEqual(result["resultTurnStatus"], "failed")
 
             canonical["turnHistory"]["history"]["islands"][0]["olderBoundary"] = {"status": "loading"}
             self.pipe.state.update(copy.deepcopy(canonical))
-            result = h._current_result_context(self.temp.name)
+            result = protocol_result._current_result_context(self.temp.name)
             self.assertEqual(result["resultTurnId"], NEW_TURN)
 
             canonical["turnHistory"]["history"]["islands"] = [
@@ -899,13 +910,13 @@ class ProtocolTests(unittest.TestCase):
                 {"olderBoundary": {"status": "exhausted"}, "entries": [{"value": "turn-2"}], "newerBoundary": {"status": "exhausted"}},
             ]
             self.pipe.state.update(copy.deepcopy(canonical))
-            result = h._current_result_context(self.temp.name)
+            result = protocol_result._current_result_context(self.temp.name)
             self.assertEqual(result["resultTurnId"], NEW_TURN)
 
             self.pipe.state.pop("turnHistory", None)
             self.pipe.state["threadRuntimeStatus"] = {"type": "active"}
             self.pipe.state["turns"] = [{"turnId": NEW_TURN, "status": "inProgress"}]
-            result = h._current_result_context(self.temp.name)
+            result = protocol_result._current_result_context(self.temp.name)
             self.assertEqual(result["runtimeStatus"], "active")
             self.assertEqual(result["resultTurnId"], NEW_TURN)
             self.assertEqual(result["resultTurnStatus"], "inProgress")
@@ -950,16 +961,16 @@ class ProtocolTests(unittest.TestCase):
             }}},
         }
         with patch.dict(os.environ, {"CODEX_THREAD_ID": THREAD, "CODEX_SESSION_ID": THREAD}, clear=False), \
-                patch.object(h, "_global_state_path", return_value=state_file), \
-                patch.object(h, "_verify_current_runner_ancestor"):
+                patch.object(protocol_identity, "_global_state_path", return_value=state_file), \
+                patch.object(protocol_operations, "_verify_current_runner_ancestor"), patch.object(protocol_result, "_verify_current_runner_ancestor"):
             for name, update in cases.items():
                 with self.subTest(case=name):
                     self.pipe.state["threadRuntimeStatus"] = {"type": "idle"}
                     self.pipe.state.pop("turns", None)
                     self.pipe.state.pop("turnHistory", None)
                     self.pipe.state.update(copy.deepcopy(update))
-                    with self.assertRaises(h.DesktopIpcError) as caught:
-                        h._current_result_context(self.temp.name)
+                    with self.assertRaises(protocol_common.DesktopIpcError) as caught:
+                        protocol_result._current_result_context(self.temp.name)
                     self.assertEqual(caught.exception.code, "DESKTOP_STATE_UNAVAILABLE")
 
     def test_current_result_context_refreshes_stale_snapshot_for_new_turn(self):
@@ -979,10 +990,10 @@ class ProtocolTests(unittest.TestCase):
             return age
 
         with patch.dict(os.environ, {"CODEX_THREAD_ID": THREAD, "CODEX_SESSION_ID": THREAD}, clear=False), \
-                patch.object(h, "_global_state_path", return_value=state_file), \
-                patch.object(h, "_verify_current_runner_ancestor"), \
-                patch.object(h._IpcClient, "snapshot_age", side_effect=snapshot_age):
-            result = h._current_result_context(self.temp.name)
+                patch.object(protocol_identity, "_global_state_path", return_value=state_file), \
+                patch.object(protocol_operations, "_verify_current_runner_ancestor"), patch.object(protocol_result, "_verify_current_runner_ancestor"), \
+                patch.object(protocol_transport._IpcClient, "snapshot_age", side_effect=snapshot_age):
+            result = protocol_result._current_result_context(self.temp.name)
         self.assertEqual(result["resultTurnId"], NEW_TURN)
         self.assertEqual(sum(frame.get("method") == "thread-stream-following-changed" for frame in self.pipe.frames), 2)
 
@@ -994,7 +1005,7 @@ class ProtocolTests(unittest.TestCase):
         }), encoding="utf-8")
         self.pipe.state["threadRuntimeStatus"] = {"type": "active"}
         self.pipe.state["turns"] = [{"turnId": OLD_TURN, "status": "inProgress"}]
-        original_snapshot = h._IpcClient.snapshot
+        original_snapshot = protocol_transport._IpcClient.snapshot
 
         for failure in ("timeout", "stale"):
             with self.subTest(failure=failure):
@@ -1006,19 +1017,19 @@ class ProtocolTests(unittest.TestCase):
                     nonlocal calls
                     calls += 1
                     if calls == 2 and failure == "timeout":
-                        raise h._error("DESKTOP_STATE_UNAVAILABLE")
+                        raise protocol_common._error("DESKTOP_STATE_UNAVAILABLE")
                     return original_snapshot(client)
 
                 values = [0.1, 1.0, 1.1, 3.0]
                 if failure == "stale":
                     values.append(3.0)
                 with patch.dict(os.environ, {"CODEX_THREAD_ID": THREAD, "CODEX_SESSION_ID": THREAD}, clear=False), \
-                        patch.object(h, "_global_state_path", return_value=state_file), \
-                        patch.object(h, "_verify_current_runner_ancestor"), \
-                        patch.object(h._IpcClient, "snapshot_age", side_effect=iter(values)), \
-                        patch.object(h._IpcClient, "snapshot", new=snapshot):
-                    with self.assertRaises(h.DesktopIpcError) as caught:
-                        h._current_result_context(self.temp.name)
+                        patch.object(protocol_identity, "_global_state_path", return_value=state_file), \
+                        patch.object(protocol_operations, "_verify_current_runner_ancestor"), patch.object(protocol_result, "_verify_current_runner_ancestor"), \
+                        patch.object(protocol_transport._IpcClient, "snapshot_age", side_effect=iter(values)), \
+                        patch.object(protocol_transport._IpcClient, "snapshot", new=snapshot):
+                    with self.assertRaises(protocol_common.DesktopIpcError) as caught:
+                        protocol_result._current_result_context(self.temp.name)
                 self.assertEqual(caught.exception.code, "DESKTOP_STATE_UNAVAILABLE")
                 self.assertEqual(calls, 2)
                 self.assertTrue(self.pipe.closed)
@@ -1032,12 +1043,12 @@ class ProtocolTests(unittest.TestCase):
         self.pipe.state["threadRuntimeStatus"] = {"type": "active"}
         self.pipe.state["turns"] = [{"turnId": OLD_TURN, "status": "inProgress"}]
         with patch.dict(os.environ, {"CODEX_THREAD_ID": THREAD, "CODEX_SESSION_ID": THREAD}, clear=False), \
-                patch.object(h, "_global_state_path", return_value=state_file), \
-                patch.object(h, "_verify_current_runner_ancestor"), \
-                patch.object(h._IpcClient, "snapshot_age", side_effect=iter([0.1, 1.0, 1.1, 3.0])), \
-                patch.object(self.pipe, "verify_server", side_effect=h._error("DESKTOP_PROCESS_CHANGED")) as verify:
-            with self.assertRaises(h.DesktopIpcError) as caught:
-                h._current_result_context(self.temp.name)
+                patch.object(protocol_identity, "_global_state_path", return_value=state_file), \
+                patch.object(protocol_operations, "_verify_current_runner_ancestor"), patch.object(protocol_result, "_verify_current_runner_ancestor"), \
+                patch.object(protocol_transport._IpcClient, "snapshot_age", side_effect=iter([0.1, 1.0, 1.1, 3.0])), \
+                patch.object(self.pipe, "verify_server", side_effect=protocol_common._error("DESKTOP_PROCESS_CHANGED")) as verify:
+            with self.assertRaises(protocol_common.DesktopIpcError) as caught:
+                protocol_result._current_result_context(self.temp.name)
         self.assertEqual(caught.exception.code, "DESKTOP_PROCESS_CHANGED")
         verify.assert_called_once_with()
         self.assertTrue(self.pipe.closed)
@@ -1051,12 +1062,12 @@ class ProtocolTests(unittest.TestCase):
         self.pipe.state["threadRuntimeStatus"] = {"type": "active"}
         self.pipe.state["turns"] = [{"turnId": OLD_TURN, "status": "inProgress"}]
         ages = iter([0.1, 1.0, 1.1, 3.0, 0.1])
-        real_monotonic = h.time.monotonic
+        real_monotonic = protocol_transport.time.monotonic
         expired = False
         verify_calls = 0
 
         def monotonic():
-            return real_monotonic() + (h.SNAPSHOT_TIMEOUT_SECONDS + 1.0 if expired else 0.0)
+            return real_monotonic() + (protocol_common.SNAPSHOT_TIMEOUT_SECONDS + 1.0 if expired else 0.0)
 
         def verify_process(*args):
             nonlocal expired, verify_calls
@@ -1066,13 +1077,14 @@ class ProtocolTests(unittest.TestCase):
             return PROCESS
 
         with patch.dict(os.environ, {"CODEX_THREAD_ID": THREAD, "CODEX_SESSION_ID": THREAD}, clear=False), \
-                patch.object(h, "_global_state_path", return_value=state_file), \
-                patch.object(h, "_verify_current_runner_ancestor"), \
-                patch.object(h, "_verify_process_identity", side_effect=verify_process), \
-                patch.object(h._IpcClient, "snapshot_age", side_effect=iter(ages)), \
-                patch.object(h.time, "monotonic", new=monotonic):
-            with self.assertRaises(h.DesktopIpcError) as caught:
-                h._current_result_context(self.temp.name)
+                patch.object(protocol_identity, "_global_state_path", return_value=state_file), \
+                patch.object(protocol_operations, "_verify_current_runner_ancestor"), patch.object(protocol_result, "_verify_current_runner_ancestor"), \
+                patch.object(protocol_operations, "_verify_process_identity", side_effect=verify_process), \
+                patch.object(protocol_result, "_verify_process_identity", side_effect=verify_process), \
+                patch.object(protocol_transport._IpcClient, "snapshot_age", side_effect=iter(ages)), \
+                patch.object(protocol_result.time, "monotonic", new=monotonic):
+            with self.assertRaises(protocol_common.DesktopIpcError) as caught:
+                protocol_result._current_result_context(self.temp.name)
         self.assertEqual(caught.exception.code, "DESKTOP_STATE_UNAVAILABLE")
         self.assertEqual(verify_calls, 3)
         self.assertEqual(sum(frame.get("method") == "thread-stream-following-changed" for frame in self.pipe.frames), 1)
@@ -1096,16 +1108,18 @@ class ProtocolTests(unittest.TestCase):
                     nonlocal calls
                     calls += 1
                     if calls == 4:
-                        raise h._error(code)
+                        raise protocol_common._error(code)
                     return PROCESS
 
                 with patch.dict(os.environ, {"CODEX_THREAD_ID": THREAD, "CODEX_SESSION_ID": THREAD}, clear=False), \
-                        patch.object(h, "_global_state_path", return_value=state_file), \
-                        patch.object(h, "_verify_process_identity", side_effect=verify_process), \
-                        patch.object(h, "_verify_current_runner_ancestor") as runner, \
-                        patch.object(h._IpcClient, "snapshot_age", side_effect=iter([0.1, 1.0, 1.1, 3.0, 0.1])):
-                    with self.assertRaises(h.DesktopIpcError) as caught:
-                        h._current_result_context(self.temp.name)
+                        patch.object(protocol_identity, "_global_state_path", return_value=state_file), \
+                        patch.object(protocol_operations, "_verify_process_identity", side_effect=verify_process), \
+                        patch.object(protocol_result, "_verify_process_identity", side_effect=verify_process), \
+                        patch.object(protocol_result, "_verify_current_runner_ancestor") as runner, \
+                        patch.object(protocol_operations, "_verify_current_runner_ancestor", new=runner), \
+                        patch.object(protocol_transport._IpcClient, "snapshot_age", side_effect=iter([0.1, 1.0, 1.1, 3.0, 0.1])):
+                    with self.assertRaises(protocol_common.DesktopIpcError) as caught:
+                        protocol_result._current_result_context(self.temp.name)
                 self.assertEqual(caught.exception.code, code)
                 self.assertEqual(calls, 4)
                 self.assertEqual(runner.call_count, 2)
@@ -1120,12 +1134,12 @@ class ProtocolTests(unittest.TestCase):
         }), encoding="utf-8")
         self.pipe.state["threadRuntimeStatus"] = {"type": "active"}
         self.pipe.state["turns"] = [{"turnId": OLD_TURN, "status": "inProgress"}]
-        real_monotonic = h.time.monotonic
+        real_monotonic = protocol_transport.time.monotonic
         expired = False
         calls = 0
 
         def monotonic():
-            return real_monotonic() + (h.SNAPSHOT_TIMEOUT_SECONDS + 1.0 if expired else 0.0)
+            return real_monotonic() + (protocol_common.SNAPSHOT_TIMEOUT_SECONDS + 1.0 if expired else 0.0)
 
         def verify_process(*args):
             nonlocal calls, expired
@@ -1135,13 +1149,15 @@ class ProtocolTests(unittest.TestCase):
             return PROCESS
 
         with patch.dict(os.environ, {"CODEX_THREAD_ID": THREAD, "CODEX_SESSION_ID": THREAD}, clear=False), \
-                patch.object(h, "_global_state_path", return_value=state_file), \
-                patch.object(h, "_verify_process_identity", side_effect=verify_process), \
-                patch.object(h, "_verify_current_runner_ancestor") as runner, \
-                patch.object(h._IpcClient, "snapshot_age", side_effect=iter([0.1, 1.0, 1.1, 3.0, 0.1])), \
-                patch.object(h.time, "monotonic", new=monotonic):
-            with self.assertRaises(h.DesktopIpcError) as caught:
-                h._current_result_context(self.temp.name)
+                patch.object(protocol_identity, "_global_state_path", return_value=state_file), \
+                patch.object(protocol_operations, "_verify_process_identity", side_effect=verify_process), \
+                patch.object(protocol_result, "_verify_process_identity", side_effect=verify_process), \
+                patch.object(protocol_result, "_verify_current_runner_ancestor") as runner, \
+                patch.object(protocol_operations, "_verify_current_runner_ancestor", new=runner), \
+                patch.object(protocol_transport._IpcClient, "snapshot_age", side_effect=iter([0.1, 1.0, 1.1, 3.0, 0.1])), \
+                patch.object(protocol_result.time, "monotonic", new=monotonic):
+            with self.assertRaises(protocol_common.DesktopIpcError) as caught:
+                protocol_result._current_result_context(self.temp.name)
         self.assertEqual(caught.exception.code, "DESKTOP_STATE_UNAVAILABLE")
         self.assertEqual(calls, 4)
         self.assertEqual(runner.call_count, 2)
@@ -1175,10 +1191,10 @@ class ProtocolTests(unittest.TestCase):
                     return age
 
                 with patch.dict(os.environ, {"CODEX_THREAD_ID": THREAD, "CODEX_SESSION_ID": THREAD}, clear=False), \
-                        patch.object(h, "_global_state_path", return_value=state_file), \
-                        patch.object(h, "_verify_current_runner_ancestor"), \
-                        patch.object(h._IpcClient, "snapshot_age", side_effect=snapshot_age):
-                    result = h._current_result_context(self.temp.name)
+                        patch.object(protocol_identity, "_global_state_path", return_value=state_file), \
+                        patch.object(protocol_operations, "_verify_current_runner_ancestor"), patch.object(protocol_result, "_verify_current_runner_ancestor"), \
+                        patch.object(protocol_transport._IpcClient, "snapshot_age", side_effect=snapshot_age):
+                    result = protocol_result._current_result_context(self.temp.name)
                     expected_turn = OLD_TURN if state_change == "approval" else NEW_TURN
                     self.assertEqual(result["resultTurnId"], expected_turn)
                 self.assertEqual(sum(frame.get("method") == "thread-stream-following-changed" for frame in self.pipe.frames), 2)
@@ -1190,11 +1206,11 @@ class ProtocolTests(unittest.TestCase):
             "local-projects": {"project_test": {"rootPaths": [self.temp.name]}},
         }), encoding="utf-8")
         with patch.dict(os.environ, {"CODEX_THREAD_ID": THREAD, "CODEX_SESSION_ID": THREAD}, clear=False), \
-                patch.object(h, "_global_state_path", return_value=state_file), \
-                patch.object(h, "_verify_current_runner_ancestor"), \
-                patch.object(h, "_show_confirmation", return_value=False) as confirm:
-            with self.assertRaises(h.DesktopIpcError) as caught:
-                h._current_confirm(self.temp.name)
+                patch.object(protocol_identity, "_global_state_path", return_value=state_file), \
+                patch.object(protocol_operations, "_verify_current_runner_ancestor"), \
+                patch.object(protocol_operations, "_show_confirmation", return_value=False) as confirm:
+            with self.assertRaises(protocol_common.DesktopIpcError) as caught:
+                protocol_operations._current_confirm(self.temp.name)
         self.assertEqual(caught.exception.code, "DESKTOP_CONFIRMATION_CANCELLED")
         confirm.assert_called_once()
         self.assertEqual(self.pipe.starts(), [])
@@ -1203,8 +1219,8 @@ class ProtocolTests(unittest.TestCase):
         for failure in ("partial_write", "lost_receipt"):
             with self.subTest(failure=failure):
                 self.pipe.failure = failure
-                session, _ = h._prepare(self.target)
-                with self.assertRaises(h.DesktopIpcError) as caught:
+                session, _ = protocol_operations._prepare(self.target)
+                with self.assertRaises(protocol_common.DesktopIpcError) as caught:
                     session.send("完整方案")
                 self.assertEqual(caught.exception.code, "DESKTOP_OUTCOME_UNKNOWN")
                 self.assertFalse(caught.exception.not_sent)
@@ -1212,11 +1228,11 @@ class ProtocolTests(unittest.TestCase):
     def test_owner_discovery_exact_no_client_found_classifies_by_target(self):
         for target_owner, expected in ((None, "DESKTOP_NO_OWNER"), (OWNER, "DESKTOP_OWNER_CHANGED")):
             with self.subTest(target_owner=target_owner):
-                client = h._IpcClient(self.pipe, THREAD, "local")
+                client = protocol_transport._IpcClient(self.pipe, THREAD, "local")
                 client.initialize()
                 client.owner = target_owner
                 self.pipe.response_errors["thread-owner-discovery"] = "no-client-found"
-                with self.assertRaises(h.DesktopIpcError) as caught:
+                with self.assertRaises(protocol_common.DesktopIpcError) as caught:
                     client.discover()
                 self.assertEqual(caught.exception.code, expected)
                 self.assertNotEqual(caught.exception.code, "DESKTOP_TARGET_NOT_FOUND")
@@ -1227,9 +1243,9 @@ class ProtocolTests(unittest.TestCase):
                               ("thread-owner-discovery", "server-error"),
                               ("initialize", "no-client-found")):
             with self.subTest(method=method, error=error):
-                client = h._IpcClient(self.pipe, THREAD, "local")
+                client = protocol_transport._IpcClient(self.pipe, THREAD, "local")
                 self.pipe.response_errors[method] = error
-                with self.assertRaises(h.DesktopIpcError) as caught:
+                with self.assertRaises(protocol_common.DesktopIpcError) as caught:
                     client.initialize() if method == "initialize" else client.discover()
                 self.assertEqual(caught.exception.code, "DESKTOP_IPC_TIMEOUT")
                 self.pipe.response_errors.clear()
@@ -1237,9 +1253,9 @@ class ProtocolTests(unittest.TestCase):
     def test_prepare_no_owner_rechecks_initial_process_before_close(self):
         self.pipe.owner = None
         verify = Mock(side_effect=[PROCESS, PROCESS])
-        with patch.object(h, "_verify_process_identity", verify):
-            with self.assertRaises(h.DesktopIpcError) as caught:
-                h._prepare(self.target)
+        with patch.object(protocol_operations, "_verify_process_identity", verify):
+            with self.assertRaises(protocol_common.DesktopIpcError) as caught:
+                protocol_operations._prepare(self.target)
         self.assertEqual(caught.exception.code, "DESKTOP_NO_OWNER")
         self.assertEqual(verify.call_count, 2)
         self.assertEqual(verify.call_args_list[1].args, (self.pipe, self.target, PROCESS))
@@ -1250,10 +1266,10 @@ class ProtocolTests(unittest.TestCase):
             with self.subTest(code=code):
                 self.pipe.owner = None
                 self.pipe.closed = False
-                verify = Mock(side_effect=[PROCESS, h._error(code)])
-                with patch.object(h, "_verify_process_identity", verify):
-                    with self.assertRaises(h.DesktopIpcError) as caught:
-                        h._prepare(self.target)
+                verify = Mock(side_effect=[PROCESS, protocol_common._error(code)])
+                with patch.object(protocol_operations, "_verify_process_identity", verify):
+                    with self.assertRaises(protocol_common.DesktopIpcError) as caught:
+                        protocol_operations._prepare(self.target)
                 self.assertEqual(caught.exception.code, code)
                 self.assertEqual(verify.call_count, 2)
                 self.assertTrue(self.pipe.closed)
@@ -1262,25 +1278,25 @@ class ProtocolTests(unittest.TestCase):
         for code in ("DESKTOP_TOKEN_UNVERIFIED", "DESKTOP_ELEVATED"):
             with self.subTest(code=code):
                 verify = Mock()
-                with patch.object(h, "_query_standard_token", side_effect=h._error(code)), \
-                        patch.object(h, "_verify_process_identity", verify):
-                    with self.assertRaises(h.DesktopIpcError) as caught:
-                        h._prepare(self.target)
+                with patch.object(protocol_operations, "_query_standard_token", side_effect=protocol_common._error(code)), \
+                        patch.object(protocol_operations, "_verify_process_identity", verify):
+                    with self.assertRaises(protocol_common.DesktopIpcError) as caught:
+                        protocol_operations._prepare(self.target)
                 self.assertEqual(caught.exception.code, code)
                 verify.assert_not_called()
 
     def test_send_error_remains_outcome_unknown(self):
-        session, _ = h._prepare(self.target)
+        session, _ = protocol_operations._prepare(self.target)
         self.pipe.response_errors["thread-follower-start-turn"] = "no-client-found"
-        with self.assertRaises(h.DesktopIpcError) as caught:
+        with self.assertRaises(protocol_common.DesktopIpcError) as caught:
             session.send("完整方案")
         self.assertEqual(caught.exception.code, "DESKTOP_OUTCOME_UNKNOWN")
         self.assertFalse(caught.exception.not_sent)
 
     def test_old_turn_id_is_not_an_acceptance(self):
-        session, _ = h._prepare(self.target)
+        session, _ = protocol_operations._prepare(self.target)
         self.pipe.turn_id = OLD_TURN
-        with self.assertRaises(h.DesktopIpcError) as caught:
+        with self.assertRaises(protocol_common.DesktopIpcError) as caught:
             session.send("计划")
         self.assertFalse(caught.exception.not_sent)
 
@@ -1293,32 +1309,32 @@ class ProtocolTests(unittest.TestCase):
                 self.pipe.owner = value
             else:
                 self.pipe.state[field] = value
-            with self.assertRaises(h.DesktopIpcError) as caught:
-                h._prepare(self.target)
+            with self.assertRaises(protocol_common.DesktopIpcError) as caught:
+                protocol_operations._prepare(self.target)
             self.assertEqual(caught.exception.code, expected)
             if field == "owner":
                 self.pipe.owner = original
             else:
                 self.pipe.state[field] = original
-        h._query_standard_token.side_effect = h._error("DESKTOP_ELEVATED")
-        with self.assertRaises(h.DesktopIpcError):
-            h._prepare(self.target)
+        protocol_operations._query_standard_token.side_effect = protocol_common._error("DESKTOP_ELEVATED")
+        with self.assertRaises(protocol_common.DesktopIpcError):
+            protocol_operations._prepare(self.target)
         self.assertEqual(self.pipe.starts(), [])
 
     def test_expired_snapshot_before_start_is_rejected(self):
-        session, _ = h._prepare(self.target)
+        session, _ = protocol_operations._prepare(self.target)
         with patch.object(session.client, "snapshot_age", return_value=3.0):
-            with self.assertRaises(h.DesktopIpcError) as caught:
+            with self.assertRaises(protocol_common.DesktopIpcError) as caught:
                 session.send("计划")
         self.assertTrue(caught.exception.not_sent)
         self.assertEqual(self.pipe.starts(), [])
 
     def test_revision_gap_fails_closed(self):
-        session, _ = h._prepare(self.target)
+        session, _ = protocol_operations._prepare(self.target)
         event = {"type": "broadcast", "method": "thread-stream-state-changed", "version": 11,
                  "sourceClientId": OWNER, "params": {"conversationId": THREAD, "hostId": "local",
                  "change": {"type": "patches", "baseRevision": 0, "revision": 2, "patches": []}}}
-        with self.assertRaises(h.DesktopIpcError):
+        with self.assertRaises(protocol_common.DesktopIpcError):
             session.client._handle(event)
         self.assertEqual(self.pipe.starts(), [])
 
@@ -1327,10 +1343,10 @@ class ProtocolTests(unittest.TestCase):
         messages = [{"id": CLIENT, "op": "prepare", "target": self.target},
                     {"id": OLD_TURN, "op": "send", "message": "\x00" * 65536},
                     {"id": NEW_TURN, "op": "send", "message": "不能再发"}]
-        source = SimpleNamespace(buffer=io.BytesIO(b"".join(h._json_bytes(m) + b"\n" for m in messages)))
+        source = SimpleNamespace(buffer=io.BytesIO(b"".join(protocol_common._json_bytes(m) + b"\n" for m in messages)))
         output = SimpleNamespace(buffer=io.BytesIO())
-        with patch.object(h, "_prepare", return_value=(fake, {})), patch.object(sys, "stdin", source), patch.object(sys, "stdout", output):
-            self.assertEqual(h._main(), 0)
+        with patch.object(protocol_dispatch, "_prepare", return_value=(fake, {})), patch.object(sys, "stdin", source), patch.object(sys, "stdout", output):
+            self.assertEqual(protocol_dispatch._main(), 0)
         responses = [json.loads(line) for line in output.buffer.getvalue().splitlines()]
         self.assertTrue(responses[1]["ok"])
         self.assertFalse(responses[2]["ok"])
@@ -1339,21 +1355,21 @@ class ProtocolTests(unittest.TestCase):
 
     def test_diagnose_operation_accepts_only_id_op_workspace_root(self):
         request = {"id": CLIENT, "op": "diagnose", "workspaceRoot": "workspace", "target": {}}
-        source = SimpleNamespace(buffer=io.BytesIO(h._json_bytes(request) + b"\n"))
+        source = SimpleNamespace(buffer=io.BytesIO(protocol_common._json_bytes(request) + b"\n"))
         output = SimpleNamespace(buffer=io.BytesIO())
         with patch.object(sys, "stdin", source), patch.object(sys, "stdout", output):
-            h._main()
+            protocol_dispatch._main()
         self.assertEqual(json.loads(output.buffer.getvalue()),
                          {"id": CLIENT, "ok": False, "code": "DESKTOP_INVALID_REQUEST", "notSent": True})
 
     def test_diagnose_reports_behavioral_mode(self):
         # diagnosis 输出必须带 mode: "behavioral"，明确告诉机器消费者这不是 compatibility 分类。
         request = {"id": CLIENT, "op": "diagnose", "workspaceRoot": "workspace"}
-        source = SimpleNamespace(buffer=io.BytesIO(h._json_bytes(request) + b"\n"))
+        source = SimpleNamespace(buffer=io.BytesIO(protocol_common._json_bytes(request) + b"\n"))
         output = SimpleNamespace(buffer=io.BytesIO())
-        with patch.object(h, "_diagnose", return_value={"mode": "behavioral", "processStable": True}), \
+        with patch.object(protocol_dispatch, "_diagnose", return_value={"mode": "behavioral", "processStable": True}), \
                 patch.object(sys, "stdin", source), patch.object(sys, "stdout", output):
-            h._main()
+            protocol_dispatch._main()
         self.assertEqual(json.loads(output.buffer.getvalue()),
                          {"id": CLIENT, "ok": True, "value": {"mode": "behavioral", "processStable": True}})
 
@@ -1361,20 +1377,20 @@ class ProtocolTests(unittest.TestCase):
         value = {"threadId": THREAD, "hostId": "local", "projectId": "project_test",
                  "workspaceRoot": str(Path.cwd()), "resultTurnId": OLD_TURN, "resultTurnStatus": "completed"}
         request = {"id": CLIENT, "op": "inspect_result_context", "target": self.target}
-        source = SimpleNamespace(buffer=io.BytesIO(h._json_bytes(request) + b"\n"))
+        source = SimpleNamespace(buffer=io.BytesIO(protocol_common._json_bytes(request) + b"\n"))
         output = SimpleNamespace(buffer=io.BytesIO())
-        with patch.object(h, "_inspect_result_context", return_value=value) as inspect, \
+        with patch.object(protocol_dispatch, "_inspect_result_context", return_value=value) as inspect, \
                 patch.object(sys, "stdin", source), patch.object(sys, "stdout", output):
-            h._main()
+            protocol_dispatch._main()
         self.assertEqual(json.loads(output.buffer.getvalue()), {"id": CLIENT, "ok": True, "value": value})
         inspect.assert_called_once_with(self.target)
 
         invalid = {**request, "workspaceRoot": str(Path.cwd())}
         invalid["extra"] = True
-        source = SimpleNamespace(buffer=io.BytesIO(h._json_bytes(invalid) + b"\n"))
+        source = SimpleNamespace(buffer=io.BytesIO(protocol_common._json_bytes(invalid) + b"\n"))
         output = SimpleNamespace(buffer=io.BytesIO())
         with patch.object(sys, "stdin", source), patch.object(sys, "stdout", output):
-            h._main()
+            protocol_dispatch._main()
         self.assertEqual(json.loads(output.buffer.getvalue())["code"], "DESKTOP_INVALID_REQUEST")
 
     def test_inspect_result_ownership_dispatch_is_exact_and_target_scoped(self):
@@ -1399,17 +1415,17 @@ class ProtocolTests(unittest.TestCase):
                        "originTurnId": NEW_TURN, "deliveryId": delivery_id}
 
         def response_for(candidate):
-            source = SimpleNamespace(buffer=io.BytesIO(h._json_bytes(candidate) + b"\n"))
+            source = SimpleNamespace(buffer=io.BytesIO(protocol_common._json_bytes(candidate) + b"\n"))
             output = SimpleNamespace(buffer=io.BytesIO())
             with patch.object(sys, "stdin", source), patch.object(sys, "stdout", output):
-                h._main()
+                protocol_dispatch._main()
             return json.loads(output.buffer.getvalue())
 
         request = {"id": CLIENT, "op": "inspect_result_ownership", "target": self.target,
                    "expectation": expectation}
         with patch.dict(os.environ, {}, clear=True), \
-                patch.object(h, "_verify_current_runner_ancestor", side_effect=AssertionError("runner check called")), \
-                patch.object(h, "_current_target", side_effect=AssertionError("current target used")):
+                patch.object(protocol_result, "_verify_current_runner_ancestor", side_effect=AssertionError("runner check called")), \
+                patch.object(protocol_result, "_current_target", side_effect=AssertionError("current target used")):
             response = response_for(request)
         self.assertEqual(response["id"], CLIENT)
         self.assertTrue(response["ok"])
@@ -1458,17 +1474,17 @@ class ProtocolTests(unittest.TestCase):
 
     def test_result_activity_marker_is_ordered_id_type_only_and_fence_is_prefix_strict(self):
         self._activity_state()
-        marker_result = h._inspect_result_activity_marker(self.target)
+        marker_result = protocol_result._inspect_result_activity_marker(self.target)
         marker = marker_result["marker"]
         self.assertEqual(marker["resultTurnId"], NEW_TURN)
         self.assertEqual(marker["itemIds"], ["item-1", "item-2"])
         self.assertEqual(marker["itemTypes"], ["userMessage", "commandExecution"])
         self.assertEqual(marker["itemCount"], 2)
-        self.assertEqual(marker["itemSha256"], h._result_activity_sha256(marker["itemIds"], marker["itemTypes"]))
+        self.assertEqual(marker["itemSha256"], protocol_result._result_activity_sha256(marker["itemIds"], marker["itemTypes"]))
         self.assertNotIn("content", marker)
         self.assertNotIn("command", marker)
 
-        safe = h._inspect_result_terminal_fence(self.target, marker)
+        safe = protocol_result._inspect_result_terminal_fence(self.target, marker)
         self.assertEqual(safe["fence"], "safe_terminal")
 
         self._activity_state(items=[
@@ -1477,7 +1493,7 @@ class ProtocolTests(unittest.TestCase):
             {"id": "item-3", "type": "reasoning"},
             {"id": "item-4", "type": "agentMessage"},
         ])
-        self.assertEqual(h._inspect_result_terminal_fence(self.target, marker)["fence"], "safe_terminal")
+        self.assertEqual(protocol_result._inspect_result_terminal_fence(self.target, marker)["fence"], "safe_terminal")
 
         self._activity_state(items=[
             {"id": "item-1", "type": "userMessage"},
@@ -1485,7 +1501,7 @@ class ProtocolTests(unittest.TestCase):
             {"id": "item-3", "type": "reasoning"},
             {"id": "item-4", "type": "agentMessage"},
         ], runtime="inProgress", status="inProgress")
-        self.assertEqual(h._inspect_result_terminal_fence(self.target, marker)["fence"], "inProgress")
+        self.assertEqual(protocol_result._inspect_result_terminal_fence(self.target, marker)["fence"], "inProgress")
 
         self._activity_state(items=[
             {"id": "item-1", "type": "userMessage"},
@@ -1493,7 +1509,7 @@ class ProtocolTests(unittest.TestCase):
             {"id": "item-3", "type": "reasoning"},
             {"id": "item-4", "type": "commandExecution"},
         ])
-        self.assertEqual(h._inspect_result_terminal_fence(self.target, marker)["fence"], "post_record_activity")
+        self.assertEqual(protocol_result._inspect_result_terminal_fence(self.target, marker)["fence"], "post_record_activity")
 
         self._activity_state(items=[
             {"id": "item-1", "type": "userMessage"},
@@ -1501,7 +1517,7 @@ class ProtocolTests(unittest.TestCase):
             {"id": "item-3", "type": "reasoning"},
             {"id": "item-4", "type": "mcpToolCall"},
         ])
-        self.assertEqual(h._inspect_result_terminal_fence(self.target, marker)["fence"], "post_record_activity")
+        self.assertEqual(protocol_result._inspect_result_terminal_fence(self.target, marker)["fence"], "post_record_activity")
 
         self._activity_state(items=[
             {"id": "item-1", "type": "userMessage"},
@@ -1509,19 +1525,19 @@ class ProtocolTests(unittest.TestCase):
             {"id": "item-3", "type": "agentMessage"},
             {"id": "item-4", "type": "fileChange"},
         ])
-        self.assertEqual(h._inspect_result_terminal_fence(self.target, marker)["fence"], "post_record_activity")
+        self.assertEqual(protocol_result._inspect_result_terminal_fence(self.target, marker)["fence"], "post_record_activity")
 
         self._activity_state(items=[
             {"id": "item-2", "type": "commandExecution"},
             {"id": "item-1", "type": "userMessage"},
         ])
-        self.assertEqual(h._inspect_result_terminal_fence(self.target, marker)["fence"], "unprovable")
+        self.assertEqual(protocol_result._inspect_result_terminal_fence(self.target, marker)["fence"], "unprovable")
 
         self._activity_state(runtime="inProgress", status="inProgress")
-        self.assertEqual(h._inspect_result_terminal_fence(self.target, marker)["fence"], "inProgress")
+        self.assertEqual(protocol_result._inspect_result_terminal_fence(self.target, marker)["fence"], "inProgress")
 
         bad_digest = {**marker, "itemSha256": "0" * 64}
-        self.assertEqual(h._inspect_result_terminal_fence(self.target, bad_digest)["fence"], "unprovable")
+        self.assertEqual(protocol_result._inspect_result_terminal_fence(self.target, bad_digest)["fence"], "unprovable")
 
     def test_result_activity_marker_unknown_or_malformed_item_fails_closed(self):
         for item in ({"type": "agentMessage"}, {"id": "item-1", "type": "futureItem"},
@@ -1530,37 +1546,37 @@ class ProtocolTests(unittest.TestCase):
                      "malformed"):
             with self.subTest(item=item):
                 self._activity_state(items=item if isinstance(item, list) else [item])
-                with self.assertRaises(h.DesktopIpcError) as caught:
-                    h._inspect_result_activity_marker(self.target)
+                with self.assertRaises(protocol_common.DesktopIpcError) as caught:
+                    protocol_result._inspect_result_activity_marker(self.target)
                 self.assertEqual(caught.exception.code, "DESKTOP_STATE_UNAVAILABLE")
 
     def test_result_activity_marker_operations_require_exact_target_shapes(self):
         marker = {"resultTurnId": NEW_TURN, "itemIds": [], "itemTypes": [], "itemCount": 0,
-                  "itemSha256": h._result_activity_sha256([], [])}
+                  "itemSha256": protocol_result._result_activity_sha256([], [])}
         value = {"marker": marker}
         request = {"id": CLIENT, "op": "inspect_result_activity_marker", "target": self.target}
-        source = SimpleNamespace(buffer=io.BytesIO(h._json_bytes(request) + b"\n"))
+        source = SimpleNamespace(buffer=io.BytesIO(protocol_common._json_bytes(request) + b"\n"))
         output = SimpleNamespace(buffer=io.BytesIO())
-        with patch.object(h, "_inspect_result_activity_marker", return_value=value) as inspect, \
+        with patch.object(protocol_dispatch, "_inspect_result_activity_marker", return_value=value) as inspect, \
                 patch.object(sys, "stdin", source), patch.object(sys, "stdout", output):
-            h._main()
+            protocol_dispatch._main()
         self.assertEqual(json.loads(output.buffer.getvalue()), {"id": CLIENT, "ok": True, "value": value})
         inspect.assert_called_once_with(self.target)
 
         request = {"id": CLIENT, "op": "inspect_result_terminal_fence", "target": self.target, "marker": marker}
-        source = SimpleNamespace(buffer=io.BytesIO(h._json_bytes(request) + b"\n"))
+        source = SimpleNamespace(buffer=io.BytesIO(protocol_common._json_bytes(request) + b"\n"))
         output = SimpleNamespace(buffer=io.BytesIO())
-        with patch.object(h, "_inspect_result_terminal_fence", return_value={"fence": "unprovable"}) as fence, \
+        with patch.object(protocol_dispatch, "_inspect_result_terminal_fence", return_value={"fence": "unprovable"}) as fence, \
                 patch.object(sys, "stdin", source), patch.object(sys, "stdout", output):
-            h._main()
+            protocol_dispatch._main()
         self.assertEqual(json.loads(output.buffer.getvalue()), {"id": CLIENT, "ok": True, "value": {"fence": "unprovable"}})
         fence.assert_called_once_with(self.target, marker)
 
         invalid = {**request, "raw": "body"}
-        source = SimpleNamespace(buffer=io.BytesIO(h._json_bytes(invalid) + b"\n"))
+        source = SimpleNamespace(buffer=io.BytesIO(protocol_common._json_bytes(invalid) + b"\n"))
         output = SimpleNamespace(buffer=io.BytesIO())
         with patch.object(sys, "stdin", source), patch.object(sys, "stdout", output):
-            h._main()
+            protocol_dispatch._main()
         self.assertEqual(json.loads(output.buffer.getvalue())["code"], "DESKTOP_INVALID_REQUEST")
 
 
@@ -1590,7 +1606,7 @@ class ClassificationTests(unittest.TestCase):
                                   "params": {"input": [ordinary_item]},
                                   "items": [{"type": "userMessage", "content": [ordinary_item]}]})
                 else:
-                    triggers = trigger if isinstance(trigger, list) else [trigger or h._NATIVE_CONTINUATION_TRIGGER] * hops
+                    triggers = trigger if isinstance(trigger, list) else [trigger or protocol_history._NATIVE_CONTINUATION_TRIGGER] * hops
                     for index in range(hops):
                         params = {"turnTrigger": triggers[index], "input": []}
                         hop_id = turn_id if index == hops - 1 else f"01a00000-0000-7000-8000-{index + 6:012d}"
@@ -1611,12 +1627,12 @@ class ClassificationTests(unittest.TestCase):
             client = SimpleNamespace(drain=Mock(), current_state=lambda: pipe.state,
                                      snapshot_age=lambda: 0, owner=OWNER)
             session = SimpleNamespace(client=client, pipe=pipe, process=PROCESS, close=Mock())
-            with patch.object(h, "_current_target", return_value=target), \
-                 patch.object(h, "_prepare", return_value=(session, {})), \
-                 patch.object(h, "_verify_process_identity", return_value=PROCESS), \
-                 patch.object(h, "_public_info", return_value={}), \
-                 patch.object(h, "_verify_current_runner_ancestor"):
-                return h._current_result_classification(directory)
+            with patch.object(protocol_result, "_current_target", return_value=target), \
+                 patch.object(protocol_result, "_prepare", return_value=(session, {})), \
+                 patch.object(protocol_result, "_verify_process_identity", return_value=PROCESS), \
+                 patch.object(protocol_result, "_public_info", return_value={}), \
+                 patch.object(protocol_operations, "_verify_current_runner_ancestor"), patch.object(protocol_result, "_verify_current_runner_ancestor"):
+                return protocol_result._current_result_classification(directory)
 
     def test_result_classification_ordinary_and_json_non_c2c_are_not_applicable(self):
         for text in ("普通后续消息", '{"type":"other"}'):
@@ -1652,7 +1668,7 @@ class ClassificationTests(unittest.TestCase):
             '{"type":"C2C_DESKTOP_TASK","version":1,"workspaceId":"workspace","commandId":"x","intent":"revision","message":"\ud800"}',
         ]
         for text in variants:
-            with self.subTest(text=text), self.assertRaises(h.DesktopIpcError) as caught:
+            with self.subTest(text=text), self.assertRaises(protocol_common.DesktopIpcError) as caught:
                 self._classification_case(text)
             self.assertEqual(caught.exception.code, "DESKTOP_STATE_UNAVAILABLE")
 
@@ -1673,7 +1689,7 @@ class ClassificationTests(unittest.TestCase):
             '{"type":"C2C_DESKTOP_TASK","version":1,"workspaceId":"workspace","commandId":"x","intent":"revision","message":"x","deliveryId":"01a00000-0000-7000-8000-000000000200"}',
         )
         for malformed in invalid:
-            with self.subTest(malformed=malformed), self.assertRaises(h.DesktopIpcError) as caught:
+            with self.subTest(malformed=malformed), self.assertRaises(protocol_common.DesktopIpcError) as caught:
                 self._classification_case(malformed)
             self.assertEqual(caught.exception.code, "DESKTOP_STATE_UNAVAILABLE")
 
@@ -1705,7 +1721,7 @@ class ClassificationTests(unittest.TestCase):
         cases = ["{malformed", '{"type":"C2C_DESKTOP_TASK"}']
         for text in cases:
             with self.subTest(text=text):
-                with self.assertRaises(h.DesktopIpcError) as caught:
+                with self.assertRaises(protocol_common.DesktopIpcError) as caught:
                     self._classification_case(text)
             self.assertEqual(caught.exception.code, "DESKTOP_STATE_UNAVAILABLE")
 
@@ -1716,7 +1732,7 @@ class ClassificationTests(unittest.TestCase):
         self.assertEqual(result["chainTurnIds"], [OLD_TURN, NEW_TURN])
         self.assertEqual(result["chainLength"], 1)
         self.assertEqual(result["chainSignatures"], ["capacity_retry_automatic"])
-        self.assertEqual(result["signature"], h._NATIVE_CONTINUATION_TRIGGER)
+        self.assertEqual(result["signature"], protocol_history._NATIVE_CONTINUATION_TRIGGER)
         self.assertEqual(result["workspaceId"], "workspace")
         self.assertEqual(result["commandId"], "cmd-classify")
         self.assertEqual(result["intent"], "development_plan")
@@ -1735,7 +1751,7 @@ class ClassificationTests(unittest.TestCase):
         self.assertEqual(result["chainSignatures"], ["resume_interrupted_task"])
         self.assertEqual(result["signature"], "resume_interrupted_task")
         for status in ("failed", "completed", "cancelled"):
-            with self.subTest(predecessor=status), self.assertRaises(h.DesktopIpcError) as caught:
+            with self.subTest(predecessor=status), self.assertRaises(protocol_common.DesktopIpcError) as caught:
                 self._classification_case(
                     "", continuation=True, trigger="resume_interrupted_task", predecessor_status=status)
             self.assertEqual(caught.exception.code, "DESKTOP_STATE_UNAVAILABLE")
@@ -1744,7 +1760,7 @@ class ClassificationTests(unittest.TestCase):
             {"machine_input": [{"type": "text", "text": "ordinary input", "text_elements": []}]},
             {"machine_items": [{"type": "userMessage"}]},
         ):
-            with self.subTest(manual_successor=kwargs), self.assertRaises(h.DesktopIpcError) as caught:
+            with self.subTest(manual_successor=kwargs), self.assertRaises(protocol_common.DesktopIpcError) as caught:
                 self._classification_case(
                     "", continuation=True, trigger="resume_interrupted_task", predecessor_status="interrupted", **kwargs)
             self.assertEqual(caught.exception.code, "DESKTOP_STATE_UNAVAILABLE")
@@ -1758,7 +1774,7 @@ class ClassificationTests(unittest.TestCase):
         self.assertEqual(result["chainSignatures"], ["capacity_retry_automatic", "resume_interrupted_task"])
         self.assertEqual(result["signature"], "resume_interrupted_task")
 
-        with self.assertRaises(h.DesktopIpcError) as caught:
+        with self.assertRaises(protocol_common.DesktopIpcError) as caught:
             self._classification_case(
                 "", continuation=True, hops=2,
                 trigger=["capacity_retry_automatic", "resume_interrupted_task"],
@@ -1770,8 +1786,8 @@ class ClassificationTests(unittest.TestCase):
         self.assertEqual(result["classification"], "not_applicable")
 
     def test_result_classification_max_unique_hops_and_ordinary_origin(self):
-        result = self._classification_case("", continuation=True, hops=h.MAX_RESULT_OWNERSHIP_CHAIN)
-        self.assertEqual(result["chainLength"], h.MAX_RESULT_OWNERSHIP_CHAIN)
+        result = self._classification_case("", continuation=True, hops=protocol_common.MAX_RESULT_OWNERSHIP_CHAIN)
+        self.assertEqual(result["chainLength"], protocol_common.MAX_RESULT_OWNERSHIP_CHAIN)
         self.assertEqual(len(set(result["chainTurnIds"])), len(result["chainTurnIds"]))
         self.assertEqual(self._classification_case("", continuation=True, ordinary_origin=True)["classification"], "not_applicable")
 
@@ -1780,7 +1796,7 @@ class ClassificationTests(unittest.TestCase):
                  {"thread_id": "01a00000-0000-7000-8000-000000000099"}, {"boundary": "loading"}]
         for case in cases:
             with self.subTest(case=case):
-                with self.assertRaises(h.DesktopIpcError):
+                with self.assertRaises(protocol_common.DesktopIpcError):
                     self._classification_case("", continuation=True, **case)
 
     def test_result_classification_two_hop_and_chain_bound(self):
@@ -1789,14 +1805,14 @@ class ClassificationTests(unittest.TestCase):
         self.assertEqual(result["chainTurnIds"], [OLD_TURN, "01a00000-0000-7000-8000-000000000006", NEW_TURN])
         for key in ("text", "message", "envelope", "history", "params", "items"):
             self.assertNotIn(key, result)
-        with self.assertRaises(h.DesktopIpcError) as caught:
-            self._classification_case("", continuation=True, hops=h.MAX_RESULT_OWNERSHIP_CHAIN + 1)
+        with self.assertRaises(protocol_common.DesktopIpcError) as caught:
+            self._classification_case("", continuation=True, hops=protocol_common.MAX_RESULT_OWNERSHIP_CHAIN + 1)
         self.assertEqual(caught.exception.code, "DESKTOP_STATE_UNAVAILABLE")
 
     def test_result_classification_continuation_malformed_trigger_or_predecessor_fails_closed(self):
         for kwargs in ({"trigger": "wrong-trigger"}, {"predecessor_status": "completed"}):
             with self.subTest(kwargs=kwargs):
-                with self.assertRaises(h.DesktopIpcError) as caught:
+                with self.assertRaises(protocol_common.DesktopIpcError) as caught:
                     self._classification_case("", continuation=True, **kwargs)
                 self.assertEqual(caught.exception.code, "DESKTOP_STATE_UNAVAILABLE")
 
@@ -1816,10 +1832,10 @@ class ClassificationTests(unittest.TestCase):
                 "entitiesByKey": {"a": origin, "b": current}}}
             client = SimpleNamespace(drain=Mock(), current_state=lambda: pipe.state, snapshot_age=lambda: 0, owner=OWNER)
             session = SimpleNamespace(client=client, pipe=pipe, process=PROCESS, close=Mock())
-            with patch.object(h, "_current_target", return_value=target), patch.object(h, "_prepare", return_value=(session, {})), \
-                 patch.object(h, "_verify_process_identity", return_value=PROCESS), patch.object(h, "_public_info", return_value={}), \
-                 patch.object(h, "_verify_current_runner_ancestor"):
-                return h._current_result_classification(directory), pipe
+            with patch.object(protocol_result, "_current_target", return_value=target), patch.object(protocol_result, "_prepare", return_value=(session, {})), \
+                 patch.object(protocol_result, "_verify_process_identity", return_value=PROCESS), patch.object(protocol_result, "_public_info", return_value={}), \
+                 patch.object(protocol_operations, "_verify_current_runner_ancestor"), patch.object(protocol_result, "_verify_current_runner_ancestor"):
+                return protocol_result._current_result_classification(directory), pipe
 
     def test_result_classification_cross_island_exhausted_is_not_applicable(self):
         result, pipe = self._cross_island_case("exhausted")
@@ -1843,8 +1859,8 @@ class ClassificationTests(unittest.TestCase):
             pipe.state["turns"]=turns; pipe.state["turnHistory"]={"kind":"canonical","history":{"islands":islands,"entitiesByKey":entities}}
             client=SimpleNamespace(drain=Mock(),current_state=lambda:pipe.state,snapshot_age=lambda:0,owner=OWNER)
             session=SimpleNamespace(client=client,pipe=pipe,process=PROCESS,close=Mock())
-            with patch.object(h,"_current_target",return_value=target), patch.object(h,"_prepare",return_value=(session,{})), patch.object(h,"_verify_process_identity",return_value=PROCESS), patch.object(h,"_verify_current_runner_ancestor"), patch.object(h,"_public_info",return_value={}):
-                result=h._current_result_classification(directory)
+            with patch.object(protocol_result,"_current_target",return_value=target), patch.object(protocol_result,"_prepare",return_value=(session,{})), patch.object(protocol_result,"_verify_process_identity",return_value=PROCESS), patch.object(protocol_result,"_verify_current_runner_ancestor"), patch.object(protocol_result,"_public_info",return_value={}):
+                result=protocol_result._current_result_classification(directory)
             self.assertEqual(result["commandId"],"cmd-current"); self.assertEqual(result["originTurnId"],NEW_TURN); self.assertEqual(pipe.starts(),[])
 
     def _fresh_state(self, turn_id, command_id):
@@ -1857,14 +1873,14 @@ class ClassificationTests(unittest.TestCase):
             target={"threadId":THREAD,"hostId":"local","projectId":"project_test","workspaceRoot":directory}; old=self._fresh_state(OLD_TURN,"cmd-old"); new=self._fresh_state(NEW_TURN,"cmd-fresh")
             class Client:
                 owner=OWNER; snapshot_serial=1
-                def __init__(self): self.ages=[0,h.MAX_OBSERVATION_AGE_SECONDS + 1,0]; self.snapshots=0
+                def __init__(self): self.ages=[0,protocol_common.MAX_OBSERVATION_AGE_SECONDS + 1,0]; self.snapshots=0
                 def drain(self,_): pass
                 def current_state(self): return old
                 def snapshot_age(self): return self.ages.pop(0) if self.ages else 0
                 def snapshot(self): self.snapshots+=1; self.snapshot_serial=2; return new
             client=Client(); pipe=SimpleNamespace(verify_server=Mock(), starts=lambda:[]); session=SimpleNamespace(client=client,pipe=pipe,process=PROCESS,close=Mock())
-            with patch.object(h,"_current_target",return_value=target), patch.object(h,"_prepare",return_value=(session,{})), patch.object(h,"_validate_observed_state"), patch.object(h,"_verify_process_identity",return_value=PROCESS) as vr, patch.object(h,"_verify_current_runner_ancestor") as va, patch.object(h,"_public_info",return_value={}):
-                result=h._current_result_classification(directory)
+            with patch.object(protocol_result,"_current_target",return_value=target), patch.object(protocol_result,"_prepare",return_value=(session,{})), patch.object(protocol_result,"_validate_observed_state"), patch.object(protocol_result,"_verify_process_identity",return_value=PROCESS) as vr, patch.object(protocol_result,"_verify_current_runner_ancestor") as va, patch.object(protocol_result,"_public_info",return_value={}):
+                result=protocol_result._current_result_classification(directory)
             self.assertEqual(result["commandId"],"cmd-fresh"); self.assertEqual(result["resultTurnId"],NEW_TURN); self.assertEqual(client.snapshots,1); self.assertEqual(vr.call_count,2); self.assertEqual(va.call_count,2); pipe.verify_server.assert_called_once()
 
     def test_result_classification_freshness_fail_closed_serial_or_age(self):
@@ -1879,41 +1895,41 @@ class ClassificationTests(unittest.TestCase):
                     def snapshot(self):
                         if serial_advanced: self.snapshot_serial=2
                         return state
-                client=Client(); ages=iter([0,h.MAX_OBSERVATION_AGE_SECONDS + 1,h.MAX_OBSERVATION_AGE_SECONDS + 1] if not fresh_after else [0,h.MAX_OBSERVATION_AGE_SECONDS + 1,0]); client.snapshot_age=lambda: next(ages,h.MAX_OBSERVATION_AGE_SECONDS + 1)
+                client=Client(); ages=iter([0,protocol_common.MAX_OBSERVATION_AGE_SECONDS + 1,protocol_common.MAX_OBSERVATION_AGE_SECONDS + 1] if not fresh_after else [0,protocol_common.MAX_OBSERVATION_AGE_SECONDS + 1,0]); client.snapshot_age=lambda: next(ages,protocol_common.MAX_OBSERVATION_AGE_SECONDS + 1)
                 pipe=SimpleNamespace(verify_server=Mock(), starts=lambda:[]); session=SimpleNamespace(client=client,pipe=pipe,process=PROCESS,close=Mock())
-                with patch.object(h,"_current_target",return_value=target), patch.object(h,"_prepare",return_value=(session,{})), patch.object(h,"_validate_observed_state"), patch.object(h,"_verify_process_identity",return_value=PROCESS), patch.object(h,"_verify_current_runner_ancestor"), patch.object(h,"_public_info",return_value={}):
-                    with self.assertRaises(h.DesktopIpcError) as caught: h._current_result_classification(directory)
+                with patch.object(protocol_result,"_current_target",return_value=target), patch.object(protocol_result,"_prepare",return_value=(session,{})), patch.object(protocol_result,"_validate_observed_state"), patch.object(protocol_result,"_verify_process_identity",return_value=PROCESS), patch.object(protocol_result,"_verify_current_runner_ancestor"), patch.object(protocol_result,"_public_info",return_value={}):
+                    with self.assertRaises(protocol_common.DesktopIpcError) as caught: protocol_result._current_result_classification(directory)
                 self.assertEqual(caught.exception.code,"DESKTOP_STATE_UNAVAILABLE")
 
     def test_result_classification_main_rejects_extra_request_fields(self):
         request = {"id": CLIENT, "op": "current_result_classification", "workspaceRoot": str(Path.cwd()),
                    "expectations": [], "extra": True}
-        source = SimpleNamespace(buffer=io.BytesIO(h._json_bytes(request) + b"\n"))
+        source = SimpleNamespace(buffer=io.BytesIO(protocol_common._json_bytes(request) + b"\n"))
         output = SimpleNamespace(buffer=io.BytesIO())
         with patch.object(sys, "stdin", source), patch.object(sys, "stdout", output):
-            h._main()
+            protocol_dispatch._main()
         response = json.loads(output.buffer.getvalue())
         self.assertFalse(response["ok"])
         self.assertEqual(response["code"], "DESKTOP_INVALID_REQUEST")
 
     def test_result_classification_main_exact_request_succeeds(self):
         request = {"id": CLIENT, "op": "current_result_classification", "workspaceRoot": str(Path.cwd())}
-        source = SimpleNamespace(buffer=io.BytesIO(h._json_bytes(request) + b"\n"))
+        source = SimpleNamespace(buffer=io.BytesIO(protocol_common._json_bytes(request) + b"\n"))
         output = SimpleNamespace(buffer=io.BytesIO())
-        with patch.object(h, "_current_result_classification", return_value={"classification": "not_applicable"}) as classify, \
+        with patch.object(protocol_dispatch, "_current_result_classification", return_value={"classification": "not_applicable"}) as classify, \
                 patch.object(sys, "stdin", source), patch.object(sys, "stdout", output):
-            h._main()
+            protocol_dispatch._main()
         response = json.loads(output.buffer.getvalue())
         self.assertEqual(response, {"id": CLIENT, "ok": True, "value": {"classification": "not_applicable"}})
         classify.assert_called_once_with(str(Path.cwd()))
 
         request = {"id": CLIENT, "op": "current_result_classification", "workspaceRoot": str(Path.cwd()),
                    "expectations": []}
-        source = SimpleNamespace(buffer=io.BytesIO(h._json_bytes(request) + b"\n"))
+        source = SimpleNamespace(buffer=io.BytesIO(protocol_common._json_bytes(request) + b"\n"))
         output = SimpleNamespace(buffer=io.BytesIO())
-        with patch.object(h, "_current_result_classification", return_value={"classification": "not_applicable"}), \
+        with patch.object(protocol_dispatch, "_current_result_classification", return_value={"classification": "not_applicable"}), \
                 patch.object(sys, "stdin", source), patch.object(sys, "stdout", output):
-            h._main()
+            protocol_dispatch._main()
         response = json.loads(output.buffer.getvalue())
         self.assertFalse(response["ok"])
         self.assertEqual(response["code"], "DESKTOP_INVALID_REQUEST")
