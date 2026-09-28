@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
-import type { FeedbackEvent } from "./store.js";
-import { FINAL_RECEIPT_REQUIRED_EVENT_KIND } from "./store.js";
+import {
+  FINAL_RECEIPT_REQUIRED_EVENT_KIND,
+  type FeedbackEvent,
+} from "./schema.js";
 
 /**
  * production feedback 的唯一 canonical formatter。

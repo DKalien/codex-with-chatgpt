@@ -5,19 +5,20 @@ import {
   type StoredExecutionRecord,
 } from "../execution/records.js";
 import { readDesktop, type DesktopState } from "../desktop/store.js";
+import { applyProjection } from "./projection-store.js";
 import {
-  applyProjection,
   ensureFeedbackState,
-  finalReceiptRequiredEventId,
+  recoverStaleFeedback,
+} from "./state-store.js";
+import { finalReceiptRequiredEventId, feedbackEventId } from "./projection-store.js";
+import {
   FINAL_RECEIPT_REQUIRED_EVENT_KIND,
-  feedbackEventId,
   feedbackEventSchema,
   FeedbackError,
-  recoverStaleFeedback,
   type FinalReceiptRequiredEvent,
   type FeedbackEvent,
   type FeedbackState,
-} from "./store.js";
+} from "./schema.js";
 import { listReceiptFinalizationAlerts } from "../desktop/receipt-finalizer.js";
 import { resolveResultOutboxEntries } from "../routing/result-outbox-store.js";
 import { readRouting, resolveWorkspaceIdentity } from "../routing/store.js";
