@@ -88,14 +88,16 @@ describe("G1a/G2 workflow CLI source contracts", () => {
 
   it("MCP workspace_info includes workflow projection schema", () => {
     const mcp = readSource("src/mcp/server.ts");
+    const workspaceTools = readSource("src/mcp/workspace-tools.ts");
+    const schemas = readSource("src/mcp/base-schemas.ts");
     const request = readSource("src/workflow/request.ts");
     expect(mcp).toMatch(/workflowOutputSchema/);
-    expect(mcp).toMatch(/conversationIdentity/);
-    expect(mcp).toMatch(/remoteRequestCapability/);
-    expect(mcp).toMatch(/workflowProjectionFailure/);
-    expect(mcp).toMatch(/WORKFLOW_BLOCKER_CODES/);
-    expect(mcp).toMatch(/WORKFLOW_OVERALL_STATES/);
-    expect(mcp).toMatch(/currentConversation/);
+    expect(workspaceTools).toMatch(/conversationIdentity/);
+    expect(workspaceTools).toMatch(/remoteRequestCapability/);
+    expect(workspaceTools).toMatch(/workflowProjectionFailure/);
+    expect(schemas).toMatch(/WORKFLOW_BLOCKER_CODES/);
+    expect(schemas).toMatch(/WORKFLOW_OVERALL_STATES/);
+    expect(workspaceTools).toMatch(/currentConversation/);
     expect(mcp).not.toMatch(/collectWorkflowReadinessInput\(/);
     expect(request).toMatch(/workflow_projection_failed/);
   });
@@ -103,13 +105,14 @@ describe("G1a/G2 workflow CLI source contracts", () => {
   it("MCP projection keeps chatKnown durable-only; request identity separate", () => {
     const facts = readSource("src/workflow/facts.ts");
     const request = readSource("src/workflow/request.ts");
-    const readiness = readSource("src/workflow/readiness.ts");
+    const readiness = readSource("src/workflow/readiness-policy.ts");
+    const readinessModel = readSource("src/workflow/readiness-model.ts");
     expect(facts).toMatch(/chatKnown: false/);
     expect(facts).not.toMatch(/chatKnown: conversationSource/);
     expect(request).toMatch(/workflowProjectionFailure/);
     expect(request).toMatch(/requestContext/);
     expect(readiness).toMatch(/currentConversation/);
-    expect(readiness).toMatch(/WORKFLOW_BLOCKER_CODES/);
+    expect(readinessModel).toMatch(/WORKFLOW_BLOCKER_CODES/);
   });
 
   it("runtime mapper classifies state before pending marker", () => {

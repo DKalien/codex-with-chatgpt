@@ -58,6 +58,22 @@
 | `cli/` | `c2c` commands; `--json` everywhere for the Skill |
 | `config/`, `logger/` | OS-convention state dir, secret-redacting logger |
 
+## R4.5 Structural Boundaries
+
+R4.5 是面向 R5 的行为保持型结构整理，不是协议、持久化 schema、所有权或安全语义迁移。
+
+- **CLI**：`src/cli/index.ts` 是薄 composition root；命令注册按 post-turn、Desktop receipt、runtime、setup/tunnel、workspace/session、maintenance 和 record 等职责分布在 CLI modules 中。
+- **Desktop TypeScript IPC**：`src/desktop/ipc.ts` 保持稳定 facade；contracts、transport、errors、validation 和 client 分层，调用方继续使用原公共入口。
+- **Python Desktop helper**：`desktop_ipc.py` 是精确 sibling bootstrap，加载 `c2c_desktop_ipc` package；dispatch、common、history、identity、operations、reconciliation、result、transport 各自负责窄领域，使用 `python -I` 时不修改 `sys.path`。
+- **Feedback / Companion**：`src/feedback/store.ts` 与 `companion.ts` 是兼容 facade；`state-store` 是唯一 feedback lock/write transaction owner，receiver、delivery-lifecycle、projection-store 分离。Companion 的 common/state/pairing/route/rebind/delivery/projection 分模块；ACK transition 集中在 delivery lifecycle。Browser Companion 仍是 return-only transport。
+- **Desktop result / finalizer / recovery**：`result.ts` 与 `receipt-finalizer.ts` 是稳定 facade；result-schema/evidence/commit/record/finalization 分层。可信 output 与 receipt append 只有一个 commit path；receipt-finalizer 的 schema/store/worker 分离，worker 仅做 orchestration。`recovery-evidence` 持有通用 evidence lock/proof primitive，administrative recovery 仍不代表 completion。
+- **Session / workflow / MCP**：`session/state.ts` facade 组合 schema、conversation、store、operations，store 是唯一 session lock/atomic-write owner。`workflow/readiness.ts` facade 组合 model、policy、projection，policy 是只依赖 model 的 pure module。`mcp/server.ts` 是 composition root，组合 workspace、execution、write-probe 及既有 remote/desktop/feedback groups；shared contracts 位于 tool-shared/base-schemas。
+- **Dependency fences**：domain modules 不依赖 CLI；canonical Routing projector/outbox 不依赖 Feedback/Browser；Companion 不获得 task-delivery、executor 或 Desktop IPC authority；内部模块依赖窄的 owning module，而不是反向穿透 public facade。
+
+R4.5 保持现有 wire、persistent state、ownership/security behavior、R4 canonical route/result/outbox 和 Browser return-only 语义不变，只为 R5 准备更小且由测试 fence 保护的代码边界。
+
+**R4.5 validation**：最终 R4.5f full regression 为 108 files / 2365 tests，连续两次通过；Python helper 52/52、protocol 82/82，typecheck、build、`git diff --check` 均通过。R4.5 仍为 local-only，未包含 install、rollout 或 deploy。
+
 ## Executor Core（H0）
 
 执行链保持清晰分层：ChatGPT 负责规划与 Review → C2C Bridge 负责 executor-agnostic 控制平面 →

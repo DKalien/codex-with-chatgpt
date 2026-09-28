@@ -27,218 +27,24 @@ import {
   type SavedSession,
 } from "../src/session/state.js";
 import { cleanup, makeTmpDir } from "./helpers.js";
-
-const WORKSPACE_ID = "web-control-workspace";
-const CHAT_URL = "https://chatgpt.com/c/web-control-chat";
-const OWNER = "codex-task-owner";
-const OTHER_OWNER = "other-codex-task";
-const NOW = Date.parse("2026-09-10T10:00:00.000Z");
-
-let stateDir: string;
-
-function baseSession(extra: Partial<SavedSession> = {}): SavedSession {
-  return { url: CHAT_URL, savedAt: new Date(NOW).toISOString(), ...extra };
-}
-
-function state() {
-  return readSession(WORKSPACE_ID)?.webControl!;
-}
-
-function commandText(commandId: string, controlSessionId: string, workspaceId = WORKSPACE_ID, goal = "完成原用户任务") {
-  return [
-    "[C2C_CONTROL]",
-    "STATE: COMMAND",
-    `CONTROL_SESSION_ID: ${controlSessionId}`,
-    `WORKSPACE_ID: ${workspaceId}`,
-    `COMMAND_ID: ${commandId}`,
-    "KIND: TASK",
-    "",
-    "GOAL:",
-    goal,
-    "",
-    "INSTRUCTIONS:",
-    "按本地计划执行并验证",
-    "",
-    "SUCCESS_CRITERIA:",
-    "原用户任务在范围内完成",
-  ].join("\n");
-}
-
-function doneText(commandId: string, controlSessionId: string, workspaceId = WORKSPACE_ID) {
-  return [
-    "[C2C_CONTROL]",
-    "STATE: DONE",
-    `CONTROL_SESSION_ID: ${controlSessionId}`,
-    `WORKSPACE_ID: ${workspaceId}`,
-    `COMMAND_ID: ${commandId}`,
-  ].join("\n");
-}
-
-function userEnvelope(text: string, options: {
-  messageId?: string;
-  latestUserMessageId?: string;
-  conversationUrl?: string;
-  source?: string;
-} = {}) {
-  const latestUserMessageId = options.latestUserMessageId ?? "user-message-1";
-  return {
-    source: options.source ?? "chatgpt-assistant",
-    conversationUrl: options.conversationUrl ?? CHAT_URL,
-    messageId: options.messageId ?? "assistant-message-1",
-    latestUserMessageId,
-    complete: true,
-    text,
-    authorization: {
-      type: "user-delegation",
-      userMessageId: latestUserMessageId,
-      explicitDelegation: true,
-    },
-  };
-}
-
-function reviewEnvelope(text: string, commandId: string, feedbackMessageId: string, options: {
-  messageId?: string;
-  conversationUrl?: string;
-  withinOriginalScope?: boolean;
-} = {}) {
-  return {
-    source: "chatgpt-assistant",
-    conversationUrl: options.conversationUrl ?? CHAT_URL,
-    messageId: options.messageId ?? "assistant-review-1",
-    latestUserMessageId: feedbackMessageId,
-    complete: true,
-    text,
-    authorization: {
-      type: "review-followup",
-      commandId,
-      withinOriginalScope: options.withinOriginalScope ?? true,
-    },
-  };
-}
-
-function enable(now = NOW, idleTimeoutMinutes = 30) {
-  return enableWebControl(WORKSPACE_ID, {
-    localUser: true,
-    codexSessionId: OWNER,
-    conversationUrl: CHAT_URL,
-    idleTimeoutMinutes,
-  }, now);
-}
-
-function boot(now = NOW) {
-  const enabled = enable(now);
-  return markBootSent(WORKSPACE_ID, OWNER, "boot-message-1", now + 1);
-}
-
-function acceptFirstCommand(now = NOW) {
-  const ready = boot(now);
-  const result = receiveControl(
-    WORKSPACE_ID,
-    OWNER,
-    userEnvelope(commandText("command-1", ready.controlSessionId)),
-    now + 2,
-  );
-  expect(result.outcome).toBe("accepted");
-  return ready.controlSessionId;
-}
-
-function recordCurrentCommand(commandId: string, now = NOW): void {
-  const active = state().activeCommand!;
-  const record: ExecutionRecord = {
-    taskId: active.taskId,
-    iteration: active.iteration,
-    changedFiles: ["src/example.ts"],
-    tests: "1 passed",
-    exitStatus: "ok",
-    timestamp: new Date(now).toISOString(),
-    controlSessionId: state().controlSessionId,
-    commandId,
-    outputAvailable: false,
-  };
-  appendExecutionRecord(WORKSPACE_ID, record);
-}
-
-function completeFirstCommand(now = NOW): void {
-  startControlCommand(WORKSPACE_ID, OWNER, "command-1", now + 3);
-  recordCurrentCommand("command-1", now + 4);
-  completeControlCommand(WORKSPACE_ID, OWNER, "command-1", now + 5);
-  markControlFeedbackSent(WORKSPACE_ID, OWNER, "command-1", "feedback-message-1", now + 6);
-}
-
-beforeEach(() => {
-  stateDir = makeTmpDir("web-control");
-  process.env.C2C_STATE_DIR = stateDir;
-  writeSession(WORKSPACE_ID, baseSession());
-});
-
-afterEach(() => {
-  vi.restoreAllMocks();
-  cleanup(stateDir);
-  delete process.env.C2C_STATE_DIR;
-});
-
-describe("网页控制完整生命周期", () => {
-  it("从 enable 到 Boot、COMMAND、记录、反馈、新 COMMAND、DONE 完成闭环", () => {
-    const enabled = enable();
-    expect(enabled.enabled).toBe(true);
-    expect(enabled.status).toBe("starting");
-    expect(controlBootPrompt(enabled)).toContain("[C2C_CONTROL]");
-
-    const waiting = markBootSent(WORKSPACE_ID, OWNER, "boot-message-1", NOW + 1);
-    expect(waiting.status).toBe("waiting");
-    const first = receiveControl(
-      WORKSPACE_ID,
-      OWNER,
-      userEnvelope(commandText("command-1", waiting.controlSessionId)),
-      NOW + 2,
-    );
-    expect(first.outcome).toBe("accepted");
-    expect(state().activeCommand?.iteration).toBe(0);
-
-    startControlCommand(WORKSPACE_ID, OWNER, "command-1", NOW + 3);
-    recordCurrentCommand("command-1", NOW + 4);
-    const firstFeedback = completeControlCommand(WORKSPACE_ID, OWNER, "command-1", NOW + 5);
-    expect(firstFeedback.feedback).toContain("STATE: EXECUTED");
-    expect(firstFeedback.feedbackMessageId).toBeUndefined();
-    markControlFeedbackSent(WORKSPACE_ID, OWNER, "command-1", "feedback-message-1", NOW + 6);
-
-    const review = receiveControl(
-      WORKSPACE_ID,
-      OWNER,
-      reviewEnvelope(
-        commandText("command-2", waiting.controlSessionId, WORKSPACE_ID, "在原用户任务范围内继续修复"),
-        "command-1",
-        "feedback-message-1",
-        { messageId: "assistant-review-1" },
-      ),
-      NOW + 7,
-    );
-    expect(review.outcome).toBe("accepted");
-    expect(state().activeCommand?.iteration).toBe(1);
-    expect(state().activeCommand?.rootGoal).toBe("完成原用户任务");
-
-    startControlCommand(WORKSPACE_ID, OWNER, "command-2", NOW + 8);
-    recordCurrentCommand("command-2", NOW + 9);
-    completeControlCommand(WORKSPACE_ID, OWNER, "command-2", NOW + 10);
-    markControlFeedbackSent(WORKSPACE_ID, OWNER, "command-2", "feedback-message-2", NOW + 11);
-
-    const done = receiveControl(
-      WORKSPACE_ID,
-      OWNER,
-      reviewEnvelope(doneText("command-2", waiting.controlSessionId), "command-2", "feedback-message-2", {
-        messageId: "assistant-done-1",
-      }),
-      NOW + 12,
-    );
-    expect(done).toEqual({ outcome: "done" });
-    expect(state().activeCommand).toBeUndefined();
-    expect(state().status).toBe("waiting");
-    expect(state().seenCommands.map((item) => [item.commandId, item.status])).toEqual([
-      ["command-1", "completed"],
-      ["command-2", "completed"],
-    ]);
-  });
-});
+import {
+  WORKSPACE_ID,
+  CHAT_URL,
+  OWNER,
+  OTHER_OWNER,
+  NOW,
+  baseSession,
+  state,
+  commandText,
+  doneText,
+  userEnvelope,
+  reviewEnvelope,
+  enable,
+  boot,
+  acceptFirstCommand,
+  recordCurrentCommand,
+  completeFirstCommand,
+} from "./web-control-fixtures.js";
 
 describe("来源、授权和范围", () => {
   it("拒绝普通文本和网页 ENABLE，且不会开启或新增命令记录", () => {
@@ -401,7 +207,6 @@ describe("来源、授权和范围", () => {
     expect(valid.outcome).toBe("accepted");
   });
 });
-
 describe("状态幂等、关闭和超时", () => {
   it("拒绝重复 Boot、COMMAND、start、complete、feedback-sent", () => {
     const ready = boot();
