@@ -1,4 +1,21 @@
 import { desktopIpc, type DesktopTarget } from "../desktop/ipc.js";
+import {
+  parseExecutorBindingCandidate,
+  type ExecutorBinding,
+  type ExecutorBindingCandidate,
+  type ExecutorDeliveryTargetSnapshot,
+} from "../endpoints/schema.js";
+import {
+  parseExecutorDeliveryAcceptance,
+  parseExecutorPluginDescriptor,
+  type ExecutorActiveExecutionProjection,
+  type ExecutorDeliveryAcceptance,
+  type ExecutorDeliveryRequest,
+  type ExecutorPlugin,
+  type ExecutorPluginCapabilities,
+  type ExecutorPluginDescriptor,
+  type ExecutorSessionProjection,
+} from "../endpoints/executor-contract.js";
 
 export const CODEX_DESKTOP_EXECUTOR_ID = "codex-desktop" as const;
 
@@ -121,3 +138,194 @@ export const executorRegistry = createExecutorRegistry();
 export function getExecutor(id: string = CODEX_DESKTOP_EXECUTOR_ID): ExecutorAdapter {
   return executorRegistry.get(id);
 }
+
+/**
+ * 窄翻译边界：generic Codex binding/snapshot → 已校验的 legacy ExecutorTarget。
+ * foreign pluginId 或 malformed locator 在调用 Desktop adapter 前 fail closed。
+ */
+export class CodexTargetTranslationError extends Error {
+  constructor(
+    readonly code: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = "CodexTargetTranslationError";
+  }
+}
+
+const CODEX_EXECUTOR_PROJECT_KEY = "executorProjectId";
+const CODEX_EXECUTOR_PROJECT_ID = /^[A-Za-z0-9_-]{1,128}$/;
+
+function translateGenericToCodexTarget(input: {
+  readonly pluginId: string;
+  readonly workspaceRoot: string;
+  readonly instanceId: string;
+  readonly sessionId: string;
+  readonly locator: Readonly<Record<string, string>>;
+}): ExecutorTarget {
+  if (input.pluginId !== CODEX_DESKTOP_EXECUTOR_ID) {
+    throw new CodexTargetTranslationError(
+      "FOREIGN_PLUGIN",
+      `generic target pluginId ${input.pluginId} 不是 Codex Desktop`,
+    );
+  }
+  const keys = Object.keys(input.locator).sort();
+  if (keys.length !== 1 || keys[0] !== CODEX_EXECUTOR_PROJECT_KEY) {
+    throw new CodexTargetTranslationError(
+      "LOCATOR_INVALID",
+      "Codex locator 必须且只包含 executorProjectId",
+    );
+  }
+  const projectId = input.locator[CODEX_EXECUTOR_PROJECT_KEY];
+  if (typeof projectId !== "string" || !CODEX_EXECUTOR_PROJECT_ID.test(projectId)) {
+    throw new CodexTargetTranslationError(
+      "LOCATOR_INVALID",
+      "executorProjectId 不是有效 bounded 值",
+    );
+  }
+  return {
+    threadId: input.sessionId,
+    hostId: input.instanceId,
+    projectId,
+    workspaceRoot: input.workspaceRoot,
+  };
+}
+
+function translateBindingToCodexTarget(
+  binding: Pick<ExecutorBinding, "pluginId" | "workspaceRoot" | "instanceId" | "sessionId" | "locator">,
+): ExecutorTarget {
+  return translateGenericToCodexTarget({
+    pluginId: binding.pluginId,
+    workspaceRoot: binding.workspaceRoot,
+    instanceId: binding.instanceId,
+    sessionId: binding.sessionId,
+    locator: binding.locator,
+  });
+}
+
+function translateSnapshotToCodexTarget(
+  target: Pick<ExecutorDeliveryTargetSnapshot, "pluginId" | "workspaceRoot" | "instanceId" | "sessionId" | "locator">,
+): ExecutorTarget {
+  return translateGenericToCodexTarget({
+    pluginId: target.pluginId,
+    workspaceRoot: target.workspaceRoot,
+    instanceId: target.instanceId,
+    sessionId: target.sessionId,
+    locator: target.locator,
+  });
+}
+
+/**
+ * R5a projection：Codex Desktop target → generic ExecutorBindingCandidate。
+ * 只投影 session identity；不铸造 bindingId/epoch/boundAt（Bridge 所有）。
+ * 不修改 desktop persisted state。
+ */
+export function projectCodexDesktopTargetToExecutorBindingCandidate(input: {
+  readonly target: ExecutorTarget;
+  readonly workspaceId: string;
+  readonly instanceId?: string;
+}): ExecutorBindingCandidate {
+  return parseExecutorBindingCandidate({
+    pluginId: CODEX_DESKTOP_EXECUTOR_ID,
+    workspaceId: input.workspaceId,
+    workspaceRoot: input.target.workspaceRoot,
+    instanceId: input.instanceId ?? input.target.hostId,
+    sessionId: input.target.threadId,
+    locator: { executorProjectId: input.target.projectId },
+  });
+}
+
+const CODEX_DESKTOP_PLUGIN_CAPABILITIES: ExecutorPluginCapabilities = Object.freeze({
+  bindExistingSession: true,
+  createSession: false,
+  delivery: true,
+  activeExecutionInspection: true,
+  approvalVisibility: true,
+  trustedTerminalReceipt: true,
+  cancellationInterrupt: false,
+  resume: false,
+});
+
+const CODEX_DESKTOP_PLUGIN_DESCRIPTOR: ExecutorPluginDescriptor = parseExecutorPluginDescriptor(
+  Object.freeze({
+    pluginId: CODEX_DESKTOP_EXECUTOR_ID,
+    kind: CODEX_DESKTOP_EXECUTOR_ID,
+    name: "Codex Desktop",
+    capabilities: CODEX_DESKTOP_PLUGIN_CAPABILITIES,
+  }),
+);
+
+/**
+ * Codex Desktop 作为第一个 production Executor Plugin。
+ * Codex-specific identity/evidence 仍留在 Desktop domain；这里只做 generic contract 适配。
+ */
+export class CodexDesktopExecutorPlugin implements ExecutorPlugin {
+  readonly descriptor = CODEX_DESKTOP_PLUGIN_DESCRIPTOR;
+  private readonly adapter: ExecutorAdapter;
+
+  constructor(adapter: ExecutorAdapter = codexDesktopAdapter) {
+    this.adapter = adapter;
+  }
+
+  async discoverCurrent(context: {
+    readonly workspaceRoot: string;
+    readonly workspaceId: string;
+  }): Promise<ExecutorBindingCandidate> {
+    const session = await this.adapter.currentIdentity(context.workspaceRoot);
+    return projectCodexDesktopTargetToExecutorBindingCandidate({
+      target: session,
+      workspaceId: context.workspaceId,
+    });
+  }
+
+  async inspectSession(binding: ExecutorBinding): Promise<ExecutorSessionProjection> {
+    const target = translateBindingToCodexTarget(binding);
+    const session = await this.adapter.inspect(target);
+    return {
+      sessionId: session.threadId,
+      instanceId: session.hostId,
+      locator: { executorProjectId: session.projectId },
+    };
+  }
+
+  async deliver(request: ExecutorDeliveryRequest): Promise<ExecutorDeliveryAcceptance> {
+    let target: ExecutorTarget;
+    try {
+      target = translateSnapshotToCodexTarget(request.target);
+    } catch (error) {
+      if (error instanceof CodexTargetTranslationError) {
+        return parseExecutorDeliveryAcceptance({
+          status: "rejected",
+          reasonCode: error.code.toLowerCase(),
+          reason: "generic target is not a valid Codex Desktop delivery target",
+        });
+      }
+      throw error;
+    }
+    const connection = await this.adapter.prepare(target);
+    try {
+      const sent = await connection.send(request.payload);
+      if (sent.threadId !== request.target.sessionId) {
+        return parseExecutorDeliveryAcceptance({
+          status: "rejected",
+          reasonCode: "session_mismatch",
+          reason: "returned session identity does not match frozen delivery target",
+        });
+      }
+      return parseExecutorDeliveryAcceptance({
+        status: "accepted",
+        deliveryId: sent.turnId,
+      });
+    } finally {
+      connection.close();
+    }
+  }
+
+  async inspectActiveExecution(binding: ExecutorBinding): Promise<ExecutorActiveExecutionProjection> {
+    const target = translateBindingToCodexTarget(binding);
+    const info = await this.adapter.inspectActiveExecution(target);
+    return { active: Boolean(info.activeTurnId), executionId: info.activeTurnId };
+  }
+}
+
+export const codexDesktopExecutorPlugin = new CodexDesktopExecutorPlugin();
