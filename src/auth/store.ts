@@ -17,6 +17,8 @@ export const SUPPORTED_SCOPES = [
 
 export const DESKTOP_CONTROL_SCOPE = "codex.desktop.control";
 export const DESKTOP_READ_SCOPE = "codex.desktop.read";
+export const EXECUTOR_CONTROL_SCOPE = "codex.executor.control";
+export const EXECUTOR_READ_SCOPE = "codex.executor.read";
 export const CONNECTOR_CONTRACT_VERSION = 1 as const;
 
 export type DesktopCompatibilityStatus =
@@ -39,7 +41,9 @@ export type Scope =
   | "codex.control"
   | "codex.read"
   | typeof DESKTOP_CONTROL_SCOPE
-  | typeof DESKTOP_READ_SCOPE;
+  | typeof DESKTOP_READ_SCOPE
+  | typeof EXECUTOR_CONTROL_SCOPE
+  | typeof EXECUTOR_READ_SCOPE;
 
 export function getSupportedScopes(): string[] {
   const scopes = [
@@ -48,6 +52,8 @@ export function getSupportedScopes(): string[] {
     "codex.read",
     DESKTOP_CONTROL_SCOPE,
     DESKTOP_READ_SCOPE,
+    EXECUTOR_CONTROL_SCOPE,
+    EXECUTOR_READ_SCOPE,
     CODEX_FEEDBACK_SCOPE,
   ];
   const optional: string[] = [];

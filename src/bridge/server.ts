@@ -2,7 +2,7 @@ import express, { type Request, type Response, type NextFunction } from "express
 import type { Server } from "node:http";
 import { randomBytes } from "node:crypto";
 import { Workspace } from "../workspace/manager.js";
-import { AuthStore, CONNECTOR_CONTRACT_VERSION, DESKTOP_CONTROL_SCOPE } from "../auth/store.js";
+import { AuthStore, CONNECTOR_CONTRACT_VERSION, DESKTOP_CONTROL_SCOPE, EXECUTOR_CONTROL_SCOPE } from "../auth/store.js";
 import { createOAuthRouter } from "../auth/oauth.js";
 import { bearerAuth } from "../auth/middleware.js";
 import { PairingManager } from "../pairing/manager.js";
@@ -154,6 +154,12 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
       const verdict = authStore.verifyAccessToken(auth.token);
       if (!verdict.ok || verdict.record.workspaceId !== workspace.id || verdict.record.clientId !== auth.clientId || !verdict.record.scopes.includes(DESKTOP_CONTROL_SCOPE)) {
         throw new DesktopError("UNAUTHORIZED", "OAuth 授权已失效，请重新授权后再发送。" );
+      }
+    },
+    executorAuthorize: (auth: AuthInfo) => {
+      const verdict = authStore.verifyAccessToken(auth.token);
+      if (!verdict.ok || verdict.record.workspaceId !== workspace.id || verdict.record.clientId !== auth.clientId || !verdict.record.scopes.includes(EXECUTOR_CONTROL_SCOPE)) {
+        throw new DesktopError("UNAUTHORIZED", "OAuth 授权已失效，请重新授权后再发送。");
       }
     },
     desktopCompatibility: (auth: AuthInfo | undefined) =>

@@ -85,6 +85,9 @@ describe("MCP tools over Streamable HTTP", () => {
       "codex_desktop_status",
       "execution_output",
       "execution_summary",
+      "executor_list",
+      "executor_send",
+      "executor_status",
       "feedback_ack_observed",
       "feedback_bootstrap_status",
       "feedback_claim_next",
@@ -106,6 +109,7 @@ describe("MCP tools over Streamable HTTP", () => {
     ]);
     const nonReadonly = new Set([
       "codex_desktop_send",
+      "executor_send",
       "feedback_ack_observed",
       "feedback_claim_next",
       "feedback_companion_pair",

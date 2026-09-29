@@ -9,6 +9,8 @@ export interface McpContext {
   logger: Logger;
   /** Revalidate the bearer token immediately before a Desktop delivery commit. */
   desktopAuthorize?: (auth: AuthInfo) => void;
+  /** Revalidate the bearer token immediately before a generic Executor delivery commit. */
+  executorAuthorize?: (auth: AuthInfo) => void;
   /** 当前请求的有效授权兼容性；不得用其他客户端授权替代。 */
   desktopCompatibility?: (auth: AuthInfo | undefined) => DesktopCompatibility;
   /** Read-only runtime upgrade projection for this Bridge instance. */

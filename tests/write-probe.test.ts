@@ -12,6 +12,9 @@ const BASE_TOOL_NAMES = [
   "codex_desktop_status",
   "execution_output",
   "execution_summary",
+  "executor_list",
+  "executor_send",
+  "executor_status",
   "feedback_ack_observed",
   "feedback_bootstrap_status",
   "feedback_claim_next",
@@ -34,6 +37,7 @@ const BASE_TOOL_NAMES = [
 /** 非只读基线工具（production feedback 状态机会写本地 store）。 */
 const NON_READONLY_BASE = new Set([
   "codex_desktop_send",
+  "executor_send",
   "feedback_ack_observed",
   "feedback_bootstrap_status",
   "feedback_claim_next",
@@ -157,8 +161,8 @@ describe("MCP write_probe", () => {
       expect(tools.filter((item) => !NON_READONLY_BASE.has(item.name)).every((item) => item.annotations?.readOnlyHint === true)).toBe(true);
       expect(tools.find((item) => item.name === "write_probe")).toBeUndefined();
       readAnnotations = annotationsOf(tools);
-      expect(await discoveryScopes(bridge.localBaseUrl(), "/.well-known/oauth-authorization-server/mcp")).toEqual([...BASE_SCOPES, "codex.control", "codex.read", "codex.desktop.control", "codex.desktop.read", "codex.feedback"]);
-      expect(await discoveryScopes(bridge.localBaseUrl(), "/.well-known/oauth-protected-resource/mcp")).toEqual([...BASE_SCOPES, "codex.control", "codex.read", "codex.desktop.control", "codex.desktop.read", "codex.feedback"]);
+      expect(await discoveryScopes(bridge.localBaseUrl(), "/.well-known/oauth-authorization-server/mcp")).toEqual([...BASE_SCOPES, "codex.control", "codex.read", "codex.desktop.control", "codex.desktop.read", "codex.executor.control", "codex.executor.read", "codex.feedback"]);
+      expect(await discoveryScopes(bridge.localBaseUrl(), "/.well-known/oauth-protected-resource/mcp")).toEqual([...BASE_SCOPES, "codex.control", "codex.read", "codex.desktop.control", "codex.desktop.read", "codex.executor.control", "codex.executor.read", "codex.feedback"]);
     });
 
     await withBridge(true, async ({ bridge, connect }) => {
@@ -180,11 +184,11 @@ describe("MCP write_probe", () => {
       expect(schema.required).toEqual(["nonce"]);
       expect(await discoveryScopes(bridge.localBaseUrl(), "/.well-known/oauth-authorization-server/mcp")).toEqual([
         ...BASE_SCOPES, "codex.control", "codex.read", "codex.desktop.control", "codex.desktop.read",
-        "codex.feedback", "probe.write",
+        "codex.executor.control", "codex.executor.read", "codex.feedback", "probe.write",
       ]);
       expect(await discoveryScopes(bridge.localBaseUrl(), "/.well-known/oauth-protected-resource/mcp")).toEqual([
         ...BASE_SCOPES, "codex.control", "codex.read", "codex.desktop.control", "codex.desktop.read",
-        "codex.feedback", "probe.write",
+        "codex.executor.control", "codex.executor.read", "codex.feedback", "probe.write",
       ]);
     });
   });

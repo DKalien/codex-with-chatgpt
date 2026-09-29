@@ -3,6 +3,7 @@ import { registerRemoteTools } from "./remote.js";
 import { registerFeedbackProbeTools } from "./feedback-probe.js";
 import { registerFeedbackTools } from "./feedback.js";
 import { registerDesktopTools } from "./desktop.js";
+import { registerExecutorTools } from "./executor-tools.js";
 import { PRODUCT_NAME, VERSION } from "../version.js";
 import { registerWorkspaceTools } from "./workspace-tools.js";
 import { registerExecutionTools } from "./execution-tools.js";
@@ -20,7 +21,7 @@ export function createMcpServer(ctx: McpContext): McpServer {
   );
 
   // Keep registration order stable: base workspace, execution, optional write probe,
-  // then the existing remote/Desktop/feedback groups.
+  // then the existing remote/Desktop/feedback groups, then generic executor tools.
   registerWorkspaceTools(server, ctx);
   registerExecutionTools(server, ctx);
   registerWriteProbeTools(server, ctx);
@@ -30,5 +31,7 @@ export function createMcpServer(ctx: McpContext): McpServer {
   registerFeedbackProbeTools(server, ctx.workspace);
   // production feedback：永久 scope codex.feedback；与 synthetic probe 分离。
   registerFeedbackTools(server, ctx.workspace);
+  // R5b generic executor control plane（不提供 MCP bind）。
+  registerExecutorTools(server, ctx.workspace, ctx.executorAuthorize);
   return server;
 }

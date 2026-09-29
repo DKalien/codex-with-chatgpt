@@ -243,8 +243,8 @@ R5a 只是建立下一阶段可迁入的新 core contracts。
 
 | 阶段 | 内容 |
 |------|------|
-| **R5a** | endpoint contracts（本轮） |
-| **R5b** | generic executor binding + generic MCP executor tools |
+| **R5a** | endpoint contracts（已完成） |
+| **R5b** | Bridge-owned Active Executor Binding + generic MCP executor tools（本轮） |
 | **R5c** | Browser Web Sink URL binding |
 | **R5d** | workspace result bus，解除 plannerRoute-pinned result delivery |
 | **R5e** | dynamic executor / web sink switching |
@@ -253,7 +253,38 @@ R5a 只是建立下一阶段可迁入的新 core contracts。
 
 ---
 
-## 8. 当前生产能力边界
+## 8. R5b 实际状态（本轮）
+
+- **Active Executor Binding** 是 Bridge-owned durable state（`src/executor-control/`）
+- 绑定必须经**本地显式** `c2c executor bind-current --plugin codex-desktop`
+- **MCP 不能 bind executor**（无 `executor_bind` 工具）
+- generic MCP `executor_send` 只选择当前 active binding，并 freeze delivery snapshot
+- **Codex production backend** 委托现有 `deliverCurrentCommand()` durable R4 transport
+- `executor_send` **不**调用 `ExecutorPlugin.deliver()`（contract seam 与 production transport 分离）
+- generic binding 与 legacy Desktop bindingId **是两个概念**，只做 session/instance/project/workspace exact attestation
+- R5b **仍**把 result 钉在 plannerRoute（R5d 才解除）
+- ChatGPT request source 在最终架构中不选择 result sink
+- production registry **只有** `codex-desktop`；其他候选工具不进入 production registry
+- OAuth：新增 `codex.executor.read` / `codex.executor.control`；保留旧 desktop scopes
+
+Persisted state：
+
+```text
+<state>/executor-control/<workspaceId>.json
+{
+  version: 1
+  workspaceId
+  workspaceRoot
+  revision            // monotonic
+  activeBinding: ExecutorBinding | null
+}
+```
+
+Store 只保存 generic binding，不保存 threadId/turnId/hostId/projectId/plannerRouteId。
+
+---
+
+## 9. 当前生产能力边界
 
 - ChatGPT Web 仍是**唯一 production Web Surface**。架构允许未来 surface plugin，本阶段不实现其他 AI 网页。
 - Codex Desktop 仍是**唯一 production Executor plugin**。

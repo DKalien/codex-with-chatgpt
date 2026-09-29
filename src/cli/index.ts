@@ -18,6 +18,7 @@ import { registerSandboxAllowCommand, registerUpdateCheckCommand } from "./machi
 import { registerSessionCommands, registerPreferencesCommands } from "./session.js";
 import { registerRecordCommand } from "./record.js";
 import { registerTunnelCommands } from "./tunnel.js";
+import { registerExecutorCommands } from "./executor.js";
 
 const program = new Command();
 registerWebControlCommands(program);
@@ -26,6 +27,7 @@ registerDesktopReceiptFinalizerCommands(program);
 registerFeedbackControlRepairCommand(program);
 registerRemoteCommands(program);
 registerDesktopCommands(program);
+registerExecutorCommands(program);
 registerWorkflowCommands(program);
 registerRuntimePruneCommands(program);
 registerFeedbackProbeCommands(program);
