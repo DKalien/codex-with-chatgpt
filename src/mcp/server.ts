@@ -4,6 +4,7 @@ import { registerFeedbackProbeTools } from "./feedback-probe.js";
 import { registerFeedbackTools } from "./feedback.js";
 import { registerDesktopTools } from "./desktop.js";
 import { registerExecutorTools } from "./executor-tools.js";
+import { registerWebSinkTools } from "./web-sink-tools.js";
 import { PRODUCT_NAME, VERSION } from "../version.js";
 import { registerWorkspaceTools } from "./workspace-tools.js";
 import { registerExecutionTools } from "./execution-tools.js";
@@ -33,5 +34,7 @@ export function createMcpServer(ctx: McpContext): McpServer {
   registerFeedbackTools(server, ctx.workspace);
   // R5b generic executor control plane（不提供 MCP bind）。
   registerExecutorTools(server, ctx.workspace, ctx.executorAuthorize);
+  // R5c generic Web Sink read-only（不提供 MCP bind/switch）。
+  registerWebSinkTools(server, ctx.workspace);
   return server;
 }

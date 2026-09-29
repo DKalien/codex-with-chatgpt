@@ -17,6 +17,11 @@ import {
 import { CompanionError } from "../feedback/companion.js";
 import { FeedbackError } from "../feedback/store.js";
 import { reconcileFeedbackOutbox } from "../feedback/projector.js";
+import { bindCurrentWebSinkFromDurableCompanion, verifyCompanionCredentialForWebSink } from "../web-sink-control/companion-adapter.js";
+import { WebSinkControlError } from "../web-sink-control/schema.js";
+import { webSinkStatus } from "../web-sink-control/service.js";
+import { readFeedbackState } from "../feedback/store.js";
+import { isRouteAttestationVerified } from "../feedback/schema.js";
 
 const pairBodySchema = z.object({
   intentId: z.string().uuid(),
@@ -63,12 +68,29 @@ const retireUnknownBodySchema = z.object({
   attemptId: z.string().uuid(),
 }).strict();
 
+const webSinkBindCurrentBodySchema = z.object({
+  routeCanonical: z.string().min(1).max(512),
+}).strict();
+
 function sendError(res: Response, error: unknown): void {
   if (error instanceof z.ZodError) {
     res.status(400).json({
       error: "COMPANION_VALIDATION",
       message: "request body validation failed",
     });
+    return;
+  }
+  if (error instanceof WebSinkControlError) {
+    const status = error.code === "WEB_SINK_COMPANION_UNAUTHORIZED"
+      || error.code === "WEB_SINK_COMPANION_UNAVAILABLE"
+      && error.message.includes("缺少")
+      ? 401
+      : error.code === "WEB_SINK_ROUTE_UNVERIFIED"
+        ? 409
+        : error.code === "WEB_SINK_ROUTE_MISMATCH"
+          ? 400
+          : 400;
+    res.status(status).json({ error: error.code, message: error.message });
     return;
   }
   if (error instanceof CompanionError || error instanceof FeedbackError) {
@@ -318,6 +340,90 @@ export function createCompanionRouter(opts: CompanionRouterOptions): Router {
         reservationId: event.reservationId,
         attemptId: event.attemptId,
         status: event.status,
+      });
+    } catch (error) {
+      sendError(res, error);
+    }
+  });
+
+  router.get("/web-sink/status", (req, res) => {
+    try {
+      const credential = bearerCredential(req);
+      if (!credential) {
+        throw new WebSinkControlError("WEB_SINK_COMPANION_UNAUTHORIZED", "缺少 companion credential");
+      }
+      verifyCompanionCredentialForWebSink({
+        workspaceId: opts.workspaceId,
+        credential,
+        stateDir: opts.stateDir,
+      });
+      let companionRouteCanonical: string | null = null;
+      let companionVerified = false;
+      let companionAvailable = false;
+      try {
+        const feedback = readFeedbackState(opts.workspaceId, opts.stateDir);
+        const companion = feedback?.companion ?? null;
+        if (companion && !companion.supersededAt) {
+          companionAvailable = true;
+          companionRouteCanonical = companion.routeCanonical;
+          companionVerified = isRouteAttestationVerified(companion);
+        }
+      } catch {
+        companionAvailable = false;
+      }
+      void webSinkStatus(opts.workspaceId, {
+        companionRouteCanonical,
+        companionVerified,
+        companionAvailable,
+      }).then((status) => {
+        const b = status.activeBinding;
+        res.json({
+          workspaceId: opts.workspaceId,
+          activeBinding: b
+            ? {
+                bindingId: b.bindingId,
+                pluginId: b.pluginId,
+                surfaceId: b.surfaceId,
+                workspaceId: b.workspaceId,
+                canonicalUrl: b.canonicalUrl,
+                epoch: b.epoch,
+                boundAt: b.boundAt,
+              }
+            : null,
+          availability: status.availability,
+        });
+      }).catch((error) => sendError(res, error));
+    } catch (error) {
+      sendError(res, error);
+    }
+  });
+
+  router.post("/web-sink/bind-current", (req, res) => {
+    try {
+      const credential = bearerCredential(req);
+      if (!credential) {
+        throw new WebSinkControlError("WEB_SINK_COMPANION_UNAUTHORIZED", "缺少 companion credential");
+      }
+      const body = webSinkBindCurrentBodySchema.parse(req.body);
+      const result = bindCurrentWebSinkFromDurableCompanion({
+        workspaceId: opts.workspaceId,
+        credential,
+        routeCanonical: body.routeCanonical,
+        stateDir: opts.stateDir,
+      });
+      const b = result.binding;
+      res.json({
+        workspaceId: opts.workspaceId,
+        activeBinding: {
+          bindingId: b.bindingId,
+          pluginId: b.pluginId,
+          surfaceId: b.surfaceId,
+          workspaceId: b.workspaceId,
+          canonicalUrl: b.canonicalUrl,
+          epoch: b.epoch,
+          boundAt: b.boundAt,
+        },
+        created: result.created,
       });
     } catch (error) {
       sendError(res, error);

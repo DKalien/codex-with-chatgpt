@@ -103,7 +103,8 @@ function initialState() {
     credential: "old-companion-credential",
     authStale: false,
     routeVerification: "PENDING",
-    routeAttestationMessage: null,
+    routeAttestationMessage: `[C2C_ROUTE_ATTEST]
+challengeId=${CHALLENGE}`,
     routeAttestationExpiresAt: null,
   };
   return {
@@ -159,11 +160,41 @@ async function loadWorker(body: Record<string, unknown>, opts: {
   const session = storageArea(initial.session);
   let messageListener: ((message: unknown, sender: unknown, sendResponse: (response: unknown) => void) => unknown) | null = null;
   const tabsSendMessage = vi.fn(opts.tabsSendMessage ?? (async () => ({ ok: true })));
-  const fetchMock = vi.fn(opts.fetch ?? (async () => ({
+  const innerFetch = opts.fetch ?? (async () => ({
     ok: true,
     status: 200,
     async json() { return body; },
-  })));
+  }));
+  const fetchMock = vi.fn(async (url: unknown, init?: unknown) => {
+    const href = String(url);
+    if (href.includes("/web-sink/bind-current")) {
+      let route = ROUTE;
+      try {
+        const parsed = JSON.parse(String((init as { body?: string })?.body ?? "{}"));
+        if (typeof parsed.routeCanonical === "string") route = parsed.routeCanonical;
+      } catch { /* keep default */ }
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return {
+            workspaceId: WORKSPACE,
+            activeBinding: {
+              bindingId: "99999999-9999-4999-8999-999999999999",
+              pluginId: "browser-companion",
+              surfaceId: "chatgpt-web",
+              workspaceId: WORKSPACE,
+              canonicalUrl: route,
+              epoch: 1,
+              boundAt: "2026-09-29T00:00:00.000Z",
+            },
+            created: true,
+          };
+        },
+      };
+    }
+    return innerFetch(url, init);
+  });
   const chrome = {
     storage: { local, session },
     runtime: {
@@ -192,7 +223,8 @@ async function loadWorker(body: Record<string, unknown>, opts: {
     proof?: { id: string };
   };
   if (!proof.ok || !proof.proof) throw new Error(`owner proof setup failed: ${JSON.stringify(proof)}`);
-  return { initial, local, session, fetchMock, tabsSendMessage, send, proofId: proof.proof.id };
+  const nonSinkCalls = () => fetchMock.mock.calls.filter(([url]) => !String(url).includes("/web-sink/bind-current"));
+  return { initial, local, session, fetchMock, tabsSendMessage, send, proofId: proof.proof.id, nonSinkCalls };
 }
 
 afterEach(() => {
@@ -663,6 +695,7 @@ describe("G4c one-click connect orchestration", () => {
       epoch: OLD_EPOCH,
     }), {
       transport: { routeVerification: "VERIFIED" },
+
       autonomyPolicy: {
         mode: "armed",
         bindingId: OLD_BINDING,
@@ -763,6 +796,7 @@ describe("G4c one-click connect orchestration", () => {
   it("fails closed when Connect cannot durably persist Autonomy OFF", async () => {
     const worker = await loadWorker(responseBody(), {
       transport: { routeVerification: "VERIFIED" },
+
       failAutonomyPersist: true,
       autonomyPolicy: {
         mode: "armed",
@@ -903,6 +937,7 @@ describe("G4c one-click connect orchestration", () => {
   it("is idempotent for exact VERIFIED state with zero route DOM Send", async () => {
     const worker = await loadWorker(responseBody(), {
       transport: { routeVerification: "VERIFIED" },
+
       autonomyPolicy: { mode: "off", rearmOnConnect: true },
       fetch: async (url) => String(url).endsWith("/state")
         ? jsonResponse(200, verifiedState({
@@ -919,6 +954,7 @@ describe("G4c one-click connect orchestration", () => {
       canonicalRoute: ROUTE,
       safety: { composer: "empty", generation: "idle", safe: true },
     }, sender);
+    if (!result || result.ok !== true) throw new Error("R=" + JSON.stringify(result));
     expect(result).toMatchObject({ ok: true, state: "CONNECTED", routeVerification: "VERIFIED" });
     expect(worker.local.values.get(AUTONOMY_KEY)).toMatchObject({
       mode: "armed",
@@ -928,7 +964,7 @@ describe("G4c one-click connect orchestration", () => {
       rearmOnConnect: true,
     });
     expect(worker.tabsSendMessage).not.toHaveBeenCalled();
-    expect(worker.fetchMock).toHaveBeenCalledTimes(1);
+    expect(worker.nonSinkCalls()).toHaveLength(1);
   });
 
   it("connects a persisted VERIFIED Project slug transport through the bare page alias", async () => {
@@ -1206,7 +1242,7 @@ describe("G4 Browser rebind init response identity gate", () => {
     });
     expect(worker.local.values.get(TRANSPORT_KEY)).toEqual(worker.initial.transport);
     expect(worker.local.values.get(FENCE_KEY)).toMatchObject({ state: "PAIRING_TRANSITION" });
-    expect(worker.fetchMock).toHaveBeenCalledTimes(1);
+    expect(worker.nonSinkCalls()).toHaveLength(1);
     expect(worker.tabsSendMessage).not.toHaveBeenCalled();
     const status = await worker.send({ type: "c2c.transport.status" }) as {
       transport?: Record<string, unknown>;
@@ -1230,7 +1266,7 @@ describe("G4 Browser rebind init response identity gate", () => {
       { type: "c2c.rebind.start", ownerProofId: worker.proofId },
       {},
     );
-    await vi.waitFor(() => expect(worker.fetchMock).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(worker.nonSinkCalls()).toHaveLength(1));
 
     const pair = await worker.send({
       type: "c2c.pair",
@@ -1244,7 +1280,7 @@ describe("G4 Browser rebind init response identity gate", () => {
       reason: "transport_mutation_in_flight",
       retryAllowed: true,
     });
-    expect(worker.fetchMock).toHaveBeenCalledTimes(1);
+    expect(worker.nonSinkCalls()).toHaveLength(1);
 
     releaseInit({
       ok: true,
@@ -1449,6 +1485,7 @@ describe("G4 R3p recoverable written-unsent bootstrap + abandon connect unknown"
     return loadWorker(responseBody(), {
       oldRoute: OLD_ROUTE,
       transport: { routeVerification: "VERIFIED" },
+
       fetch: async (url) => String(url).includes("/rebind/init")
         ? jsonResponse(409, { error: "COMPANION_REBIND_NOT_SUCCESSOR" })
         : Promise.reject(new Error(`unexpected URL ${String(url)}`)),
@@ -1713,6 +1750,7 @@ describe("G4 R3p recoverable written-unsent bootstrap + abandon connect unknown"
       connectFlow: outcomeUnknownFlow(),
       oldRoute: OLD_ROUTE,
       transport: { routeVerification: "VERIFIED" },
+
       fetch: async (url) => {
         if (String(url).includes("/rebind/init")) return pendingInit;
         throw new Error(`unexpected URL ${String(url)}`);
@@ -1721,7 +1759,7 @@ describe("G4 R3p recoverable written-unsent bootstrap + abandon connect unknown"
 
     // An in-flight Rebind holds the transport mutation gate.
     const rebind = worker.send({ type: "c2c.rebind.start", ownerProofId: worker.proofId }, {});
-    await vi.waitFor(() => expect(worker.fetchMock).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(worker.nonSinkCalls()).toHaveLength(1));
 
     // Abandon while the gate is held: rejected without executing its handler.
     const blocked = await worker.send(
@@ -1808,6 +1846,7 @@ describe("G4 R3p recoverable written-unsent bootstrap + abandon connect unknown"
   it("abandon rejects a used (replayed) proof and keeps the fence durable", async () => {
     const worker = await loadWorker(responseBody(), {
       transport: { routeVerification: "VERIFIED" },
+
       connectFlow: outcomeUnknownFlow(),
       fetch: async (url) => String(url).includes("/rebind/init")
         ? jsonResponse(409, { error: "COMPANION_REBIND_NOT_SUCCESSOR" })
@@ -2263,6 +2302,12 @@ describe("G4 R3q route-attest written-unsent recovery + abandon route-attest unk
       companionId: OLD_COMPANION,
       routeCanonical: ROUTE,
       challengeId: CHALLENGE,
+      ownerWitness: {
+        tabId: 7,
+        documentId: "document-g4-rebind",
+        generation: expect.any(Number),
+        canonicalRoute: ROUTE,
+      },
       bootstrapAutoResume: false,
       updatedAt: expect.any(Number),
     });
@@ -2327,6 +2372,12 @@ describe("G4 R3q route-attest written-unsent recovery + abandon route-attest unk
       companionId: OLD_COMPANION,
       routeCanonical: ROUTE,
       challengeId: CHALLENGE,
+      ownerWitness: {
+        tabId: 7,
+        documentId: "document-g4-rebind",
+        generation: expect.any(Number),
+        canonicalRoute: ROUTE,
+      },
       bootstrapAutoResume: false,
       updatedAt: expect.any(Number),
     });
@@ -2676,7 +2727,7 @@ describe("G4 R3q route-attest written-unsent recovery + abandon route-attest unk
 
     // An in-flight Rebind holds the transport mutation gate.
     const rebind = worker.send({ type: "c2c.rebind.start", ownerProofId: worker.proofId }, {});
-    await vi.waitFor(() => expect(worker.fetchMock).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(worker.nonSinkCalls()).toHaveLength(1));
 
     const blocked = await worker.send(
       { type: "c2c.route-attest.abandon.unknown", ownerProofId: worker.proofId },

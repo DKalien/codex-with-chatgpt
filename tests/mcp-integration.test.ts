@@ -105,6 +105,8 @@ describe("MCP tools over Streamable HTTP", () => {
       "read_file",
       "search_workspace",
       "test_status",
+      "web_sink_list",
+      "web_sink_status",
       "workspace_info",
     ]);
     const nonReadonly = new Set([

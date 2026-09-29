@@ -77,7 +77,7 @@
     el.className = "value" + (cls ? " " + cls : "");
   }
 
-  function friendlyConnectState(transport, isOwner, connectReason, connectState, routeMatches) {
+  function friendlyConnectState(transport, isOwner, connectReason, connectState, routeMatches, r5cConnected) {
     if (transport?.authStale) return ["连接需要修复", "bad"];
     if (connectReason === "bootstrap_tool_missing") {
       return ["当前对话缺少反馈连接工具", "bad"];
@@ -96,9 +96,14 @@
       return ["还差一步完成连接", "warn"];
     }
     if (transport?.connected && transport?.routeVerification === "VERIFIED") {
-      return isOwner === true && routeMatches === true
-        ? ["当前对话已连接", "ok"]
-        : ["当前页面需要重新连接", "warn"];
+      if (!(isOwner === true && routeMatches === true)) {
+        return ["当前页面需要重新连接", "warn"];
+      }
+      // R5c: full connected requires Web Sink convergence, not only legacy VERIFIED.
+      if (r5cConnected !== true) {
+        return ["当前对话需要完成连接", "warn"];
+      }
+      return ["当前对话已连接", "ok"];
     }
     return ["可以连接当前对话", "warn"];
   }
@@ -436,6 +441,7 @@
       status?.connectReason,
       status?.connectState,
       routeMatchesTransport,
+      transport?.r5cConnected === true || status?.webSinkConverged === true,
     );
     const ownerNeedsReconnect = connectionText === "当前页面需要重新连接";
     setText(els.userConnectionStatus, connectionText, connectionClass);
@@ -444,6 +450,8 @@
       ? "页面刷新后需要重新确认当前页面，请点击“连接当前对话”。"
       : connectionText === "当前对话已连接"
       ? (armed ? "执行结果会自动回到当前对话。" : "如需自动回流，请勾选确认后开启。")
+        : connectionText === "当前对话需要完成连接"
+          ? "请再次点击“连接当前对话”完成 Web Sink 收敛。"
         : (status?.connectReason === "bootstrap_tool_missing"
           ? "请在当前 Chat 启用 feedback_status 与 feedback_takeover 工具；不会自动重发自举消息。"
           : transport?.rebindPending

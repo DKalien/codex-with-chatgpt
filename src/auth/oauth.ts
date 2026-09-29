@@ -1,6 +1,6 @@
 import { Router, type Request, type Response, urlencoded, json } from "express";
 import { randomBytes } from "node:crypto";
-import { AuthStore, DESKTOP_CONTROL_SCOPE, DESKTOP_READ_SCOPE, EXECUTOR_CONTROL_SCOPE, EXECUTOR_READ_SCOPE, getSupportedScopes, base64UrlSha256, filterScopes, safeEqual } from "./store.js";
+import { AuthStore, DESKTOP_CONTROL_SCOPE, DESKTOP_READ_SCOPE, EXECUTOR_CONTROL_SCOPE, EXECUTOR_READ_SCOPE, WEB_SINK_READ_SCOPE, getSupportedScopes, base64UrlSha256, filterScopes, safeEqual } from "./store.js";
 import { WRITE_PROBE_SCOPE } from "../mcp/write-probe.js";
 import { PairingManager } from "../pairing/manager.js";
 import type { Logger } from "../logger/index.js";
@@ -83,6 +83,7 @@ function pairingPage(opts: {
     [DESKTOP_READ_SCOPE]: "读取 Desktop 绑定、可用性和投递状态（只读）",
     [EXECUTOR_CONTROL_SCOPE]: "Executor / 本地编程工具：向当前 active Executor Binding 发送任务；任务可能按该工具权限修改文件或执行命令（可随时在本机撤权）",
     [EXECUTOR_READ_SCOPE]: "读取 Executor / 本地编程工具 插件列表与 active binding 状态（只读）",
+    [WEB_SINK_READ_SCOPE]: "读取 Active Web Sink / 当前结果接收 URL 绑定状态（只读）",
     [WRITE_PROBE_SCOPE]: "实验：将测试 nonce 写入 C2C 自身的固定状态文件（不修改工作区）",
     offline_access: "Stay connected between sessions",
   };

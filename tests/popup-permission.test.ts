@@ -179,7 +179,7 @@ describe("popup classic packaging", () => {
 
 describe("popup Bridge permission and Pair separation", () => {
   it("shows the saved auto-rearm preference and restores the pause prompt when cleared", async () => {
-    const transport = { connected: true, routeCanonical: route, routeVerification: "VERIFIED", productionEligible: true };
+    const transport = { connected: true, routeCanonical: route, routeVerification: "VERIFIED", r5cConnected: true, productionEligible: true, r5cConnected: true };
     const saved = await loadPopup(true, true, {
       status: { transport, autonomy: { mode: "off", rearmOnConnect: true } },
     });
@@ -396,7 +396,7 @@ describe("popup Bridge permission and Pair separation", () => {
         transport: {
           connected: true,
           routeCanonical: route,
-          routeVerification: "VERIFIED",
+          routeVerification: "VERIFIED", r5cConnected: true,
           rebindPending: false,
           authStale: false,
           bridgeOrigin: "https://bridge.example.test",
@@ -416,7 +416,7 @@ describe("popup Bridge permission and Pair separation", () => {
         ownership: { hasOwner: true },
         transport: {
           connected: true,
-          routeVerification: "VERIFIED",
+          routeVerification: "VERIFIED", r5cConnected: true,
           rebindPending: false,
           authStale: false,
           bridgeOrigin: "https://bridge.example.test",
@@ -437,7 +437,7 @@ describe("popup Bridge permission and Pair separation", () => {
         isOwner: false,
         transport: {
           connected: true,
-          routeVerification: "VERIFIED",
+          routeVerification: "VERIFIED", r5cConnected: true,
           rebindPending: false,
           authStale: true,
           bridgeOrigin: "https://bridge.example.test",
@@ -464,7 +464,7 @@ describe("popup Bridge permission and Pair separation", () => {
         transport: {
           connected: true,
           routeCanonical: oldRoute,
-          routeVerification: "VERIFIED",
+          routeVerification: "VERIFIED", r5cConnected: true,
           productionEligible: true,
           rebindPending: false,
           authStale: false,
@@ -496,7 +496,7 @@ describe("popup Bridge permission and Pair separation", () => {
         transport: {
           connected: true,
           routeCanonical: route,
-          routeVerification: "VERIFIED",
+          routeVerification: "VERIFIED", r5cConnected: true,
           productionEligible: true,
           rebindPending: false,
           authStale: false,
@@ -515,7 +515,7 @@ describe("popup Bridge permission and Pair separation", () => {
         isOwner: false,
         transport: {
           connected: true,
-          routeVerification: "VERIFIED",
+          routeVerification: "VERIFIED", r5cConnected: true,
           rebindPending: true,
           authStale: false,
           bridgeOrigin: "https://bridge.example.test",
@@ -756,4 +756,28 @@ describe("popup Bridge permission and Pair separation", () => {
     const grantBlock = grantEnd > 0 ? block.slice(0, grantEnd) : block;
     expect(grantBlock).not.toMatch(/permissions\.contains/);
   });
+
+  it("pending Web Sink shows reconnect hint without full connected", async () => {
+    const { calls, elements } = await loadPopup(true, true, {
+      status: {
+        isOwner: true,
+        transport: {
+          connected: true,
+          routeVerification: "VERIFIED",
+          r5cConnected: false,
+          webSinkConverged: false,
+          routeCanonical: route,
+          authStale: false,
+          rebindPending: false,
+        },
+        connectState: "DONE",
+      },
+    });
+    expect(elements.get("user-connection-status")!.textContent).toBe("当前对话需要完成连接");
+    expect(elements.get("user-connection-status")!.className).toContain("warn");
+    const hint = elements.get("user-action-hint")?.textContent ?? "";
+    expect(hint).toContain("连接当前对话");
+    expect(calls.ownerProof).toBeGreaterThanOrEqual(0);
+  });
+
 });

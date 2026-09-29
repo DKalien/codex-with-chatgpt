@@ -27,6 +27,8 @@ const FEEDBACK_ENDPOINTS = new Set([
   "/begin-send",
   "/ack",
   "/retire-unknown",
+  "/web-sink/status",
+  "/web-sink/bind-current",
 ]);
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 

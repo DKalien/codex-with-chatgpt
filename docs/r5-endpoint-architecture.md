@@ -244,8 +244,8 @@ R5a 只是建立下一阶段可迁入的新 core contracts。
 | 阶段 | 内容 |
 |------|------|
 | **R5a** | endpoint contracts（已完成） |
-| **R5b** | Bridge-owned Active Executor Binding + generic MCP executor tools（本轮） |
-| **R5c** | Browser Web Sink URL binding |
+| **R5b** | Bridge-owned Active Executor Binding + generic MCP executor tools（已完成） |
+| **R5c** | Browser Web Sink URL binding（本轮） |
 | **R5d** | workspace result bus，解除 plannerRoute-pinned result delivery |
 | **R5e** | dynamic executor / web sink switching |
 | **R5f** | Bridge lifecycle independence + retire core post-turn-finalizer |
@@ -284,7 +284,45 @@ Store 只保存 generic binding，不保存 threadId/turnId/hostId/projectId/pla
 
 ---
 
-## 9. 当前生产能力边界
+## 9. R5c 实际状态（本轮）
+
+**Production path（已接线）：**
+
+```text
+Browser current URL
+  → verified Companion route
+  → POST /api/companion/v1/web-sink/bind-current  (credential auth)
+  → Bridge-owned Active Web Sink Binding
+```
+
+- Web Sink identity 是 **URL-based**，不是 planner-principal-based
+- production surface registry 仅 `browser-companion` / `chatgpt-web`
+- Companion 认证边界：active companion + credential hash + verified exact route + workspace
+- **不**要求 planner principal / Feedback receiver 相等（R4 feedback 仍用更严格 `verifyCompanionCredential`）
+- ChatGPT URL parser 只在 `chatgpt-surface.ts`
+- **legacy Feedback Companion transport 保持完整**
+- R4 Result Outbox **仍**钉在 plannerRoute，直到 R5d
+- URL 切换不影响 Executor binding；Executor 切换不影响 Web Sink binding
+- MCP 只读：`web_sink_list` / `web_sink_status`（`codex.websink.read`）
+- **无** MCP `web_sink_bind` / `web_sink_switch`
+- Browser「连接当前对话」在 route VERIFIED 后显式 bind；导航切换不自动改 sink
+- `webSinkStatus` availability 依据 companion/verified route 事实
+
+Persisted state：
+
+```text
+<state>/web-sink-control/<workspaceId>.json
+{
+  version: 1
+  workspaceId
+  revision
+  activeBinding: WebSinkBinding | null   // generic URL identity only
+}
+```
+
+---
+
+## 10. 当前生产能力边界
 
 - ChatGPT Web 仍是**唯一 production Web Surface**。架构允许未来 surface plugin，本阶段不实现其他 AI 网页。
 - Codex Desktop 仍是**唯一 production Executor plugin**。

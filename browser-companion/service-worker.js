@@ -132,6 +132,8 @@ import {
   beginConnectAttestation,
   requestConnectCompletion,
   finishConnectFlow,
+  connectFlowOwnerWitnessMatches,
+  refreshExplicitConnectOwnerWitness,
 } from "./connect-flow.js";
 import {
   deriveCompanionIndicator,
@@ -174,6 +176,9 @@ let routeAttestLatch = emptyRouteAttestLatch();
 let routeAttestFence = emptyRouteAttestFence();
 /** G4c one-click orchestration fence (durable local). */
 let connectFlow = emptyConnectFlow();
+/** Last explicit connect Web Sink binding; never mutated by navigation alone. */
+/** Bridge-authoritative Web Sink projection cache (read-only sync). */
+let activeWebSinkProjection = { binding: null, available: false, synced: false };
 let connectInFlight = false;
 let transportMutationInFlight = false;
 /** E1b3d3b concurrent production send gate (memory only; durable truth is journal). */
@@ -553,6 +558,11 @@ function safeTransportSummary() {
       pairedAt: null,
     };
   }
+  const r5cFlowCurrent = Boolean(
+    connectFlow.state === "DONE"
+    && connectFlowIdentity(transport)
+    && connectFlowMatches(connectFlow, connectFlowIdentity(transport)),
+  );
   return {
     connected: !transport.authStale && storageProtected,
     authStale: transport.authStale === true,
@@ -567,6 +577,22 @@ function safeTransportSummary() {
     productionEligible: transport.routeVerification === "VERIFIED",
     rebindPending: transport.rebindPending === true,
     connectState: connectFlow.state,
+    webSinkConverged: Boolean(
+      activeWebSinkProjection.synced
+      && activeWebSinkProjection.available
+      && activeWebSinkProjection.binding
+      && activeWebSinkProjection.binding.canonicalUrl === transport.routeCanonical
+      && transport.routeVerification === "VERIFIED"
+      && r5cFlowCurrent,
+    ),
+    r5cConnected: Boolean(
+      activeWebSinkProjection.synced
+      && activeWebSinkProjection.available
+      && activeWebSinkProjection.binding
+      && activeWebSinkProjection.binding.canonicalUrl === transport.routeCanonical
+      && transport.routeVerification === "VERIFIED"
+      && r5cFlowCurrent,
+    ),
     pairedAt: transport.pairedAt,
   };
 }
@@ -787,6 +813,145 @@ async function fetchCompanion(path, init = {}) {
   });
   const body = await res.json().catch(() => ({}));
   return wrapFetchResponse(res, body);
+}
+
+/**
+ * Explicit-connect convergence only:
+ * exact explicit owner identity + transport route + authenticated VERIFIED
+ *   -> POST /web-sink/bind-current
+ *   -> fail-closed validate generic binding
+ * Periodic GET /state must never call this. Navigation alone never mutates sink.
+ */
+async function convergeExplicitVerifiedConnect(expectedOwner) {
+  if (!storageProtected || !transport?.credential || typeof transport.routeCanonical !== "string") {
+    return { ok: false, reason: "web_sink_transport_unready" };
+  }
+  if (transport.routeVerification !== "VERIFIED") {
+    return { ok: false, reason: "web_sink_route_unverified" };
+  }
+  if (expectedOwner) {
+    if (!ownerStillMatches(expectedOwner)) {
+      return { ok: false, reason: "web_sink_owner_mismatch" };
+    }
+    if (!areChatgptConversationRoutesEquivalent(expectedOwner.canonicalRoute, transport.routeCanonical)) {
+      return { ok: false, reason: "web_sink_owner_mismatch" };
+    }
+  } else if (!ownerState?.owner?.canonicalRoute
+    || !areChatgptConversationRoutesEquivalent(ownerState.owner.canonicalRoute, transport.routeCanonical)) {
+    return { ok: false, reason: "web_sink_owner_mismatch" };
+  }
+  try {
+    const res = await fetchCompanion("/web-sink/bind-current", {
+      method: "POST",
+      body: JSON.stringify({ routeCanonical: transport.routeCanonical }),
+    });
+    if (!res.ok || !res.body || typeof res.body !== "object") {
+      return { ok: false, reason: "web_sink_bind_failed", status: res.status };
+    }
+    const b = res.body.activeBinding;
+    const created = res.body.created;
+    if (!b || typeof b !== "object") {
+      return { ok: false, reason: "web_sink_response_invalid" };
+    }
+    const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    // Align with Endpoint endpointInstantSchema (z.string().datetime()): ISO-8601 with Z only.
+    const ISO_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?Z$/;
+    const epochOk = Number.isInteger(b.epoch) && b.epoch >= 1 && b.epoch <= 2147483647;
+    const boundAtOk = typeof b.boundAt === "string" && ISO_INSTANT.test(b.boundAt) && !Number.isNaN(Date.parse(b.boundAt));
+    if (
+      res.body.workspaceId !== transport.workspaceId
+      || b.workspaceId !== transport.workspaceId
+      || b.pluginId !== "browser-companion"
+      || b.surfaceId !== "chatgpt-web"
+      || b.canonicalUrl !== transport.routeCanonical
+      || typeof b.bindingId !== "string"
+      || !UUID.test(b.bindingId)
+      || !epochOk
+      || !boundAtOk
+      || typeof created !== "boolean"
+    ) {
+      return { ok: false, reason: "web_sink_response_invalid" };
+    }
+    activeWebSinkProjection = {
+      binding: {
+        bindingId: b.bindingId,
+        pluginId: b.pluginId,
+        surfaceId: b.surfaceId,
+        workspaceId: b.workspaceId,
+        canonicalUrl: b.canonicalUrl,
+        epoch: b.epoch,
+        boundAt: b.boundAt,
+        created,
+      },
+      available: true,
+      synced: true,
+    };
+    return { ok: true, binding: activeWebSinkProjection.binding };
+  } catch (error) {
+    return { ok: false, reason: "web_sink_bind_error", error: String(error?.message || error) };
+  }
+}
+
+/**
+ * Read-only Bridge Web Sink status sync (GET /web-sink/status).
+ * Bridge remains authority; never mutates Web Sink from this path.
+ */
+async function syncActiveWebSinkFromBridge() {
+  if (!storageProtected || !transport?.credential) {
+    return { ok: false, reason: "web_sink_transport_unready" };
+  }
+  try {
+    const res = await fetchCompanion("/web-sink/status", { method: "GET" });
+    if (!res.ok || !res.body || typeof res.body !== "object") {
+      activeWebSinkProjection = { binding: null, available: false, synced: false };
+      return { ok: false, reason: "web_sink_status_unavailable" };
+    }
+    const b = res.body.activeBinding;
+    const available = res.body.availability?.available === true;
+    if (!b || typeof b !== "object") {
+      // Successful authoritative read with no binding: still a successful sync.
+      activeWebSinkProjection = { binding: null, available: false, synced: true };
+      return { ok: true, binding: null, available: false };
+    }
+    const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const ISO_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?Z$/;
+    if (
+      res.body.workspaceId !== transport.workspaceId
+      || b.workspaceId !== transport.workspaceId
+      || b.pluginId !== "browser-companion"
+      || b.surfaceId !== "chatgpt-web"
+      || typeof b.bindingId !== "string"
+      || !UUID.test(b.bindingId)
+      || !Number.isInteger(b.epoch)
+      || b.epoch < 1
+      || b.epoch > 2147483647
+      || typeof b.canonicalUrl !== "string"
+      || typeof b.boundAt !== "string"
+      || !ISO_INSTANT.test(b.boundAt)
+    ) {
+      activeWebSinkProjection = { binding: null, available: false, synced: false };
+      return { ok: false, reason: "web_sink_response_invalid" };
+    }
+    // Bridge is authority: assign the whole projection atomically.
+    activeWebSinkProjection = {
+      binding: {
+        bindingId: b.bindingId,
+        pluginId: b.pluginId,
+        surfaceId: b.surfaceId,
+        workspaceId: b.workspaceId,
+        canonicalUrl: b.canonicalUrl,
+        epoch: b.epoch,
+        boundAt: b.boundAt,
+        created: false,
+      },
+      available,
+      synced: true,
+    };
+    return { ok: true, binding: activeWebSinkProjection.binding, available };
+  } catch {
+    activeWebSinkProjection = { binding: null, available: false, synced: false };
+    return { ok: false, reason: "web_sink_status_error" };
+  }
 }
 
 /** Persist authStale before returning (survives SW restart). */
@@ -1405,8 +1570,9 @@ async function handleRebindComplete({ managed = false } = {}) {
     routeVerification: "PENDING",
     rebindPending: false,
   };
+  // Do NOT mark R5c DONE before Web Sink convergence; keep a retryable pending state.
   const nextConnectFlow = identity
-    ? finishConnectFlow(connectFlow, identity, "DONE")
+    ? { ...connectFlow, state: "COMPLETE_REQUESTED", updatedAt: Date.now() }
     : connectFlow;
   if (!await commitPairDurableLocals({
     nextTransport,
@@ -1424,15 +1590,48 @@ async function handleRebindComplete({ managed = false } = {}) {
   await forceAutonomyOff("identity_disarm");
   const stateRes = await handleFetchState();
   const verified = stateRes?.ok === true && stateRes?.status?.routeVerification === "VERIFIED";
-  const autonomy = managed && verified
+  let webSink = { ok: false, reason: "not_verified" };
+  if (verified) {
+    const witness = connectFlow.ownerWitness
+      ? {
+          tabId: connectFlow.ownerWitness.tabId,
+          documentId: connectFlow.ownerWitness.documentId,
+          generation: connectFlow.ownerWitness.generation,
+          canonicalRoute: connectFlow.ownerWitness.canonicalRoute,
+        }
+      : null;
+    if (!witness || !connectFlowOwnerWitnessMatches(connectFlow, ownerState.owner)) {
+      webSink = { ok: false, reason: "owner_witness_required" };
+    } else {
+      webSink = await convergeExplicitVerifiedConnect(witness);
+      if (webSink.ok && identity) {
+        const doneFlow = finishConnectFlow(connectFlow, identity, "DONE");
+        const prevFlow = connectFlow;
+        connectFlow = doneFlow;
+        if (!await persistConnectFlow()) {
+          connectFlow = prevFlow;
+          await persistConnectFlow().catch(() => false);
+          return {
+            ok: false,
+            reason: "connect_done_persist_failed",
+            routeVerification: stateRes?.status?.routeVerification ?? "PENDING",
+            retryAllowed: true,
+            webSink: null,
+          };
+        }
+      }
+    }
+  }
+  const autonomy = managed && verified && webSink.ok === true
     ? await rearmAutonomyAfterVerifiedConnect()
     : { ok: true, mode: parseAutonomyPolicy(autonomyPolicy).mode };
   return {
-    ok: verified,
-    reason: stateRes?.ok ? undefined : stateRes?.reason,
+    ok: verified && webSink.ok === true,
+    reason: stateRes?.ok ? (webSink.ok ? undefined : webSink.reason) : stateRes?.reason,
     routeVerification: stateRes?.status?.routeVerification ?? "PENDING",
     productionEligible: stateRes?.status?.productionEligible === true,
     autonomy: autonomy.mode,
+    webSink: webSink.ok ? webSink.binding : null,
     autonomyReason: autonomy.ok ? undefined : autonomy.reason,
     retryAllowed: false,
   };
@@ -1609,6 +1808,14 @@ async function dispatchConnectRouteAttestation({ resumeExisting = false } = {}) 
   }
   const flowIdentity = connectFlowIdentity(transport);
   if (!flowIdentity) return { ok: false, reason: "connect_identity_invalid", retryAllowed: false };
+  const ownerWitness = ownerState.owner
+    ? {
+        tabId: ownerState.owner.tabId,
+        documentId: ownerState.owner.documentId,
+        generation: ownerState.owner.generation,
+        canonicalRoute: ownerState.owner.canonicalRoute,
+      }
+    : null;
   let begun;
   if (connectFlow.state === "ATTEST_REQUESTED" && connectFlowMatches(connectFlow, flowIdentity)) {
     if (!resumeExisting || connectFlow.bootstrapAutoResume !== true || routeAttestFence.state !== "NONE") {
@@ -1616,7 +1823,7 @@ async function dispatchConnectRouteAttestation({ resumeExisting = false } = {}) 
     }
     begun = { ok: true, flow: connectFlow };
   } else {
-    begun = beginConnectAttestation(connectFlow, flowIdentity);
+    begun = beginConnectAttestation(connectFlow, flowIdentity, ownerWitness);
   }
   if (!begun.ok) {
     return {
@@ -1710,22 +1917,55 @@ async function dispatchConnectRouteAttestation({ resumeExisting = false } = {}) 
     return { ...attested, state: connectFlow.state };
   }
   if (attested.serverConfirmed === true) {
+    // Keep ATTEST_REQUESTED until Web Sink convergence succeeds.
+    const witness = connectFlow.ownerWitness
+      ? {
+          tabId: connectFlow.ownerWitness.tabId,
+          documentId: connectFlow.ownerWitness.documentId,
+          generation: connectFlow.ownerWitness.generation,
+          canonicalRoute: connectFlow.ownerWitness.canonicalRoute,
+        }
+      : null;
+    if (!witness || !connectFlowOwnerWitnessMatches(connectFlow, ownerState.owner)) {
+      return {
+        ok: false,
+        state: connectFlow.state === "ATTEST_REQUESTED" ? "AWAITING_CONFIRMATION" : connectFlow.state,
+        routeVerification: attested.routeVerification,
+        reason: "owner_witness_required",
+        retryAllowed: true,
+      };
+    }
+    const sink = await convergeExplicitVerifiedConnect(witness);
+    if (!sink.ok) {
+      return {
+        ok: false,
+        state: connectFlow.state === "ATTEST_REQUESTED" ? "AWAITING_CONFIRMATION" : connectFlow.state,
+        routeVerification: attested.routeVerification,
+        reason: sink.reason || "web_sink_bind_failed",
+        retryAllowed: true,
+      };
+    }
     connectFlow = finishConnectFlow(connectFlow, flowIdentity, "DONE");
     if (!await persistConnectFlow()) {
       connectFlow = finishConnectFlow(connectFlow, flowIdentity, "OUTCOME_UNKNOWN");
       await persistConnectFlow().catch(() => false);
       return { ok: false, reason: "connect_done_persist_failed", retryAllowed: false };
     }
+    const autonomy = await rearmAutonomyAfterVerifiedConnect();
+    return {
+      ok: true,
+      state: "CONNECTED",
+      routeVerification: attested.routeVerification,
+      autonomy: autonomy.mode,
+      autonomyReason: autonomy.ok ? undefined : autonomy.reason,
+      webSink: sink.binding,
+    };
   }
-  const autonomy = attested.serverConfirmed === true
-    ? await rearmAutonomyAfterVerifiedConnect()
-    : { ok: true, mode: parseAutonomyPolicy(autonomyPolicy).mode };
   return {
     ok: true,
-    state: attested.serverConfirmed === true ? "CONNECTED" : "AWAITING_CONFIRMATION",
+    state: "AWAITING_CONFIRMATION",
     routeVerification: attested.routeVerification,
-    autonomy: autonomy.mode,
-    autonomyReason: autonomy.ok ? undefined : autonomy.reason,
+    autonomy: "off",
   };
 }
 
@@ -1841,6 +2081,81 @@ async function handleConnectPage(sender, message) {
     if (!transport.rebindPending && areChatgptConversationRoutesEquivalent(transport.routeCanonical, canonicalRoute)) {
       const current = await handleFetchState();
       if (current?.ok && current.status?.routeVerification === "VERIFIED") {
+        if (!ownerState.owner) {
+          return { ok: false, reason: "not_exact_owner", retryAllowed: false };
+        }
+        const currentOwner = {
+          tabId: ownerState.owner.tabId,
+          documentId: ownerState.owner.documentId,
+          generation: ownerState.owner.generation,
+          canonicalRoute: ownerState.owner.canonicalRoute,
+        };
+        // Explicit Connect only: rebase stale owner witness; persist before use.
+        if (["ATTEST_REQUESTED", "COMPLETE_REQUESTED"].includes(connectFlow.state)) {
+          const refreshed = refreshExplicitConnectOwnerWitness(connectFlow, currentOwner);
+          if (refreshed.ok) {
+            const prev = connectFlow;
+            connectFlow = refreshed.flow;
+            if (!await persistConnectFlow()) {
+              connectFlow = prev;
+              await persistConnectFlow().catch(() => false);
+              return { ok: false, reason: "connect_witness_persist_failed", retryAllowed: true };
+            }
+          }
+        }
+        // Establish local R5c DONE flow when none exists (legacy VERIFIED bootstrap).
+        if (connectFlow.state === "NONE") {
+          const fi = connectFlowIdentity(transport);
+          if (!fi) {
+            return { ok: false, reason: "connect_identity_invalid", retryAllowed: false };
+          }
+          connectFlow = {
+            state: "ATTEST_REQUESTED",
+            ...fi,
+            ownerWitness: currentOwner,
+            bootstrapAutoResume: false,
+            updatedAt: Date.now(),
+          };
+          if (!await persistConnectFlow()) {
+            connectFlow = emptyConnectFlow();
+            await persistConnectFlow().catch(() => false);
+            return { ok: false, reason: "connect_witness_persist_failed", retryAllowed: true };
+          }
+        }
+        const witness = connectFlow.ownerWitness
+          ? {
+              tabId: connectFlow.ownerWitness.tabId,
+              documentId: connectFlow.ownerWitness.documentId,
+              generation: connectFlow.ownerWitness.generation,
+              canonicalRoute: connectFlow.ownerWitness.canonicalRoute,
+            }
+          : null;
+        if (!witness || !connectFlowOwnerWitnessMatches(connectFlow, currentOwner)) {
+          return { ok: false, reason: "owner_witness_required", retryAllowed: true };
+        }
+        const sink = await convergeExplicitVerifiedConnect(witness);
+        if (!sink.ok) {
+          return { ok: false, reason: sink.reason || "web_sink_bind_failed", retryAllowed: true };
+        }
+        const fiDone = [connectFlowIdentity(transport), {
+          workspaceId: connectFlow.workspaceId,
+          bindingId: connectFlow.bindingId,
+          epoch: connectFlow.epoch,
+          companionId: connectFlow.companionId,
+          routeCanonical: connectFlow.routeCanonical,
+          challengeId: connectFlow.challengeId,
+        }].find((c) => c && connectFlowMatches(connectFlow, c));
+        if (!fiDone) {
+          return { ok: false, reason: "connect_identity_invalid", retryAllowed: true };
+        }
+        const doneFlow = finishConnectFlow(connectFlow, fiDone, "DONE");
+        const prevFlow = connectFlow;
+        connectFlow = doneFlow;
+        if (!await persistConnectFlow()) {
+          connectFlow = prevFlow;
+          await persistConnectFlow().catch(() => false);
+          return { ok: false, reason: "connect_done_persist_failed", retryAllowed: true };
+        }
         const autonomy = await rearmAutonomyAfterVerifiedConnect();
         return {
           ok: true,
@@ -1848,6 +2163,8 @@ async function handleConnectPage(sender, message) {
           routeVerification: "VERIFIED",
           autonomy: autonomy.mode,
           autonomyReason: autonomy.ok ? undefined : autonomy.reason,
+          webSink: sink.binding,
+          r5cConnected: true,
         };
       }
       currentPairPending = current?.ok === true
@@ -2213,6 +2530,7 @@ async function handleMessage(message, sender, { transportMutationHeld = false, m
     return runTransportMutation(() => handleRebindComplete());
   }
   if (message.type === "c2c.transport.status") {
+    await syncActiveWebSinkFromBridge().catch(() => undefined);
     return {
       ok: true,
       storageProtected,
@@ -2521,6 +2839,9 @@ async function handleMessage(message, sender, { transportMutationHeld = false, m
     if (!identity.ok && identity.reason !== "document_id_unavailable") {
       return { ok: false, reason: identity.reason };
     }
+    if (message.type === "c2c.status.page") {
+      await syncActiveWebSinkFromBridge().catch(() => undefined);
+    }
     const applied = applyObservationRouteVerdict(ownerState, {
       tabId: tabId ?? -1,
       documentId,
@@ -2652,15 +2973,37 @@ async function handleMessage(message, sender, { transportMutationHeld = false, m
               if (attestState?.ok && attestState.status?.routeVerification === "VERIFIED") {
                 lastAutonomyReason = "route_attest_server_verified";
                 if (restartSafeConnectPoll || connectFlow.state === "ATTEST_REQUESTED") {
-                  connectFlow = finishConnectFlow(connectFlow, flowIdentity, "DONE");
-                  if (await persistConnectFlow()) {
-                    const currentFlowIdentity = connectFlowIdentity(transport);
-                    if (connectFlow.state === "DONE"
-                      && currentFlowIdentity
-                      && connectFlowMatches(connectFlow, currentFlowIdentity)) {
-                      const autonomy = await rearmAutonomyAfterVerifiedConnect();
-                      if (!autonomy.ok) lastAutonomyReason = autonomy.reason;
+                  const currentFlowIdentity = connectFlowIdentity(transport);
+                  const witness = connectFlow.ownerWitness;
+                  const witnessOk = ownerExact === true
+                    && currentFlowIdentity
+                    && connectFlowMatches(connectFlow, currentFlowIdentity)
+                    && witness
+                    && connectFlowOwnerWitnessMatches(connectFlow, ownerState.owner);
+                  if (witnessOk) {
+                    const sink = await convergeExplicitVerifiedConnect({
+                      tabId: witness.tabId,
+                      documentId: witness.documentId,
+                      generation: witness.generation,
+                      canonicalRoute: witness.canonicalRoute,
+                    });
+                    if (sink.ok) {
+                      const doneFlow = finishConnectFlow(connectFlow, flowIdentity, "DONE");
+                      const prevFlow = connectFlow;
+                      connectFlow = doneFlow;
+                      if (await persistConnectFlow()) {
+                        const autonomy = await rearmAutonomyAfterVerifiedConnect();
+                        if (!autonomy.ok) lastAutonomyReason = autonomy.reason;
+                      } else {
+                        connectFlow = prevFlow;
+                        await persistConnectFlow().catch(() => false);
+                        lastAutonomyReason = "connect_done_persist_failed";
+                      }
+                    } else {
+                      lastAutonomyReason = sink.reason || "web_sink_bind_failed";
                     }
+                  } else {
+                    lastAutonomyReason = "owner_witness_required";
                   }
                 }
               }

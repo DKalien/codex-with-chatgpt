@@ -28,6 +28,20 @@ export function emptyConnectFlow() {
   };
 }
 
+function validOwnerWitness(value) {
+  return Boolean(
+    value
+    && Number.isInteger(value.tabId)
+    && typeof value.documentId === "string"
+    && value.documentId.length > 0
+    && value.documentId.length <= 256
+    && Number.isInteger(value.generation)
+    && typeof value.canonicalRoute === "string"
+    && value.canonicalRoute.length > 0
+    && value.canonicalRoute.length <= 512,
+  );
+}
+
 function validIdentity(value) {
   return Boolean(
     value
@@ -66,7 +80,9 @@ function validFlowIdentity(state, value) {
   if (["TAKEOVER_DISPATCH", "WAITING_TAKEOVER"].includes(state)) {
     return validTakeoverIdentity(value);
   }
-  return validIdentity(value) || (state === "OUTCOME_UNKNOWN" && validTakeoverIdentity(value));
+  return validIdentity(value)
+    || validTakeoverIdentity(value)
+    || (state === "OUTCOME_UNKNOWN" && validTakeoverIdentity(value));
 }
 
 export function parseConnectFlow(value) {
@@ -76,7 +92,7 @@ export function parseConnectFlow(value) {
   if (!STATES.has(value.state) || !validFlowIdentity(value.state, value)) {
     return { ...emptyConnectFlow(), state: "OUTCOME_UNKNOWN", updatedAt: Date.now() };
   }
-  return {
+  const parsed = {
     state: value.state,
     workspaceId: value.workspaceId,
     bindingId: value.bindingId,
@@ -87,13 +103,22 @@ export function parseConnectFlow(value) {
     bootstrapAutoResume: value.bootstrapAutoResume === true,
     updatedAt: Number.isFinite(value.updatedAt) ? value.updatedAt : null,
   };
+  if (validOwnerWitness(value.ownerWitness)) {
+    parsed.ownerWitness = {
+      tabId: value.ownerWitness.tabId,
+      documentId: value.ownerWitness.documentId,
+      generation: value.ownerWitness.generation,
+      canonicalRoute: value.ownerWitness.canonicalRoute,
+    };
+  }
+  return parsed;
 }
 
 export function connectFlowIdentity(transport) {
   const challengeId = typeof transport?.routeAttestationMessage === "string"
     ? /challengeId=([0-9a-fA-F-]{36})/.exec(transport.routeAttestationMessage)?.[1] ?? null
     : null;
-  const identity = {
+  const base = {
     workspaceId: transport?.workspaceId,
     bindingId: transport?.bindingId,
     epoch: transport?.epoch,
@@ -101,7 +126,13 @@ export function connectFlowIdentity(transport) {
     routeCanonical: transport?.routeCanonical,
     challengeId,
   };
-  return validIdentity(identity) ? identity : null;
+  if (validIdentity(base)) return base;
+  // Legacy VERIFIED without recoverable challenge: bounded local convergence identity.
+  if (challengeId === null) {
+    const local = { ...base, challengeId: null };
+    return validTakeoverIdentity(local) ? local : null;
+  }
+  return null;
 }
 
 export function connectFlowMatches(flow, identity) {
@@ -170,7 +201,10 @@ export function observeConnectTakeover(current, identity, now = Date.now()) {
   return { ...parsed, state: "WAITING_TAKEOVER", updatedAt: now };
 }
 
-export function beginConnectAttestation(current, identity, now = Date.now()) {
+export function beginConnectAttestation(current, identity, ownerWitnessOrNow = null, maybeNow = Date.now()) {
+  // Compatibility: legacy third argument is numeric `now`.
+  const ownerWitness = ownerWitnessOrNow && typeof ownerWitnessOrNow === "object" ? ownerWitnessOrNow : null;
+  const now = typeof ownerWitnessOrNow === "number" ? ownerWitnessOrNow : maybeNow;
   const parsed = parseConnectFlow(current);
   if (!validIdentity(identity)) return { ok: false, reason: "connect_identity_invalid", flow: parsed };
   if (parsed.state === "OUTCOME_UNKNOWN") {
@@ -179,6 +213,8 @@ export function beginConnectAttestation(current, identity, now = Date.now()) {
   if (connectFlowMatches(parsed, identity)) {
     return { ok: false, reason: parsed.state === "DONE" ? "already_connected" : "connect_active", flow: parsed };
   }
+  const witness = validOwnerWitness(ownerWitness) ? ownerWitness : null;
+  const withWitness = (flow) => witness ? { ...flow, ownerWitness: witness } : flow;
   if (parsed.state === "WAITING_TAKEOVER") {
     const successor = parsed.workspaceId === identity.workspaceId
       && areChatgptConversationRoutesEquivalent(parsed.routeCanonical, identity.routeCanonical)
@@ -188,7 +224,7 @@ export function beginConnectAttestation(current, identity, now = Date.now()) {
     if (!successor) return { ok: false, reason: "connect_identity_conflict", flow: parsed };
     return {
       ok: true,
-      flow: { state: "ATTEST_REQUESTED", ...identity, bootstrapAutoResume: true, updatedAt: now },
+      flow: withWitness({ state: "ATTEST_REQUESTED", ...identity, bootstrapAutoResume: true, updatedAt: now }),
     };
   }
   if (parsed.state !== "NONE" && parsed.state !== "DONE") {
@@ -196,7 +232,7 @@ export function beginConnectAttestation(current, identity, now = Date.now()) {
   }
   return {
     ok: true,
-    flow: { state: "ATTEST_REQUESTED", ...identity, bootstrapAutoResume: false, updatedAt: now },
+    flow: withWitness({ state: "ATTEST_REQUESTED", ...identity, bootstrapAutoResume: false, updatedAt: now }),
   };
 }
 
@@ -213,5 +249,49 @@ export function finishConnectFlow(current, identity, state, now = Date.now()) {
   if (!connectFlowMatches(parsed, identity) || !["DONE", "OUTCOME_UNKNOWN"].includes(state)) {
     return { ...parsed, state: "OUTCOME_UNKNOWN", updatedAt: now };
   }
-  return { ...parsed, state, bootstrapAutoResume: state === "DONE" ? false : parsed.bootstrapAutoResume, updatedAt: now };
+  const next = {
+    ...parsed,
+    state,
+    bootstrapAutoResume: state === "DONE" ? false : parsed.bootstrapAutoResume,
+    updatedAt: now,
+  };
+  return next;
+}
+
+/** Original explicit-connect owner witness still owns the page. */
+export function connectFlowOwnerWitnessMatches(flow, owner) {
+  const parsed = parseConnectFlow(flow);
+  const witness = parsed.ownerWitness;
+  if (!witness || !owner) return false;
+  return witness.tabId === owner.tabId
+    && witness.documentId === owner.documentId
+    && witness.generation === owner.generation
+    && areChatgptConversationRoutesEquivalent(witness.canonicalRoute, owner.canonicalRoute);
+}
+
+/**
+ * Explicit Connect only: replace stale owner witness with current document.
+ * Never call from heartbeat/status/navigation.
+ */
+export function refreshExplicitConnectOwnerWitness(current, owner, now = Date.now()) {
+  const parsed = parseConnectFlow(current);
+  if (!validOwnerWitness(owner)) {
+    return { ok: false, reason: "owner_witness_invalid", flow: parsed };
+  }
+  if (parsed.state !== "ATTEST_REQUESTED" && parsed.state !== "COMPLETE_REQUESTED") {
+    return { ok: false, reason: "connect_not_pending", flow: parsed };
+  }
+  return {
+    ok: true,
+    flow: {
+      ...parsed,
+      ownerWitness: {
+        tabId: owner.tabId,
+        documentId: owner.documentId,
+        generation: owner.generation,
+        canonicalRoute: owner.canonicalRoute,
+      },
+      updatedAt: now,
+    },
+  };
 }
