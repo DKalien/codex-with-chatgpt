@@ -89,8 +89,10 @@ The send action waits only for a real delivery acceptance and returns
 `deliveryStatus=accepted` with the actual thread/turn IDs. It does not mean
 the task is completed or tested. If delivery is uncertain (`outcome_unknown`), do not resend,
 change `commandId` or rebind; the whole workspace stays blocked, including a
-new binding, and this MVP has no recovery interface. A local user must check
-the Desktop session first. The send input requires `intent` to be
+new binding. A local user must check the Desktop session and then use the
+documented `reconcile-unknown` or two-step `resolve-unknown` workflow as appropriate;
+administrative resolution only stops waiting and does not prove delivery or success.
+See [Desktop Control](docs/desktop-control.md). The send input requires `intent` to be
 `development_plan` or `revision`, literal `userConfirmed=true`, and the full
 UTF-8 wire message, including the internal task envelope and JSON escaping, is capped at 64 KiB.
 The model may set `userConfirmed=true`

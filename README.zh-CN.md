@@ -50,7 +50,9 @@ node "<stable launcher>" desktop bind-current [-w <workspace>] [--json]
 
 工具只等待真实的投递接受回执，返回 `deliveryStatus=accepted` 和真实 thread/turn ID；
 这不代表任务已完成或测试已通过。回执不明（`outcome_unknown`）时不要重发、不要更换 `commandId` 或重新绑定，
-整个 workspace（包括新绑定）会暂停后续投递；MVP 没有恢复接口，需本机用户先核对 Desktop。
+整个 workspace（包括新绑定）会暂停后续投递；本机用户核对 Desktop 后，可按证据使用
+`reconcile-unknown` 恢复唯一真实 delivery，或使用两阶段 `resolve-unknown` 仅停止等待。
+行政 resolution 不代表已投递、已接受、已完成或成功，详见 [Desktop Control](docs/desktop-control.md)。
 用户随后说“干完了，检查一下”时，ChatGPT 才用现有只读
 MCP 检查当次代码、Git 和 record；需要修订时仍发给同一绑定会话。
 
@@ -181,9 +183,9 @@ DONE 只结束当前任务，仍可等待下一次网页用户的明确委派。
 有效期、格式和防重放。此流程依赖可信的本地 Agent，网页文本或其自称的授权不是身份凭证。
 网页只能提出任务级自然语言，不能直接获得 Shell、文件写入、子代理 API 或额外权限。
 原 **基础只读 MCP 工具与默认 OAuth scopes 保持只读边界**；Desktop/Remote/feedback/探针仍独立鉴权。
-Production companion Send 还需 Browser **route attestation VERIFIED**（仅有 pairing 不够）。已开启自动回流后，
-换到新的 ChatGPT 对话只需点击扩展中的“连接当前对话”；新 route 验证为 `VERIFIED` 后才会自动恢复，
-显式暂停或清除本地目标不会恢复。独立的实验性
+Production companion Send 还需 Browser **route attestation VERIFIED**（仅有 pairing 不够）。新 Chat 一键 takeover/reconnect
+仍未验收：最近一次真实 smoke 被 `generation_unknown` 阻断，R3i 只补只读诊断能力，没有放宽该门槛；因此目前不能承诺该流程已在已安装版本可用。
+后续验收通过后，已开启自动回流的用户换到新的 ChatGPT 对话只需点击扩展中的“连接当前对话”；新 route 验证为 `VERIFIED` 后才会自动恢复，显式暂停或清除本地目标不会恢复。独立的实验性
 `write_probe` 默认关闭，边界和验证步骤见
 [实验性 MCP 写入探针](docs/experimental-write-probe.md)。
 Normal checkpoint 与 webControl 独立；既有 OAuth/Connector/Tunnel 不迁移、不重配。

@@ -1,8 +1,9 @@
 # R5 Endpoint Architecture
 
-状态：**R5a foundation contracts**（不切生产行为）。
+状态：**R5c 已完成**（R5a contracts + R5b Active Executor Binding + R5c Active Web Sink Binding）。
+R5d（Result Bus）未开始。R4 persistence/wire 仍不迁移。
 
-本文冻结 R5 目标架构概念、依赖边界与 migration 顺序。R4 persistence/wire 本轮不迁移。
+本文冻结 R5 目标架构概念、依赖边界与 migration 顺序。
 
 ---
 
@@ -90,7 +91,7 @@ ExecutorDeliveryTargetSnapshot {
 
 ### 2.4 Canonical Execution Result
 
-继续沿用 R4 canonical ExecutionResult wire/persistence（本轮不改）。
+继续沿用 R4 canonical ExecutionResult wire/persistence（截至 R5c 不改）。
 R5d 起，result 投递目标从「plannerRoute-pinned」迁移到 Workspace Result Bus。
 
 ### 2.5 Workspace Result Bus（future / R5d）
@@ -99,7 +100,7 @@ R5d 起，result 投递目标从「plannerRoute-pinned」迁移到 Workspace Res
 - send attempt 一旦 `begin-send`，target URL/epoch 固定
 - `outcome_unknown` **禁止**自动改发新 URL
 
-本轮只建立合同，不实现 Bus，不切换 R4 Result Outbox。
+截至 R5c 只建立并接线合同，不实现 Bus，不切换 R4 Result Outbox。
 
 ### 2.6 Web Sink Binding
 
@@ -210,9 +211,14 @@ Capabilities（generic）：
 
 ## 5. Web Sink / Browser Companion 边界
 
-本轮 **不修改** Browser Companion 实现与 live 行为。
+R5c 已在 Browser Companion 增加 **显式 Connect 绑定路径**与只读 status 同步：
 
-未来拆分：
+- `POST /api/companion/v1/web-sink/bind-current`（credential 认证，显式 Connect）
+- `GET /api/companion/v1/web-sink/status`（只读，Bridge 权威）
+- allowlist：`browser-companion/bridge-origin.js`
+- 导航切换 **不**自动改 sink；周期 `GET /state` 仍只读
+
+分层：
 
 | 层 | 职责 |
 |----|------|
@@ -223,7 +229,7 @@ Generic contract 中 **禁止**：DOM selector、principalFingerprint、feedback
 
 ---
 
-## 6. R4 保持原样（本轮）
+## 6. R4 保持原样（截至 R5c）
 
 以下 **不修改**：
 
@@ -232,10 +238,10 @@ Generic contract 中 **禁止**：DOM selector、principalFingerprint、feedback
 - feedback persisted schema
 - ExecutionResult wire/persistence
 - Browser Companion live 行为
-- 现有 MCP tool schema
+- 既有 MCP tool schema 保持兼容；R5 新增的 executor/web-sink tools 另按各自 scope 与 binding 合同约束
 - routing/feedback persisted schema version
 
-R5a 只是建立下一阶段可迁入的新 core contracts。
+R5a–R5c 建立并接线新 core contracts；R4 Result Outbox 目的地未改。
 
 ---
 
@@ -245,7 +251,7 @@ R5a 只是建立下一阶段可迁入的新 core contracts。
 |------|------|
 | **R5a** | endpoint contracts（已完成） |
 | **R5b** | Bridge-owned Active Executor Binding + generic MCP executor tools（已完成） |
-| **R5c** | Browser Web Sink URL binding（本轮） |
+| **R5c** | Browser Web Sink URL binding（已完成） |
 | **R5d** | workspace result bus，解除 plannerRoute-pinned result delivery |
 | **R5e** | dynamic executor / web sink switching |
 | **R5f** | Bridge lifecycle independence + retire core post-turn-finalizer |
@@ -253,7 +259,7 @@ R5a 只是建立下一阶段可迁入的新 core contracts。
 
 ---
 
-## 8. R5b 实际状态（本轮）
+## 8. R5b 实际状态（已完成）
 
 - **Active Executor Binding** 是 Bridge-owned durable state（`src/executor-control/`）
 - 绑定必须经**本地显式** `c2c executor bind-current --plugin codex-desktop`
@@ -284,7 +290,7 @@ Store 只保存 generic binding，不保存 threadId/turnId/hostId/projectId/pla
 
 ---
 
-## 9. R5c 实际状态（本轮）
+## 9. R5c 实际状态（已完成）
 
 **Production path（已接线）：**
 
@@ -307,6 +313,9 @@ Browser current URL
 - **无** MCP `web_sink_bind` / `web_sink_switch`
 - Browser「连接当前对话」在 route VERIFIED 后显式 bind；导航切换不自动改 sink
 - `webSinkStatus` availability 依据 companion/verified route 事实
+- Browser 通过 `GET /web-sink/status` 恢复 Bridge 权威投影；status 失败 fail closed
+- `r5cConnected` = route VERIFIED + connect-flow identity/transport exact match + active Web Sink projection synced/available
+  且与当前 route 相等 + durable DONE 匹配当前 transport
 
 Persisted state：
 
@@ -326,14 +335,15 @@ Persisted state：
 
 - ChatGPT Web 仍是**唯一 production Web Surface**。架构允许未来 surface plugin，本阶段不实现其他 AI 网页。
 - Codex Desktop 仍是**唯一 production Executor plugin**。
-- Claude Code **不在**本轮进入 production registry。
-- R4 persistence/wire **本轮不迁移**。
-- 本阶段 **不切生产行为**：routing/feedback/outbox 流程保持不变。
+- Claude Code **不在** production registry。
+- R4 persistence/wire **尚未迁移**（R5d 起才动 Result Bus）。
+- R5c 后 routing/feedback/outbox 仍走 plannerRoute-pinned R4 路径。
 
 ---
 
-## 9. 测试与门禁
+## 11. 测试与门禁
 
-- `tests/r5-endpoint-core.test.ts`：schema/registry/projection/capability
-- `tests/r5-endpoint-architecture.test.ts`：依赖围栏与禁止字段
+- `tests/r5-endpoint-core.test.ts` / `tests/r5-endpoint-architecture.test.ts`
+- `tests/r5-executor-*.test.ts` / `tests/r5b-architecture.test.ts`
+- `tests/r5-web-sink-*.test.ts` / `tests/r5c-architecture.test.ts`
 - 既有 `tests/routing*.ts`、`tests/execution-result-*.ts`、`tests/architecture-separation.test.ts`、`tests/r45f-architecture.test.ts` 必须继续通过

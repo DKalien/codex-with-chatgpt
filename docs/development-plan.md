@@ -3,7 +3,7 @@
 本文件是本 workspace 持续维护的开发事实源，不是一次性 handoff。阶段完成、设计修正、
 新风险或 `NEXT_EXPECTED_STEP` 变化时必须同步更新；历史观察与当前实现分开记录。
 
-## R0→R5 recovered authoritative roadmap（截至 2026-09-26）
+## R0→R5 recovered authoritative roadmap（截至 2026-09-30）
 
 本路线收敛当前产品阶段；它优先于下方历史记录中的旧 `NEXT_EXPECTED_STEP` 和各 R3 slice
 当时的 pending 状态。C/A/D/B、Phase E/F/G/H 仍是保留的历史实现记录，不再覆盖 R0→R5 的阶段顺序。
@@ -14,8 +14,16 @@
 | R1 | Project 是 workspace 内的容器，可关联多个带 planner/executor role 的 Route；Route identity 为 `{workspaceId, platform, conversationId}`；随机 `bindingId` / `routeId` / `resultId` 仅作引用；Command 与最小 ExecutionResult durable model | foundation done |
 | R2 | 以 Desktop behavioral adapter 取代生产 build/hash/catalog gates | done |
 | R3 | Browser Companion“设备授权一次 + 当前网址一键绑定”的 Web adapter 与 feedback return plane | done；真实 live E2E PASS |
-| R4 | 将 Codex terminal truth（machine facts + Codex 自己的 final summary）写成 canonical ExecutionResult，经 `Command.plannerRouteId` 的 durable outbox 返回；不做第二次 AI rewrite | R4a、R4b done；独立 review PASS。trusted receipt → canonical RoutingResult → planner-route Result Outbox 已接通；下一步 R4c 消费新 outbox 并渐进迁移旧 Browser feedback delivery |
-| R5 | Bridge lifecycle 与 conversation execution state 完全解耦，不再由 Desktop busy、`approval_pending` 或 self-turn post-turn-finalizer 耦合 | planned |
+| R4 | 将 Codex terminal truth（machine facts + Codex 自己的 final summary）写成 canonical ExecutionResult，经 `Command.plannerRouteId` 的 durable outbox 返回；不做第二次 AI rewrite | R4a-R4c 源码实现完成并通过独立 review；canonical Result Outbox 已接入 route-pinned Browser return，routed Command 走 canonical-only；Result Bus 仍未迁移 |
+| R5 | Bridge lifecycle 与 conversation execution state 完全解耦，不再由 Desktop busy、`approval_pending` 或 self-turn post-turn-finalizer 耦合 | R5a-R5c 源码实现完成；R5d Result Bus 与后续 lifecycle decoupling planned |
+
+### 当前运行时观察（只读快照：2026-09-27）
+
+- 源码 `HEAD` 与 `origin/main` 均为 `cc0d2d4c83818c01a7e9569e3d9bbe25e2534550`；该提交包含 P0.7 v2 delivery provenance 与 v3 pending-finalizer ownership re-attestation。
+- workspace `2582910bf0d2` 的 `status --json` 报告 runtime `241e5d8d…df7ee`、installed/target `769cc448…af0e3`、`runtimeUpgrade=stale`、`upgradePending=true`、reason=`desktop_unknown`。运行时不是当前目标版本。
+- 同一 checkout 的 `doctor --no-fix --json` 报告 `core=install_corrupt` 且 `installedBuildId=null`；独立只读核验显示 fast pointer 检查通过，但 full artifact 校验失败。status 与 doctor 对安装完整性的投影不一致，不能把 target ID 当作已验证的完整安装。
+- named HTTPS `/health` 返回 200，workspace、PID、startedAt、runtimeBuildId 与 authenticated status 一致；doctor 的 named repair 不需要修复，tunnel 检查通过，但 status 附带 DNS resolver timeout 详情。post-turn finalizer 当前 inactive；最近结果是旧目标的 `named_unhealthy`，不是当前 target 的成功升级证明。
+- 因此 P0.7 live manual Stop→Continue smoke 尚未运行；本观察未执行 install、修复、restart 或 rollout。后续处置须先单独诊断 install artifact 不一致与 `desktop_unknown`，并遵守新的操作授权；本快照只作 2026-09-27 历史运行态证据，使用前重新核验。
 
 ### 历史兼容债务与阶段边界
 
@@ -35,16 +43,17 @@
 - 旧 Companion-derived planner routes 及 legacy `bindingId` 只保留为历史 route/reference；当前
   planner authority 来自同一 MCP request 的官方 conversation principal。不能删除、迁移或把旧记录
   提升为当前 authority。
-- R5 的已知债务位于 `rollout.ts`：`assessRolloutIdle()` 会被 Desktop busy、`approval_pending` 等状态
-  阻断，并可能为 self-turn 安排 post-turn-finalizer；这是待解耦的生命周期耦合，不代表 R5 已实现。
-- H0 / Claude E1a 是独立的 executor extensibility 支线，不属于 R5，也不改变 R0→R5 的阶段顺序。
+- R5f 的已知债务位于 `rollout.ts`：`assessRolloutIdle()` 会被 Desktop busy、`approval_pending` 等状态
+  阻断，并可能为 self-turn 安排 post-turn-finalizer；这是后续 Bridge lifecycle decoupling 工作，不代表 R5d
+  Result Bus 已实现。
+- H0 / Claude E1a 是独立的 executor extensibility 支线，不属于 R5d/f；Claude 仍未进入 production registry。
 
 R4a 已建立显式 `rawSummary` 的 Desktop receipt 与 read-only trusted receipt → canonical
 `ResultInput` 投影接缝，并通过独立 review；它本身不自动 append result，也不改 Browser production
 transport 或 R5 lifecycle。R4b 已完成并通过独立 review：本机可信 receipt 收敛接线先持久化 canonical
 RoutingResult，再由 routing-owned Result Outbox 引用它，并只按原 Command 的 persisted `plannerRouteId`
-建立投递目标。该 receipt → result → outbox 生成路径已接入生产记录/finalizer 边界；新 outbox 的 Browser
-消费与旧 Browser feedback delivery 渐进迁移尚未开始，属于 R4c。
+建立投递目标。R4c 已接入 route-pinned Browser return consumer；routed Command 走 canonical-only，
+旧 projector 仅保留给没有 Routing Command 的 genuine legacy receipt。
 
 ## Baseline（2026-09-13）
 
@@ -850,7 +859,7 @@ G3 修复 Browser Companion 误绑错误 ChatGPT conversation 后 production Sen
   仍只服务新 send，两者不改变彼此的 fail-closed 语义。P0.6 不新增 MCP 工具、不公开链内部、
   不重发 Desktop task、不产生第二条 receipt。
 
-### P0.7 — v2 Desktop delivery provenance 与严格 re-materialization alias（本轮实现）
+### P0.7 — v2 Desktop delivery provenance 与严格 re-materialization alias（源码已提交；live smoke 待运行时升级后验证）
 
 - 新 send 使用精确 v2 `C2C_DESKTOP_TASK` envelope；C2C 自行生成 UUID `deliveryId`，在
   `outcome_unknown` durable commit 中持久化后才发送，wire 与状态共用同一值。状态 version 1 继续读取，
@@ -889,7 +898,8 @@ G3 修复 Browser Companion 误绑错误 ChatGPT conversation 后 production Sen
   保留 preview/confirm 或等价的有界授权、幂等与审计证据，并对损坏、漂移和歧义 fail closed。
 - `resolve-unknown` wrapper 必须原样保留语义告知：行政 resolution 仅停止等待/解除阻塞，
   不代表已投递、已接受、已完成或成功。其他候选能力只在出现明确 workflow 需求后逐项评估；
-  当前不实现、不改变 R4/R5 范围，也不建设 generic exec 工具。
+  当前不实现、不改变 R4/R5 范围，也不建设任意 shell/命令执行或 generic exec 工具；R5b
+  已有的 `executor_send` 仍只按 active executor binding 提供受限投递。
 
 ## H0 — Executor Core foundation（2026-09-23，本轮）
 

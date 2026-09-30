@@ -46,17 +46,31 @@
 | `mcp/` | McpServer with workspace/git/search/session/pairing/feedback/workflow tools (base read-only set + separately guarded Desktop/Remote/feedback schemas); stateless Streamable HTTP transport (fresh server per request, JSON responses) |
 | `desktop/` | Local Desktop binding, behaviorally attested IPC delivery, replay-safe state and delivery status |
 | `executor/` | Executor Core 的有限适配器契约、固定注册表及当前 Codex Desktop adapter |
+| `endpoints/` | R5 generic executor/web-sink contracts, identity snapshots and fixed plugin registry |
+| `executor-control/` | Bridge-owned active executor binding, explicit local bind and frozen delivery target |
+| `web-sink-control/` | Bridge-owned active Web Sink binding, explicit browser connect and read-only status projection |
 | `auth/` | OAuth 2.1 authorization server: discovery metadata (RFC 8414 + Protected Resource Metadata), dynamic client registration (RFC 7591), authorization-code + PKCE (S256 only), refresh rotation, revocation (RFC 7009). Opaque tokens stored as SHA-256 hashes |
 | `pairing/` | PairingCode lifecycle: CSPRNG generation, TTL, attempt limits, IP rate limit, one-time use |
 | `workspace/` | Canonical-path containment (realpath of deepest existing ancestor), sensitive-file policy, `.c2cignore`, paginated read/list, ripgrep search with Node fallback, git status/diff with pagination |
 | `tunnel/` | `TunnelProvider` interface + Cloudflare Quick and workspace-configured Named Tunnel implementations; business logic is vendor-agnostic |
 | `execution/` | JSONL execution records plus optional sanitized command output (`execution_output`) |
 | `feedback/` | Production feedback outbox + companion transport: pairing/credential, route-principal attestation (challenge → `feedback_companion_route_confirm` → VERIFIED), reserve/begin-send/ack/retire, stale → `outcome_unknown`, exact late-positive ACK |
-| `browser-companion/` | MV3 sources → `dist/browser-companion`: SW-only Bridge HTTP + durable send journal + route-attestation fence; content_scripts use classic `*-global.js` (ESM `dom-adapter`/`turn-observer`/`route-attestation*` stay for SW import graph); autonomy default OFF; zero DOM/Send unless explicit production one-shot or armed heartbeat; production Send requires **route VERIFIED**；display-only toolbar indicator uses `C/C!/C×`，低频 `alarms` 只做 `/state` discovery |
+| `browser-companion/` | MV3 sources → `dist/browser-companion`: SW-only Bridge HTTP + durable send journal + route-attestation fence; content_scripts use built classic artifacts (including `*-global.js` and classic wrappers), while ESM `dom-adapter`/`turn-observer`/`route-attestation*` stay for the SW import graph; autonomy default OFF; zero DOM/Send unless explicit production one-shot or armed heartbeat; production Send requires **route VERIFIED**；display-only toolbar indicator uses `C/C!/C×`，低频 `alarms` 只做 `/state` discovery |
 | `process/` | Daemon spawn/reuse, health probing, graceful shutdown |
 | `core/` | Verified machine install metadata, guarded rollout and per-workspace pending upgrades |
 | `cli/` | `c2c` commands; `--json` everywhere for the Skill |
 | `config/`, `logger/` | OS-convention state dir, secret-redacting logger |
+
+### R5 source status
+
+The current source includes the reviewed R5a-R5c slices:
+
+- R5a defines generic endpoint contracts and a fixed registry in `src/endpoints/`.
+- R5b adds the Bridge-owned Active Executor Binding in `src/executor-control/`; the production registry still contains only Codex Desktop, and local binding remains explicit.
+- R5c adds the Bridge-owned Active Web Sink Binding in `src/web-sink-control/`; Browser Connect is explicit and navigation does not retarget the sink.
+- R5d Result Bus, dynamic endpoint switching, and Bridge lifecycle retirement are not implemented.
+
+These are source/repository facts only. They do not claim that the current machine runtime has installed or rolled out this checkout; verify `status --json` and the named idle rollout gates before deployment.
 
 ## R4.5 Structural Boundaries
 
@@ -84,7 +98,9 @@ R4.5 保持现有 wire、persistent state、ownership/security behavior、R4 can
 - Claude Code 是计划中的第一个额外 adapter；H0 只留下扩展接缝，不实现该集成。
 - Mimo Desktop 依赖稳定的本机机器接口；仅 GUI 自动化属于较低信任路径，不能自动继承 Codex 的 trusted receipt 语义。
 - capability metadata 仅供规划/UI 描述，不能授予权限；注册表固定且拒绝未知 executor，不做插件自动发现、PATH/网络探测或动态加载。
-- Browser Companion 与 feedback transport 保持 executor-independent；H0 不新增 generic MCP executor 工具，也不引入第二个 executor。
+- Browser Companion 与 feedback transport 保持 executor-independent；H0 当时不新增 generic MCP executor 工具，也不引入第二个 executor。
+  R5b 后 generic `executor_list` / `executor_status` / `executor_send` 已作为独立、受 OAuth scope 保护的 surface 接入，
+  但本机 bind 仍只能由显式 CLI 完成。
 
 ## Executor E1a — Claude runner contract（2026-09-23）
 

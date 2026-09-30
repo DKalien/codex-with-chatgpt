@@ -1,4 +1,4 @@
-# Routing Architecture（R1 foundation + R3 live-complete；R4a/R4b reviewed）
+# Routing Architecture（R1 foundation + R3 live-complete；R4c + R5a-R5c source-complete）
 
 Routing 是 C2C 的新语义身份层：以 `{workspaceId, platform, conversationId}` 标识
 workspace 内特定平台上的对话。Route 另有注册后不可变的 planner / executor role；
@@ -9,7 +9,7 @@ store，不接任何生产调用方。
 
 权威阶段定义与完整历史见[长期开发计划](development-plan.md)。当前状态：R0 基线、R1 Routing
 foundation、R2 Desktop behavioral adapter、R3 Browser Companion Web adapter / feedback return plane
-均已完成，R3 真实 live E2E 已通过；R4a canonical result envelope 与 R4b receipt → canonical RoutingResult → routing-owned Result Outbox 均已完成且独立 review PASS；R4c 下一步消费新 outbox 并渐进迁移旧 Browser feedback delivery；R5 尚未开始。
+均已完成，R3 真实 live E2E 已通过；R4a canonical result envelope、R4b receipt → canonical RoutingResult → routing-owned Result Outbox、R4c route-pinned Browser return consumer 与 R4c2 canonical-only routed return 已完成源码实现。R5a endpoint contracts、R5b Active Executor Binding、R5c Active Web Sink Binding 已完成源码实现；R5d Result Bus 尚未开始。本文记录源码架构，不代表当前机器已安装或已 rollout。
 
 | 阶段 | Routing 相关目标 | 状态 |
 | --- | --- | --- |
@@ -17,8 +17,8 @@ foundation、R2 Desktop behavioral adapter、R3 Browser Companion Web adapter / 
 | R1 | Project 容器、核心身份为 `{workspaceId, platform, conversationId}` 的 Route、Command、最小 ExecutionResult durable model | foundation done |
 | R2 | Desktop 生产信任基于 live behavioral proof | done |
 | R3 | Web adapter、当前网址绑定与 feedback return plane | live E2E PASS |
-| R4 | canonical ExecutionResult + `Command.plannerRouteId` durable outbox；机器事实与 Codex 自己的 final summary 一并回流，不做第二次 AI rewrite | R4a/R4b done / independent review PASS；R4c next：消费 planner-route outbox 并渐进迁移旧 Browser feedback delivery |
-| R5 | Bridge lifecycle 与会话执行状态解耦 | planned; 不属于 H0 / Claude E1a |
+| R4 | canonical ExecutionResult + `Command.plannerRouteId` durable outbox；机器事实与 Codex 自己的 final summary 一并回流，不做第二次 AI rewrite | R4a-R4c source-complete / independent review PASS；Result Outbox 仍保持 planner-route pinned |
+| R5 | Bridge lifecycle 与会话执行状态解耦 | R5a-R5c source-complete；R5d Result Bus 及后续 lifecycle decoupling planned |
 
 ## 术语
 
@@ -187,7 +187,7 @@ R3e 将现有 `codex_desktop_send` 接到 R3d adapter；底层仍复用原 Deskt
   上述 slice 已由真实 live E2E 收官；各 slice 内更早的 pending 记录以 `development-plan.md` 的 R3 aggregate
   closeout 为准。
 
-## R4 ExecutionResult outbox（R4a、R4b 完成；R4c 下一步）
+## R4 ExecutionResult outbox（R4a-R4c 源码实现完成）
 
 - R1 的 `RoutingState.results[]` / `appendResult()` 原先只保存最小结果身份与状态。
   R4a 扩充为 bounded `rawSummary` + versioned `machineEvidence`：来源是显式 Codex final summary
@@ -198,10 +198,12 @@ R3e 将现有 `codex_desktop_send` 接到 R3d adapter；底层仍复用原 Deskt
   唯一 trusted receipt 与 output metadata 后产生 `ResultInput` 候选；它不调用 `appendResult()`，
   不创建 outbox entry，不触碰 Browser/feedback 或 Desktop send。旧 generic/历史 receipt 读取兼容，
   但缺显式 summary/provenance 的记录不能成为新 canonical machine evidence。
-- R4a 与 R4b 均已完成并通过独立 review；trusted Desktop receipt → canonical RoutingResult → routing-owned durable Result Outbox 已接入本机生产收敛边界。R4c 的 outbox consumer 与 Browser delivery 迁移尚未接通。
+- R4a-R4c 均已完成并通过独立 review；trusted Desktop receipt → canonical RoutingResult → routing-owned durable
+  Result Outbox 已接入 route-pinned Browser return consumer。R4c2 对 persisted Routing Command 采用 canonical-only，
+  旧 projector 仅服务没有 Routing Command 的 genuine legacy receipt。
 - R4 将 canonical ExecutionResult 绑定原 Command，经其 `plannerRouteId` durable outbox 返回；复用 Codex
-  自己的 final summary，不再让第二个 AI 重写结果。R4b 已接通 receipt-to-outbox 的生产生成路径；R4c
-  尚未接通从新 outbox 到 Browser feedback consumer 的生产交付。
+  自己的 final summary，不再让第二个 AI 重写结果。R4c 已接通从新 outbox 到 Browser feedback consumer 的
+  route-pinned 生产投影，且不会由当前 Browser binding 重新决定 planner ownership。
 - R3 pairing / feedback 身份字段及状态机已由真实 live E2E 验收，应保持兼容。当前 feedback outbox 以
   `bindingId / epoch / principalFingerprint` 为接收者，状态为
   `queued → ready → reserved → claimed → observed / outcome_unknown / retired_unknown`；R4b 不修改此 schema
@@ -256,15 +258,17 @@ R4b 把 R4a projector 验证出的 `ResultInput` 先交给 Routing store，持�
   会在自己的 receipt 提交前重新发布。恢复命令只需历史 trusted receipt，不要求当前 Desktop binding。
   `appendResultWithReplay()` exact replay 取得原 result 后补齐缺少的 Outbox entry；原子 rename 前崩溃留下的 temp 不会被当作主状态，
   重试仍可收敛；原子发布后的 caller retry 返回原 entry，不重复生成 Result 或投递目标。
-- 本切片不依赖 Browser、feedback state、current binding/state、`/state`、`/reserve` 或 Companion，也不修改 R3
-  feedback schema、状态迁移或 transport。R4c 才消费新 planner-route Result Outbox，并渐进迁移旧 Browser feedback
-  delivery；R4c 未在本切片实现。
+- Routing Result Outbox 的 canonical consumer 已接入 route-pinned Browser return path；R4c2 对 persisted Routing
+  Command 实行 canonical-only，旧 execution-record projector 只保留给没有 Routing Command 的 genuine legacy receipt。
+  该路径仍不改变 R4 persistence/schema，也不让 routing canonical store 依赖 Feedback/Browser。
 
-## R5 Bridge lifecycle decoupling（规划中）
+## R5 Endpoint 与 Bridge lifecycle 路线
 
-`rollout.ts` 的 `assessRolloutIdle()` 当前会因 Desktop busy、`approval_pending` 等阻断 rollout，并可能通过
-self-turn `post-turn-finalizer` 延后执行。R5 的目标是让 Bridge lifecycle 完全脱离 conversation execution state；
-该耦合是待处理债务。H0 / Claude E1a 属于独立 executor extensibility 支线，不是 R5。
+- R5a-r5c 已在源码中建立并接线 generic endpoint contracts、Bridge-owned Active Executor Binding 与 Active Web Sink
+  Binding；Codex Desktop 仍是唯一 production Executor，ChatGPT Web 仍是当前唯一 production Web Surface。
+- R5d Result Bus 尚未实现，Result Outbox 仍保持 planner-route pinned；后续 R5e dynamic endpoint switching 与 R5f Bridge
+  lifecycle independence 才会处理 `rollout.ts` 当前对 Desktop busy、`approval_pending` 和 post-turn-finalizer 的耦合。
+- H0 / Claude E1a 属于独立 executor extensibility 支线，不等同于 R5d/f，也未把 Claude 加入 production registry。
 
 ## R3k Task delivery 与 Feedback return plane
 

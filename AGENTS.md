@@ -26,4 +26,4 @@ Codex with ChatGPT 让 ChatGPT 负责规划与 Review，由 Codex 保留执行�
 - 不降低 OAuth scope、Desktop 本机确认、binding/enable、owner/project/workspace、版本/hash、审批、防重放或 outcome_unknown 门禁。
 - Desktop `accepted` 不是执行完成。实际 `C2C_DESKTOP_TASK` turn 按 Skill 在最终回复前写 exact commandId receipt；后续 turn 不能代记，Review 不以历史 `test_status` 代替本轮证据。
 - Browser Companion production Send（reserve/begin-send）必须 route attestation `VERIFIED`（authenticated `/state`）；pairing 本身不授权 DOM Send。route durable fence 仅 re-pair（新 companionId+challengeId）可重置；任何 non-NONE fence 同 challenge 禁止再 Send。
-- Companion `content_scripts` 只加载 classic `*-global.js`；ESM `dom-adapter.js` / `turn-observer.js` / `route-attestation*.js` 留给 service-worker import graph，禁止当作 content script 挂载。
+- Companion `content_scripts` 只加载构建后的 classic artifacts（包括 `*-global.js` 与 classic wrappers）；ESM `dom-adapter.js` / `turn-observer.js` / `route-attestation*.js` 留给 service-worker import graph，禁止直接作为 content script 挂载。

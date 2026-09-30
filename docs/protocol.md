@@ -321,14 +321,25 @@ workspace，再用 `desktop enable` 明确接受 Desktop 会话现有权限可�
 send 的风险标注保持 `readOnlyHint:false`、`destructiveHint:true`、`openWorldHint:true`、
 `idempotentHint:true`；`idempotent` 仅表示同一 `commandId` 防止重复尝试，不是网络 exactly-once。
 
+R5b/R5c 的 generic endpoint surface 与 Desktop task delivery 分开：`executor_list`、`executor_status`、
+`executor_send` 使用 `codex.executor.read` / `codex.executor.control` scope，且必须先由本机用户通过
+`c2c executor bind-current --plugin codex-desktop` 建立 active binding；MCP 不提供 executor bind。
+`web_sink_list`、`web_sink_status` 仅使用 `codex.websink.read`，Browser Companion 通过已验证 route 的显式
+`bind-current` 建立 Web Sink binding；MCP 不提供 web-sink bind/switch。两类 binding 都由 Bridge 持有，
+send attempt 的目标 identity 一旦冻结不得因后续 endpoint 切换而改写。
+
 `accepted` 仅表示投递被 Desktop 接受，不是 `completed`，也不是测试通过。忙、待审批、
 无 owner、离线、错项目、workspace 不匹配、提权或 live 协议不兼容时零发送并返回明确错误。
 回执超时、断线或落盘不明返回 `outcome_unknown`；不要重发、换 `commandId` 或重新绑定绕过，
-整个 workspace（包括新绑定）的后续投递暂停，必须先由本机用户人工核对；MVP 没有自动
-恢复或恢复接口。
+整个 workspace（包括新绑定）的后续投递暂停。由本机用户先核对 Desktop，再按证据选择严格的
+`reconcile-unknown`（仅恢复唯一真实 turn）或两阶段 `resolve-unknown`（只停止等待，不代表已投递、
+已接受、已完成或成功）；不得自动重发或把行政 resolution 当作成功。详见
+[Desktop Control](desktop-control.md)。
 
-执行 receipt 只能由统一 `c2c record` 在匹配 delivery.threadId / delivery.turnId 的真实当前
-terminal turn 写入；写入前及幂等返回前仍须复核，后续 turn 不能代记。若当前 turn 仍为
+执行 receipt 只能由统一 `c2c record` 在精确匹配 delivery.threadId 的真实当前 terminal turn 写入；
+普通 origin 与未触发 alias 的 v1/v2 必须匹配原 delivery.turnId。P0.6 native continuation 与 P0.7
+唯一 v2 re-materialization alias 必须分别通过完整 ownership attestation，且不会改写 durable accepted
+turnId；任意后续 turn 不能代记。写入前及幂等返回前仍须复核。若当前 turn 仍为
 `inProgress`，只写入受保护的 pending draft，不产生 trusted receipt；当前 canonical history
 无法证明 record 后没有继续的 command/tool activity 时，通过 `FINAL_RECEIPT_REQUIRED` 控制反馈
 要求重新只读核对，而不是伪造 `C2C_EXECUTED`。该命令在可证明终态时自动升级为
