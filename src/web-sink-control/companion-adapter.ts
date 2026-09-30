@@ -24,6 +24,9 @@ export interface WebSinkCompanionAuthContext {
   readonly workspaceId: string;
   readonly companionId: string;
   readonly routeCanonical: string;
+  /** 传输层兼容元数据：来自 Companion record，不与 active Feedback receiver 校验。 */
+  readonly bindingId: string;
+  readonly epoch: number;
 }
 
 /**
@@ -68,6 +71,8 @@ export function verifyCompanionCredentialForWebSink(input: {
     workspaceId: state!.workspaceId,
     companionId: companion.companionId,
     routeCanonical: companion.routeCanonical,
+    bindingId: companion.bindingId,
+    epoch: companion.epoch,
   };
 }
 

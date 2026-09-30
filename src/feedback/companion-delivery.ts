@@ -12,7 +12,7 @@ import {
   reserveNext,
   retireOutcomeUnknown,
 } from "./delivery-lifecycle.js";
-import { recoverStaleFeedback } from "./state-store.js";
+import { recoverStaleFeedback, readFeedbackState } from "./state-store.js";
 import { publicCompanionDeliveryEvent } from "./projection-store.js";
 import { productionFeedbackDelivery } from "./message.js";
 import {
@@ -28,14 +28,21 @@ import {
 } from "../chatgpt/route.js";
 import { assertRouteVerifiedForProduction } from "./companion-route.js";
 
-/** 用 credential 校验 companion；binding/epoch 必须仍匹配。 */
-export function verifyCompanionCredential(input: {
+/**
+ * 只读 Companion credential 预认证边界（R5d3 auth-purity）。
+ * 使用 readFeedbackState（零写入/零 stale recovery）证明 credential 属于
+ * 当前、未 superseded 的 Companion：workspace 精确、companion 存在、
+ * credential hash 精确。不做 binding/principal/epoch 强化检查，不执行任何
+ * lifecycle recovery——这些由认证后的 source-specific 路径按原有语义完成。
+ * 不暴露 credential/hash/principal 材料。
+ */
+export function verifyCompanionCredentialReadOnly(input: {
   workspaceId: string;
   credential: string;
   stateDir?: string;
 }): CompanionAuthContext {
   const stateDir = input.stateDir ?? getStateDir();
-  const state = recoverStaleFeedback(input.workspaceId, stateDir);
+  const state = readFeedbackState(input.workspaceId, stateDir);
   const companion = state.companion;
   if (!isActiveCompanion(companion)) {
     throw new CompanionError("COMPANION_UNAUTHORIZED", "companion 未配对或已撤销");
@@ -43,6 +50,38 @@ export function verifyCompanionCredential(input: {
   if (!hashEqual(companion.credentialHash, sha256Hex(input.credential))) {
     throw new CompanionError("COMPANION_UNAUTHORIZED", "companion credential 无效");
   }
+  return {
+    workspaceId: state.workspaceId,
+    companionId: companion.companionId,
+    bindingId: companion.bindingId,
+    epoch: companion.epoch,
+    principalFingerprint: companion.principalFingerprint,
+    routeCanonical: companion.routeCanonical,
+    routeVerified: isRouteAttestationVerified(companion),
+  };
+}
+
+/** 用 credential 校验 companion；binding/epoch 必须仍匹配。 */
+export function verifyCompanionCredential(input: {
+  workspaceId: string;
+  credential: string;
+  stateDir?: string;
+}): CompanionAuthContext {
+  const stateDir = input.stateDir ?? getStateDir();
+  // R5d3 auth-purity：先对 raw 只读状态校验 credential 真实性（零写入）；
+  // 无效 credential 直接 401，绝不触发 stale recovery 等任何持久化 mutation。
+  const raw = readFeedbackState(input.workspaceId, stateDir);
+  const rawCompanion = raw.companion;
+  if (!isActiveCompanion(rawCompanion)) {
+    throw new CompanionError("COMPANION_UNAUTHORIZED", "companion 未配对或已撤销");
+  }
+  if (!hashEqual(rawCompanion.credentialHash, sha256Hex(input.credential))) {
+    throw new CompanionError("COMPANION_UNAUTHORIZED", "companion credential 无效");
+  }
+  // 已认证：stale convergence 是合法的 authenticated lifecycle 维护。
+  // recoverStaleInMemory 只收敛 events，不触碰 companion/binding，复用已收窄引用。
+  const state = recoverStaleFeedback(input.workspaceId, stateDir);
+  const companion = rawCompanion;
   if (!state.binding || state.binding.status !== "active") {
     throw new FeedbackError("FEEDBACK_NOT_ENABLED", "production feedback 未启用");
   }

@@ -20,127 +20,13 @@ import {
   type FeedbackState,
 } from "./schema.js";
 import { listReceiptFinalizationAlerts } from "../desktop/receipt-finalizer.js";
-import { resolveResultOutboxEntries } from "../routing/result-outbox-store.js";
 import { readRouting, resolveWorkspaceIdentity } from "../routing/store.js";
-import type { RoutingResult } from "../routing/schema.js";
-
-function truncateSummary(text: string, max = 2000): string {
-  return text.length > max ? text.slice(0, max) : text;
-}
 
 function changedFilesSummary(record: StoredExecutionRecord): string[] {
   if (Array.isArray(record.changedFiles)) {
     return record.changedFiles.slice(0, 200);
   }
   return [`changedFiles=${record.changedFiles}`];
-}
-
-/**
- * Legacy feedback 与 canonical result 共享的不可变事件事实。
- * 时间戳和 receiver lifecycle 属于各自投影，不参与迁移匹配。
- */
-function sameLegacyCanonicalIdentity(
-  legacy: FeedbackEvent,
-  canonical: FeedbackEvent,
-): boolean {
-  return legacy.kind === canonical.kind
-    && legacy.source === canonical.source
-    && legacy.workspaceId === canonical.workspaceId
-    && legacy.eventId === canonical.eventId
-    && legacy.commandId === canonical.commandId
-    && legacy.taskId === canonical.taskId
-    && legacy.iteration === canonical.iteration
-    && legacy.result === canonical.result
-    && JSON.stringify(legacy.changedFilesSummary) === JSON.stringify(canonical.changedFilesSummary)
-    && legacy.testsSummary === canonical.testsSummary
-    && legacy.outputAvailable === canonical.outputAvailable
-    && legacy.outputId === canonical.outputId;
-}
-
-function sameCanonicalImmutableIdentity(a: FeedbackEvent, b: FeedbackEvent): boolean {
-  const keys = [
-    "kind", "source", "workspaceId", "eventId", "commandId", "taskId", "iteration", "result",
-    "changedFilesSummary", "testsSummary", "outputAvailable", "outputId", "plannerRouteId",
-    "plannerPrincipalFingerprint", "resultId", "resultSha256", "rawSummary", "machineEvidence",
-  ] as const;
-  const left = a as Record<string, unknown>;
-  const right = b as Record<string, unknown>;
-  return keys.every((key) => JSON.stringify(left[key]) === JSON.stringify(right[key]));
-}
-
-function canonicalEvent(input: {
-  workspaceId: string;
-  result: RoutingResult;
-  plannerRouteId: string;
-  plannerPrincipalFingerprint: string;
-  resultSha256: string;
-  occurredAt: string;
-}): FeedbackEvent {
-  if (!("rawSummary" in input.result) || !("machineEvidence" in input.result)) {
-    throw new FeedbackError("FEEDBACK_CANONICAL_RESULT_INVALID", "legacy RoutingResult 不能投影为 canonical feedback");
-  }
-  const evidence = input.result.machineEvidence;
-  const eventId = feedbackEventId({
-    workspaceId: input.workspaceId,
-    commandId: input.result.commandId,
-    taskId: evidence.taskId,
-    iteration: input.result.iteration,
-    desktopReceiptSha256: evidence.desktopReceiptSha256,
-  });
-  return feedbackEventSchema.parse({
-    version: 1, eventId, kind: "C2C_EXECUTED", workspaceId: input.workspaceId, source: "desktop",
-    commandId: input.result.commandId, taskId: evidence.taskId, iteration: input.result.iteration,
-    result: input.result.status, changedFilesSummary: evidence.changedFiles.slice(0, 200),
-    testsSummary: truncateSummary(evidence.testsSummary), outputAvailable: evidence.output?.outputAvailable ?? false,
-    ...(evidence.output?.outputId !== undefined ? { outputId: evidence.output.outputId } : {}),
-    occurredAt: input.occurredAt, createdAt: input.occurredAt, updatedAt: input.occurredAt,
-    targetBindingId: null, targetEpoch: null, targetPrincipalFingerprint: null, status: "queued",
-    plannerRouteId: input.plannerRouteId, plannerPrincipalFingerprint: input.plannerPrincipalFingerprint,
-    resultId: input.result.resultId, resultSha256: input.resultSha256,
-    rawSummary: input.result.rawSummary, machineEvidence: evidence,
-  });
-}
-
-export function reconcileCanonicalResultOutbox(
-  workspaceRoot: string,
-  workspaceId: string,
-  stateDir?: string,
-): { state: FeedbackState; projected: number } {
-  const identity = resolveWorkspaceIdentity({ id: workspaceId, root: workspaceRoot });
-  const state = recoverStaleFeedback(workspaceId, stateDir);
-  const resolved = resolveResultOutboxEntries(identity, stateDir);
-  const candidates = resolved.map(({ entry, result, plannerRoute }) => ({
-    entry,
-    result,
-    event: canonicalEvent({
-      workspaceId, result, plannerRouteId: plannerRoute.routeId, plannerPrincipalFingerprint: plannerRoute.conversationId,
-      resultSha256: entry.resultSha256,
-      occurredAt: result.createdAt,
-    }),
-  }));
-  const events = candidates
-    .filter(({ result, event }) => {
-      const matches = state.events.filter((item) => item.commandId === result.commandId && item.iteration === result.iteration);
-      if (matches.length > 1) {
-        throw new FeedbackError("FEEDBACK_CANONICAL_ROUTE_CONFLICT", "同一 commandId/iteration 存在多个 feedback 事件；拒绝选择性投影");
-      }
-      const existing = matches[0];
-      if (!existing) return true;
-      if ("plannerRouteId" in existing) {
-        if (!sameCanonicalImmutableIdentity(existing, event)) {
-          throw new FeedbackError("FEEDBACK_CANONICAL_ROUTE_CONFLICT", "canonical feedback 身份已漂移；拒绝覆盖");
-        }
-        return false;
-      }
-      // Pre-R4c legacy projection is compatible only when its immutable event identity matches.
-      if (!sameLegacyCanonicalIdentity(existing, event)) {
-        throw new FeedbackError("FEEDBACK_CANONICAL_ROUTE_CONFLICT", "历史 feedback 事件与 canonical result 冲突；拒绝静默重定向");
-      }
-      return false;
-    });
-  if (!events.length) return { state, projected: 0 };
-  const newEvents = events.map(({ event }) => event);
-  return { state: applyProjection({ workspaceId, stateDir, nextCursor: state.projectionCursor, newEvents }), projected: newEvents.length };
 }
 
 /**
@@ -197,6 +83,11 @@ function assertTrustedDesktopReceipt(
  * 只投影 cursor 之后的 strict records。
  * 首次 baseline cursor = 当前 record 数量，不投历史。
  * 每次 reconcile 先做 stale convergence，再处理 slice。
+ *
+ * R5d3 cutover：routed canonical results 不再投影为 Feedback canonical 投递事件
+ * （canonical delivery 由 Workspace Result Bus 承担；R4 outbox 的兼容投影
+ * 保留在 feedback 层独立的 canonical 投影兼容模块）。本函数只负责 legacy
+ * 非 routed 投递与 FINAL_RECEIPT_REQUIRED 控制事件。
  */
 export function reconcileFeedbackOutbox(
   workspaceId: string,
@@ -205,7 +96,6 @@ export function reconcileFeedbackOutbox(
 ): { state: FeedbackState; projected: number } {
   const records = readExecutionRecordsStrict(workspaceId);
   ensureFeedbackState(workspaceId, records.length, stateDir);
-  if (workspaceRoot) reconcileCanonicalResultOutbox(workspaceRoot, workspaceId, stateDir);
   // 即使 slice 为空也必须收敛 stale claimed，保证 status 即可恢复。
   let state = recoverStaleFeedback(workspaceId, stateDir);
   if (state.projectionCursor > records.length) {
@@ -218,14 +108,14 @@ export function reconcileFeedbackOutbox(
   const desktop = readDesktop(workspaceId);
   const routingIdentity = workspaceRoot ? resolveWorkspaceIdentity({ id: workspaceId, root: workspaceRoot }) : null;
   // Routed commands are never eligible for the untargeted legacy projector,
-  // even while their canonical result/outbox is pending or unavailable.
-  const routedCommandIds = routingIdentity
-    ? new Set(readRouting(routingIdentity, stateDir)?.commands.map(command => command.commandId) ?? [])
-    : new Set<string>();
-  const canonicalByIdentity = routingIdentity
-    ? new Set(resolveResultOutboxEntries(routingIdentity, stateDir)
-      .map(({ result }) => `${result.commandId}\u0000${result.iteration}`))
-    : new Set<string>();
+  // even while their canonical result delivery is pending or unavailable.
+  const routing = routingIdentity ? readRouting(routingIdentity, stateDir) : null;
+  const routedCommandIds = new Set(routing?.commands.map(command => command.commandId) ?? []);
+  const canonicalByIdentity = new Set(
+    (routing?.results ?? [])
+      .filter(result => "rawSummary" in result)
+      .map(result => `${result.commandId}\u0000${result.iteration}`),
+  );
   const newEvents: FeedbackEvent[] = [];
   for (const record of slice) {
     if (!claimsDesktopReceipt(record)) {
@@ -306,4 +196,8 @@ export function reconcileFeedbackOutbox(
     newEvents,
   });
   return { state: next, projected: newEvents.length };
+}
+
+function truncateSummary(text: string, max = 2000): string {
+  return text.length > max ? text.slice(0, max) : text;
 }

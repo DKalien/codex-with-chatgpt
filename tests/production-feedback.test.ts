@@ -16,7 +16,8 @@ import {
   feedbackEventSchema,
   type FeedbackEvent,
 } from "../src/feedback/store.js";
-import { reconcileCanonicalResultOutbox, reconcileFeedbackOutbox } from "../src/feedback/projector.js";
+import { reconcileFeedbackOutbox } from "../src/feedback/projector.js";
+import { reconcileCanonicalResultOutbox } from "../src/feedback/canonical-compat.js";
 import {
   resolveConversationPrincipal,
   ConversationPrincipalError,

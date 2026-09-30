@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { getStateDir } from "../config/paths.js";
 import { resolveWorkspaceIdentity, type RoutingWorkspaceIdentity } from "../routing/store.js";
 import { freezeActiveWebSinkTarget, readActiveWebSinkBinding } from "../web-sink-control/service.js";
 import type { WebSinkBinding, WebSinkSendTargetSnapshot } from "../endpoints/schema.js";
@@ -56,6 +57,8 @@ export type RecoverStaleResultBusOutcome = { requeued: number; outcomeUnknown: n
 export type ResultBusLifecycleOptions = {
   /** 确定性测试注入的当前时间（epoch ms）。 */
   readonly nowMs?: number;
+  /** 投递抑制集（如 R5d3 cutover ledger 已处置的 busEntryId）；预约时跳过。 */
+  readonly excludeBusEntryIds?: ReadonlySet<string>;
 };
 
 function requireEntry(previous: ResultBusState | null, busEntryId: string): { state: ResultBusState; index: number; entry: ResultBusEntry } {
@@ -85,6 +88,7 @@ function isoNow(nowMs: number | undefined): string {
 export function reserveNextResultBusEntry(
   identity: RoutingWorkspaceIdentity,
   options: ResultBusLifecycleOptions = {},
+  stateDir = getStateDir(),
 ): ReserveNextResultBusEntryOutcome {
   const resolved = resolveWorkspaceIdentity(identity);
   const active = readActiveWebSinkBinding(resolved.id);
@@ -103,7 +107,10 @@ export function reserveNextResultBusEntry(
     if (inFlight) {
       return { state: previous, noWrite: true, result: { status: "in_flight", entry: inFlight } };
     }
-    const queued = entries.filter(entry => entry.deliveryStatus === "queued").sort(compareResultBusEntries)[0];
+    const excluded = options.excludeBusEntryIds;
+    const queued = entries
+      .filter(entry => entry.deliveryStatus === "queued" && !(excluded?.has(entry.busEntryId) ?? false))
+      .sort(compareResultBusEntries)[0];
     if (!queued) {
       // previous 为 null（bus 未初始化）时由 store 的 null-state 只读路径处理，不创建文件。
       return { state: previous, noWrite: true, result: { status: "empty" as const } };
@@ -120,13 +127,14 @@ export function reserveNextResultBusEntry(
       state: replaceEntry(previous!, previous!.entries.indexOf(queued), entry),
       result: { status: "reserved" as const, entry, sink: active },
     };
-  });
+  }, stateDir);
 }
 
 /** reserved → queued（仅 begin-send 前）：清除 reservation 元数据；claimed/outcome_unknown 永不可释放回 queued。 */
 export function releaseResultBusReservation(
   identity: RoutingWorkspaceIdentity,
   input: { busEntryId: string; reservationId: string },
+  stateDir = getStateDir(),
 ): ReleaseResultBusReservationOutcome {
   const resolved = resolveWorkspaceIdentity(identity);
   return withResultBusTransaction<ReleaseResultBusReservationOutcome>(resolved, previous => {
@@ -139,7 +147,7 @@ export function releaseResultBusReservation(
     }
     const requeued: ResultBusEntry = { ...entry, deliveryStatus: "queued", reservation: null };
     return { state: replaceEntry(state, index, requeued), result: { status: "released", entry: requeued } };
-  });
+  }, stateDir);
 }
 
 /**
@@ -154,6 +162,7 @@ export function beginResultBusSend(
   identity: RoutingWorkspaceIdentity,
   input: { busEntryId: string; reservationId: string },
   options: ResultBusLifecycleOptions = {},
+  stateDir = getStateDir(),
 ): BeginResultBusSendOutcome {
   const resolved = resolveWorkspaceIdentity(identity);
   return withResultBusTransaction<BeginResultBusSendOutcome>(resolved, previous => {
@@ -193,7 +202,7 @@ export function beginResultBusSend(
       state: replaceEntry(state, index, claimed),
       result: { status: "claimed", entry: claimed, attemptId: attempt.attemptId, sendTarget, noWrite: false },
     };
-  });
+  }, stateDir);
 }
 
 /**
@@ -204,6 +213,7 @@ export function ackResultBusObserved(
   identity: RoutingWorkspaceIdentity,
   input: { busEntryId: string; attemptId: string },
   options: ResultBusLifecycleOptions = {},
+  stateDir = getStateDir(),
 ): AckResultBusObservedOutcome {
   const resolved = resolveWorkspaceIdentity(identity);
   return withResultBusTransaction<AckResultBusObservedOutcome>(resolved, previous => {
@@ -228,7 +238,7 @@ export function ackResultBusObserved(
       outcomeReasonCode: null,
     };
     return { state: replaceEntry(state, index, observed), result: { status: "observed", entry: observed, noWrite: false } };
-  });
+  }, stateDir);
 }
 
 /**
@@ -239,6 +249,7 @@ export function markResultBusOutcomeUnknown(
   identity: RoutingWorkspaceIdentity,
   input: { busEntryId: string; attemptId: string; reasonCode?: string },
   options: ResultBusLifecycleOptions = {},
+  stateDir = getStateDir(),
 ): MarkOutcomeUnknownResult {
   const resolved = resolveWorkspaceIdentity(identity);
   const reasonCode = input.reasonCode === undefined ? undefined : resultBusReasonCodeSchema.parse(input.reasonCode);
@@ -263,7 +274,7 @@ export function markResultBusOutcomeUnknown(
       outcomeReasonCode: reasonCode ?? null,
     };
     return { state: replaceEntry(state, index, outcome), result: { status: "outcome_unknown", entry: outcome, noWrite: false } };
-  });
+  }, stateDir);
 }
 
 /**
@@ -274,6 +285,7 @@ export function retireResultBusOutcomeUnknown(
   identity: RoutingWorkspaceIdentity,
   input: { busEntryId: string; attemptId: string },
   options: ResultBusLifecycleOptions = {},
+  stateDir = getStateDir(),
 ): RetireOutcomeUnknownResult {
   const resolved = resolveWorkspaceIdentity(identity);
   return withResultBusTransaction<RetireOutcomeUnknownResult>(resolved, previous => {
@@ -292,7 +304,7 @@ export function retireResultBusOutcomeUnknown(
     }
     const retired: ResultBusEntry = { ...entry, deliveryStatus: "retired_unknown", retiredAt: isoNow(options.nowMs) };
     return { state: replaceEntry(state, index, retired), result: { status: "retired_unknown", entry: retired, noWrite: false } };
-  });
+  }, stateDir);
 }
 
 /**
@@ -304,6 +316,7 @@ export function retireResultBusOutcomeUnknown(
 export function recoverStaleResultBusEntries(
   identity: RoutingWorkspaceIdentity,
   options: { nowMs?: number; reservedStaleMs?: number; claimedStaleMs?: number } = {},
+  stateDir = getStateDir(),
 ): RecoverStaleResultBusOutcome {
   const resolved = resolveWorkspaceIdentity(identity);
   const reservedStaleMs = options.reservedStaleMs ?? RESULT_BUS_RESERVED_STALE_MS;
@@ -344,5 +357,5 @@ export function recoverStaleResultBusEntries(
       return { state: previous, noWrite: true, result: { requeued: 0, outcomeUnknown: 0 } };
     }
     return { state: { ...previous, entries }, result: { requeued, outcomeUnknown } };
-  });
+  }, stateDir);
 }

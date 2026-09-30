@@ -1,7 +1,8 @@
 # R5 Endpoint Architecture
 
-状态：**R5d1 foundation 已完成；R5d2 Result Bus delivery lifecycle core 已实现（非 production cutover）**（含 R5a contracts + R5b Active Executor Binding + R5c Active Web Sink Binding）。
-R5d3 cutover 尚未开始。R4 persistence/wire 仍不迁移；production 投递仍走 R4 Result Outbox，无 production consumer 使用 Result Bus。
+状态：**R5d1/R5d2 已完成；R5d3 production canonical cutover 已实现（待 independent review / live deployment 证明）**（含 R5a contracts + R5b Active Executor Binding + R5c Active Web Sink Binding）。
+R5e/R5f 尚未开始。R4 persistence/wire 不迁移、不删除；R4 Result Outbox 保留为兼容 shadow（可写/可读，用于回滚与审计），
+但不再是 production canonical delivery 权威。
 
 本文冻结 R5 目标架构概念、依赖边界与 migration 顺序。
 
@@ -155,7 +156,102 @@ bounded 恢复（显式常量 + 可注入 nowMs；不导入既有反馈恢复代
 
 `outcome_unknown` **永不**自动回 queued、**永不**采纳当前 Active Web Sink（A→B 切换后仍 pin A）。
 
-R5d3 才进行 Companion endpoint cutover 与旧 outbox drain。
+R5d3 已进行 Companion endpoint cutover（见 2.5.1）；旧 outbox 物理删除留待 live E2E 证明后的清理阶段。
+
+### 2.5.1 R5d3 production canonical cutover
+
+Canonical routed result 投递路径自 R5d3 起为：
+
+```text
+Canonical RoutingResult → Workspace Result Bus → 当前 Active Web Sink → Browser Companion → 当前绑定 URL
+```
+
+投递目标只来自 `readActiveWebSinkBinding(workspaceId)`；plannerRouteId /
+plannerPrincipalFingerprint 不再参与目标选择。历史 canonical legacy 事件仅按
+commandId/iteration/resultSha256 精确分类，不读取其 planner 身份值。
+
+历史重复防回放（migration disposition ledger，`<state>/result-bus-cutover/<workspaceId>.json`）：
+
+- 分类器识别**两类**历史 counterpart：R4c canonical-pinned 事件与 **pre-R4c exact legacy**
+  事件（无 planner/canonical 元数据，但 eventId 由 workspaceId/commandId/taskId/iteration/
+  desktopReceiptSha256 派生且 immutable facts 精确匹配，含 R4c 同语义 truncate/normalize）；
+  两者共存（歧义）→ fail closed；
+- 历史 observed → `legacy_observed`；retired_unknown → `legacy_retired`：对应 Bus entry 永久抑制；
+- 历史 ready/queued → `legacy_unbegun_bus_owned`：旧事件永久不可经 legacy 路径预约
+  （reserve/claim 排除集），Bus entry 不抑制、由 Bus exactly once 投递；
+- 历史 reserved/claimed/outcome_unknown → cutover 不 ready：既有 legacy in-flight 优先经旧
+  lifecycle 精确收敛，其 Bus counterpart 不独立发送；收敛到 observed/retired 后写入
+  disposition 并永久抑制；
+- resultSha256 漂移 / 重复事件 / 歧义 → fail closed；绝不从时间戳推断已投递；
+- ledger 自校验：每行必须恰一 Bus entry 匹配、resultSha256 一致、legacyEventId/disposition
+  与历史 source 一致；orphan/future 行 fail closed；抑制集取自校验后的 reconciliation 结果。
+
+认证与全局仲裁（R5d3 review-fix）：
+
+- Bus canonical 路径认证**只需** R5c Web Sink Companion 边界
+  （`verifyCompanionCredentialForWebSink`），不要求 active Feedback receiver
+  binding/principal；Feedback receiver 为 null/principal 漂移不阻断 Bus 投递；
+  legacy/control 路径 lazy 使用 `verifyCompanionCredential`；
+- 全局单飞在**写 durable state 之前**由 per-workspace delivery arbiter
+  （`src/bridge/delivery-arbiter.ts`）串行化：Browser Bus reserve、Browser legacy reserve、
+  MCP `feedback_claim_next` 全部参与；第二获取被拒且状态零改动；
+- cutover ownership 先于**所有** legacy 获取路径建立：即使无 Active Sink / Web Sink 暂不可用，
+  arbiter 内也先 reconcile cutover 并以 validated `ownedLegacyEventIds` 排除集传入
+  legacy reserve/claim；canonical counterpart 绝不因 Sink 缺失而重获 legacy 可预约性；
+- legacy canonical ACK/retire 终态化与 disposition 写入、新 Bus reservation 同锁串行，
+  关闭 terminalization TOCTOU 窗口；
+- route/frozen 边界：reserve 请求 route === 当前 Active Sink；begin-send 请求 route ===
+  reservation 目标（stamp 匹配时即当前 Sink；已切换则交由 core stale-requeue）；ack/retire
+  请求 route 必须等于**冻结** `sendTarget.canonicalUrl`；retire 另要求精确 reservationId；
+  Sink 切到 C 绝不 reinterpret 冻结于 B 的 attempt；
+- in-flight 保密性：foreign（reservedBy 非本 companion）legacy in-flight 与冻结到其他 route
+  的 Bus attempt 只暴露 bounded blocking 元数据（`blockedByLegacyInFlight` /
+  `pinnedToOtherRoute`），不泄露 eventId/attemptId/reservationId/message/messageSha256。
+
+R5d3 final review-fix（两处契约收紧）：
+
+- canonical counterpart 分类只考虑 **canonical-like 候选**（R4c pinned canonical 事件与
+  pre-R4c exact `C2C_EXECUTED` desktop 事件）；同 command 的 `FINAL_RECEIPT_REQUIRED`
+  control 事件与其他非 canonical/control 事件可与同一 canonical execution 合法共存，
+  不参与 ambiguity/drift 判定，由 legacy/control 路径按自身生命周期继续投递；
+  `validateLedgerRows` 同口径——control 事件不使有效 canonical ledger 行歧义或无效；
+  多个 canonical-like counterpart、pinned `resultSha256` 漂移、pre-R4c immutable 元数据
+  漂移仍一律 fail closed（exact pre-R4c 匹配不弱化）；
+- `/reserve` **auth-first**：无效/缺失 credential 一律 401，绝不触发 Feedback projector、
+  Result Bus shadow、cutover ledger 或 Bus lifecycle 的任何 reconcile/写入。认证边界
+  先于一切生产 reconcile 建立（Web Sink Companion auth 可用即用之；否则要求有效 legacy
+  Feedback Companion auth 作 fallback-only 操作）；已认证后由 adapter 拥有完整 reconcile
+  序列（projector reconcile → arbiter 内 cutover ownership → reserve/fallback），
+  路由层不再 pre-auth reconcile；Web Sink credential 不要求 Active Sink 存在即可通过认证；
+- **auth-purity（零 stale recovery before auth）**：credential 真实性先对 raw 只读状态
+  校验（`verifyCompanionCredentialReadOnly`：workspace 精确、companion 存在、未 superseded、
+  hash 精确，零写入/零 recovery），通过后才允许 `recoverStaleFeedback`（此时 recovery 是
+  authenticated lifecycle 维护）。`resolveDeliverySource` 严格只读（`readFeedbackState`），
+  不做 stale transition。release/begin-send/ack/retire 序列为：只读 credential pre-auth →
+  只读 source resolution → source-specific 授权/route 检查 → authenticated lifecycle
+  recovery/mutation。无效/缺失/malformed/superseded credential 对 Feedback state、stale
+  lifecycle、Result Bus、cutover ledger、projection cursor 零持久化 mutation；有效
+  credential 仍在认证边界内执行既有 bounded stale recovery。superseded credential 的
+  endpoint 错误码统一为 pre-auth 的 `COMPANION_UNAUTHORIZED`（401 语义不变）。
+
+投递接线（`src/bridge/result-bus-delivery.ts`，唯一 adapter 入口）：
+
+- Bus 投递授权走 R5c Web Sink Companion 边界（`verifyCompanionCredentialForWebSink`）；
+  reserve 时请求 route 必须与当前 Active Web Sink canonicalUrl 精确一致；
+- Browser HTTP wire 兼容：eventId 为确定性 32-hex 兼容投递 ID
+  `sha256("result-bus-companion:" + busEntryId).slice(0, 32)`，
+  不写入 Bus 持久化身份；eventId 解析到 Bus/legacy 必须恰好一个来源，冲突 fail closed；
+- `/state` 是跨 Bus / legacy 非 canonical / pre-cutover legacy canonical 的单一 coherent
+  单飞视图；任两源同时存在 durable in-flight 即 migration conflict fail closed；
+  源优先级：1. 既有精确 in-flight → 2. queued canonical Result Bus → 3. legacy 非 canonical/control；
+- `/reserve` `/release` `/begin-send` `/ack` `/retire-unknown` 按 eventId 解析来源后
+  分别走 R5d2 Bus lifecycle 或旧 legacy lifecycle；旧 legacy unsafe in-flight 永不 retarget；
+- canonical message 由 server 中性 formatter 生成（与 legacy 事件字节语义一致），
+  EVENT_ID 使用兼容投递 ID；browser 不得自行拼装。
+
+Feedback projector 不再把 fresh routed canonical results 投影为 production canonical
+投递事件（`FINAL_RECEIPT_REQUIRED` 控制事件与 legacy 非 routed 投递不变）；
+R4 outbox 的兼容投影保留在显式 compat 模块，仅用于审计/回滚/测试。
 
 ### 2.6 Web Sink Binding
 

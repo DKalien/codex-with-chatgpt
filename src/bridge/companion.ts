@@ -19,9 +19,18 @@ import { FeedbackError } from "../feedback/store.js";
 import { reconcileFeedbackOutbox } from "../feedback/projector.js";
 import { bindCurrentWebSinkFromDurableCompanion, verifyCompanionCredentialForWebSink } from "../web-sink-control/companion-adapter.js";
 import { WebSinkControlError } from "../web-sink-control/schema.js";
-import { webSinkStatus } from "../web-sink-control/service.js";
+import { webSinkStatus, readActiveWebSinkBinding } from "../web-sink-control/service.js";
 import { readFeedbackState } from "../feedback/store.js";
 import { isRouteAttestationVerified } from "../feedback/schema.js";
+import {
+  ResultBusDeliveryError,
+  resultBusCompanionAck,
+  resultBusCompanionBeginSend,
+  resultBusCompanionRelease,
+  resultBusCompanionReserve,
+  resultBusCompanionRetire,
+  resultBusCompanionState,
+} from "./result-bus-delivery.js";
 
 const pairBodySchema = z.object({
   intentId: z.string().uuid(),
@@ -114,6 +123,15 @@ function sendError(res: Response, error: unknown): void {
               || error.code.startsWith("PAIRING_")
               ? 401
               : 400;
+    res.status(status).json({ error: error.code, message: error.message });
+    return;
+  }
+  if (error instanceof ResultBusDeliveryError) {
+    const status = error.code === "RESULT_BUS_STALE_RESERVATION"
+      || error.code === "RESULT_BUS_CUTOVER_INFLIGHT_CONFLICT"
+      || error.code === "RESULT_BUS_DELIVERY_ID_CONFLICT"
+      ? 409
+      : 400;
     res.status(status).json({ error: error.code, message: error.message });
     return;
   }
@@ -227,9 +245,32 @@ export function createCompanionRouter(opts: CompanionRouterOptions): Router {
 
   router.get("/state", (req, res) => {
     try {
-      // Auth first: unauthenticated must 401 without touching projector.
+      const credential = bearerCredential(req);
+      if (!credential) {
+        throw new CompanionError("COMPANION_UNAUTHORIZED", "缺少 companion credential");
+      }
+      // R5d3 review-fix：Bus canonical 路径只需 Web Sink Companion 认证，
+      // 不要求 active Feedback receiver binding/principal。
+      const webSink = (() => {
+        try {
+          return { ok: true as const, ctx: verifyCompanionCredentialForWebSink({ workspaceId: opts.workspaceId, credential, stateDir: opts.stateDir }) };
+        } catch {
+          return { ok: false as const };
+        }
+      })();
+      if (webSink.ok && opts.workspaceRoot) {
+        // E1b2 autonomous reconcile for legacy/control events；canonical 由 Bus 承担。
+        reconcileFeedbackOutbox(opts.workspaceId, opts.stateDir, opts.workspaceRoot);
+        res.json(resultBusCompanionState({
+          workspaceId: opts.workspaceId,
+          workspaceRoot: opts.workspaceRoot,
+          credential,
+          stateDir: opts.stateDir,
+        }));
+        return;
+      }
+      // pairing/legacy-only 阶段：完整 legacy 视图（含 pending attestation）。
       const ctx = auth(req);
-      // E1b2 autonomous reconcile: browser can pull outbox without MCP kick.
       reconcileFeedbackOutbox(opts.workspaceId, opts.stateDir, opts.workspaceRoot);
       res.json(companionPublicState({
         workspaceId: opts.workspaceId,
@@ -243,20 +284,35 @@ export function createCompanionRouter(opts: CompanionRouterOptions): Router {
 
   router.post("/reserve", (req, res) => {
     try {
-      const ctx = auth(req);
       const body = routeBodySchema.parse(req.body);
-      // Project newly landed trusted receipts before reserving.
+      const credential = bearerCredential(req);
+      if (!credential) {
+        throw new CompanionError("COMPANION_UNAUTHORIZED", "缺少 companion credential");
+      }
+      if (opts.workspaceRoot) {
+        // R5d3 final-fix：auth-first——adapter 先建立认证边界（无效 credential 401），
+        // 之后才执行 projector/cutover reconcile 与 reserve/fallback；
+        // 路由层不再 pre-auth reconcile。
+        const result = resultBusCompanionReserve({
+          workspaceId: opts.workspaceId,
+          workspaceRoot: opts.workspaceRoot!,
+          credential,
+          routeCanonical: body.routeCanonical,
+          stateDir: opts.stateDir,
+        });
+        res.json({ reservationId: result.reservationId, delivery: result.delivery });
+        return;
+      }
+      // legacy 非 canonical/control 路径：Feedback receiver 认证 + attestation 门禁。
+      const ctx = auth(req);
       reconcileFeedbackOutbox(opts.workspaceId, opts.stateDir, opts.workspaceRoot);
-      const result = companionReserveNext({
+      const legacy = companionReserveNext({
         workspaceId: opts.workspaceId,
         ctx,
         routeCanonical: body.routeCanonical,
         stateDir: opts.stateDir,
       });
-      res.json({
-        reservationId: result.reservationId,
-        delivery: result.delivery,
-      });
+      res.json({ reservationId: legacy.reservationId, delivery: legacy.delivery });
     } catch (error) {
       sendError(res, error);
     }
@@ -264,17 +320,34 @@ export function createCompanionRouter(opts: CompanionRouterOptions): Router {
 
   router.post("/release", (req, res) => {
     try {
-      const ctx = auth(req);
       const body = releaseBodySchema.parse(req.body);
-      const event = companionRelease({
+      const credential = bearerCredential(req);
+      if (!credential) {
+        throw new CompanionError("COMPANION_UNAUTHORIZED", "缺少 companion credential");
+      }
+      if (!opts.workspaceRoot) {
+        const ctx = auth(req);
+        const event = companionRelease({
+          workspaceId: opts.workspaceId,
+          ctx,
+          routeCanonical: body.routeCanonical,
+          eventId: body.eventId,
+          reservationId: body.reservationId,
+          stateDir: opts.stateDir,
+        });
+        res.json({ eventId: event.eventId, status: event.status });
+        return;
+      }
+      const result = resultBusCompanionRelease({
         workspaceId: opts.workspaceId,
-        ctx,
+        workspaceRoot: opts.workspaceRoot,
+        credential,
         routeCanonical: body.routeCanonical,
         eventId: body.eventId,
         reservationId: body.reservationId,
         stateDir: opts.stateDir,
       });
-      res.json({ eventId: event.eventId, status: event.status });
+      res.json(result);
     } catch (error) {
       sendError(res, error);
     }
@@ -282,23 +355,40 @@ export function createCompanionRouter(opts: CompanionRouterOptions): Router {
 
   router.post("/begin-send", (req, res) => {
     try {
-      const ctx = auth(req);
       const body = beginSendBodySchema.parse(req.body);
-      const result = companionBeginSend({
+      const credential = bearerCredential(req);
+      if (!credential) {
+        throw new CompanionError("COMPANION_UNAUTHORIZED", "缺少 companion credential");
+      }
+      if (!opts.workspaceRoot) {
+        const ctx = auth(req);
+        const legacy = companionBeginSend({
+          workspaceId: opts.workspaceId,
+          ctx,
+          routeCanonical: body.routeCanonical,
+          eventId: body.eventId,
+          reservationId: body.reservationId,
+          stateDir: opts.stateDir,
+        });
+        res.json({
+          eventId: legacy.event.eventId,
+          status: legacy.event.status,
+          attemptId: legacy.attemptId,
+          message: legacy.message,
+          messageSha256: legacy.messageSha256,
+        });
+        return;
+      }
+      const result = resultBusCompanionBeginSend({
         workspaceId: opts.workspaceId,
-        ctx,
+        workspaceRoot: opts.workspaceRoot,
+        credential,
         routeCanonical: body.routeCanonical,
         eventId: body.eventId,
         reservationId: body.reservationId,
         stateDir: opts.stateDir,
       });
-      res.json({
-        eventId: result.event.eventId,
-        status: result.event.status,
-        attemptId: result.attemptId,
-        message: result.message,
-        messageSha256: result.messageSha256,
-      });
+      res.json(result);
     } catch (error) {
       sendError(res, error);
     }
@@ -306,17 +396,34 @@ export function createCompanionRouter(opts: CompanionRouterOptions): Router {
 
   router.post("/ack", (req, res) => {
     try {
-      const ctx = auth(req);
       const body = ackBodySchema.parse(req.body);
-      const event = companionAckObserved({
+      const credential = bearerCredential(req);
+      if (!credential) {
+        throw new CompanionError("COMPANION_UNAUTHORIZED", "缺少 companion credential");
+      }
+      if (!opts.workspaceRoot) {
+        const ctx = auth(req);
+        const event = companionAckObserved({
+          workspaceId: opts.workspaceId,
+          ctx,
+          routeCanonical: body.routeCanonical,
+          eventId: body.eventId,
+          attemptId: body.attemptId,
+          stateDir: opts.stateDir,
+        });
+        res.json({ eventId: event.eventId, status: event.status });
+        return;
+      }
+      const result = resultBusCompanionAck({
         workspaceId: opts.workspaceId,
-        ctx,
+        workspaceRoot: opts.workspaceRoot,
+        credential,
         routeCanonical: body.routeCanonical,
         eventId: body.eventId,
         attemptId: body.attemptId,
         stateDir: opts.stateDir,
       });
-      res.json({ eventId: event.eventId, status: event.status });
+      res.json(result);
     } catch (error) {
       sendError(res, error);
     }
@@ -324,23 +431,41 @@ export function createCompanionRouter(opts: CompanionRouterOptions): Router {
 
   router.post("/retire-unknown", (req, res) => {
     try {
-      const ctx = auth(req);
       const body = retireUnknownBodySchema.parse(req.body);
-      const event = companionRetireOutcomeUnknown({
+      const credential = bearerCredential(req);
+      if (!credential) {
+        throw new CompanionError("COMPANION_UNAUTHORIZED", "缺少 companion credential");
+      }
+      if (!opts.workspaceRoot) {
+        const ctx = auth(req);
+        const event = companionRetireOutcomeUnknown({
+          workspaceId: opts.workspaceId,
+          ctx,
+          routeCanonical: body.routeCanonical,
+          eventId: body.eventId,
+          reservationId: body.reservationId,
+          attemptId: body.attemptId,
+          stateDir: opts.stateDir,
+        });
+        res.json({
+          eventId: event.eventId,
+          reservationId: event.reservationId,
+          attemptId: event.attemptId,
+          status: event.status,
+        });
+        return;
+      }
+      const result = resultBusCompanionRetire({
         workspaceId: opts.workspaceId,
-        ctx,
+        workspaceRoot: opts.workspaceRoot,
+        credential,
         routeCanonical: body.routeCanonical,
         eventId: body.eventId,
         reservationId: body.reservationId,
         attemptId: body.attemptId,
         stateDir: opts.stateDir,
       });
-      res.json({
-        eventId: event.eventId,
-        reservationId: event.reservationId,
-        attemptId: event.attemptId,
-        status: event.status,
-      });
+      res.json(result);
     } catch (error) {
       sendError(res, error);
     }

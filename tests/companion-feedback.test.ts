@@ -2372,7 +2372,10 @@ describe("public companion HTTP surface", () => {
       authorization: `Bearer ${paired.body.credential as string}`,
       "content-type": "application/json",
     };
-    expect((await fetchJson("/api/companion/v1/state", { headers: oldAuth })).status).toBe(401);
+    // R5d3 review-fix：旧 credential 仍是 verified companion（同 route），
+    // WebSink 视图 /state 可读（不要求 Feedback receiver principal）；但
+    // legacy reserve 仍被 Feedback receiver 认证拒绝（401）。
+    expect((await fetchJson("/api/companion/v1/state", { headers: oldAuth })).status).toBe(200);
     expect((await fetchJson("/api/companion/v1/reserve", {
       method: "POST",
       headers: oldAuth,

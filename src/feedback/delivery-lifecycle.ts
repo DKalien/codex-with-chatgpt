@@ -24,6 +24,8 @@ export function claimNext(input: {
   bindingId: string;
   epoch: number;
   stateDir?: string;
+  /** R5d3 cutover：永久不可预约的 legacy eventId 集（如已归属 Result Bus 的历史事件）。 */
+  excludeEventIds?: ReadonlySet<string>;
 }): { event: FeedbackEvent; attemptId: string } {
   requireConversationPrincipal(input.principal);
   const stateDir = input.stateDir ?? getStateDir();
@@ -39,6 +41,8 @@ export function claimNext(input: {
     }
     const ready = recovered.events
       .filter((e) => e.status === "ready"
+        && !("plannerRouteId" in e)
+        && !(input.excludeEventIds?.has(e.eventId) ?? false)
         && e.targetBindingId === input.bindingId
         && e.targetEpoch === input.epoch
         && e.targetPrincipalFingerprint === input.principal.fingerprint)
@@ -221,6 +225,8 @@ export function reserveNext(input: {
   principalFingerprint: string;
   companionId: string;
   stateDir?: string;
+  /** R5d3 cutover：永久不可预约的 legacy eventId 集（如已归属 Result Bus 的历史事件）。 */
+  excludeEventIds?: ReadonlySet<string>;
 }): { event: FeedbackEvent; reservationId: string } {
   const stateDir = input.stateDir ?? getStateDir();
   return withFeedbackLock(input.workspaceId, stateDir, (read) => {
@@ -237,8 +243,13 @@ export function reserveNext(input: {
         "存在 reserved/claimed/outcome_unknown 事件；禁止并发预占",
       );
     }
+    // R5d3 cutover：canonical-pinned（planner route）事件不再经 legacy 通道投递；
+    // 其 canonical delivery 由 Workspace Result Bus 承担。历史 canonical
+    // ready/queued 事件在此成为不可预约的兼容只读记录。
     const ready = recovered.events
       .filter((e) => e.status === "ready"
+        && !("plannerRouteId" in e)
+        && !(input.excludeEventIds?.has(e.eventId) ?? false)
         && e.targetBindingId === input.bindingId
         && e.targetEpoch === input.epoch
         && e.targetPrincipalFingerprint === input.principalFingerprint)

@@ -27,6 +27,34 @@ import {
 } from "../feedback/companion.js";
 import { reconcileFeedbackOutbox } from "../feedback/projector.js";
 import { findLiveBridge } from "../bridge/runtime.js";
+import { withDeliveryArbiter, assertNoResultBusInFlight } from "../bridge/delivery-arbiter.js";
+import { reconcileResultBusCutover } from "../bridge/result-bus-delivery.js";
+
+/**
+ * MCP feedback_claim_next 的生产获取路径（FIX A/FIX 5）：
+ * arbiter 锁内先 reconcile cutover（建立/发现 pre-R4c & R4c 归属），
+ * 经 neutral read fence 拒绝 Bus in-flight，再以 validated 排除集领取。
+ */
+export function claimNextForMcp(input: {
+  workspace: Workspace;
+  principal: ConversationPrincipal;
+  bindingId: string;
+  epoch: number;
+  stateDir?: string;
+}): { attemptId: string; event: unknown } {
+  return withDeliveryArbiter({ workspaceId: input.workspace.id, workspaceRoot: input.workspace.root, stateDir: input.stateDir }, identity => {
+    assertNoResultBusInFlight({ workspaceId: input.workspace.id, workspaceRoot: input.workspace.root, stateDir: input.stateDir });
+    const cutover = reconcileResultBusCutover({ identity, stateDir: input.stateDir });
+    return claimNext({
+      workspaceId: input.workspace.id,
+      principal: input.principal,
+      bindingId: input.bindingId,
+      epoch: input.epoch,
+      excludeEventIds: cutover.ownedLegacyEventIds,
+      stateDir: input.stateDir,
+    });
+  });
+}
 
 type ToolResult = {
   content: { type: "text"; text: string }[];
@@ -338,8 +366,10 @@ export function registerFeedbackTools(server: McpServer, workspace: Workspace): 
       try {
         const principal = principalFromExtra(extra);
         reconcileWorkspaceFeedback();
-        const claimed = claimNext({
-          workspaceId: workspace.id,
+        // R5d3 review-fix：全局单飞 pre-mutation 检查——Bus in-flight 时拒绝 claim，
+        // Feedback state 保持不变；cutover-owned legacy 事件不可领取。
+        const claimed = claimNextForMcp({
+          workspace,
           principal,
           bindingId: args.bindingId,
           epoch: args.epoch,
@@ -371,13 +401,19 @@ export function registerFeedbackTools(server: McpServer, workspace: Workspace): 
       if (denied) return denied;
       try {
         const principal = principalFromExtra(extra);
-        const event = ackObserved({
-          workspaceId: workspace.id,
-          principal,
-          bindingId: args.bindingId,
-          epoch: args.epoch,
-          eventId: args.eventId,
-          attemptId: args.attemptId,
+        // FIX 6：legacy canonical ACK 终态化与 disposition 写入经 arbiter 串行，
+        // 关闭与新 Bus reservation 的 terminalization TOCTOU 窗口。
+        const event = withDeliveryArbiter({ workspaceId: workspace.id, workspaceRoot: workspace.root }, identity => {
+          const acked = ackObserved({
+            workspaceId: workspace.id,
+            principal,
+            bindingId: args.bindingId,
+            epoch: args.epoch,
+            eventId: args.eventId,
+            attemptId: args.attemptId,
+          });
+          reconcileResultBusCutover({ identity });
+          return acked;
         });
         return ok({ eventId: event.eventId, status: event.status });
       } catch (error) {

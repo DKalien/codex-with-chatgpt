@@ -62,6 +62,67 @@ function formatChangedFiles(files: readonly string[] | undefined): string {
 export type ProductionFeedbackMessageInput = FeedbackEvent & { attemptId: string };
 
 /**
+ * 中性 canonical EXECUTED 消息输入：FeedbackEvent 与 Result Bus entry 共用。
+ * 字段语义与旧 formatter 完全一致；调用方负责 eventId/attemptId 来源。
+ */
+export type CanonicalExecutedMessageInput = {
+  workspaceId: string;
+  commandId: string;
+  taskId: string;
+  iteration: number;
+  result: "ok" | "failed" | "blocked";
+  eventId: string;
+  attemptId: string;
+  changedFilesSummary: readonly string[];
+  testsSummary: string;
+  outputAvailable: boolean;
+  rawSummary?: string;
+  machineEvidence?: {
+    version: 1;
+    source: "codex_desktop_receipt";
+    status: "ok" | "failed" | "blocked";
+    changedFiles: readonly string[];
+    testsSummary: string;
+    output?: { outputId: number; outputAvailable: boolean } | undefined;
+  };
+};
+
+/**
+ * Format the deterministic canonical EXECUTED production message.
+ * Never includes principalFingerprint / bindingId / reservedBy / credential / secret / session.
+ */
+export function formatCanonicalExecutedMessage(input: CanonicalExecutedMessageInput): string {
+  if (!input.attemptId) {
+    throw new Error("production feedback message requires attemptId");
+  }
+  const tests = clamp(normalizeInline(input.testsSummary || ""), MAX_TESTS_CHARS) || "未运行";
+  return [
+    "[C2C_CONTROL]",
+    "STATE: EXECUTED",
+    `WORKSPACE_ID: ${safeInline(input.workspaceId)}`,
+    `COMMAND_ID: ${safeInline(input.commandId)}`,
+    `TASK_ID: ${safeInline(input.taskId)}`,
+    `ITERATION: ${safeInline(input.iteration)}`,
+    `RESULT: ${safeInline(input.result)}`,
+    `EVENT_ID: ${safeInline(input.eventId)}`,
+    `ATTEMPT_ID: ${safeInline(input.attemptId)}`,
+    `CHANGED_FILES: ${formatChangedFiles(input.changedFilesSummary)}`,
+    `TESTS: ${tests}`,
+    `OUTPUT_AVAILABLE: ${input.outputAvailable}`,
+    ...(input.rawSummary ? [`RAW_SUMMARY_JSON: ${oneLineJson(input.rawSummary)}`] : []),
+    ...(input.machineEvidence ? [`MACHINE_EVIDENCE_JSON: ${oneLineJson({
+      version: input.machineEvidence.version,
+      source: input.machineEvidence.source,
+      status: input.machineEvidence.status,
+      changedFiles: input.machineEvidence.changedFiles.slice(0, 200),
+      testsSummary: input.machineEvidence.testsSummary,
+      output: input.machineEvidence.output,
+    })}`] : []),
+    `INSTRUCTION: ${PRODUCTION_FEEDBACK_INSTRUCTION}`,
+  ].join("\n");
+}
+
+/**
  * Format the unique deterministic production feedback message from a claimed FeedbackEvent.
  * Never includes principalFingerprint / bindingId / reservedBy / credential / secret / session.
  */
@@ -82,31 +143,31 @@ export function formatProductionFeedbackMessage(event: ProductionFeedbackMessage
       `INSTRUCTION: ${FINAL_RECEIPT_REQUIRED_INSTRUCTION}`,
     ].join("\n");
   }
-  const tests = clamp(normalizeInline(event.testsSummary || ""), MAX_TESTS_CHARS) || "未运行";
-  return [
-    "[C2C_CONTROL]",
-    "STATE: EXECUTED",
-    `WORKSPACE_ID: ${safeInline(event.workspaceId)}`,
-    `COMMAND_ID: ${safeInline(event.commandId)}`,
-    `TASK_ID: ${safeInline(event.taskId)}`,
-    `ITERATION: ${safeInline(event.iteration)}`,
-    `RESULT: ${safeInline(event.result)}`,
-    `EVENT_ID: ${safeInline(event.eventId)}`,
-    `ATTEMPT_ID: ${safeInline(event.attemptId)}`,
-    `CHANGED_FILES: ${formatChangedFiles(event.changedFilesSummary)}`,
-    `TESTS: ${tests}`,
-    `OUTPUT_AVAILABLE: ${event.outputAvailable}`,
-    ...(event.rawSummary ? [`RAW_SUMMARY_JSON: ${oneLineJson(event.rawSummary)}`] : []),
-    ...(event.machineEvidence ? [`MACHINE_EVIDENCE_JSON: ${oneLineJson({
-      version: event.machineEvidence.version,
-      source: event.machineEvidence.source,
-      status: event.machineEvidence.status,
-      changedFiles: event.machineEvidence.changedFiles.slice(0, 200),
-      testsSummary: event.machineEvidence.testsSummary,
-      output: event.machineEvidence.output,
-    })}`] : []),
-    `INSTRUCTION: ${PRODUCTION_FEEDBACK_INSTRUCTION}`,
-  ].join("\n");
+  return formatCanonicalExecutedMessage({
+    workspaceId: event.workspaceId,
+    commandId: event.commandId,
+    taskId: event.taskId,
+    iteration: event.iteration,
+    result: event.result,
+    eventId: event.eventId,
+    attemptId: event.attemptId,
+    changedFilesSummary: event.changedFilesSummary,
+    testsSummary: event.testsSummary,
+    outputAvailable: event.outputAvailable,
+    ...(event.rawSummary !== undefined ? { rawSummary: event.rawSummary } : {}),
+    ...(event.machineEvidence !== undefined
+      ? {
+          machineEvidence: {
+            version: event.machineEvidence.version,
+            source: event.machineEvidence.source,
+            status: event.machineEvidence.status,
+            changedFiles: event.machineEvidence.changedFiles,
+            testsSummary: event.machineEvidence.testsSummary,
+            output: event.machineEvidence.output,
+          },
+        }
+      : {}),
+  });
 }
 
 export function productionFeedbackMessageSha256(message: string): string {
