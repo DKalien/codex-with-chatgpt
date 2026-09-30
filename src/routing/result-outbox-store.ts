@@ -1,11 +1,10 @@
 import fs from "node:fs";
 import path from "node:path";
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { ensureDir, getStateDir } from "../config/paths.js";
 import {
   RoutingError,
-  resultSchema,
   routingCommandIdSchema,
   routingWorkspaceIdSchema,
   type RoutingResult,
@@ -28,6 +27,7 @@ import {
   type ResultOutboxState,
   type ResultReconciliationQueue,
 } from "./result-outbox-schema.js";
+import { canonicalRoutingResultDigest as sharedCanonicalRoutingResultDigest } from "./execution-result-digest.js";
 export type {
   ResultOutboxEntry,
   ResultOutboxReconciliationInput,
@@ -216,11 +216,12 @@ function sameReference(entry: ResultOutboxEntry, expected: EntryReference): bool
 
 /** Digest the strict, canonical RoutingResult envelope, including its evidence and immutable identity. */
 export function canonicalRoutingResultDigest(result: RoutingResult): string {
-  const parsed = resultSchema.parse(result);
-  if (!("rawSummary" in parsed) || !("machineEvidence" in parsed)) {
+  try {
+    return sharedCanonicalRoutingResultDigest(result);
+  } catch (error) {
+    if (error instanceof z.ZodError) throw error;
     throw outboxError("RESULT_OUTBOX_LEGACY_RESULT", "legacy RoutingResult 缺少 summary/evidence，不能进入 Result Outbox。");
   }
-  return createHash("sha256").update(JSON.stringify(parsed), "utf8").digest("hex");
 }
 
 function withRoutingFileLock<T>(file: string, busyCode: string, busyMessage: string, action: () => T): T {

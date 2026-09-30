@@ -13,13 +13,37 @@ import {
   listResultOutboxEntries,
   markResultReconciliationNeeded,
 } from "./result-outbox-store.js";
+import { reconcileWorkspaceResultBus } from "../result-bus/service.js";
 import { RoutingError, routingCommandIdSchema } from "./schema.js";
 
 export type DesktopExecutionResultReconciliation =
   | { status: "not_applicable"; reason: "routing_command_missing" }
   | { status: "not_canonical"; reason: "receipt_not_trusted_or_legacy" }
-  | { status: "reconciled"; resultId: string; plannerRouteId: string; resultReplayed: boolean; outboxEntryId: string; outboxReplayed: boolean }
+  | { status: "reconciled"; resultId: string; plannerRouteId: string; resultReplayed: boolean; outboxEntryId: string; outboxReplayed: boolean; resultBus: ResultBusShadowOutcome }
   | { status: "reconciliation_needed"; reasonCode: string; issuePersisted: boolean };
+
+/**
+ * R5d1 shadow seam outcome. The Result Bus is reconciled after the R4 canonical
+ * result/outbox commit; its failure is reported but never blocks or invalidates
+ * the independently deliverable R4 result/outbox. A later retry of this
+ * reconciliation re-attempts the shadow backfill from persisted canonical results.
+ */
+export type ResultBusShadowOutcome =
+  | { status: "reconciled"; projected: number; replayed: number }
+  | { status: "failed"; reasonCode: string };
+
+function resultBusReasonCode(error: unknown): string {
+  const code = reasonCode(error);
+  return code === "RESULT_RECONCILIATION_FAILED" ? "RESULT_BUS_RECONCILIATION_FAILED" : code;
+}
+
+function reconcileResultBusShadow(identity: RoutingWorkspaceIdentity): ResultBusShadowOutcome {
+  try {
+    return { status: "reconciled", ...reconcileWorkspaceResultBus(identity) };
+  } catch (error) {
+    return { status: "failed", reasonCode: resultBusReasonCode(error) };
+  }
+}
 
 function reasonCode(error: unknown): string {
   const code = error && typeof error === "object" && "code" in error && typeof error.code === "string"
@@ -162,6 +186,10 @@ export function reconcileTrustedDesktopExecutionResult(
           iteration: result.iteration,
         });
         clearResultReconciliationNeeded(identity, command.commandId);
+        // R4 result/outbox are durably committed above; the Result Bus shadow is
+        // reconciled afterwards and isolated so a bus-side failure can never
+        // suppress or invalidate the already valid R4 delivery state.
+        const resultBus = reconcileResultBusShadow(identity);
         return {
           status: "reconciled",
           resultId: result.resultId,
@@ -169,6 +197,7 @@ export function reconcileTrustedDesktopExecutionResult(
           resultReplayed,
           outboxEntryId: queued.entry.outboxEntryId,
           outboxReplayed: queued.replayed,
+          resultBus,
         };
       } catch (error) {
         return recordFailure(identity, command.commandId, error);

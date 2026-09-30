@@ -1,7 +1,7 @@
 # R5 Endpoint Architecture
 
-状态：**R5c 已完成**（R5a contracts + R5b Active Executor Binding + R5c Active Web Sink Binding）。
-R5d（Result Bus）未开始。R4 persistence/wire 仍不迁移。
+状态：**R5d1 foundation 已完成（shadow/backfill only）**（含 R5a contracts + R5b Active Executor Binding + R5c Active Web Sink Binding）。
+R5d2 delivery lifecycle、R5d3 cutover 尚未开始。R4 persistence/wire 仍不迁移。
 
 本文冻结 R5 目标架构概念、依赖边界与 migration 顺序。
 
@@ -12,7 +12,7 @@ R5d（Result Bus）未开始。R4 persistence/wire 仍不迁移。
 ```text
 Web Planner  →  Bridge  →  Executor Binding
                      ↓
-              Result Bus（future）
+              Result Bus（R5d1 shadow）
                      ↓
 Web Sink     ←  Bridge  ←  canonical Execution Result
 ```
@@ -94,13 +94,37 @@ ExecutorDeliveryTargetSnapshot {
 继续沿用 R4 canonical ExecutionResult wire/persistence（截至 R5c 不改）。
 R5d 起，result 投递目标从「plannerRoute-pinned」迁移到 Workspace Result Bus。
 
-### 2.5 Workspace Result Bus（future / R5d）
+### 2.5 Workspace Result Bus（R5d1 shadow / R5d2 delivery）
 
 - queued result 跟随 **当前** Web Sink
 - send attempt 一旦 `begin-send`，target URL/epoch 固定
 - `outcome_unknown` **禁止**自动改发新 URL
 
-截至 R5c 只建立并接线合同，不实现 Bus，不切换 R4 Result Outbox。
+R5d1 已建立 Bridge-owned、planner-independent Result Bus 持久化与 canonical-result shadow/backfill，
+并接入生产 seam：`reconcileTrustedDesktopExecutionResult` 在 R4 canonical result/outbox 落定后，
+以 persisted canonical RoutingResult 为源幂等补建 Bus entry（单锁批量）。
+- Bus shadow 失败（如临时状态损坏）只在上报 `resultBus` 结果，不抑制、不回滚已成立的 R4 result/outbox；
+- 精确重放只比对不可变 canonical identity（busEntryId/resultId/digest/result bytes），
+  不重置 `deliveryStatus`/`sendTarget` 等未来投递状态；crash gap 由下一次对账修复，无需重新执行；
+- legacy RoutingResult 永不晋升为 Bus entry。
+
+持久化身份自校验（读取即 fail closed，`RESULT_BUS_STATE_CORRUPT`）：
+
+```text
+busEntryId   = sha256(JSON.stringify([workspaceId, commandId, iteration]))
+resultSha256 = canonicalRoutingResultDigest(result)   // 与 R4 outbox 共享同一实现
+```
+
+投递 lifecycle 冻结（R5d2 begin-send 目标契约，本阶段不实现迁移 API）：
+
+```text
+queued/reserved                          sendTarget === null
+claimed/observed/outcome_unknown/retired_unknown
+                                         sendTarget 必须保留 WebSinkSendTargetSnapshot
+```
+
+即 queued/reserved 均未冻结目的地；begin-send（reserved → claimed）是冻结边界，冻结后 target 不可消失或改指。
+R5d2 才实现 Web Sink delivery lifecycle，R5d3 才评估 cutover 与旧 outbox drain。
 
 ### 2.6 Web Sink Binding
 

@@ -16,6 +16,8 @@ import {
   resultOutboxFile,
   resultReconciliationQueueFile,
 } from "../src/routing/result-outbox-store.js";
+import { canonicalRoutingResultDigest } from "../src/routing/execution-result-digest.js";
+import { listResultBusEntries, readResultBus, resultBusFile } from "../src/result-bus/store.js";
 
 const THREAD = "01a00000-0000-7000-8000-000000000101";
 const TURN = "01a00000-0000-7000-8000-000000000102";
@@ -539,5 +541,55 @@ describe("R4b trusted Desktop execution result reconciliation", () => {
     expect(reconciliationState().entries).toContainEqual(expect.objectContaining({
       commandId: COMMAND, reasonCode: "ROUTING_RESULT_RECEIPT_AMBIGUOUS",
     }));
+  });
+});
+
+describe("R5d1 Result Bus shadow reconciliation seam", () => {
+  it("canonical result 通过生产 seam 自动进入 shadow Bus (A)", () => {
+    const outcome = reconcile();
+    expect(outcome).toMatchObject({
+      status: "reconciled",
+      resultBus: { status: "reconciled", projected: 1, replayed: 0 },
+    });
+    const entries = listResultBusEntries(workspace);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({ commandId: COMMAND, iteration: 1, deliveryStatus: "queued", sendTarget: null });
+    const persisted = readRouting(workspace)?.results.find(result => result.commandId === COMMAND);
+    expect(persisted).toBeTruthy();
+    expect(entries[0]!.resultSha256).toBe(canonicalRoutingResultDigest(persisted!));
+    expect(reconcile()).toMatchObject({
+      status: "reconciled", resultReplayed: true, outboxReplayed: true,
+      resultBus: { status: "reconciled", projected: 0, replayed: 1 },
+    });
+  });
+
+  it("crash gap：canonical result 已存在而 Bus 缺失时，后续生产对账补建且不重新执行 (B)", () => {
+    const first = reconcile();
+    expect(first).toMatchObject({ status: "reconciled", resultBus: { status: "reconciled" } });
+    fs.rmSync(resultBusFile(workspace.id));
+    fs.rmSync(`${resultBusFile(workspace.id)}.initialized`);
+    const repaired = reconcile();
+    expect(repaired).toMatchObject({
+      status: "reconciled", resultReplayed: true, outboxReplayed: true,
+      resultBus: { status: "reconciled", projected: 1, replayed: 0 },
+    });
+    expect(listResultBusEntries(workspace)).toHaveLength(1);
+    expect(repaired.status === "reconciled" ? repaired.resultId : "").toBe(
+      first.status === "reconciled" ? first.resultId : "",
+    );
+    expect(readResultBus(workspace)?.revision).toBe(1);
+  });
+
+  it("Bus 临时故障不抑制已成立的 R4 result/outbox 交付", () => {
+    expect(reconcile()).toMatchObject({ status: "reconciled", resultBus: { status: "reconciled" } });
+    fs.writeFileSync(resultBusFile(workspace.id), "{}\n");
+    const outcome = reconcile();
+    expect(outcome).toMatchObject({
+      status: "reconciled",
+      resultBus: { status: "failed", reasonCode: "RESULT_BUS_STATE_CORRUPT" },
+    });
+    expect(readRouting(workspace)?.results.filter(result => result.commandId === COMMAND)).toHaveLength(1);
+    expect(listResultOutboxEntries(workspace)).toHaveLength(1);
+    expect(fs.readFileSync(resultBusFile(workspace.id), "utf8")).toBe("{}\n");
   });
 });
