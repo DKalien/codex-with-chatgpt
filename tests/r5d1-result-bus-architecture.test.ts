@@ -30,13 +30,25 @@ describe("R5d1 Result Bus architecture fence", () => {
     expect(fs.existsSync(path.join(root, "src/routing/result-outbox-store.ts"))).toBe(true);
   });
 
-  it("keeps the Result Bus shadow-only: no R5d2 delivery transition surface", () => {
-    const files = fs.readdirSync(path.join(root, "src/result-bus"), { withFileTypes: true })
-      .filter(entry => entry.isFile() && entry.name.endsWith(".ts"))
-      .map(entry => `src/result-bus/${entry.name}`);
-    for (const file of files) {
-      expect(read(file), file).not.toMatch(/beginSend|begin-send|reserveResultBus|ackResultBus|acknowledgeResultBus/);
+  it("keeps R5d2 delivery lifecycle inside the generic core with no production wiring", () => {
+    // lifecycle 只经由 generic web-sink-control service 读 Active Web Sink，
+    // 不触碰 store/companion-adapter/registry 内部。
+    const lifecycle = read("src/result-bus/delivery-lifecycle.ts");
+    expect(lifecycle).toMatch(/web-sink-control\/service\.js/);
+    expect(lifecycle).not.toMatch(/web-sink-control\/(store|companion-adapter|registry|chatgpt-surface)/);
+    expect(lifecycle).not.toMatch(/feedback|browser-companion|src\/mcp|src\/cli|executor-control/);
+    // 无 production Result Bus reserve/begin-send/ack 路由：Companion 与 MCP 均不引用 result-bus
+    const companion = read("src/bridge/companion.ts");
+    expect(companion).not.toMatch(/result-bus|ResultBus/);
+    for (const file of fs.readdirSync(path.join(root, "src/mcp")).filter(name => name.endsWith(".ts"))) {
+      expect(read(`src/mcp/${file}`), file).not.toMatch(/result-bus|ResultBus/);
     }
+  });
+
+  it("keeps the transaction boundary free of skip-style bypasses", () => {
+    const store = read("src/result-bus/store.ts");
+    expect(store).not.toMatch(/\bskip\b/);
+    expect(store).toMatch(/noWrite/);
   });
 
   it("routes the feedback projector through the R4 outbox, never the Result Bus", () => {

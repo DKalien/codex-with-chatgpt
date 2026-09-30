@@ -1,7 +1,7 @@
 # R5 Endpoint Architecture
 
-状态：**R5d1 foundation 已完成（shadow/backfill only）**（含 R5a contracts + R5b Active Executor Binding + R5c Active Web Sink Binding）。
-R5d2 delivery lifecycle、R5d3 cutover 尚未开始。R4 persistence/wire 仍不迁移。
+状态：**R5d1 foundation 已完成；R5d2 Result Bus delivery lifecycle core 已实现（非 production cutover）**（含 R5a contracts + R5b Active Executor Binding + R5c Active Web Sink Binding）。
+R5d3 cutover 尚未开始。R4 persistence/wire 仍不迁移；production 投递仍走 R4 Result Outbox，无 production consumer 使用 Result Bus。
 
 本文冻结 R5 目标架构概念、依赖边界与 migration 顺序。
 
@@ -115,7 +115,7 @@ busEntryId   = sha256(JSON.stringify([workspaceId, commandId, iteration]))
 resultSha256 = canonicalRoutingResultDigest(result)   // 与 R4 outbox 共享同一实现
 ```
 
-投递 lifecycle 冻结（R5d2 begin-send 目标契约，本阶段不实现迁移 API）：
+投递 lifecycle 冻结（R5d2 已实现 lifecycle core；无 HTTP/MCP 端点，未接 Companion）：
 
 ```text
 queued/reserved                          sendTarget === null
@@ -124,7 +124,38 @@ claimed/observed/outcome_unknown/retired_unknown
 ```
 
 即 queued/reserved 均未冻结目的地；begin-send（reserved → claimed）是冻结边界，冻结后 target 不可消失或改指。
-R5d2 才实现 Web Sink delivery lifecycle，R5d3 才评估 cutover 与旧 outbox drain。
+
+R5d2 lifecycle core 状态机（全部经由 result-bus store-owned 事务原语写盘；单锁、revision +1 恰好一次、noWrite 字节等价、fsync + atomic rename）：
+
+```text
+queued -> reserved                    reserve-next：按 createdAt 升序 + busEntryId 决胜，
+                                      盖章当前 Active Web Sink binding stamp（bindingId/epoch/boundAt），
+                                      不冻结 sendTarget、不铸造 attempt
+reserved -> claimed                   begin-send = target freeze：以当时 Active Web Sink 冻结精确
+                                      WebSinkSendTargetSnapshot + 铸造 attemptId
+claimed -> observed                   ACK（精确 attemptId）；observed + 精确 attemptId 重放 noWrite
+claimed -> outcome_unknown            保留 reservation/attempt/冻结 target + outcomeUnknownAt/reasonCode
+outcome_unknown -> observed           late-positive ACK（清除 outcome 时间戳）
+outcome_unknown -> retired_unknown    手动 retire（终态）
+```
+
+单飞（single-flight）：reserved / claimed / outcome_unknown 任一存在时不得预约新 entry；
+observed / retired_unknown 是终态，不再阻塞后续 entry。
+
+Web Sink 切换语义：
+
+- reserved 期间切换 → begin-send 检测 binding stamp 不匹配：不冻结旧 target、不铸造 attempt，
+  entry 安全回 queued 并返回 bounded stale_reservation；后续 reserve 指向新 binding；
+- claimed 之后切换 → 已冻结 target 不变；ack / outcome_unknown / retire / shadow reconcile 均不改写 target。
+
+bounded 恢复（显式常量 + 可注入 nowMs；不导入既有反馈恢复代码）：
+
+- stale reserved → queued（begin-send 意图未持久化，安全侧）；
+- stale claimed → outcome_unknown（保留 attemptId 与冻结 target，绝不回 queued）。
+
+`outcome_unknown` **永不**自动回 queued、**永不**采纳当前 Active Web Sink（A→B 切换后仍 pin A）。
+
+R5d3 才进行 Companion endpoint cutover 与旧 outbox drain。
 
 ### 2.6 Web Sink Binding
 

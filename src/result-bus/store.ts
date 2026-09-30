@@ -66,7 +66,16 @@ function writeAtomic(file: string, state: ResultBusState): void {
   }
 }
 
-function withLock<T>(identity: RoutingWorkspaceIdentity, stateDir: string, fn: (state: ResultBusState | null) => { state: ResultBusState; result: T; noWrite?: boolean }): T {
+/**
+ * Result Bus 事务变更描述。
+ * - 无 noWrite：语义写；revision +1、fsync + atomic rename。
+ * - noWrite + previous 非 null：必须与 previous 字节等价（精确重放），否则 corrupt。
+ * - noWrite + previous === null + state === null：absent-state 只读空操作，
+ *   不创建文件/marker。caller 不能借 noWrite 注入已变更的非空 state。
+ */
+type ResultBusChange<T> = { state: ResultBusState | null; result: T; noWrite?: boolean };
+
+function withLock<T>(identity: RoutingWorkspaceIdentity, stateDir: string, fn: (state: ResultBusState | null) => ResultBusChange<T>): T {
   const file = resultBusFile(identity.id, stateDir);
   ensureDir(path.dirname(file));
   let lock: number;
@@ -82,7 +91,12 @@ function withLock<T>(identity: RoutingWorkspaceIdentity, stateDir: string, fn: (
     const previous = readState(identity, stateDir);
     const next = fn(previous);
     if (next.noWrite) {
-      if (!previous || JSON.stringify(next.state) !== JSON.stringify(previous)) throw corrupt();
+      if (!previous) {
+        // 唯一合法的 null-state 只读路径：noWrite + state null；注入非空 state 即 corrupt。
+        if (next.state !== null) throw corrupt();
+        return next.result;
+      }
+      if (JSON.stringify(next.state) !== JSON.stringify(previous)) throw corrupt();
       return next.result;
     }
     const revision = previous ? previous.revision + 1 : 1;
@@ -115,6 +129,12 @@ function canonicalEntry(identity: RoutingWorkspaceIdentity, result: RoutingResul
     createdAt: now,
     deliveryStatus: "queued",
     sendTarget: null,
+    reservation: null,
+    attempt: null,
+    observedAt: null,
+    outcomeUnknownAt: null,
+    retiredAt: null,
+    outcomeReasonCode: null,
   });
 }
 
@@ -127,6 +147,29 @@ function sameImmutable(left: ResultBusEntry, right: ResultBusEntry): boolean {
 export function readResultBus(identity: RoutingWorkspaceIdentity, stateDir = getStateDir()): ResultBusState | null {
   const resolved = resolveWorkspaceIdentity(identity);
   return readState(resolved, stateDir);
+}
+
+/**
+ * R5d2 transactional mutation boundary：Result Bus 的唯一写路径。
+ * - 每 workspace 一把 durable 锁；写前 strict parse（损坏 fail closed）；
+ * - 语义写 revision +1 恰好一次；noWrite 必须与 previous 字节等价；
+ * - fsync + atomic rename + initialized marker 语义保持。
+ * delivery lifecycle 服务不得绕开本原语直接改写 Result Bus JSON。
+ */
+export function withResultBusTransaction<T>(
+  identity: RoutingWorkspaceIdentity,
+  change: (state: ResultBusState | null) => ResultBusChange<T>,
+  stateDir = getStateDir(),
+): T {
+  const resolved = resolveWorkspaceIdentity(identity);
+  return withLock(resolved, stateDir, change);
+}
+
+/** createdAt 升序 + busEntryId 稳定决胜；不使用 planner route 顺序。 */
+export function compareResultBusEntries(a: ResultBusEntry, b: ResultBusEntry): number {
+  if (a.createdAt !== b.createdAt) return a.createdAt < b.createdAt ? -1 : 1;
+  if (a.busEntryId !== b.busEntryId) return a.busEntryId < b.busEntryId ? -1 : 1;
+  return 0;
 }
 
 export function listResultBusEntries(identity: RoutingWorkspaceIdentity, stateDir = getStateDir()): ResultBusEntry[] {

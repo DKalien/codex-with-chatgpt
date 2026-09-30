@@ -82,6 +82,23 @@ function frozenSendTarget() {
   };
 }
 
+function reservation() {
+  return {
+    reservationId: "01a00000-0000-7000-8000-0000000003d1",
+    reservedAt: new Date().toISOString(),
+    bindingId: "binding-r5d1",
+    epoch: 3,
+    boundAt: new Date().toISOString(),
+  };
+}
+
+function attempt() {
+  return {
+    attemptId: "01a00000-0000-7000-8000-0000000003d2",
+    claimedAt: new Date().toISOString(),
+  };
+}
+
 function writeBusState(entries: unknown[]): void {
   const file = resultBusFile(identity.id, stateDir);
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -264,6 +281,7 @@ describe("R5d1 workspace Result Bus", () => {
 
   it("freezes the single send-target lifecycle contract (P/Q)", () => {
     const result = canonicalResult("r5d1-lifecycle");
+    const now = new Date().toISOString();
     const base = {
       version: 1,
       busEntryId: resultBusEntryId(identity.id, result.commandId, 1),
@@ -273,18 +291,40 @@ describe("R5d1 workspace Result Bus", () => {
       resultId: result.resultId,
       resultSha256: canonicalRoutingResultDigest(result),
       result,
-      createdAt: new Date().toISOString(),
+      createdAt: now,
+      observedAt: null,
+      outcomeUnknownAt: null,
+      retiredAt: null,
+      outcomeReasonCode: null,
     };
     const target = frozenSendTarget();
+    const reserve = reservation();
+    const claim = attempt();
     expect(resultBusLifecycleSchema.options).toEqual(["queued", "reserved", "claimed", "observed", "outcome_unknown", "retired_unknown"]);
-    expect(resultBusEntrySchema.parse({ ...base, deliveryStatus: "queued", sendTarget: null })).toBeTruthy();
-    expect(() => resultBusEntrySchema.parse({ ...base, deliveryStatus: "queued", sendTarget: target })).toThrow();
-    expect(resultBusEntrySchema.parse({ ...base, deliveryStatus: "reserved", sendTarget: null })).toBeTruthy();
-    expect(() => resultBusEntrySchema.parse({ ...base, deliveryStatus: "reserved", sendTarget: target })).toThrow();
-    for (const deliveryStatus of ["claimed", "observed", "outcome_unknown", "retired_unknown"] as const) {
-      expect(resultBusEntrySchema.parse({ ...base, deliveryStatus, sendTarget: target })).toBeTruthy();
-      expect(() => resultBusEntrySchema.parse({ ...base, deliveryStatus, sendTarget: null })).toThrow();
-    }
+    expect(resultBusEntrySchema.parse({ ...base, deliveryStatus: "queued", sendTarget: null, reservation: null, attempt: null })).toBeTruthy();
+    expect(() => resultBusEntrySchema.parse({ ...base, deliveryStatus: "queued", sendTarget: target, reservation: null, attempt: null })).toThrow();
+    expect(() => resultBusEntrySchema.parse({ ...base, deliveryStatus: "queued", sendTarget: null, reservation: reserve, attempt: null })).toThrow();
+    expect(resultBusEntrySchema.parse({ ...base, deliveryStatus: "reserved", sendTarget: null, reservation: reserve, attempt: null })).toBeTruthy();
+    expect(() => resultBusEntrySchema.parse({ ...base, deliveryStatus: "reserved", sendTarget: target, reservation: reserve, attempt: null })).toThrow();
+    expect(() => resultBusEntrySchema.parse({ ...base, deliveryStatus: "reserved", sendTarget: null, reservation: null, attempt: null })).toThrow();
+    expect(resultBusEntrySchema.parse({ ...base, deliveryStatus: "claimed", sendTarget: target, reservation: reserve, attempt: claim })).toBeTruthy();
+    expect(() => resultBusEntrySchema.parse({ ...base, deliveryStatus: "claimed", sendTarget: null, reservation: reserve, attempt: claim })).toThrow();
+    expect(() => resultBusEntrySchema.parse({ ...base, deliveryStatus: "claimed", sendTarget: target, reservation: null, attempt: claim })).toThrow();
+    expect(() => resultBusEntrySchema.parse({ ...base, deliveryStatus: "claimed", sendTarget: target, reservation: reserve, attempt: null })).toThrow();
+    expect(resultBusEntrySchema.parse({
+      ...base, deliveryStatus: "observed", sendTarget: target, reservation: reserve, attempt: claim, observedAt: now,
+    })).toBeTruthy();
+    expect(() => resultBusEntrySchema.parse({ ...base, deliveryStatus: "observed", sendTarget: target, reservation: reserve, attempt: claim })).toThrow();
+    expect(resultBusEntrySchema.parse({
+      ...base, deliveryStatus: "outcome_unknown", sendTarget: target, reservation: reserve, attempt: claim, outcomeUnknownAt: now,
+    })).toBeTruthy();
+    expect(() => resultBusEntrySchema.parse({ ...base, deliveryStatus: "outcome_unknown", sendTarget: target, reservation: reserve, attempt: claim })).toThrow();
+    expect(resultBusEntrySchema.parse({
+      ...base, deliveryStatus: "retired_unknown", sendTarget: target, reservation: reserve, attempt: claim, outcomeUnknownAt: now, retiredAt: now,
+    })).toBeTruthy();
+    expect(() => resultBusEntrySchema.parse({
+      ...base, deliveryStatus: "retired_unknown", sendTarget: target, reservation: reserve, attempt: claim, retiredAt: now,
+    })).toThrow();
   });
 
   it("exact canonical replay preserves a frozen post-send lifecycle and snapshot (R)", () => {
@@ -302,6 +342,12 @@ describe("R5d1 workspace Result Bus", () => {
       createdAt: new Date().toISOString(),
       deliveryStatus: "claimed" as const,
       sendTarget: target,
+      reservation: reservation(),
+      attempt: attempt(),
+      observedAt: null,
+      outcomeUnknownAt: null,
+      retiredAt: null,
+      outcomeReasonCode: null,
     };
     writeBusState([entry]);
     const file = resultBusFile(identity.id, stateDir);
@@ -310,7 +356,7 @@ describe("R5d1 workspace Result Bus", () => {
     expect(fs.readFileSync(file, "utf8")).toBe(before);
     const state = readResultBus(identity, stateDir)!;
     expect(state.revision).toBe(1);
-    expect(state.entries[0]).toMatchObject({ deliveryStatus: "claimed", sendTarget: target });
+    expect(state.entries[0]).toMatchObject({ deliveryStatus: "claimed", sendTarget: target, attempt: entry.attempt, reservation: entry.reservation });
   });
 
   it("rejects conflicting same command+iteration result identity (D)", () => {
