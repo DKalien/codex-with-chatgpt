@@ -17,19 +17,20 @@ function conflict(reason: string): never {
 export function projectTrustedDesktopExecutionResult(
   identity: RoutingWorkspaceIdentity,
   receipt: { commandId: string; desktopReceiptSha256: string },
+  stateDir?: string,
 ): ResultInput {
   const workspace = resolveWorkspaceIdentity(identity);
   routingCommandIdSchema.parse(receipt.commandId);
   if (!SHA256.test(receipt.desktopReceiptSha256)) conflict("receipt 摘要格式无效");
 
-  const routing = readRouting(workspace);
+  const routing = readRouting(workspace, stateDir);
   const command = routing?.commands.find(item => item.commandId === receipt.commandId);
   if (!command || command.deliveryStatus !== "accepted") conflict("缺少已接受的 Routing Command");
   const executor = routing!.routes.find(item => item.routeId === command.executorRouteId);
   if (!executor || executor.role !== "executor" || executor.platform !== "codex_desktop" ||
       executor.locator.hostId !== "local") conflict("Command executor route 不是精确本机 Desktop target");
 
-  const desktop = readDesktop(workspace.id);
+  const desktop = readDesktop(workspace.id, stateDir);
   if (!desktop || desktop.workspaceRoot !== workspace.root) conflict("Desktop workspace 身份不匹配");
   const deliveries = desktop.deliveries.filter(item => item.commandId === command.commandId);
   if (deliveries.length !== 1) conflict("缺少唯一 Desktop delivery");
@@ -42,7 +43,7 @@ export function projectTrustedDesktopExecutionResult(
   }
 
   const taskId = `desktop_${command.commandId}`;
-  const records = readExecutionRecordsStrict(workspace.id).filter(item =>
+  const records = readExecutionRecordsStrict(workspace.id, stateDir).filter(item =>
     item.commandId === command.commandId || item.taskId === taskId);
   if (records.length !== 1) conflict("缺少唯一 Desktop execution record");
   const record = records[0]!;
@@ -59,7 +60,7 @@ export function projectTrustedDesktopExecutionResult(
   if ((record.outputId === undefined) !== (record.outputAvailable === undefined)) {
     conflict("execution record 的 output 元数据不完整");
   }
-  const outputs = readExecutionOutputMetadataStrict(workspace.id).filter(item =>
+  const outputs = readExecutionOutputMetadataStrict(workspace.id, stateDir).filter(item =>
     item.taskId === taskId && item.iteration === record.iteration);
   if (record.outputId === undefined ? outputs.length !== 0 :
       outputs.length !== 1 || outputs[0]!.id !== record.outputId ||

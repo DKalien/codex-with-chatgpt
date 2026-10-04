@@ -9,8 +9,9 @@ import { registerDesktopCommands } from "../src/cli/desktop.js";
 import { cleanup, isolateStateDir } from "./helpers.js";
 
 const workspace = { id: "desktop_current_test", root: process.cwd() };
+const runtimeFence = { desktopPid: 1001, desktopExe: "C:\\Program Files\\ChatGPT\\ChatGPT.exe", desktopCreation: "1000001", appServerPid: 1002, appServerExe: "C:\\Program Files\\ChatGPT\\codex.exe", appServerCreation: "1000002" };
 const observed = { threadId: "01a00000-0000-7000-8000-000000000001", hostId: "local", projectId: "project_test",
-  title: "当前会话", workspaceRoot: workspace.root, cwd: workspace.root, runtimeStatus: "active" };
+  title: "当前会话", workspaceRoot: workspace.root, cwd: workspace.root, runtimeStatus: "active", runtimeFence };
 let directory: string;
 let exitCode: typeof process.exitCode;
 beforeEach(() => {

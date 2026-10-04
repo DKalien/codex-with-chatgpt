@@ -21,6 +21,14 @@ import {
 
 const workspaceId = "2582910bf0d2";
 const workspaceRoot = "D:\\python\\codex-with-chatgpt";
+const runtimeFence = {
+  desktopPid: 1001,
+  desktopExe: "C:\\Program Files\\ChatGPT\\ChatGPT.exe",
+  desktopCreation: "1000001",
+  appServerPid: 1002,
+  appServerExe: "C:\\Program Files\\ChatGPT\\codex.exe",
+  appServerCreation: "1000002",
+};
 
 function candidate(overrides: Partial<ExecutorBindingCandidate> = {}): ExecutorBindingCandidate {
   return {
@@ -45,6 +53,7 @@ function writeDesktopState(enabled: boolean, binding: Record<string, unknown> | 
       workspaceRoot,
       revision: 1,
       enabled,
+      runtimeFence,
       binding,
       deliveries: [],
     }),
@@ -97,7 +106,7 @@ describe("R5b production send attestation", () => {
     fs.rmSync(stateDir, { recursive: true, force: true });
   });
 
-  it("rejects when snapshot identity differs from activeBinding", async () => {
+  it("rejects when target identity differs from legacy Desktop binding", async () => {
     const bound = bindCurrentExecutor(workspaceId, workspaceRoot, candidate());
     writeDesktopState(true, legacyBinding);
     const backend = resolveProductionBackend(CODEX_DESKTOP_EXECUTOR_ID);
@@ -111,7 +120,6 @@ describe("R5b production send attestation", () => {
         message: "SECRET_TASK_BODY",
         userConfirmed: true,
         clientId: "client-1",
-        activeBinding: bound.binding,
         target,
         authorize: () => {},
       }),
@@ -135,7 +143,6 @@ describe("R5b production send attestation", () => {
           message: "x",
           userConfirmed: true,
           clientId: "client-1",
-          activeBinding: bound.binding,
           target: { ...freezeActiveDeliveryTarget(bound.binding), ...patch },
           authorize: () => {},
         }),
@@ -156,7 +163,6 @@ describe("R5b production send attestation", () => {
         message: "x",
         userConfirmed: true,
         clientId: "client-1",
-        activeBinding: bound.binding,
         target: {
           ...freezeActiveDeliveryTarget(bound.binding),
           locator: { executorProjectId: legacyBinding.projectId, extraKey: "nope" },
@@ -179,7 +185,6 @@ describe("R5b production send attestation", () => {
         message: "SECRET_TASK_BODY",
         userConfirmed: true,
         clientId: "client-1",
-        activeBinding: bound.binding,
         target: freezeActiveDeliveryTarget(bound.binding),
         authorize: () => {},
       }),

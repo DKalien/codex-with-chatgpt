@@ -155,7 +155,7 @@
     if (message.type === "c2c.status.request") {
       // Forward to SW so MessageSender is this real ChatGPT document.
       const msg = buildObserveMessage();
-      void sendToWorker({ ...msg, type: "c2c.status.page" }).then((response) => {
+        void sendToWorker({ ...msg, type: "c2c.status.read" }).then((response) => {
         sendResponse(response);
       });
       return true;
@@ -383,15 +383,30 @@
       return true;
     }
     if (message.type === "c2c.feedback.bootstrap.execute") {
+      // Preflight refusals need the same exact-document envelope as runner results.
+      // Otherwise SW cannot prove zero mutation and must harden the dispatch fence.
+      const refuseBootstrap = (reason) => sendResponse({
+        type: "c2c.feedback.bootstrap.result",
+        mode: "feedback_bootstrap_send",
+        ok: false,
+        reason,
+        mutationAttempted: false,
+        wrote: false,
+        clickAttempted: false,
+        clicked: false,
+        observed: false,
+        canonicalRoute: parseRoute(location.href)?.canonical ?? null,
+        generation,
+      });
       // MV3 service-worker MessageSender.url is not stable; internal senders have no tab.
       if (sender?.id !== chrome.runtime.id || sender?.tab != null) {
-        sendResponse({ ok: false, reason: "bootstrap_sender_invalid", mutationAttempted: false });
+        refuseBootstrap("bootstrap_sender_invalid");
         return false;
       }
       const expectedRoute = typeof message.expectedRoute === "string" ? message.expectedRoute : "";
       const expectedGeneration = message.expectedGeneration;
       if (typeof globalThis.__c2cRunFeedbackBootstrapSend !== "function") {
-        sendResponse({ ok: false, reason: "bootstrap_capability_missing", mutationAttempted: false });
+        refuseBootstrap("bootstrap_capability_missing");
         return false;
       }
       void (async () => {

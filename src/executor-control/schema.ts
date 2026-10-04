@@ -79,6 +79,7 @@ export interface ExecutorPluginSummary {
 }
 
 export interface ExecutorStatusProjection {
+  readonly activity?: import("../endpoints/executor-contract.js").ExecutorSessionProjection["activity"];
   readonly workspaceId: string;
   readonly activeBinding: import("../endpoints/schema.js").ExecutorBinding | null;
   readonly plugins: readonly ExecutorPluginSummary[];

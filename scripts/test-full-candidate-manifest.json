@@ -1,0 +1,1000 @@
+{
+  "version": 1,
+  "notice": "Experimental only. Changed tests/shared support require manual audit and refreshed hashes; serial full remains authoritative.",
+  "files": [
+    {
+      "file": "tests/action-indicator.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "4a136520366ed18725083f36617757f8b36e1c094da4d88a9e69e06f15671486"
+    },
+    {
+      "file": "tests/activation-skill.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "43f8d53115d7a915e2af4f9115b45347169fa9e783a0786b01701f6f6cd10f46"
+    },
+    {
+      "file": "tests/architecture-separation.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "9d87f9e2f0b88f1c72acaf36a507d9a4f5ae9c99db288271c0137f070ce1f256"
+    },
+    {
+      "file": "tests/auth-compatibility.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "97fc86b54fc1ac4f831b05384abe0ace31118fb6d85801b6aa816356f4356a88"
+    },
+    {
+      "file": "tests/bridge-maintenance-fence.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "4fb2d88330bde7b83e763359f67b9571bd26b123fc3f34369be6b6eb09c1dbb8"
+    },
+    {
+      "file": "tests/bridge-parent-death.test.ts",
+      "group": "serial",
+      "dist": "none",
+      "sha256": "7d6f6f57cd04f3e0dd97c187ad2ed2fc3e8e2fc495ad1463f7d3a8674b8b8668"
+    },
+    {
+      "file": "tests/bridge-provenance.test.ts",
+      "group": "parallel",
+      "dist": "read",
+      "sha256": "18332d41ec127c500675e8d93ffd24076c7fa05078988564cdbb4e549a756fd4"
+    },
+    {
+      "file": "tests/browser-companion.test.ts",
+      "group": "parallel",
+      "dist": "read",
+      "sha256": "3febdfdbbfe8d34de2d8345231f922e34dc3fbfc1a9bb918d4a6d4c29dc3e500"
+    },
+    {
+      "file": "tests/build-id.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "7189cbeace2d01179a70753ea3cb1becb80e9265f64dc12eb7e425619e36c404"
+    },
+    {
+      "file": "tests/chatgpt-route.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "328f53f4338786f6c000cda27e4751c7cabed17e44dcf5d5f1db9e4f0f0673ae"
+    },
+    {
+      "file": "tests/classic-route-fence-regressions.test.ts",
+      "group": "parallel",
+      "dist": "read",
+      "sha256": "3c080d4ad0c8acd22ff7f66860661d193d778732ebbb1aa4c4321c4dd5b7fa24"
+    },
+    {
+      "file": "tests/claude-runner.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "fb262c99c4926248dbfea2f5b63cc1a33517e4b6856de36fdfd6ab2a065c61dc"
+    },
+    {
+      "file": "tests/companion-feedback.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "077fc282197f9f5bc6694f8c47eb59ae68a8da075e4a022c12386365077dcf43"
+    },
+    {
+      "file": "tests/companion-operations.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "0bf22e6e8c4f38b9c1698264b9f9ef94f9f27e326de856621aec2fc3fccd19ec"
+    },
+    {
+      "file": "tests/control-protocol.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "6ce570c831ad359c713e5513f2be962dc66bfdeddbb12a139f148d6c798076cd"
+    },
+    {
+      "file": "tests/core-install.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "581eccc9070a6d4553379f8d719f007c045844f39dd8a57437dd605ae3ef5973"
+    },
+    {
+      "file": "tests/core-upgrade.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "3e6806df84da9dd1b9f8552120b7c7d2535aa2ecbd8f7175d45f8d1851e1d2a4"
+    },
+    {
+      "file": "tests/daemon-parent-death.test.ts",
+      "group": "serial",
+      "dist": "none",
+      "sha256": "b70a6aa3900dfc035b8f8759e692f439c038c8aa9a952457bc6993384048e5b5"
+    },
+    {
+      "file": "tests/daemon-spawn.test.ts",
+      "group": "serial",
+      "dist": "none",
+      "sha256": "0a12466d1249e517e1280b9528c5c04e707cc39868e27855f74ed5b292e837ca"
+    },
+    {
+      "file": "tests/desktop-abandonment-cli.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "aa2f33af0f95d947dc38bc1b75d95a42dd998ca2be19672fa5f04bff61caa0fe"
+    },
+    {
+      "file": "tests/desktop-abandonment-repair.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "5a359618253b6ee9a1a085294363228c3965f7675084a708eeed02c359547425"
+    },
+    {
+      "file": "tests/desktop-abandonment.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "a9c032b87803d2b46725d49856fa6129eb759bba0a07cb02f6e94a15a628c8b2"
+    },
+    {
+      "file": "tests/desktop-control.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "d9ccd3f25b5b98da9600b830b0786f5c6e340ff764f4355015cf17e769f331ad"
+    },
+    {
+      "file": "tests/desktop-current.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "b1ae55b8761fa9bbab8fb54a710779b905e8939f7f36a747c36358795e60197b"
+    },
+    {
+      "file": "tests/desktop-envelope.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "f6cc5564700c088b623b939947749bdc51b657889f826e441afad06912e33878"
+    },
+    {
+      "file": "tests/desktop-helper-packaging.test.ts",
+      "group": "packaging",
+      "dist": "write",
+      "sha256": "2cb0e86142e21c51f29ff148eef6d7a432b042b83b380ac7730e360ebbad548a"
+    },
+    {
+      "file": "tests/desktop-interfaces.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "5164a881c4ac4a7203297ff9866cd9c1b90d293de43c9641d0b1cd69eb572632"
+    },
+    {
+      "file": "tests/desktop-ipc.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "2a0021b17e10d4cb28a8ba69e59b9930917c9df20c68e08f15cab9c0d44ca34e"
+    },
+    {
+      "file": "tests/desktop-outcome-resolution.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "3ddaf32f805e691d674bc4c5bb30ac5bc0e283184f37a32aa98a1c7ccf44eda2"
+    },
+    {
+      "file": "tests/desktop-python.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "1a5c61a121f402d9819a142f3d134520ed722e888b747e5a51b35ea72f600faa"
+    },
+    {
+      "file": "tests/desktop-r45e-architecture.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "bb85014533fc07fdc97695952f15a20cb4b2bc90a9e9bd52dfbba313c3563e77"
+    },
+    {
+      "file": "tests/desktop-receipt-finalizer.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "ed0689650c35903c0165f348999761a73611d35273abbdfd1390174ca4079713"
+    },
+    {
+      "file": "tests/desktop-receipt-skill.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "4165bc642cafe7d706fa2c38883f947551b46838038c6401d90b83f62bbbe355"
+    },
+    {
+      "file": "tests/desktop-result-cli.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "6e8015ab9a00880f7a67c41cde6560a7f13190a8225d3bd023714029b3ecd02c"
+    },
+    {
+      "file": "tests/desktop-result.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "b0ebf2e416fe7f0e08fb2094a72dfcb922d510a9e1a92f033f7afa8041c2098d"
+    },
+    {
+      "file": "tests/desktop-unknown-reconciliation.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "cd9dad6a7820a30de0113e1591b406d6814639727cb45842c11766bcec74da3d"
+    },
+    {
+      "file": "tests/dispatch-store-lock.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "8495a8bc34383fb3be92c32ee5252d125b822517ed611fde647ce1620a9d2e06"
+    },
+    {
+      "file": "tests/e1b2-transport.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "5d0952e4ed827dbce179b4325a64703e8ffd34bdcd726e3b8c6ab2647285adee"
+    },
+    {
+      "file": "tests/e1b3-dom-capability.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "551c41d65a24448637581792609a2ab586d507b288000c5f16cfa5803db5af3d"
+    },
+    {
+      "file": "tests/e1b3-send-journal.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "ba68478fb359fd94b29543ab2a888e6015900c7182bab0676315e3e6ccef61c6"
+    },
+    {
+      "file": "tests/e1b3-send-orchestration.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "1e99508be47279aa73732d65adf8489adcb8c67c6961a1c4366d0db3c5ababb5"
+    },
+    {
+      "file": "tests/e1b3d1-shadow-runtime.test.ts",
+      "group": "parallel",
+      "dist": "read",
+      "sha256": "cc65ea23620a7c2b42ac049b2fe260cb642b44c8182384c3bca140a6ce7af181"
+    },
+    {
+      "file": "tests/e1b3d2a-write-probe.test.ts",
+      "group": "parallel",
+      "dist": "read",
+      "sha256": "c33a90ae2d7f3cc0934df6a597ff13cc73b9c554d90846776627976198c70d9e"
+    },
+    {
+      "file": "tests/e1b3d3a-send-probe.test.ts",
+      "group": "parallel",
+      "dist": "read",
+      "sha256": "708c40389dd170aee849d4a3c73970304828b7fa055bf523e4a817dcca73fe40"
+    },
+    {
+      "file": "tests/e1b3d3b-production-send.test.ts",
+      "group": "parallel",
+      "dist": "read",
+      "sha256": "9ecd5d4020aa94bfe13eec5e88148e136f6cbe2bb5bfc066c9aac08c467c8366"
+    },
+    {
+      "file": "tests/e1b3d3b2-autonomy.test.ts",
+      "group": "parallel",
+      "dist": "read",
+      "sha256": "2536c857cf78b0816f013ed1130b146f0d5f99e2438f0ef4ac2a4a0519d8bd79"
+    },
+    {
+      "file": "tests/endpoint-switch-lock.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "93fc68cb6b7aa2465cb58efbf15d7593f0463e1d42d90c929aad2367685e9379"
+    },
+    {
+      "file": "tests/endpoint.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "20653fa38c2f5c9f2033bca61b1c404e6d7a60ed173d604978d8a9cc1949ced4"
+    },
+    {
+      "file": "tests/execution-output.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "a7d21028b7109f48b8ac49c4cbcdca3cf8a560ed7534b0e251126c0f65cd6448"
+    },
+    {
+      "file": "tests/execution-result-projector.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "a978f1d661c88ee6039e55ce4fa2bfc35f40aa2b6f975af9bc4e4da47736f11d"
+    },
+    {
+      "file": "tests/execution-result-reconciliation.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "9f33cc720f6176de32f95f9971f1f539d01ef4cfffd87dd4bae0f23cd78fec62"
+    },
+    {
+      "file": "tests/execution-terminal.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "2c7db3bc7ca7b3874360936e40995aa4f6444581b22066e2834560883261dc77"
+    },
+    {
+      "file": "tests/executor-core.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "e924ac6188027c6cb33a008095965d92b4242038f02423d44f8d314412b3fb1f"
+    },
+    {
+      "file": "tests/f1-companion-resilience.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "f12c071a263ac26e98e41184ad68ba4fba3eb0a324ba95cec6df6fa71553172d"
+    },
+    {
+      "file": "tests/feedback-bootstrap-runner.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "0634651bc51825576bbad9ab5982aa7cc87aa4485900c64e4d45035740705722"
+    },
+    {
+      "file": "tests/feedback-companion-pair.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "02e9fccbd6b292eefa86747e1aa4cb83930b11258607fb84b68e9dd0542bf9b7"
+    },
+    {
+      "file": "tests/feedback-decomposition.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "95dfae66fdc6aae992ae4edc24d37ad674f18ddcd6d748dd16f156dacffd0eaa"
+    },
+    {
+      "file": "tests/feedback-finalization-repair.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "f420dd628e3d2a5204185f7bbe5a782bb07137f33c1cc5319503a70b5a28cf46"
+    },
+    {
+      "file": "tests/feedback-finalization.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "f747f245c3d7129fb59c95d8479c8fbb5a1cab757eef811fe0cd5da186c55dc9"
+    },
+    {
+      "file": "tests/feedback-probe-cli.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "cf7f719f553d5fcf5dd22d85abb6667e825fc32e60a2df6b12ef47d748670d58"
+    },
+    {
+      "file": "tests/feedback-probe.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "19b37af47ce9d9d89d6f5a0ccbbb0939af702107dbfe3e7a45b7a2a4f011b434"
+    },
+    {
+      "file": "tests/fork-scripts.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "57acacd6a6f74e1f484b4861f1b2f3beed33a2453d8b04fd48ddb9101025e32d"
+    },
+    {
+      "file": "tests/g4-rebind-browser.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "f4a878833c35c4d07ceda3d3f5ed8ecf05ad37fa98a6d9644c0e4c64cb4878a1"
+    },
+    {
+      "file": "tests/g4c-connect.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "ec480961814528cdc686be8491f79fed41d0561d344de0327d088483777ff6ff"
+    },
+    {
+      "file": "tests/gc-apply.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "689f3a228333c18ba2eab65f2684edd1186258ee4dfad724b67ba1147925fa58"
+    },
+    {
+      "file": "tests/gc-plan.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "958ac4fa2937a3edb09a22fe6bc956c2031a146733a5bd2a17b658327334c504"
+    },
+    {
+      "file": "tests/git.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "bc536fd98ad1c8fcb5c7c62fedbc91ae7186dcc8c3ecf16f3551c0975e51971b"
+    },
+    {
+      "file": "tests/http-json.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "dd916e07212a1761a40951afe7fd4429f38c499421a48f99e59d3161304dcbe2"
+    },
+    {
+      "file": "tests/install-gc.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "d726d14fb0059d025adfc0cb5bac55148e4926227628c5552911b935e0e4f33a"
+    },
+    {
+      "file": "tests/legacy-history-cleanup.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "bfcc5ba0eb973ac6a7687da39df84590a29fd959e1f575f9ce92bc8446c25627"
+    },
+    {
+      "file": "tests/legacy-reconciliation.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "e933456ad07d43ad3e2adbbc98ebd2519d621f0dbdd8cc80fafc77663bd16c6e"
+    },
+    {
+      "file": "tests/legacy-retirement.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "61e5a691243dd84ee4c14323fe8948c83d03b616276e71a43c62e7f75aff4bc7"
+    },
+    {
+      "file": "tests/loopback-http.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "76247ab2357a85a94f865bbbdae57782a0c7662dd6e34b702826094d1dc58ded"
+    },
+    {
+      "file": "tests/maintenance-lock.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "60c021196f7185a910ae90d9b461e10e0096b3e2473c6eebc233628c8db01acb"
+    },
+    {
+      "file": "tests/mcp-integration.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "7cba27eeab7621c9efb2298c306f5dc974a0596831c8c9eb12748e82555c47a7"
+    },
+    {
+      "file": "tests/named-health.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "df44cf7fd4e24b4ae7148987168b9bf7bda157af325f5636f8d1a6d4b07affa0"
+    },
+    {
+      "file": "tests/oauth.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "7356b357dbc42661d74c758917c981e68a400a63d6d871e1cf506dc79cee5ade"
+    },
+    {
+      "file": "tests/output-atomicity.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "c75e58ac61d496b0118dd46660ef60b711f77b433605453cdeecce9dd8d5dd4d"
+    },
+    {
+      "file": "tests/pairing.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "364317f42f311bcdacfc52195dbbebd9efc149b7d18e786332e74fa9105d8928"
+    },
+    {
+      "file": "tests/popup-permission.test.ts",
+      "group": "parallel",
+      "dist": "read",
+      "sha256": "09effda42073867084f3138ba68ea4bba1fedc8663c2913397c0175e529f5ad0"
+    },
+    {
+      "file": "tests/port.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "4b74cc798848b2ca2accbc2e80be1815122e0c7a61aee47a2a64c0791643f834"
+    },
+    {
+      "file": "tests/post-turn-finalizer.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "d721466f3fef03095fb737b843256878e772e06b1fa6d66582f2856c3d1f001a"
+    },
+    {
+      "file": "tests/prefs.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "683bac5655ae4bd00e3042d341390f9a78d4a3581c00a68b31612c638161fc92"
+    },
+    {
+      "file": "tests/production-feedback-message.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "b2935189e056564b9f46a65f714934cbdeb5dcb42e7d8fd8a39f0bff27842471"
+    },
+    {
+      "file": "tests/production-feedback.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "ecd66554f9e3b90d0480eb290d363c7c3f13330ec9c34db65892e82ef2a02b89"
+    },
+    {
+      "file": "tests/r45f-architecture.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "ff729f72f8b403fe467bf20548b8bd92065b21fa39ba1ef2eb64dc6565f9c0a9"
+    },
+    {
+      "file": "tests/r5-endpoint-architecture.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "87bc8a74f82390523f56d788c780c116173f5130c8bb0e8f13c225bf58baab6e"
+    },
+    {
+      "file": "tests/r5-endpoint-core.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "2292a961e295a13d2a463d9d2bed015690f86a472a2fe623d4a1033c20eecc7e"
+    },
+    {
+      "file": "tests/r5-executor-binding-store.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "b5417a278da8e9df72558892f338fb7b4b7034275b0dc33d55c329bdfa03df34"
+    },
+    {
+      "file": "tests/r5-executor-mcp-auth.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "dfd37c868d5af9ae778f6caca911e2130cf1d94c2bcb3f7db74170e1f1b64248"
+    },
+    {
+      "file": "tests/r5-executor-mcp.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "8ee61a97d156b51baaca90e95d74316fc82aa5603944779fab011ce6be83bdc4"
+    },
+    {
+      "file": "tests/r5-executor-service.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "59410fb2d4c7b6c0fc4e6666988c7c5f80749bdcbb90895574bc464c33ee76db"
+    },
+    {
+      "file": "tests/r5-result-bus.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "1942d6ec16bd40de6e0bd4538e7a5634e7fb0f45fefe5b33f41cebe5d061bc31"
+    },
+    {
+      "file": "tests/r5-web-sink-browser.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "8eff5dc4c2ee4171b5b9261c7e9028ab08882725b4f60baea3d7ba03b8f38cb5"
+    },
+    {
+      "file": "tests/r5-web-sink-companion.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "4085dc3cbbc71eabf9101a04320e3281ace78c21ce2a9b8868b32cb0ea1a6cb0"
+    },
+    {
+      "file": "tests/r5-web-sink-http.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "a039b1fd77bfe427fc1b60889bda0baf2da74d0c051191b3d7e57d209bc51d7e"
+    },
+    {
+      "file": "tests/r5-web-sink-mcp-auth.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "9b23184f00ca7fb848928181a50657a13b5dd77378ba7dfdc3a68d65ccb9b94d"
+    },
+    {
+      "file": "tests/r5-web-sink-mcp.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "f9c34495b3accf2f87d2d38f8eb5e61053e80295e3915020377c5464ed51e6f0"
+    },
+    {
+      "file": "tests/r5-web-sink-service.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "7f18609404f8d777a850d7c81d284dcd2e22cf8a1ae028198489e9782f2a8dba"
+    },
+    {
+      "file": "tests/r5-web-sink-store.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "bfc28fb785ac6bd84bf108bbaa338253e3398e2a86e1537c69c17e095ecdf700"
+    },
+    {
+      "file": "tests/r5b-architecture.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "c2f6ccdf43bc2067f77849854d7a300215c67acdd78599732b25d6147986941f"
+    },
+    {
+      "file": "tests/r5c-architecture.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "62ed71493963dbc6a806e4b0ae8437e533b7fa37561b7844ff1bf672cde84456"
+    },
+    {
+      "file": "tests/r5d1-result-bus-architecture.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "94a149a3af450626addfec4379cfddc8afbe8e22ea78331c0f9584f4416f8215"
+    },
+    {
+      "file": "tests/r5d2-result-bus-delivery-lifecycle.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "fdf9b2aa7ed965d4874de9ba1298d1b31b847eb54c970c631ed9f4395fa0cda2"
+    },
+    {
+      "file": "tests/r5d3-result-bus-cutover.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "e62be62376fc33a18fdd0535201aea9936a080f639a512ca7f8817af56db3e8a"
+    },
+    {
+      "file": "tests/r5e-architecture.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "feb9d951b3f42aec2a4ee477baae535350e8b3032bbed1376e68c515df69fb12"
+    },
+    {
+      "file": "tests/r5e-executor-dispatch.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "0f8d349e15ad59e6eedc19ea30a9b52773526979ad0c4f727d52364386850106"
+    },
+    {
+      "file": "tests/r5e-independence.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "356e505120e6fbaf64169b1f1c41b4d8a5267323faa8cf51970c22474e332883"
+    },
+    {
+      "file": "tests/r5e-web-sink-switch.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "c3c063f3922e1a431a82854a453fe43d5867262353e89ac32062e448b1137909"
+    },
+    {
+      "file": "tests/r5g-cross-plugin-e2e.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "0d9903be4ecd0b0ad524da4aed8cdfd2bf864830cfe52d469c96c6b6785c8212"
+    },
+    {
+      "file": "tests/r5h-cleanup-cli.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "556a85c5e0a83b30f8a62a64b01a0ee028bd85a23f1a8fc43814a58612b5a0f2"
+    },
+    {
+      "file": "tests/r5h-command-cleanup.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "1722f8d706667f99bae4209784ec96f06d9bb5b67fab3f3c5e4a045202bc86dc"
+    },
+    {
+      "file": "tests/r5h-desktop-cleanup.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "486f80a1b5dadb6daa55780d57fc94935ded3eae0e9c614c21ae6900898386e4"
+    },
+    {
+      "file": "tests/r5h-execution-cleanup.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "cc459a5344443e65efc290bd5cd2a9b5957b0936a120b0a3b5188c6b3de237f8"
+    },
+    {
+      "file": "tests/r5h-feedback-cleanup-fence.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "6c80d6541778f40040068960f04232c660f576d49d024d9fa7327a5282e3e5f3"
+    },
+    {
+      "file": "tests/r5h-projection-cleanup.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "6a582095f034910bb15120e6e44bf6d64936331dad36cc96fe468769b3a14b72"
+    },
+    {
+      "file": "tests/r5h-workspace-cleanup-lock.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "117892ac0b2fdb8a79061133de39034f7b2afc565638627cf98bfc960f3b7a0e"
+    },
+    {
+      "file": "tests/record-cli.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "4c74f1077c2785736354ebb9fa1a50e9bfb5381de9032823aebdd4835695c3b4"
+    },
+    {
+      "file": "tests/record-desktop-discovery.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "f5963e0dc8087e0a2dd50cd1531e5cd4454b4c1adadf54616fefce4c545d03c0"
+    },
+    {
+      "file": "tests/release-references-supervisor.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "696cfbcb1f10a64d60885c66cc0072a6bc27ef3e8ae91f4768b5cc05cc15ec2f"
+    },
+    {
+      "file": "tests/remote-app-server.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "7a837813141562b10490a756512fb9d1c7e91c9f231e011c3ec1f960ba30319f"
+    },
+    {
+      "file": "tests/remote-control.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "a58caef9d95c33acd9db2a971cc95e4aa93845572b95706bfd58deb363e779a3"
+    },
+    {
+      "file": "tests/rollout.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "e54759e784d677a4e247b5e14ec763ab8abe5830714c5177a46f19fb96080298"
+    },
+    {
+      "file": "tests/route-attestation-runner.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "887aef74175e05ec7a067b177a11021a8060b70845f94229308a5bf1096279e2"
+    },
+    {
+      "file": "tests/route-attestation.test.ts",
+      "group": "parallel",
+      "dist": "read",
+      "sha256": "e4085518ee87b85ff769efd6d635acaa261e6f9f9cc02e5f08db4a49f5f5cf17"
+    },
+    {
+      "file": "tests/routing-legacy.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "df506123966b6a3f0f57311cea386a13d50ea16fbbc1a52ef5dd29625cfaf03b"
+    },
+    {
+      "file": "tests/routing-result-outbox.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "209a185e40c339c7d8e919b2075daf7948e58c6320e2296551058de72f2c884a"
+    },
+    {
+      "file": "tests/routing.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "9b211c570bff1666310ac7ed13cff49d0ac3fe033b9418ce9a3531fe87a344b0"
+    },
+    {
+      "file": "tests/runtime-prune.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "f588f6dd77e1f34e665d1bc32300bccfcfe2c0d0db89594d8baa3d758203c7ec"
+    },
+    {
+      "file": "tests/runtime.test.ts",
+      "group": "serial",
+      "dist": "none",
+      "sha256": "e4d17415120ebe264979841c7e8aa09951e21dc0a359dee6c855b490a9fb75c8"
+    },
+    {
+      "file": "tests/sandbox-allow.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "0599c2bd17713d6b4d528c6e4ef9d4bc14d775b04078aaf05e0b129039b5eb7e"
+    },
+    {
+      "file": "tests/search.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "f10a8940e4eed27a36af98c7418abf300d28e4a7ec29fad292d3f31920168549"
+    },
+    {
+      "file": "tests/serve-fence.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "2b2b4f0a5d1634ef6285772486fcdc8508f74388ee8a3153895500e5708ad449"
+    },
+    {
+      "file": "tests/session-projection.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "b7577ef0e2924143a015afc83d013b90abb5426631ec1274011af2caccca01f1"
+    },
+    {
+      "file": "tests/session.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "4edd1dc58487338f5638c63b9fb6e234c4883cde00ae9780d1522906f794889c"
+    },
+    {
+      "file": "tests/sleep-wake-feedback.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "06f781536e7a2e029ec82970b0c4882922e8d5bdc3c0ab2bfbeb02bff7f7e7aa"
+    },
+    {
+      "file": "tests/startup-lease.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "58b651e7b497f90b35421aeabaa0e9d76bf07d02409275ce15dd80b3f9879475"
+    },
+    {
+      "file": "tests/supervisor-cli.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "85707ccd9154ac00188cf515829da1553718bd96a345b7ddc9cbacb948ab07f8"
+    },
+    {
+      "file": "tests/supervisor-launcher.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "c764fb1f875277280c5db2009738b38eb88d3c3ba99aa5e82a76dbb9914c7771"
+    },
+    {
+      "file": "tests/supervisor-store.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "e76c1ee3d2f89de5f745e510ac8303d43897b93f14cb001327f92f640383d4a6"
+    },
+    {
+      "file": "tests/supervisor-windows-task.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "bf0dac9ad2f1b9c5a3a7c26744db3b1cd712868faaa00d3a700d5274d699a1d1"
+    },
+    {
+      "file": "tests/supervisor.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "42d6b33eafef48a8eccf7b3d854e828958570209bcb2fab2fc5affde008cafba"
+    },
+    {
+      "file": "tests/test-full-candidate.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "2e8001d174ebbd658ef536289770e85599f08914a11145b6d9733c2848512771"
+    },
+    {
+      "file": "tests/tunnel.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "e8b0eaa18022020922fbca5b974ac6f76759ae23264193cacf08fd4f4af95a89"
+    },
+    {
+      "file": "tests/update-check.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "a9379e9056fbec479023799ecdc3e7ee53d3540a84a7c493845b6977226dbbc3"
+    },
+    {
+      "file": "tests/watchdog-idempotence.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "1201e8e6a05fcfe2a305c31db8ac305b52319022b48eb6c76d37a31977a02641"
+    },
+    {
+      "file": "tests/web-control-cli.test.ts",
+      "group": "serial",
+      "dist": "none",
+      "sha256": "b078697b350c5c163a65753dee1a038307a5569caa155cf6b2334d3c0c652b31"
+    },
+    {
+      "file": "tests/web-control-feedback.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "e5ef7eabc9e534d17279bfcd98b85f123f66434d0cef58734faa3a02863e108b"
+    },
+    {
+      "file": "tests/web-control-lifecycle.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "9f4e8ae4d65e286b85bcbeeb63b13b02d4500e1f36162dc4dfc990e5fd04d6f8"
+    },
+    {
+      "file": "tests/web-control-state.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "8e0e6176f7cf8a0e38a78241a22fe7b34379c473e46c58746d71333103bf0427"
+    },
+    {
+      "file": "tests/windows-process.test.ts",
+      "group": "serial",
+      "dist": "none",
+      "sha256": "397a7873676ca6c67e8ffde5b93f8a323573c3dc06370e0100a7d959ad33b52c"
+    },
+    {
+      "file": "tests/workflow-cli.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "f712f7dba0bc85ace8acc01a94634b7e995424ccea4cb5448e3ce6db431582ac"
+    },
+    {
+      "file": "tests/workflow-mcp-projection.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "8a9b7607be79e4b048fc9f5f0c31788d09aa630ebe412106125abeb460c015f2"
+    },
+    {
+      "file": "tests/workflow-readiness-collector.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "3470ed9eb07e968156186fe3ac4253900b045d527e520c39080ca90a3bfa9cec"
+    },
+    {
+      "file": "tests/workflow-readiness-routing.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "f8314c96344e9ad5794b6aa93722dc5eadb58dd0bed754d2a9d263b44444a7f3"
+    },
+    {
+      "file": "tests/workflow-readiness-session.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "80e1a87fc41b893715723b11cb4dc50d66d372f121611528afd58524df689128"
+    },
+    {
+      "file": "tests/workflow-request.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "9519401e2d97adb09346f86d0c6b95a259e5ef99e70f7831dd5131ad8ec0eb21"
+    },
+    {
+      "file": "tests/workspace.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "267c87c2d08b291dc36226df14bda35d10f7e0497723987155241c6b09e0b010"
+    },
+    {
+      "file": "tests/write-probe-cli.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "f82c4a0a8b61d9fa5b27bb1a282db077e7214eb4eec2749d40c06dda35af32c2"
+    },
+    {
+      "file": "tests/write-probe.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "d693e83573d248195368d09712af86077874e947575e0823117ea5e270159fd2"
+    }
+  ],
+  "support": {
+    "package.json": "a2082de5a3e4b075b17300d418ae8ebe454c8f7e61d82637e6b96fe665e457d7",
+    "scripts/build-browser-companion.mjs": "53b2ac555553e8a0c011f3b41bd9777ce9deaad18afbdfee8e15964d08c4d7f9",
+    "scripts/copy-daemon-helper.mjs": "70372212ef6b7e84b6b68fb66ba59679a5b54629ac7e34f17f61049a34c40d81",
+    "scripts/copy-desktop-helper.mjs": "7f3601df86de1fafe8781c837c7d180dd77bf3a060ef555757648fbee99bd7ad",
+    "scripts/core-launcher.cjs": "305106eb4dd29dc99ada9c0ea5bbb440fbe59d7cbdfb27a5f021b8dd87866b8c",
+    "scripts/core-release.cjs": "0d4e4299b2ac80ec2cda11489c232447b74d5c4e0adbd0279f403887e2b21253",
+    "scripts/dev-install.ps1": "133136fe8e3e50a7fe46abc0aef274afd9c764df7084ab927ee49e768a1e52c2",
+    "scripts/install-core.mjs": "49a842adcd0f3e1bd671ca83708f38fbaa7f565ffd4c5627d07a2a30e866fda7",
+    "scripts/measure-core-release.cjs": "a284cfe2f9b4c932196e5f072207c6a3cc60fa26bfde98e7f503d7d838946df7",
+    "scripts/poc-client.mjs": "7d2f02e98c62b1a574f42ecdcfa5142c25d2ad420b3d005cd30d64cd0147c1da",
+    "scripts/test-full-candidate-reporter.mjs": "ed9ffb26880b12cee89dbb16997cfb47f57c77cfccd698a7598298fc5890fbba",
+    "scripts/test-full-candidate.mjs": "f0fdf8be90b6574174a6dcd4ad3a02417b5807fb4423b6863447eabead82b222",
+    "scripts/update-upstream-track.ps1": "4f4b2cbca4dff0b69810b388646d74d7658ad01605fa022d62e0fc829f0c2ea1",
+    "scripts/write-build-id.mjs": "9df9fe47d6499d89931ba3dce7e77410c58598ad70fe1728ce14caf83f6af7cf",
+    "tests/daemon_spawn_protocol_test.py": "fa9ab2663dc2f8592e7440f309a81d01cd99d6b519c41acbf28243d0537fa38c",
+    "tests/daemon_spawn_teardown_test.py": "6c66cfb9db51f3ff1da5ed27c839825cc9bc2c3b6e4278a65b367e7c7baec01b",
+    "tests/desktop_authenticode_spike.py": "0107b2195cae4421a6b459e340575d0bb28f5847eb650f394f9513c51f50c589",
+    "tests/desktop_ipc_helper_test.py": "f9843e5843596ce5ab205320ca1cfe25825ae65c2f5b472edd14b86424f6639c",
+    "tests/desktop_protocol_test.py": "2b83b040f70883fc6f928975b2c7d1a701412703231bd1992b6c8d8fda8e6ce5",
+    "tests/fixture_process_teardown_test.py": "673858274fa8900d540c68005e5c654ebecacd04dc8176498af729462c440be6",
+    "tests/fixture_process_teardown.py": "6a7adfdb693c901624446e5529ec24a3ee3ba4e1aa56efc2c8106753884b194c",
+    "tests/fixtures/daemon_job_membership_probe.py": "8f18cc12a9a2288242e83d11a6e0ca28da3cb63f6e940fb79b6af58f1c7de965",
+    "tests/fixtures/daemon_parent_death_parent.py": "777d4a57b5bad3b3a5d31cb8e9d6a96508b124818ef4b4b549dbc7fb30165601",
+    "tests/fixtures/desktop-native-resume-steering-shape.json": "e7126e03589b7662f6fca83626c90afd6258c3faadbe96c6813f21ecc85f52e0",
+    "tests/fixtures/web-control-cli.ts": "71d128f2d4f7f85d0f610b68f01a909820e1d15dc39f28fc8220d6d73c3f9490",
+    "tests/helpers.ts": "2c17347362384e0c527d334a2b538d6858527786f2a4404ae77d15f0281228da",
+    "tests/http-json.ts": "4a4a892b387e10a449b354a888e071dbda4f108316a1374aa8f1328a32cc95bf",
+    "tests/setup-state-dir.ts": "c86bc2aa380816c2aa6509406ddc44ad5eed91e14fa3e9334285c610229b787c",
+    "tests/strict-teardown.ts": "fd8584b775d729bd5e4c8182c8cda73526347f0a77562992219a0f6730432f00",
+    "tests/web-control-fixtures.ts": "5817c61e254bb0e3f0ebfe3d927f8f000630af2126e54d5acb1f0b7325448e9d",
+    "tests/workflow-readiness-fixtures.ts": "4eac5f8ccef3b8848edfe65944a1986c7a7e73bce2a647af3858fd9744c83698",
+    "vitest.config.ts": "7785df19d68c470389ccc6a97e3de91d73af4468a4f1cc173d6e8cfb1ea7ae3d"
+  }
+}

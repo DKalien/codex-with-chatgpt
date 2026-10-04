@@ -11,11 +11,16 @@
     "node": ">=20"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json && node scripts/copy-desktop-helper.mjs && node scripts/write-build-id.mjs && node scripts/build-browser-companion.mjs",
+    "build": "tsc -p tsconfig.json && node scripts/copy-desktop-helper.mjs && node scripts/copy-daemon-helper.mjs && node scripts/build-browser-companion.mjs && node scripts/write-build-id.mjs",
     "build:companion": "tsc -p tsconfig.json && node scripts/build-browser-companion.mjs",
     "dev": "tsx src/cli/index.ts",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:single": "vitest run --maxWorkers=1",
+    "test:changed": "vitest run --changed HEAD",
+    "test:related": "vitest related --run",
+    "test:full:candidate": "node scripts/test-full-candidate.mjs",
+    "test:parallel": "vitest run --maxWorkers=2 --testTimeout=90000",
     "typecheck": "tsc --noEmit"
   },
   "packageManager": "pnpm@11.24.0",

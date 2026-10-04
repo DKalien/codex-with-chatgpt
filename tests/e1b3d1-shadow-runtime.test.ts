@@ -335,7 +335,7 @@ describe("R3i owner-local read-only shadow RPC", () => {
   });
 
   it("service-worker inspect stays owner-local and read-only", () => {
-    const sw = fs.readFileSync(path.join(companionRoot, "service-worker.js"), "utf8");
+    const sw = fs.readFileSync(path.join(companionRoot, "service-worker.js"), "utf8").replace(/\r\n/g, "\n");
     const start = sw.indexOf("async function handleShadowInspect() {");
     const end = sw.indexOf("\n}\n\n/**", start);
     expect(start).toBeGreaterThan(-1);

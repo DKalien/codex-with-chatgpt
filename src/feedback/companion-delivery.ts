@@ -12,7 +12,7 @@ import {
   reserveNext,
   retireOutcomeUnknown,
 } from "./delivery-lifecycle.js";
-import { recoverStaleFeedback, readFeedbackState } from "./state-store.js";
+import { readFeedbackState } from "./state-store.js";
 import { publicCompanionDeliveryEvent } from "./projection-store.js";
 import { productionFeedbackDelivery } from "./message.js";
 import {
@@ -78,9 +78,8 @@ export function verifyCompanionCredential(input: {
   if (!hashEqual(rawCompanion.credentialHash, sha256Hex(input.credential))) {
     throw new CompanionError("COMPANION_UNAUTHORIZED", "companion credential 无效");
   }
-  // 已认证：stale convergence 是合法的 authenticated lifecycle 维护。
-  // recoverStaleInMemory 只收敛 events，不触碰 companion/binding，复用已收窄引用。
-  const state = recoverStaleFeedback(input.workspaceId, stateDir);
+  // Authentication is read-only; lifecycle mutations perform their own recovery.
+  const state = raw;
   const companion = rawCompanion;
   if (!state.binding || state.binding.status !== "active") {
     throw new FeedbackError("FEEDBACK_NOT_ENABLED", "production feedback 未启用");
@@ -125,7 +124,7 @@ export function companionPublicState(input: {
   stateDir?: string;
 }): Record<string, unknown> {
   const stateDir = input.stateDir ?? getStateDir();
-  const state = recoverStaleFeedback(input.workspaceId, stateDir);
+  const state = readFeedbackState(input.workspaceId, stateDir);
   // 只暴露当前 companion binding/epoch/fingerprint 对应事件；不做全 history 泄露。
   const scoped = state.events.filter((e) =>
     e.targetBindingId === input.ctx.bindingId

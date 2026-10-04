@@ -22,7 +22,7 @@ Read `runtimeUpgrade` in `status/doctor --json`: `installedBuildId` is the selec
 `busy`, approval, unresolved outcome, unknown identity, pairing or Remote activity keep the
 workspace pending. `quick` is skipped because a restart would change its URL; stopped workspaces
 are not started. Once a named workspace is provably healthy and idle, a local
-`c2c rollout -w <workspace> --json` can retry. Phase 1 has no background Supervisor.
+`c2c rollout -w <workspace> --json` can retry. A supervisor foundation now exists, but independent OS recovery requires separately authorized per-user task installation. Read `c2c supervisor status -w <workspace> --json`; installed code alone does not mean the task is registered or running.
 A concurrent `rollout_busy` response performs no state writes; it does not create a new pending record.
 Do not rebuild a compatible Connector or reauthorize OAuth merely because the Core build differs.
 Do not interrupt an active Review Bridge to clear pending status.
@@ -32,6 +32,19 @@ Do not interrupt an active Review Bridge to clear pending status.
 隧道 `running=true` 或公网 `/health` 返回 HTTP 200 不能单独证明 rollout 安全。命名 tunnel 的 workspace、hostname、publicUrl/provider，以及运行时 PID、startedAt、build identity 必须与本地受认证的 admin/runtime 观察完全一致；任一身份不一致都保持 `named_unhealthy`，不要按旧 PID kill、手工改 pending/finalizer 状态或循环重试。先等待/修复同一 workspace 的身份一致性，再使用稳定 launcher 执行一次 `c2c rollout -w <workspace> --json`。
 
 ## Common situations
+
+### 新网页接管完成，但 Companion 仍未连接
+
+“ChatGPT 已接管”、保存的 binding VERIFIED、当前网页已验证和完整连接是不同阶段。先查看高级诊断的 connectState、recovery、currentPageMatchesBinding、bindingEpoch、routeAttestFence、reason，连同当前 route 核对；不要复制配对密钥或凭据。任务面板的 Codex/网页可用性也分别判断。
+
+- `recovery=verify_takeover`：一次显式“连接当前对话”只核验原服务端 immediate successor，不重发自举。`COMPANION_REBIND_NOT_SUCCESSOR` 表示尚无可继续的精确下一代绑定，不能当作接管成功。
+- `bootstrap_capability_missing` / `bootstrap_sender_invalid`：新版对精确零写入拒绝保留错误并允许后续显式重试；页面组件缺失可在更新扩展后刷新页面。刷新/重载产生新 document，需要显式连接确认 owner，不能自动继承。
+- `OUTCOME_UNKNOWN`：未证明发送结果，不能用“输入框为空”或新代码断言旧尝试未发送；不要反复发送、清除目标或重新配对。必要的人工恢复仅走高级区对应的 connect bootstrap 或 route-attest 专用确认入口；二者都不代表连接成功。`not_exact_owner` 表示当前 document 校验未通过，不是已清除。
+- 当前页面须 route VERIFIED、绑定一致且 Web Sink 收敛后才显示已连接；自动回流开关另外核验。popup 可见时每2秒串行读取本地状态，GET /state 也是只读；它们不自动重连或发送。
+
+### 任务面板 Codex 端显示 inspect_failed
+
+先分别只读核对稳定入口 `desktop status` 与 `executor status` 的 workspace、thread/session、binding 和可用性。generic Executor 仍指旧 thread 时，网页回流连接成功也不会使旧目标可用。仅在用户已授权且真实当前会话与目标精确一致后，走既有 `executor bind-current` 流程；不要手写绑定或把无法确认显示成空闲。正在执行本轮任务显示 busy 是正常状态。
 
 ### 普通权限无法停止管理员 Bridge
 

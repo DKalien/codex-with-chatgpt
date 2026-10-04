@@ -14,6 +14,7 @@ import {
   type ExecutorStatusProjection,
 } from "./schema.js";
 import { nextEpoch, readExecutorControl, updateExecutorControlDetailed } from "./store.js";
+import { withEndpointSwitchLock } from "../endpoint-switch/lock.js";
 import {
   getProductionExecutorPlugin,
   hasProductionExecutorPlugin,
@@ -61,6 +62,7 @@ export function readActiveExecutorBinding(
 /**
  * 显式本地 bind-current：只接受已在本地确认过的 candidate。
  * 同一 candidate 在锁内幂等 noWrite；identity 变化则新 bindingId + epoch+1。
+ * R5e：全程持有 endpoint switch lock（executor 域），与 dispatch target pin 串行。
  */
 export function bindCurrentExecutor(
   workspaceId: string,
@@ -79,43 +81,45 @@ export function bindCurrentExecutor(
       `plugin ${candidate.pluginId} 不在 production registry。`,
     );
   }
-  return updateExecutorControlDetailed<ActiveExecutorBindingResult>(
-    workspaceId,
-    workspaceRoot,
-    (previous) => {
-      const active = previous?.activeBinding ?? null;
-      if (active && previous && isSameExecutorCandidate(active, candidate)) {
-        return {
-          state: previous,
-          result: { binding: active, created: false, noWrite: true },
-          noWrite: true,
-        };
-      }
-      const epoch = active ? nextEpoch(active.epoch) : 1;
-      const binding: ExecutorBinding = {
-        version: 1,
-        bindingId: randomUUID(),
-        pluginId: candidate.pluginId,
-        workspaceId: candidate.workspaceId,
-        workspaceRoot: candidate.workspaceRoot,
-        instanceId: candidate.instanceId,
-        sessionId: candidate.sessionId,
-        locator: candidate.locator,
-        epoch,
-        boundAt: new Date().toISOString(),
-      };
-      return {
-        state: {
+  return withEndpointSwitchLock("executor", workspaceId, () =>
+    updateExecutorControlDetailed<ActiveExecutorBindingResult>(
+      workspaceId,
+      workspaceRoot,
+      (previous) => {
+        const active = previous?.activeBinding ?? null;
+        if (active && previous && isSameExecutorCandidate(active, candidate)) {
+          return {
+            state: previous,
+            result: { binding: active, created: false, noWrite: true },
+            noWrite: true,
+          };
+        }
+        const epoch = active ? nextEpoch(active.epoch) : 1;
+        const binding: ExecutorBinding = {
           version: 1,
-          workspaceId,
-          workspaceRoot,
-          revision: (previous?.revision ?? 0) + 1,
-          activeBinding: binding,
-        },
-        result: { binding, created: true },
-      };
-    },
-  ).result;
+          bindingId: randomUUID(),
+          pluginId: candidate.pluginId,
+          workspaceId: candidate.workspaceId,
+          workspaceRoot: candidate.workspaceRoot,
+          instanceId: candidate.instanceId,
+          sessionId: candidate.sessionId,
+          locator: candidate.locator,
+          epoch,
+          boundAt: new Date().toISOString(),
+        };
+        return {
+          state: {
+            version: 1,
+            workspaceId,
+            workspaceRoot,
+            revision: (previous?.revision ?? 0) + 1,
+            activeBinding: binding,
+          },
+          result: { binding, created: true },
+        };
+      },
+    ).result,
+  );
 }
 
 export async function executorStatus(
@@ -185,6 +189,7 @@ export async function executorStatus(
       activeBinding,
       plugins,
       availability: { available: true },
+      ...(session.activity ? { activity: session.activity } : {}),
     };
   } catch {
     return {

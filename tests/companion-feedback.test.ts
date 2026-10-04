@@ -1,3 +1,5 @@
+import { recoverStaleFeedback as maintainFeedback } from "../src/feedback/state-store.js";
+import { requestHttp } from "./http-json.js";
 import fs from "node:fs";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -1112,6 +1114,10 @@ describe("reserved state machine", () => {
     state.events[0].reservedAt = new Date(Date.now() - FEEDBACK_RESERVATION_STALE_MS - 1000).toISOString();
     fs.writeFileSync(file, JSON.stringify(state, null, 2));
 
+    const bytesBeforeRead = fs.readFileSync(file);
+    companionPublicState({ workspaceId: workspace.id, ctx, stateDir });
+    expect(fs.readFileSync(file)).toEqual(bytesBeforeRead);
+    maintainFeedback(workspace.id, stateDir);
     const st = companionPublicState({
       workspaceId: workspace.id,
       ctx,
@@ -1500,6 +1506,10 @@ describe("E1b3a canonical production feedback message", () => {
     state.events[0].claimedAt = new Date(Date.now() - 11 * 60_000).toISOString();
     fs.writeFileSync(file, JSON.stringify(state, null, 2));
 
+    const bytesBeforeRead = fs.readFileSync(file);
+    companionPublicState({ workspaceId: workspace.id, ctx, stateDir });
+    expect(fs.readFileSync(file)).toEqual(bytesBeforeRead);
+    maintainFeedback(workspace.id, stateDir);
     const st = companionPublicState({
       workspaceId: workspace.id,
       ctx,
@@ -2005,8 +2015,8 @@ describe("public companion HTTP surface", () => {
   let base: string;
   let previousStateDir: string | undefined;
 
-  async function fetchJson(pathname: string, init?: RequestInit) {
-    const res = await fetch(`${base}${pathname}`, init);
+  async function fetchJson(pathname: string, init?: Parameters<typeof requestHttp>[1]) {
+    const res = await requestHttp(`${base}${pathname}`, init);
     const body = await res.json().catch(() => ({}));
     return { status: res.status, body };
   }
@@ -2042,6 +2052,17 @@ describe("public companion HTTP surface", () => {
       stateDir,
     });
   }
+
+  it("B2 operations GET is authenticated, no-store, and cannot mutate feedback state", async () => {
+    await enableAndSeed();
+    const paired = pairCompanion();
+    const before = fs.readFileSync(path.join(stateDir, "feedback", `${workspace.id}.json`));
+    const result = await requestHttp(`${base}/api/companion/v1/operations`, { headers: { authorization: `Bearer ${paired.credential}` } });
+    expect(result.status).toBe(200);
+    expect(await result.json()).toMatchObject({ readOnly: true, scope: "workspace_metadata", commands: [{ commandId: "http-cmd" }] });
+    expect(fs.readFileSync(path.join(stateDir, "feedback", `${workspace.id}.json`))).toEqual(before);
+    expect((await fetchJson("/api/companion/v1/operations")).status).toBe(401);
+  });
 
   it("pairing 流程 + reserve/begin-send/ack；companion 不能访问 admin/mcp", async () => {
     await enableAndSeed();
@@ -2142,7 +2163,7 @@ describe("public companion HTTP surface", () => {
     expect(acked.body.status).toBe("observed");
 
     // companion credential 不能当 MCP bearer
-    const mcp = await fetch(`${base}/mcp`, {
+    const mcp = await requestHttp(`${base}/mcp`, {
       method: "POST",
       headers: {
         authorization: `Bearer ${credential}`,
@@ -2154,7 +2175,7 @@ describe("public companion HTTP surface", () => {
     expect(mcp.status).toBe(401);
 
     // admin 仍不可达（非 loopback 伪装无关；无 admin token → 404）
-    const admin = await fetch(`${base}/admin/info`, {
+    const admin = await requestHttp(`${base}/admin/info`, {
       headers: { authorization: `Bearer ${credential}` },
     });
     expect(admin.status).toBe(404);
@@ -2647,7 +2668,7 @@ describe("public companion HTTP surface", () => {
     };
   }
 
-  it("autonomous /state: pair 后 seed 新 receipt，无 MCP 仅 GET /state 即投影", async () => {
+  it("read-only /state: 新 receipt 由显式维护投影，GET 保持只读", async () => {
     reconcileFeedbackOutbox(workspace.id, stateDir);
     seedTrustedReceipt("http-cmd");
     reconcileFeedbackOutbox(workspace.id, stateDir);
@@ -2664,8 +2685,12 @@ describe("public companion HTTP surface", () => {
     const baselineReady = baseline.body.pendingReady as number;
     expect(baselineReady).toBeGreaterThanOrEqual(1);
 
-    // 测试侧不调用 reconcileFeedbackOutbox
     seedTrustedReceipt("auto-cmd-1");
+    const bytes = fs.readFileSync(path.join(stateDir, "feedback", `${workspace.id}.json`));
+    const unprojected = await fetchJson("/api/companion/v1/state", { headers: auth });
+    expect(unprojected.body.pendingReady).toBe(baselineReady);
+    expect(fs.readFileSync(path.join(stateDir, "feedback", `${workspace.id}.json`))).toEqual(bytes);
+    reconcileFeedbackOutbox(workspace.id, stateDir);
     const state1 = await fetchJson("/api/companion/v1/state", { headers: auth });
     expect(state1.status).toBe(200);
     expect(state1.body.pendingReady).toBe(baselineReady + 1);

@@ -19,6 +19,7 @@ import { readDesktop, updateDesktop } from "../src/desktop/store.js";
 import { registerDesktopCommands } from "../src/cli/desktop.js";
 import { Workspace } from "../src/workspace/manager.js";
 import { cleanup, makeTmpDir } from "./helpers.js";
+import { confirmCommandCleanup, previewCommandCleanup } from "../src/command-cleanup/service.js";
 
 let root: string;
 let stateDir: string;
@@ -30,6 +31,14 @@ const turnId = "01a00000-0000-7000-8000-000000000002";
 const acceptedAt = "2026-01-01T00:00:00.000Z";
 const deliveryIdA = "01a00000-0000-7000-8000-000000000004";
 const deliveryIdB = "01a00000-0000-7000-8000-000000000005";
+const runtimeFence = {
+  desktopPid: 1001,
+  desktopExe: "C:\\Program Files\\ChatGPT\\ChatGPT.exe",
+  desktopCreation: "1000001",
+  appServerPid: 1002,
+  appServerExe: "C:\\Program Files\\ChatGPT\\codex.exe",
+  appServerCreation: "1000002",
+};
 
 beforeEach(() => {
   root = makeTmpDir("legacy-reconciliation-workspace");
@@ -52,6 +61,7 @@ function seedDelivery(overrides: Record<string, unknown> = {}): void {
       workspaceId: workspace.id,
       workspaceRoot: workspace.root,
       enabled: false,
+      runtimeFence,
       binding: {
         threadId,
         hostId: "local",
@@ -337,6 +347,109 @@ describe("legacy accepted reconciliation", () => {
     expect(getReconciledLegacyCommandIds(workspace)).toEqual(new Set([commandId]));
     expect(reconcileLegacyAccepted(workspace, commandId).status).toBe("already_reconciled");
     expect(fs.readFileSync(file, "utf8")).toBe(before);
+  });
+
+  it.each([1, 7, 40])("retention horizon 后正常 command cleanup 删除 %i 条仍只读重验 snapshot", holes => {
+    seedDelivery();
+    seedEvidenceSources();
+    reconcileLegacyAccepted(workspace, commandId);
+    const evidence = fs.readFileSync(legacyReconciliationFile(workspace.id));
+    for (let i = 0; i < MAX_OUTPUT_RECORDS; i++) saveExecutionOutput(workspace.id, {
+      command: "new flow", raw: "output", commandId: `new-${i}`, taskId: `desktop_new-${i}`, iteration: 1,
+    });
+    for (let i = 0; i < holes; i++) {
+      const target = { workspaceId: workspace.id, workspaceRoot: workspace.root, commandId: `new-${i}`, iteration: 1 as const, stateDir };
+      const preview = previewCommandCleanup(target);
+      expect(confirmCommandCleanup(target, preview.confirmationSha256!).status).toBe("cleaned");
+      expect(previewCommandCleanup(target).status).toBe("not_found");
+    }
+    const indexFile = path.join(stateDir, "execution-outputs", workspace.id, "index.json");
+    const before = fs.readFileSync(indexFile);
+    expect(JSON.parse(before.toString())).toMatchObject({ nextId: MAX_OUTPUT_RECORDS + 2 });
+    expect(JSON.parse(before.toString()).retentionThrough).toBe(1);
+    expect(readExecutionOutputMetadataStrict(workspace.id)).toHaveLength(MAX_OUTPUT_RECORDS - holes);
+    expect(getReconciledLegacyCommandIds(workspace)).toEqual(new Set([commandId]));
+    expect(listLegacyReconciliations(workspace)).toEqual([{ commandId, status: "reconciled" }]);
+    expect(fs.readFileSync(indexFile)).toEqual(before);
+    expect(fs.readFileSync(legacyReconciliationFile(workspace.id))).toEqual(evidence);
+  });
+
+  it.each(["horizon_short", "older_retained", "invalid_next_id", "same_id_drift", "no_snapshot"])(
+    "missing metadata cannot bypass strict horizon/evidence proof (%s)", mode => {
+      seedDelivery();
+      saveExecutionOutput(workspace.id, { command: "older", raw: "output" });
+      const original = seedEvidenceSourcesFor(commandId);
+      reconcileLegacyAccepted(workspace, commandId);
+      for (let i = 0; i < MAX_OUTPUT_RECORDS; i++) saveExecutionOutput(workspace.id, { command: "new", raw: "output" });
+      const file = path.join(stateDir, "execution-outputs", workspace.id, "index.json");
+      const index = JSON.parse(fs.readFileSync(file, "utf8"));
+      delete index.retentionThrough; // Exercise legacy compatibility independently of the new eviction witness.
+      index.items.pop(); // simulate a hole; never enough on its own to authorize a snapshot
+      if (mode === "horizon_short") index.nextId = original.id + MAX_OUTPUT_RECORDS;
+      if (mode === "older_retained") index.items[0].id = original.id - 1;
+      if (mode === "same_id_drift") index.items.unshift({ ...readLegacyReconciliations(workspace.id)[0]!.outputSnapshot, allowed: false });
+      if (mode === "invalid_next_id") index.nextId = index.items.at(-1).id;
+      if (mode === "no_snapshot") {
+        const evidenceFile = legacyReconciliationFile(workspace.id);
+        const evidence = JSON.parse(fs.readFileSync(evidenceFile, "utf8"));
+        delete evidence.entries[0].outputSnapshot;
+        fs.writeFileSync(evidenceFile, JSON.stringify(evidence));
+      }
+      fs.writeFileSync(file, JSON.stringify(index));
+      expect(() => getReconciledLegacyCommandIds(workspace)).toThrowError(expect.objectContaining({
+        code: mode === "invalid_next_id" ? "LEGACY_RECONCILIATION_OUTPUT_CORRUPT" : "LEGACY_RECONCILIATION_CONFLICT",
+      }));
+    },
+  );
+
+  it("legacy index without eviction watermark: retained newer items plus last committed allocation prove full capacity", () => {
+    seedDelivery();
+    seedEvidenceSources();
+    reconcileLegacyAccepted(workspace, commandId);
+    for (let i = 0; i < MAX_OUTPUT_RECORDS; i++) saveExecutionOutput(workspace.id, {
+      command: "new", raw: "output", commandId: `new-${i}`, iteration: 1,
+    });
+    const target = { workspaceId: workspace.id, workspaceRoot: workspace.root, commandId: `new-${MAX_OUTPUT_RECORDS - 1}`, iteration: 1 as const, stateDir };
+    confirmCommandCleanup(target, previewCommandCleanup(target).confirmationSha256!);
+    const file = path.join(stateDir, "execution-outputs", workspace.id, "index.json");
+    const index = JSON.parse(fs.readFileSync(file, "utf8"));
+    delete index.retentionThrough; // Legacy writer did not persist this optional field.
+    fs.writeFileSync(file, JSON.stringify(index));
+    expect(getReconciledLegacyCommandIds(workspace)).toEqual(new Set([commandId]));
+    // Another historical hole is no longer provable without an eviction witness.
+    index.items.shift();
+    fs.writeFileSync(file, JSON.stringify(index));
+    expect(() => getReconciledLegacyCommandIds(workspace)).toThrowError(expect.objectContaining({ code: "LEGACY_RECONCILIATION_CONFLICT" }));
+  });
+
+  it("allocation horizon from orphan skips/short-lived cleanup cannot authorize arbitrary metadata loss", () => {
+    seedDelivery();
+    seedEvidenceSources();
+    reconcileLegacyAccepted(workspace, commandId);
+    // A failed writer can leave arbitrarily many bodies, never committed metadata.
+    for (let id = 2; id <= MAX_OUTPUT_RECORDS; id++) fs.writeFileSync(path.join(stateDir, "execution-outputs", workspace.id, "bodies", `${id}.txt`), "orphan");
+    saveExecutionOutput(workspace.id, { command: "transient", raw: "output", commandId: "transient", iteration: 1 });
+    const target = { workspaceId: workspace.id, workspaceRoot: workspace.root, commandId: "transient", iteration: 1 as const, stateDir };
+    confirmCommandCleanup(target, previewCommandCleanup(target).confirmationSha256!);
+    const file = path.join(stateDir, "execution-outputs", workspace.id, "index.json");
+    const index = JSON.parse(fs.readFileSync(file, "utf8"));
+    expect(index.nextId).toBe(MAX_OUTPUT_RECORDS + 2);
+    expect(index.retentionThrough).toBeUndefined();
+    expect(index.items).toHaveLength(1); // Correct store still has the old output.
+    index.items = []; // Unsupported external deletion, despite a crossed horizon.
+    fs.writeFileSync(file, JSON.stringify(index));
+    expect(() => getReconciledLegacyCommandIds(workspace)).toThrowError(expect.objectContaining({ code: "LEGACY_RECONCILIATION_CONFLICT" }));
+  });
+
+  it("exact legacy command cleanup removes its evidence too; no surviving snapshot authority", () => {
+    seedDelivery();
+    seedEvidenceSources();
+    reconcileLegacyAccepted(workspace, commandId);
+    const target = { workspaceId: workspace.id, workspaceRoot: workspace.root, commandId, iteration: 1 as const, stateDir };
+    expect(confirmCommandCleanup(target, previewCommandCleanup(target).confirmationSha256!).status).toBe("cleaned");
+    expect(readLegacyReconciliations(workspace.id)).toEqual([]);
+    expect(getReconciledLegacyCommandIds(workspace)).toEqual(new Set());
+    expect(previewCommandCleanup(target).status).toBe("not_found");
   });
 
   it.each(["missing", "changed", "corrupt"])("已 reconciliation 的 output index %s 仍拒绝", mode => {

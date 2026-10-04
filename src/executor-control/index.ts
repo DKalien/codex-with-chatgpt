@@ -47,6 +47,52 @@ export {
 export type { ActiveExecutorBindingResult } from "./service.js";
 
 export {
+  EXECUTOR_DISPATCH_MAX_ENTRIES,
+  ExecutorDispatchError,
+  executorDispatchEntrySchema,
+  executorDispatchStateSchema,
+  executorDispatchStatusSchema,
+  parseExecutorDispatchEntry,
+  parseExecutorDispatchState,
+} from "./dispatch-schema.js";
+export type {
+  ExecutorDispatchEntry,
+  ExecutorDispatchIntent,
+  ExecutorDispatchState,
+  ExecutorDispatchStatus,
+} from "./dispatch-schema.js";
+
+export {
+  executorDispatchFile,
+  executorDispatchInitializedFile,
+  readExecutorDispatchState,
+  updateExecutorDispatchDetailed,
+} from "./dispatch-store.js";
+
+export {
+  beginExecutorDispatch,
+  finalizeExecutorDispatch,
+  getProcessDispatchOwnerId,
+  hashRequestAuthority,
+  markExecutorDispatchOutcomeUnknown,
+  readExecutorDispatchEntry,
+} from "./dispatch-service.js";
+export type {
+  BeginExecutorDispatchInput,
+  BeginExecutorDispatchResult,
+  FinalizeExecutorDispatchInput,
+  MarkExecutorDispatchOutcomeUnknownInput,
+} from "./dispatch-service.js";
+
+export {
+  EndpointSwitchLockError,
+  acquireEndpointSwitchLock,
+  endpointSwitchLockFile,
+  withEndpointSwitchLock,
+} from "../endpoint-switch/lock.js";
+export type { EndpointSwitchDomain, EndpointSwitchLockHandle, EndpointSwitchReleaseOutcome } from "../endpoint-switch/lock.js";
+
+export {
   CodexDesktopProductionBackend,
   createCodexDesktopProductionBackend,
 } from "./codex-backend.js";

@@ -1,37 +1,36 @@
 # Architecture
 
+## 当前实现与部署边界（2026-10-04）
+
+当前运行、构建、测试及下一阶段的唯一快照见 [开发计划当前事实](development-plan.md#当前事实与开发阶段2026-10-04-2144asiashanghai)。checkout 扩展构建与已安装/运行 Core 不同；历史全量、清零和部署记录仅证明对应阶段，不能据它们宣称当前队列为空或当前源码通过全量。
+
+B1 进程退出证据、B2 查询/连接与维护分离、B4 canonical 主链、B5 受控任务面板已实现；B3 已评估并决定不迁移 SQLite。固定 registry、Executor/Web Sink 合同、领域存储与安全启动协议继续复用。Supervisor foundation 已随 Core 安装，实际 Scheduled Task/config/runtime 仍 absent/null，独立自动恢复尚未启用。
+
+- `feedback_status`、`feedback_companion_status`、Companion `GET /state` 与任务面板读取现有权威，不负责 reconcile/cleanup/修锁/启动进程。连接修改通过 `bridge/connection.ts` 的 delivery arbiter 和 fresh in-flight 校验；后台 `bridge/maintenance.ts` 分批推进已授权的维护。
+- 网页命令经 MCP 与核心执行路由进入 Desktop；Companion 负责回流及面板，不下发开发任务。Desktop accepted、可信终态 record、canonical result、网页 observed/ACK 分别表示不同事实。
+- 显式连接依次完成主体接管、route attestation、凭据轮换与 Web Sink 收敛。旧绑定 VERIFIED 不代表当前页面已连接；刷新产生的新 document 需显式确认 owner。接管自举结果未知时只可验证原服务端下一代身份，不自动重发或清除未知；精确零写入拒绝可在后续显式操作重试。
+- 面板聚合当前 workspace 全部存续任务和异常历史；清理过的历史不重建。写操作需本机限时授权和精确 preview/confirm，不能任意重发 accepted/unknown 或终止执行。长期记录保留不是首版功能。
+- 运行判断分别核验进程身份、OS 退出证据和应用健康。shutdown ACK/端口关闭/exit code 都不能替代 HANDLE signaled；不确定时保留 runtime/release pin，不另起实例。
+
+详细职责与操作条件见 [职责边界第12节](core-plugin-boundaries.md#12-b2b5-剩余源码交付2026-10-04)，连接修复及现场结果见第14–15节。下方 command/B 切片中的未部署或 NEXT 均为当轮历史，当前进度以开发计划为准。
+
+```mermaid
+flowchart LR
+    WEB[ChatGPT 网页] -->|MCP 读取与受控任务请求| CORE[C2C Bridge 核心]
+    CORE -->|冻结执行目标 / Desktop IPC| CODEX[Codex 执行会话]
+    CODEX -->|同来源终态 record| CORE
+    CORE -->|canonical result / Result Bus| BC[Browser Companion]
+    BC -->|精确页面与发送门禁| WEB
+    UI[CLI / 任务面板] -->|只读查询或经授权用例| CORE
+    MAINT[有界后台维护] --> CORE
 ```
-             ┌───────────────────────────┐
-             │    ChatGPT Web / Sol      │
-             │  Reason / Plan / Review   │
-             └──────────┬──────────▲─────┘
-                        │          │
-               MCP      │          │ Computer Use
-            Data Plane  │          │ Control Plane
-                        ▼          │
-             ┌─────────────────────┐
-             │      C2C Bridge     │
-             │  MCP (RO + gated)   │
-             │  OAuth AS + PRM     │
-             │  Pairing Manager    │
-             │  Tunnel Manager     │
-             │  Admin API (local)  │
-             └──────────┬──────────┘
-                        │  read-only
-                        ▼
-             ┌─────────────────────┐
-             │   Local Workspace   │
-             └──────────▲──────────┘
-                        │ edit / shell / git / test
-             ┌──────────┴──────────┐
-             │  Codex Harness      │
-             └─────────────────────┘
-```
+
+Normal C2C 的 Computer Use 小消息流程仍是独立支持模式；不把它与 Desktop command/receipt、Remote Control 或 Companion 回流混为一条权限链。
 
 ## Principles
 
 - **ChatGPT thinks. Codex works.** The bridge never re-implements a coding harness.
-- **Computer Use = control plane**: tiny `[C2C]` state messages (< 1 KB).
+- **Normal C2C control plane**: Computer Use carries tiny `[C2C]` messages; separately authorized Desktop tasks use their own delivery/receipt contract.
 - **MCP = data plane**: ChatGPT pulls files/diffs/search results itself.
 - **Read-only by default**: the 9 base tools remain read-only. Desktop Control is a separately
   authorized plain-text delivery path to one existing Desktop thread; it is not a workspace
@@ -56,10 +55,56 @@
 | `execution/` | JSONL execution records plus optional sanitized command output (`execution_output`) |
 | `feedback/` | Production feedback outbox + companion transport: pairing/credential, route-principal attestation (challenge → `feedback_companion_route_confirm` → VERIFIED), reserve/begin-send/ack/retire, stale → `outcome_unknown`, exact late-positive ACK |
 | `browser-companion/` | MV3 sources → `dist/browser-companion`: SW-only Bridge HTTP + durable send journal + route-attestation fence; content_scripts use built classic artifacts (including `*-global.js` and classic wrappers), while ESM `dom-adapter`/`turn-observer`/`route-attestation*` stay for the SW import graph; autonomy default OFF; zero DOM/Send unless explicit production one-shot or armed heartbeat; production Send requires **route VERIFIED**；display-only toolbar indicator uses `C/C!/C×`，低频 `alarms` 只做 `/state` discovery |
-| `process/` | Daemon spawn/reuse, health probing, graceful shutdown |
-| `core/` | Verified machine install metadata, guarded rollout and per-workspace pending upgrades |
+| `process/` | Daemon spawn/reuse, health probing, graceful shutdown; Windows daemon spawn escapes Job kill-on-close via the Python stdlib helper `daemon_spawn.py` (`CREATE_BREAKAWAY_FROM_JOB` → WMI `Win32_Process.Create` relay, fail closed when Job escape cannot be proven), handing a bounded explicit allowlisted daemon env over through a 0600 JSON file (OS/runtime/path variables plus the exact C2C config set the bridge reads; unknown parent secrets/context excluded; a fresh startup lease is injected explicitly after projection, never inherited from the parent) so the bridge survives its spawner (e.g. Codex) exiting |
+| `core/` | Verified machine install metadata, guarded rollout and per-workspace pending upgrades; real installs reclaim unreferenced immutable releases through the existing `gc --apply` gates (maintenance lock, rollout fence, start lock, tombstone + no-follow delete); `--protect-current` never deletes |
 | `cli/` | `c2c` commands; `--json` everywhere for the Skill |
+| `supervisor/` | Per-workspace desired state, exact process lease, conservative recovery through existing daemon authority, and least-privilege Windows user-logon task registration |
 | `config/`, `logger/` | OS-convention state dir, secret-redacting logger |
+
+B2 首版历史证据见[设计第11节](core-plugin-boundaries.md#11-b2-首个实现切片只读状态与项目任务面板2026-10-04)；其中 `/state` 兼容维护的旧限制已由当前第12节实现替换。当前查询与连接的边界以上方最新源码段落为准。
+
+B2 源码门禁：**159 files / 3274 tests 全 PASS、exit0、unhandled0**；452 冻结 hash 稳定，归属/歧义进程、listener、新 test-tmp 目录均0。canonical build 三处一致为 `ac300c18dbdeb3d98e007645de2b7a16a46dbb5ba56c5157e987048c05037dfe`；未安装、Reload 扩展或 rollout。完整验证见[设计第11节](core-plugin-boundaries.md#11-b2-首个实现切片只读状态与项目任务面板2026-10-04)。
+
+B1 首个源码切片门禁：158 files / 3243 tests 全 PASS、unhandled0，445 冻结 hash 稳定、进程/listener/temp 新增0；canonical build 三处一致为 `6e18fd3ebde732847590a7420a3e81157e2c46c28115b1e5ce58ff2edad71aba`。此次未安装、rollout 或操作真实 Bridge/Scheduled Task；完整证据与保守保留 runtime pin 的代价见[设计第10节](core-plugin-boundaries.md#10-b1-首个实现切片进程退出证据2026-10-04)。
+
+### repair reclaim 的 stale-owner 恢复（command49）
+
+command49 修正下节 command48 takeover 的缺口：`.repair.reclaim` 不再只是 ad-hoc `{version,owner,nonce}`。新的 strict V1 sidecar绑定 workspaceId/commandId/repairId、exact PID/creationTime/executable、nonce、目标 repair fence 的 dev/ino/size/mtime/ctime/SHA256 和 createdAt；所有字段有界，不含原锁路径、argv、凭据或用户正文。普通 acquireLock 对 `.repair`、`.repair.reclaim`、`.repair.tmp` 的存在继续一律 BUSY，没有普通 stale reclaim 旁路。
+
+只读 preview 可验证有效 reclaim 的 owner missing、精确 target与文件身份，但不做 mutation；live/unknown/reused/replaced/corrupt 一律拒绝。显式双摘要 confirm 取得既有 maintenance 后，strict-read sidecar和target，做两次 exact missing proof，并在 unlink 前再次验证 maintenance、sidecar及target的完整身份/内容，才精确消费旧claim。之后 wx/fsync创建自己的新claim，再两次证明旧repair owner missing。新claim在替换主fence**之前**被精确消费，仍持有maintenance；所以 crash在消费前可恢复valid sidecar，消费后/发布前仍保留原主fence，发布后不会遗留target已过期的claim。atomic temp、损坏或target漂移继续保留现场，不猜测。
+
+实际锁顺序是 **machine maintenance → sorted command repair/normal lifecycle authorities → abandonment evidence/store locks**。入口显式拒绝已继承的command/workspace cleanup context；整个confirm及release期间持maintenance，低层takeover要求传入并反复验证exact handle。原cleanup仍command → workspace cleanup → stores，本流程不取得workspace cleanup。原rollout/GC先maintenance再rollout fence，本流程不取得rollout/start fence；独立Bridge start尝试start.lock后非阻塞获取maintenance，失败释放自己的start.lock；继承maintenance的start验证已有handle。本流程不调用Bridge start，因此不构成反向等待环。争用均为BUSY，不排队持低层锁等待maintenance。
+
+两contender测试验证失败者不做quarantine/abandonment mutation；真实wx获取顺序检查覆盖maintenance、各command及evidence。新增恢复测试覆盖claim创建后、owner proof后、claim消费后、二次proof变unknown、sidecar/target替换、maintenance丢失及corrupt schema。command48的原七个crash点、精确重放和普通writer无authority空窗继续保留。
+
+**维护锁边界**：没有改变或递归回收现有maintenance.lock。如果OS进程崩溃同时留下该锁，原maintenance机制继续BUSY，需单独审查解决该authority后才能执行repair恢复；有效reclaim的missing proof不授权删除maintenance。零字节/非strict reclaim（包括旧ad-hoc格式）永久fail closed待人工review，不能按age自动删除。真实command10修复仍待Planner review和新的明确破坏性授权；command49仅source/tests/docs。
+
+command49 source gate：focused18 files/430 tests、typecheck/diff PASS；唯一authoritative serial full **158 files/3223 tests PASS、exit0/unhandled0**，wall1711.52s/runner1706.84s。445冻结hash稳定，归属/歧义进程、listener及新增temp均0。full后一次canonical build的stored/compute/core ID精确一致为 **`b6a25e1c2b7912fb32f3abfa60556ec67d19ef3d361a1213e8eb5f58fd6303f7`**，没有再改源码/测试。机器历史、部署与Scheduled Task状态未由本轮改变，下一步仍需独立review和真实破坏性操作授权。
+
+### 历史零字节 lock 的显式行政收敛（command48）
+
+> 本节保留 command48 初始实现与门禁；有效 reclaim 的恢复和外层锁顺序以 command49 为准。
+
+`desktop/abandonment-repair.ts` 是唯一行政入口，`command-cleanup/abandonment-repair-store.ts` 管理独立 repair authority。它不是通用删锁工具；正常 send/record/projection/cleanup 不调用 repair acquisition，原 corrupt lifecycle lock 始终 `COMMAND_CLEANUP_BUSY`。普通 acquisition 在检查、stale reclaim 前及新锁创建后检查 repair sidecar/journal，避免 quarantine rename 到新锁之间产生 writer authority 空窗。
+
+CLI `desktop abandon-corrupt-lock -w <workspace> --command-ids <exact,csv> --repair-command-ids <exact,subset> --json` 仅返回只读 preview；最多100个 batch 命令、10个 repair 目标，无 all/wildcard/force/自动发现。操作者保存 JSON 后，confirm 还必须传 `--preview-file <saved.json> --confirm <abandonmentSha256> --repair-confirm <repairSha256>`。第二摘要绑定 canonical workspace、完整选择、binding、delivery、当前 maintenance context、两次零字节文件指纹和有界观察时间。公开 JSON 不含锁路径、owner nonce、凭据、argv 或正文。preview 不创建目录、sidecar 或 journal。maintenance context 变化也拒绝旧 proof；恢复并不授予跨 binding/turn 漂移的旁路。
+
+仅 historical accepted 且不同于当前 thread、两次 fresh IPC 为 `DESKTOP_NO_OWNER` 的目标可进入；这不证明未知旧锁 owner 已死或任务成功。已有 receipt、result/claim、outcome_unknown、行政证据、cleanup journal/temp/reclaim 均拒绝。锁须 canonical、regular、nlink=1、恰好零字节，两次 dev/ino/size/mtime/ctime/SHA256 一致；非空 malformed lock 不支持。
+
+全局顺序为 **sorted command repair/normal lifecycle authorities → 原 abandonment evidence/store locks**；不取得 workspace cleanup lock。repair sidecar 使用 `wx`/fsync，带精确 PID/creation/executable；live/unknown/reused/corrupt owner 不抢占。取得 repair fence 后再次校验全部 eligibility，先写 `prepared` 意图，再把原锁原子 rename 到 owner-only `desktop-lock-repairs/<workspace>/<repairId>.lock`，记录 `adopted_pending` 指纹，创建事务拥有的新正常锁。私有 capability 仅让同一个 abandonment 事务继承锁；提交前重新核验 fence、新锁、journal 与 quarantine 文件身份。原 delivery、records、outputs 不改写；一个 batch 写成功后记录其摘要、标记 completed，再释放新 lifecycle lock 和 repair fence。隔离原文件长期保留，不自动 restore/delete。
+
+| 中断点 | 留存状态与显式重放 |
+| --- | --- |
+| repair sidecar 后、rename 前 | 原损坏锁不变；sidecar 的 strict intent 固定选择及指纹。仅 exact owner missing 后重获该 authority。 |
+| quarantine rename 后、新 lifecycle lock 前 | 已有 prepared journal 和原 quarantine inode；repair sidecar 阻止普通 writer。验证后继续 adopted_pending/new lock。 |
+| adopted_pending / 新 lifecycle lock 后、abandonment 前 | 新有效锁与 repair fence 持续阻止写入；确认 owner missing、文件身份及全部 eligibility 后在新事务继承。正常锁固定最初 pid/nonce，恢复者的 exact ownership 在 repair sidecar，不能由普通 PID reclaim 获权。 |
+| abandonment 写入后、completed 前 | 使用原 confirmation 精确识别既有 batch，仅补齐 repair completion；不追加 batch 或第二 quarantine。 |
+| completed 后、锁释放前 | 校验 persisted batch 摘要与 quarantine，精确释放剩余自有锁。已完全释放的 replay 只读返回 already_abandoned。 |
+| 替换/损坏、未收敛 atomic temp 或 repair.reclaim | 保留现场并 fail closed；不推断、删除或自动回滚到无锁状态。 |
+
+Windows quarantine 目录/文件以当前用户 SID 验证 owner，设置并核验只含该用户的受保护 DACL，保留系统 audit ACL；使用真实 ACL 操作测试。不能证明文件身份或 process missing 即拒绝。本轮仅隔离 fixture 执行；真实 command10 repair 仍须 Planner review 和新的明确破坏性授权，没有安装、rollout、Bridge recovery 或 Scheduled Task 操作。当前验证证据见 [development-plan command48](development-plan.md)。
+
+command48 最终 gate **未通过**：唯一 serial full 158 files/3200 tests中3199通过、1项CLI精确名单断言遗漏新命令，exit1/unhandled0；445 hash稳定，归属/歧义进程、listener及temp残留0。已补齐该测试名单及manifest hash，定向接口/CLI/清单3 files/51 tests通过，生产源码未变；没有第二次full或额外post-PASS canonical build。需要另轮最终门禁，不能据新增协议45/45通过宣称整体ready。
 
 ### R5 source status
 
@@ -71,6 +116,52 @@ The current source includes the reviewed R5a-R5c slices:
 - R5d Result Bus, dynamic endpoint switching, and Bridge lifecycle retirement are not implemented.
 
 These are source/repository facts only. They do not claim that the current machine runtime has installed or rolled out this checkout; verify `status --json` and the named idle rollout gates before deployment.
+
+## R5i-b/c Windows per-user Bridge supervisor（command44）
+
+**command47 历史机器阻塞（2026-10-04；仅保留当轮阻塞证据，后续收敛见开发计划当前事实）**：用户授权的五条 exact ownerless 历史命令已通过当前生产 abandonment preview，但一次 confirm 返回 `DESKTOP_ABANDONMENT_FAILED`，五条全部仍 unresolved。已安装代码要求先获取各 command lifecycle 锁；受保护的 command10 零字节锁不能解析，按现有规则拒绝抢占，因此 batch 写入未开始。preview 的 eligibility 不等于 confirm 的锁可用性。完整 delivery 文件/身份、receipt/output metadata、既有 abandonment、bindings 与受保护 authority 前后未变；不拆批、不修锁、不直接写行政证据。历史收敛先决条件未满足，未进入 Bridge 条件恢复或安装/rollout；build `2714cdd9…6a0c1` 和442冻结文件保持不变，机器仍是旧 release。需另审安全收敛方案；详见[长期计划](development-plan.md) command47。
+
+**command46 部署前状态（2026-10-04 07:56，Asia/Shanghai）**：command45 source gate 已获 Planner 接受，442个冻结文件及 build `2714cdd9…6a0c1` 三重身份复核一致；安装与 scoped rollout 因现场门禁阻塞而未开始。机器仍运行 `8e155373…e2eebce`、PID16188/creation134355028686992076，exact process 存在。旧 thread 五条 unresolved 历史记录遇到 `DESKTOP_NO_OWNER`，rollout idle 为 `desktop_unknown`；后续 loopback health 返回 null、admin 8s响应超时、named health三次超时。应用状态未知不等于 stopped，本轮未强杀、重启或改动历史记录。只读 supervisor task=absent、config/runtime=null、状态目录不存在；GC plan 无 global blocker，保留一个历史 dangling local issue，未执行回收。部署和机器持久注册都尚未完成，后续先审查现场阻塞；详细证据见[长期计划](development-plan.md) command46。
+
+**command45 测试门禁更新（2026-10-04）**：本轮仅拆分测试及更新计数/hash bookkeeping 和文档，**supervisor 生产语义未变**。官方 test 仍 `vitest run`，candidate 仅同步157/3150、packaging1/serial6/parallel150、support32，workers3、experimental/deferred；未运行 candidate/parallel/worker 实验。 supervisor-store 15→23项独立 fixture 保留原77条断言与真实 ACL/store/身份操作；初轮 replacement 57.27s未达标，继续拆分后最终 standalone 最长53.29s；focused7/103、typecheck/diff通过。唯一正式 `pnpm test --maxWorkers=1 --testTimeout=90000` 为 **157 files / 3150 tests PASS，exit0，unhandled errors 0**；wall **1561.23s** / runner **1556.18s**，full 内 supervisor-store 最长单项 **54.26s**。无 skipped/pending/retry，442 个 source/test/support 冻结哈希稳定；command44 生产代码与未改 core-install 测试哈希保持一致；core-install 本轮32/32通过，原EPERM未复现。新增 test-tmp 目录、归属/歧义进程及 listener 均0（全局新增进程也为0）。 full PASS 后仅执行一次显式 canonical build，stored build-id == computeBuildId == core-release.buildId == `2714cdd9a48d21881d73800720b66403f829275a5de42006ffaf6001e7d6a0c1`。 生产部署与真实注册/reboot验收仍待另轮授权，证据见[长期计划](development-plan.md) command45。
+
+command45 的 source gate PASS 不等于终态回执闭环：标准 record 返回 `DESKTOP_RESULT_NOT_APPLICABLE`，原 delivery turn 已 failed，用户“继续”在新的普通 turn 中完成剩余工作；新 turn 不能代记旧 delivery。没有生成 record/draft/output，也未使用 fallback 或手写 Result Bus。诊断在 `.tooling/command45/receipt-diagnostic.json`。
+
+`src/supervisor/` 建立每个 workspace 一份严格 desired-state config、单 supervisor lease 与显式 intent operation lock。每轮 supervisor 在 operation lock 内重读 config 并完成状态观察/恢复；配置读取也在锁内，防止 install/pause/stop 与恢复竞态。长 lease 记录 workspace、supervisor PID/creation/executable 和 build identity。只有锁 owner 精确证明已退出、并在 unlink 前复核同一文件身份时才回收；活跃、未知、被替换或损坏的 owner 一律 busy。
+
+Config 绑定 canonical `workspaceId`/`workspaceRoot`，严格 schema 包含 version、desired state、tunnel、registration mode、revision 与 `updatedAt`。状态目录/文件要求 canonical regular-file identity，拒绝链接、共享 hardlink、损坏 schema 与中断临时文件；写入使用 owner-only ACL、fsync 和 atomic rename，不包含 credential/secret。
+
+`desiredState=stopped` 时 supervisor 不启动或终止 Bridge；`running` 时仅对健康 Bridge no-op，对 `unknown`、probe/application timeout、maintenance/start-lock busy 保持有界 backoff，不启动第二个 Bridge、不 kill 现有进程。只有现有 observation 明确证明 Bridge stopped 时，才调用既有 `ensureBridgeAndTunnel`/startup lease/start-lock。配置要求 tunnel 时必须复用该 workspace 已配置且 ready 的 named tunnel，并验证恢复后的 hostname/provider；不会退化到 quick tunnel。Desktop、Feedback、Web Sink、Executor binding 与 endpoint target 不属于 supervisor 控制面。
+
+显式 `start`/`stop`/`restart` 与首次 install 共用既有 machine maintenance fence；start/restart 传递 inherited handle 给原 ensure/start authority。围栏内确认本 workspace 没有 supervisor evidence 时走 legacy 路径，不创建 supervisor state、不调用其 ACL/process probe/ScheduledTasks；存在 config/orphan/损坏证据则严格处理。配置存在时在 operation lock 中先提交 desired state 再执行动作，写失败不启动/关闭 Bridge；并发竞争返回 busy，不宣称 stop 完成。rollout 不改变 desired state。
+
+`supervisor install` 在同一 operation fence 内先写 stopped/none，保留 tunnel，注册并 fresh inspect exact-owned task 后才写 running/windows-scheduled-task。失败保持 stopped/none；不立即运行 task 或启动 Bridge。`pause` 保留注册并 idle。`uninstall` 先写 stopped、exact remove/confirm absent，再写 stopped/none；loop 见非 windows-scheduled-task 即自退，finally 释放 exact lease/runtime，不停止 Bridge。remove 失败/冲突仍 stopped/windows-scheduled-task；最后写 none 失败报告错误，由后续显式 uninstall 根据 absent 收敛。status 只读分别呈现 config.registrationMode、registration inspection 与 runtime。
+
+Windows registration abstraction 的定义绑定当前用户 SID、`InteractiveToken`、`Limited` 与 `AtLogOn`，使用稳定的 `<stateDir>/bin/c2c.js` 加 exact Node executable，参数只包含 workspace/state directory。Settings 固定为 `StartWhenAvailable`、`IgnoreNew`、`ExecutionTimeLimit=PT0S` 和 3 次/1 分钟的 bounded restart。inspect 对 action、trigger、principal、registration description 和 settings 做完整投影比较；同名 foreign/drifted task 是 conflict，install 不 force overwrite，uninstall 再读取并确认 exact match。当前 Windows capability audit 为代表性只读检查：确认 ScheduledTasks module 1.0/cmdlets、当前 SID 以及上述 principal/settings 可表达；没有真实创建、注册或启动任务。无 Scheduled Task capability 时显式报告 unsupported，不回退到 Windows Service、HKCU Run 或其他启动机制。
+
+stable launcher 对 scheduled task 的 `supervisor run` 入口先取得 machine maintenance fence，在 fence 内读取 current 并写入 exact launch pin，再释放 fence、载入所选 immutable release 并传入该 pin 及创建时的有界 file identity/SHA256。release 先对照 launcher 原始 proof，读取并固定 pin 的 filename/nonce/content/file identity，取得 fsync/atomic rename 发布的 runtime lease 后再次证明完整 ownership，才通过限定 capability 消费原 launch pin。任意文件路径或重新读取的替代快照不授予删除权。交接后 runtime 是唯一运行期 release 引用；正常退出释放 runtime，不要求 launch pin 仍存在。交接前失败保留 startup pin；成功交接后 crash/reboot 只留下 stale runtime/lock，下一实例仅在 exact PID/creation identity 被证明 missing 后回收。
+
+GC reference graph 识别 launch/runtime 两种引用：startup handoff 未完成时保守保护 launch build，完成后 live exact runtime 单独保护旧 build；损坏、非 canonical、身份不符或未知条目 fail closed。当前 supervisor 不 hot-update；旧进程继续执行 pinned release，退出后下一次实际 launch/logon 才选择 current。`IgnoreNew` 避免并发 supervisor；本 slice 不含运行中版本热交接。
+
+foundation 已包含在当前安装 Core；实际 Scheduled Task 尚未注册，不能宣称独立守护已启用。真实注册、reboot/login、Codex 退出后恢复、Core update/GC 与现场 safety acceptance 仍待独立授权及验证。command43 用户优先级将 R5j candidate 性能优化推迟到产品/lifecycle 工作最后；command42 的历史 NEXT 不再是当前 NEXT。
+
+公开入口均接受 `-w <workspace>`：`supervisor status [--json]` 只读显示 config、任务 ownership 和 runtime identity；`install [--tunnel] [--json]` 注册并允许恢复；`pause [--json]` 暂停恢复；`uninstall [--json]` 暂停、移除精确任务并要求 loop 自退。内部 `supervisor run` 只能由 stable launcher 携带精确 launch pin 进入，不能从 checkout 直接运行。未配置 supervisor 的 start/stop/restart 不创建 desired-state config；existing maintenance fence 协调首次 install。失败/unknown 的等待阶梯为 1、2、5、10 秒，10 秒封顶；healthy 或 paused 重置退避并等待 10 秒，OS 探测和权限校验耗时另计；none/unsupported 为终止条件，不再 sleep。
+
+command43 历史门禁为157文件/3126测试、3125 PASS/1 FAIL、exit1，失败是未改的 core-install 旧v1 pointer fixture目录rename EPERM，随后32/32 standalone仅作诊断。command44 保持该测试不变，新增 handoff/retire/registration/race 回归。最终focused14文件/379测试、typecheck/diff通过；唯一正式full为 **157文件/3142测试 passed，但1个 unhandled Vitest `onTaskUpdate` RPC timeout，exit1，门禁仍FAIL**（wall1604.38s/runner1599.06s）。core-install32/32通过，原EPERM未复现。错误没有task/file归属证据，未改runner/timeout、未追加full。442 hash稳定，新增目录/归属及歧义进程/listener均0（全局新增5进程已证明无关）；packaging两次build通过，三方ID为`2714cdd9a48d21881d73800720b66403f829275a5de42006ffaf6001e7d6a0c1`，只读复核后未额外post-PASS build。证据见[长期计划](development-plan.md) command44 与 `.tooling/command44/`。尚未部署，真实注册/reboot验收仍需另轮授权。
+
+## Core GC reference scope（command33实现，command34已部署/live验证）
+
+command34真实机器验收：installed/current/running均 `8256ad7b704e7c109973b5c1436253f05a59aa24ed157fc766fbecfad3016765`。phase1自动GC删除预冻结13项/929,156,162 bytes；phase2在旧runtime exact identity消失后，只删除退役59e一项/72,081,745 bytes。合计14项/1,001,237,907 bytes，active releases最终仅1，candidate0/unknown0/global0/local1。dangling runtime:d94af68105aa→missing9c33929c…ce0732a告警及authority保持，不阻断独立release回收；partial/exit1保留告警语义。本轮新增tombstone0，9月遗留gc-trash目录另行保留，未扩大删除范围。初次rollout的named tunnel API超时通过stable同target start --tunnel恢复，最终scoped rollout current1/pending0/error0、local/admin/named精确健康；bindings及其他workspace runtimes保持。详细证据见development-plan command34。
+
+GC 从 current/runtime/runtime-upgrade/legacy finalizer lifecycle authority，以及当前 canonical supervisor launch/runtime pin 收集 release 引用；spawn provenance、execution record、Result Bus 与 command cleanup 不加入 release authority。supervisor pin 精确指向 build；无效或未知 supervisor authority 默认 global blocker，避免猜测其是否仍在使用某个 release。
+
+- `global`：current identity 不可验证、目标 build 不明、authority 非 canonical regular file/目录遍历不完整、orphan/corrupt retirement/claim；整轮拒绝开始删除，运行中出现则停止后续删除。
+- `build(buildId)`：exact dangling 引用，或 exact target 已证明但不兼容 strict retirement 的 finalizer；只 pin 该 build，不丢弃告警或放宽 retirement。
+- `release(entryName)`：manifest/链接/目录名等局部损坏；只将该 release 标为 unknown，不跟随不安全路径。
+
+最小 reference extraction 要求 canonical filename、workspaceRoot/id 和 buildId 精确匹配；`capabilities` 等非引用字段不使已知 pin 变 unknown。原始 authority 不写回、不修复、不删除。strict retirement 继续要求 expired、claim/token、ESRCH 与前后文件身份；不兼容记录保守保留，不进入 retirement。
+
+`GcPlan.safety` 为 clean/degraded/blocked；显式 scope/count 与 `issueDetails` 供机器消费。`ok=false`/CLI exit1 保留告警合同；degraded 可含安全候选，apply `status=partial` 可含已删除与保留项。maintenance → rollout fence → start-lock → fresh plan 下只处理 initial/fresh 稳定交集；新候选推迟，逐项重验，no-follow tombstone/delete，bytesDeleted 只计已完成物理删除。新近 exact retirement 释放项只有两次快照均有该 pin 且严格证明成立才能当轮回收。此合同没有执行真实清理的隐式授权。
 
 ## R4.5 Structural Boundaries
 
@@ -145,6 +236,8 @@ the exact command ID and this turn's test/output evidence. Review resolves that 
 output ID, never a historical latest test result. See [automatic receipts](desktop-control.md#自动验收记录).
 
 **Production feedback companion**: ChatGPT MCP (trusted principal) enables receiver → one-time pairing → Edge MV3 companion holds scoped credential **only in SW** → **route attestation**: pair mints pending challenge; production `/reserve`/`begin-send` require authenticated `/state` `routeVerification=VERIFIED` via MCP `feedback_companion_route_confirm` (wrong principal does not consume the challenge). `feedback_bootstrap_status` is a bounded request-scoped readiness projection. After a CAS takeover, the predecessor credential remains invalid for all production APIs; it can only call `/rebind/init`, read exact `/rebind/status`, and call `/rebind/complete` for the immediate successor when no in-flight event exists. `Connect this Chat` binds identity through the content-script `MessageSender`, durable-persists autonomy `OFF`, then reuses the G3 one-shot runner/fence; a durable connect fence prevents attestation or completion replay across restart. Read-only status rechecks `reserved|claimed|outcome_unknown` before returning `CONFIRMED`; deterministic pre-mint repair/confirmation rejection rolls back to `ATTEST_REQUESTED`, while ambiguity remains `OUTCOME_UNKNOWN`. Rebind uses a persisted TTL/one-shot challenge and rotates to a fresh credential only after current-principal confirmation; the Browser Companion never receives an MCP principal. Pair/Rebind/Complete/Clear are serialized in SW. Browser durable fence + `PAIRING_TRANSITION` survive restart; non-NONE fence blocks resend until a successful re-pair or rebind writes matching identity. Named URL `/api/companion/v1` reserve/begin-send/ack/rebind. Journal is durable and single-flight; observation timeout becomes `outcome_unknown` (never auto-resend). Late-positive closeout requires exact identity: Companion `/ack` or trusted `feedback_ack_observed` (`claimed|outcome_unknown` + exact attempt → `observed`), SW clear from authenticated `/state` observed proof when `inFlight=null`, or exact message-body DOM observation (parent ATTEMPT + bounded descendant `innerText` equality). Route-attestation observer uses the same bounded descendant style but **challengeId** marker only (no ATTEMPT_ID). Optional autonomy scheduler defaults OFF: shadow is read-only; armed uses exact-owner heartbeat + journal-first recovery + durable cooldown. `retired_unknown` is a manual terminal that never ACKs or resurrects.
+
+**R5h ephemeral command state**: new command flows are complete only after canonical Result Bus exact observed/ACK. The observed commit precedes physical cleanup of command-scoped delivery, dispatch, receipt/output, Routing and compatibility projections; incomplete/unknown flows remain. An active-only cleanup journal fences producers and recovery until deletion finishes, then removes itself. Exact-confirm `cleanup command` can locally abandon an incomplete flow without claiming execution or observation. Browser recovery uses an authenticated signed exact-attempt `terminal_gone` response to discard its local journal without sending again. Completed history is no longer permanent dedupe or execution-summary storage; workspace bindings/runtime fences remain. Existing unmarked history is legacy and is not automatically migrated. See [R5h protocol](r5-endpoint-architecture.md#15-r5h-ephemeral-command-lifecycle).
 
 **Authorization**: 401 with `WWW-Authenticate: resource_metadata=…` →
 `/.well-known/oauth-protected-resource/mcp` → AS metadata → DCR →

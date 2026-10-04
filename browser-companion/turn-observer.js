@@ -471,10 +471,90 @@ export function hasExactVisibleBodyDescendant(node, want, attemptId) {
 }
 
 /**
+ * Observed ChatGPT user Markdown shape: one P, inline text/SPAN/A and BR.
+ * A link's empty block favicon can add a layout newline to P.innerText; outer
+ * collapse controls add more text. Reconstruct ONLY this explicit body shape,
+ * preserving every text character and BR. No whitespace folding, href-derived
+ * text, hidden-text fallback or general Markdown interpretation.
+ */
+function readRichTextUserBody(bubble) {
+  if (bubble?.getAttribute?.("data-user-message-bubble") !== "true") return null;
+  const view = bubble.ownerDocument?.defaultView;
+  if (typeof view?.getComputedStyle !== "function") return null;
+  const visible = (element) => {
+    const style = view.getComputedStyle(element);
+    return style.display !== "none" && style.visibility === "visible"
+      && Number(style.opacity) !== 0;
+  };
+  try {
+    // Search wrappers only, pruning rich bodies. Exhaust the bounded search so
+    // a second body cannot be silently ignored. Existing 64-node scan stays put.
+    const pending = [bubble], bodies = [];
+    let searched = 0;
+    while (pending.length) {
+      if (++searched > 64) return null;
+      const element = pending.pop();
+      if (element.classList?.contains("rich-text-user-turn")) {
+        bodies.push(element);
+        continue;
+      }
+      const children = element.children;
+      if (!children || searched + pending.length + children.length > 64) return null;
+      for (const child of children) pending.push(child);
+    }
+    if (bodies.length !== 1) return null;
+    const body = bodies[0];
+    if (body.tagName !== "DIV" || body.childNodes.length !== 1
+      || body.firstChild?.tagName !== "P") return null;
+    for (let parent = body; parent; parent = parent.parentElement) {
+      if (!visible(parent)) return null;
+      if (parent === bubble) break;
+    }
+    // Separate, bounded grammar walk: real incident body has 65 nodes, including
+    // text nodes and the empty favicon. Unknown/oversized trees fail closed.
+    let remaining = 128;
+    const read = (node, inLink = false) => {
+      if (--remaining < 0) throw Error("rich_body_limit");
+      if (node.nodeType === 3) return node.nodeValue;
+      if (node.nodeType !== 1) throw Error("rich_body_node");
+      const tag = node.tagName.toUpperCase();
+      // A link's decorative subtree is allowed only when it has no text.
+      if (inLink && rawTextContentOf(node) === "" && ["SPAN", "SVG", "PATH", "IMG"].includes(tag)) {
+        for (const child of node.childNodes) read(child, true);
+        return "";
+      }
+      if (!visible(node)) throw Error("rich_body_hidden");
+      const style = view.getComputedStyle(node);
+      const display = style.display;
+      if (style.textTransform !== "none") throw Error("rich_body_transform");
+      if (node.childNodes.length > remaining) throw Error("rich_body_limit");
+      if (tag === "BR" && !inLink && node.childNodes.length === 0 && display === "inline") return "\n";
+      if (tag === "A" && !inLink && display === "inline"
+        && /(?:^|\s)ExternalMarkdownLink-\S+/.test(node.className)) {
+        const text = rawInnerTextOf(node);
+        if (!text || text !== rawTextContentOf(node) || LINE_BREAKS.test(text)) throw Error("rich_body_link");
+        const rebuilt = Array.from(node.childNodes, child => read(child, true)).join("");
+        if (rebuilt !== text) throw Error("rich_body_link_text");
+        return text;
+      }
+      if (!((tag === "P" && node === body.firstChild && display === "block")
+        || (tag === "SPAN" && display === "inline"))) throw Error("rich_body_shape");
+      if (tag === "SPAN" && rawInnerTextOf(node) !== rawTextContentOf(node)) throw Error("rich_body_inline_text");
+      return Array.from(node.childNodes, child => read(child, inLink)).join("");
+    };
+    return normalizeCanonicalDomText(read(body.firstChild));
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Canonical message-body match for one USER turn.
  * 1) Parent exact fast path: turn.text === want + exact ATTEMPT.
  * 2) Else bounded fallback: parent visible text must have exact ATTEMPT marker,
  *    and some descendant innerText is canonical-exact (byte/canonical equality only).
+ * 3) Known modern rich USER paragraph may reconstruct text + explicit BRs;
+ *    the whole reconstructed body and ATTEMPT marker must still match exactly.
  * Ambiguity is counted per USER TURN, never per descendant.
  */
 export function canonicalTurnBodyMatch(turn, want, attemptId) {
@@ -489,14 +569,16 @@ export function canonicalTurnBodyMatch(turn, want, attemptId) {
   // Parent visible representation must carry the exact ATTEMPT marker first.
   if (!hasExactAttemptMarker(turn.text, attemptId).ok) return false;
 
-  return hasExactVisibleBodyDescendant(turn.node, want, attemptId);
+  if (hasExactVisibleBodyDescendant(turn.node, want, attemptId)) return true;
+  const richBody = readRichTextUserBody(turn.node);
+  return richBody === want && hasExactAttemptMarker(richBody, attemptId).ok;
 }
 
 /**
  * Find exactly one new (or uniquely matching) USER turn whose
  * normalized body equals the canonical message with exact ATTEMPT_ID line.
  *
- * Parent exact fast path, or bounded descendant innerText exact-body fallback.
+ * Parent exact, bounded descendant exact, or known rich USER body reconstruction.
  * Zero => not observed. Multiple USER turns => ambiguous fail closed.
  */
 export function findCanonicalUserTurn(doc, input = {}) {

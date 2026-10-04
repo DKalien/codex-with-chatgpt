@@ -8,7 +8,7 @@ import {
   isRouteAttestationVerified,
   type FeedbackState,
 } from "./schema.js";
-import { readFeedbackState, recoverStaleInMemory, recoverStaleFeedback } from "./state-store.js";
+import { readFeedbackState, readFeedbackStatusState, recoverStaleInMemory } from "./state-store.js";
 import { mutateCompanionPairing } from "./companion-state.js";
 import {
   companionMatchesBinding,
@@ -25,7 +25,7 @@ export function companionStatusForPrincipal(input: {
 }): Record<string, unknown> {
   requireConversationPrincipal(input.principal);
   const stateDir = input.stateDir ?? getStateDir();
-  const state = recoverStaleFeedback(input.workspaceId, stateDir);
+  const state = readFeedbackStatusState(input.workspaceId, stateDir);
   if (
     !state.binding
     || state.binding.status !== "active"

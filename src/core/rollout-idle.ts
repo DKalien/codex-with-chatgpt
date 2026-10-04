@@ -82,13 +82,13 @@ export function currentCodexThread(workspace: Workspace): string | null {
 }
 
 /**
- * 结构化 idle 评估。normal rollout 与 finalizer 共用，避免门禁漂移。
- * 不 throw Skip；调用方按 blockers 决定 restart / pending_busy / schedule。
+ * rollout 只忽略 Desktop 活动；默认模式保留 legacy self-busy 评估。
+ * 不 throw Skip；调用方按 blockers 决定维护或保留 pending。
  */
 export async function assessRolloutIdle(
   workspace: Workspace,
   info: { pairingActive?: unknown; runtimeBuildId?: unknown } | null,
-  options: { skipSelfTurnCheck?: boolean } = {},
+  options: { skipSelfTurnCheck?: boolean; ignoreDesktopActivity?: boolean } = {},
 ): Promise<IdleAssessment> {
   const blockers: RolloutBlocker[] = [];
   const selfThreadId = options.skipSelfTurnCheck ? null : currentCodexThread(workspace);
@@ -111,20 +111,23 @@ export async function assessRolloutIdle(
         .map(item => item.threadId!);
       const binding = desktop?.binding;
       if (acceptedThreads.length && !binding) blockers.push({ kind: "desktop_unknown" });
-      if (binding) for (const tid of new Set([binding.threadId, ...acceptedThreads])) {
+      if (binding && !desktop?.runtimeFence) blockers.push({ kind: "desktop_unknown" });
+      if (binding && desktop?.runtimeFence) for (const tid of new Set([binding.threadId, ...acceptedThreads])) {
         const retirementOnly = tid !== binding.threadId && accepted
           .filter(item => item.threadId === tid && !skipHistory.has(item.commandId))
           .every(item => retired.has(item.commandId));
         let observed;
         try {
           observed = await desktopIpc.inspect({ threadId: tid, hostId: binding.hostId,
-            projectId: binding.projectId, workspaceRoot: workspace.root });
+            projectId: binding.projectId, workspaceRoot: workspace.root }, desktop.runtimeFence);
         } catch (error) {
           if (!retirementOnly) {
             const code = (error as { code?: string }).code;
             if (code === "DESKTOP_BUSY") {
-              if (tid !== selfThreadId) blockers.push({ kind: "desktop_busy", threadId: tid });
-            } else if (code === "DESKTOP_APPROVAL_PENDING") blockers.push({ kind: "approval_pending" });
+              if (!options.ignoreDesktopActivity && tid !== selfThreadId) blockers.push({ kind: "desktop_busy", threadId: tid });
+            } else if (code === "DESKTOP_APPROVAL_PENDING") {
+              if (!options.ignoreDesktopActivity) blockers.push({ kind: "approval_pending" });
+            }
             else blockers.push({ kind: "desktop_unknown" });
             continue;
           }
@@ -134,14 +137,16 @@ export async function assessRolloutIdle(
             .filter(item => item.threadId === tid && !skipHistory.has(item.commandId))
             .every(item => ownerless.has(item.commandId))) continue;
           if (code === "DESKTOP_BUSY") {
-            if (tid !== selfThreadId) blockers.push({ kind: "desktop_busy", threadId: tid });
+            if (!options.ignoreDesktopActivity && tid !== selfThreadId) blockers.push({ kind: "desktop_busy", threadId: tid });
+          } else if (code === "DESKTOP_APPROVAL_PENDING") {
+            if (!options.ignoreDesktopActivity) blockers.push({ kind: "approval_pending" });
           } else blockers.push({ kind: "desktop_unknown" });
           continue;
         }
         if (observed.runtimeStatus !== "idle") {
           if (observed.runtimeStatus === "active" || observed.runtimeStatus === "inProgress") {
             // 同一 self-turn 不再重复记 desktop_busy，避免遮挡唯一 self-busy proof。
-            if (tid !== selfThreadId) blockers.push({ kind: "desktop_busy", threadId: tid });
+            if (!options.ignoreDesktopActivity && tid !== selfThreadId) blockers.push({ kind: "desktop_busy", threadId: tid });
           } else {
             blockers.push({ kind: "desktop_unknown" });
           }
@@ -150,8 +155,11 @@ export async function assessRolloutIdle(
     }
   } catch (error) {
     const code = (error as { code?: string }).code;
-    if (code === "DESKTOP_BUSY") blockers.push({ kind: "desktop_busy" });
-    else if (code === "DESKTOP_APPROVAL_PENDING") blockers.push({ kind: "approval_pending" });
+    if (code === "DESKTOP_BUSY") {
+      if (!options.ignoreDesktopActivity) blockers.push({ kind: "desktop_busy" });
+    } else if (code === "DESKTOP_APPROVAL_PENDING") {
+      if (!options.ignoreDesktopActivity) blockers.push({ kind: "approval_pending" });
+    }
     else blockers.push({ kind: "desktop_unknown" });
   }
 

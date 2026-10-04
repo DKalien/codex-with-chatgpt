@@ -18,6 +18,25 @@ describe("R5b MCP tool contract surface", () => {
     expect(source).not.toMatch(/registerTool\(\s*"executor_bind"/);
   });
 
+  it("R5E_AUTH_BEFORE_PIN: executor_send performs live executorAuthorize BEFORE durable pin, retains send-time revalidation, userConfirmed intact", () => {
+    const source = fs.readFileSync(path.join(process.cwd(), "src/mcp/executor-tools.ts"), "utf8");
+    // pre-pin 顺序：requireAuth → authorizeNow → executorAuthorize → workspace 校验 → pin。
+    expect(source).toMatch(
+      /authorizeNow\(auth\);\s*\n(?:\s*\/\/[^\n]*\n)*\s*executorAuthorize\?\.\(auth\);\s*\n\s*if \(input\.workspaceId/,
+    );
+    // send-time authorize 回调保留为第二道重验证。
+    expect(source).toMatch(
+      /authorize:\s*\(\)\s*=>\s*\{\s*authorizeNow\(auth\);\s*executorAuthorize\?\.\(auth\);/,
+    );
+    // pin 前不得有任何 beginExecutorDispatch 调用先于 executorAuthorize。
+    const prePinIndex = source.indexOf("executorAuthorize?.(auth);");
+    const pinIndex = source.indexOf("beginExecutorDispatch({");
+    expect(prePinIndex).toBeGreaterThanOrEqual(0);
+    expect(pinIndex).toBeGreaterThan(prePinIndex);
+    // userConfirmed:true 不得削弱。
+    expect(source).toMatch(/userConfirmed:\s*z\.literal\(true\)/);
+  });
+
   it("scope matrix is distinct: desktop scopes cannot substitute executor scopes", () => {
     expect(EXECUTOR_READ_SCOPE).toBe("codex.executor.read");
     expect(EXECUTOR_CONTROL_SCOPE).toBe("codex.executor.control");

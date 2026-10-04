@@ -31,6 +31,14 @@ const turnId = "01a00000-0000-7000-8000-000000000003";
 const deliveryIdA = "01a00000-0000-7000-8000-000000000004";
 const deliveryIdB = "01a00000-0000-7000-8000-000000000005";
 const now = "2026-09-20T00:00:00.000Z";
+const runtimeFence = {
+  desktopPid: 1001,
+  desktopExe: "C:\\Program Files\\ChatGPT\\ChatGPT.exe",
+  desktopCreation: "1000001",
+  appServerPid: 1002,
+  appServerExe: "C:\\Program Files\\ChatGPT\\codex.exe",
+  appServerCreation: "1000002",
+};
 
 let root: string;
 let stateDir: string;
@@ -76,6 +84,7 @@ function seedUnknown(commandId = "unknown_one", status: "outcome_unknown" | "acc
       workspaceId: workspace.id,
       workspaceRoot: workspace.root,
       enabled: true,
+      runtimeFence,
       binding: { threadId, hostId: "local" as const, projectId: "project", bindingId, title: "bound", boundAt: now },
       deliveries: [{ commandId, ...(deliveryId === undefined ? {} : { deliveryId }), clientId: "client", bindingId, intent: "development_plan" as const,
         messageSha256: "a".repeat(64), messageBytes: 1, threadId,
@@ -189,7 +198,7 @@ describe("Desktop outcome_unknown administrative resolution", () => {
     expect(readDesktop(workspace.id)?.deliveries[0]).toMatchObject({ deliveryStatus: "outcome_unknown" });
   });
 
-  it("reconciliation 已完成 Desktop 观察后与行政 resolution 交错时仍拒绝改写", async () => {
+  it("reconciliation 持有 command lifecycle lock 时行政 resolution busy，释放后 reconciliation 完成", async () => {
     seedUnknown();
     const observed = deferred<void>();
     const release = deferred<{
@@ -203,13 +212,15 @@ describe("Desktop outcome_unknown administrative resolution", () => {
     await observed.promise;
 
     const preview = previewOutcomeResolution(workspace, "unknown_one");
-    resolveOutcomeUnknown(workspace, "unknown_one", preview.confirmationSha256);
+    expect(() => resolveOutcomeUnknown(workspace, "unknown_one", preview.confirmationSha256))
+      .toThrowError(expect.objectContaining({ code: "COMMAND_CLEANUP_BUSY" }));
+    expect(readOutcomeResolutions(workspace.id)).toHaveLength(0);
     release.resolve({ threadId, hostId: "local", projectId: "project", workspaceRoot: workspace.root, candidates: [turnId] });
 
-    await expect(pendingReconciliation).rejects.toMatchObject({ code: "DESKTOP_RECONCILIATION_CONFLICT" });
+    await expect(pendingReconciliation).resolves.toMatchObject({ status: "accepted", turnId });
     expect(reconcile).toHaveBeenCalledTimes(1);
-    expect(readDesktop(workspace.id)?.deliveries[0]).toMatchObject({ deliveryStatus: "outcome_unknown" });
-    expect(getResolvedUnknownCommandIds(workspace)).toEqual(new Set(["unknown_one"]));
+    expect(readDesktop(workspace.id)?.deliveries[0]).toMatchObject({ deliveryStatus: "accepted", turnId });
+    expect(getResolvedUnknownCommandIds(workspace)).toEqual(new Set());
   });
 
   it("accepted transition 先提交时，后续行政 resolution 拒绝且保留 accepted", async () => {
@@ -224,6 +235,34 @@ describe("Desktop outcome_unknown administrative resolution", () => {
       .toThrow(/outcome_unknown|不满足|不存在|冲突/);
     expect(readOutcomeResolutions(workspace.id)).toHaveLength(0);
     expect(readDesktop(workspace.id)?.deliveries[0]).toMatchObject({ deliveryStatus: "accepted", turnId });
+  });
+
+  it("缺少 runtime fence 时 reconciliation 与 rollout idle 都 fail closed", async () => {
+    seedUnknown();
+    updateDesktop(workspace.id, state => {
+      if (!state) throw new Error("missing state");
+      const next = { ...state };
+      delete next.runtimeFence;
+      return { state: next, result: undefined };
+    });
+    const reconcile = vi.spyOn(desktopIpc, "reconcileUnknown").mockResolvedValue({
+      threadId, hostId: "local", projectId: "project", workspaceRoot: workspace.root, candidates: [turnId],
+    });
+    await expect(reconcileUnknownDesktopDelivery(workspace, "unknown_one"))
+      .rejects.toMatchObject({ code: "DESKTOP_RUNTIME_FENCE_MISSING" });
+    expect(reconcile).not.toHaveBeenCalled();
+
+    updateDesktop(workspace.id, state => {
+      if (!state) throw new Error("missing state");
+      const delivery = state.deliveries[0]!;
+      delivery.deliveryStatus = "accepted";
+      delivery.turnId = turnId;
+      return { state, result: undefined };
+    });
+    vi.mocked(desktopIpc.inspect).mockClear();
+    const assessment = await assessRolloutIdle(workspace, null);
+    expect(assessment.blockers).toContainEqual({ kind: "desktop_unknown" });
+    expect(desktopIpc.inspect).not.toHaveBeenCalled();
   });
 
   it("孤立 execution output 也构成冲突证据", () => {

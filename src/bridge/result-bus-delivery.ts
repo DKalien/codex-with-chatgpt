@@ -1,11 +1,13 @@
+import { canonicalRoutingResultDigest } from "../routing/execution-result-digest.js";
 import { createHash } from "node:crypto";
-import { resolveWorkspaceIdentity, type RoutingWorkspaceIdentity } from "../routing/store.js";
+import { resolveWorkspaceIdentity, listResults, type RoutingWorkspaceIdentity } from "../routing/store.js";
 import { areChatgptConversationRoutesEquivalent } from "../chatgpt/route.js";
 import {
+  ResultBusError,
   listResultBusEntries,
   readResultBus,
 } from "../result-bus/store.js";
-import { reconcileWorkspaceResultBus } from "../result-bus/service.js";
+import { projectAvailableResultBusCommands, reconcileWorkspaceResultBus } from "../result-bus/service.js";
 import type { CanonicalRoutingResult, ResultBusEntry } from "../result-bus/schema.js";
 import {
   RESULT_BUS_CLAIMED_STALE_MS,
@@ -24,7 +26,7 @@ import {
   recordResultBusCutoverDisposition,
 } from "../result-bus/cutover-store.js";
 import type { FeedbackEvent } from "../feedback/schema.js";
-import { recoverStaleFeedback, readFeedbackState } from "../feedback/state-store.js";
+import { recoverStaleFeedback, readFeedbackState, feedbackStateFile } from "../feedback/state-store.js";
 import { verifyCompanionCredentialReadOnly } from "../feedback/companion-delivery.js";
 import { reconcileFeedbackOutbox } from "../feedback/projector.js";
 import {
@@ -49,6 +51,10 @@ import {
   type WebSinkCompanionAuthContext,
 } from "../web-sink-control/companion-adapter.js";
 import { withDeliveryArbiter } from "./delivery-arbiter.js";
+import { ensureTerminalWitnessKey, issueTerminalWitness, verifyTerminalWitness } from "../command-cleanup/terminal-witness.js";
+import { assertCleanupStoreFile } from "../command-cleanup/fence.js";
+import { CommandCleanupError } from "../command-cleanup/schema.js";
+import { getStateDir } from "../config/paths.js";
 
 /**
  * R5d3 canonical delivery adapter：Workspace Result Bus → Active Web Sink → Companion。
@@ -64,6 +70,7 @@ import { withDeliveryArbiter } from "./delivery-arbiter.js";
  */
 
 export { assertNoProductionInFlight, assertNoResultBusInFlight } from "./delivery-arbiter.js";
+export { ResultBusCutoverError };
 
 export class ResultBusDeliveryError extends Error {
   constructor(readonly code: string, message: string) {
@@ -202,7 +209,7 @@ export function resultBusDeliveryMessage(entry: ResultBusEntry, attemptId: strin
   return { message, messageSha256: productionFeedbackMessageSha256(message) };
 }
 
-function busInFlightDto(entry: ResultBusEntry): Record<string, unknown> {
+function busInFlightDto(entry: ResultBusEntry, companionId: string, stateDir?: string): Record<string, unknown> {
   const inFlight: Record<string, unknown> = {
     eventId: resultBusCompanionDeliveryId(entry.busEntryId),
     status: entry.deliveryStatus,
@@ -213,6 +220,7 @@ function busInFlightDto(entry: ResultBusEntry): Record<string, unknown> {
     const delivery = resultBusDeliveryMessage(entry, entry.attempt.attemptId);
     inFlight.message = delivery.message;
     inFlight.messageSha256 = delivery.messageSha256;
+    if (entry.lifecycle === "ephemeral" && entry.sendTarget) inFlight.terminalWitness = issueTerminalWitness({ workspaceId: entry.workspaceId, eventId: resultBusCompanionDeliveryId(entry.busEntryId), attemptId: entry.attempt.attemptId, routeCanonical: entry.sendTarget.canonicalUrl, companionId }, stateDir, false);
   }
   return inFlight;
 }
@@ -303,12 +311,21 @@ function validateLedgerRows(input: {
 export function reconcileResultBusCutover(input: {
   identity: RoutingWorkspaceIdentity;
   stateDir?: string;
+  /** Validate existing canonical authority only; never project, recover or create a disposition. */
+  readOnly?: boolean;
+  /** Explicit background maintenance: projection is already bounded by its caller. */
+  maintenanceOnly?: boolean;
 }): ResultBusCutoverReconciliation {
   const { identity, stateDir } = input;
-  const projected = reconcileWorkspaceResultBus(identity, stateDir).projected;
+  const projected = input.readOnly || input.maintenanceOnly ? 0 : reconcileWorkspaceResultBus(identity, stateDir).projected;
+  return reconcileCutover(input, projected);
+}
+
+function reconcileCutover(input: Parameters<typeof reconcileResultBusCutover>[0], projected: number): ResultBusCutoverReconciliation {
+  const { identity, stateDir } = input;
   const bus = readResultBus(identity, stateDir);
   const busEntries = bus?.entries ?? [];
-  const feedback = recoverStaleFeedback(identity.id, stateDir);
+  const feedback = input.readOnly ? strictFeedbackSnapshot(identity.id, stateDir) : recoverStaleFeedback(identity.id, stateDir);
   let ledgerRows = listResultBusCutoverDispositions(identity, stateDir);
   const ledgerByEntry = new Map(ledgerRows.map(row => [row.busEntryId, row]));
   let dispositionsWritten = 0;
@@ -373,6 +390,10 @@ export function reconcileResultBusCutover(input: {
       dispositionsReplayed += 1;
       continue;
     }
+    if (input.readOnly) throw new ResultBusCutoverError(
+      "RESULT_BUS_CUTOVER_REQUIRED", "历史 counterpart 尚无已验证处置；需要正常 legacy reconciliation，不能降级预约。",
+    );
+    if (input.maintenanceOnly && dispositionsWritten >= 25) throw new ResultBusCutoverError("RESULT_BUS_MAINTENANCE_PENDING", "本次维护批量已满；下次从既有精确 disposition 继续。");
     const written = recordResultBusCutoverDisposition(identity, {
       busEntryId: entry.busEntryId,
       resultSha256: entry.resultSha256,
@@ -427,6 +448,43 @@ export function reconcileResultBusCutover(input: {
   };
 }
 
+function strictFeedbackSnapshot(workspaceId: string, stateDir = getStateDir()) {
+  assertCleanupStoreFile(feedbackStateFile(workspaceId, stateDir), stateDir);
+  const snapshot = readFeedbackState(workspaceId, stateDir);
+  if (snapshot.cleanupAdjustments?.length) throw new ResultBusDeliveryError(
+    "FEEDBACK_CURSOR_CLEANUP_PENDING", "Feedback cleanup transaction 未收敛；不能证明跨源安全。",
+  );
+  return snapshot;
+}
+
+/** Called only inside the delivery arbiter after Web Sink authentication.
+ * Only unavailable command-lock enrichment can degrade. Corrupt snapshots,
+ * unresolved counterparts and cutover conflicts remain hard failures.
+ */
+function prepareCanonicalDelivery(identity: RoutingWorkspaceIdentity, stateDir?: string) {
+  strictFeedbackSnapshot(identity.id, stateDir);
+  // Canonical projection has its own authority/result, outside the legacy catch.
+  const projection = projectAvailableResultBusCommands(identity, stateDir);
+  const canonicalProjectionDegraded = projection.skipped.length ? {
+    skippedCount: projection.skipped.length, skipped: projection.skipped.slice(0, 20),
+  } : null;
+  const skippedCommands = new Set(projection.skipped.map(item => item.commandId));
+  try {
+    reconcileFeedbackOutbox(identity.id, stateDir, identity.root);
+    const cutover = reconcileCutover({ identity, stateDir }, projection.projected);
+    return { cutover, feedbackState: strictFeedbackSnapshot(identity.id, stateDir), legacyFeedbackDegraded: null,
+      canonicalProjectionDegraded, skippedCommands };
+  } catch (error) {
+    if (!(error instanceof CommandCleanupError) || error.code !== "COMMAND_CLEANUP_BUSY" || !error.commandId) throw error;
+    const feedbackState = strictFeedbackSnapshot(identity.id, stateDir);
+    const cutover = reconcileResultBusCutover({ identity, stateDir, readOnly: true });
+    return { cutover, feedbackState, canonicalProjectionDegraded, skippedCommands, legacyFeedbackDegraded: {
+      code: error.code, stage: "legacy_feedback_enrichment" as const,
+      ...(error.commandId ? { commandId: error.commandId } : {}),
+    } };
+  }
+}
+
 type DeliverySource =
   | { source: "bus"; entry: ResultBusEntry }
   | { source: "legacy"; event: FeedbackEvent };
@@ -458,6 +516,16 @@ function resolveDeliverySource(input: {
 
 function routesMatch(a: string, b: string): boolean {
   return areChatgptConversationRoutesEquivalent(a, b);
+}
+
+function isCurrentSinkReservation(entry: ResultBusEntry, authenticatedRoute: string): boolean {
+  const active = readActiveWebSinkBinding(entry.workspaceId);
+  const stamp = entry.reservation;
+  return active != null && stamp != null
+    && routesMatch(authenticatedRoute, active.canonicalUrl)
+    && active.bindingId === stamp.bindingId
+    && active.epoch === stamp.epoch
+    && active.boundAt === stamp.boundAt;
 }
 
 function companionRouteMismatch(): CompanionError {
@@ -541,12 +609,25 @@ export function resultBusCompanionReserve(input: {
     legacyCtx = feedbackAuth;
   }
   return withDeliveryArbiter({ workspaceId: input.workspaceId, workspaceRoot: input.workspaceRoot, stateDir }, identity => {
-    // 已认证：projector reconcile（legacy/control 事件）→ cutover ownership 先于一切获取路径建立。
-    reconcileFeedbackOutbox(input.workspaceId, stateDir, input.workspaceRoot);
-    const cutover = reconcileResultBusCutover({ identity, stateDir });
-    const owned = cutover.ownedLegacyEventIds;
+    // Exact caller route is checked before canonical projection or legacy enrichment.
     const activeSink = "error" in sinkAuth ? null : readActiveWebSinkBinding(input.workspaceId);
+    if (!("error" in sinkAuth)) {
+      // Without a canonical sink this is a legacy acquisition: its credential
+      // fence (including stale epoch) must precede route checks and all writes.
+      if (!activeSink) legacyCtx = feedbackAuthOrThrow({ workspaceId: input.workspaceId, credential: input.credential, stateDir });
+      if (!routesMatch(input.routeCanonical, sinkAuth.routeCanonical)) throw companionRouteMismatch();
+      if (activeSink && !routesMatch(input.routeCanonical, activeSink.canonicalUrl)) throw new ResultBusDeliveryError(
+        "RESULT_BUS_SINK_ROUTE_MISMATCH", "请求 route 与当前 Active Web Sink 不一致。",
+      );
+    }
+    const prepared = "error" in sinkAuth ? null : prepareCanonicalDelivery(identity, stateDir);
+    if (!prepared) reconcileFeedbackOutbox(input.workspaceId, stateDir, input.workspaceRoot);
+    const cutover = prepared?.cutover ?? reconcileResultBusCutover({ identity, stateDir });
+    const owned = cutover.ownedLegacyEventIds;
     if ("error" in sinkAuth || !activeSink) {
+      if (prepared?.legacyFeedbackDegraded) throw new ResultBusDeliveryError(
+        "COMMAND_CLEANUP_BUSY", "legacy_feedback_enrichment 不可用；禁止 legacy fallback。",
+      );
       // Web Sink 边界不可用：维持 legacy 非 canonical/control 语义（feedback auth 必需），
       // cutover-owned 历史 legacy 事件经排除集永久不可预约。
       return legacyReserve({
@@ -570,7 +651,7 @@ export function resultBusCompanionReserve(input: {
       reservedStaleMs: RESULT_BUS_RESERVED_STALE_MS,
       claimedStaleMs: RESULT_BUS_CLAIMED_STALE_MS,
     });
-    const feedbackInFlight = legacyInFlightEvents(recoverStaleFeedback(input.workspaceId, stateDir));
+    const feedbackInFlight = legacyInFlightEvents(prepared?.feedbackState ?? recoverStaleFeedback(input.workspaceId, stateDir));
     const busInFlight = busInFlightEntries(readResultBus(identity, stateDir)?.entries ?? []);
     if (feedbackInFlight.length > 0 && busInFlight.length > 0) {
       throw new ResultBusDeliveryError(
@@ -585,16 +666,33 @@ export function resultBusCompanionReserve(input: {
     // Bus 自身 in-flight → core reserveNext 返回 in_flight 幂等 DTO（priority 1）。
     const reserved = reserveNextResultBusEntry(
       identity,
-      { excludeBusEntryIds: new Set(cutover.suppressions.keys()) },
+      { excludeBusEntryIds: new Set([...cutover.suppressions.keys(),
+        ...listResultBusEntries(identity, stateDir).filter(entry => prepared?.skippedCommands.has(entry.commandId)).map(entry => entry.busEntryId)]) },
       stateDir,
     );
     if (reserved.status === "reserved" || reserved.status === "in_flight") {
+      if (reserved.entry.deliveryStatus === "reserved" && !isCurrentSinkReservation(reserved.entry, sinkAuth.routeCanonical)) {
+        throw new ResultBusDeliveryError(
+          "RESULT_BUS_STALE_RESERVATION",
+          "预约不属于当前已认证的 Active Web Sink；保持预约不变，拒绝返回旧预约信息。",
+        );
+      }
+      if (reserved.entry.sendTarget && !routesMatch(input.routeCanonical, reserved.entry.sendTarget.canonicalUrl)) {
+        throw new ResultBusDeliveryError(
+          "RESULT_BUS_FROZEN_TARGET_MISMATCH",
+          "reserve route 与冻结 sendTarget 不一致；拒绝暴露其他 route 的 in-flight 结果。",
+        );
+      }
       return {
         reservationId: reserved.entry.reservation!.reservationId,
         delivery: busDeliveryDto(reserved.entry),
       };
     }
     // Bus 空（或全部被抑制）→ priority 3：legacy 非 canonical/control。
+    if (prepared?.legacyFeedbackDegraded) {
+      // Full reconciliation is mandatory before making any legacy/control event reservable.
+      throw new ResultBusDeliveryError("COMMAND_CLEANUP_BUSY", "legacy_feedback_enrichment 不可用；禁止 legacy fallback。");
+    }
     return legacyReserve({
       workspaceId: input.workspaceId,
       auth: legacyCtx
@@ -659,7 +757,7 @@ export function resultBusCompanionBeginSend(input: {
   eventId: string;
   reservationId: string;
   stateDir?: string;
-}): { eventId: string; status: string; attemptId: string; message: string; messageSha256: string } {
+}): { eventId: string; status: string; attemptId: string; message: string; messageSha256: string; terminalWitness?: string } {
   const stateDir = input.stateDir;
   return withDeliveryArbiter({ workspaceId: input.workspaceId, workspaceRoot: input.workspaceRoot, stateDir }, identity => {
     // R5d3 auth-purity：只读 credential pre-auth 先于 source resolution 与一切 mutation；
@@ -670,6 +768,13 @@ export function resultBusCompanionBeginSend(input: {
       const sinkAuth = verifyCompanionCredentialForWebSink({ workspaceId: input.workspaceId, credential: input.credential, stateDir });
       // FIX B：credential verified route 必须与请求 route 一致（独立于 Active Sink 证据）。
       if (!routesMatch(input.routeCanonical, sinkAuth.routeCanonical)) throw companionRouteMismatch();
+      // claimed 重放仍属于原 sendTarget；切换 Sink 不授予新 route 读取或发送旧载荷的权限。
+      if (source.entry.sendTarget && !routesMatch(input.routeCanonical, source.entry.sendTarget.canonicalUrl)) {
+        throw new ResultBusDeliveryError(
+          "RESULT_BUS_FROZEN_TARGET_MISMATCH",
+          "begin-send route 与冻结 sendTarget 不一致；frozen attempt 不随 Active Sink 迁移。",
+        );
+      }
       // reserved target boundary：若 reservation stamp 仍与当前 Active Sink 一致，
       // 请求 route 必须等于当前 Sink；Sink 已切换时交由 core stale-requeue 安全边界处理。
       const active = readActiveWebSinkBinding(input.workspaceId);
@@ -683,6 +788,7 @@ export function resultBusCompanionBeginSend(input: {
           "请求 route 与 reservation 目标（当前 Active Web Sink）不一致。",
         );
       }
+      if (source.entry.lifecycle === "ephemeral") ensureTerminalWitnessKey(input.workspaceId, stateDir);
       const outcome = beginResultBusSend(identity, {
         busEntryId: source.entry.busEntryId,
         reservationId: input.reservationId,
@@ -700,6 +806,7 @@ export function resultBusCompanionBeginSend(input: {
         attemptId: outcome.attemptId,
         message: delivery.message,
         messageSha256: delivery.messageSha256,
+        ...(outcome.entry.lifecycle === "ephemeral" ? { terminalWitness: issueTerminalWitness({ workspaceId: input.workspaceId, eventId: resultBusCompanionDeliveryId(outcome.entry.busEntryId), attemptId: outcome.attemptId, routeCanonical: outcome.sendTarget.canonicalUrl, companionId: sinkAuth.companionId }, stateDir) } : {}),
       };
     }
     if (source?.source === "legacy") {
@@ -737,8 +844,9 @@ export function resultBusCompanionAck(input: {
   routeCanonical: string;
   eventId: string;
   attemptId: string;
+  terminalWitness?: string;
   stateDir?: string;
-}): { eventId: string; status: string } {
+}): { eventId: string; status: string; attemptId?: string; cleanupStatus?: string } {
   const stateDir = input.stateDir;
   return withDeliveryArbiter({ workspaceId: input.workspaceId, workspaceRoot: input.workspaceRoot, stateDir }, identity => {
     // R5d3 auth-purity：只读 credential pre-auth 先于 source resolution 与一切 mutation；
@@ -760,7 +868,7 @@ export function resultBusCompanionAck(input: {
         busEntryId: source.entry.busEntryId,
         attemptId: input.attemptId,
       }, {}, stateDir);
-      return { eventId: resultBusCompanionDeliveryId(acked.entry.busEntryId), status: acked.entry.deliveryStatus };
+      return { eventId: resultBusCompanionDeliveryId(acked.entry.busEntryId), status: acked.entry.deliveryStatus, ...(acked.cleanupStatus ? { cleanupStatus: acked.cleanupStatus } : {}) };
     }
     if (source?.source === "legacy") {
       const ctx = feedbackAuthOrThrow({ workspaceId: input.workspaceId, credential: input.credential, stateDir });
@@ -778,6 +886,14 @@ export function resultBusCompanionAck(input: {
       // FIX 6：legacy 终态化与 disposition 写入/新 reserve 串行（同 arbiter 锁），关闭 TOCTOU。
       reconcileResultBusCutover({ identity, stateDir });
       return { eventId: event.eventId, status: event.status };
+    }
+    if (!source && input.terminalWitness) {
+      const sinkAuth = verifyCompanionCredentialForWebSink({ workspaceId: input.workspaceId, credential: input.credential, stateDir });
+      if (!routesMatch(input.routeCanonical, sinkAuth.routeCanonical)) throw companionRouteMismatch();
+      if (verifyTerminalWitness(input.terminalWitness, { workspaceId: input.workspaceId, eventId: input.eventId, attemptId: input.attemptId, routeCanonical: sinkAuth.routeCanonical, companionId: sinkAuth.companionId }, stateDir)) {
+        // The exact issued attempt is gone. This is not a claim that manual-force cleanup observed a send.
+        return { eventId: input.eventId, attemptId: input.attemptId, status: "terminal_gone" };
+      }
     }
     throw new CompanionError("FEEDBACK_EVENT_NOT_FOUND", "feedback 事件不存在");
   });
@@ -871,14 +987,18 @@ export function resultBusCompanionState(input: {
     // Web Sink 边界不可用：仅呈现 legacy 视图（无 production canonical 发送可能）。
     return { legacyOnly: true as const };
   }
-  return withDeliveryArbiter({ workspaceId: input.workspaceId, workspaceRoot: input.workspaceRoot, stateDir }, identity => {
-    const cutover = reconcileResultBusCutover({ identity, stateDir });
-    recoverStaleResultBusEntries(identity, {
-      reservedStaleMs: RESULT_BUS_RESERVED_STALE_MS,
-      claimedStaleMs: RESULT_BUS_CLAIMED_STALE_MS,
-    });
-    const feedbackState = recoverStaleFeedback(input.workspaceId, stateDir);
+  const identity = resolveWorkspaceIdentity({ id: input.workspaceId, root: input.workspaceRoot });
+  {
+    const feedbackState = strictFeedbackSnapshot(identity.id, stateDir);
+    const cutover = reconcileResultBusCutover({ identity, stateDir, readOnly: true });
     const busEntries = listResultBusEntries(identity, stateDir);
+    const results = listResults(identity, stateDir);
+    for (const entry of busEntries) {
+      const result = results.find(item => item.commandId === entry.commandId && item.iteration === entry.iteration);
+      if (result && (result.resultId !== entry.resultId || !("machineEvidence" in result)
+        || canonicalRoutingResultDigest(result) !== entry.resultSha256))
+        throw new ResultBusError("RESULT_BUS_CONFLICT", "持久化 canonical result 与 Bus immutable identity 冲突。");
+    }
     const feedbackAuth = tryFeedbackAuth({ workspaceId: input.workspaceId, credential: input.credential, stateDir });
     const legacyCtx = "error" in feedbackAuth ? null : feedbackAuth;
     const scoped = legacyCtx
@@ -904,9 +1024,10 @@ export function resultBusCompanionState(input: {
       const pinnedAway = (entry.deliveryStatus === "claimed" || entry.deliveryStatus === "outcome_unknown")
         && entry.sendTarget != null
         && !routesMatch(sinkAuth.routeCanonical, entry.sendTarget.canonicalUrl);
-      inFlight = pinnedAway
+      const reservedAway = entry.deliveryStatus === "reserved" && !isCurrentSinkReservation(entry, sinkAuth.routeCanonical);
+      inFlight = pinnedAway || reservedAway
         ? { status: entry.deliveryStatus, pinnedToOtherRoute: true }
-        : busInFlightDto(entry);
+        : busInFlightDto(entry, sinkAuth.companionId, stateDir);
     } else if (legacyInFlight.length === 1) {
       const event = legacyInFlight[0]!;
       const owned = legacyCtx != null && event.reservedBy === legacyCtx.companionId;
@@ -936,6 +1057,18 @@ export function resultBusCompanionState(input: {
         }
         return dto;
       });
+    for (const entry of busEntries) {
+      if (entry.deliveryStatus === "observed"
+        && entry.attempt
+        && entry.sendTarget?.canonicalUrl === sinkAuth.routeCanonical) {
+        events.push({
+          eventId: resultBusCompanionDeliveryId(entry.busEntryId),
+          status: "observed",
+          attemptId: entry.attempt.attemptId,
+        });
+      }
+    }
+    const activeSink = readActiveWebSinkBinding(input.workspaceId);
     return {
       legacyOnly: false as const,
       workspaceId: input.workspaceId,
@@ -945,7 +1078,7 @@ export function resultBusCompanionState(input: {
       routeCanonical: sinkAuth.routeCanonical,
       enabled: feedbackState.binding?.status === "active",
       routeVerification: "VERIFIED" as const,
-      productionEligible: true,
+      productionEligible: activeSink != null && routesMatch(activeSink.canonicalUrl, sinkAuth.routeCanonical),
       cutoverReady: cutover.cutoverReady,
       blockedByLegacyInFlight,
       pendingReady:
@@ -967,5 +1100,5 @@ export function resultBusCompanionState(input: {
       unsafeLegacyInFlight: cutover.unsafeLegacyInFlight,
       events,
     };
-  });
+  }
 }

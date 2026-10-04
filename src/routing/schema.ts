@@ -133,6 +133,7 @@ export const commandSchema = z
     payloadBytes: z.number().int().positive(),
     payloadSha256: z.string().regex(HEX64),
     deliveryStatus: commandDeliveryStatusSchema,
+    cancelledAt: z.string().datetime().optional(),
     createdAt: z.string().datetime(),
     updatedAt: z.string().datetime(),
   })
@@ -145,7 +146,7 @@ export type RoutingCommand = z.infer<typeof commandSchema>;
  * transition API 写入。
  */
 export const commandInputSchema = commandSchema
-  .omit({ deliveryStatus: true, createdAt: true, updatedAt: true })
+  .omit({ deliveryStatus: true, cancelledAt: true, createdAt: true, updatedAt: true })
   .strict();
 export type CommandInput = z.infer<typeof commandInputSchema>;
 
@@ -255,6 +256,7 @@ export const routingStateSchema = z
     }
     const commandIds = new Set<string>();
     for (const command of state.commands) {
+      if (command.cancelledAt && command.deliveryStatus !== "rejected") issue("cancelled command 必须保持 rejected 投递终态");
       if (commandIds.has(command.commandId)) issue(`commandId 重复：${command.commandId}`);
       commandIds.add(command.commandId);
       if (!routeIds.has(command.plannerRouteId)) {

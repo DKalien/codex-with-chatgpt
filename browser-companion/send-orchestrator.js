@@ -185,7 +185,7 @@ function validateAckResult(journal, result) {
   if (result.eventId !== journal.eventId) {
     return "ack_event_id_mismatch";
   }
-  if (result.status !== "observed") {
+  if (result.status !== "observed" && !(result.status === "terminal_gone" && journal.terminalWitness && result.attemptId === journal.attemptId)) {
     return "ack_status_not_observed";
   }
   return null;
@@ -527,6 +527,7 @@ export async function continueFromSendIntent(ctx, sendIntentJournal) {
       attemptId: beginResult.attemptId,
       message: beginResult.message,
       messageSha256: beginResult.messageSha256,
+      ...(beginResult.terminalWitness === undefined ? {} : { terminalWitness: beginResult.terminalWitness }),
     });
     await persist(persistJournal, claimed);
   } catch (error) {
@@ -774,6 +775,7 @@ export async function recoverSendOrchestration(ctx) {
           attemptId: inFlight.attemptId,
           message: inFlight.message,
           messageSha256: inFlight.messageSha256,
+          ...(inFlight.terminalWitness === undefined ? {} : { terminalWitness: inFlight.terminalWitness }),
         });
         await persist(persistJournal, claimed);
         const cont = await continueFromClaimed(ctx, claimed, { snapshotBaseline: true, doc });
@@ -794,6 +796,7 @@ export async function recoverSendOrchestration(ctx) {
         attemptId: inFlight.attemptId,
         message: inFlight.message,
         messageSha256: inFlight.messageSha256,
+        ...(inFlight.terminalWitness === undefined ? {} : { terminalWitness: inFlight.terminalWitness }),
       });
       await persist(persistJournal, unknown);
       return fail("outcome_unknown", {

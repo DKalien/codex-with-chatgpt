@@ -36,6 +36,14 @@ export const WS = "workspaceg1amulti";
 export const BINDING_THREAD = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
 export const BINDING_PROJECT = "project_bind_test";
 export const BINDING_ID = "33333333-3333-4333-8333-333333333333";
+export const RUNTIME_FENCE = {
+  desktopPid: 1001,
+  desktopExe: "C:\\Program Files\\ChatGPT\\ChatGPT.exe",
+  desktopCreation: "1000001",
+  appServerPid: 1002,
+  appServerExe: "C:\\Program Files\\ChatGPT\\codex.exe",
+  appServerCreation: "1000002",
+};
 
 let stateDir: string;
 let previousStateDir: string | undefined;
@@ -114,6 +122,7 @@ export function writeDesktopFixture(workspaceId: string): void {
     workspaceId,
     workspaceRoot: root,
     enabled: true,
+    runtimeFence: RUNTIME_FENCE,
     binding: {
       threadId: BINDING_THREAD,
       hostId: "local",

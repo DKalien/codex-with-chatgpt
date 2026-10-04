@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { CommandCleanupError } from "../command-cleanup/schema.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import { Workspace } from "../workspace/manager.js";
@@ -26,6 +27,8 @@ import {
   revokeCompanion,
 } from "../feedback/companion.js";
 import { reconcileFeedbackOutbox } from "../feedback/projector.js";
+import { readFeedbackStatusState } from "../feedback/state-store.js";
+import { withConnectionMutation } from "../bridge/connection.js";
 import { findLiveBridge } from "../bridge/runtime.js";
 import { withDeliveryArbiter, assertNoResultBusInFlight } from "../bridge/delivery-arbiter.js";
 import { reconcileResultBusCutover } from "../bridge/result-bus-delivery.js";
@@ -85,6 +88,9 @@ function fail(code: string, message: string, scope?: string): ToolResult {
 }
 
 function mapError(error: unknown): ToolResult {
+  if (error instanceof CommandCleanupError) {
+    return fail(error.code, `legacy_feedback_enrichment: ${error.code}${error.commandId ? ` commandId=${error.commandId}` : ""}`);
+  }
   if (error instanceof FeedbackError) {
     return fail(error.code, error.message);
   }
@@ -180,7 +186,7 @@ function modelVisibleMeta(extra?: Record<string, unknown>): Record<string, unkno
 
 /**
  * Production feedback tools（E1a：无 card UI / 无 emit / 无 model_confirm）。
- * status/claim 前 reconcile，恢复 crash gap。
+ * 查询与连接不触发历史维护；领取属于显式投递写入。
  */
 export function registerFeedbackTools(server: McpServer, workspace: Workspace): void {
   // MCP 与 Bridge 统一走带 workspace root 的 reconcile 路径。
@@ -230,7 +236,7 @@ export function registerFeedbackTools(server: McpServer, workspace: Workspace): 
     {
       title: "Production feedback status",
       description:
-        "读取 production feedback receiver/outbox，并在本地执行 reconcile（含 stale claimed 收敛）。只维护本机 outbox，不执行 Codex/task、不外部发送。",
+        "只读已持久化的 production feedback receiver/outbox；不初始化、不 reconcile、不清理历史。过期投递由显式生命周期操作重新核验。",
       inputSchema: {},
       outputSchema: {
         workspaceId: z.string(),
@@ -241,7 +247,7 @@ export function registerFeedbackTools(server: McpServer, workspace: Workspace): 
         companion: z.unknown(),
         events: z.array(z.unknown()),
       },
-      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
       _meta: modelVisibleMeta(),
     },
     async (_args, extra: Extra) => {
@@ -249,10 +255,9 @@ export function registerFeedbackTools(server: McpServer, workspace: Workspace): 
       if (denied) return denied;
       try {
         const principal = principalFromExtra(extra);
-        const reconciled = reconcileWorkspaceFeedback();
         return ok({
-          ...feedbackStatusSummary(reconciled.state, principal.fingerprint),
-          projected: reconciled.projected,
+          ...feedbackStatusSummary(readFeedbackStatusState(workspace.id), principal.fingerprint),
+          projected: 0,
         });
       } catch (error) {
         return mapError(error);
@@ -283,12 +288,11 @@ export function registerFeedbackTools(server: McpServer, workspace: Workspace): 
       if (denied) return denied;
       try {
         const principal = principalFromExtra(extra);
-        reconcileWorkspaceFeedback();
-        const state = enableReceiver({
+        const state = withConnectionMutation({ workspaceId: workspace.id, workspaceRoot: workspace.root, initialize: true }, () => enableReceiver({
           workspaceId: workspace.id,
           principal,
           widgetId: args.widgetId,
-        });
+        }));
         return ok({
           workspaceId: state.workspaceId,
           binding: {
@@ -326,13 +330,12 @@ export function registerFeedbackTools(server: McpServer, workspace: Workspace): 
       if (denied) return denied;
       try {
         const principal = principalFromExtra(extra);
-        reconcileWorkspaceFeedback();
-        const result = takeoverReceiver({
+        const result = withConnectionMutation({ workspaceId: workspace.id, workspaceRoot: workspace.root }, () => takeoverReceiver({
           workspaceId: workspace.id,
           principal,
           widgetId: args.widgetId,
           expectedEpoch: args.expectedEpoch,
-        });
+        }));
         return ok({
           bindingId: result.state.binding!.bindingId,
           epoch: result.state.binding!.epoch,
@@ -469,11 +472,10 @@ export function registerFeedbackTools(server: McpServer, workspace: Workspace): 
       try {
         const principal = principalFromExtra(extra);
         const bridgeOrigin = await companionBridgeOrigin(workspace.id);
-        reconcileWorkspaceFeedback();
-        const intent = createPairingIntent({
+        const intent = withConnectionMutation({ workspaceId: workspace.id, workspaceRoot: workspace.root, kind: "companion" }, () => createPairingIntent({
           workspaceId: workspace.id,
           principal,
-        });
+        }));
         return ok({ ...intent, bridgeOrigin });
       } catch (error) {
         return mapError(error);
@@ -538,7 +540,7 @@ export function registerFeedbackTools(server: McpServer, workspace: Workspace): 
         companion: z.unknown(),
         pairingIntentActive: z.boolean(),
       },
-      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
       _meta: modelVisibleMeta(),
     },
     async (_args, extra: Extra) => {
@@ -546,7 +548,6 @@ export function registerFeedbackTools(server: McpServer, workspace: Workspace): 
       if (denied) return denied;
       try {
         const principal = principalFromExtra(extra);
-        reconcileWorkspaceFeedback();
         return ok(companionStatusForPrincipal({
           workspaceId: workspace.id,
           principal,

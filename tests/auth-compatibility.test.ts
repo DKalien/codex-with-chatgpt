@@ -1,3 +1,4 @@
+import { requestHttp } from "./http-json.js";
 import { afterEach, describe, expect, it } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -157,7 +158,7 @@ describe("Desktop OAuth compatibility", () => {
         clientId: "current",
         scopes: [DESKTOP_READ_SCOPE, DESKTOP_CONTROL_SCOPE],
       });
-      const response = await fetch(`${bridge.localBaseUrl()}/admin/info`, {
+      const response = await requestHttp(`${bridge.localBaseUrl()}/admin/info`, {
         headers: { authorization: `Bearer ${bridge.adminToken}` },
       });
       expect(response.status).toBe(200);

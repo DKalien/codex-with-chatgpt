@@ -35,6 +35,7 @@ export const resultBusLifecycleSchema = z.enum([
   "observed",
   "outcome_unknown",
   "retired_unknown",
+  "cancelled",
 ]);
 
 /** Bus entry 持久化身份：由 (workspaceId, commandId, iteration) 确定性派生，读取时可自校验。 */
@@ -77,6 +78,7 @@ const nullable = <T extends z.ZodTypeAny>(schema: T) => schema.nullable().option
 
 export const resultBusEntrySchema = z.object({
   version: z.literal(1),
+  lifecycle: z.literal("ephemeral").optional(),
   busEntryId: z.string().regex(HEX64),
   workspaceId: routingWorkspaceIdSchema,
   commandId: routingCommandIdSchema,
@@ -93,6 +95,7 @@ export const resultBusEntrySchema = z.object({
   outcomeUnknownAt: nullable(endpointInstantSchema),
   retiredAt: nullable(endpointInstantSchema),
   outcomeReasonCode: nullable(resultBusReasonCodeSchema),
+  cancelledAt: nullable(endpointInstantSchema),
 }).strict().superRefine((entry, ctx) => {
   const issue = (path: string[], message: string) =>
     ctx.addIssue({ code: z.ZodIssueCode.custom, path, message });
@@ -123,7 +126,9 @@ export const resultBusEntrySchema = z.object({
   const hasOutcomeUnknownAt = entry.outcomeUnknownAt != null;
   const hasRetiredAt = entry.retiredAt != null;
   const hasReasonCode = entry.outcomeReasonCode != null;
+  if ((entry.deliveryStatus === "cancelled") !== (entry.cancelledAt != null)) issue(["cancelledAt"], "只有 cancelled 必须保留取消时间。");
   switch (entry.deliveryStatus) {
+    case "cancelled":
     case "queued":
       if (hasReservation || hasAttempt || hasTarget || hasObservedAt || hasOutcomeUnknownAt || hasRetiredAt || hasReasonCode) {
         issue(["deliveryStatus"], "queued 不得携带 reservation/attempt/sendTarget 或后续状态时间戳。");

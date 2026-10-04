@@ -11,6 +11,7 @@ import { reconcileUnknownDesktopDelivery } from "../desktop/unknown-reconciliati
 import { LegacyReconciliationError, listLegacyReconciliations, reconcileLegacyAccepted } from "../desktop/legacy-reconciliation.js";
 import { retireLegacyAccepted } from "../desktop/legacy-retirement.js";
 import { abandonHistoricalAccepted, previewAbandonment } from "../desktop/abandonment.js";
+import { previewCorruptLockAbandonment, confirmCorruptLockAbandonment } from "../desktop/abandonment-repair.js";
 import { listDesktopHistory } from "../desktop/history.js";
 import { previewOutcomeResolution, resolveOutcomeUnknown } from "../desktop/outcome-resolution.js";
 
@@ -278,6 +279,35 @@ export function registerDesktopCommands(program: Command): void {
       } catch (error) {
         const code = error instanceof DesktopError ? error.code : "LEGACY_RETIREMENT_INVALID";
         print({ ok: false, error: code, message: "历史等待处置被拒绝；未覆盖证据，不表示完成或成功。" }, opts.json, "历史等待处置被拒绝；请保留证据并核对。");
+        process.exitCode = 1;
+      }
+    });
+
+  desktop.command("abandon-corrupt-lock")
+    .description("显式隔离历史 ownerless 投递的零字节损坏锁并在同一事务内行政 abandonment")
+    .option("-w, --workspace <path>", "workspace 根目录")
+    .requiredOption("--command-ids <ids>", "精确 abandonment commandId 集合")
+    .requiredOption("--repair-command-ids <ids>", "需要零字节锁修复的精确子集，最多10条")
+    .option("--preview-file <path>", "已保存的只读 preview JSON；confirm 必须提供")
+    .option("--confirm <sha256>", "abandonment confirmation digest")
+    .option("--repair-confirm <sha256>", "repair confirmation digest")
+    .option("--json", "机器可读输出", false)
+    .action(async (opts: { workspace?: string; commandIds: string; repairCommandIds: string; previewFile?: string; confirm?: string; repairConfirm?: string; json: boolean }) => {
+      try {
+        const workspace = new Workspace(workspaceRoot(opts.workspace));
+        const ids = parseAbandonmentCommandIds(opts.commandIds), repairs = parseAbandonmentCommandIds(opts.repairCommandIds);
+        if (!opts.confirm && !opts.repairConfirm && !opts.previewFile) {
+          const preview = { ok: true, ...await previewCorruptLockAbandonment(workspace, ids, repairs) };
+          print(preview, opts.json, JSON.stringify(preview, null, 2));
+          return;
+        }
+        if (!opts.confirm || !opts.repairConfirm || !opts.previewFile || fs.statSync(opts.previewFile).size > 262144) throw new Error("confirmation_required");
+        const preview = JSON.parse(fs.readFileSync(opts.previewFile, "utf8").replace(/^\uFEFF/, ""));
+        const result = await confirmCorruptLockAbandonment(workspace, ids, repairs, preview.proof,
+          parseAbandonmentConfirmation(opts.confirm)!, parseAbandonmentConfirmation(opts.repairConfirm)!);
+        print({ ok: true, ...result }, opts.json, "行政修复及 abandonment 已收敛；不代表执行成功。");
+      } catch {
+        print({ ok: false, error: "DESKTOP_ABANDONMENT_REPAIR_BLOCKED", message: "历史损坏锁修复被阻断；保留证据，可能处于 adopted_pending，禁止普通写入。" }, opts.json, "修复被阻断；保留证据，勿删除或绕过锁。");
         process.exitCode = 1;
       }
     });

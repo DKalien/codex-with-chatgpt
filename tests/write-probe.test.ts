@@ -1,3 +1,4 @@
+import { requestHttp } from "./http-json.js";
 import { describe, expect, it } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
@@ -98,7 +99,7 @@ function expectNoPathLeak(value: unknown, ...paths: string[]): void {
 }
 
 async function discoveryScopes(base: string, suffix: string): Promise<unknown> {
-  const response = await fetch(`${base}${suffix}`);
+  const response = await requestHttp(`${base}${suffix}`);
   expect(response.status).toBe(200);
   const body = (await response.json()) as { scopes_supported?: unknown };
   return body.scopes_supported;
@@ -290,7 +291,7 @@ describe("MCP write_probe", () => {
 
   it("保留 /mcp 的 Bearer 保护", async () => {
     await withBridge(true, async ({ bridge }) => {
-      const response = await fetch(`${bridge.localBaseUrl()}/mcp`, {
+      const response = await requestHttp(`${bridge.localBaseUrl()}/mcp`, {
         method: "POST",
         headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
         body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }),

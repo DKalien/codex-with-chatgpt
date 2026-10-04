@@ -1,3 +1,4 @@
+import { createWorkspaceMaintenance } from "./maintenance.js";
 import express, { type Request, type Response, type NextFunction } from "express";
 import type { Server } from "node:http";
 import { randomBytes } from "node:crypto";
@@ -29,6 +30,7 @@ import {
 import { readRuntimeUpgrade } from "../core/upgrade.js";
 import { projectRuntimeUpgrade } from "../workflow/request.js";
 import { FEEDBACK_CONTROL_EVENT_VERSION } from "../feedback/store.js";
+import { readBridgeProvenance, recordShutdownIntent, type ShutdownReason } from "../process/bridge-provenance.js";
 
 function tunnelForWorkspace(workspaceId: string, logger: Logger): TunnelProvider {
   const binding = namedTunnelBinding(readTunnelState(workspaceId));
@@ -67,7 +69,7 @@ export interface Bridge {
   tunnel: TunnelProvider;
   getPublicBaseUrl(): string | null;
   localBaseUrl(): string;
-  close(): Promise<void>;
+  close(reason?: ShutdownReason): Promise<void>;
 }
 
 /**
@@ -235,6 +237,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
       pid: process.pid,
       startedAt,
       ...(runtimeBuildId === null ? {} : { runtimeBuildId }),
+      bridgeProvenance: readBridgeProvenance(runtimeState()),
     });
   });
 
@@ -267,19 +270,20 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     res.json({ revoked: count });
   });
 
-  app.post("/admin/shutdown", adminGuard, (_req, res) => {
+  app.post("/admin/shutdown", adminGuard, (req, res) => {
+    const source = req.get("X-C2C-Shutdown-Reason");
+    const reason = source === "restart" || source === "rollout" ? source : "admin_shutdown";
+    noteShutdown(reason);
     res.json({ shuttingDown: true });
     setTimeout(() => {
-      void shutdown().then(() => process.exit(0));
+      void shutdown(reason).then(() => process.exit(0));
     }, 100);
   });
 
   const { server, port } = await listen(app, host, opts.port ?? DEFAULT_PORT);
   logger.info(`Bridge listening on ${host}:${port} for workspace ${workspace.name} (${workspace.id})`);
 
-  const persistRuntime = (): void => {
-    if (opts.persistRuntime === false) return;
-    const state: RuntimeState = {
+  const runtimeState = (): RuntimeState => ({
       service: SERVICE_NAME,
       version: VERSION,
       workspaceId: workspace.id,
@@ -291,18 +295,41 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
       startedAt,
       capabilities: RUNTIME_CAPABILITIES,
       ...(runtimeBuildId === null ? {} : { runtimeBuildId }),
-    };
-    writeRuntimeState(state);
+    });
+  const persistRuntime = (): void => {
+    if (opts.persistRuntime === false) return;
+    writeRuntimeState(runtimeState());
   };
   persistRuntime();
+  const maintain = createWorkspaceMaintenance(workspace);
+  const maintenanceTimer = opts.persistRuntime === false ? null : setInterval(() => {
+    try { const result = maintain(); if (result.cleanup.pending) logger.warn("Workspace maintenance command_pending"); }
+    catch (error) {
+      const code = (error as { code?: unknown }).code;
+      logger.warn(`Workspace maintenance ${typeof code === "string" && /^[A-Z_]{1,80}$/.test(code) ? code : "unavailable"}`);
+    }
+  }, 30_000);
+  maintenanceTimer?.unref();
 
   let closed = false;
-  const shutdown = async (): Promise<void> => {
+  let shutdownNoted = false;
+  const noteShutdown = (reason: ShutdownReason): void => {
+    if (shutdownNoted || opts.persistRuntime === false) return;
+    shutdownNoted = true;
+    try { recordShutdownIntent(runtimeState(), reason); }
+    catch { logger.warn("Bridge shutdown diagnostic unavailable_or_conflict"); }
+  };
+  const shutdown = async (reason: ShutdownReason = "close"): Promise<void> => {
     if (closed) return;
+    noteShutdown(reason);
     closed = true;
+    if (maintenanceTimer) clearInterval(maintenanceTimer);
     await tunnel.stop().catch(() => undefined);
     await new Promise<void>((resolve) => server.close(() => resolve()));
-    if (opts.persistRuntime !== false) clearRuntimeState(workspace.id, { pid: process.pid, startedAt, adminToken });
+    // A process-exit path cannot prove its own exit. Keep the runtime/release pin
+    // until an external observer proves exit; a subsequent safe start replaces it.
+    // Embedded callers closing only this server retain the existing close contract.
+    if (reason === "close" && opts.persistRuntime !== false) clearRuntimeState(workspace.id, { pid: process.pid, startedAt, adminToken });
     logger.info("Bridge stopped");
   };
 

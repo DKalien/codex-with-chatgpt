@@ -425,7 +425,7 @@ describe("E1b3d3b2 autonomy policy", () => {
   });
 
   it("C/D durable commit first: arm and stamp never mutate memory before persist", () => {
-    const sw = fs.readFileSync(path.join(companionRoot, "service-worker.js"), "utf8");
+    const sw = fs.readFileSync(path.join(companionRoot, "service-worker.js"), "utf8").replace(/\r\n/g, "\n");
     expect(sw).toMatch(/async function commitAutonomyPolicy/);
     expect(sw).toMatch(/Memory authority changes only after persist success/);
     const commitStart = sw.indexOf("async function commitAutonomyPolicy");

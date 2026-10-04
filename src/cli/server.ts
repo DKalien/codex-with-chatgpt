@@ -68,11 +68,11 @@ program
     }
     releaseMaintenanceOrThrow(ownedMaintenance, { result: bridge, actionError: actionError ?? undefined });
     const started = bridge!;
-    const shutdown = (): void => {
-      void started.close().then(() => process.exit(0));
+    const shutdown = (reason: "SIGINT" | "SIGTERM"): void => {
+      void started.close(reason).then(() => process.exit(0));
     };
-    process.on("SIGINT", shutdown);
-    process.on("SIGTERM", shutdown);
+    process.on("SIGINT", () => shutdown("SIGINT"));
+    process.on("SIGTERM", () => shutdown("SIGTERM"));
     say(`bridge ready on ${started.localBaseUrl()} (workspace ${started.workspace.name})`);
   });
 }

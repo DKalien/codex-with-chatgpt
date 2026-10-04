@@ -1,3 +1,4 @@
+import { cleanupStrict } from "./strict-teardown.js";
 import fs from "node:fs";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -25,21 +26,24 @@ import { ensureBridge } from "../src/process/daemon.js";
 import * as bridgeRuntime from "../src/bridge/runtime.js";
 import { Workspace } from "../src/workspace/manager.js";
 import { SERVICE_NAME, VERSION } from "../src/version.js";
-import { cleanup, isolateStateDir, makeTmpDir } from "./helpers.js";
+import { isolateStateDir, makeTmpDir } from "./helpers.js";
 
 let stateDir: string;
 let wsRoot: string;
+const extraDirectories: string[] = [];
+let previousState: string | undefined;
 
 beforeEach(() => {
+  previousState = process.env.C2C_STATE_DIR;
   stateDir = isolateStateDir();
   wsRoot = makeTmpDir("startup-lease-ws");
 });
 
-afterEach(() => {
+afterEach(async () => {
   vi.restoreAllMocks();
-  cleanup(stateDir);
-  cleanup(wsRoot);
-  delete process.env.C2C_STATE_DIR;
+  if (previousState === undefined) delete process.env.C2C_STATE_DIR;
+  else process.env.C2C_STATE_DIR = previousState;
+  await cleanupStrict(stateDir, wsRoot, ...extraDirectories.splice(0));
 });
 
 describe("strict maintenance lock metadata", () => {
@@ -94,7 +98,9 @@ describe("startup lease fencing", () => {
       .toThrow();
     expect(() => assertStartupLease({ ...lease, startLockNonce: "00000000-0000-4000-8000-000000000002" }, workspace))
       .toThrow(StartupLeaseError);
-    expect(() => assertStartupLease(lease, new Workspace(makeTmpDir("other-ws"))))
+    const otherRoot = makeTmpDir("other-ws");
+    extraDirectories.push(otherRoot);
+    expect(() => assertStartupLease(lease, new Workspace(otherRoot)))
       .toThrow(StartupLeaseError);
 
     expect(start.release()).toBe(true);

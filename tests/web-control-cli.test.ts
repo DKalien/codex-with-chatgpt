@@ -3,10 +3,11 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { cleanup, makeTmpDir } from "./helpers.js";
+import { makeTmpDir } from "./helpers.js";
+import { cleanupStrict } from "./strict-teardown.js";
 
 const project = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const entry = path.join(project, "src/cli/index.ts");
+const entry = path.join(project, "tests/fixtures/web-control-cli.ts");
 const url = "https://chatgpt.com/c/control-test";
 let root: string;
 let stateDir: string;
@@ -21,9 +22,28 @@ function control(...args: string[]) {
   return { exit: result.status, ...JSON.parse(result.stdout) };
 }
 beforeEach(() => { root = makeTmpDir("control-cli"); stateDir = makeTmpDir("control-cli-state"); });
-afterEach(() => { cleanup(root); cleanup(stateDir); });
+afterEach(async () => { await cleanupStrict(root, stateDir); });
 
 describe("本地 Web Control CLI（独立进程，跨重读持久化）", () => {
+  it("minimal entry reuses commands still wired into the production CLI", () => {
+    const production = fs.readFileSync(path.join(project, "src/cli/index.ts"), "utf8");
+    const fixture = fs.readFileSync(entry, "utf8");
+    for (const [registration, module] of [
+      ["registerWebControlCommands", "web-control"],
+      ["registerSessionCommands", "session"],
+      ["registerRecordCommand", "record"],
+    ]) {
+      for (const [source, prefix] of [[production, "\\./"], [fixture, "\\.\\./\\.\\./src/cli/"]]) {
+        expect(source).toMatch(new RegExp(`import\\s+\\{[^}]*\\b${registration}\\b[^}]*\\}\\s+from "${prefix}${module}\\.js"`));
+        expect(source).toContain(`${registration}(program);`);
+      }
+    }
+    // Only the registration graph is smaller; every invocation still boots a
+    // fresh Node/tsx process and loads the real command actions/store code.
+    expect(fixture.match(/register\w+\(program\);/g)).toHaveLength(3);
+    expect(fixture).toContain("program.parseAsync(process.argv)");
+  });
+
   it("只在本地明确开启，接收后记录并反馈，重复 start 不执行", () => {
     expect(control("status")).toMatchObject({ ok: true, enabled: false });
     expect(cli("session", "set", "--url", url).status).toBe(0);

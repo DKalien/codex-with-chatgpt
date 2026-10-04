@@ -1,3 +1,4 @@
+import { listResultBusCutoverDispositions } from "../src/result-bus/cutover-store.js";
 import fs from "node:fs";
 import path from "node:path";
 import http from "node:http";
@@ -7,7 +8,7 @@ import { Workspace } from "../src/workspace/manager.js";
 import { cleanup, isolateStateDir, makeTmpDir } from "./helpers.js";
 import { appendExecutionRecordLocked, withExecutionRecordsLock } from "../src/execution/records.js";
 import { updateDesktop } from "../src/desktop/store.js";
-import { appendResult, createCommand, registerRoute } from "../src/routing/store.js";
+import { appendResult, createCommand, registerRoute, routingFile } from "../src/routing/store.js";
 import { canonicalRoutingResultDigest } from "../src/routing/execution-result-digest.js";
 import { enqueueResultBusEntry, readResultBus, resultBusFile } from "../src/result-bus/store.js";
 import { reserveNextResultBusEntry, markResultBusOutcomeUnknown, retireResultBusOutcomeUnknown } from "../src/result-bus/delivery-lifecycle.js";
@@ -44,12 +45,15 @@ import {
 import { applyProjection, feedbackEventId, finalReceiptRequiredEventId } from "../src/feedback/projection-store.js";
 import { canonicalFeedbackEvent } from "../src/feedback/canonical-compat.js";
 import { reconcileFeedbackOutbox } from "../src/feedback/projector.js";
-import { writeState } from "../src/feedback/state-store.js";
+import { writeState, feedbackStateFile } from "../src/feedback/state-store.js";
+import { cleanupJournalFile } from "../src/command-cleanup/fence.js";
 import { resolveConversationPrincipal } from "../src/mcp/conversation-principal.js";
 import { bindCurrentWebSink, readActiveWebSinkBinding } from "../src/web-sink-control/index.js";
 import { projectChatgptRouteToWebSinkCandidate } from "../src/web-sink-control/index.js";
 import { createCompanionRouter } from "../src/bridge/companion.js";
 import { claimNextForMcp } from "../src/mcp/feedback.js";
+import { evaluateServerObservedCloseout, findExactObservedEvent } from "../browser-companion/production-send.js";
+import { requestJson } from "./http-json.js";
 
 let stateDir: string;
 let wsRoot: string;
@@ -281,6 +285,205 @@ function ackViaAdapter(credential: string, eventId: string, attemptId: string, r
     eventId, attemptId, stateDir,
   });
 }
+
+function blockUnrelatedLegacy() {
+  const commandId = "unrelated-control-locked";
+  projectControlEvent(commandId);
+  const file = `${cleanupJournalFile(workspace.id, commandId, stateDir)}.lock`;
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  // Real incident: an empty, unprovable owner is never reclaimed.
+  fs.writeFileSync(file, "");
+  return file;
+}
+
+describe("canonical delivery with unavailable legacy enrichment", () => {
+  function setup() {
+    enableBinding();
+    const paired = pairCompanion();
+    bindSink(ROUTE_A);
+    const seeded = seedBusEntry("canonical-lock-independent");
+    return { ...seeded, credential: paired.credential };
+  }
+  function state(credential: string) {
+    return resultBusCompanionState({ workspaceId: workspace.id, workspaceRoot: wsRoot, credential, stateDir });
+  }
+  function snapshot() {
+    return [feedbackStateFile(workspace.id, stateDir), resultBusCutoverFile(workspace.id, stateDir)]
+      .map(file => fs.existsSync(file) ? fs.readFileSync(file, "utf8") : null);
+  }
+
+  it("unrelated corrupt lock leaves canonical state/reserve/release/begin/ACK available with no legacy writes", () => {
+    const { credential, entry } = setup();
+    const lock = blockUnrelatedLegacy();
+    const before = snapshot();
+    expect(state(credential)).toMatchObject({ routeVerification: "VERIFIED", productionEligible: true,
+      pendingReady: 2 }); // Durable ready counts; actual acquisition rechecks command authority.
+    const reserved = reserveViaAdapter(credential);
+    expect(reserved.delivery.eventId).toBe(resultBusCompanionDeliveryId(entry.busEntryId));
+    const busBytes = fs.readFileSync(resultBusFile(workspace.id, stateDir));
+    expect(reserveViaAdapter(credential)).toEqual(reserved);
+    expect(fs.readFileSync(resultBusFile(workspace.id, stateDir))).toEqual(busBytes);
+    resultBusCompanionRelease({ workspaceId: workspace.id, workspaceRoot: wsRoot, credential,
+      eventId: reserved.delivery.eventId as string, reservationId: reserved.reservationId, routeCanonical: ROUTE_A, stateDir });
+    const next = reserveViaAdapter(credential);
+    const sent = beginViaAdapter(credential, next.delivery.eventId as string, next.reservationId);
+    expect(beginViaAdapter(credential, next.delivery.eventId as string, next.reservationId)).toEqual(sent);
+    expect(ackViaAdapter(credential, next.delivery.eventId as string, sent.attemptId)).toMatchObject({ status: "observed" });
+    expect(snapshot()).toEqual(before);
+    expect(fs.statSync(lock).size).toBe(0);
+  });
+
+  it.each(["reserved", "claimed", "outcome_unknown"])("strict legacy %s still fences new canonical reservation", status => {
+    const { credential } = setup();
+    projectControlEvent("legacy-flight", { status });
+    blockUnrelatedLegacy();
+    const before = snapshot();
+    expect(state(credential)).toMatchObject({ blockedByLegacyInFlight: true });
+    expectCode(() => reserveViaAdapter(credential), "FEEDBACK_INFLIGHT_FENCE");
+    expect(readResultBus(workspace, stateDir)!.entries[0]).toMatchObject({ deliveryStatus: "queued", attempt: null });
+    expect(snapshot()).toEqual(before);
+  });
+
+  it("unresolved historical counterpart cannot invent a disposition in degraded mode", () => {
+    const { credential, result } = setup();
+    projectPinnedLegacy(result);
+    blockUnrelatedLegacy();
+    const before = snapshot();
+    expectCode(() => state(credential), "RESULT_BUS_CUTOVER_REQUIRED");
+    const reserved = reserveViaAdapter(credential); // Explicit mutation may establish the exact cutover disposition.
+    expect(reserved.delivery.commandId).toBe(result.commandId);
+    expect(snapshot()[0]).toEqual(before[0]);
+    expect(listResultBusCutoverDispositions(workspace, stateDir)).toHaveLength(1);
+  });
+
+  it("strict existing cutover disposition can be reused without writing legacy authority", () => {
+    const { credential, result } = setup();
+    projectPinnedLegacy(result);
+    reconcileResultBusCutover({ identity: workspace, stateDir });
+    blockUnrelatedLegacy();
+    const before = snapshot();
+    expect(state(credential).pendingReady).toBe(2);
+    expect(reserveViaAdapter(credential).reservationId).toBeTruthy();
+    expect(snapshot()).toEqual(before);
+  });
+
+  it("corrupt Feedback snapshot cannot prove absence of legacy in-flight", () => {
+    const { credential } = setup();
+    blockUnrelatedLegacy();
+    fs.writeFileSync(feedbackStateFile(workspace.id, stateDir), "{}");
+    // Auth cannot even be established from a corrupt Feedback store; no canonical state.
+    expect(state(credential)).toEqual({ legacyOnly: true });
+    expect(() => reserveViaAdapter(credential)).toThrow();
+    expect(readResultBus(workspace, stateDir)!.entries[0].deliveryStatus).toBe("queued");
+  });
+
+  it("invalid credential/route/sink cannot use degraded canonical authority", () => {
+    const { credential } = setup();
+    blockUnrelatedLegacy();
+    const before = snapshot();
+    expect(() => reserveViaAdapter("invalid")).toThrow();
+    expectCode(() => reserveViaAdapter(credential, ROUTE_B), "ROUTE_MISMATCH");
+    bindSink(ROUTE_B);
+    expect(state(credential).productionEligible).toBe(false);
+    expectCode(() => reserveViaAdapter(credential), "RESULT_BUS_SINK_ROUTE_MISMATCH");
+    expect(snapshot()).toEqual(before);
+  });
+
+  it("legacy/control fallback remains blocked when there is no canonical entry", () => {
+    enableBinding();
+    const paired = pairCompanion();
+    bindSink(ROUTE_A);
+    blockUnrelatedLegacy();
+    expectCode(() => reserveViaAdapter(paired.credential), "COMMAND_CLEANUP_BUSY");
+  });
+
+  it.each(["corrupt_lock", "cleanup_journal"])("new result's own %s prevents projection/reservation without touching its authority", kind => {
+    enableBinding();
+    const paired = pairCompanion();
+    bindSink(ROUTE_A);
+    const result = routingResult("own-fenced-result");
+    const journal = cleanupJournalFile(workspace.id, result.commandId, stateDir);
+    const file = kind === "corrupt_lock" ? `${journal}.lock` : journal;
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, kind === "corrupt_lock" ? "" : JSON.stringify({ version: 1,
+      workspaceId: workspace.id, workspaceRoot: wsRoot, commandId: result.commandId, iteration: 1,
+      cleanupId: CLAIM_ATTEMPT, mode: "manual_force", phase: "fenced", createdAt: new Date().toISOString(), artifacts: [] }));
+    const before = fs.readFileSync(file);
+    // GET observes the durable Bus only, without projection or cleanup lock acquisition.
+    expect(state(paired.credential)).toMatchObject({ pendingReady: 0 });
+    expect(() => reserveViaAdapter(paired.credential)).toThrow();
+    expect(readResultBus(workspace, stateDir)?.entries ?? []).toEqual([]);
+    expect(fs.readFileSync(file)).toEqual(before);
+  });
+
+  it("corrupt Bus fails canonical projection before any rewrite despite unavailable legacy locks", () => {
+    const { credential } = setup();
+    routingResult("new-result-not-enqueued");
+    blockUnrelatedLegacy();
+    const file = resultBusFile(workspace.id, stateDir);
+    fs.writeFileSync(file, "{}");
+    const before = snapshot();
+    expectCode(() => state(credential), "RESULT_BUS_STATE_CORRUPT");
+    expectCode(() => reserveViaAdapter(credential), "RESULT_BUS_STATE_CORRUPT");
+    expect(fs.readFileSync(file, "utf8")).toBe("{}");
+    expect(snapshot()).toEqual(before);
+  });
+
+  it("immutable routing drift is not a skippable lifecycle failure", () => {
+    const { credential } = setup();
+    blockUnrelatedLegacy();
+    const file = routingFile(workspace.id, stateDir);
+    const routing = JSON.parse(fs.readFileSync(file, "utf8"));
+    routing.results[0].rawSummary = "different immutable canonical content";
+    fs.writeFileSync(file, JSON.stringify(routing));
+    const bus = fs.readFileSync(resultBusFile(workspace.id, stateDir));
+    expectCode(() => state(credential), "RESULT_BUS_CONFLICT");
+    expectCode(() => reserveViaAdapter(credential), "RESULT_BUS_CONFLICT");
+    expect(fs.readFileSync(resultBusFile(workspace.id, stateDir))).toEqual(bus);
+  });
+
+  it("new projection cannot bypass its unresolved historical counterpart", () => {
+    enableBinding();
+    const paired = pairCompanion();
+    bindSink(ROUTE_A);
+    const result = routingResult("new-with-counterpart");
+    projectPinnedLegacy(result);
+    blockUnrelatedLegacy();
+    const before = snapshot();
+    expect(state(paired.credential)).toMatchObject({ pendingReady: 1 });
+    expect(readResultBus(workspace, stateDir)?.entries ?? []).toEqual([]);
+    expect(snapshot()).toEqual(before);
+    expect(reserveViaAdapter(paired.credential).delivery.commandId).toBe(result.commandId);
+    expect(listResultBusCutoverDispositions(workspace, stateDir)).toHaveLength(1);
+    expect(readResultBus(workspace, stateDir)!.entries[0]).toMatchObject({ deliveryStatus: "reserved", attempt: null });
+    expect(snapshot()[0]).toEqual(before[0]);
+  });
+
+  it("validated old disposition remains usable while a new pure canonical result projects", () => {
+    const { credential, result } = setup();
+    projectPinnedLegacy(result, { status: "observed" });
+    reconcileResultBusCutover({ identity: workspace, stateDir });
+    blockUnrelatedLegacy();
+    const next = routingResult("new-after-disposition");
+    const before = snapshot();
+    expect(state(credential).pendingReady).toBe(1);
+    expect(reserveViaAdapter(credential).delivery.commandId).toBe(next.commandId);
+    expect(snapshot()).toEqual(before);
+  });
+
+  it("invalid request route cannot project a new result before rejection", () => {
+    enableBinding();
+    const paired = pairCompanion();
+    bindSink(ROUTE_A);
+    routingResult("new-auth-first");
+    blockUnrelatedLegacy();
+    expect(() => reserveViaAdapter("invalid")).toThrow();
+    expectCode(() => reserveViaAdapter(paired.credential, ROUTE_B), "ROUTE_MISMATCH");
+    bindSink(ROUTE_B);
+    expectCode(() => reserveViaAdapter(paired.credential), "RESULT_BUS_SINK_ROUTE_MISMATCH");
+    expect(fs.existsSync(resultBusFile(workspace.id, stateDir))).toBe(false);
+  });
+});
 
 describe("R5d3 Result Bus cutover", () => {
   it("A: R4c pinned observed → legacy_observed；Bus 永不被预约", () => {
@@ -544,6 +747,36 @@ describe("R5d3 Result Bus cutover", () => {
     projectPinnedLegacy(result, { status: "ready", eventId: "ffffffffffffffffffffffffffffffff" });
     projectControlEvent("r5d3-fix21e");
     expectCode(() => reconcileResultBusCutover({ identity: workspace, stateDir }), "RESULT_BUS_CUTOVER_IDENTITY_CONFLICT");
+  });
+
+  it.each(["claimed", "outcome_unknown"] as const)("%s replay cannot expose Sink A payload to verified Sink B", status => {
+    enableBinding();
+    const pairedA = pairCompanion(ROUTE_A);
+    bindSink(ROUTE_A);
+    const { entry } = seedBusEntry("r5g-frozen-begin-replay");
+    const reserved = reserveViaAdapter(pairedA.credential);
+    const eventId = (reserved.delivery as { eventId: string }).eventId;
+    const sent = beginViaAdapter(pairedA.credential, eventId, reserved.reservationId);
+    if (status === "outcome_unknown") {
+      markResultBusOutcomeUnknown(workspace, { busEntryId: entry.busEntryId, attemptId: sent.attemptId }, {}, stateDir);
+    } else {
+      const replayBytes = fs.readFileSync(resultBusFile(workspace.id, stateDir));
+      expect(beginViaAdapter(pairedA.credential, eventId, reserved.reservationId)).toEqual(sent);
+      expect(fs.readFileSync(resultBusFile(workspace.id, stateDir))).toEqual(replayBytes);
+    }
+    const frozen = readResultBus(workspace, stateDir)!.entries[0]!;
+    const pairedB = pairCompanion(ROUTE_B);
+    bindSink(ROUTE_B);
+    const before = fs.readFileSync(resultBusFile(workspace.id, stateDir));
+
+    expectCode(() => reserveViaAdapter(pairedB.credential, ROUTE_B), "RESULT_BUS_FROZEN_TARGET_MISMATCH");
+    expectCode(() => beginViaAdapter(pairedB.credential, eventId, reserved.reservationId, ROUTE_B), "RESULT_BUS_FROZEN_TARGET_MISMATCH");
+
+    expect(fs.readFileSync(resultBusFile(workspace.id, stateDir))).toEqual(before);
+    expect(readResultBus(workspace, stateDir)!.entries[0]).toMatchObject({
+      busEntryId: entry.busEntryId, deliveryStatus: status,
+      attempt: { attemptId: sent.attemptId }, sendTarget: frozen.sendTarget,
+    });
   });
 
   it("16/FIX B: 认证 route 与目标边界——B 目标必须出自 B-verified credential；跨 route 一律拒绝", () => {
@@ -924,10 +1157,8 @@ describe("R5d3 Result Bus cutover", () => {
       return new Promise(resolve => server.listen(0, "127.0.0.1", () => resolve()));
     }
 
-    async function fetchJson(pathname: string, init?: RequestInit) {
-      const res = await fetch(`${base}${pathname}`, init);
-      const body = await res.json().catch(() => ({}));
-      return { status: res.status, body };
+    function fetchJson(pathname: string, init?: Parameters<typeof requestJson>[1]) {
+      return requestJson(`${base}${pathname}`, init);
     }
 
     beforeEach(async () => {
@@ -937,6 +1168,34 @@ describe("R5d3 Result Bus cutover", () => {
 
     afterEach(async () => {
       await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    });
+
+    it("HTTP: new canonical result projects after degraded state despite another result's corrupt lifecycle lock", async () => {
+      enableBinding();
+      const paired = pairCompanion();
+      bindSink(ROUTE_A);
+      routingResult("unrelated-control-locked");
+      const lock = blockUnrelatedLegacy();
+      const headers = { authorization: `Bearer ${paired.credential}`, "content-type": "application/json" };
+      const before = fs.readFileSync(feedbackStateFile(workspace.id, stateDir));
+      expect(await fetchJson("/api/companion/v1/state", { headers })).toMatchObject({ status: 200,
+        body: { pendingReady: 1 } });
+      // Incident: the trusted canonical result appears AFTER degraded serving began.
+      const result = routingResult("new-command27-like");
+      expect(readResultBus(workspace, stateDir)?.entries ?? []).toEqual([]);
+      const state = await fetchJson("/api/companion/v1/state", { headers });
+      expect(state).toMatchObject({ status: 200, body: { pendingReady: 1, routeVerification: "VERIFIED" } });
+      expect(readResultBus(workspace, stateDir)?.entries ?? []).toEqual([]);
+      expect(JSON.stringify(state.body)).not.toMatch(/nonce|\.json\.lock|c2c_comp_/);
+      const request = { method: "POST", headers, body: JSON.stringify({ routeCanonical: ROUTE_A }) };
+      const reserved = await fetchJson("/api/companion/v1/reserve", request);
+      expect(reserved).toMatchObject({ status: 200, body: { delivery: { commandId: result.commandId } } });
+      const bytes = fs.readFileSync(resultBusFile(workspace.id, stateDir));
+      expect(await fetchJson("/api/companion/v1/reserve", request)).toEqual(reserved);
+      expect(fs.readFileSync(resultBusFile(workspace.id, stateDir))).toEqual(bytes);
+      expect(readResultBus(workspace, stateDir)!.entries).toHaveLength(1);
+      expect(fs.readFileSync(feedbackStateFile(workspace.id, stateDir))).toEqual(before);
+      expect(fs.statSync(lock).size).toBe(0);
     });
 
     it("HTTP: WebSink-only auth（binding null）下 /state /reserve /begin-send 可用", async () => {
@@ -964,6 +1223,179 @@ describe("R5d3 Result Bus cutover", () => {
       expect(sent.body.status).toBe("claimed");
       expect(sent.body.message).toContain("[C2C_CONTROL]");
     });
+
+    it("HTTP: valid Web Sink state/reserve bypass only unrelated unavailable legacy enrichment", async () => {
+      enableBinding();
+      const paired = pairCompanion();
+      bindSink(ROUTE_A);
+      seedBusEntry("http-canonical-locked-legacy");
+      blockUnrelatedLegacy();
+      const before = fs.readFileSync(feedbackStateFile(workspace.id, stateDir));
+      const headers = { authorization: `Bearer ${paired.credential}`, "content-type": "application/json" };
+      const state = await fetchJson("/api/companion/v1/state", { headers });
+      expect(state).toMatchObject({ status: 200, body: { routeVerification: "VERIFIED", pendingReady: 2 } });
+      expect(JSON.stringify(state.body)).not.toMatch(/nonce|\.json\.lock|c2c_comp_/);
+      expect(await fetchJson("/api/companion/v1/reserve", { method: "POST", headers,
+        body: JSON.stringify({ routeCanonical: ROUTE_A }) })).toMatchObject({ status: 200 });
+      expect(fs.readFileSync(feedbackStateFile(workspace.id, stateDir))).toEqual(before);
+    });
+
+    it("HTTP: unresolved cutover and corrupt Feedback stay bounded fail-closed", async () => {
+      enableBinding();
+      const paired = pairCompanion();
+      bindSink(ROUTE_A);
+      const { result } = seedBusEntry("http-unresolved-cutover");
+      projectPinnedLegacy(result);
+      blockUnrelatedLegacy();
+      const headers = { authorization: `Bearer ${paired.credential}`, "content-type": "application/json" };
+      expect(await fetchJson("/api/companion/v1/state", { headers })).toEqual({ status: 409,
+        body: { error: "RESULT_BUS_CUTOVER_REQUIRED", stage: "result_bus_cutover" } });
+      fs.writeFileSync(feedbackStateFile(workspace.id, stateDir), "{}");
+      const failed = await fetchJson("/api/companion/v1/state", { headers });
+      expect(failed.status).not.toBe(200);
+      expect(failed.body.error).toBe("FEEDBACK_STATE_CORRUPT");
+      expect(readResultBus(workspace, stateDir)!.entries[0].deliveryStatus).toBe("queued");
+    });
+
+    it("HTTP: 无 Active Sink 保持 queued；显式绑定后 ACK 丢响应可由冻结 route 的 /state 精确收敛", async () => {
+      enableBinding();
+      const paired = pairCompanion(ROUTE_A);
+      const { entry } = seedBusEntry("r5d3-http-observed");
+      const auth = { authorization: `Bearer ${paired.credential}`, "content-type": "application/json" };
+      expect(readActiveWebSinkBinding(workspace.id)).toBeNull();
+      const before = await fetchJson("/api/companion/v1/state", { headers: auth });
+      expect(before.status).toBe(200);
+      expect(before.body).toMatchObject({ routeVerification: "VERIFIED", pendingReady: 1, inFlight: null });
+      const unavailable = await fetchJson("/api/companion/v1/reserve", {
+        method: "POST", headers: auth, body: JSON.stringify({ routeCanonical: ROUTE_A }),
+      });
+      expect(unavailable.status).toBe(404);
+      expect(readResultBus(workspace, stateDir)!.entries[0]).toMatchObject({
+        deliveryStatus: "queued", attempt: null,
+      });
+
+      const bound = await fetchJson("/api/companion/v1/web-sink/bind-current", {
+        method: "POST", headers: auth, body: JSON.stringify({ routeCanonical: ROUTE_A }),
+      });
+      expect(bound.status).toBe(200);
+      expect(bound.body.activeBinding.canonicalUrl).toBe(ROUTE_A);
+      const reserved = await fetchJson("/api/companion/v1/reserve", {
+        method: "POST", headers: auth, body: JSON.stringify({ routeCanonical: ROUTE_A }),
+      });
+      expect(reserved.status).toBe(200);
+      const eventId = reserved.body.delivery.eventId as string;
+      const sent = await fetchJson("/api/companion/v1/begin-send", {
+        method: "POST", headers: auth,
+        body: JSON.stringify({ routeCanonical: ROUTE_A, eventId, reservationId: reserved.body.reservationId }),
+      });
+      expect(sent.status).toBe(200);
+      const attemptId = sent.body.attemptId as string;
+      const ackBody = { routeCanonical: ROUTE_A, eventId, attemptId };
+      const ack = await fetchJson("/api/companion/v1/ack", {
+        method: "POST", headers: auth, body: JSON.stringify(ackBody),
+      });
+      expect(ack).toMatchObject({ status: 200, body: { eventId, status: "observed" } });
+      // 模拟 ACK 响应丢失：仅用随后认证 /state 的投影恢复本地 journal。
+      const state = await fetchJson("/api/companion/v1/state", { headers: auth });
+      expect(state.status).toBe(200);
+      expect(state.body.inFlight).toBeNull();
+      const observed = { eventId, status: "observed", attemptId };
+      expect(state.body.events.filter((event: { eventId: string }) => event.eventId === eventId)).toEqual([observed]);
+      for (const journalState of ["OUTCOME_UNKNOWN", "OBSERVED_PENDING_ACK"]) {
+        const journal = { state: journalState, eventId, attemptId };
+        const found = findExactObservedEvent(state.body.events, journal);
+        expect(found).toEqual({ ok: true, observed });
+        expect(evaluateServerObservedCloseout({ journal, inFlight: state.body.inFlight, serverObserved: found.observed }))
+          .toEqual({ ok: true, action: "server_observed_clear" });
+      }
+      expect(findExactObservedEvent(state.body.events, {
+        state: "OBSERVED_PENDING_ACK", eventId, attemptId: CLAIM_ATTEMPT_ALT,
+      }).ok).toBe(false);
+      const duplicate = await fetchJson("/api/companion/v1/ack", {
+        method: "POST", headers: auth, body: JSON.stringify(ackBody),
+      });
+      expect(duplicate).toMatchObject({ status: 200, body: { eventId, status: "observed" } });
+      expect(readResultBus(workspace, stateDir)!.entries[0]!.busEntryId).toBe(entry.busEntryId);
+
+      bindSink(ROUTE_C);
+      const oldRoute = await fetchJson("/api/companion/v1/state", { headers: auth });
+      expect(oldRoute.body.events).toContainEqual(observed);
+      const pairedC = pairCompanion(ROUTE_C);
+      const otherRoute = await fetchJson("/api/companion/v1/state", {
+        headers: { authorization: `Bearer ${pairedC.credential}` },
+      });
+      expect(otherRoute.status).toBe(200);
+      expect(otherRoute.body.events).not.toContainEqual(observed);
+      expect(findExactObservedEvent(otherRoute.body.events, {
+        state: "OBSERVED_PENDING_ACK", eventId, attemptId,
+      }).ok).toBe(false);
+    });
+
+    for (const sameRouteSuccessor of [false, true]) {
+      it(`HTTP: reserved 只向原 Sink stamp 暴露；${sameRouteSuccessor ? "同 route successor" : "跨 route Sink"} 切换后先 stale 再新预约`, async () => {
+        enableBinding();
+        const pairedA = pairCompanion(ROUTE_A);
+        const sinkA = bindSink(ROUTE_A);
+        const { entry } = seedBusEntry(`r5d3-reserved-isolation-${sameRouteSuccessor ? "same" : "cross"}`);
+        const authA = { authorization: `Bearer ${pairedA.credential}`, "content-type": "application/json" };
+        const reserve = (auth: typeof authA, routeCanonical: string) => fetchJson("/api/companion/v1/reserve", {
+          method: "POST", headers: auth, body: JSON.stringify({ routeCanonical }),
+        });
+        const first = await reserve(authA, ROUTE_A);
+        expect(first.status).toBe(200);
+        const eventId = first.body.delivery.eventId as string;
+        const reservationId = first.body.reservationId as string;
+        expect(eventId).toBe(resultBusCompanionDeliveryId(entry.busEntryId));
+        const firstStamp = readResultBus(workspace, stateDir)!.entries[0]!.reservation!;
+        expect(firstStamp).toMatchObject({ bindingId: sinkA.bindingId, epoch: sinkA.epoch, boundAt: sinkA.boundAt });
+        const firstBytes = fs.readFileSync(resultBusFile(workspace.id, stateDir), "utf8");
+        const same = await reserve(authA, ROUTE_A);
+        expect(same).toMatchObject({ status: 200, body: { reservationId, delivery: { eventId } } });
+        const equivalentRoute = `https://www.chatgpt.com/c/${ROUTE_A.split("/").at(-1)}/`;
+        const equivalent = await reserve(authA, equivalentRoute);
+        expect(equivalent).toMatchObject({ status: 200, body: { reservationId, delivery: { eventId } } });
+        const sameState = await fetchJson("/api/companion/v1/state", { headers: authA });
+        expect(sameState.body.inFlight).toMatchObject({ status: "reserved", eventId, reservationId });
+        expect(fs.readFileSync(resultBusFile(workspace.id, stateDir), "utf8")).toBe(firstBytes);
+
+        const pairedB = pairCompanion(ROUTE_B);
+        bindSink(ROUTE_B);
+        const nextPaired = sameRouteSuccessor ? pairCompanion(ROUTE_A) : pairedB;
+        const nextRoute = sameRouteSuccessor ? ROUTE_A : ROUTE_B;
+        const nextSink = sameRouteSuccessor ? bindSink(ROUTE_A) : readActiveWebSinkBinding(workspace.id)!;
+        expect(nextSink.bindingId).not.toBe(sinkA.bindingId);
+        const nextAuth = { authorization: `Bearer ${nextPaired.credential}`, "content-type": "application/json" };
+        const beforeStale = fs.readFileSync(resultBusFile(workspace.id, stateDir), "utf8");
+        const blocked = await reserve(nextAuth, nextRoute);
+        expect(blocked.status).toBe(409);
+        expect(blocked.body.error).toBe("RESULT_BUS_STALE_RESERVATION");
+        expect(blocked.body).not.toHaveProperty("delivery");
+        expect(blocked.body).not.toHaveProperty("reservationId");
+        expect(JSON.stringify(blocked.body)).not.toContain(eventId);
+        expect(JSON.stringify(blocked.body)).not.toContain(reservationId);
+        expect(JSON.stringify(blocked.body)).not.toContain(entry.result.rawSummary);
+        const pinned = await fetchJson("/api/companion/v1/state", { headers: nextAuth });
+        expect(pinned.body.inFlight).toEqual({ status: "reserved", pinnedToOtherRoute: true });
+        expect(fs.readFileSync(resultBusFile(workspace.id, stateDir), "utf8")).toBe(beforeStale);
+
+        const stale = await fetchJson("/api/companion/v1/begin-send", {
+          method: "POST", headers: nextAuth,
+          body: JSON.stringify({ routeCanonical: nextRoute, eventId, reservationId }),
+        });
+        expect(stale.status).toBe(409);
+        expect(stale.body.error).toBe("RESULT_BUS_STALE_RESERVATION");
+        expect(readResultBus(workspace, stateDir)!.entries[0]).toMatchObject({
+          deliveryStatus: "queued", reservation: null, attempt: null, sendTarget: null,
+        });
+        const fresh = await reserve(nextAuth, nextRoute);
+        expect(fresh).toMatchObject({ status: 200, body: { delivery: { eventId } } });
+        expect(fresh.body.reservationId).not.toBe(reservationId);
+        expect(readResultBus(workspace, stateDir)!.entries[0]!.reservation).toMatchObject({
+          reservationId: fresh.body.reservationId,
+          bindingId: nextSink.bindingId, epoch: nextSink.epoch, boundAt: nextSink.boundAt,
+        });
+      });
+    }
 
     it("HTTP: pre-R4c observed 历史事件经 /reserve 不重发", async () => {
       enableBinding();

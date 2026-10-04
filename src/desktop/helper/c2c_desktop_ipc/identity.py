@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import re
 from pathlib import Path
 from ctypes import wintypes
 from typing import Any
@@ -34,6 +35,12 @@ ELEVATION_TYPE_FULL = 2
 ELEVATION_TYPE_LIMITED = 3
 SECURITY_MANDATORY_MEDIUM_RID = 0x2000
 SECURITY_MANDATORY_LABEL_AUTHORITY = 16
+_DECIMAL_UINT64 = re.compile(r"[1-9][0-9]*\Z")
+_MAX_UINT64 = (1 << 64) - 1
+_MAX_PID = (1 << 32) - 1
+_RUNTIME_FENCE_KEYS = frozenset({
+    "desktopPid", "desktopExe", "desktopCreation", "appServerPid", "appServerExe", "appServerCreation",
+})
 
 
 class _TokenElevation(ctypes.Structure):
@@ -164,21 +171,24 @@ def _processes() -> list[dict[str, Any]]:
         first = _kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
         while first:
             name = str(entry.szExeFile)
+            # Keep every parent row so a codex process launched through an
+            # intermediate executable can still be tied to its ChatGPT root.
+            pid = int(entry.th32ProcessID)
+            parent = int(entry.th32ParentProcessID)
+            exe = ""
+            creation = 0
+            process = None
             if name.casefold() in {"chatgpt.exe", "codex.exe"}:
-                pid = int(entry.th32ProcessID)
-                parent = int(entry.th32ParentProcessID)
                 process = _kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-                exe = ""
-                creation = 0
-                if _valid_handle(process):
-                    try:
-                        exe = _query_image_path(process)
-                        creation = _creation_time(process)
-                    except (OSError, ValueError, ctypes.ArgumentError):
-                        exe = ""
-                    finally:
-                        _kernel32.CloseHandle(process)
-                result.append({"pid": pid, "parentPid": parent, "name": name, "exe": exe, "creation": creation})
+            if process is not None and _valid_handle(process):
+                try:
+                    exe = _query_image_path(process)
+                    creation = _creation_time(process)
+                except (OSError, ValueError, ctypes.ArgumentError):
+                    exe = ""
+                finally:
+                    _kernel32.CloseHandle(process)
+            result.append({"pid": pid, "parentPid": parent, "name": name, "exe": exe, "creation": creation})
             first = _kernel32.Process32NextW(snapshot, ctypes.byref(entry))
     finally:
         _kernel32.CloseHandle(snapshot)
@@ -208,23 +218,27 @@ def _process_parent_ids() -> dict[int, int]:
     return result
 
 
+def _ancestor_chain(pid: int, parents: dict[int, int]) -> set[int]:
+    chain: set[int] = set()
+    current = pid
+    for _ in range(64):
+        if current in chain:
+            break
+        chain.add(current)
+        parent = parents.get(current)
+        if parent is None or parent == current:
+            break
+        current = parent
+    return chain
+
+
 def _verify_current_runner_ancestor(process: dict[str, Any]) -> None:
     expected = process.get("appServerPid")
     if type(expected) is not int or expected <= 0:
         raise _error("DESKTOP_CURRENT_CONTEXT_INVALID")
     parents = _process_parent_ids()
-    current = os.getpid()
-    seen: set[int] = set()
-    for _ in range(64):
-        if current == expected:
-            return
-        if current in seen:
-            break
-        seen.add(current)
-        parent = parents.get(current)
-        if parent is None or parent == current:
-            break
-        current = parent
+    if expected in _ancestor_chain(os.getpid(), parents):
+        return
     raise _error("DESKTOP_CURRENT_CONTEXT_INVALID")
 
 
@@ -287,28 +301,107 @@ def _verify_project(target: dict[str, str]) -> None:
         raise _error("DESKTOP_PROJECT_MISMATCH")
 
 
-def _verify_process_identity(pipe: _Pipe, target: dict[str, str], expected: dict[str, Any] | None = None) -> dict[str, Any]:
-    """核对当前 pipe 对端是唯一 ChatGPT Desktop 进程树；不读取版本或 bundle。"""
+def _decode_runtime_fence(value: Any) -> dict[str, Any]:
+    """Decode the wire fence without allowing JSON numbers for FILETIME."""
+    if not isinstance(value, dict) or frozenset(value) != _RUNTIME_FENCE_KEYS:
+        raise _error("DESKTOP_INVALID_REQUEST")
+    for key in ("desktopPid", "appServerPid"):
+        pid = value.get(key)
+        if type(pid) is not int or not 0 < pid <= _MAX_PID:
+            raise _error("DESKTOP_INVALID_REQUEST")
+    for key in ("desktopExe", "appServerExe"):
+        exe = value.get(key)
+        if not isinstance(exe, str) or not exe or "\x00" in exe:
+            raise _error("DESKTOP_INVALID_REQUEST")
+    result: dict[str, Any] = {
+        "desktopPid": value["desktopPid"],
+        "desktopExe": value["desktopExe"],
+        "appServerPid": value["appServerPid"],
+        "appServerExe": value["appServerExe"],
+    }
+    for key in ("desktopCreation", "appServerCreation"):
+        creation = value.get(key)
+        if (not isinstance(creation, str) or len(creation) > 20 or _DECIMAL_UINT64.fullmatch(creation) is None
+                or int(creation) > _MAX_UINT64):
+            raise _error("DESKTOP_INVALID_REQUEST")
+        result[key] = int(creation)
+    return result
+
+
+def _encode_runtime_fence(value: dict[str, Any]) -> dict[str, Any]:
+    """Encode a checked process fence with lossless decimal FILETIME strings."""
+    try:
+        decoded = _decode_runtime_fence({
+            "desktopPid": value["desktopPid"],
+            "desktopExe": value["desktopExe"],
+            "desktopCreation": str(value["desktopCreation"]),
+            "appServerPid": value["appServerPid"],
+            "appServerExe": value["appServerExe"],
+            "appServerCreation": str(value["appServerCreation"]),
+        })
+    except (DesktopIpcError, KeyError, TypeError, ValueError):
+        raise _error("DESKTOP_PROCESS_CHANGED")
+    return {
+        "desktopPid": decoded["desktopPid"],
+        "desktopExe": decoded["desktopExe"],
+        "desktopCreation": str(decoded["desktopCreation"]),
+        "appServerPid": decoded["appServerPid"],
+        "appServerExe": decoded["appServerExe"],
+        "appServerCreation": str(decoded["appServerCreation"]),
+    }
+def _verify_process_identity(
+    pipe: _Pipe,
+    target: dict[str, str],
+    expected: dict[str, Any] | None = None,
+    require_runner_ancestor: bool = False,
+) -> dict[str, Any]:
+    """核对 pipe 对端及其进程树；不读取版本或 bundle。"""
     pipe.verify_server()
     rows = _processes()
     server = next((row for row in rows if row["pid"] == pipe.server_pid), None)
     if not server or server["name"].casefold() != "chatgpt.exe" or not server["exe"] or server["creation"] <= 0:
         raise _error("DESKTOP_IPC_SERVER_MISMATCH")
     if _normalize_path(server["exe"]) != _normalize_path(pipe.server_exe):
-        raise _error("DESKTOP_IPC_SERVER_MISMATCH")
-    children = [row for row in rows if row["name"].casefold() == "codex.exe" and row["parentPid"] == pipe.server_pid]
-    if len(children) != 1 or not children[0]["exe"] or children[0]["creation"] <= 0:
+        raise _error("DESKTOP_PROCESS_CHANGED" if expected is not None else "DESKTOP_IPC_SERVER_MISMATCH")
+    parents = {int(row["pid"]): int(row["parentPid"]) for row in rows
+               if isinstance(row.get("pid"), int) and isinstance(row.get("parentPid"), int)
+               and row["pid"] > 0 and row["parentPid"] > 0}
+    candidates = [row for row in rows
+                  if row["name"].casefold() == "codex.exe"
+                  and row.get("exe") and row.get("creation", 0) > 0
+                  and pipe.server_pid in _ancestor_chain(int(row["pid"]), parents)]
+
+    # An existing fence always wins candidate discovery.  A restarted
+    # app-server must fail closed even when another codex is available.
+    if expected is not None:
+        app_server = next((row for row in candidates if row["pid"] == expected.get("appServerPid")), None)
+        if app_server is None:
+            raise _error("DESKTOP_PROCESS_CHANGED")
+    elif require_runner_ancestor:
+        runner_pid = os.getpid()
+        runner_chain = _ancestor_chain(runner_pid, parents) if runner_pid in parents else set()
+        owned = [row for row in candidates if row["pid"] in runner_chain]
+        if len(owned) != 1:
+            raise _error("DESKTOP_CURRENT_CONTEXT_INVALID")
+        app_server = owned[0]
+    elif len(candidates) == 1:
+        app_server = candidates[0]
+    else:
         raise _error("DESKTOP_PROCESS_CHANGED")
-    app_server = children[0]
+
     if expected and (
-        expected["desktopPid"] != pipe.server_pid
-        or expected["appServerPid"] != app_server["pid"]
-        or expected["desktopCreation"] != server["creation"]
-        or expected["appServerCreation"] != app_server["creation"]
-        or _normalize_path(expected["desktopExe"]) != _normalize_path(server["exe"])
-        or _normalize_path(expected["appServerExe"]) != _normalize_path(app_server["exe"])
+        expected.get("desktopPid") != pipe.server_pid
+        or expected.get("appServerPid") != app_server["pid"]
+        or expected.get("desktopCreation") != server["creation"]
+        or expected.get("appServerCreation") != app_server["creation"]
+        or _normalize_path(str(expected.get("desktopExe", ""))) != _normalize_path(server["exe"])
+        or _normalize_path(str(expected.get("appServerExe", ""))) != _normalize_path(app_server["exe"])
     ):
         raise _error("DESKTOP_PROCESS_CHANGED")
+    if require_runner_ancestor:
+        runner_pid = os.getpid()
+        if runner_pid not in parents or app_server["pid"] not in _ancestor_chain(runner_pid, parents):
+            raise _error("DESKTOP_CURRENT_CONTEXT_INVALID")
     _verify_project(target)
     return {
         "desktopPid": pipe.server_pid,

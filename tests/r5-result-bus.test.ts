@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { Workspace } from "../src/workspace/manager.js";
-import { appendResult, createCommand, registerRoute } from "../src/routing/store.js";
+import { appendResult, createCommand, registerRoute, routingFile } from "../src/routing/store.js";
 import { canonicalRoutingResultDigest } from "../src/routing/execution-result-digest.js";
 import {
   enqueueResultOutboxEntry,
@@ -23,7 +23,8 @@ import {
   readResultBus,
   resultBusFile,
 } from "../src/result-bus/store.js";
-import { reconcileWorkspaceResultBus } from "../src/result-bus/service.js";
+import { projectAvailableResultBusCommands, reconcileWorkspaceResultBus } from "../src/result-bus/service.js";
+import { cleanupJournalFile } from "../src/command-cleanup/fence.js";
 
 const HEX64 = "c".repeat(64);
 const PLANNER = "018c0000-0000-7000-8000-00000000c2d1";
@@ -68,6 +69,59 @@ function canonicalResult(commandId = "r5d1-command", iteration = 1) {
     },
   }, stateDir);
 }
+
+describe("delivery-only available-command projection", () => {
+  it("skips only unavailable command A; strict reconciliation still rejects it", () => {
+    canonicalResult("a-locked");
+    canonicalResult("b-available", 1);
+    canonicalResult("b-available", 2);
+    const file = `${cleanupJournalFile(identity.id, "a-locked", stateDir)}.lock`;
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, "");
+    expect(() => reconcileWorkspaceResultBus(identity, stateDir)).toThrow(/lock live\/unknown\/corrupt/);
+    expect(readResultBus(identity, stateDir)).toBeNull();
+    expect(projectAvailableResultBusCommands(identity, stateDir)).toEqual({ projected: 2, replayed: 0,
+      skipped: [{ commandId: "a-locked", code: "COMMAND_CLEANUP_BUSY" }] });
+    const bytes = fs.readFileSync(resultBusFile(identity.id, stateDir));
+    expect(projectAvailableResultBusCommands(identity, stateDir)).toMatchObject({ projected: 0, replayed: 2 });
+    expect(fs.readFileSync(resultBusFile(identity.id, stateDir))).toEqual(bytes);
+    expect(fs.statSync(file).size).toBe(0);
+  });
+
+  it("corrupt cleanup journal is a hard failure, never a skipped command", () => {
+    canonicalResult("a-corrupt-journal");
+    canonicalResult("b-available");
+    const file = cleanupJournalFile(identity.id, "a-corrupt-journal", stateDir);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, "{}");
+    expect(() => projectAvailableResultBusCommands(identity, stateDir)).toThrow(/journal 损坏/);
+    expect(readResultBus(identity, stateDir)).toBeNull();
+    expect(fs.readFileSync(file, "utf8")).toBe("{}");
+  });
+
+  it("valid cleanup journal skips only its command while another result projects", () => {
+    canonicalResult("a-cleaning");
+    canonicalResult("b-available");
+    const file = cleanupJournalFile(identity.id, "a-cleaning", stateDir);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ version: 1, workspaceId: identity.id, workspaceRoot: root,
+      commandId: "a-cleaning", iteration: 1, cleanupId: EXECUTOR, mode: "manual_force", phase: "fenced",
+      createdAt: new Date().toISOString(), artifacts: [] }));
+    const bytes = fs.readFileSync(file);
+    expect(projectAvailableResultBusCommands(identity, stateDir)).toEqual({ projected: 1, replayed: 0,
+      skipped: [{ commandId: "a-cleaning", code: "COMMAND_CLEANUP_IN_PROGRESS" }] });
+    expect(readResultBus(identity, stateDir)!.entries.map(e => e.commandId)).toEqual(["b-available"]);
+    expect(fs.readFileSync(file)).toEqual(bytes);
+  });
+
+  it("corrupt routing and mismatched workspace fail closed instead of returning degraded success", () => {
+    canonicalResult("available");
+    expect(() => projectAvailableResultBusCommands({ ...identity, id: "0".repeat(12) }, stateDir)).toThrow();
+    fs.writeFileSync(routingFile(identity.id, stateDir), "{}");
+    expect(() => projectAvailableResultBusCommands(identity, stateDir)).toThrow(/Routing 状态损坏/);
+    expect(readResultBus(identity, stateDir)).toBeNull();
+  });
+});
 
 function frozenSendTarget() {
   return {
@@ -300,7 +354,13 @@ describe("R5d1 workspace Result Bus", () => {
     const target = frozenSendTarget();
     const reserve = reservation();
     const claim = attempt();
-    expect(resultBusLifecycleSchema.options).toEqual(["queued", "reserved", "claimed", "observed", "outcome_unknown", "retired_unknown"]);
+    expect(resultBusLifecycleSchema.options).toEqual(["queued", "reserved", "claimed", "observed", "outcome_unknown", "retired_unknown", "cancelled"]);
+    const cancelled = { ...base, deliveryStatus: "cancelled", sendTarget: null, reservation: null, attempt: null, cancelledAt: now };
+    expect(resultBusEntrySchema.parse(cancelled)).toBeTruthy();
+    expect(() => resultBusEntrySchema.parse({ ...cancelled, cancelledAt: null })).toThrow();
+    expect(() => resultBusEntrySchema.parse({ ...cancelled, reservation: reserve })).toThrow();
+    expect(() => resultBusEntrySchema.parse({ ...cancelled, attempt: claim, sendTarget: target })).toThrow();
+    expect(() => resultBusEntrySchema.parse({ ...cancelled, deliveryStatus: "queued" })).toThrow();
     expect(resultBusEntrySchema.parse({ ...base, deliveryStatus: "queued", sendTarget: null, reservation: null, attempt: null })).toBeTruthy();
     expect(() => resultBusEntrySchema.parse({ ...base, deliveryStatus: "queued", sendTarget: target, reservation: null, attempt: null })).toThrow();
     expect(() => resultBusEntrySchema.parse({ ...base, deliveryStatus: "queued", sendTarget: null, reservation: reserve, attempt: null })).toThrow();

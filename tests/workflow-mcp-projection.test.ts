@@ -15,6 +15,14 @@ import { cleanup, isolateStateDir, makeTmpDir } from "./helpers.js";
 
 const PROJECT = "https://chatgpt.com/g/g-p-6a94399430e08191860ab5364b7748b8/project";
 const BINDING_THREAD = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+const runtimeFence = {
+  desktopPid: 1001,
+  desktopExe: "C:\\Program Files\\ChatGPT\\ChatGPT.exe",
+  desktopCreation: "1000001",
+  appServerPid: 1002,
+  appServerExe: "C:\\Program Files\\ChatGPT\\codex.exe",
+  appServerCreation: "1000002",
+};
 
 let stateDir: string;
 let previousStateDir: string | undefined;
@@ -89,6 +97,7 @@ function writeDesktop(workspaceId: string) {
     workspaceId,
     workspaceRoot: root,
     enabled: true,
+    runtimeFence,
     binding: {
       threadId: BINDING_THREAD,
       hostId: "local",

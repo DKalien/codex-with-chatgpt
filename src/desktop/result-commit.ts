@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import { listExecutionOutputs, saveExecutionOutput, saveRestrictedExecutionOutput, type ExecutionOutputMeta } from "../execution/output.js";
+import { getStateDir } from "../config/paths.js";
+import { listExecutionOutputs, readExecutionOutputMetadataStrict, saveExecutionOutput, saveRestrictedExecutionOutput, type ExecutionOutputMeta } from "../execution/output.js";
 import { appendExecutionRecordLocked, type StoredExecutionRecord } from "../execution/records.js";
 import {
   canonicalReceiptFinalizationInput,
@@ -42,18 +43,24 @@ export function existingRecord(
   return prior;
 }
 
-export function outputForRecord(workspaceId: string, record: StoredExecutionRecord): ExecutionOutputMeta | null {
+export function outputForRecord(workspaceId: string, record: StoredExecutionRecord, stateDir?: string): ExecutionOutputMeta | null {
   if (record.outputId === undefined) return null;
   try {
-    return listExecutionOutputs(workspaceId, Number.MAX_SAFE_INTEGER).find(item => item.id === record.outputId) ?? null;
+    const outputs = stateDir === undefined
+      ? listExecutionOutputs(workspaceId, Number.MAX_SAFE_INTEGER)
+      : readExecutionOutputMetadataStrict(workspaceId, stateDir);
+    return outputs.find(item => item.id === record.outputId) ?? null;
   } catch {
     return failClosed("DESKTOP_RESULT_OUTPUT_CORRUPT", "执行输出状态损坏；保留原文件并人工核对，拒绝重放结果。");
   }
 }
 
-export function hasPartialOutput(workspaceId: string, taskId: string): boolean {
+export function hasPartialOutput(workspaceId: string, taskId: string, stateDir?: string): boolean {
   try {
-    return listExecutionOutputs(workspaceId, Number.MAX_SAFE_INTEGER).some(item => item.taskId === taskId);
+    const outputs = stateDir === undefined
+      ? listExecutionOutputs(workspaceId, Number.MAX_SAFE_INTEGER)
+      : readExecutionOutputMetadataStrict(workspaceId, stateDir);
+    return outputs.some(item => item.taskId === taskId);
   } catch {
     return failClosed("DESKTOP_RESULT_OUTPUT_CORRUPT", "执行输出状态损坏；保留原文件并人工核对，拒绝追加结果。");
   }
@@ -78,28 +85,31 @@ export function appendTrustedReceiptLocked(
   workspaceId: string,
   input: ReceiptFinalizationInput,
   record: Omit<StoredExecutionRecord, "outputId" | "outputAvailable">,
+  stateDir = getStateDir(),
 ): DesktopResultReceipt {
   const output = input.output !== undefined
-    ? saveExecutionOutput(workspaceId, {
+      ? saveExecutionOutput(workspaceId, {
         command: input.command ?? `Desktop result ${record.commandId}`,
+        commandId: record.commandId,
         raw: input.output,
         exitCode: input.exitCode,
         taskId: record.taskId,
         iteration: record.iteration,
-      })
+      }, stateDir)
     : input.outputRestrictedReason !== undefined
       ? saveRestrictedExecutionOutput(workspaceId, {
           command: input.command ?? `Desktop result ${record.commandId}`,
+          commandId: record.commandId,
           reason: input.outputRestrictedReason,
           exitCode: input.exitCode,
           taskId: record.taskId,
           iteration: record.iteration,
-        })
+        }, stateDir)
       : null;
   const committed: StoredExecutionRecord = {
     ...record,
     ...(output === null ? {} : { outputId: output.id, outputAvailable: output.allowed }),
   };
-  appendExecutionRecordLocked(workspaceId, committed);
+  appendExecutionRecordLocked(workspaceId, committed, stateDir);
   return { record: committed, output };
 }

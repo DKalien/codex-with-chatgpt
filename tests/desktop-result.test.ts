@@ -7,7 +7,7 @@ import { listExecutionOutputs, readExecutionOutput, saveExecutionOutput } from "
 import { appendExecutionRecord, readExecutionRecords } from "../src/execution/records.js";
 import { desktopIpc, type DesktopResultClassification, type DesktopResultContext } from "../src/desktop/ipc.js";
 import { discoverCurrentDesktopDelivery, recordDesktopResult, type DesktopResultInput } from "../src/desktop/result.js";
-import { receiptFinalizationMarkerDigest } from "../src/desktop/receipt-finalizer.js";
+import { receiptFinalizationMarkerDigest, readReceiptFinalizationDraft } from "../src/desktop/receipt-finalizer.js";
 import { DesktopError, desktopFile, readDesktop, updateDesktop } from "../src/desktop/store.js";
 import { cleanup, isolateStateDir } from "./helpers.js";
 
@@ -21,6 +21,14 @@ const continuationTurnId2 = "00000000-0000-4000-8000-000000000104";
 const originTurnId = "00000000-0000-4000-8000-000000000105";
 const v2DeliveryId = "00000000-0000-4000-8000-000000000106";
 const commandId = "desktop_command_1";
+const runtimeFence = {
+  desktopPid: 1001,
+  desktopExe: "C:\\Program Files\\ChatGPT\\ChatGPT.exe",
+  desktopCreation: "1000001",
+  appServerPid: 1002,
+  appServerExe: "C:\\Program Files\\ChatGPT\\codex.exe",
+  appServerCreation: "1000002",
+};
 let stateDir: string;
 let previousThread: string | undefined;
 
@@ -92,6 +100,7 @@ function writeDesktopState(options: {
     workspaceId: workspace.id,
     workspaceRoot: options.workspaceRoot ?? workspace.root,
     enabled: options.enabled ?? true,
+    runtimeFence,
     binding,
     deliveries: options.deliveries ?? [delivery()],
   };
@@ -299,7 +308,7 @@ describe("Desktop execution result", () => {
     expect(ownership).not.toHaveBeenCalled();
   });
 
-  it("inProgress Desktop result 只暂存 pending，不写 trusted receipt 或 output", async () => {
+  it.each([false, true])("inProgress result 暂存完整 marker steering=%s，不提前写 receipt/output", async (steering) => {
     process.env.C2C_RECEIPT_FINALIZER_NO_SPAWN = "1";
     writeDesktopState();
     vi.mocked(desktopIpc.currentResultContext).mockResolvedValue(validResultContext({
@@ -307,9 +316,9 @@ describe("Desktop execution result", () => {
     }));
     const marker = {
       resultTurnId: turnId,
-      itemIds: ["record-marker"],
-      itemTypes: ["userMessage"],
-      itemCount: 1,
+      itemIds: steering ? ["record-marker", "steering", "steered"] : ["record-marker"],
+      itemTypes: steering ? ["userMessage", "steeringUserMessage", "steered"] : ["userMessage"],
+      itemCount: steering ? 3 : 1,
       itemSha256: "",
     };
     marker.itemSha256 = receiptFinalizationMarkerDigest(marker);
@@ -322,12 +331,33 @@ describe("Desktop execution result", () => {
         version: 3,
         ownershipSnapshot: { ownership: "origin", originTurnId: turnId, resultTurnId: turnId, chainSignatures: [] },
         input: { commandId, output: "1 passed\n" },
-        marker: { resultTurnId: turnId, itemCount: 1, itemIds: ["record-marker"], itemTypes: ["userMessage"] },
+        marker,
       },
     });
     expect(readExecutionRecords(workspace.id)).toEqual([]);
     expect(listExecutionOutputs(workspace.id, Number.MAX_SAFE_INTEGER)).toEqual([]);
+    expect(readReceiptFinalizationDraft(stateDir, workspace.id, commandId)).toMatchObject({ marker });
     delete process.env.C2C_RECEIPT_FINALIZER_NO_SPAWN;
+  });
+
+  it.each([
+    [new DesktopError("DESKTOP_STATE_UNAVAILABLE", "private detail"), "DESKTOP_STATE_UNAVAILABLE"],
+    [new DesktopError("DESKTOP_PROCESS_CHANGED", "private detail"), "DESKTOP_PROCESS_CHANGED"],
+    [new DesktopError("private-code", "private detail"), "DESKTOP_INTERNAL_ERROR"],
+    [new Error("private detail"), "DESKTOP_INTERNAL_ERROR"],
+  ])("marker 失败只保留安全 diagnostic code (%s)", async (failure, code) => {
+    writeDesktopState();
+    vi.mocked(desktopIpc.currentResultContext).mockResolvedValue(validResultContext({
+      runtimeStatus: "active", resultTurnStatus: "inProgress",
+    }));
+    vi.spyOn(desktopIpc, "inspectResultActivityMarker").mockRejectedValue(failure);
+    await expect(recordDesktopResult(workspace, input())).rejects.toMatchObject({
+      code: "DESKTOP_RESULT_CURRENT_EXECUTION",
+      message: `无法建立 Desktop receipt activity marker（${code}）；未写入 pending receipt。 `,
+    });
+    expect(readReceiptFinalizationDraft(stateDir, workspace.id, commandId)).toBeNull();
+    expect(readExecutionRecords(workspace.id)).toEqual([]);
+    expect(listExecutionOutputs(workspace.id, Number.MAX_SAFE_INTEGER)).toEqual([]);
   });
 
   it("accepted origin 在 capacity-retry continuation tip 上只写一条 receipt，且 origin turn 不变", async () => {
@@ -983,7 +1013,7 @@ await recordDesktopResult(${JSON.stringify(workspace)}, ${JSON.stringify(input()
     for (const result of results) {
       if (result.code === 0) continue;
       expect(result.error).toBeUndefined();
-      expect(result.stderr).toMatch(/EXECUTION_RECORDS_BUSY|执行记录写锁繁忙/);
+      expect(result.stderr).toMatch(/EXECUTION_RECORDS_BUSY|执行记录写锁繁忙|COMMAND_CLEANUP_BUSY/);
     }
     expect(readExecutionRecords(workspace.id)).toHaveLength(1);
     expect(listExecutionOutputs(workspace.id)).toHaveLength(1);

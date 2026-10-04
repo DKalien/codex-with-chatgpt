@@ -1,3 +1,4 @@
+import { assertCommandNotCancelled } from "../routing/store.js";
 import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 import type { Workspace } from "../workspace/manager.js";
@@ -8,6 +9,8 @@ import { DesktopError, desktopId, publicDelivery, readDesktop, sendInput, target
   type DesktopBinding, type DesktopDelivery, type DesktopState } from "./store.js";
 import { unresolvedOutcomeUnknownCommandIds, isOutcomeUnknownAdministrativelyResolved, assertNoOutcomeResolutionForCommand } from "./outcome-resolution.js";
 import { withEvidenceLock } from "./recovery-evidence.js";
+import { withCommandOperationAsync } from "../command-cleanup/fence.js";
+import type { DesktopRuntimeFence } from "./ipc-contracts.js";
 
 type LocalWorkspace = Pick<Workspace, "id" | "root">;
 const POST_RESULT_SETTLE_TIMEOUT_MS = 30_000;
@@ -20,7 +23,7 @@ interface PostResultSettleOptions {
   pollMs?: number;
 }
 function initial(workspace: LocalWorkspace): DesktopState {
-  return { version: 1, workspaceId: workspace.id, workspaceRoot: workspace.root, enabled: false, binding: null, deliveries: [] };
+  return { version: 1, workspaceId: workspace.id, workspaceRoot: workspace.root, enabled: false, binding: null, runtimeFence: null, deliveries: [] };
 }
 function checked(workspace: LocalWorkspace, state: DesktopState | null): DesktopState {
   if (state && state.workspaceRoot !== workspace.root)
@@ -37,14 +40,25 @@ function authorized(workspace: LocalWorkspace, state: DesktopState | null, bindi
 function target(workspace: LocalWorkspace, binding: z.infer<typeof targetInput>) {
   return { threadId: binding.threadId, hostId: binding.hostId, projectId: binding.projectId, workspaceRoot: workspace.root };
 }
+function requireRuntimeFence(fence: DesktopState["runtimeFence"]): NonNullable<DesktopState["runtimeFence"]> {
+  if (!fence) throw new DesktopError("DESKTOP_RUNTIME_FENCE_MISSING", "Desktop 绑定缺少运行时身份 fence；请重新绑定当前 Desktop 会话。");
+  return fence;
+}
+function sameRuntimeFence(left: DesktopRuntimeFence, right: DesktopRuntimeFence): boolean {
+  return left.desktopPid === right.desktopPid && left.desktopExe === right.desktopExe && left.desktopCreation === right.desktopCreation &&
+    left.appServerPid === right.appServerPid && left.appServerExe === right.appServerExe && left.appServerCreation === right.appServerCreation;
+}
 
 export async function bindDesktop(workspace: LocalWorkspace, raw: z.infer<typeof targetInput>, executor: ExecutorAdapter = getExecutor()): Promise<DesktopBinding> {
   const input = targetInput.parse(raw);
-  const observed = await executor.inspect(target(workspace, input));
+  const observed = executor.discoverForBinding
+    ? await executor.discoverForBinding(target(workspace, input))
+    : await executor.inspect(target(workspace, input));
+  const runtimeFence = requireRuntimeFence(observed.runtimeFence);
   const binding: DesktopBinding = { ...input, bindingId: randomUUID(), title: observed.title, boundAt: new Date().toISOString() };
   return updateDesktop(workspace.id, previous => {
     const state = checked(workspace, previous);
-    state.enabled = false; state.binding = binding;
+    state.enabled = false; state.binding = binding; state.runtimeFence = runtimeFence;
     return { state, result: binding };
   });
 }
@@ -68,17 +82,23 @@ export function disableDesktop(workspace: LocalWorkspace): void {
 export async function bindCurrentDesktop(workspace: LocalWorkspace, executor: ExecutorAdapter = getExecutor()) {
   assertNoUncertainDelivery(workspace, checked(workspace, readDesktop(workspace.id)));
   const observed = await executor.currentIdentity(workspace.root);
+  const observedFence = requireRuntimeFence(observed.runtimeFence);
   const selected = targetInput.parse({ threadId: observed.threadId, hostId: observed.hostId, projectId: observed.projectId });
   const snapshot = checked(workspace, readDesktop(workspace.id));
   assertNoUncertainDelivery(workspace, snapshot);
   const sameTarget = snapshot.binding && snapshot.binding.threadId === selected.threadId &&
     snapshot.binding.hostId === selected.hostId && snapshot.binding.projectId === selected.projectId;
-  if (sameTarget && snapshot.enabled) return { alreadyEnabled: true, enabled: true, binding: snapshot.binding! };
+  if (sameTarget && snapshot.enabled) {
+    const savedFence = requireRuntimeFence(snapshot.runtimeFence);
+    if (!sameRuntimeFence(savedFence, observedFence)) throw new DesktopError("DESKTOP_PROCESS_CHANGED", "当前 Desktop 运行时身份已变化；请重新绑定。");
+    return { alreadyEnabled: true, enabled: true, binding: snapshot.binding! };
+  }
 
   // 普通 userMessage 不能证明来自本地 composer；只接受本机固定确认框，不能由 prompt 免除。
   const confirmed = await executor.confirmCurrent(workspace.root);
   if (confirmed.threadId !== selected.threadId || confirmed.hostId !== selected.hostId ||
-    confirmed.projectId !== selected.projectId || confirmed.title !== observed.title)
+    confirmed.projectId !== selected.projectId || confirmed.title !== observed.title ||
+    !confirmed.runtimeFence || !sameRuntimeFence(observedFence, confirmed.runtimeFence))
     throw new DesktopError("DESKTOP_BINDING_CHANGED", "确认期间目标身份发生变化；未绑定或启用，请重新操作。");
   return updateDesktop(workspace.id, previous => {
     const state = checked(workspace, previous);
@@ -88,7 +108,7 @@ export async function bindCurrentDesktop(workspace: LocalWorkspace, executor: Ex
       throw new DesktopError("DESKTOP_BINDING_CHANGED", "确认期间本机状态发生变化；未覆盖撤权或重新绑定，请重新操作。");
     const binding: DesktopBinding = sameTarget ? { ...state.binding!, title: confirmed.title } :
       { ...selected, bindingId: randomUUID(), title: confirmed.title, boundAt: new Date().toISOString() };
-    state.binding = binding; state.enabled = true;
+    state.binding = binding; state.runtimeFence = confirmed.runtimeFence!; state.enabled = true;
     return { state, result: { alreadyEnabled: false, enabled: true, binding } };
   });
 }
@@ -148,12 +168,13 @@ async function prepareWithPostResultSettle(
   options: PostResultSettleOptions = {},
   executor: ExecutorAdapter,
 ): Promise<ExecutorConnection> {
+  const initialState = authorized(workspace, readDesktop(workspace.id), binding.bindingId);
   try {
-    return await executor.prepare(target(workspace, binding));
+    return await executor.prepare(target(workspace, binding), requireRuntimeFence(initialState.runtimeFence));
   } catch (failure) {
     if (!(failure instanceof DesktopError) || failure.code !== "DESKTOP_BUSY") throw failure;
     let active: ExecutorExecutionInfo;
-    try { active = await executor.inspectActiveExecution(target(workspace, binding)); }
+    try { active = await executor.inspectActiveExecution(target(workspace, binding), requireRuntimeFence(initialState.runtimeFence)); }
     catch { throw failure; }
     if (!receiptBackedTail(workspace, binding, active)) throw failure;
 
@@ -168,12 +189,12 @@ async function prepareWithPostResultSettle(
       const state = authorized(workspace, readDesktop(workspace.id), binding.bindingId);
       assertNoUncertainDelivery(workspace, state);
       try {
-        return await executor.prepare(target(workspace, binding));
+        return await executor.prepare(target(workspace, binding), requireRuntimeFence(state.runtimeFence));
       } catch (retryFailure) {
         if (!(retryFailure instanceof DesktopError) || retryFailure.code !== "DESKTOP_BUSY") throw retryFailure;
       }
       let current: ExecutorExecutionInfo;
-      try { current = await executor.inspectActiveExecution(target(workspace, binding)); }
+      try { current = await executor.inspectActiveExecution(target(workspace, binding), requireRuntimeFence(state.runtimeFence)); }
       catch (error) {
         if (error instanceof DesktopError && error.code === "DESKTOP_BUSY") throw error;
         throw error;
@@ -190,7 +211,15 @@ export async function sendDesktop(workspace: LocalWorkspace, raw: z.infer<typeof
   const input = sendInput.parse(raw);
   if (input.workspaceId !== workspace.id) throw new DesktopError("DESKTOP_WRONG_WORKSPACE", "请求工作区不匹配。");
   if (!clientId || clientId.length > 256) throw new DesktopError("INSUFFICIENT_SCOPE", "缺少有效的 OAuth 客户端身份。");
+  return withCommandOperationAsync(workspace.id, input.commandId,
+    () => sendDesktopLocked(workspace, input, clientId, authorize, settleOptions, executor));
+}
+
+async function sendDesktopLocked(workspace: LocalWorkspace, input: z.infer<typeof sendInput>, clientId: string,
+  authorize: () => void, settleOptions: PostResultSettleOptions | undefined,
+  executor: ExecutorAdapter): Promise<ReturnType<typeof publicDelivery>> {
   authorize();
+  assertCommandNotCancelled(workspace, input.commandId);
   const snapshot = authorized(workspace, readDesktop(workspace.id), input.bindingId);
   const digest = createHash("sha256").update(input.message, "utf8").digest("hex");
   const prior = replay(snapshot, input, clientId, digest);
@@ -210,7 +239,7 @@ export async function sendDesktop(workspace: LocalWorkspace, raw: z.infer<typeof
       assertNoUncertainDelivery(workspace, state);
       const now = new Date().toISOString();
       const record: DesktopDelivery = { commandId: input.commandId, deliveryId: randomUUID(), clientId, bindingId: input.bindingId,
-        intent: input.intent,
+        lifecycle: "ephemeral", intent: input.intent,
         messageSha256: digest, messageBytes: Buffer.byteLength(input.message, "utf8"), threadId: state.binding.threadId,
         deliveryStatus: "outcome_unknown", createdAt: now, updatedAt: now };
       state.deliveries.push(record);
@@ -276,7 +305,7 @@ export async function desktopStatus(workspace: LocalWorkspace, commandId?: strin
   let state = checked(workspace, readDesktop(workspace.id));
   let availability: { available: boolean; error?: string; message?: string } = { available: false };
   if (state.binding) {
-    try { await executor.inspect(target(workspace, state.binding)); availability = { available: true }; }
+    try { await executor.inspect(target(workspace, state.binding), requireRuntimeFence(state.runtimeFence)); availability = { available: true }; }
     catch (error) {
       availability = { available: false, error: error instanceof DesktopError ? error.code : "DESKTOP_UNAVAILABLE",
         message: error instanceof DesktopError ? error.message : "Desktop 当前不可用；没有发送消息。" };

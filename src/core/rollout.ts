@@ -10,15 +10,10 @@ import { SERVICE_NAME } from "../version.js";
 import { readCurrentInstall } from "./install.js";
 import { clearPending, readPending, writePending, type UpgradeReason } from "./upgrade.js";
 import { readTunnelState, isNamedTunnelReady } from "../tunnel/state.js";
-import { desktopIpc } from "../desktop/ipc.js";
-import { readDesktop } from "../desktop/store.js";
-import { readRemote } from "../remote/store.js";
-import { desktopHistory } from "../desktop/history.js";
 import { appendCleanupError, releaseMaintenanceOrThrow, tryAcquireMaintenanceLock } from "./maintenance-lock.js";
 import { releaseRolloutFence, tryAcquireRolloutFence } from "./rollout-fence.js";
-import { assessRolloutIdle, blockerToReason, type IdleAssessment } from "./rollout-idle.js";
-import { schedulePostTurnFinalizer } from "./post-turn-finalizer.js";
-import type { spawn } from "node:child_process";
+import { assessRolloutIdle, blockerToReason } from "./rollout-idle.js";
+import { probeNamedHealth, type NamedHealthFailure, type NamedHealthIdentity } from "./named-health.js";
 
 const runtimeSchema = z.object({ service: z.literal(SERVICE_NAME), version: z.string(),
   workspaceId: z.string().regex(/^[a-f0-9]{12}$/), workspaceRoot: z.string().refine(path.isAbsolute),
@@ -26,16 +21,23 @@ const runtimeSchema = z.object({ service: z.literal(SERVICE_NAME), version: z.st
   publicUrl: z.string().nullable(), startedAt: z.string().datetime(),
   runtimeBuildId: z.string().refine(isRuntimeBuildId).optional() });
 type RolloutStatus = "current" | "upgraded" | "stopped" | "pending_busy" | "skipped_quick" | "pending" | "error";
+interface NamedHealthDiagnostic {
+  phase: "preflight" | "pre_shutdown" | "postcheck";
+  failure: NamedHealthFailure | "tunnel_state_mismatch" | "canonical_url_mismatch";
+  attempts: number;
+  httpStatus?: number;
+}
 interface RolloutItem {
   workspaceId: string;
   workspaceName?: string;
   status: RolloutStatus;
   reason?: UpgradeReason;
-  finalizer?: { jobId: string; status: "scheduled" | "existing" };
+  /** Bounded diagnostic only; not persisted in the strict pending authority schema. */
+  namedHealth?: NamedHealthDiagnostic;
 }
 
 class Skip extends Error {
-  constructor(readonly reason: UpgradeReason) { super(reason); }
+  constructor(readonly reason: UpgradeReason, readonly namedHealth?: NamedHealthDiagnostic) { super(reason); }
 }
 function sameRuntime(a: RuntimeState, b: RuntimeState): boolean {
   return a.workspaceId === b.workspaceId && a.workspaceRoot === b.workspaceRoot && a.pid === b.pid &&
@@ -55,67 +57,38 @@ async function authenticatedInfo(workspace: Workspace, expected: RuntimeState): 
   return info;
 }
 
-async function namedUrl(workspace: Workspace, info: BridgeAdminInfo): Promise<string> {
+async function namedUrl(workspace: Workspace, info: BridgeAdminInfo, phase: NamedHealthDiagnostic["phase"],
+  previous?: NamedHealthIdentity): Promise<string> {
   if (info.tunnel?.provider === "cloudflare-quick") throw new Skip("quick");
   const state = readTunnelState(workspace.id);
   if (state.workspaceId !== workspace.id || !isNamedTunnelReady(state) || state.provider !== "cloudflare-named" ||
     !state.hostname || !state.tunnelId || info.tunnel?.provider !== "cloudflare-named" || info.tunnel.running !== true)
-    throw new Skip("named_unhealthy");
+    throw new Skip("named_unhealthy", { phase, failure: "tunnel_state_mismatch", attempts: 0 });
   const expected = `https://${state.hostname}`;
-  if (info.publicUrl !== expected || info.tunnel.url !== expected) throw new Skip("named_unhealthy");
-  try {
-    const response = await fetch(`${expected}/health`, { signal: AbortSignal.timeout(8000), redirect: "error" });
-    const health = await response.json() as Record<string, unknown>;
-    if (!response.ok || health.service !== SERVICE_NAME || health.workspaceId !== workspace.id || health.status !== "ok" ||
-      (health.pid !== undefined && health.pid !== info.pid) || (health.startedAt !== undefined && health.startedAt !== info.startedAt))
-      throw new Error("Unhealthy named endpoint");
-  } catch { throw new Skip("named_unhealthy"); }
+  if (info.publicUrl !== expected || info.tunnel.url !== expected)
+    throw new Skip("named_unhealthy", { phase, failure: "canonical_url_mismatch", attempts: 0 });
+  const probe = await probeNamedHealth(expected, info, previous);
+  if (!probe.ok) {
+    const { ok: _ok, ...detail } = probe;
+    throw new Skip("named_unhealthy", { phase, ...detail });
+  }
   return expected;
 }
 
-async function idle(workspace: Workspace, info: BridgeAdminInfo, assessment?: IdleAssessment): Promise<IdleAssessment> {
-  const result = assessment ?? await assessRolloutIdle(workspace, info);
+async function idle(workspace: Workspace, info: BridgeAdminInfo): Promise<void> {
+  const result = await assessRolloutIdle(workspace, info, {
+    skipSelfTurnCheck: true,
+    ignoreDesktopActivity: true,
+  });
   if (!result.idle) {
     const first = result.blockers[0]!;
     throw new Skip(blockerToReason(first));
-  }
-  return result;
-}
-
-/** 显式 rollout 在 reason=busy 且严格 self-busy proof 时 schedule 一次性 finalizer。 */
-async function tryScheduleSelfBusyFinalizer(
-  workspace: Workspace,
-  targetBuildId: string,
-  assessment: IdleAssessment,
-  saved: RuntimeState,
-  spawnImpl?: typeof spawn,
-): Promise<{ jobId: string; status: "scheduled" | "existing" } | null> {
-  try {
-    if (assessment.blockers.length !== 1 || assessment.blockers[0]!.kind !== "self_turn" || !assessment.selfBusyProof) {
-      return null;
-    }
-    const scheduled = await schedulePostTurnFinalizer(workspace, targetBuildId, {
-      stateDir: getStateDir(),
-      assessment,
-      runtime: saved,
-      ...(spawnImpl ? { spawnImpl } : {}),
-    });
-    if (!scheduled.ok) return null;
-    // existing 不再 spawn，避免重复 worker。
-    if (scheduled.status === "existing") {
-      return { jobId: scheduled.job.jobId, status: "existing" };
-    }
-    return { jobId: scheduled.job.jobId, status: scheduled.status };
-  } catch {
-    return null;
   }
 }
 
 /** 本机显式维护；只共享程序版本，不迁移 Connector 或 workspace 业务状态。 */
 export async function rollout(opts: {
   workspaceRoot?: string;
-  /** 测试注入：仅用于替代 detached spawn；生产默认真实 spawn。 */
-  finalizerSpawnImpl?: typeof spawn;
 } = {}) {
   const installed = readCurrentInstall();
   if (!installed || getRuntimeBuildId() !== installed.runtimeBuildId) {
@@ -168,13 +141,10 @@ export async function rollout(opts: {
       if (selected && selected.id !== workspaceId) continue;
       let workspace: Workspace | undefined;
       let restarting = false;
-      let lastSaved: RuntimeState | undefined;
-      let initialAssessment: IdleAssessment | undefined;
       try {
         let saved: RuntimeState;
         try { saved = runtimeSchema.parse(JSON.parse(fs.readFileSync(path.join(runtimeDir, name), "utf8"))); }
         catch { throw new Skip("runtime_corrupt"); }
-        lastSaved = saved;
         const resolved = new Workspace(saved.workspaceRoot);
         if (resolved.id !== workspaceId || saved.workspaceId !== workspaceId || saved.workspaceRoot !== resolved.root ||
           (selected && selected.root !== resolved.root)) throw new Skip("identity_mismatch");
@@ -194,35 +164,33 @@ export async function rollout(opts: {
           continue;
         }
         if (info.tunnel?.provider === "cloudflare-quick") throw new Skip("quick");
-        // 当前 active workspace 在任何公网探测或关闭之前直接保留 pending。
-        initialAssessment = await assessRolloutIdle(workspace, info);
-        await idle(workspace, info, initialAssessment);
-        const url = await namedUrl(workspace, info);
+        // 在公网探测和关闭前确认安全门禁；Desktop turn 活动不阻断维护。
+        await idle(workspace, info);
+        const url = await namedUrl(workspace, info, "preflight");
         restarting = true;
         const result = await restartBridge(workspace.root, { tunnel: true, expectedRuntime: saved,
+          shutdownReason: "rollout",
           maintenance: maintenance.handle,
           beforeShutdown: async () => {
             const fresh = await authenticatedInfo(workspace!, saved);
-            if (await namedUrl(workspace!, fresh) !== url) throw new Skip("named_unhealthy");
+            if (await namedUrl(workspace!, fresh, "pre_shutdown") !== url)
+              throw new Skip("named_unhealthy", { phase: "pre_shutdown", failure: "canonical_url_mismatch", attempts: 0 });
             await idle(workspace!, fresh);
           } });
         const after = await authenticatedInfo(workspace, result.runtime);
-        if (after.runtimeBuildId !== targetBuildId || await namedUrl(workspace, after) !== url || result.mcpUrl !== `${url}/mcp`)
+        if (after.runtimeBuildId !== targetBuildId || await namedUrl(workspace, after, "postcheck", info) !== url || result.mcpUrl !== `${url}/mcp`)
           throw new Skip("postcheck_failed");
         clearPending(workspace);
         items.push({ workspaceId, workspaceName: workspace.name, status: "upgraded" });
       } catch (error) {
         const reason = error instanceof Skip ? error.reason : restarting ? "restart_failed" : "runtime_unknown";
         let status: RolloutStatus = reason === "quick" ? "skipped_quick" :
-          ["busy", "approval_pending", "pairing_active"].includes(reason) ? "pending_busy" : restarting && !(error instanceof Skip) ? "error" : "pending";
-        let finalizer: RolloutItem["finalizer"];
+          reason === "pairing_active" ? "pending_busy" : restarting && !(error instanceof Skip) ? "error" : "pending";
         if (workspace) {
           try { writePending(workspace, targetBuildId, reason); } catch { status = "error"; }
-          if (reason === "busy" && !restarting && initialAssessment && lastSaved) {
-            finalizer = await tryScheduleSelfBusyFinalizer(workspace, targetBuildId, initialAssessment, lastSaved, opts.finalizerSpawnImpl) ?? undefined;
-          }
         } else status = "error";
-        items.push({ workspaceId, ...(workspace ? { workspaceName: workspace.name } : {}), status, reason, ...(finalizer ? { finalizer } : {}) });
+        items.push({ workspaceId, ...(workspace ? { workspaceName: workspace.name } : {}), status, reason,
+          ...(error instanceof Skip && error.namedHealth ? { namedHealth: error.namedHealth } : {}) });
       }
     }
     // runtime 文件已消失的 workspace 不启动；其 pending 可在此显式维护操作中清理。

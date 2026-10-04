@@ -101,6 +101,7 @@ import {
   commitJournalDurably,
   findExactObservedEvent,
   evaluateServerObservedCloseout,
+  evaluateTerminalGoneCloseout,
   isServerObservedCloseoutEligible,
 } from "./production-send.js";
 import {
@@ -129,6 +130,7 @@ import {
   takeoverConnectFlowIdentity,
   beginConnectTakeover,
   observeConnectTakeover,
+  connectTakeoverRecoveryStage,
   beginConnectAttestation,
   requestConnectCompletion,
   finishConnectFlow,
@@ -543,6 +545,14 @@ async function persistSessionOwnership() {
   });
 }
 
+function verifiedConnectFlowMatchesTransport(flow) {
+  if (transport?.routeVerification !== "VERIFIED") return false;
+  const identity = connectFlowIdentity(transport);
+  return Boolean(identity && connectFlowMatches(flow, identity.challengeId === null
+    ? { ...identity, challengeId: flow.challengeId }
+    : identity));
+}
+
 function safeTransportSummary() {
   if (!transport) {
     return {
@@ -560,12 +570,12 @@ function safeTransportSummary() {
   }
   const r5cFlowCurrent = Boolean(
     connectFlow.state === "DONE"
-    && connectFlowIdentity(transport)
-    && connectFlowMatches(connectFlow, connectFlowIdentity(transport)),
+    && verifiedConnectFlowMatchesTransport(connectFlow),
   );
   return {
     connected: !transport.authStale && storageProtected,
     authStale: transport.authStale === true,
+    authStaleReason: transport.authStale ? boundedAuthReason(transport.authStaleReason) : null,
     storageProtected,
     bridgeOrigin: transport.bridgeOrigin,
     workspaceId: transport.workspaceId,
@@ -574,9 +584,10 @@ function safeTransportSummary() {
     epoch: transport.epoch,
     routeCanonical: transport.routeCanonical,
     routeVerification: transport.routeVerification === "VERIFIED" ? "VERIFIED" : "PENDING",
-    productionEligible: transport.routeVerification === "VERIFIED",
+    productionEligible: storageProtected && !transport.authStale && transport.routeVerification === "VERIFIED",
     rebindPending: transport.rebindPending === true,
     connectState: connectFlow.state,
+    takeoverRecovery: currentTakeoverRecoveryStage(),
     webSinkConverged: Boolean(
       activeWebSinkProjection.synced
       && activeWebSinkProjection.available
@@ -750,7 +761,7 @@ function statusPayload(tabId, documentId, extra = {}) {
     routeAttestLatch: routeAttestLatch.state,
     routeAttestFence: routeAttestFence.state,
     connectState: connectFlow.state,
-    connectReason,
+    connectReason: connectReason ?? connectFlow.failureReason ?? null,
     productionSendInFlight,
     autonomy: autonomySummary(autonomyPolicy, {
       identityExact: policyIdentityExact(autonomyPolicy, transport),
@@ -796,14 +807,25 @@ function statusPayload(tabId, documentId, extra = {}) {
   };
 }
 
+// Private request witness: never returned through extension messages or persisted.
+const requestTransports = new WeakMap();
+let authFailureRevision = 0;
+function isCurrentTransportResponse(response) {
+  const sent = requestTransports.get(response);
+  return !!sent && !!transport && ["bridgeOrigin", "workspaceId", "companionId", "bindingId", "epoch", "routeCanonical", "credential", "pairedAt"]
+    .every(key => sent[key] === transport[key]);
+}
+
 async function fetchCompanion(path, init = {}) {
   if (!storageProtected) throw new Error("storage_unprotected");
-  const origin = transport?.bridgeOrigin;
+  const requestTransport = transport ? { ...transport } : null;
+  const requestAuthRevision = authFailureRevision;
+  const origin = requestTransport?.bridgeOrigin;
   if (!origin) throw new Error("transport_missing");
   const url = companionApiUrl(origin, path);
   const headers = {
     ...(init.body ? { "content-type": "application/json" } : {}),
-    ...(transport ? { authorization: `Bearer ${transport.credential}` } : {}),
+    ...(requestTransport ? { authorization: `Bearer ${requestTransport.credential}` } : {}),
     ...(init.headers || {}),
   };
   const res = await fetch(url, {
@@ -812,7 +834,9 @@ async function fetchCompanion(path, init = {}) {
     signal: init.signal ?? AbortSignal.timeout(15_000),
   });
   const body = await res.json().catch(() => ({}));
-  return wrapFetchResponse(res, body);
+  const response = wrapFetchResponse(res, body);
+  requestTransports.set(response, { ...requestTransport, requestAuthRevision });
+  return response;
 }
 
 /**
@@ -845,6 +869,7 @@ async function convergeExplicitVerifiedConnect(expectedOwner) {
       method: "POST",
       body: JSON.stringify({ routeCanonical: transport.routeCanonical }),
     });
+    if (!isCurrentTransportResponse(res)) return { ok: false, reason: "stale_transport_response" };
     if (!res.ok || !res.body || typeof res.body !== "object") {
       return { ok: false, reason: "web_sink_bind_failed", status: res.status };
     }
@@ -902,6 +927,7 @@ async function syncActiveWebSinkFromBridge() {
   }
   try {
     const res = await fetchCompanion("/web-sink/status", { method: "GET" });
+    if (!isCurrentTransportResponse(res)) return { ok: false, reason: "stale_transport_response" };
     if (!res.ok || !res.body || typeof res.body !== "object") {
       activeWebSinkProjection = { binding: null, available: false, synced: false };
       return { ok: false, reason: "web_sink_status_unavailable" };
@@ -955,9 +981,17 @@ async function syncActiveWebSinkFromBridge() {
 }
 
 /** Persist authStale before returning (survives SW restart). */
-async function markAuthStale(reason) {
+function boundedAuthReason(reason) {
+  return ["COMPANION_UNAUTHORIZED", "COMPANION_EPOCH_STALE", "identity_missing",
+    ...["workspaceId", "bindingId", "epoch", "companionId", "routeCanonical"].map(key => `identity_mismatch:${key}`)]
+    .includes(reason) ? reason : "auth_revalidation_required";
+}
+
+async function markAuthStale(reason, response) {
+  if (!isCurrentTransportResponse(response)) return { ok: false, reason: "stale_transport_response" };
   if (transport) {
-    transport = { ...transport, authStale: true };
+    authFailureRevision += 1;
+    transport = { ...transport, authStale: true, authStaleReason: boundedAuthReason(reason) };
     await persistTransport();
   }
   return { ok: false, reason, authStale: true };
@@ -1646,6 +1680,7 @@ async function fetchRebindStatus(identity) {
   } catch {
     return { ok: false, reason: "rebind_status_unreachable" };
   }
+  if (!isCurrentTransportResponse(res)) return { ok: false, reason: "stale_transport_response" };
   if (!res.ok) {
     return { ok: false, reason: res.body?.error || `http_${res.status}`, status: res.status };
   }
@@ -1725,6 +1760,7 @@ async function dispatchFeedbackBootstrap(identity) {
     }, { documentId: owner.documentId });
   } catch {
     connectFlow = finishConnectFlow(connectFlow, identity, "OUTCOME_UNKNOWN");
+    connectFlow.failureReason = "bootstrap_response_unavailable";
     await persistConnectFlow().catch(() => false);
     return { ok: false, reason: "bootstrap_outcome_unknown", state: "OUTCOME_UNKNOWN", retryAllowed: false };
   }
@@ -1797,6 +1833,9 @@ async function dispatchFeedbackBootstrap(identity) {
     }
   }
   connectFlow = finishConnectFlow(connectFlow, identity, "OUTCOME_UNKNOWN");
+  connectFlow.failureReason = typeof response?.reason === "string"
+    && /^[a-zA-Z][a-zA-Z0-9_]{0,95}$/.test(response.reason)
+    ? response.reason : "bootstrap_response_invalid";
   await persistConnectFlow().catch(() => false);
   return { ok: false, reason: response?.reason || "bootstrap_outcome_unknown", state: "OUTCOME_UNKNOWN", retryAllowed: false };
 }
@@ -2010,6 +2049,56 @@ async function resumeConnectAfterTakeover(ownerExact) {
   return dispatchConnectRouteAttestation();
 }
 
+function currentTakeoverRecoveryStage() {
+  const stage = connectTakeoverRecoveryStage(connectFlow, transport, ownerState.owner?.canonicalRoute);
+  if (!stage) return null;
+  // A previous route Send or uncertain rebind cannot be erased by this recovery.
+  // An exact VERIFIED old challenge can be retired by the normal new-pair path.
+  const priorIdentity = connectFlowIdentity(transport);
+  // Authenticated VERIFIED deliberately removes the one-time message. Its
+  // durable VERIFIED fence retains the challenge; do not require erased text.
+  const priorChallenge = priorIdentity?.challengeId
+    ?? (transport.routeVerification === "VERIFIED" && isUuid(routeAttestFence.challengeId)
+      ? routeAttestFence.challengeId : null);
+  const fenceSafe = routeAttestFence.state === "NONE"
+    || (stage === "verify_takeover" && routeAttestFence.state === "VERIFIED"
+      && routeAttestFence.companionId === transport.companionId
+      && priorChallenge !== null && routeAttestFence.challengeId === priorChallenge
+      && areChatgptConversationRoutesEquivalent(routeAttestFence.routeCanonical, transport.routeCanonical));
+  const latchSafe = routeAttestLatch.state === "NONE"
+    || (stage === "verify_takeover" && routeAttestLatch.state === "VERIFIED"
+      && priorChallenge !== null && routeAttestLatch.challengeId === priorChallenge
+      && areChatgptConversationRoutesEquivalent(routeAttestLatch.canonicalRoute, transport.routeCanonical));
+  return fenceSafe && latchSafe ? stage : null;
+}
+
+// Only an explicit Connect may resolve a bootstrap observation gap. Neither
+// heartbeat nor popup status calls this; no bootstrap runner is invoked here.
+async function recoverConnectTakeover() {
+  const stage = currentTakeoverRecoveryStage();
+  const blocked = { ok: false, reason: "connect_outcome_unknown", state: connectFlow.state, retryAllowed: false };
+  if (!stage) return blocked;
+  if (stage === "verify_takeover") {
+    ownerProof = mintOwnerProof({
+      tabId: ownerState.owner.tabId,
+      documentId: ownerState.owner.documentId,
+      routeCanonical: ownerState.owner.canonicalRoute,
+    });
+    const started = await handleRebindStart({ ownerProofId: ownerProof.id });
+    if (!started.ok) return { ...started, state: connectFlow.state };
+  }
+  if (connectTakeoverRecoveryStage(connectFlow, transport, ownerState.owner?.canonicalRoute) !== "verify_page") {
+    return blocked;
+  }
+  const previous = connectFlow;
+  connectFlow = { ...connectFlow, state: "WAITING_TAKEOVER", updatedAt: Date.now() };
+  if (!await persistConnectFlow()) {
+    connectFlow = previous;
+    return { ...blocked, reason: "connect_fence_persist_failed" };
+  }
+  return dispatchConnectRouteAttestation();
+}
+
 async function handleConnectPage(sender, message) {
   if (connectInFlight) return { ok: false, reason: "connect_in_flight", retryAllowed: false };
   connectInFlight = true;
@@ -2057,7 +2146,7 @@ async function handleConnectPage(sender, message) {
     if (permission !== true) return { ok: false, reason: "bridge_permission_missing" };
 
     if (connectFlow.state === "TAKEOVER_DISPATCH" || connectFlow.state === "OUTCOME_UNKNOWN") {
-      return { ok: false, reason: "connect_outcome_unknown", state: "OUTCOME_UNKNOWN", retryAllowed: false };
+      return await recoverConnectTakeover();
     }
     if (connectFlow.state === "WAITING_TAKEOVER"
       && !connectFlowTargetMatches(connectFlow, transport.workspaceId, canonicalRoute)) {
@@ -2090,8 +2179,12 @@ async function handleConnectPage(sender, message) {
           generation: ownerState.owner.generation,
           canonicalRoute: ownerState.owner.canonicalRoute,
         };
-        // Explicit Connect only: rebase stale owner witness; persist before use.
-        if (["ATTEST_REQUESTED", "COMPLETE_REQUESTED"].includes(connectFlow.state)) {
+        // Explicit Connect only: rebase stale owner witness for this exact transport.
+        if (connectFlow.state === "DONE"
+          && !verifiedConnectFlowMatchesTransport(connectFlow)) {
+          return { ok: false, reason: "connect_identity_conflict", retryAllowed: false };
+        }
+        if (["ATTEST_REQUESTED", "COMPLETE_REQUESTED", "DONE"].includes(connectFlow.state)) {
           const refreshed = refreshExplicitConnectOwnerWitness(connectFlow, currentOwner);
           if (refreshed.ok) {
             const prev = connectFlow;
@@ -2207,15 +2300,21 @@ async function handleConnectPage(sender, message) {
 }
 
 async function handleFetchState() {
-  const gate = requireProtectedTransport();
-  if (!gate.ok) return gate;
+  // A stale observation blocks writes, not a fresh read with the SAME credential.
+  // Otherwise a transient rejection permanently disables its own recovery path.
+  if (!storageProtected) return { ok: false, reason: "storage_unprotected" };
+  if (!transport?.credential) return { ok: false, reason: "transport_missing" };
   try {
     const res = await fetchCompanion("/state", { method: "GET" });
+    if (!isCurrentTransportResponse(res)) return { ok: false, reason: "stale_transport_response" };
+    if (requestTransports.get(res).requestAuthRevision !== authFailureRevision) {
+      return { ok: false, reason: "stale_transport_response" };
+    }
     if (res.status === 401 && transport?.rebindPending === true) {
       return { ok: false, reason: "rebind_pending", authStale: false };
     }
     if (res.status === 401) {
-      return markAuthStale(res.body?.error || "COMPANION_UNAUTHORIZED");
+      return markAuthStale(res.body?.error || "COMPANION_UNAUTHORIZED", res);
     }
     if (res.status === 409 && res.body?.error === "COMPANION_REPAIR_BLOCKED") {
       return { ok: false, reason: "COMPANION_REPAIR_BLOCKED", status: 409 };
@@ -2224,9 +2323,13 @@ async function handleFetchState() {
       return { ok: false, reason: res.body?.error || `http_${res.status}` };
     }
     assertNoForbiddenFields(res.body);
+    if (!res.body || typeof res.body !== "object" || Array.isArray(res.body)
+      || !["workspaceId", "bindingId", "epoch", "companionId", "routeCanonical"].every(key => key in res.body)) {
+      return { ok: false, reason: "state_response_invalid" };
+    }
     const idCheck = validateStateIdentity(transport, res.body);
     if (!idCheck.ok) {
-      return markAuthStale(idCheck.reason);
+      return markAuthStale(idCheck.reason, res);
     }
     // Authenticated /state is the ONLY route-verification authority.
     const sync = syncTransportRouteVerification(transport, res.body);
@@ -2234,8 +2337,20 @@ async function handleFetchState() {
       if (sync.downgraded) {
         await forceAutonomyOff("route_verification_downgrade");
       }
-      transport = sync.transport;
-      await persistTransport();
+      if (!isCurrentTransportResponse(res)
+        || requestTransports.get(res).requestAuthRevision !== authFailureRevision) {
+        return { ok: false, reason: "stale_transport_response" };
+      }
+      const nextTransport = { ...sync.transport, authStale: false };
+      delete nextTransport.authStaleReason;
+      // Keep writes blocked in memory until the exact successful recheck is durable.
+      await chrome.storage.local.set({ [TRANSPORT_KEY]: nextTransport });
+      if (!isCurrentTransportResponse(res)
+        || requestTransports.get(res).requestAuthRevision !== authFailureRevision) {
+        await persistTransport();
+        return { ok: false, reason: "stale_transport_response" };
+      }
+      transport = nextTransport;
       // Latch + durable fence terminal only from authenticated /state VERIFIED.
       const appliedLatch = applyRouteAttestServerVerification(routeAttestLatch, sync.routeVerification);
       if (appliedLatch.ok && appliedLatch.transitioned) {
@@ -2322,10 +2437,11 @@ async function handleReservePage(sender, message) {
     await persistJournal();
     return { ok: false, reason: "network_unreachable", journalState: journal.state };
   }
+  if (!isCurrentTransportResponse(res)) return { ok: false, reason: "stale_transport_response" };
   if (res.status === 401) {
     journal = markReservationRecovery(journal, { routeCanonical });
     await persistJournal();
-    return markAuthStale(res.body?.error || "COMPANION_UNAUTHORIZED");
+    return markAuthStale(res.body?.error || "COMPANION_UNAUTHORIZED", res);
   }
   if (!res.ok) {
     if (res.status === 404 || res.status === 409) {
@@ -2384,7 +2500,8 @@ async function handleRelease() {
   } catch {
     return { ok: false, reason: "network_unreachable" };
   }
-  if (res.status === 401) return markAuthStale(res.body?.error || "COMPANION_UNAUTHORIZED");
+  if (!isCurrentTransportResponse(res)) return { ok: false, reason: "stale_transport_response" };
+  if (res.status === 401) return markAuthStale(res.body?.error || "COMPANION_UNAUTHORIZED", res);
   if (res.ok) {
     journal = clearJournal();
     await persistJournal();
@@ -2450,6 +2567,29 @@ async function handleRecover() {
 
   // E1b3d3b: send-side durable states recover through exact-document production runtime.
   if (journalIsSendSide(journal)) {
+    // Manual force cleanup also deletes server authority. Clear only this exact
+    // issued attempt; no CS, DOM, begin-send, or fabricated observed evidence.
+    if (!inFlight && journal.terminalWitness) {
+      const previous = journal;
+      const snapshot = JSON.stringify(previous);
+      let terminal;
+      try {
+        terminal = await fetchCompanion("/ack", { method: "POST", body: JSON.stringify({
+          routeCanonical: previous.routeCanonical, eventId: previous.eventId,
+          attemptId: previous.attemptId, terminalWitness: previous.terminalWitness,
+        }) });
+      } catch { return { ok: false, reason: "network_unreachable", zeroWrite: true, zeroClick: true }; }
+      if (!isCurrentTransportResponse(terminal)) return { ok: false, reason: "stale_transport_response" };
+      if (terminal.status === 401) return markAuthStale(terminal.body?.error || "COMPANION_UNAUTHORIZED", terminal);
+      if (JSON.stringify(journal) !== snapshot) return { ok: false, reason: "journal_identity_changed", zeroWrite: true, zeroClick: true };
+      if (terminal.ok && evaluateTerminalGoneCloseout({ journal, inFlight, serverTerminal: terminal.body }).ok) {
+        journal = clearJournal();
+        try { await persistJournal(); }
+        catch { journal = previous; return { ok: false, reason: "terminal_gone_persist_failed", zeroWrite: true, zeroClick: true }; }
+        productionClaimProof = null; productionAckProof = null;
+        return { ok: true, recovered: true, action: "terminal_gone_clear", journal: { state: "NONE" }, zeroWrite: true, zeroClick: true };
+      }
+    }
     // Server-observed closeout: trusted ACK already moved server event to observed.
     // Eligible durable states (OUTCOME_UNKNOWN | OBSERVED_PENDING_ACK) + exact
     // identity proof + inFlight=null may SW-only clear. Zero DOM / ACK / Send / CS.
@@ -2514,9 +2654,135 @@ async function handleClearTransport() {
   };
 }
 
+let operationsReadInFlight = null;
+async function readOperations() {
+  const local = () => ({
+    autonomy: autonomyPolicy.mode,
+    web: {
+      observedAt: evidence?.observedAt ?? null,
+      ownerAvailable: !!ownerState.owner && !!evidence && isOwner(ownerState, evidence.tabId, evidence.documentId),
+      routeMatches: !!evidence && !!transport && areChatgptConversationRoutesEquivalent(evidence.canonicalRoute, transport.routeCanonical),
+      composer: evidence?.composer ?? "unknown", generation: evidence?.generation ?? "unknown", safe: evidence?.safe === true,
+      verified: transport?.routeVerification === "VERIFIED",
+    },
+    journal: { state: journal.state, eventId: journal.eventId ?? null, attemptId: journal.attemptId ?? null },
+  });
+  if (!storageProtected || !transport?.credential) return { ok: false, reason: "transport_unavailable", ...local() };
+  try {
+    const response = await fetchCompanion("/operations", { method: "GET", cache: "no-store" });
+    if (!isCurrentTransportResponse(response) || requestTransports.get(response)?.requestAuthRevision !== authFailureRevision) {
+      return { ok: false, reason: "stale_transport_response", ...local() };
+    }
+    if (!response.ok) return { ok: false, reason: response.body?.error ?? "bridge_unavailable", ...local() };
+    assertNoForbiddenFields(response.body);
+    const identity = validateStateIdentity(transport, response.body);
+    if (!identity.ok) return { ok: false, reason: identity.reason, ...local() };
+    if (response.body?.schemaVersion !== 1 || response.body?.readOnly !== true || !Array.isArray(response.body.commands)) {
+      return { ok: false, reason: "operations_protocol_mismatch", ...local() };
+    }
+    return { ok: true, snapshot: response.body, ...local() };
+  } catch { return { ok: false, reason: "bridge_unavailable", ...local() }; }
+}
+
+const PANEL_ACTION_KEY = "c2c.panel.action.v1";
+async function panelAction(message) {
+  if (!storageProtected || !transport?.credential) return { ok: false, reason: "transport_unavailable" };
+  const workspaceId = transport.workspaceId;
+  if (!/^[a-f0-9]{12}$/.test(workspaceId ?? "")) return { ok: false, reason: "transport_unavailable" };
+  if (!["preview", "confirm", "check", "reconcile"].includes(message.phase)) return { ok: false, reason: "bad_message" };
+  const stored = (await chrome.storage.local.get(PANEL_ACTION_KEY))[PANEL_ACTION_KEY];
+  if (stored && (stored.version !== 1 || !Array.isArray(stored.operations) || stored.operations.length > 100
+    || stored.operations.some(item => !/^[a-f0-9]{12}$/.test(item?.workspaceId ?? "") || !["pending", "completed", "rejected"].includes(item?.status)
+      || !/^[a-f0-9-]{36}$/.test(item?.request?.requestId ?? "") || !/^[A-Za-z0-9_-]{1,128}$/.test(item?.request?.commandId ?? ""))))
+    return { ok: false, reason: "panel_journal_corrupt" };
+  let operations = stored?.operations ?? [];
+  const save = async entry => {
+    const remaining = operations.filter(item => item.workspaceId !== workspaceId || item.request.requestId !== entry.request.requestId);
+    const next = [...remaining.filter(item => item.status === "pending"), ...remaining.filter(item => item.status !== "pending").slice(-20), { ...entry, workspaceId }];
+    if (next.length > 100) throw new Error("panel_journal_full");
+    await chrome.storage.local.set({ [PANEL_ACTION_KEY]: { version: 1, operations: next } });
+    operations = next;
+  };
+  if (transport?.workspaceId !== workspaceId) return { ok: false, reason: "stale_transport_response" };
+  const scoped = operations.filter(item => item.workspaceId === workspaceId);
+  const saved = message.phase === "check" ? scoped.filter(item => !message.commandId || item.request.commandId === message.commandId).at(-1)
+    : scoped.find(item => item.status === "pending" && item.request.commandId === message.request?.commandId);
+  if (message.phase === "check") {
+    if (!saved?.request?.requestId) return { ok: true, status: "none" };
+    const response = await fetchCompanion(`/operations/result?requestId=${encodeURIComponent(saved.request.requestId)}`, { method: "GET", cache: "no-store" });
+    if (!isCurrentTransportResponse(response) || requestTransports.get(response)?.requestAuthRevision !== authFailureRevision || !response.ok) return { ok: false, reason: "operation_status_unavailable" };
+    if (response.body?.requestId !== saved.request.requestId) return { ok: false, reason: "operation_status_mismatch" };
+    if (response.body.status === "completed") await save({ ...saved, status: "completed" });
+    return { ok: true, ...response.body };
+  }
+  if (message.phase === "reconcile") {
+    if (!/^[a-f0-9-]{36}$/.test(message.requestId ?? "")) return { ok: false, reason: "bad_message" };
+    const response = await fetchCompanion("/operations/reconcile", { method: "POST", body: JSON.stringify({ requestId: message.requestId }) });
+    if (!isCurrentTransportResponse(response) || requestTransports.get(response)?.requestAuthRevision !== authFailureRevision || !response.ok || response.body?.requestId !== message.requestId)
+      return { ok: false, reason: response.body?.error ?? "operation_status_unavailable" };
+    const prior = scoped.find(item => item.request.requestId === message.requestId);
+    if (response.body.status === "completed" && prior) await save({ ...prior, status: "completed" });
+    return { ok: true, ...response.body };
+  }
+  if (saved?.status === "pending") return { ok: false, reason: "panel_operation_unknown", requestId: saved.request.requestId };
+  if (autonomyPolicy.mode === "armed" || productionSendInFlight || autonomyTickInFlight || connectInFlight) return { ok: false, reason: "pause_autonomy_before_manual_action" };
+  const request = message.request;
+  if (!request || Object.keys(request).some(key => !["requestId", "commandId", "action", "eventId"].includes(key))
+    || !/^[a-f0-9-]{36}$/.test(request.requestId ?? "") || !/^[A-Za-z0-9_-]{1,128}$/.test(request.commandId ?? "")) return { ok: false, reason: "bad_message" };
+  const reservationOnly = request.action === "requeue_return" && journal.state === "RESERVED" && journal.eventId === request.eventId;
+  if (journal.state !== "NONE" && !reservationOnly) return { ok: false, reason: "delivery_journal_requires_recovery" };
+  const beforeJournal = journal;
+  if (message.phase === "confirm") {
+    if (message.confirmed !== true || !/^[a-f0-9]{64}$/.test(message.confirmationSha256 ?? "")) return { ok: false, reason: "explicit_confirmation_required" };
+    await save({ status: "pending", request, confirmationSha256: message.confirmationSha256 });
+  }
+  productionSendInFlight = true;
+  try {
+    const response = await fetchCompanion(`/operations/${message.phase}`, { method: "POST", body: JSON.stringify({ request,
+      ...(message.phase === "confirm" ? { confirmationSha256: message.confirmationSha256 } : {}) }) });
+    if (!isCurrentTransportResponse(response) || requestTransports.get(response)?.requestAuthRevision !== authFailureRevision)
+      return { ok: false, reason: "stale_transport_response" };
+    if (!response.ok) {
+      if (message.phase === "confirm" && response.body?.noMutation === true && response.body.requestId === request.requestId)
+        await save({ status: "rejected", request });
+      return { ok: false, reason: response.body?.error ?? "panel_action_failed" };
+    }
+    assertNoForbiddenFields(response.body);
+    if (message.phase === "preview" && (!response.body?.request || ["requestId", "commandId", "action", "eventId"].some(key => response.body.request[key] !== request[key])
+      || !/^[a-f0-9]{64}$/.test(response.body.confirmationSha256 ?? "") || typeof response.body.notice !== "string" || response.body.notice.length > 2048))
+      return { ok: false, reason: "panel_preview_identity_mismatch" };
+    if (message.phase === "confirm" && response.body?.requestId === request.requestId && response.body.status === "completed") {
+      await save({ status: "completed", request });
+      if (reservationOnly && journal === beforeJournal && journal.state === "RESERVED") {
+        journal = clearJournal();
+        try { await persistJournal(); } catch (error) { journal = beforeJournal; throw error; }
+      }
+    }
+    return { ok: true, ...response.body };
+  } catch { return { ok: false, reason: message.phase === "confirm" ? "panel_operation_unknown" : "network_unreachable" }; }
+  finally { productionSendInFlight = false; }
+}
+
 async function handleMessage(message, sender, { transportMutationHeld = false, managedAttestRollback = false } = {}) {
   await initPromise;
   if (!message || typeof message !== "object") return { ok: false, reason: "bad_message" };
+
+  if (message.type === "c2c.operations.action") {
+    const ownPanel = typeof chrome.runtime.id === "string" && sender?.id === chrome.runtime.id
+      && sender?.url === chrome.runtime.getURL?.("operations/operations.html");
+    if (!ownPanel || sender?.tab?.url?.startsWith("https://")) return { ok: false, reason: "extension_panel_required" };
+    if (Object.keys(message).some(key => !["type", "phase", "request", "requestId", "commandId", "confirmationSha256", "confirmed"].includes(key))) return { ok: false, reason: "bad_message" };
+    return runTransportMutation(() => panelAction(message));
+  }
+
+  if (message.type === "c2c.operations.read") {
+    const ownPanel = typeof chrome.runtime.id === "string" && sender?.id === chrome.runtime.id
+      && sender?.url === chrome.runtime.getURL?.("operations/operations.html");
+    if (!isExtensionInternalSender(sender) && !ownPanel) return { ok: false, reason: "extension_sender_required" };
+    if (Object.keys(message).length !== 1) return { ok: false, reason: "bad_message" };
+    if (!operationsReadInFlight) operationsReadInFlight = readOperations().finally(() => { operationsReadInFlight = null; });
+    return operationsReadInFlight;
+  }
 
   if (message.type === "c2c.unbind") return unbindAll();
   if (message.type === "c2c.owner-proof.request") return handleMintOwnerProof(sender, message);
@@ -2766,7 +3032,10 @@ async function handleMessage(message, sender, { transportMutationHeld = false, m
     if (parseAutonomyPolicy(autonomyPolicy).mode === "armed") {
       return { ok: false, reason: "autonomy_armed" };
     }
-    return handleReservePage(sender, { generation, safety: message?.safety, canonicalRoute: message?.canonicalRoute ?? null });
+    return handleReservePage(sender, {
+      generation: Number.isFinite(message.generation) ? Number(message.generation) : 1,
+      safety: message?.safety, canonicalRoute: message?.canonicalRoute ?? null,
+    });
   }
   if (message.type === "c2c.release") return handleRelease();
   if (message.type === "c2c.recover") return handleRecover();
@@ -2804,7 +3073,12 @@ async function handleMessage(message, sender, { transportMutationHeld = false, m
     );
   }
   if (message.type === "c2c.connect.page") {
-    return runTransportMutation(() => handleConnectPage(sender, message));
+    return runTransportMutation(async () => {
+      const result = await handleConnectPage(sender, message);
+      connectReason = !result?.ok && typeof result?.reason === "string"
+        && /^[a-zA-Z][a-zA-Z0-9_]{0,95}$/.test(result.reason) ? result.reason : null;
+      return result;
+    });
   }
   if (message.type === "c2c.bind") {
     const currentDocument = resolveCurrentDocumentBindingIdentity(sender, message?.canonicalRoute ?? null);
@@ -2830,6 +3104,13 @@ async function handleMessage(message, sender, { transportMutationHeld = false, m
   // mandatory-equivalence witness. A non-matching canonical is never trusted below.
   const observationVerdict = resolveObservationRouteVerdict(sender, message?.canonicalRoute ?? null);
   const canonical = observationVerdict.verdict === "match" ? observationVerdict.canonicalRoute : null;
+
+  if (message.type === "c2c.status.read") {
+    if (!identity.ok) return { ok: false, reason: identity.reason };
+    const exact = canonical != null && isOwner(ownerState, tabId, documentId)
+      && areChatgptConversationRoutesEquivalent(canonical, ownerState.owner?.canonicalRoute);
+    return statusPayload(tabId, documentId, { isOwner: exact, canonicalRoute: canonical });
+  }
 
   if (
     message.type === "c2c.status.page"
@@ -3665,8 +3946,9 @@ async function handleProductionBeginSend(sender, message) {
   } catch {
     return { ok: false, reason: "network_unreachable", journal: summarizeProductionJournal(journal) };
   }
+  if (!isCurrentTransportResponse(res)) return { ok: false, reason: "stale_transport_response" };
   if (res.status === 401) {
-    return markAuthStale(res.body?.error || "COMPANION_UNAUTHORIZED");
+    return markAuthStale(res.body?.error || "COMPANION_UNAUTHORIZED", res);
   }
   if (res.status === 409) {
     return {
@@ -3705,6 +3987,7 @@ async function handleProductionBeginSend(sender, message) {
     attemptId: body.attemptId,
     message: body.message,
     messageSha256: body.messageSha256,
+    ...(body.terminalWitness === undefined ? {} : { terminalWitness: body.terminalWitness }),
   });
   if (!productionClaimProof) {
     return { ok: false, reason: "claim_proof_mint_failed", journal: summarizeProductionJournal(journal) };
@@ -3716,6 +3999,7 @@ async function handleProductionBeginSend(sender, message) {
     attemptId: body.attemptId,
     message: body.message,
     messageSha256: body.messageSha256,
+    ...(body.terminalWitness === undefined ? {} : { terminalWitness: body.terminalWitness }),
   };
 }
 
@@ -3750,6 +4034,7 @@ async function handleProductionAck(sender, message) {
         routeCanonical: journal.routeCanonical,
         eventId: journal.eventId,
         attemptId: journal.attemptId,
+        ...(journal.terminalWitness ? { terminalWitness: journal.terminalWitness } : {}),
       }),
     });
   } catch {
@@ -3760,8 +4045,9 @@ async function handleProductionAck(sender, message) {
       journal: summarizeProductionJournal(journal),
     };
   }
+  if (!isCurrentTransportResponse(res)) return { ok: false, reason: "stale_transport_response" };
   if (res.status === 401) {
-    return markAuthStale(res.body?.error || "COMPANION_UNAUTHORIZED");
+    return markAuthStale(res.body?.error || "COMPANION_UNAUTHORIZED", res);
   }
   if (!res.ok) {
     return {
@@ -3774,7 +4060,7 @@ async function handleProductionAck(sender, message) {
   }
   assertNoForbiddenFields(res.body);
   const body = res.body || {};
-  if (body.eventId !== journal.eventId || body.status !== "observed") {
+  if (body.eventId !== journal.eventId || (body.status !== "observed" && !(body.status === "terminal_gone" && journal.terminalWitness && body.attemptId === journal.attemptId))) {
     return {
       ok: false,
       reason: "ack_response_invalid",
@@ -3787,6 +4073,7 @@ async function handleProductionAck(sender, message) {
     eventId: body.eventId,
     attemptId: journal.attemptId,
     status: body.status,
+    ...(body.status === "terminal_gone" ? { terminalWitness: journal.terminalWitness } : {}),
   });
   if (!productionAckProof) {
     return {
@@ -3796,7 +4083,7 @@ async function handleProductionAck(sender, message) {
       journal: summarizeProductionJournal(journal),
     };
   }
-  return { ok: true, eventId: body.eventId, status: body.status };
+  return { ok: true, eventId: body.eventId, status: body.status, ...(body.status === "terminal_gone" ? { attemptId: body.attemptId } : {}) };
 }
 
 /**
@@ -4164,6 +4451,7 @@ async function recoverProductionSendSide(inFlight) {
       attemptId: safeInFlight.attemptId,
       message: safeInFlight.message,
       messageSha256: safeInFlight.messageSha256,
+      ...(safeInFlight.terminalWitness === undefined ? {} : { terminalWitness: safeInFlight.terminalWitness }),
     });
     if (!productionClaimProof) {
       return {
@@ -4521,8 +4809,9 @@ async function handleRetireUnknown() {
       ackCalled: false,
     };
   }
+  if (!isCurrentTransportResponse(res)) return { ok: false, reason: "stale_transport_response" };
   if (res.status === 401) {
-    return markAuthStale(res.body?.error || "COMPANION_UNAUTHORIZED");
+    return markAuthStale(res.body?.error || "COMPANION_UNAUTHORIZED", res);
   }
   if (!res.ok) {
     return {
@@ -4593,8 +4882,10 @@ async function handleRetireUnknown() {
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   handleMessage(message, sender)
     .then((response) => {
-      void refreshActionIndicator();
-      void syncWakeWatchdog();
+      if (message?.type !== "c2c.operations.read" && message?.type !== "c2c.status.read") {
+        void refreshActionIndicator();
+        void syncWakeWatchdog();
+      }
       sendResponse(response);
     })
     .catch(() => sendResponse({ ok: false, reason: "internal" }));

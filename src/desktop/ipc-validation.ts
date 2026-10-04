@@ -4,6 +4,7 @@ import {
   MAX_RESULT_CONTINUATION_CHAIN,
   type DesktopDiagnosis,
   type DesktopExecutionInfo,
+  type DesktopRuntimeFence,
   type DesktopResultActivityItemType,
   type DesktopResultActivityMarker,
   type DesktopResultActivityMarkerObservation,
@@ -17,6 +18,7 @@ import {
   type DesktopResultTerminalFenceKind,
   type DesktopTarget,
   type DesktopTargetInfo,
+  type DesktopTargetInfoInternal,
   type DesktopUnknownReconcileExpectation,
   type DesktopUnknownReconcileObservation,
   type NativeContinuationSignature,
@@ -30,6 +32,20 @@ import {
 
 const MAX_RESULT_ACTIVITY_ITEMS = 4096;
 const RESULT_ACTIVITY_ITEM_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$/u;
+const RUNTIME_FENCE_KEYS = ["appServerCreation", "appServerExe", "appServerPid", "desktopCreation", "desktopExe", "desktopPid"];
+const MAX_UINT64 = 18446744073709551615n;
+
+export function validateRuntimeFence(value: unknown): DesktopRuntimeFence {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw error("DESKTOP_PROTOCOL_ERROR");
+  const input = value as Record<string, unknown>;
+  if (Object.keys(input).sort().join(",") !== RUNTIME_FENCE_KEYS.join(",")) throw error("DESKTOP_PROTOCOL_ERROR");
+  if (!["desktopPid", "appServerPid"].every(key => Number.isSafeInteger(input[key]) && (input[key] as number) > 0 && (input[key] as number) <= 0xffffffff) ||
+      !["desktopExe", "appServerExe"].every(key => typeof input[key] === "string" && !!input[key] && !(input[key] as string).includes("\0")) ||
+      !["desktopCreation", "appServerCreation"].every(key => typeof input[key] === "string" && /^[1-9][0-9]*$/u.test(input[key] as string) && BigInt(input[key] as string) <= MAX_UINT64)) {
+    throw error("DESKTOP_PROTOCOL_ERROR");
+  }
+  return { ...input } as unknown as DesktopRuntimeFence;
+}
 
 export function validateTarget(value: DesktopTarget): DesktopTarget {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw error("DESKTOP_INVALID_REQUEST");
@@ -68,7 +84,15 @@ export function validateInfo(value: unknown, target: DesktopTarget): DesktopTarg
       normalizePath(info.cwd) !== normalizePath(target.workspaceRoot)) {
     throw error("DESKTOP_PROTOCOL_ERROR");
   }
-  return { ...target, ...info } as DesktopTargetInfo;
+  const result = { ...target, ...info } as DesktopTargetInfo & { runtimeFence?: DesktopRuntimeFence };
+  if (Object.prototype.hasOwnProperty.call(info, "runtimeFence")) result.runtimeFence = validateRuntimeFence((info as Record<string, unknown>).runtimeFence);
+  return result;
+}
+
+export function validateInternalInfo(value: unknown, target: DesktopTarget): DesktopTargetInfoInternal {
+  const info = validateInfo(value, target) as DesktopTargetInfo & { runtimeFence?: DesktopRuntimeFence };
+  if (!info.runtimeFence) throw error("DESKTOP_PROTOCOL_ERROR");
+  return info as DesktopTargetInfoInternal;
 }
 
 export function validateExecutionInfo(value: unknown, target: DesktopTarget): DesktopExecutionInfo {
@@ -81,7 +105,7 @@ export function validateExecutionInfo(value: unknown, target: DesktopTarget): De
   return { ...info, activeTurnId };
 }
 
-export function validateResultContext(value: unknown, target: DesktopTarget): DesktopResultContext {
+export function validateResultContext(value: unknown, target: DesktopTarget, frozenReceipt = false): DesktopResultContext {
   const info = validateInfo(value, target);
   const input = value as { resultTurnId?: unknown; resultTurnStatus?: unknown };
   if (!isUuid(input.resultTurnId) || typeof input.resultTurnStatus !== "string" ||
@@ -91,7 +115,7 @@ export function validateResultContext(value: unknown, target: DesktopTarget): De
   if (info.runtimeStatus === "idle" && input.resultTurnStatus === "inProgress") {
     throw error("DESKTOP_STATE_UNAVAILABLE");
   }
-  if ((info.runtimeStatus === "active" || info.runtimeStatus === "inProgress") && input.resultTurnStatus !== "inProgress") {
+  if (!frozenReceipt && (info.runtimeStatus === "active" || info.runtimeStatus === "inProgress") && input.resultTurnStatus !== "inProgress") {
     throw error("DESKTOP_STATE_UNAVAILABLE");
   }
   if (info.runtimeStatus !== "idle" && info.runtimeStatus !== "active" && info.runtimeStatus !== "inProgress") {
@@ -230,7 +254,7 @@ export function validateResultOwnershipExpectation(value: DesktopResultOwnership
   return { ...value };
 }
 
-export function validateResultOwnership(value: unknown, target: DesktopTarget): DesktopResultOwnership {
+export function validateResultOwnership(value: unknown, target: DesktopTarget, frozenReceipt = false): DesktopResultOwnership {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw error("DESKTOP_PROTOCOL_ERROR");
   const input = value as Record<string, unknown>;
   const allowed = new Set([
@@ -240,7 +264,7 @@ export function validateResultOwnership(value: unknown, target: DesktopTarget): 
     "chainTurnIds", "chainLength", "chainSignatures", "signature",
   ]);
   if (Object.keys(input).some(key => !allowed.has(key))) throw error("DESKTOP_PROTOCOL_ERROR");
-  const context = validateResultContext(value, target);
+  const context = validateResultContext(value, target, frozenReceipt);
   const ownership = input.ownership;
   const originTurnId = input.originTurnId;
   const deliveryId = input.deliveryId;

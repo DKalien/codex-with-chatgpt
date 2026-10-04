@@ -1,10 +1,6 @@
 # Phase E：部署基线与 ChatGPT 接收端预检
 
-> **当前实现（2026-09-22）**：Browser Companion 的 `alarms` 只做低频 `/state`
-> discovery；真实 owner heartbeat 才能触发生产发送。Desktop `c2c record` 在
-> `inProgress` 时进入终态 fence，终态与无后续工具活动可证明时写入 trusted receipt，
-> 否则发出 `FINAL_RECEIPT_REQUIRED` 控制唤醒；新 Bridge 通过受控 reconcile 投影该事件，
-> 旧 Bridge 保持兼容。以下 E0/E1 段落是历史验收记录，不代表当前运行时、部署状态或待办命令。
+> **现役机制（2026-10-04）**：`GET /state` 已纯读，`alarms` 仅 discovery；有界维护由 Bridge 独立批次推进，生产发送仍需真实 exact-owner heartbeat。新 canonical result 由 Result Bus 统一发送，legacy 仅保留兼容范围。`c2c record` 的 pending draft、trusted terminal receipt 与网页 ACK 是不同阶段。当前构建/部署/网页状态见 [开发计划](development-plan.md)，详细边界见 [职责设计第12节](core-plugin-boundaries.md#12-b2b5-剩余源码交付2026-10-04)。下方带日期的 E0/E1/F 证据仅代表当轮，不是当前待办或机器快照。
 
 ## Sleep / wake 恢复边界
 
@@ -14,12 +10,12 @@ Browser Companion 的 MV3 `alarms` watchdog 只做低频、受保护的 `/state`
 
 工具栏指示器是纯诊断显示，不授予权限、改变路由、开启 autonomy 或触发发送：健康且已连接的状态显示 `C`，初始化/等待/临时 in-flight 或需要用户处理的状态显示 `C!`，持久身份漂移、认证过期、`OUTCOME_UNKNOWN`、存储保护失败或未知 journal 状态显示 `C×`；优先级固定为 error > warning > normal。Service Worker 对相同 badge/title 去重，并在 autonomy tick、production send 和恢复路径清除 in-flight 标记后再次刷新，避免短暂 `C!` 残留。
 
-低频 `alarms` 仍只负责 `/state` discovery/reconcile；它不能 reserve、send、写 DOM 或直接调用 autonomy tick。真实 owner 文档的 heartbeat 仍是生产动作的唯一入口。
+低频 `alarms` 只负责只读 `/state` discovery；历史 reconcile/cleanup 由 Bridge 的有界维护批次负责；它不能 reserve、send、写 DOM 或直接调用 autonomy tick。真实 owner 文档的 heartbeat 仍是生产动作的唯一入口。
 
-### 当前部署证据（2026-09-22）
+### 历史部署证据（2026-09-22）
 
 - toolbar stale-warning 修复已由用户在扩展 Reload 后实测；源码提交 `ab79b6a` 已推送，相关 focused/full Vitest、typecheck、build 与 diff-check 均通过。
-- 已安装目标与当前 workspace Bridge 现已都是 `15c76d1…`；最新稳定 launcher `status --json` 报告 `runtimeUpgrade.state=current`、`upgradePending=false`、`desktopCompatibility=current`，因此此前 pending/finalizer 与 PID/startedAt 不一致属于历史部署证据，不是当前状态。
+- 该日已安装目标与 workspace Bridge 都是 `15c76d1…`；最新稳定 launcher `status --json` 报告 `runtimeUpgrade.state=current`、`upgradePending=false`、`desktopCompatibility=current`，因此此前 pending/finalizer 与 PID/startedAt 不一致属于历史部署证据，不是当前状态。
 - 后续排障仍须以同一 workspace 的完整 runtime identity 为准；不要因 HTTP 200 或 tunnel `running=true` 单独重复 rollout，也不要修改绑定、反馈事件或 Browser Companion 权限。
 
 核验日期：2026-09-14。任务来源是用户手动交给本机主代理的任务包。

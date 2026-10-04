@@ -16,6 +16,14 @@ const BINDING = "01a00000-0000-7000-8000-000000000103";
 const DIGEST = "a".repeat(64);
 const MESSAGE = "execute R4a";
 const COMMAND = "r4a-test-command";
+const runtimeFence = {
+  desktopPid: 1001,
+  desktopExe: "C:\\Program Files\\ChatGPT\\ChatGPT.exe",
+  desktopCreation: "1000001",
+  appServerPid: 1002,
+  appServerExe: "C:\\Program Files\\ChatGPT\\codex.exe",
+  appServerCreation: "1000002",
+};
 let stateDir: string;
 let root: string;
 let workspace: { id: string; root: string };
@@ -54,7 +62,7 @@ beforeEach(() => {
     payloadSha256: createHash("sha256").update(MESSAGE).digest("hex") });
   transitionCommandDelivery(workspace, { commandId: COMMAND, deliveryStatus: "accepted" });
   updateDesktop(workspace.id, () => ({ state: {
-    version: 1, workspaceId: workspace.id, workspaceRoot: root, enabled: true,
+    version: 1, workspaceId: workspace.id, workspaceRoot: root, enabled: true, runtimeFence,
     binding: { bindingId: BINDING, threadId: THREAD, hostId: "local", projectId: "project-r4a",
       title: "R4a", boundAt: new Date().toISOString() },
     deliveries: [{ commandId: COMMAND, clientId: "client-r4a", bindingId: BINDING,

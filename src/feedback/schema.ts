@@ -203,17 +203,46 @@ export const companionRebindPredecessorSchema = z.object({
   epoch: z.number().int().nonnegative(),
 }).strict();
 
+export const panelActionSchema = z.enum(["cancel_command", "cancel_return", "requeue_return", "cleanup"]);
+export const panelGrantSchema = z.object({
+  grantId: z.string().uuid(), companionId: z.string().uuid(), bindingId: z.string().uuid(),
+  epoch: z.number().int().nonnegative(), routeCanonical: z.string().min(1).max(512),
+  actions: z.array(panelActionSchema).min(1).max(4), expiresAt: z.string().datetime(),
+}).strict();
+export const panelOperationSchema = z.object({
+  requestId: z.string().uuid(), grantId: z.string().uuid(), commandId: z.string().regex(DESKTOP_ID),
+  action: panelActionSchema, confirmationSha256: z.string().regex(HEX64),
+  requestSha256: z.string().regex(HEX64),
+  eventId: z.string().regex(HEX32).optional(), sourceSha256: z.string().regex(HEX64).optional(), reservationId: z.string().uuid().optional(),
+  status: z.enum(["pending", "completed"]), createdAt: z.string().datetime(),
+}).strict();
+
 export const feedbackStateSchema = z.object({
   version: z.literal(1),
   workspaceId: z.string().regex(WORKSPACE_ID),
   projectionCursor: z.number().int().nonnegative(),
   binding: feedbackBindingSchema.nullable(),
   events: z.array(feedbackEventSchema).max(10000),
+  panelGrant: panelGrantSchema.optional(),
+  panelOperations: z.array(panelOperationSchema).max(100).optional(),
+  // Active command cleanup only; removed before its journal is finalized.
+  cleanupAdjustments: z.array(z.object({
+    cleanupId: z.string().uuid(),
+    commandId: z.string().regex(DESKTOP_ID),
+    index: z.number().int().nonnegative(),
+    recordCount: z.number().int().positive(),
+    beforePrefixSha256: z.string().regex(HEX64),
+    afterPrefixSha256: z.string().regex(HEX64),
+    state: z.enum(["prepared", "applied"]),
+  }).strict()).max(8).optional(),
   pairingIntent: pairingIntentSchema.nullable().default(null),
   companion: companionRecordSchema.nullable().default(null),
   rebindIntent: companionRebindIntentSchema.nullable().default(null),
   rebindPredecessor: companionRebindPredecessorSchema.nullable().default(null),
-}).strict();
+}).strict().superRefine((state, ctx) => {
+  const ids = (state.panelOperations ?? []).map(item => item.requestId);
+  if (new Set(ids).size !== ids.length) ctx.addIssue({ code: z.ZodIssueCode.custom, message: "重复 panel requestId" });
+});
 
 // Compatibility fence: the running pre-command51 Bridge only understands
 // C2C_EXECUTED events. Keep this schema local to the repair path so normal

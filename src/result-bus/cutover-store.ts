@@ -4,6 +4,10 @@ import { randomUUID } from "node:crypto";
 import { ensureDir, getStateDir } from "../config/paths.js";
 import { resolveWorkspaceIdentity, type RoutingWorkspaceIdentity } from "../routing/store.js";
 import { routingWorkspaceIdSchema } from "../routing/schema.js";
+import { listResultBusEntries } from "./store.js";
+import { resultBusEntryId } from "./schema.js";
+import { assertCleanupStoreFile, readCleanupJournal, withCommandOperation } from "../command-cleanup/fence.js";
+import { assertCleanupArtifacts, cleanupArtifact, CommandCleanupError, type CleanupArtifact, type CommandCleanupTarget } from "../command-cleanup/schema.js";
 import {
   resultBusCutoverEntrySchema,
   resultBusCutoverStateSchema,
@@ -115,6 +119,12 @@ export function recordResultBusCutoverDisposition(
   stateDir = getStateDir(),
 ): { entry: ResultBusCutoverEntry; replayed: boolean } {
   const resolved = resolveWorkspaceIdentity(identity);
+  const source = listResultBusEntries(resolved, stateDir).find(entry => entry.busEntryId === input.busEntryId);
+  if (!source) throw new ResultBusCutoverError("RESULT_BUS_CUTOVER_CONFLICT", "cutover source 已不存在。");
+  return withCommandOperation(resolved.id, source.commandId, () => {
+  const fresh = listResultBusEntries(resolved, stateDir).find(entry => entry.busEntryId === input.busEntryId);
+  if (!fresh || fresh.commandId !== source.commandId || fresh.iteration !== source.iteration || fresh.resultId !== source.resultId || fresh.resultSha256 !== input.resultSha256)
+    throw new ResultBusCutoverError("RESULT_BUS_CUTOVER_CONFLICT", "取得 lifecycle lock 后 cutover source 已漂移或消失。");
   return withCutoverLock<{ entry: ResultBusCutoverEntry; replayed: boolean }>(resolved, stateDir, previous => {
     const current = previous ?? { version: 1 as const, workspaceId: resolved.id, workspaceRoot: resolved.root, revision: 0, entries: [] };
     const existing = current.entries.find(item => item.busEntryId === input.busEntryId);
@@ -132,5 +142,30 @@ export function recordResultBusCutoverDisposition(
       state: { ...current, entries: [...current.entries, entry] },
       result: { entry, replayed: false },
     };
+  });
+  }, stateDir);
+}
+
+export function inspectResultBusCutoverCleanupArtifacts(target: CommandCleanupTarget): CleanupArtifact[] {
+  assertCleanupStoreFile(resultBusCutoverFile(target.workspaceId, target.stateDir), target.stateDir ?? getStateDir());
+  const id = resultBusEntryId(target.workspaceId, target.commandId, target.iteration);
+  return listResultBusCutoverDispositions({ id: target.workspaceId, root: target.workspaceRoot }, target.stateDir)
+    .filter(entry => entry.busEntryId === id).map(entry => cleanupArtifact("result_bus_cutover", entry.busEntryId, entry));
+}
+
+export function deleteResultBusCutoverCleanupArtifacts(target: CommandCleanupTarget, expected: readonly CleanupArtifact[]): void {
+  const stateDir = target.stateDir ?? getStateDir();
+  assertCleanupStoreFile(resultBusCutoverFile(target.workspaceId, stateDir), stateDir);
+  const journal = readCleanupJournal(target.workspaceId, target.commandId, stateDir);
+  if (!journal || journal.workspaceRoot !== target.workspaceRoot || JSON.stringify(journal.artifacts) !== JSON.stringify(expected))
+    throw new CommandCleanupError("COMMAND_CLEANUP_REQUIRED", "删除 cutover 必须持有 exact cleanup journal。");
+  const identity = resolveWorkspaceIdentity({ id: target.workspaceId, root: target.workspaceRoot });
+  if (!readState(identity, stateDir)) return;
+  withCutoverLock(identity, stateDir, previous => {
+    const current = inspectResultBusCutoverCleanupArtifacts(target);
+    assertCleanupArtifacts(current, expected);
+    if (current.length === 0) return { state: previous, noWrite: true, result: undefined };
+    const ids = new Set(current.map(item => item.id));
+    return { state: { ...previous!, entries: previous!.entries.filter(entry => !ids.has(entry.busEntryId)) }, result: undefined };
   });
 }

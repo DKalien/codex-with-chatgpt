@@ -6,6 +6,9 @@ import { resolveWorkspaceIdentity, type RoutingWorkspaceIdentity } from "../rout
 import { canonicalRoutingResultDigest } from "../routing/execution-result-digest.js";
 import { routingCommandIdSchema, routingWorkspaceIdSchema, type RoutingResult } from "../routing/schema.js";
 import { resultBusEntryId, resultBusEntrySchema, resultBusStateSchema, type ResultBusEntry, type ResultBusState } from "./schema.js";
+import { isEphemeralCommand } from "../command-cleanup/ownership.js";
+import { assertCleanupStoreFile, readCleanupJournal, withCommandOperation } from "../command-cleanup/fence.js";
+import { assertCleanupArtifacts, cleanupArtifact, CommandCleanupError, type CleanupArtifact, type CommandCleanupTarget } from "../command-cleanup/schema.js";
 
 export class ResultBusError extends Error {
   constructor(readonly code: string, message: string) {
@@ -113,12 +116,13 @@ function withLock<T>(identity: RoutingWorkspaceIdentity, stateDir: string, fn: (
   }
 }
 
-function canonicalEntry(identity: RoutingWorkspaceIdentity, result: RoutingResult): ResultBusEntry {
+function canonicalEntry(identity: RoutingWorkspaceIdentity, result: RoutingResult, stateDir: string): ResultBusEntry {
   const parsedCommandId = routingCommandIdSchema.parse(result.commandId);
   const digest = canonicalRoutingResultDigest(result);
   const now = new Date().toISOString();
   return resultBusEntrySchema.parse({
     version: 1,
+    ...(isEphemeralCommand(identity.id, result.commandId, stateDir) ? { lifecycle: "ephemeral" } : {}),
     busEntryId: resultBusEntryId(identity.id, parsedCommandId, result.iteration),
     workspaceId: identity.id,
     commandId: parsedCommandId,
@@ -178,7 +182,8 @@ export function listResultBusEntries(identity: RoutingWorkspaceIdentity, stateDi
 
 export function enqueueResultBusEntry(identity: RoutingWorkspaceIdentity, result: RoutingResult, stateDir = getStateDir()): { entry: ResultBusEntry; replayed: boolean } {
   const resolved = resolveWorkspaceIdentity(identity);
-  const expected = canonicalEntry(resolved, result);
+  return withCommandOperation(resolved.id, result.commandId, () => {
+  const expected = canonicalEntry(resolved, result, stateDir);
   return withLock(resolved, stateDir, previous => {
     const current = previous ?? emptyState(resolved);
     const existing = current.entries.find(item => item.commandId === expected.commandId && item.iteration === expected.iteration);
@@ -189,6 +194,7 @@ export function enqueueResultBusEntry(identity: RoutingWorkspaceIdentity, result
     if (current.entries.length >= MAX_ENTRIES) throw new ResultBusError("RESULT_BUS_FULL", "Workspace Result Bus 已达到 10000 条上限。 ");
     return { state: { ...current, entries: [...current.entries, expected] }, result: { entry: expected, replayed: false } as { entry: ResultBusEntry; replayed: boolean } };
   });
+  }, stateDir);
 }
 
 /**
@@ -205,7 +211,12 @@ export function enqueueResultBusEntries(
   stateDir = getStateDir(),
 ): { projected: number; replayed: number } {
   const resolved = resolveWorkspaceIdentity(identity);
-  const expected = results.map(result => canonicalEntry(resolved, result));
+  const commandIds = [...new Set(results.map(result => result.commandId))].sort();
+  const locked = (index: number): { projected: number; replayed: number } => index < commandIds.length
+    ? withCommandOperation(resolved.id, commandIds[index]!, () => locked(index + 1), stateDir)
+    : enqueueLocked();
+  const enqueueLocked = (): { projected: number; replayed: number } => {
+  const expected = results.map(result => canonicalEntry(resolved, result, stateDir));
   if (expected.length === 0) return { projected: 0, replayed: 0 };
   return withLock(resolved, stateDir, previous => {
     const current = previous ?? emptyState(resolved);
@@ -232,4 +243,27 @@ export function enqueueResultBusEntries(
     }
     return { state: { ...current, entries }, result: { projected, replayed } };
   });
+  };
+  return locked(0);
+}
+
+export function inspectResultBusCleanupArtifacts(target: CommandCleanupTarget): CleanupArtifact[] {
+  assertCleanupStoreFile(resultBusFile(target.workspaceId, target.stateDir), target.stateDir ?? getStateDir());
+  const entries = listResultBusEntries({ id: target.workspaceId, root: target.workspaceRoot }, target.stateDir)
+    .filter(entry => entry.commandId === target.commandId);
+  if (entries.some(entry => entry.iteration !== target.iteration)) throw new CommandCleanupError("COMMAND_CLEANUP_AMBIGUOUS", "command 有其他 iteration，禁止部分清理。");
+  return entries.map(entry => cleanupArtifact("result_bus", entry.busEntryId, entry));
+}
+
+export function deleteResultBusCleanupArtifacts(target: CommandCleanupTarget, expected: readonly CleanupArtifact[]): void {
+  const stateDir = target.stateDir ?? getStateDir();
+  const journal = readCleanupJournal(target.workspaceId, target.commandId, stateDir);
+  if (!journal || journal.workspaceRoot !== target.workspaceRoot || JSON.stringify(journal.artifacts) !== JSON.stringify(expected))
+    throw new CommandCleanupError("COMMAND_CLEANUP_REQUIRED", "删除 Result Bus 必须持有 exact cleanup journal。");
+  withResultBusTransaction({ id: target.workspaceId, root: target.workspaceRoot }, previous => {
+    const current = inspectResultBusCleanupArtifacts(target);
+    assertCleanupArtifacts(current, expected);
+    if (current.length === 0) return { state: previous, noWrite: true, result: undefined };
+    return { state: { ...previous!, entries: previous!.entries.filter(entry => entry.commandId !== target.commandId) }, result: undefined };
+  }, stateDir);
 }

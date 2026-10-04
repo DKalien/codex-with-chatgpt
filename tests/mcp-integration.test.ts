@@ -1,3 +1,4 @@
+import { cleanupStrict } from "./strict-teardown.js";
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
@@ -7,8 +8,13 @@ import { startBridge, type Bridge } from "../src/bridge/server.js";
 import { appendExecutionRecord } from "../src/execution/records.js";
 import { SUPPORTED_SCOPES } from "../src/auth/store.js";
 import { saveExecutionOutput } from "../src/execution/output.js";
-import { makeTmpDir, cleanup, write, makeGitRepo, git, isolateStateDir } from "./helpers.js";
+import { makeTmpDir, write, makeGitRepo, git, isolateStateDir } from "./helpers.js";
 
+const previousState = process.env.C2C_STATE_DIR;
+const directories: string[] = [];
+function tmp(name: string): string {
+  const dir = makeTmpDir(name); directories.push(dir); return dir;
+}
 let root: string;
 let bridge: Bridge;
 let client: Client;
@@ -44,7 +50,8 @@ function expectToolOutputSchema(
 
 beforeAll(async () => {
   stateDir = isolateStateDir();
-  root = makeTmpDir("mcp-ws");
+  directories.push(stateDir);
+  root = tmp("mcp-ws");
   makeGitRepo(root);
   write(root, "package.json", JSON.stringify({ name: "demo", scripts: { test: "vitest run" }, dependencies: { react: "^19.0.0" } }));
   write(root, ".env", "API_KEY=supersecret\n");
@@ -55,7 +62,7 @@ beforeAll(async () => {
     workspaceRoot: root,
     port: 0,
     persistRuntime: false,
-    authStoreFile: path.join(makeTmpDir("auth"), "store.json"),
+    authStoreFile: path.join(tmp("auth"), "store.json"),
   });
   const tokens = bridge.authStore.issueTokens({
     clientId: "it-client",
@@ -71,9 +78,11 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
-  await client.close();
-  await bridge.close();
-  cleanup(root);
+  try { try { await client?.close(); } finally { await bridge?.close(); } } finally {
+    if (previousState === undefined) delete process.env.C2C_STATE_DIR;
+    else process.env.C2C_STATE_DIR = previousState;
+    await cleanupStrict(...directories);
+  }
 });
 
 describe("MCP tools over Streamable HTTP", () => {
@@ -396,19 +405,20 @@ describe("MCP tools over Streamable HTTP", () => {
     const transport = new StreamableHTTPClientTransport(new URL(`${bridge.localBaseUrl()}/mcp`), {
       requestInit: { headers: { authorization: `Bearer ${limited.accessToken}` } },
     });
-    await limitedClient.connect(transport);
-    const denied = await limitedClient.callTool({ name: "git_diff", arguments: {} });
-    expect(denied.isError).toBe(true);
-    expect(textOf(denied)).toContain("INSUFFICIENT_SCOPE");
-    const outputDenied = await limitedClient.callTool({
-      name: "execution_output",
-      arguments: { action: "list" },
-    });
-    expect(outputDenied.isError).toBe(true);
-    expect(textOf(outputDenied)).toContain("INSUFFICIENT_SCOPE");
-    const allowed = await limitedClient.callTool({ name: "read_file", arguments: { path: "hello.txt" } });
-    expect(allowed.isError ?? false).toBe(false);
-    await limitedClient.close();
+    try {
+      await limitedClient.connect(transport);
+      const denied = await limitedClient.callTool({ name: "git_diff", arguments: {} });
+      expect(denied.isError).toBe(true);
+      expect(textOf(denied)).toContain("INSUFFICIENT_SCOPE");
+      const outputDenied = await limitedClient.callTool({
+        name: "execution_output",
+        arguments: { action: "list" },
+      });
+      expect(outputDenied.isError).toBe(true);
+      expect(textOf(outputDenied)).toContain("INSUFFICIENT_SCOPE");
+      const allowed = await limitedClient.callTool({ name: "read_file", arguments: { path: "hello.txt" } });
+      expect(allowed.isError ?? false).toBe(false);
+    } finally { await limitedClient.close(); }
   });
 
   it("git_diff over MCP excludes sensitive files like .npmrc and service-account*.json", async () => {
@@ -470,10 +480,15 @@ describe("MCP tools over Streamable HTTP", () => {
     git(root, "reset", "--hard", "HEAD");
   });
 
-  it("feedback reconciliation entrypoints remain workspace-root aware", () => {
+  it("mutating feedback reconciliation entrypoints remain workspace-root aware and status stays read-only", () => {
     const source = fs.readFileSync(path.resolve(process.cwd(), "src/mcp/feedback.ts"), "utf8");
     expect(source).toContain("reconcileFeedbackOutbox(workspace.id, undefined, workspace.root)");
     expect(source).not.toMatch(/reconcileFeedbackOutbox\(workspace\.id\)\s*[;)]/);
-    expect((source.match(/reconcileWorkspaceFeedback\(\)/g) ?? []).length).toBe(6);
+    const reconciledTools = source.split("server.registerTool(").slice(1)
+      .filter(tool => tool.includes("reconcileWorkspaceFeedback();"))
+      .map(tool => /^\s*"([^"]+)"/.exec(tool)?.[1]);
+    expect(reconciledTools).toEqual([
+      "feedback_claim_next",
+    ]);
   });
 });

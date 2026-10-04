@@ -5,6 +5,7 @@ import path from "node:path";
 import { Workspace } from "../workspace/manager.js";
 import { findBridgeObservation, type RuntimeState } from "../bridge/runtime.js";
 import { adminFetch, ensureBridge, ensureBridgeAndTunnel, restartBridge, stopBridge, type BridgeAdminInfo as AdminInfo } from "../process/daemon.js";
+import { requestLoopback } from "../bridge/loopback-http.js";
 import {
   CHATGPT_CREATE_CONNECTOR_URL,
   CHATGPT_DEVELOPER_MODE_URL,
@@ -32,6 +33,8 @@ import { readRuntimeUpgrade } from "../core/upgrade.js";
 import { planGc, gcPlanSummary } from "../core/gc-plan.js";
 import { isMaintenanceLockBusy } from "../core/maintenance-lock.js";
 import { PRODUCT_NAME } from "../version.js";
+import { readBridgeProvenance } from "../process/bridge-provenance.js";
+import { withExplicitSupervisorIntent } from "../supervisor/lifecycle.js";
 import { resolveWorkspace, say, check, cross, handleCliError, persistWorkspaceEndpoint, trySandboxAllow, type TunnelStartResponse, type PairingResponse } from "./shared.js";
 
 export function registerStartCommands(program: Command): void {
@@ -39,12 +42,13 @@ program
   .command("start")
   .description("Start (or reuse) the bridge for this workspace")
   .option("-w, --workspace <path>", "workspace root (defaults to current directory)")
-  .option("--tunnel", "also establish the secure public connection", false)
+  .option("--tunnel", "also establish the secure public connection")
   .option("--json", "machine-readable output", false)
-  .action(async (opts: { workspace?: string; tunnel: boolean; json: boolean }) => {
+  .action(async (opts: { workspace?: string; tunnel?: boolean; json: boolean }) => {
     const root = resolveWorkspace(opts.workspace);
     try {
-      const { runtime, info, mcpUrl } = await ensureBridgeAndTunnel(root, { tunnel: opts.tunnel });
+      const { runtime, info, mcpUrl } = await withExplicitSupervisorIntent(root, "running", opts.tunnel,
+        (tunnel, maintenance) => ensureBridgeAndTunnel(root, { tunnel, maintenance }));
       const connectorName = mcpUrl
         ? persistWorkspaceEndpoint({
             workspaceId: info.workspaceId,
@@ -75,8 +79,9 @@ program
   .description("Stop the bridge for this workspace")
   .option("-w, --workspace <path>")
   .action(async (opts: { workspace?: string }) => {
-    const stopped = await stopBridge(resolveWorkspace(opts.workspace));
-    if (stopped) check("Bridge 已停止");
+    const root = resolveWorkspace(opts.workspace);
+    const accepted = await withExplicitSupervisorIntent(root, "stopped", undefined, () => stopBridge(root));
+    if (accepted) check("Bridge 已接受关闭请求；进程退出状态请查看 status。");
     else say("未停止 Bridge：没有可确认的运行实例，或认证关闭失败。");
   });
 
@@ -84,11 +89,12 @@ program
   .command("restart")
   .description("Restart the bridge for this workspace")
   .option("-w, --workspace <path>")
-  .option("--tunnel", "re-establish the secure public connection", false)
-  .action(async (opts: { workspace?: string; tunnel: boolean }) => {
+  .option("--tunnel", "re-establish the secure public connection")
+  .action(async (opts: { workspace?: string; tunnel?: boolean }) => {
     const root = resolveWorkspace(opts.workspace);
     try {
-      const { info, mcpUrl } = await restartBridge(root, { tunnel: opts.tunnel });
+      const { info, mcpUrl } = await withExplicitSupervisorIntent(root, "running", opts.tunnel,
+        (tunnel, maintenance) => restartBridge(root, { tunnel, maintenance }));
       check(`Bridge 已重启（${info.workspaceName}）`);
       if (mcpUrl) check(`安全连接已建立`);
     } catch (error) {
@@ -144,7 +150,7 @@ program
     const runtime = observation.runtime;
     const info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
     if (opts.json) {
-      say(JSON.stringify({ ok: true, running: true, ...info, runtimeUpgrade, ...remoteStatus(workspace.id) }));
+      say(JSON.stringify({ ok: true, running: true, ...info, bridgeProvenance: readBridgeProvenance(runtime), runtimeUpgrade, ...remoteStatus(workspace.id) }));
       return;
     }
     say(PRODUCT_NAME);
@@ -229,7 +235,7 @@ program
     // MCP local reachability (401 without token means MCP + auth both work)
     if (runtime) {
       try {
-        const response = await fetch(`http://127.0.0.1:${runtime.port}/mcp`, {
+        const response = await requestLoopback({ port: runtime.port, path: "/mcp", timeoutMs: 8000,
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({ jsonrpc: "2.0", method: "ping", id: 1 }),

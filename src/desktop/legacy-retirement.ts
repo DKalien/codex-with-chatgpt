@@ -19,6 +19,7 @@ import {
 } from "./store.js";
 import { readLegacyReconciliations } from "./legacy-reconciliation.js";
 import { withEvidenceLock } from "./recovery-evidence.js";
+import { withCommandOperationAsync } from "../command-cleanup/fence.js";
 import { readAbandonedCommandIds } from "./abandonment.js";
 import { unresolvedOutcomeUnknownCommandIds } from "./outcome-resolution.js";
 
@@ -142,20 +143,20 @@ function parseCommandId(value: string): string {
   catch { return invalid("commandId 格式无效；拒绝 legacy retirement。"); }
 }
 
-function evidenceDir(): string {
-  return path.join(getStateDir(), "desktop-legacy-retirement");
+function evidenceDir(stateDir = getStateDir()): string {
+  return path.join(path.resolve(stateDir), "desktop-legacy-retirement");
 }
 
-export function legacyRetirementFile(workspaceId: string): string {
-  return path.join(evidenceDir(), `${desktopId.parse(workspaceId)}.json`);
+export function legacyRetirementFile(workspaceId: string, stateDir = getStateDir()): string {
+  return path.join(evidenceDir(stateDir), `${desktopId.parse(workspaceId)}.json`);
 }
 
-function markerFile(workspaceId: string): string {
-  return `${legacyRetirementFile(workspaceId)}.initialized`;
+function markerFile(workspaceId: string, stateDir = getStateDir()): string {
+  return `${legacyRetirementFile(workspaceId, stateDir)}.initialized`;
 }
 
-function hasTemporaryEvidence(workspaceId: string): boolean {
-  const file = legacyRetirementFile(workspaceId);
+function hasTemporaryEvidence(workspaceId: string, stateDir = getStateDir()): boolean {
+  const file = legacyRetirementFile(workspaceId, stateDir);
   try {
     return fs.readdirSync(path.dirname(file)).some(name =>
       name.startsWith(`${path.basename(file)}.`) && name.endsWith(".tmp"));
@@ -165,13 +166,13 @@ function hasTemporaryEvidence(workspaceId: string): boolean {
   }
 }
 
-function readState(workspaceId: string): { version: 1; workspaceId: string; entries: LegacyRetirementEvidence[] } {
-  const file = legacyRetirementFile(workspaceId);
-  if (hasTemporaryEvidence(workspaceId)) {
+function readState(workspaceId: string, stateDir = getStateDir()): { version: 1; workspaceId: string; entries: LegacyRetirementEvidence[] } {
+  const file = legacyRetirementFile(workspaceId, stateDir);
+  if (hasTemporaryEvidence(workspaceId, stateDir)) {
     return corrupt("LEGACY_RETIREMENT_STORE_CORRUPT", "遗留 retirement 证据含未完成临时文件；拒绝继续。");
   }
   const exists = fs.existsSync(file);
-  const marker = fs.existsSync(markerFile(workspaceId));
+  const marker = fs.existsSync(markerFile(workspaceId, stateDir));
   if (!exists) {
     if (marker) return corrupt("LEGACY_RETIREMENT_STORE_CORRUPT", "遗留 retirement 主文件缺失；拒绝重置证据。");
     return { version: 1, workspaceId, entries: [] };
@@ -190,9 +191,10 @@ function readState(workspaceId: string): { version: 1; workspaceId: string; entr
 function writeState(
   workspaceId: string,
   state: { version: 1; workspaceId: string; entries: LegacyRetirementEvidence[] },
+  stateDir = getStateDir(),
 ): void {
-  const file = legacyRetirementFile(workspaceId);
-  const marker = markerFile(workspaceId);
+  const file = legacyRetirementFile(workspaceId, stateDir);
+  const marker = markerFile(workspaceId, stateDir);
   const temporary = `${file}.${randomUUID()}.tmp`;
   const parsed = retirementStateSchema.parse(state);
   let fd: number | undefined;
@@ -225,11 +227,19 @@ function writeState(
 }
 
 /** 只读读取；缺少初始化文件时返回空数组，不创建目录或锁。 */
-export function readLegacyRetirements(workspaceId: string): LegacyRetirementEvidence[] {
+export function readLegacyRetirements(workspaceId: string, stateDir = getStateDir()): LegacyRetirementEvidence[] {
   let id: string;
   try { id = desktopId.parse(workspaceId); }
   catch { return invalid("workspaceId 格式无效；拒绝读取 legacy retirement。"); }
-  return readState(id).entries;
+  return readState(id, stateDir).entries;
+}
+
+/** Must run under the shared evidence lock; removes only this command's strict evidence. */
+export function removeLegacyRetirementForCommand(workspaceId: string, commandId: string, stateDir = getStateDir()): void {
+  const state = readState(desktopId.parse(workspaceId), stateDir);
+  const selected = desktopId.parse(commandId);
+  const entries = state.entries.filter(entry => entry.commandId !== selected);
+  if (entries.length !== state.entries.length) writeState(workspaceId, { ...state, entries }, stateDir);
 }
 
 function deliverySummary(delivery: DesktopDelivery): Record<string, unknown> {
@@ -434,6 +444,9 @@ async function confirmTargets(
   binding: NonNullable<DesktopState["binding"]>,
   ownerless: boolean,
 ): Promise<TargetConfirmation> {
+  const desktopState = readDesktop(workspace.id);
+  if (!desktopState?.runtimeFence) return ipcFailure("old", new DesktopError("DESKTOP_RUNTIME_FENCE_MISSING", "Desktop 绑定缺少运行时身份 fence；请重新绑定当前 Desktop 会话。"));
+  const runtimeFence = desktopState.runtimeFence;
   const oldTarget: DesktopTarget = {
     threadId: facts.delivery.threadId,
     hostId: binding.hostId,
@@ -442,7 +455,7 @@ async function confirmTargets(
   };
   let observedMissingAt: string | undefined;
   try {
-    await desktopIpc.inspect(oldTarget);
+    await desktopIpc.inspect(oldTarget, runtimeFence);
   } catch (error) {
     const code = ipcCode(error);
     if (ownerless) {
@@ -468,7 +481,7 @@ async function confirmTargets(
     workspaceRoot: workspace.root,
   };
   let current: Awaited<ReturnType<typeof desktopIpc.inspect>>;
-  try { current = await desktopIpc.inspect(currentTarget); }
+  try { current = await desktopIpc.inspect(currentTarget, runtimeFence); }
   catch (error) { return ipcFailure("current", error); }
   if (current.runtimeStatus !== "idle") {
     return notEligible("当前 Desktop binding 不是 idle；拒绝 legacy retirement。");
@@ -498,6 +511,15 @@ export async function retireLegacyAccepted(
 ): Promise<LegacyRetirementResult> {
   const workspace = parseWorkspace(workspaceRaw);
   const commandId = parseCommandId(commandIdRaw);
+  return withCommandOperationAsync(workspace.id, commandId,
+    () => retireLegacyAcceptedLocked(workspace, commandId, options));
+}
+
+async function retireLegacyAcceptedLocked(
+  workspace: LegacyRetirementWorkspace,
+  commandId: string,
+  options: { ownerless?: boolean },
+): Promise<LegacyRetirementResult> {
   const ownerless = options.ownerless === true;
   const initialState = readState(workspace.id);
   const abandoned = readAbandonedCommandIds(workspace.id);

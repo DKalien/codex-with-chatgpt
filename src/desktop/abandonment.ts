@@ -20,6 +20,7 @@ import {
 } from "./store.js";
 import { readLegacyReconciliations, type LegacyReconciliationEvidence } from "./legacy-reconciliation.js";
 import { withEvidenceLock } from "./recovery-evidence.js";
+import { withCommandOperationAsync, assertCommandOperationOwned } from "../command-cleanup/fence.js";
 import { readLegacyRetirements, type LegacyRetirementEvidence } from "./legacy-retirement.js";
 import { unresolvedOutcomeUnknownCommandIds } from "./outcome-resolution.js";
 
@@ -204,20 +205,20 @@ function parseConfirmation(value: string): string {
   }
 }
 
-function evidenceDir(): string {
-  return path.join(getStateDir(), "desktop-abandonment");
+function evidenceDir(stateDir = getStateDir()): string {
+  return path.join(path.resolve(stateDir), "desktop-abandonment");
 }
 
-export function abandonmentFile(workspaceId: string): string {
-  return path.join(evidenceDir(), `${desktopId.parse(workspaceId)}.json`);
+export function abandonmentFile(workspaceId: string, stateDir = getStateDir()): string {
+  return path.join(evidenceDir(stateDir), `${desktopId.parse(workspaceId)}.json`);
 }
 
-function markerFile(workspaceId: string): string {
-  return `${abandonmentFile(workspaceId)}.initialized`;
+function markerFile(workspaceId: string, stateDir = getStateDir()): string {
+  return `${abandonmentFile(workspaceId, stateDir)}.initialized`;
 }
 
-function hasTemporaryEvidence(workspaceId: string): boolean {
-  const file = abandonmentFile(workspaceId);
+function hasTemporaryEvidence(workspaceId: string, stateDir = getStateDir()): boolean {
+  const file = abandonmentFile(workspaceId, stateDir);
   try {
     return fs.readdirSync(path.dirname(file)).some(name =>
       name.startsWith(`${path.basename(file)}.`) && name.endsWith(".tmp"));
@@ -227,13 +228,13 @@ function hasTemporaryEvidence(workspaceId: string): boolean {
   }
 }
 
-function readState(workspaceId: string): AbandonmentState {
-  const file = abandonmentFile(workspaceId);
-  if (hasTemporaryEvidence(workspaceId)) {
+function readState(workspaceId: string, stateDir = getStateDir()): AbandonmentState {
+  const file = abandonmentFile(workspaceId, stateDir);
+  if (hasTemporaryEvidence(workspaceId, stateDir)) {
     return corrupt("DESKTOP_ABANDONMENT_STORE_CORRUPT", "abandonment 证据含未完成临时文件；拒绝继续。");
   }
   const exists = fs.existsSync(file);
-  const marker = fs.existsSync(markerFile(workspaceId));
+  const marker = fs.existsSync(markerFile(workspaceId, stateDir));
   if (!exists) {
     if (marker) return corrupt("DESKTOP_ABANDONMENT_STORE_CORRUPT", "abandonment 主文件缺失；拒绝重置证据。");
     return { version: 1, workspaceId, batches: [] };
@@ -249,9 +250,9 @@ function readState(workspaceId: string): AbandonmentState {
   return state.data;
 }
 
-function writeState(workspaceId: string, state: AbandonmentState): void {
-  const file = abandonmentFile(workspaceId);
-  const marker = markerFile(workspaceId);
+function writeState(workspaceId: string, state: AbandonmentState, stateDir = getStateDir()): void {
+  const file = abandonmentFile(workspaceId, stateDir);
+  const marker = markerFile(workspaceId, stateDir);
   const temporary = `${file}.${randomUUID()}.tmp`;
   let fd: number | undefined;
   let prepared = false;
@@ -585,19 +586,36 @@ function flatEntries(state: AbandonmentState): AbandonmentEntry[] {
 }
 
 /** 只读读取 abandonment 证据；缺少初始化文件时返回空数组，不创建目录或锁。 */
-export function readAbandonments(workspaceId: string): AbandonmentEntry[] {
+export function readAbandonments(workspaceId: string, stateDir = getStateDir()): AbandonmentEntry[] {
   let id: string;
   try { id = desktopId.parse(workspaceId); }
   catch { return invalid("workspaceId 格式无效；拒绝读取 abandonment。"); }
-  return flatEntries(readState(id));
+  return flatEntries(readState(id, stateDir));
 }
 
 /** 供 reconciliation/retirement 互斥检查使用；只读取本模块 strict store。 */
-export function readAbandonedCommandIds(workspaceId: string): Set<string> {
+export function readAbandonedCommandIds(workspaceId: string, stateDir = getStateDir()): Set<string> {
   let id: string;
   try { id = desktopId.parse(workspaceId); }
   catch { return invalid("workspaceId 格式无效；拒绝读取 abandonment。"); }
-  return new Set(readState(id).batches.flatMap(batch => batch.commandIds));
+  return new Set(readState(id, stateDir).batches.flatMap(batch => batch.commandIds));
+}
+
+/** Must run under the shared evidence lock; removes only this command and rehashes any surviving batch. */
+export function pruneAbandonedCommand(workspaceId: string, commandId: string, stateDir = getStateDir()): void {
+  const id = desktopId.parse(workspaceId);
+  const selected = desktopId.parse(commandId);
+  const state = readState(id, stateDir);
+  let changed = false;
+  const batches = state.batches.flatMap(batch => {
+    if (!batch.commandIds.includes(selected)) return [batch];
+    changed = true;
+    const commandIds = batch.commandIds.filter(value => value !== selected);
+    if (!commandIds.length) return [];
+    const deliveries = batch.deliveries.filter(delivery => delivery.commandId !== selected);
+    return [{ ...batch, commandIds, deliveries, selectionSha256: selectionDigest(id, commandIds, deliveries) }];
+  });
+  if (changed) writeState(id, { ...state, batches }, stateDir);
 }
 
 function evidenceLockError(error: unknown): never {
@@ -622,6 +640,25 @@ export function previewAbandonment(workspaceRaw: AbandonmentWorkspace, commandId
   return { commandIds, confirmationSha256: digestFor(snapshot, workspace, commandIds, deliveries), notice: abandonmentNotice };
 }
 
+/** @internal Read-only pre-adoption validation. Only the explicit repair protocol uses this. */
+export async function validateRepairAbandonment(workspaceRaw: AbandonmentWorkspace, commandIdsRaw: readonly string[], expected?: string) {
+  const workspace = parseWorkspace(workspaceRaw), commandIds = parseCommandIds(commandIdsRaw);
+  const before = readSnapshot(workspace), prior = batchFor(before, commandIds);
+  if (prior && (!expected || prior.confirmationSha256 !== expected)) return conflict("repair batch 与已有行政证据不一致。");
+  const deliveries = assertEligible(before, workspace, commandIds, prior);
+  const digest = digestFor(before, workspace, commandIds, deliveries);
+  if (expected && digest !== expected) return conflict("repair abandonment confirmation 已变化。");
+  const binding = before.desktop!.binding!;
+  const context = await currentMaintenanceContext(workspace, binding);
+  const after = readSnapshot(workspace);
+  const fresh = assertEligible(after, workspace, commandIds, batchFor(after, commandIds));
+  if (digestFor(after, workspace, commandIds, fresh) !== digest || !sameJson(before.state, after.state))
+    return conflict("repair eligibility 在 maintenance 检查期间变化。");
+  return { commandIds, confirmationSha256: digest, bindingSha256: sha256Of(binding),
+    deliveriesSha256: sha256Of(deliveries), contextSha256: sha256Of(context),
+    binding, runtimeFence: before.desktop!.runtimeFence, deliveries, prior: prior ?? null };
+}
+
 /**
  * 本机明确确认后的批量行政处置。只写独立 abandonment 证据，不修改 Desktop
  * delivery、execution records 或 output；currentResultContext 调用不跨持有本地证据锁。
@@ -634,6 +671,18 @@ export async function abandonHistoricalAccepted(
   const workspace = parseWorkspace(workspaceRaw);
   const commandIds = parseCommandIds(commandIdsRaw);
   const confirmationSha256 = parseConfirmation(confirmationSha256Raw);
+  const run = () => abandonHistoricalAcceptedLocked(workspace, commandIds, confirmationSha256);
+  const withLocks = async (index: number): Promise<AbandonmentResult> => index === commandIds.length
+    ? run()
+    : withCommandOperationAsync(workspace.id, commandIds[index]!, () => withLocks(index + 1));
+  return withLocks(0);
+}
+
+async function abandonHistoricalAcceptedLocked(
+  workspace: AbandonmentWorkspace,
+  commandIds: string[],
+  confirmationSha256: string,
+): Promise<AbandonmentResult> {
   const initial = readSnapshot(workspace);
   const initialPrior = batchFor(initial, commandIds);
   if (initialPrior && initialPrior.confirmationSha256 !== confirmationSha256) {
@@ -669,6 +718,7 @@ export async function abandonHistoricalAccepted(
 
   try {
     return withEvidenceLock(workspace.id, () => {
+      for (const commandId of commandIds) assertCommandOperationOwned(workspace.id, commandId);
       const locked = readSnapshot(workspace);
       const lockedPrior = batchFor(locked, commandIds);
       if (initialPrior && !sameJson(initialPrior, lockedPrior)) {

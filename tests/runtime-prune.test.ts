@@ -1,3 +1,4 @@
+import { cleanupStrict } from "./strict-teardown.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createServer, type Server } from "node:http";
 import fs from "node:fs";
@@ -16,15 +17,21 @@ import { registerRuntimePruneCommands } from "../src/cli/runtime-prune.js";
 import { SERVICE_NAME, VERSION } from "../src/version.js";
 import { Workspace } from "../src/workspace/manager.js";
 import { getStateDir } from "../src/config/paths.js";
-import { cleanup, isolateStateDir, makeTmpDir, write } from "./helpers.js";
+import * as processProbe from "../src/process/process-probe.js";
+import { isolateStateDir, makeTmpDir, write } from "./helpers.js";
 
 let stateDir: string;
 let previousStateDir: string | undefined;
 const openServers: Server[] = [];
+const directories: string[] = [];
+function tmp(name: string): string {
+  const dir = makeTmpDir(name); directories.push(dir); return dir;
+}
 
 beforeEach(() => {
   previousStateDir = process.env.C2C_STATE_DIR;
   stateDir = isolateStateDir();
+  directories.push(stateDir);
 });
 
 afterEach(async () => {
@@ -35,10 +42,11 @@ afterEach(async () => {
   }
   if (previousStateDir === undefined) delete process.env.C2C_STATE_DIR;
   else process.env.C2C_STATE_DIR = previousStateDir;
+  await cleanupStrict(...directories.splice(0));
 });
 
 function makeWorkspace(name: string): Workspace {
-  const root = makeTmpDir(name);
+  const root = tmp(name);
   write(root, "README.md", "# test\n");
   return new Workspace(root);
 }
@@ -100,6 +108,16 @@ function deadPid(): number {
 }
 
 describe("G3-0a runtime prune-stale plan/apply", () => {
+  it("unknown process completion keeps legacy runtime ineligible for prune", async () => {
+    const ws = makeWorkspace("prune-unknown-exit");
+    writeLegacyRuntime(ws, { pid: 1234, port: 9 });
+    const before = fs.readFileSync(runtimeFile(ws.id));
+    vi.spyOn(processProbe, "observeProcessPresence").mockResolvedValue("unknown");
+    expect(await findBridgeObservation(ws.id)).toMatchObject({ state: "unknown", reason: "pid_unknown" });
+    expect(await planRuntimePrune(ws.root)).toMatchObject({ ok: true, eligible: false,
+      blockedReason: "observation_unknown_pid_unknown" });
+    expect(fs.readFileSync(runtimeFile(ws.id))).toEqual(before);
+  });
   it("核心回归：A stale legacy + B healthy same port → prune A only", async () => {
     const wsA = makeWorkspace("prune-stale-a");
     const wsB = makeWorkspace("prune-stale-b");
@@ -224,7 +242,7 @@ describe("G3-0a runtime prune-stale plan/apply", () => {
   });
 
   it("invalid workspace path → bounded workspace_invalid without path leak", async () => {
-    const missing = path.join(makeTmpDir("prune-missing-parent"), "no-such-workspace-xyz");
+    const missing = path.join(tmp("prune-missing-parent"), "no-such-workspace-xyz");
     const plan = await planRuntimePrune(missing);
     expect(plan.ok).toBe(false);
     if (!plan.ok) expect(plan.error).toBe("workspace_invalid");
@@ -327,7 +345,7 @@ describe("G3-0a runtime prune-stale plan/apply", () => {
 
   it("non-canonical runtime file → blocked", async () => {
     const ws = makeWorkspace("prune-symlink");
-    const outside = makeTmpDir("prune-outside");
+    const outside = tmp("prune-outside");
     const target = write(outside, "rt.json", JSON.stringify({
       service: SERVICE_NAME,
       version: VERSION,
@@ -498,7 +516,7 @@ describe("G3-0a GC diagnostics runtime_missing_build_id", () => {
     expect(graph.issues.some((i) => i.code === "runtime_missing_build_id" && i.source === `runtime:${ws.id}.json`)).toBe(false);
   });
 
-  it("legacy missing buildId + extra field → runtime_corrupt, not runtime_missing_build_id", () => {
+  it("missing buildId + non-reference extra field stays an explicit global missing-build blocker", () => {
     const ws = makeWorkspace("gc-legacy-extra-field");
     writeLegacyRuntime(ws, { pid: deadPid(), port: 9 });
     const file = runtimeFile(ws.id);
@@ -508,7 +526,10 @@ describe("G3-0a GC diagnostics runtime_missing_build_id", () => {
     fs.writeFileSync(file, JSON.stringify(raw));
     const graph = collectReleaseReferences(stateDir);
     expect(graph.ok).toBe(false);
-    expect(graph.issues.some((i) => i.code === "runtime_corrupt" && i.source === `runtime:${ws.id}.json`)).toBe(true);
-    expect(graph.issues.some((i) => i.code === "runtime_missing_build_id" && i.source === `runtime:${ws.id}.json`)).toBe(false);
+    expect(graph.issues).toContainEqual(expect.objectContaining({
+      code: "runtime_missing_build_id", source: `runtime:${ws.id}.json`, scope: { kind: "global" },
+    }));
+    expect(graph.issues.some((i) => i.code === "runtime_corrupt" && i.source === `runtime:${ws.id}.json`)).toBe(false);
+    expect(graph.referencedBuildIds.size).toBe(0);
   });
 });

@@ -12,8 +12,7 @@ import {
 } from "./schema.js";
 import {
   recoverStaleInMemory,
-  requireInitializedState,
-  withFeedbackLock,
+  withFeedbackCommandSnapshotLock,
   writeState,
 } from "./state-store.js";
 import { requireActiveBinding } from "./receiver.js";
@@ -29,12 +28,7 @@ export function claimNext(input: {
 }): { event: FeedbackEvent; attemptId: string } {
   requireConversationPrincipal(input.principal);
   const stateDir = input.stateDir ?? getStateDir();
-  return withFeedbackLock(input.workspaceId, stateDir, (read) => {
-    const previous = requireInitializedState(read(), input.workspaceId);
-    const recovered = recoverStaleInMemory(previous, Date.now());
-    if (recovered !== previous) {
-      writeState(input.workspaceId, stateDir, recovered);
-    }
+  return withRecoveredFeedbackState(input.workspaceId, stateDir, recovered => {
     const binding = requireActiveBinding(recovered, input.principal);
     if (binding.bindingId !== input.bindingId || binding.epoch !== input.epoch) {
       throw new FeedbackError("FEEDBACK_EPOCH_STALE", "旧绑定不能领取事件");
@@ -128,13 +122,12 @@ function applyAckObserved(
   };
 }
 
-function withRecoveredAckState<T>(
+function withRecoveredFeedbackState<T>(
   workspaceId: string,
   stateDir: string,
   fn: (state: FeedbackState) => T,
 ): T {
-  return withFeedbackLock(workspaceId, stateDir, (read) => {
-    const previous = requireInitializedState(read(), workspaceId);
+  return withFeedbackCommandSnapshotLock(workspaceId, stateDir, previous => {
     const recovered = recoverStaleInMemory(previous, Date.now());
     if (recovered !== previous) {
       writeState(workspaceId, stateDir, recovered);
@@ -154,7 +147,7 @@ export function ackObserved(input: {
 }): FeedbackEvent {
   requireConversationPrincipal(input.principal);
   const stateDir = input.stateDir ?? getStateDir();
-  return withRecoveredAckState(input.workspaceId, stateDir, (recovered) => {
+  return withRecoveredFeedbackState(input.workspaceId, stateDir, (recovered) => {
     const binding = requireActiveBinding(recovered, input.principal);
     if (binding.bindingId !== input.bindingId || binding.epoch !== input.epoch) {
       throw new FeedbackError("FEEDBACK_EPOCH_STALE", "旧绑定不能确认事件");
@@ -185,7 +178,7 @@ export function ackObservedForCompanion(input: {
   stateDir?: string;
 }): FeedbackEvent {
   const stateDir = input.stateDir ?? getStateDir();
-  return withRecoveredAckState(input.workspaceId, stateDir, (recovered) => {
+  return withRecoveredFeedbackState(input.workspaceId, stateDir, (recovered) => {
     const acked = applyAckObserved(recovered, input);
     if (acked.state !== recovered) {
       writeState(input.workspaceId, stateDir, acked.state);
@@ -229,12 +222,7 @@ export function reserveNext(input: {
   excludeEventIds?: ReadonlySet<string>;
 }): { event: FeedbackEvent; reservationId: string } {
   const stateDir = input.stateDir ?? getStateDir();
-  return withFeedbackLock(input.workspaceId, stateDir, (read) => {
-    const previous = requireInitializedState(read(), input.workspaceId);
-    const recovered = recoverStaleInMemory(previous, Date.now());
-    if (recovered !== previous) {
-      writeState(input.workspaceId, stateDir, recovered);
-    }
+  return withRecoveredFeedbackState(input.workspaceId, stateDir, recovered => {
     requireActiveCompanionBinding(recovered, input);
     // Companion delivery 严格 single-flight：未解决 reserved/claimed/outcome_unknown 不得越过继续消费 ready。
     if (recovered.events.some((e) => INFLIGHT_FENCE_STATUSES.has(e.status))) {
@@ -295,12 +283,7 @@ export function releaseReservation(input: {
   stateDir?: string;
 }): FeedbackEvent {
   const stateDir = input.stateDir ?? getStateDir();
-  return withFeedbackLock(input.workspaceId, stateDir, (read) => {
-    const previous = requireInitializedState(read(), input.workspaceId);
-    const recovered = recoverStaleInMemory(previous, Date.now());
-    if (recovered !== previous) {
-      writeState(input.workspaceId, stateDir, recovered);
-    }
+  return withRecoveredFeedbackState(input.workspaceId, stateDir, recovered => {
     requireActiveCompanionBinding(recovered, input);
     const event = recovered.events.find((e) => e.eventId === input.eventId);
     if (!event) throw new FeedbackError("FEEDBACK_EVENT_NOT_FOUND", "feedback 事件不存在");
@@ -353,12 +336,7 @@ export function beginSend(input: {
   stateDir?: string;
 }): { event: FeedbackEvent; attemptId: string } {
   const stateDir = input.stateDir ?? getStateDir();
-  return withFeedbackLock(input.workspaceId, stateDir, (read) => {
-    const previous = requireInitializedState(read(), input.workspaceId);
-    const recovered = recoverStaleInMemory(previous, Date.now());
-    if (recovered !== previous) {
-      writeState(input.workspaceId, stateDir, recovered);
-    }
+  return withRecoveredFeedbackState(input.workspaceId, stateDir, recovered => {
     const binding = requireActiveCompanionBinding(recovered, input);
     const event = recovered.events.find((e) => e.eventId === input.eventId);
     if (!event) throw new FeedbackError("FEEDBACK_EVENT_NOT_FOUND", "feedback 事件不存在");
@@ -421,12 +399,7 @@ export function retireOutcomeUnknown(input: {
   stateDir?: string;
 }): FeedbackEvent {
   const stateDir = input.stateDir ?? getStateDir();
-  return withFeedbackLock(input.workspaceId, stateDir, (read) => {
-    const previous = requireInitializedState(read(), input.workspaceId);
-    const recovered = recoverStaleInMemory(previous, Date.now());
-    if (recovered !== previous) {
-      writeState(input.workspaceId, stateDir, recovered);
-    }
+  return withRecoveredFeedbackState(input.workspaceId, stateDir, recovered => {
     const binding = requireActiveCompanionBinding(recovered, input);
     const event = recovered.events.find((e) => e.eventId === input.eventId);
     if (!event) throw new FeedbackError("FEEDBACK_EVENT_NOT_FOUND", "feedback 事件不存在");

@@ -7,6 +7,7 @@ import { createCurrentCommand } from "./current-command.js";
 import { resolveCurrentExecutorRoute } from "./current-executor-route.js";
 import { resolveCurrentPlannerRoute } from "./current-planner-route.js";
 import { listCommands, listRoutes, transitionCommandDelivery, type RoutingWorkspaceIdentity } from "./store.js";
+import { withCommandOperationAsync } from "../command-cleanup/fence.js";
 
 type Delivery = Awaited<ReturnType<typeof sendDesktop>>;
 
@@ -98,6 +99,7 @@ export async function deliverCurrentCommand(
   authorize: () => void,
   expectedBindingId?: string,
 ): Promise<{ command: RoutingCommand; delivery: Delivery | null }> {
+  return withCommandOperationAsync(identity.id, input.commandId, async () => {
   // Preserve the pre-send OAuth/request authorization fence before any routing-state write.
   authorize();
   const existing = listCommands(identity).find((item) => item.commandId === input.commandId);
@@ -166,4 +168,5 @@ export async function deliverCurrentCommand(
     deliveryStatus: delivery.deliveryStatus,
   });
   return { command: updated, delivery };
+  });
 }

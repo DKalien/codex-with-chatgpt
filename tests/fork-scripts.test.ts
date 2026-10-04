@@ -1,9 +1,14 @@
+import { cleanupStrict, fixtureProcessIdentity, stopFixtureProcess } from "./strict-teardown.js";
 import fs from "node:fs";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it } from "vitest";
-import { buildCoreFixture, cleanup, git, makeGitRepo, makeTmpDir, write } from "./helpers.js";
+import { setTimeout as delay } from "node:timers/promises";
+import { probeProcess } from "../src/process/process-probe.js";
+import { resolveDaemonSpawnHelperPath, resolveDaemonSpawnPython } from "../src/process/daemon-spawn.js";
+import { afterAll, afterEach, describe, expect, it } from "vitest";
+import { buildCoreFixture, git, makeGitRepo, makeTmpDir, write } from "./helpers.js";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const devInstallSource = path.join(projectRoot, "scripts", "dev-install.ps1");
@@ -14,10 +19,51 @@ const updateSource = path.join(projectRoot, "scripts", "update-upstream-track.ps
 const skillSource = path.join(projectRoot, "skill", "SKILL.md");
 
 const temporaryDirs: string[] = [];
+const seeds: { root: string; snapshot: string }[] = [];
+let devSeed: string | undefined;
+let upstreamSeed: string | undefined;
 
-afterEach(() => {
-  while (temporaryDirs.length > 0) cleanup(temporaryDirs.pop()!);
+afterEach(async () => {
+  try {
+    // Includes .git refs/config/objects: mutations in a case must never reach a seed.
+    for (const seed of seeds) expect(seedSnapshot(seed.root)).toBe(seed.snapshot);
+  } finally {
+    await cleanupStrict(...temporaryDirs.splice(0));
+  }
 });
+
+afterAll(async () => {
+  await cleanupStrict(...seeds.map(seed => seed.root));
+});
+
+function seedSnapshot(root: string): string {
+  expect(fs.realpathSync.native(root)).toBe(root);
+  const digest = createHash("sha256");
+  function visit(relative: string) {
+    const file = path.join(root, relative);
+    const stat = fs.lstatSync(file);
+    expect(stat.isSymbolicLink()).toBe(false);
+    digest.update(JSON.stringify([relative, stat.isDirectory() ? "directory" : "file"]));
+    if (stat.isDirectory()) {
+      for (const name of fs.readdirSync(file).sort()) visit(path.join(relative, name));
+    } else {
+      expect(stat.isFile()).toBe(true);
+      expect(stat.nlink).toBe(1); // No hardlinked mutable Git objects/config/source files.
+      digest.update(fs.readFileSync(file));
+    }
+  }
+  visit("");
+  return digest.digest("hex");
+}
+
+function copySeed(seed: string, name: string): string {
+  const copy = tempDir(name);
+  expect(copy).not.toBe(seed);
+  // cpSync makes ordinary independent copies (including .git); never clone --shared or link.
+  fs.cpSync(seed, copy, { recursive: true, force: false, errorOnExist: true });
+  expect(seedSnapshot(copy)).toBe(seeds.find(item => item.root === seed)!.snapshot);
+  return copy;
+}
 
 function tempDir(name: string): string {
   const dir = makeTmpDir(name);
@@ -58,14 +104,29 @@ function powerShell(script: string, repo: string, args: string[] = [], extraEnv:
 }
 
 function makeUpstreamRepo(name: string): { repo: string; remote: string; script: string } {
-  const repo = tempDir(`fork-${name}`);
-  const remote = tempDir(`fork-remote-${name}`);
+  upstreamSeed ??= createUpstreamSeed();
+  const pair = copySeed(upstreamSeed, `fork-${name}`);
+  const repo = path.join(pair, "repo"), remote = path.join(pair, "remote");
+  const url = git(repo, "remote", "get-url", "upstream").trim();
+  expect(url).toBe("../remote");
+  expect(fs.realpathSync.native(path.resolve(repo, url))).toBe(remote);
+  return { repo, remote, script: path.join(repo, "scripts/update-upstream-track.ps1") };
+}
+
+function createUpstreamSeed(): string {
+  const root = makeTmpDir("fork-upstream-seed");
+  const seed = { root, snapshot: "" };
+  seeds.push(seed); // Track even partially constructed seeds for strict suite teardown.
+  const repo = path.join(root, "repo"), remote = path.join(root, "remote");
+  fs.mkdirSync(repo);
+  fs.mkdirSync(remote);
   makeGitRepo(repo);
   git(remote, "init", "--bare", "-b", "main");
-  git(repo, "remote", "add", "upstream", remote);
+  git(repo, "remote", "add", "upstream", "../remote");
   git(repo, "push", "upstream", "main");
-  const script = copyIntoRepo(repo, updateSource, "scripts/update-upstream-track.ps1");
-  return { repo, remote, script };
+  copyIntoRepo(repo, updateSource, "scripts/update-upstream-track.ps1");
+  seed.snapshot = seedSnapshot(root);
+  return root;
 }
 
 function update(repoInfo: { repo: string; script: string }) {
@@ -73,11 +134,34 @@ function update(repoInfo: { repo: string; script: string }) {
 }
 
 function makeDevRepo(name: string): { repo: string; script: string; installRoot: string; coreStateDir: string } {
-  const repo = tempDir(`dev-install-${name}`);
+  devSeed ??= createDevSeed();
+  const repo = copySeed(devSeed, `dev-install-${name}`);
+  return {
+    repo, script: path.join(repo, "scripts/dev-install.ps1"),
+    installRoot: tempDir(`skill-${name}`), coreStateDir: tempDir(`core-state-${name}`),
+  };
+}
+
+function createDevSeed(): string {
+  const repo = makeTmpDir("dev-install-seed");
+  const seed = { root: repo, snapshot: "" };
+  seeds.push(seed);
   makeGitRepo(repo);
   write(repo, "package.json", '{"type":"module"}\n');
   write(repo, "bin/c2c.js", `import fs from "node:fs";
-import { spawn } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
+if (process.argv[2] === "gc") {
+  const gcLog = process.env.C2C_TEST_GC_LOG;
+  if (gcLog) fs.appendFileSync(gcLog, JSON.stringify(process.argv.slice(2)) + "\\n");
+  const ok = process.env.C2C_GC_EXIT_CODE !== "7";
+  console.log(JSON.stringify({
+    ok,
+    items: [],
+    issues: ok ? [] : ["fixture: gc apply failed"],
+    totals: { candidateCount: 0, deletedCount: 0, tombstonedCount: 0, skippedCount: 0, bytesDeleted: 0 },
+  }));
+  process.exit(ok ? 0 : 7);
+}
 const summary = {
   targetBuildId: "should-not-leak",
   counts: { current: 1, upgraded: 0, stopped: 0, pending_busy: 0, skipped_quick: 0, pending: 0, error: 0 },
@@ -87,9 +171,15 @@ const resultFile = process.argv[process.argv.indexOf("--result-file") + 1];
 if (process.argv.includes("--result-file")) fs.writeFileSync(resultFile, JSON.stringify(summary), { flag: "wx" });
 console.log(JSON.stringify(summary));
 if (process.env.C2C_TEST_ROLLOUT_CHILD) {
-  fs.writeFileSync(process.env.C2C_TEST_ROLLOUT_CHILD, "alive");
-  spawn(process.execPath, ["-e", 'setTimeout(() => require("node:fs").rmSync(process.env.C2C_TEST_ROLLOUT_CHILD, {force:true}), 8000)'],
-    { detached: true, stdio: "inherit", windowsHide: true }).unref();
+  const child = spawn(process.execPath, ["-e", 'setTimeout(() => {}, 60000)'],
+    { detached: true, stdio: "inherit", windowsHide: true });
+  // Capture synchronously while this trusted ChildProcess still owns its native handle.
+  // The marker carries the spawn identity, not a PID to rediscover during teardown.
+  const evidence = execFileSync(process.env.C2C_TEST_PROBE_PYTHON,
+    ['-I', '-B', '-X', 'utf8', process.env.C2C_TEST_PROBE_HELPER, '--probe-pid', String(child.pid)],
+    { windowsHide: true, timeout: 5000 });
+  fs.writeFileSync(process.env.C2C_TEST_ROLLOUT_CHILD, evidence);
+  child.unref();
 }
 process.exit(Number(process.env.C2C_ROLLOUT_EXIT_CODE || "0"));
 `);
@@ -100,9 +190,9 @@ process.exit(Number(process.env.C2C_ROLLOUT_EXIT_CODE || "0"));
   write(repo, "dist/cli/index.js", "// fixture runtime");
   fs.mkdirSync(path.join(repo, "node_modules"));
   buildCoreFixture(repo);
-  const coreStateDir = tempDir(`core-state-${name}`);
   copyIntoRepo(repo, skillSource, "skill/SKILL.md");
-  return { repo, script: path.join(repo, "scripts", "dev-install.ps1"), installRoot: tempDir(`skill-${name}`), coreStateDir };
+  seed.snapshot = seedSnapshot(repo);
+  return repo;
 }
 
 function makeFakePnpm(): { bin: string; log: string } {
@@ -144,18 +234,30 @@ windowsTests("fork maintenance scripts", () => {
       { encoding: "utf8", windowsHide: true, env: { ...process.env, C2C_STATE_DIR: fixture.coreStateDir } });
     expect(launched.status, launched.stderr).toBe(0);
     expect(JSON.parse(launched.stdout).counts.current).toBe(1);
-  });
-  it("rollout 创建后台进程后安装仍返回，不等待 daemon 的输出管道", () => {
+  }, 120_000);
+  it("rollout 创建后台进程后安装仍返回，不等待 daemon 的输出管道", async () => {
     const fixture = makeDevRepo("background");
     const fake = makeFakePnpm();
     const marker = path.join(fixture.coreStateDir, "background-alive");
     const result = powerShell(fixture.script, fixture.repo, ["-InstallRoot", fixture.installRoot], {
       ...withFakePnpm(fake), C2C_STATE_DIR: fixture.coreStateDir, C2C_TEST_ROLLOUT_CHILD: marker,
+      C2C_TEST_PROBE_PYTHON: resolveDaemonSpawnPython(), C2C_TEST_PROBE_HELPER: resolveDaemonSpawnHelperPath(),
     });
-    expect(result.status, result.output).toBe(0);
-    expect(result.output).toContain('"current":1');
-    expect(fs.existsSync(marker)).toBe(true);
-  });
+    const deadline = Date.now() + 10_000;
+    while (!fs.existsSync(marker) && Date.now() < deadline) await delay(25);
+    const identity = fs.existsSync(marker) ? fixtureProcessIdentity(JSON.parse(fs.readFileSync(marker, "utf8"))) : null;
+    try {
+      expect(result.status, result.output).toBe(0);
+      expect(result.output).toContain('"current":1');
+      expect(fs.existsSync(marker)).toBe(true);
+      // Installer already returned, while the exact child still owns inherited output pipes.
+      expect(identity).not.toBeNull();
+      const current = await probeProcess(identity!.pid, resolveDaemonSpawnPython(), resolveDaemonSpawnHelperPath(), identity!.creationTime);
+      expect(current).toMatchObject({ ...identity, status: "identified" });
+    } finally {
+      await stopFixtureProcess(identity);
+    }
+  }, 120_000);
   it("开发安装运行冻结依赖、构建，并把 Skill 写入隔离目录", () => {
     const fixture = makeDevRepo("install");
     const fake = makeFakePnpm();
@@ -192,7 +294,7 @@ windowsTests("fork maintenance scripts", () => {
     expect(repeated.status).toBe(0);
     expect(fs.readFileSync(installed, "utf8")).toBe(installedText);
     fs.chmodSync(installed, 0o666);
-  });
+  }, 120_000);
 
   it("rollout 失败时保持 best effort，保留已安装 core 与 Skill", () => {
     const fixture = makeDevRepo("rollout-failure");
@@ -213,7 +315,62 @@ windowsTests("fork maintenance scripts", () => {
     expect(result.output).toContain("abc123def456");
     expect(fs.existsSync(path.join(fixture.coreStateDir, "current.json"))).toBe(true);
     expect(fs.existsSync(path.join(fixture.installRoot, "SKILL.md"))).toBe(true);
-  });
+  }, 120_000);
+
+  it("安装成功后通过已安装 launcher 触发 gc --apply --json", () => {
+    const fixture = makeDevRepo("gc-apply");
+    const fake = makeFakePnpm();
+    const gcLog = path.join(fixture.coreStateDir, "gc-args.log");
+    const result = powerShell(fixture.script, fixture.repo, ["-InstallRoot", fixture.installRoot], {
+      ...withFakePnpm(fake),
+      C2C_STATE_DIR: fixture.coreStateDir,
+      C2C_TEST_GC_LOG: gcLog,
+    });
+    expect(result.status, result.output).toBe(0);
+    // dev-install 先 protect-current 再真实 install；只有真实 install 调用 launcher 的 gc。
+    expect(fs.readFileSync(gcLog, "utf8")).toBe('["gc","--apply","--json"]\n');
+    expect(result.output).toContain('"gc":{"ok":true,"items"');
+    expect(result.output).not.toContain("旧 release 回收未完全成功");
+  }, 120_000);
+
+  it("gc apply 失败只降级为警告，安装结果与 launcher 不受影响", () => {
+    const fixture = makeDevRepo("gc-failure");
+    const fake = makeFakePnpm();
+    const result = powerShell(fixture.script, fixture.repo, ["-InstallRoot", fixture.installRoot], {
+      ...withFakePnpm(fake),
+      C2C_STATE_DIR: fixture.coreStateDir,
+      C2C_GC_EXIT_CODE: "7",
+    });
+    expect(result.status, result.output).toBe(0);
+    expect(result.output).toContain('"gc":{"ok":false');
+    expect(result.output).toContain("旧 release 回收未完全成功");
+    expect(fs.existsSync(path.join(fixture.coreStateDir, "current.json"))).toBe(true);
+    const launched = spawnSync(process.execPath, [path.join(fixture.coreStateDir, "bin", "c2c.js"), "rollout", "--json"],
+      { encoding: "utf8", windowsHide: true, env: { ...process.env, C2C_STATE_DIR: fixture.coreStateDir } });
+    expect(launched.status, launched.stderr).toBe(0);
+    expect(JSON.parse(launched.stdout).counts.current).toBe(1);
+  }, 120_000);
+
+  it("protect-current 冻结修复不触发旧 release 回收", () => {
+    const fixture = makeDevRepo("gc-protect");
+    const env = { ...process.env, C2C_STATE_DIR: fixture.coreStateDir };
+    // 先真实安装一次，保证 launcher 存在；此时不记录 gc 调用。
+    const first = spawnSync(process.execPath, [installCoreSource, "--checkout-root", fixture.repo, "--json"], {
+      encoding: "utf8", windowsHide: true, env,
+    });
+    expect(first.status, first.stderr).toBe(0);
+
+    const gcLog = path.join(fixture.coreStateDir, "gc-args.log");
+    const protect = spawnSync(process.execPath, [installCoreSource, "--protect-current", "--json"], {
+      encoding: "utf8", windowsHide: true, env: { ...env, C2C_TEST_GC_LOG: gcLog },
+    });
+    expect(protect.status, protect.stderr).toBe(0);
+    const parsed = JSON.parse(protect.stdout.trim());
+    expect(parsed.protected).toBe(true);
+    // launcher 存在但保护路径不得调用 gc；short-circuit 为 protect_current。
+    expect(parsed.gc).toEqual({ ok: true, skipped: "protect_current" });
+    expect(fs.existsSync(gcLog)).toBe(false);
+  }, 120_000);
 
   it("-Test 排除本测试，且 checkout upstream-main 时拒绝安装", () => {
     const fixture = makeDevRepo("guards");
@@ -239,7 +396,7 @@ windowsTests("fork maintenance scripts", () => {
     expect(rejected.status).not.toBe(0);
     expect(rejected.output).toContain("upstream-main");
     expect(fs.readFileSync(fake.log, "utf8")).toBe("");
-  });
+  }, 120_000);
 
   it("创建 upstream-main 并设置 upstream/main tracking", () => {
     const fixture = makeUpstreamRepo("create");
@@ -250,7 +407,7 @@ windowsTests("fork maintenance scripts", () => {
     expect(git(fixture.repo, "rev-parse", "refs/heads/upstream-main").trim()).toBe(remoteSha);
     expect(git(fixture.repo, "config", "--get", "branch.upstream-main.remote").trim()).toBe("upstream");
     expect(git(fixture.repo, "config", "--get", "branch.upstream-main.merge").trim()).toBe("refs/heads/main");
-  });
+  }, 120_000);
 
   it("equal 状态不移动引用，远端快进时只做 fast-forward", () => {
     const fixture = makeUpstreamRepo("states");
@@ -270,7 +427,7 @@ windowsTests("fork maintenance scripts", () => {
     expect(git(fixture.repo, "rev-parse", "refs/heads/upstream-main").trim()).toBe(
       git(fixture.repo, "rev-parse", "refs/remotes/upstream/main").trim()
     );
-  });
+  }, 120_000);
 
   it("local-ahead 和 diverged 都停止且不覆盖 upstream-main", () => {
     const ahead = makeUpstreamRepo("ahead");
@@ -305,7 +462,8 @@ windowsTests("fork maintenance scripts", () => {
     expect(divergedResult.status).not.toBe(0);
     expect(divergedResult.output).toContain("diverged");
     expect(git(diverged.repo, "rev-parse", "refs/heads/upstream-main").trim()).toBe(divergedSha);
-  });
+    // powershell+git 子进程冷启动在 Windows 上可超 30s（实测 ~50s），与本轮 spawn 密集用例同一显式上限策略。
+  }, 120_000);
 
   it("linked worktree checkout upstream-main 时拒绝移动", () => {
     const fixture = makeUpstreamRepo("worktree");
@@ -318,7 +476,7 @@ windowsTests("fork maintenance scripts", () => {
     expect(result.status).not.toBe(0);
     expect(result.output).toContain("linked worktree");
     git(fixture.repo, "worktree", "remove", "--force", linked);
-  });
+  }, 120_000);
 
   it("同步时保留当前 branch、HEAD、dirty/staged/untracked 工作区和 stash", () => {
     const fixture = makeUpstreamRepo("preserve");
@@ -359,5 +517,5 @@ windowsTests("fork maintenance scripts", () => {
     expect(git(fixture.repo, "status", "--porcelain=v1")).toBe(before.status);
     expect(git(fixture.repo, "diff", "--cached", "--binary")).toBe(before.cached);
     expect(git(fixture.repo, "stash", "list", "--format=%H")).toBe(before.stash);
-  });
+  }, 120_000);
 });

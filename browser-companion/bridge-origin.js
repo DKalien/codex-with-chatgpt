@@ -22,6 +22,7 @@ const FEEDBACK_ENDPOINTS = new Set([
   "/rebind/complete",
   "/rebind/status",
   "/state",
+  "/operations",
   "/reserve",
   "/release",
   "/begin-send",

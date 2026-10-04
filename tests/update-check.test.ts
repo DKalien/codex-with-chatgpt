@@ -1,27 +1,85 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
 import { checkForUpdates } from "../src/cli/update-check.js";
-import { cleanup, git, makeGitRepo, makeTmpDir, write } from "./helpers.js";
+import { git, makeGitRepo, makeTmpDir, write } from "./helpers.js";
+import { cleanupStrict } from "./strict-teardown.js";
+import { treeSnapshot } from "../scripts/test-full-candidate.mjs";
+
+function pairSnapshot(root: string): ReturnType<typeof treeSnapshot> {
+  expect(fs.realpathSync.native(root)).toBe(root);
+  const snapshot = treeSnapshot(root); // Includes .git refs/config/objects; rejects links.
+  for (const [relative, value] of Object.entries(snapshot)) {
+    if (value !== "directory") expect(fs.lstatSync(path.join(root, relative)).nlink).toBe(1);
+  }
+  for (const repo of ["remote", "local"]) {
+    const gitDir = path.join(root, repo, ".git");
+    expect(fs.lstatSync(gitDir).isDirectory()).toBe(true);
+    for (const shared of ["commondir", "gitdir", "objects/info/alternates", "objects/info/http-alternates"]) {
+      expect(fs.existsSync(path.join(gitDir, shared))).toBe(false);
+    }
+  }
+  return snapshot;
+}
 
 describe("Fork 更新检查（真实 Git 仓库）", () => {
   let dir: string;
   let remote: string;
   let local: string;
   let cache: string;
+  let seedRoot: string | undefined;
+  let seed: { snapshot: ReturnType<typeof pairSnapshot>; origin: string; upstream: string } | undefined;
+  const copies: string[] = [];
+  beforeAll(() => {
+    // Match helpers.git so seed validation and checkForUpdates see the same config sources.
+    vi.stubEnv("GIT_CONFIG_GLOBAL", "/dev/null");
+    vi.stubEnv("GIT_CONFIG_SYSTEM", "/dev/null");
+  });
   beforeEach(() => {
+    if (!seed) {
+      if (seedRoot) throw new Error("update-check seed construction failed; refusing another seed");
+      seedRoot = makeTmpDir("update-check-seed"); // Track partial construction for strict teardown.
+      const seedRemote = path.join(seedRoot, "remote"), seedLocal = path.join(seedRoot, "local");
+      fs.mkdirSync(seedRemote);
+      makeGitRepo(seedRemote);
+      git(seedRoot, "clone", "--no-hardlinks", seedRemote, seedLocal);
+      git(seedLocal, "remote", "set-url", "origin", "../remote");
+      // upstream remains a real unreachable relative path inside each copied pair.
+      git(seedLocal, "remote", "add", "upstream", "../absent-upstream");
+      git(seedLocal, "update-ref", "refs/remotes/upstream/main", git(seedLocal, "rev-parse", "HEAD").trim());
+      const origin = git(seedLocal, "remote", "get-url", "origin").trim();
+      const upstream = git(seedLocal, "remote", "get-url", "upstream").trim();
+      expect(origin).toBe("../remote");
+      expect(upstream).toBe("../absent-upstream");
+      seed = { snapshot: pairSnapshot(seedRoot), origin, upstream };
+    }
     dir = makeTmpDir("update-check");
+    copies.push(dir);
+    expect(dir).not.toBe(seedRoot);
+    fs.cpSync(seedRoot!, dir, { recursive: true, force: false, errorOnExist: true });
+    // Exact copied config bytes retain the URLs verified once with real Git above.
+    expect(pairSnapshot(dir)).toEqual(seed.snapshot);
     remote = path.join(dir, "remote");
     local = path.join(dir, "local");
     cache = path.join(dir, "state", "update-check.json");
-    fs.mkdirSync(remote);
-    makeGitRepo(remote);
-    git(dir, "clone", remote, local);
-    // upstream 无法访问：任何误 fetch 都会失败。
-    git(local, "remote", "add", "upstream", path.join(dir, "absent-upstream"));
-    git(local, "update-ref", "refs/remotes/upstream/main", git(local, "rev-parse", "HEAD").trim());
+    expect(fs.realpathSync.native(local)).toBe(local);
+    expect(fs.realpathSync.native(path.resolve(local, seed.origin))).toBe(remote);
+    expect(remote).not.toBe(path.join(seedRoot!, "remote"));
+    const missingUpstream = path.resolve(local, seed.upstream);
+    expect(missingUpstream).toBe(path.join(dir, "absent-upstream"));
+    expect(fs.existsSync(missingUpstream)).toBe(false);
   });
-  afterEach(() => cleanup(dir));
+  afterEach(async () => {
+    try {
+      if (seed) expect(pairSnapshot(seedRoot!)).toEqual(seed.snapshot);
+    } finally {
+      await cleanupStrict(...copies.splice(0));
+    }
+  });
+  afterAll(async () => {
+    try { if (seedRoot) await cleanupStrict(seedRoot); }
+    finally { vi.unstubAllEnvs(); }
+  });
   const commit = (repo: string, name: string) => {
     write(repo, `${name}.txt`, name);
     git(repo, "add", `${name}.txt`);

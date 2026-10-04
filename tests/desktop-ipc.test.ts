@@ -22,6 +22,7 @@ const target = {
   projectId: "project_test",
   workspaceRoot: "D:\\python\\codex-with-chatgpt",
 } as const;
+const runtimeFence = { desktopPid: 1001, desktopExe: "C:\\Program Files\\ChatGPT\\ChatGPT.exe", desktopCreation: "1000001", appServerPid: 1002, appServerExe: "C:\\Program Files\\ChatGPT\\codex.exe", appServerCreation: "1000002" };
 
 type FakeRequest = Record<string, unknown> & { op?: string; id?: string };
 type FakeReply = { ok: true; value: unknown } | { ok: false; code: string; notSent?: boolean };
@@ -42,7 +43,7 @@ function fakeSpawner(replyFor: (request: FakeRequest) => FakeReply = request => 
   if (request.op === "inspect" || request.op === "prepare") {
     return {
       ok: true,
-      value: { ...target, title: "Fake Desktop 会话", cwd: target.workspaceRoot, runtimeStatus: "idle" },
+      value: { ...target, title: "Fake Desktop 会话", cwd: target.workspaceRoot, runtimeStatus: "idle", runtimeFence },
     };
   }
   if (request.op === "send") {
@@ -104,7 +105,7 @@ describe("Desktop IPC wrapper（fake helper）", () => {
     try {
       const fake = fakeSpawner(request => request.op === "current_confirm" ?
         { ok: false, code: "DESKTOP_CONFIRMATION_CANCELLED", notSent: true } :
-        { ok: true, value: { ...target, title: "当前会话", cwd: target.workspaceRoot, runtimeStatus: "active" } });
+        { ok: true, value: { ...target, title: "当前会话", cwd: target.workspaceRoot, runtimeStatus: "active", runtimeFence } });
       const client = makeClient(fake.spawnImpl);
       expect((await client.currentIdentity(target.workspaceRoot)).runtimeStatus).toBe("active");
       await expect(client.confirmCurrent(target.workspaceRoot)).rejects.toMatchObject({ code: "DESKTOP_CONFIRMATION_CANCELLED" });
@@ -154,11 +155,11 @@ describe("Desktop IPC wrapper（fake helper）", () => {
     const fake = fakeSpawner(request => request.op === "inspect_active_execution"
       ? { ok: true, value: { ...target, title: "目标 active 会话", cwd: target.workspaceRoot, runtimeStatus: "active", activeTurnId } }
       : { ok: true, value: { ...target, title: "Fake Desktop 会话", cwd: target.workspaceRoot, runtimeStatus: "idle" } });
-    const result = await makeClient(fake.spawnImpl).inspectActiveExecution(target);
+    const result = await makeClient(fake.spawnImpl).inspectActiveExecution(target, runtimeFence);
     expect(result).toMatchObject({ ...target, runtimeStatus: "active", activeTurnId });
     expect(fake.requests).toHaveLength(1);
     expect(fake.requests[0]).toMatchObject({ op: "inspect_active_execution", target });
-    expect(Object.keys(fake.requests[0]).sort()).toEqual(["id", "op", "target"]);
+    expect(Object.keys(fake.requests[0]).sort()).toEqual(["id", "op", "runtimeFence", "target"]);
   });
 
   it("inspectActiveExecution 严格拒绝无效 active turn、idle 和错目标响应", async () => {
@@ -169,7 +170,7 @@ describe("Desktop IPC wrapper（fake helper）", () => {
       { ...target, title: "idle", cwd: target.workspaceRoot, runtimeStatus: "idle", activeTurnId },
     ]) {
       const fake = fakeSpawner(() => ({ ok: true, value }));
-      await expect(makeClient(fake.spawnImpl).inspectActiveExecution(target))
+      await expect(makeClient(fake.spawnImpl).inspectActiveExecution(target, runtimeFence))
         .rejects.toMatchObject({ code: "DESKTOP_STATE_UNAVAILABLE" });
     }
     for (const value of [
@@ -178,7 +179,7 @@ describe("Desktop IPC wrapper（fake helper）", () => {
       { ...target, workspaceRoot: "D:\\python\\other", title: "wrong", cwd: "D:\\python\\other", runtimeStatus: "active", activeTurnId },
     ]) {
       const fake = fakeSpawner(() => ({ ok: true, value }));
-      await expect(makeClient(fake.spawnImpl).inspectActiveExecution(target))
+      await expect(makeClient(fake.spawnImpl).inspectActiveExecution(target, runtimeFence))
         .rejects.toMatchObject({ code: "DESKTOP_TARGET_NOT_FOUND" });
     }
   });
@@ -201,12 +202,12 @@ describe("Desktop IPC wrapper（fake helper）", () => {
     const fake = fakeSpawner(request => request.op === "inspect_result_context"
       ? { ok: true, value }
       : { ok: true, value: {} });
-    await expect(makeClient(fake.spawnImpl).inspectResultContext(target)).resolves.toMatchObject({
+    await expect(makeClient(fake.spawnImpl).inspectResultContext(target, runtimeFence)).resolves.toMatchObject({
       ...target, ownerClientId: "01a00000-0000-7000-8000-000000000004", resultTurnId, resultTurnStatus: "completed",
     });
     expect(fake.requests).toHaveLength(1);
     expect(fake.requests[0]).toMatchObject({ op: "inspect_result_context", target });
-    expect(Object.keys(fake.requests[0]).sort()).toEqual(["id", "op", "target"]);
+    expect(Object.keys(fake.requests[0]).sort()).toEqual(["id", "op", "runtimeFence", "target"]);
     expect(Object.keys(value).sort()).toEqual([
       "cwd", "hostId", "ownerClientId", "projectId", "requestsCount",
       "resultTurnId", "resultTurnStatus", "resumeState", "runtimeStatus", "threadId", "title",
@@ -216,19 +217,19 @@ describe("Desktop IPC wrapper（fake helper）", () => {
     const extra = fakeSpawner(request => request.op === "inspect_result_context"
       ? { ok: true, value: { ...value, secret: "nope" } }
       : { ok: true, value: {} });
-    await expect(makeClient(extra.spawnImpl).inspectResultContext(target))
+    await expect(makeClient(extra.spawnImpl).inspectResultContext(target, runtimeFence))
       .rejects.toMatchObject({ code: "DESKTOP_PROTOCOL_ERROR" });
     vi.unstubAllEnvs();
   });
 
-  it("inspectResultActivityMarker 只投影有序 item id/type 且使用严格 target request", async () => {
+  it.each([false, true])("inspectResultActivityMarker 有序投影且保留 steering=%s", async (steering) => {
     vi.stubEnv("CODEX_THREAD_ID", "");
     const resultTurnId = "01a00000-0000-7000-8000-000000000003";
     const marker = {
       resultTurnId,
-      itemIds: ["item-1", "item-2"],
-      itemTypes: ["userMessage", "commandExecution"],
-      itemCount: 2,
+      itemIds: steering ? ["item-1", "item-2", "item-3", "item-4"] : ["item-1", "item-2"],
+      itemTypes: steering ? ["userMessage", "steeringUserMessage", "steered", "commandExecution"] : ["userMessage", "commandExecution"],
+      itemCount: steering ? 4 : 2,
       itemSha256: "a".repeat(64),
     } satisfies DesktopResultActivityMarker;
     const value = {
@@ -247,10 +248,10 @@ describe("Desktop IPC wrapper（fake helper）", () => {
     const fake = fakeSpawner(request => request.op === "inspect_result_activity_marker"
       ? { ok: true, value }
       : { ok: true, value: {} });
-    await expect(makeClient(fake.spawnImpl).inspectResultActivityMarker(target)).resolves.toEqual(value);
+    await expect(makeClient(fake.spawnImpl).inspectResultActivityMarker(target, runtimeFence)).resolves.toEqual(value);
     expect(fake.requests).toHaveLength(1);
     expect(fake.requests[0]).toMatchObject({ op: "inspect_result_activity_marker", target });
-    expect(Object.keys(fake.requests[0]).sort()).toEqual(["id", "op", "target"]);
+    expect(Object.keys(fake.requests[0]).sort()).toEqual(["id", "op", "runtimeFence", "target"]);
     vi.unstubAllEnvs();
   });
 
@@ -279,12 +280,12 @@ describe("Desktop IPC wrapper（fake helper）", () => {
     const fake = fakeSpawner(request => request.op === "inspect_result_terminal_fence"
       ? { ok: true, value: { ...base, fence: "safe_terminal" } }
       : { ok: true, value: {} });
-    await expect(makeClient(fake.spawnImpl).inspectResultTerminalFence(target, marker)).resolves.toMatchObject({
+    await expect(makeClient(fake.spawnImpl).inspectResultTerminalFence(target, marker, runtimeFence)).resolves.toMatchObject({
       ...base, fence: "safe_terminal",
     });
     expect(fake.requests).toHaveLength(1);
     expect(fake.requests[0]).toMatchObject({ op: "inspect_result_terminal_fence", target, marker });
-    expect(Object.keys(fake.requests[0]).sort()).toEqual(["id", "marker", "op", "target"]);
+    expect(Object.keys(fake.requests[0]).sort()).toEqual(["id", "marker", "op", "runtimeFence", "target"]);
     vi.unstubAllEnvs();
   });
 
@@ -375,6 +376,21 @@ describe("Desktop IPC wrapper（fake helper）", () => {
       expect(fake.requests).toHaveLength(1);
       expect(Object.keys(fake.requests[0]).sort()).toEqual(["id", "op", "workspaceRoot"]);
     } finally { vi.unstubAllEnvs(); }
+  });
+
+  it("target-scoped request 把 runtimeFence 放在顶层，send 子请求不接受覆盖", async () => {
+    const activeTurnId = "01a00000-0000-7000-8000-000000000003";
+    const fake = fakeSpawner(request => request.op === "prepare"
+      ? { ok: true, value: { ...target, title: "目标", cwd: target.workspaceRoot, runtimeStatus: "idle", runtimeFence } }
+      : request.op === "send"
+        ? { ok: true, value: { threadId: target.threadId, turnId: activeTurnId } }
+        : { ok: true, value: { ...target, title: "目标", cwd: target.workspaceRoot, runtimeStatus: "idle", runtimeFence } });
+    const connection = await makeClient(fake.spawnImpl).prepare(target, runtimeFence);
+    await connection.send("hello");
+    connection.close();
+    expect(fake.requests[0]).toMatchObject({ op: "prepare", target, runtimeFence });
+    expect(fake.requests[1]).toMatchObject({ op: "send", message: "hello" });
+    expect(fake.requests[1]).not.toHaveProperty("runtimeFence");
   });
 
   it("currentResultClassification 接受严格 allowlist 内的 manual resume signature", async () => {
@@ -641,10 +657,10 @@ describe("Desktop IPC wrapper（fake helper）", () => {
     };
     const fake = fakeSpawner(request => request.op === "inspect_result_ownership"
       ? { ok: true, value: valid } : { ok: true, value: {} });
-    const result = await makeClient(fake.spawnImpl).inspectResultOwnership(target, expectation);
+    const result = await makeClient(fake.spawnImpl).inspectResultOwnership(target, expectation, runtimeFence);
     expect(result).toMatchObject({ ownership: "origin", originTurnId, chainSignatures: [] });
     expect(fake.requests).toHaveLength(1);
-    expect(Object.keys(fake.requests[0]).sort()).toEqual(["expectation", "id", "op", "target"]);
+    expect(Object.keys(fake.requests[0]).sort()).toEqual(["expectation", "id", "op", "runtimeFence", "target"]);
     expect(fake.requests[0]).toMatchObject({ op: "inspect_result_ownership", target, expectation });
 
     const deliveryId = randomUUID();
@@ -652,18 +668,18 @@ describe("Desktop IPC wrapper（fake helper）", () => {
     const v2Origin = { ...valid, deliveryId };
     await expect(makeClient(fakeSpawner(request => request.op === "inspect_result_ownership"
       ? { ok: true, value: v2Origin } : { ok: true, value: {} }).spawnImpl)
-      .inspectResultOwnership(target, v2Expectation)).resolves.toMatchObject({ deliveryId });
+      .inspectResultOwnership(target, v2Expectation, runtimeFence)).resolves.toMatchObject({ deliveryId });
     for (const mismatchedDelivery of [
       (() => { const value = { ...v2Origin } as Record<string, unknown>; delete value.deliveryId; return value; })(),
       { ...v2Origin, deliveryId: randomUUID() },
     ]) {
       await expect(makeClient(fakeSpawner(request => request.op === "inspect_result_ownership"
         ? { ok: true, value: mismatchedDelivery } : { ok: true, value: {} }).spawnImpl)
-        .inspectResultOwnership(target, v2Expectation)).rejects.toMatchObject({ code: "DESKTOP_RECONCILIATION_CONFLICT" });
+        .inspectResultOwnership(target, v2Expectation, runtimeFence)).rejects.toMatchObject({ code: "DESKTOP_RECONCILIATION_CONFLICT" });
     }
     await expect(makeClient(fakeSpawner(request => request.op === "inspect_result_ownership"
       ? { ok: true, value: { ...valid, deliveryId } } : { ok: true, value: {} }).spawnImpl)
-      .inspectResultOwnership(target, expectation)).rejects.toMatchObject({ code: "DESKTOP_RECONCILIATION_CONFLICT" });
+      .inspectResultOwnership(target, expectation, runtimeFence)).rejects.toMatchObject({ code: "DESKTOP_RECONCILIATION_CONFLICT" });
 
     const malformedRequest = fakeSpawner();
     await expect(makeClient(malformedRequest.spawnImpl).inspectResultOwnership(
@@ -673,7 +689,7 @@ describe("Desktop IPC wrapper（fake helper）", () => {
 
     const wrongTarget = fakeSpawner(request => request.op === "inspect_result_ownership"
       ? { ok: true, value: { ...valid, threadId: randomUUID() } } : { ok: true, value: {} });
-    await expect(makeClient(wrongTarget.spawnImpl).inspectResultOwnership(target, expectation))
+    await expect(makeClient(wrongTarget.spawnImpl).inspectResultOwnership(target, expectation, runtimeFence))
       .rejects.toMatchObject({ code: "DESKTOP_TARGET_NOT_FOUND" });
 
     for (const broken of [
@@ -684,8 +700,34 @@ describe("Desktop IPC wrapper（fake helper）", () => {
     ]) {
       const malformedResponse = fakeSpawner(request => request.op === "inspect_result_ownership"
         ? { ok: true, value: broken } : { ok: true, value: {} });
-      await expect(makeClient(malformedResponse.spawnImpl).inspectResultOwnership(target, expectation))
+      await expect(makeClient(malformedResponse.spawnImpl).inspectResultOwnership(target, expectation, runtimeFence))
         .rejects.toMatchObject({ code: "DESKTOP_PROTOCOL_ERROR" });
+    }
+  });
+
+  it("pending receipt pins its historical turn without weakening current ownership validation", async () => {
+    const originTurnId = randomUUID();
+    const expectation = { workspaceId: "workspace_test", commandId: "command_test", intent: "revision" as const,
+      messageBytes: 10, messageSha256: "a".repeat(64), originTurnId };
+    const marker: DesktopResultActivityMarker = { resultTurnId: originTurnId, itemIds: ["item-1"],
+      itemTypes: ["userMessage"], itemCount: 1, itemSha256: "b".repeat(64) };
+    const ownership = { ...target, title: "test", cwd: target.workspaceRoot, runtimeStatus: "active",
+      resultTurnId: originTurnId, resultTurnStatus: "completed", ownership: "origin", originTurnId,
+      originAlias: null, chainTurnIds: [originTurnId], chainLength: 0, chainSignatures: [], signature: null };
+    const valid = { ownership, fence: "safe_terminal" };
+    const fake = fakeSpawner(() => ({ ok: true, value: valid }));
+    await expect(makeClient(fake.spawnImpl).inspectPendingReceipt(target, expectation, marker, runtimeFence))
+      .resolves.toMatchObject({ resultTurnId: originTurnId, resultTurnStatus: "completed", runtimeStatus: "active", fence: "safe_terminal" });
+    expect(fake.requests[0]).toMatchObject({ op: "inspect_pending_receipt", expectation, marker, runtimeFence, target });
+    await expect(makeClient(fakeSpawner(() => ({ ok: true, value: ownership })).spawnImpl)
+      .inspectResultOwnership(target, expectation, runtimeFence)).rejects.toMatchObject({ code: "DESKTOP_STATE_UNAVAILABLE" });
+    for (const value of [
+      { ...valid, extra: true }, { ...valid, fence: "unknown" }, { ...valid, fence: "inProgress" },
+      { ...valid, ownership: { ...ownership, resultTurnId: randomUUID() } },
+      { ...valid, ownership: { ...ownership, resultTurnStatus: "inProgress" } },
+    ]) {
+      await expect(makeClient(fakeSpawner(() => ({ ok: true, value })).spawnImpl)
+        .inspectPendingReceipt(target, expectation, marker, runtimeFence)).rejects.toHaveProperty("code");
     }
   });
 
@@ -718,7 +760,7 @@ describe("Desktop IPC wrapper（fake helper）", () => {
       const client = makeClient(fake.spawnImpl);
       const message = "请按已确认方案执行。\n\n```ts\nconst greeting = '你好';\n```";
 
-      const connection = await client.prepare(target);
+      const connection = await client.prepare(target, runtimeFence);
       await expect(connection.send(message)).resolves.toEqual({
         threadId: target.threadId,
         turnId: "01a00000-0000-7000-8000-000000000002",
@@ -758,7 +800,7 @@ describe("Desktop IPC wrapper（fake helper）", () => {
   it("不在非 Windows 平台启动 helper", async () => {
     const spawnImpl = vi.fn();
     const client = new DesktopIpcClient({ platform: "linux", spawnImpl });
-    await expect(client.inspect(target)).rejects.toMatchObject({ code: "DESKTOP_UNSUPPORTED_PLATFORM" });
+    await expect(client.inspect(target, runtimeFence)).rejects.toMatchObject({ code: "DESKTOP_UNSUPPORTED_PLATFORM" });
     expect(spawnImpl).not.toHaveBeenCalled();
   });
 
@@ -769,7 +811,7 @@ describe("Desktop IPC wrapper（fake helper）", () => {
       }
       return { ok: true, value: {} };
     });
-    await expect(makeClient(wrongInfo.spawnImpl).inspect(target)).rejects.toMatchObject({ code: "DESKTOP_TARGET_NOT_FOUND" });
+    await expect(makeClient(wrongInfo.spawnImpl).inspect(target, runtimeFence)).rejects.toMatchObject({ code: "DESKTOP_TARGET_NOT_FOUND" });
 
     const wrongReceipt = fakeSpawner(request => {
       if (request.op === "send") return { ok: true, value: { threadId: randomUUID(), turnId: randomUUID() } };
@@ -778,7 +820,7 @@ describe("Desktop IPC wrapper（fake helper）", () => {
         value: { ...target, title: "Fake Desktop 会话", cwd: target.workspaceRoot },
       };
     });
-    const connection = await makeClient(wrongReceipt.spawnImpl).prepare(target);
+    const connection = await makeClient(wrongReceipt.spawnImpl).prepare(target, runtimeFence);
     await expect(connection.send("执行修订")).rejects.toMatchObject({ code: "DESKTOP_OUTCOME_UNKNOWN", notSent: false });
     connection.close();
   });
@@ -791,7 +833,7 @@ describe("Desktop IPC wrapper（fake helper）", () => {
         value: { ...target, title: "Fake Desktop 会话", cwd: target.workspaceRoot },
       };
     });
-    const connection = await makeClient(fake.spawnImpl).prepare(target);
+    const connection = await makeClient(fake.spawnImpl).prepare(target, runtimeFence);
     try {
       await connection.send("执行修订");
       throw new Error("send 错误未被拒绝");
@@ -808,7 +850,7 @@ describe("Desktop IPC wrapper（fake helper）", () => {
     });
     const child = fake.children;
     const client = makeClient(fake.spawnImpl);
-    const inspection = client.inspect(target);
+    const inspection = client.inspect(target, runtimeFence);
     await vi.waitFor(() => expect(child).toHaveLength(1));
     child[0].stdout.write(Buffer.from([0xff, 0x0a]));
     try {

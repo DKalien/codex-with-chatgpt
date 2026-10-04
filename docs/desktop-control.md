@@ -48,11 +48,15 @@ notes 说明已有脏工作区。不会清理旧改动。
 
 当当前 Desktop turn 仍为 `inProgress` 时，`c2c record` 只写入受 workspace、thread、origin/result
 turn 和输入摘要保护的 pending draft，不写 execution output，也不产生 `desktop_<commandId>` trusted
-receipt。独立终态 worker 会在有界时间内重新核对相同身份；由于当前 canonical Desktop history 不提供
-record 之后的 command/tool item 顺序证明，即使 turn 进入终态也不能猜测“没有后续工作”，因此会发出
-`FINAL_RECEIPT_REQUIRED` 控制反馈，而不是伪造 `C2C_EXECUTED`。该反馈只含 workspace、command、有限 reason
+receipt。独立终态 worker 会在有界时间内重新核对相同身份，使用 record 时捕获的有序
+item ID/type marker 核对同一 turn：
+只有原序列保持精确前缀、后续仅 reasoning/agentMessage 且已 terminal，才提交 trusted receipt。
+`steeringUserMessage`/`steered` 在 record 前作为普通活动纳入 marker 和摘要；record 后新增任一类型均为
+`post_record_activity`，不能当作安全 epilogue。此兼容仅用于 activity marker，不放宽 origin input、
+native continuation、完整 history、runtimeFence 或同源要求。未知 type、重复 ID、顺序变化仍拒绝。
+无法证明安全终态时发出 `FINAL_RECEIPT_REQUIRED` 控制反馈，而不是伪造 `C2C_EXECUTED`。该反馈只含 workspace、command、有限 reason
 和时间，要求先独立只读检查；只有发现实际需要修复或补测时才发起聚焦的 revision/review，若当前状态已充分则继续既定计划或 DONE，禁止无改动 closeout 递归；不会覆盖旧 receipt 或自动生成第二个 commandId。
-终态 worker 只写入 durable alert，不直接写 production feedback state；仅声明
+需要人工复核时，终态 worker 只写入 durable alert，不直接写 production feedback state；仅声明
 `feedbackControlEventVersion=1` 的运行中 Bridge 在受控 reconcile 时投影该事件。旧 Bridge
 不会解析前向控制事件，维护修复只隔离有对应 alert 的控制事件并保留 alert，待升级后再投影。
 
@@ -61,6 +65,10 @@ record 之后的 command/tool item 顺序证明，即使 turn 进入终态也不
 保留为低层/测试/高级显式入口。相同内容重试不追加，
 冲突拒绝，不覆盖证据。rejected/outcome_unknown/身份未知均不能生成 receipt；记录失败必须报告
 “本轮验收记录缺失”，不能宣称闭环完成。没有新增网页写 record 工具，也没有改变 Connector contract。
+
+activity marker 读取失败保留安全 IPC error code，不暴露底层正文/路径等原始错误。
+如果失败发生在 pending draft 建立前，后续普通 turn 无法凭历史 accepted/completed 状态补造 trusted receipt；
+现有恢复入口只能恢复已有可信记录或满足原始 ownership/fence 的 draft，不回填一个事后 marker。
 
 用户要求 Review 时，先用 `execution_summary` 精确匹配刚才 delivery 的 commandId，再读取对应
 outputId 的 `execution_output`。不能把最新 test_status 或历史测试当本轮通过证据；找不到匹配记录
@@ -398,6 +406,17 @@ deliveryId、result tip 和完整 continuation 签名链）。终态 fence 到�
 精确 Desktop target 做只读 ownership re-attestation；只有整份 snapshot 与当前 canonical history 一致，且 durable
 accepted delivery 的原 turnId/deliveryId 在写入前仍一致，才可写 output/receipt。v1/v2 draft 仍按原 schema 与
 原 finalizer 语义读取，不补造历史 ownership 证据、不迁移或改写旧 draft。
+
+v3 冻结草稿恢复使用 `inspect_pending_receipt`：在同一份 fresh canonical snapshot 中，按原
+resultTurnId 同时检查 ownership chain 与有序 activity marker。后续普通 composer turn 不替原 turn
+代签；只有原 turn 已终态、与当前 turn 位于完整的同一 canonical island、紧邻后继明确为 composer，
+才可恢复较早草稿。native continuation、未知 trigger、loading boundary、身份漂移或 record 后的新
+工具活动仍拒绝。提交前再次核验同一 ownership 与 safe_terminal；正常 `record` 的 current-turn 限制不变。
+
+receipt worker 复用 daemon Job escape helper，启动完成后 `record` 才返回 pending；短暂 lifecycle lock
+争用有界等待且每次重新读取原 draft。遗留 claim 仅在 PID 探测为 ESRCH 且文件身份/内容未变时回收，
+不按年龄抢占 live/unknown worker。硬退出仍可能留下 draft；它不等于 trusted receipt 或网页已回流，
+只能通过严格 frozen-draft finalization 恢复，不允许用后续 `record --task` 补造。
 
 已存在的 `outcome_unknown` 仍按原始 C2C envelope 的严格 reconciliation 处理；行政 resolution
 只允许在 IPC/历史不可用时独立停止等待，不能恢复为 accepted，也不能进入 P0.6 continuation ownership。

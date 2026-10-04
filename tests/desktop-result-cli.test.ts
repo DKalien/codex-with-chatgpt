@@ -23,6 +23,14 @@ const threadId = "01a00000-0000-7000-8000-000000000001";
 const commandId = "desktop_result_command";
 const continuationTurnId = "01a00000-0000-7000-8000-000000000003";
 const originTurnId = "01a00000-0000-7000-8000-000000000004";
+const runtimeFence = {
+  desktopPid: 1001,
+  desktopExe: "C:\\Program Files\\ChatGPT\\ChatGPT.exe",
+  desktopCreation: "1000001",
+  appServerPid: 1002,
+  appServerExe: "C:\\Program Files\\ChatGPT\\codex.exe",
+  appServerCreation: "1000002",
+};
 let root: string;
 let stateDir: string;
 let workspace: Workspace;
@@ -55,6 +63,7 @@ function seedAcceptedDelivery(): void {
       workspaceId: workspace.id,
       workspaceRoot: workspace.root,
       enabled: false,
+      runtimeFence,
       binding: {
         threadId,
         hostId: "local",

@@ -1,8 +1,15 @@
 import fs from "node:fs";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { ensureDir, getStateDir } from "../config/paths.js";
+import { assertCleanupArtifacts, cleanupArtifact, CommandCleanupError, type CleanupArtifact, type CommandCleanupTarget } from "../command-cleanup/schema.js";
+import { assertCleanupStoreFile, assertCommandWritable, readCleanupJournal, withCommandOperation } from "../command-cleanup/fence.js";
+import { assertExecutionArtifactPath, deleteExecutionOutputCleanupArtifacts, inspectExecutionOutputCleanupArtifacts } from "./output.js";
 import { sanitizeExecutionOutput } from "./sanitize.js";
+import { isExecutionLockAcquisitionContention } from "./short-lock.js";
+import { applyFeedbackCursorCleanup, prepareFeedbackCursorCleanup } from "../feedback/cursor-cleanup.js";
+import { assertNoLegacyHistoryCleanup } from "../command-cleanup/legacy-history-fence.js";
 
 export const MAX_EXECUTION_SUMMARY_BYTES = 8 * 1024;
 export const executionSummarySchema = z.string().min(1).refine(
@@ -132,14 +139,15 @@ export class ExecutionRecordsBusyError extends Error {
 
 const waitCell = new Int32Array(new SharedArrayBuffer(4));
 
-function recordsFile(workspaceId: string): string {
-  const dir = ensureDir(path.join(getStateDir(), "executions"));
+function recordsFile(workspaceId: string, stateDir = getStateDir()): string {
+  const dir = ensureDir(path.join(stateDir, "executions"));
   return path.join(dir, `${workspaceId}.jsonl`);
 }
 
 /** 对 execution JSONL 的短跨进程锁；Desktop 结果需要在此锁内查重并追加。 */
-export function withExecutionRecordsLock<T>(workspaceId: string, action: () => T): T {
-  const file = `${recordsFile(workspaceId)}.lock`;
+export function withExecutionRecordsLock<T>(workspaceId: string, action: () => T, stateDir = getStateDir()): T {
+  assertNoLegacyHistoryCleanup(workspaceId, stateDir);
+  const file = `${recordsFile(workspaceId, stateDir)}.lock`;
   const deadline = Date.now() + 500;
   let lock: number;
   for (;;) {
@@ -147,7 +155,7 @@ export function withExecutionRecordsLock<T>(workspaceId: string, action: () => T
       lock = fs.openSync(file, "wx", 0o600);
       break;
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      if (!isExecutionLockAcquisitionContention(error)) throw error;
       if (Date.now() >= deadline) throw new ExecutionRecordsBusyError();
       Atomics.wait(waitCell, 0, 0, 10);
     }
@@ -155,6 +163,7 @@ export function withExecutionRecordsLock<T>(workspaceId: string, action: () => T
   try {
     fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, createdAt: Date.now() }));
     fs.fsyncSync(lock);
+    assertNoLegacyHistoryCleanup(workspaceId, stateDir);
     return action();
   } finally {
     try { fs.closeSync(lock); }
@@ -163,8 +172,9 @@ export function withExecutionRecordsLock<T>(workspaceId: string, action: () => T
 }
 
 /** 对需要在 execution 锁内再次读取 Desktop 状态的结果写入提供 async 事务。 */
-export async function withExecutionRecordsLockAsync<T>(workspaceId: string, action: () => Promise<T>): Promise<T> {
-  const file = `${recordsFile(workspaceId)}.lock`;
+export async function withExecutionRecordsLockAsync<T>(workspaceId: string, action: () => Promise<T>, stateDir = getStateDir()): Promise<T> {
+  assertNoLegacyHistoryCleanup(workspaceId, stateDir);
+  const file = `${recordsFile(workspaceId, stateDir)}.lock`;
   const deadline = Date.now() + 500;
   let lock: number;
   for (;;) {
@@ -172,7 +182,7 @@ export async function withExecutionRecordsLockAsync<T>(workspaceId: string, acti
       lock = fs.openSync(file, "wx", 0o600);
       break;
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      if (!isExecutionLockAcquisitionContention(error)) throw error;
       if (Date.now() >= deadline) throw new ExecutionRecordsBusyError();
       await new Promise<void>(resolve => setTimeout(resolve, 10));
     }
@@ -180,6 +190,7 @@ export async function withExecutionRecordsLockAsync<T>(workspaceId: string, acti
   try {
     fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, createdAt: Date.now() }));
     fs.fsyncSync(lock);
+    assertNoLegacyHistoryCleanup(workspaceId, stateDir);
     return await action();
   } finally {
     try { fs.closeSync(lock); }
@@ -188,23 +199,26 @@ export async function withExecutionRecordsLockAsync<T>(workspaceId: string, acti
 }
 
 /** 仅供已持有 withExecutionRecordsLock 的事务追加；普通调用请用 appendExecutionRecord。 */
-export function appendExecutionRecordLocked(workspaceId: string, record: StoredExecutionRecord): void {
-  const file = recordsFile(workspaceId);
+export function appendExecutionRecordLocked(workspaceId: string, record: StoredExecutionRecord, stateDir = getStateDir()): void {
+  assertNoLegacyHistoryCleanup(workspaceId, stateDir);
   const parsed = storedExecutionRecordSchema.parse(record);
   const safe = parsed.rawSummary === undefined
     ? parsed
     : { ...parsed, rawSummary: sanitizeExecutionSummary(parsed.rawSummary) };
+  if (safe.commandId && safe.iteration === 1) assertCommandWritable(workspaceId, safe.commandId, stateDir);
   const serialized = JSON.stringify(safe) + "\n";
-  const fd = fs.openSync(file, "a", 0o600);
+  const fd = fs.openSync(recordsFile(workspaceId, stateDir), "a", 0o600);
   try {
     fs.writeFileSync(fd, serialized, "utf8");
     fs.fsyncSync(fd);
   } finally { fs.closeSync(fd); }
 }
 
-export function appendExecutionRecord(workspaceId: string, record: ExecutionRecord): void {
+export function appendExecutionRecord(workspaceId: string, record: ExecutionRecord, stateDir = getStateDir()): void {
   const parsed = executionRecordSchema.parse(record);
-  withExecutionRecordsLock(workspaceId, () => appendExecutionRecordLocked(workspaceId, parsed));
+  const append = () => withExecutionRecordsLock(workspaceId, () => appendExecutionRecordLocked(workspaceId, parsed, stateDir), stateDir);
+  if (parsed.commandId && parsed.iteration === 1) withCommandOperation(workspaceId, parsed.commandId, append, stateDir);
+  else append();
 }
 
 /**
@@ -212,7 +226,7 @@ export function appendExecutionRecord(workspaceId: string, record: ExecutionReco
  * 或 schema 不合法都停止调用方，避免把部分落盘当作可继续追加的历史。
  */
 export function readExecutionRecordsStrict(workspaceId: string, stateDir = getStateDir()): StoredExecutionRecord[] {
-  const file = path.join(stateDir, "executions", `${workspaceId}.jsonl`);
+  const file = path.join(path.resolve(stateDir), "executions", `${workspaceId}.jsonl`);
   let raw: string;
   try {
     raw = fs.readFileSync(file, "utf8");
@@ -257,4 +271,105 @@ export function readExecutionRecords(workspaceId: string, limit = 10): Execution
 export function latestExecutionRecord(workspaceId: string): ExecutionRecord | null {
   const records = readExecutionRecords(workspaceId, 1);
   return records[records.length - 1] ?? null;
+}
+
+function validateCleanupTarget(target: CommandCleanupTarget): string {
+  if (!/^[a-f0-9]{12}$/.test(target.workspaceId) || !/^[A-Za-z0-9_-]{1,128}$/.test(target.commandId) ||
+      target.iteration !== 1 || target.workspaceRoot.length === 0) {
+    throw new CommandCleanupError("COMMAND_CLEANUP_INVALID", "execution cleanup identity 非法。");
+  }
+  return path.resolve(target.stateDir ?? getStateDir());
+}
+
+function recordArtifact(target: CommandCleanupTarget, record: StoredExecutionRecord): CleanupArtifact {
+  return cleanupArtifact("execution_record", `${target.commandId}:1`, record);
+}
+
+function requireRecordCleanupJournal(target: CommandCleanupTarget, expected: readonly CleanupArtifact[], stateDir: string): void {
+  const journal = readCleanupJournal(target.workspaceId, target.commandId, stateDir);
+  if (!journal || journal.phase === "snapshot_pending" || journal.workspaceRoot !== target.workspaceRoot || journal.iteration !== 1) {
+    throw new CommandCleanupError("COMMAND_CLEANUP_REQUIRED", "缺少匹配的 cleanup_pending journal；拒绝删除 execution record。");
+  }
+  const sort = (items: readonly CleanupArtifact[]) => [...items].sort((a, b) => `${a.kind}\0${a.id}`.localeCompare(`${b.kind}\0${b.id}`));
+  if (JSON.stringify(sort(expected)) !== JSON.stringify(sort(journal.artifacts))) {
+    throw new CommandCleanupError("COMMAND_CLEANUP_IDENTITY_CHANGED", "cleanup expected artifacts 与 journal 不一致。");
+  }
+}
+
+function recordsPath(workspaceId: string, stateDir: string): string {
+  return path.join(stateDir, "executions", `${workspaceId}.jsonl`);
+}
+
+function targetRecords(target: CommandCleanupTarget, records: readonly StoredExecutionRecord[]): StoredExecutionRecord[] {
+  return records.filter(record => record.commandId === target.commandId && record.iteration === 1);
+}
+
+/** 只报告 exact commandId+iteration=1 的记录及其精确关联输出。 */
+export function inspectExecutionCleanupArtifacts(target: CommandCleanupTarget): CleanupArtifact[] {
+  const stateDir = validateCleanupTarget(target);
+  const journal = readCleanupJournal(target.workspaceId, target.commandId, stateDir);
+  const file = recordsPath(target.workspaceId, stateDir);
+  assertCleanupStoreFile(file, stateDir);
+  assertExecutionArtifactPath(path.join(stateDir, "executions"), stateDir, "directory");
+  if (assertExecutionArtifactPath(file + ".lock", stateDir, "file")) {
+    throw new CommandCleanupError("COMMAND_CLEANUP_BUSY", "execution records 正在写入；拒绝取得不完整快照。");
+  }
+  const stat = assertExecutionArtifactPath(file, stateDir, "file");
+  const selected = stat ? targetRecords(target, readExecutionRecordsStrict(target.workspaceId, stateDir)) : [];
+  if (selected.length > 1) throw new CommandCleanupError("COMMAND_CLEANUP_IDENTITY_CHANGED", "execution record commandId+iteration 重复；拒绝猜测。");
+  const records = selected.map(record => recordArtifact(target, record));
+  const outputs = inspectExecutionOutputCleanupArtifacts(target, selected.flatMap(record => record.outputId === undefined ? [] : [record.outputId]));
+  if (journal && journal.phase !== "snapshot_pending") assertCleanupArtifacts([...records, ...outputs], journal.artifacts);
+  return [...records, ...outputs];
+}
+
+/** 在 cleanup journal 与完整 expected 快照约束下，按 output → JSONL 顺序物理删除。 */
+export function deleteExecutionCleanupArtifacts(
+  target: CommandCleanupTarget,
+  expected: readonly CleanupArtifact[],
+  stageHook?: (stage: "cursor_prepared" | "record_deleted" | "cursor_applied") => void,
+): void {
+  const stateDir = validateCleanupTarget(target);
+  requireRecordCleanupJournal(target, expected, stateDir);
+  withCommandOperation(target.workspaceId, target.commandId, () => {
+    deleteExecutionOutputCleanupArtifacts(target, expected);
+    const file = recordsPath(target.workspaceId, stateDir);
+    assertCleanupStoreFile(file, stateDir);
+    assertExecutionArtifactPath(path.join(stateDir, "executions"), stateDir, "directory");
+    const deleteRecord = () => {
+      requireRecordCleanupJournal(target, expected, stateDir);
+      assertExecutionArtifactPath(path.join(stateDir, "executions"), stateDir, "directory");
+      const stat = assertExecutionArtifactPath(file, stateDir, "file");
+      const records = stat ? readExecutionRecordsStrict(target.workspaceId, stateDir) : [];
+      const selected = targetRecords(target, records);
+      if (selected.length > 1) throw new CommandCleanupError("COMMAND_CLEANUP_IDENTITY_CHANGED", "execution record commandId+iteration 重复；拒绝猜测。");
+      assertCleanupArtifacts(selected.map(record => recordArtifact(target, record)), expected);
+      if (selected.length === 1) {
+        const index = records.findIndex(record => record.commandId === target.commandId && record.iteration === target.iteration);
+        if (index < 0) throw new CommandCleanupError("COMMAND_CLEANUP_IDENTITY_CHANGED", "execution record target index 已变化。");
+        const retained = records.filter((_record, position) => position !== index);
+        prepareFeedbackCursorCleanup(target, records, retained, index, expected);
+        stageHook?.("cursor_prepared");
+        assertExecutionArtifactPath(file, stateDir, "file");
+        if (retained.length === 0) {
+          fs.unlinkSync(file);
+        } else {
+          const temporary = `${file}.${randomUUID()}.tmp`;
+          const fd = fs.openSync(temporary, "wx", 0o600);
+          try {
+            fs.writeFileSync(fd, `${retained.map(record => JSON.stringify(record)).join("\n")}\n`, "utf8");
+            fs.fsyncSync(fd);
+          } finally { fs.closeSync(fd); }
+          try { fs.renameSync(temporary, file); }
+          finally { fs.rmSync(temporary, { force: true }); }
+        }
+      }
+      stageHook?.("record_deleted");
+      const after = readExecutionRecordsStrict(target.workspaceId, stateDir);
+      if (targetRecords(target, after).length) throw new CommandCleanupError("COMMAND_CLEANUP_CORRUPT", "execution record 物理删除未完成。");
+      applyFeedbackCursorCleanup(target, after, expected);
+      stageHook?.("cursor_applied");
+    };
+    withExecutionRecordsLock(target.workspaceId, deleteRecord, stateDir);
+  }, stateDir, true);
 }

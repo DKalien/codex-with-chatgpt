@@ -1,8 +1,15 @@
+import { requestHttp } from "./http-json.js";
+import { cleanupStrict } from "./strict-teardown.js";
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import path from "node:path";
 import { startBridge, type Bridge } from "../src/bridge/server.js";
 import { makeTmpDir, cleanup, write, isolateStateDir, pkceVerifierAndChallenge } from "./helpers.js";
 
+const previousState = process.env.C2C_STATE_DIR;
+const directories: string[] = [];
+function tmp(name: string): string {
+  const dir = makeTmpDir(name); directories.push(dir); return dir;
+}
 let root: string;
 let bridge: Bridge;
 let base: string;
@@ -10,25 +17,28 @@ let base: string;
 const REDIRECT_URI = "http://127.0.0.1:19999/callback";
 
 beforeAll(async () => {
-  isolateStateDir();
-  root = makeTmpDir("oauth-ws");
+  directories.push(isolateStateDir());
+  root = tmp("oauth-ws");
   write(root, "hello.txt", "hello oauth\n");
   bridge = await startBridge({
     workspaceRoot: root,
     port: 0,
     persistRuntime: false,
-    authStoreFile: path.join(makeTmpDir("auth"), "store.json"),
+    authStoreFile: path.join(tmp("auth"), "store.json"),
   });
   base = bridge.localBaseUrl();
 });
 
 afterAll(async () => {
-  await bridge.close();
-  cleanup(root);
+  try { await bridge?.close(); } finally {
+    if (previousState === undefined) delete process.env.C2C_STATE_DIR;
+    else process.env.C2C_STATE_DIR = previousState;
+    await cleanupStrict(...directories);
+  }
 });
 
 async function registerClient(): Promise<string> {
-  const response = await fetch(`${base}/oauth/register`, {
+  const response = await requestHttp(`${base}/oauth/register`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ client_name: "ChatGPT-Test", redirect_uris: [REDIRECT_URI] }),
@@ -53,12 +63,12 @@ async function authorizeWithPairing(
   authorizeUrl.searchParams.set("code_challenge_method", "S256");
   authorizeUrl.searchParams.set("scope", "workspace.read workspace.search git.read execution.read offline_access");
 
-  const pageResponse = await fetch(authorizeUrl, { redirect: "manual" });
+  const pageResponse = await requestHttp(authorizeUrl, { redirect: "manual" });
   const html = await pageResponse.text();
   const requestId = html.match(/name="request_id" value="([a-f0-9]+)"/)?.[1];
   if (!requestId) return { code: null, location: null, page: html, status: pageResponse.status };
 
-  const postResponse = await fetch(`${base}/oauth/authorize`, {
+  const postResponse = await requestHttp(`${base}/oauth/authorize`, {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({ request_id: requestId, pairing_code: pairingCode }),
@@ -77,7 +87,7 @@ async function exchangeToken(
   code: string,
   verifier: string
 ): Promise<{ status: number; body: Record<string, string> }> {
-  const response = await fetch(`${base}/oauth/token`, {
+  const response = await requestHttp(`${base}/oauth/token`, {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
@@ -93,7 +103,7 @@ async function exchangeToken(
 
 describe("discovery metadata", () => {
   it("serves protected resource metadata", async () => {
-    const response = await fetch(`${base}/.well-known/oauth-protected-resource/mcp`);
+    const response = await requestHttp(`${base}/.well-known/oauth-protected-resource/mcp`);
     expect(response.status).toBe(200);
     const body = (await response.json()) as { resource: string; authorization_servers: string[] };
     expect(body.resource).toContain("/mcp");
@@ -101,7 +111,7 @@ describe("discovery metadata", () => {
   });
 
   it("serves authorization server metadata with PKCE S256", async () => {
-    const response = await fetch(`${base}/.well-known/oauth-authorization-server`);
+    const response = await requestHttp(`${base}/.well-known/oauth-authorization-server`);
     const body = (await response.json()) as Record<string, unknown>;
     expect(body.code_challenge_methods_supported).toEqual(["S256"]);
     expect(body.grant_types_supported).toEqual(["authorization_code", "refresh_token"]);
@@ -125,7 +135,7 @@ describe("authorization + token flow", () => {
     expect(token.body.token_type).toBe("Bearer");
 
     // authorized MCP request
-    const mcpResponse = await fetch(`${base}/mcp`, {
+    const mcpResponse = await requestHttp(`${base}/mcp`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -153,18 +163,18 @@ describe("authorization + token flow", () => {
   });
 
   it("escapes the workspace name in the pairing page", async () => {
-    const xssWorkspaceRoot = makeTmpDir("oauth-html");
+    const xssWorkspaceRoot = tmp("oauth-html");
     write(xssWorkspaceRoot, ".c2c.json", JSON.stringify({ name: "<script>alert('xss')</script>" }));
     const xssBridge = await startBridge({
       workspaceRoot: xssWorkspaceRoot,
       port: 0,
       persistRuntime: false,
-      authStoreFile: path.join(makeTmpDir("auth-html"), "store.json"),
+      authStoreFile: path.join(tmp("auth-html"), "store.json"),
     });
 
     try {
       const xssBase = xssBridge.localBaseUrl();
-      const registration = await fetch(`${xssBase}/oauth/register`, {
+      const registration = await requestHttp(`${xssBase}/oauth/register`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ client_name: "HTML-Test", redirect_uris: [REDIRECT_URI] }),
@@ -180,7 +190,7 @@ describe("authorization + token flow", () => {
       authorizeUrl.searchParams.set("code_challenge", challenge);
       authorizeUrl.searchParams.set("code_challenge_method", "S256");
 
-      const response = await fetch(authorizeUrl, { redirect: "manual" });
+      const response = await requestHttp(authorizeUrl, { redirect: "manual" });
       expect(response.status).toBe(200);
       const html = await response.text();
 
@@ -202,7 +212,7 @@ describe("authorization + token flow", () => {
     authorizeUrl.searchParams.set("code_challenge", challenge);
     authorizeUrl.searchParams.set("code_challenge_method", "S256");
 
-    const response = await fetch(authorizeUrl, { redirect: "manual" });
+    const response = await requestHttp(authorizeUrl, { redirect: "manual" });
     expect(response.status).toBe(200);
     expect(response.headers.get("content-security-policy")).toBe(
       "default-src 'none'; style-src 'unsafe-inline'; form-action 'self' https:; base-uri 'none'; frame-ancestors 'none'"
@@ -240,13 +250,13 @@ describe("authorization + token flow", () => {
     authorizeUrl.searchParams.set("client_id", clientId);
     authorizeUrl.searchParams.set("redirect_uri", REDIRECT_URI);
     authorizeUrl.searchParams.set("response_type", "code");
-    const response = await fetch(authorizeUrl, { redirect: "manual" });
+    const response = await requestHttp(authorizeUrl, { redirect: "manual" });
     expect(response.status).toBe(302);
     expect(response.headers.get("location")).toContain("error=invalid_request");
   });
 
   it("rejects registration with non-https redirect uris", async () => {
-    const response = await fetch(`${base}/oauth/register`, {
+    const response = await requestHttp(`${base}/oauth/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ redirect_uris: ["http://evil.example.com/cb"] }),
@@ -257,7 +267,7 @@ describe("authorization + token flow", () => {
 
 describe("token enforcement on /mcp", () => {
   const mcpCall = (token?: string): Promise<Response> =>
-    fetch(`${base}/mcp`, {
+    requestHttp(`${base}/mcp`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -315,7 +325,7 @@ describe("refresh token rotation", () => {
     const initial = await exchangeToken(clientId, code!, verifier);
 
     const refresh = async (refreshToken: string): Promise<{ status: number; body: Record<string, string> }> => {
-      const response = await fetch(`${base}/oauth/token`, {
+      const response = await requestHttp(`${base}/oauth/token`, {
         method: "POST",
         headers: { "content-type": "application/x-www-form-urlencoded" },
         body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: refreshToken, client_id: clientId }),

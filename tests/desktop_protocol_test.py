@@ -100,9 +100,13 @@ class ProtocolTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.target = {"threadId": THREAD, "hostId": "local", "projectId": "project_test", "workspaceRoot": self.temp.name}
         self.pipe = FakePipe(self.target)
+        self.runtime_fence = {"desktopPid": 100, "desktopExe": self.pipe.server_exe, "desktopCreation": "10",
+                              "appServerPid": 101, "appServerExe": str(Path(self.temp.name) / "codex.exe"),
+                              "appServerCreation": "11"}
         rows = [{"pid": 100, "parentPid": 1, "name": "ChatGPT.exe", "exe": self.pipe.server_exe, "creation": 10},
                 {"pid": 101, "parentPid": 100, "name": "codex.exe",
-                 "exe": str(Path(self.temp.name) / "codex.exe"), "creation": 11}]
+                 "exe": str(Path(self.temp.name) / "codex.exe"), "creation": 11},
+                {"pid": os.getpid(), "parentPid": 101, "name": "test-runner.exe", "exe": "", "creation": 0}]
         self.state_file = Path(self.temp.name) / "global-state.json"
         self.state_file.write_text(json.dumps({
             "thread-project-assignments": {THREAD: {"projectKind": "local", "projectId": "project_test"}},
@@ -196,7 +200,7 @@ class ProtocolTests(unittest.TestCase):
         self.pipe.state["threadRuntimeStatus"] = {"type": "active"}
         self.pipe.state["requests"] = [{"kind": "approval"}]
         self.pipe.state["turns"] = [{"turnId": OLD_TURN, "status": "inProgress"}]
-        request = {"id": CLIENT, "op": "inspect", "target": self.target}
+        request = {"id": CLIENT, "op": "inspect_for_binding", "target": self.target}
         source = SimpleNamespace(buffer=io.BytesIO(protocol_common._json_bytes(request) + b"\n"))
         output = SimpleNamespace(buffer=io.BytesIO())
         with patch.object(sys, "stdin", source), patch.object(sys, "stdout", output):
@@ -239,7 +243,7 @@ class ProtocolTests(unittest.TestCase):
                 "turn-active": {"turnId": NEW_TURN, "status": "inProgress"},
             },
         }}
-        request = {"id": CLIENT, "op": "inspect", "target": self.target}
+        request = {"id": CLIENT, "op": "inspect_for_binding", "target": self.target}
         source = SimpleNamespace(buffer=io.BytesIO(protocol_common._json_bytes(request) + b"\n"))
         output = SimpleNamespace(buffer=io.BytesIO())
         with patch.object(sys, "stdin", source), patch.object(sys, "stdout", output):
@@ -268,6 +272,90 @@ class ProtocolTests(unittest.TestCase):
             self.assertEqual(session.send(message), {"threadId": THREAD, "turnId": NEW_TURN})
         self.assertEqual(len(self.pipe.starts()), 1)
         session.close()
+
+    def test_runtime_fence_pins_multi_candidate_inspect_and_send(self):
+        rows = protocol_identity._processes.return_value
+        rows.append({"pid": 121, "parentPid": 100, "name": "codex.exe",
+                     "exe": str(Path(self.temp.name) / "other-codex.exe"), "creation": 12})
+        fence = {"desktopPid": 100, "desktopExe": self.pipe.server_exe, "desktopCreation": "10",
+                 "appServerPid": 101, "appServerExe": str(Path(self.temp.name) / "codex.exe"),
+                 "appServerCreation": "11"}
+        session, info = protocol_operations._prepare(self.target, purpose="observe", runtime_fence=fence)
+        self.assertNotIn("runtimeFence", info)
+        session.close()
+        session, _ = protocol_operations._prepare(self.target, runtime_fence=fence)
+        message = "runtime fence"
+        item = {"type": "text", "text": message, "text_elements": []}
+        turn = {"turnId": NEW_TURN, "status": "inProgress", "params": {"input": [item]},
+                "items": [{"type": "userMessage", "content": [item]}]}
+        with self._inject_on_start([turn]):
+            self.assertEqual(session.send(message), {"threadId": THREAD, "turnId": NEW_TURN})
+        self.assertEqual(len(self.pipe.starts()), 1)
+        session.close()
+
+    def test_runtime_fence_rejects_wrong_pid_reuse_and_exe_drift(self):
+        base = {"desktopPid": 100, "desktopExe": self.pipe.server_exe, "desktopCreation": "10",
+                "appServerPid": 101, "appServerExe": str(Path(self.temp.name) / "codex.exe"),
+                "appServerCreation": "11"}
+        cases = [
+            {**base, "appServerPid": 999},
+            {**base, "appServerCreation": "12"},
+            {**base, "appServerExe": str(Path(self.temp.name) / "drift.exe")},
+            {**base, "desktopCreation": "12"},
+        ]
+        for fence in cases:
+            with self.subTest(fence=fence):
+                with self.assertRaises(protocol_common.DesktopIpcError) as caught:
+                    protocol_operations._prepare(self.target, runtime_fence=fence)
+                self.assertEqual(caught.exception.code, "DESKTOP_PROCESS_CHANGED")
+                self.assertEqual(self.pipe.starts(), [])
+
+    def test_dispatch_requires_runtime_fence_for_target_operations(self):
+        marker = {"resultTurnId": NEW_TURN, "itemIds": [], "itemTypes": [], "itemCount": 0,
+                  "itemSha256": protocol_result._result_activity_sha256([], [])}
+        expectation = {"workspaceId": "workspace_test", "commandId": "command_test", "intent": "development_plan",
+                       "messageBytes": 1, "messageSha256": "0" * 64, "originTurnId": NEW_TURN}
+        requests = [
+            {"id": CLIENT, "op": "inspect", "target": self.target},
+            {"id": CLIENT, "op": "prepare", "target": self.target},
+            {"id": CLIENT, "op": "inspect_active_execution", "target": self.target},
+            {"id": CLIENT, "op": "inspect_result_context", "target": self.target},
+            {"id": CLIENT, "op": "inspect_result_activity_marker", "target": self.target},
+            {"id": CLIENT, "op": "inspect_result_terminal_fence", "target": self.target, "marker": marker},
+            {"id": CLIENT, "op": "inspect_result_ownership", "target": self.target, "expectation": expectation},
+            {"id": CLIENT, "op": "reconcile_unknown", "target": self.target, "expectation": expectation},
+        ]
+        for request in requests:
+            source = SimpleNamespace(buffer=io.BytesIO(protocol_common._json_bytes(request) + b"\n"))
+            output = SimpleNamespace(buffer=io.BytesIO())
+            with self.subTest(op=request["op"]), patch.object(sys, "stdin", source), patch.object(sys, "stdout", output):
+                protocol_dispatch._main()
+            response = json.loads(output.buffer.getvalue())
+            self.assertFalse(response["ok"])
+            self.assertEqual(response["code"], "DESKTOP_RUNTIME_FENCE_MISSING")
+
+    def test_binding_discovery_returns_fence_and_rejects_ambiguous_candidates(self):
+        request = {"id": CLIENT, "op": "inspect_for_binding", "target": self.target}
+        source = SimpleNamespace(buffer=io.BytesIO(protocol_common._json_bytes(request) + b"\n"))
+        output = SimpleNamespace(buffer=io.BytesIO())
+        with patch.object(sys, "stdin", source), patch.object(sys, "stdout", output):
+            protocol_dispatch._main()
+        response = json.loads(output.buffer.getvalue())
+        self.assertTrue(response["ok"])
+        self.assertEqual(response["value"]["runtimeFence"], self.runtime_fence)
+
+        protocol_identity._processes.return_value.append({
+            "pid": 121, "parentPid": 100, "name": "codex.exe",
+            "exe": str(Path(self.temp.name) / "other-codex.exe"), "creation": 12,
+        })
+        source = SimpleNamespace(buffer=io.BytesIO(protocol_common._json_bytes(request) + b"\n"))
+        output = SimpleNamespace(buffer=io.BytesIO())
+        with patch.object(sys, "stdin", source), patch.object(sys, "stdout", output):
+            protocol_dispatch._main()
+        response = json.loads(output.buffer.getvalue())
+        self.assertFalse(response["ok"])
+        self.assertEqual(response["code"], "DESKTOP_PROCESS_CHANGED")
+        self.assertEqual(self.pipe.starts(), [])
 
     def test_post_start_waits_for_unique_inprogress_user_message_mirror(self):
         session, _ = protocol_operations._prepare(self.target)
@@ -627,6 +715,7 @@ class ProtocolTests(unittest.TestCase):
         process = {"desktopPid": 100, "desktopExe": str(Path(self.temp.name) / "ChatGPT.exe"),
                    "desktopCreation": 10, "appServerPid": 101,
                    "appServerExe": str(Path(self.temp.name) / "codex.exe"), "appServerCreation": 11}
+        self.assertEqual(info["runtimeFence"], {**process, "desktopCreation": "10", "appServerCreation": "11"})
         ancestor.assert_called_once_with(process)
         self.assertEqual(self.pipe.starts(), [])
 
@@ -1069,7 +1158,7 @@ class ProtocolTests(unittest.TestCase):
         def monotonic():
             return real_monotonic() + (protocol_common.SNAPSHOT_TIMEOUT_SECONDS + 1.0 if expired else 0.0)
 
-        def verify_process(*args):
+        def verify_process(*args, **kwargs):
             nonlocal expired, verify_calls
             verify_calls += 1
             if verify_calls == 3:
@@ -1104,7 +1193,7 @@ class ProtocolTests(unittest.TestCase):
                 self.pipe.state["turns"] = [{"turnId": OLD_TURN, "status": "inProgress"}]
                 calls = 0
 
-                def verify_process(*args):
+                def verify_process(*args, **kwargs):
                     nonlocal calls
                     calls += 1
                     if calls == 4:
@@ -1141,7 +1230,7 @@ class ProtocolTests(unittest.TestCase):
         def monotonic():
             return real_monotonic() + (protocol_common.SNAPSHOT_TIMEOUT_SECONDS + 1.0 if expired else 0.0)
 
-        def verify_process(*args):
+        def verify_process(*args, **kwargs):
             nonlocal calls, expired
             calls += 1
             if calls == 4:
@@ -1340,7 +1429,7 @@ class ProtocolTests(unittest.TestCase):
 
     def test_helper_process_is_single_attempt_even_with_new_control_ids(self):
         fake = SimpleNamespace(send=Mock(return_value={"threadId": THREAD, "turnId": NEW_TURN}), close=Mock())
-        messages = [{"id": CLIENT, "op": "prepare", "target": self.target},
+        messages = [{"id": CLIENT, "op": "prepare", "target": self.target, "runtimeFence": self.runtime_fence},
                     {"id": OLD_TURN, "op": "send", "message": "\x00" * 65536},
                     {"id": NEW_TURN, "op": "send", "message": "不能再发"}]
         source = SimpleNamespace(buffer=io.BytesIO(b"".join(protocol_common._json_bytes(m) + b"\n" for m in messages)))
@@ -1376,14 +1465,15 @@ class ProtocolTests(unittest.TestCase):
     def test_inspect_result_context_main_requires_exact_target_request(self):
         value = {"threadId": THREAD, "hostId": "local", "projectId": "project_test",
                  "workspaceRoot": str(Path.cwd()), "resultTurnId": OLD_TURN, "resultTurnStatus": "completed"}
-        request = {"id": CLIENT, "op": "inspect_result_context", "target": self.target}
+        request = {"id": CLIENT, "op": "inspect_result_context", "target": self.target,
+                   "runtimeFence": self.runtime_fence}
         source = SimpleNamespace(buffer=io.BytesIO(protocol_common._json_bytes(request) + b"\n"))
         output = SimpleNamespace(buffer=io.BytesIO())
         with patch.object(protocol_dispatch, "_inspect_result_context", return_value=value) as inspect, \
                 patch.object(sys, "stdin", source), patch.object(sys, "stdout", output):
             protocol_dispatch._main()
         self.assertEqual(json.loads(output.buffer.getvalue()), {"id": CLIENT, "ok": True, "value": value})
-        inspect.assert_called_once_with(self.target)
+        inspect.assert_called_once_with(self.target, runtime_fence=self.runtime_fence)
 
         invalid = {**request, "workspaceRoot": str(Path.cwd())}
         invalid["extra"] = True
@@ -1422,7 +1512,7 @@ class ProtocolTests(unittest.TestCase):
             return json.loads(output.buffer.getvalue())
 
         request = {"id": CLIENT, "op": "inspect_result_ownership", "target": self.target,
-                   "expectation": expectation}
+                   "expectation": expectation, "runtimeFence": self.runtime_fence}
         with patch.dict(os.environ, {}, clear=True), \
                 patch.object(protocol_result, "_verify_current_runner_ancestor", side_effect=AssertionError("runner check called")), \
                 patch.object(protocol_result, "_current_target", side_effect=AssertionError("current target used")):
@@ -1539,9 +1629,36 @@ class ProtocolTests(unittest.TestCase):
         bad_digest = {**marker, "itemSha256": "0" * 64}
         self.assertEqual(protocol_result._inspect_result_terminal_fence(self.target, bad_digest)["fence"], "unprovable")
 
+    def test_result_activity_marker_preserves_pre_record_steering_and_rejects_later_steering(self):
+        # Minimal content-free shape from command15: these are activity, not origin input.
+        items = [
+            {"id": "item-1", "type": "userMessage"},
+            {"id": "item-2", "type": "steeringUserMessage", "input": [],
+             "targetTurnId": NEW_TURN, "restoreMessage": {}, "compareKey": {}},
+            {"id": "item-3", "type": "steered"},
+            {"id": "item-4", "type": "commandExecution"},
+        ]
+        self._activity_state(items=items, runtime="inProgress", status="inProgress")
+        marker = protocol_result._inspect_result_activity_marker(self.target)["marker"]
+        self.assertEqual(marker["itemIds"], [item["id"] for item in items])
+        self.assertEqual(marker["itemTypes"], [item["type"] for item in items])
+        self.assertEqual(marker["itemCount"], 4)
+        self.assertEqual(set(marker), {"resultTurnId", "itemIds", "itemTypes", "itemCount", "itemSha256"})
+        self.assertEqual(protocol_result._inspect_result_terminal_fence(self.target, marker)["fence"], "inProgress")
+        self._activity_state(items=items + [{"id": "final", "type": "agentMessage"}])
+        self.assertEqual(protocol_result._inspect_result_terminal_fence(self.target, marker)["fence"], "safe_terminal")
+        for item_type in ("steeringUserMessage", "steered"):
+            with self.subTest(item_type=item_type):
+                self._activity_state(items=items + [{"id": "later", "type": item_type}])
+                self.assertEqual(protocol_result._inspect_result_terminal_fence(self.target, marker)["fence"], "post_record_activity")
+        self._activity_state(items=[items[0], items[2], items[1], items[3]])
+        self.assertEqual(protocol_result._inspect_result_terminal_fence(self.target, marker)["fence"], "unprovable")
+
     def test_result_activity_marker_unknown_or_malformed_item_fails_closed(self):
         for item in ({"type": "agentMessage"}, {"id": "item-1", "type": "futureItem"},
                      {"id": "item-1", "type": []},
+                     {"id": "bad id", "type": "steeringUserMessage"},
+                     [{"id": "item-1", "type": "steered"}, {"id": "item-1", "type": "steered"}],
                      [{"id": "item-1", "type": "userMessage"}, {"id": "item-1", "type": "agentMessage"}],
                      "malformed"):
             with self.subTest(item=item):
@@ -1550,27 +1667,48 @@ class ProtocolTests(unittest.TestCase):
                     protocol_result._inspect_result_activity_marker(self.target)
                 self.assertEqual(caught.exception.code, "DESKTOP_STATE_UNAVAILABLE")
 
+    def test_pending_receipt_operation_requires_marker_expectation_and_runtime_fence(self):
+        marker = {"resultTurnId": NEW_TURN, "itemIds": ["item-1"], "itemTypes": ["userMessage"], "itemCount": 1,
+                  "itemSha256": protocol_result._result_activity_sha256(["item-1"], ["userMessage"])}
+        request = {"id": CLIENT, "op": "inspect_pending_receipt", "target": self.target,
+                   "expectation": {}, "marker": marker, "runtimeFence": self.runtime_fence}
+        def response(value):
+            source = SimpleNamespace(buffer=io.BytesIO(protocol_common._json_bytes(value) + b"\n"))
+            output = SimpleNamespace(buffer=io.BytesIO())
+            with patch.object(sys, "stdin", source), patch.object(sys, "stdout", output):
+                protocol_dispatch._main()
+            return json.loads(output.buffer.getvalue())
+        with patch.object(protocol_dispatch, "_inspect_result_ownership", return_value={"fence": "safe_terminal"}) as inspect:
+            self.assertTrue(response(request)["ok"])
+            inspect.assert_called_once_with(self.target, {}, marker_value=marker, runtime_fence=self.runtime_fence)
+            for key in ["marker", "expectation", "runtimeFence", "target"]:
+                self.assertFalse(response({k: v for k, v in request.items() if k != key})["ok"])
+            self.assertFalse(response({**request, "marker": None})["ok"])
+            self.assertFalse(response({**request, "extra": True})["ok"])
+
     def test_result_activity_marker_operations_require_exact_target_shapes(self):
         marker = {"resultTurnId": NEW_TURN, "itemIds": [], "itemTypes": [], "itemCount": 0,
                   "itemSha256": protocol_result._result_activity_sha256([], [])}
         value = {"marker": marker}
-        request = {"id": CLIENT, "op": "inspect_result_activity_marker", "target": self.target}
+        request = {"id": CLIENT, "op": "inspect_result_activity_marker", "target": self.target,
+                   "runtimeFence": self.runtime_fence}
         source = SimpleNamespace(buffer=io.BytesIO(protocol_common._json_bytes(request) + b"\n"))
         output = SimpleNamespace(buffer=io.BytesIO())
         with patch.object(protocol_dispatch, "_inspect_result_activity_marker", return_value=value) as inspect, \
                 patch.object(sys, "stdin", source), patch.object(sys, "stdout", output):
             protocol_dispatch._main()
         self.assertEqual(json.loads(output.buffer.getvalue()), {"id": CLIENT, "ok": True, "value": value})
-        inspect.assert_called_once_with(self.target)
+        inspect.assert_called_once_with(self.target, runtime_fence=self.runtime_fence)
 
-        request = {"id": CLIENT, "op": "inspect_result_terminal_fence", "target": self.target, "marker": marker}
+        request = {"id": CLIENT, "op": "inspect_result_terminal_fence", "target": self.target, "marker": marker,
+                   "runtimeFence": self.runtime_fence}
         source = SimpleNamespace(buffer=io.BytesIO(protocol_common._json_bytes(request) + b"\n"))
         output = SimpleNamespace(buffer=io.BytesIO())
         with patch.object(protocol_dispatch, "_inspect_result_terminal_fence", return_value={"fence": "unprovable"}) as fence, \
                 patch.object(sys, "stdin", source), patch.object(sys, "stdout", output):
             protocol_dispatch._main()
         self.assertEqual(json.loads(output.buffer.getvalue()), {"id": CLIENT, "ok": True, "value": {"fence": "unprovable"}})
-        fence.assert_called_once_with(self.target, marker)
+        fence.assert_called_once_with(self.target, marker, runtime_fence=self.runtime_fence)
 
         invalid = {**request, "raw": "body"}
         source = SimpleNamespace(buffer=io.BytesIO(protocol_common._json_bytes(invalid) + b"\n"))
@@ -1755,6 +1893,14 @@ class ClassificationTests(unittest.TestCase):
                 self._classification_case(
                     "", continuation=True, trigger="resume_interrupted_task", predecessor_status=status)
             self.assertEqual(caught.exception.code, "DESKTOP_STATE_UNAVAILABLE")
+
+    def test_result_classification_does_not_treat_steering_user_message_as_resume_edge(self):
+        with self.assertRaises(protocol_common.DesktopIpcError) as caught:
+            self._classification_case(
+                "", continuation=True, trigger="resume_interrupted_task", predecessor_status="interrupted",
+                machine_items=[{"type": "steeringUserMessage"}],
+            )
+        self.assertEqual(caught.exception.code, "DESKTOP_STATE_UNAVAILABLE")
 
         for kwargs in (
             {"machine_input": [{"type": "text", "text": "ordinary input", "text_elements": []}]},

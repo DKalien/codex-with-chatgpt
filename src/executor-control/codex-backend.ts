@@ -2,9 +2,7 @@ import { deliverCurrentCommand } from "../routing/current-command-transport.js";
 import { readDesktop } from "../desktop/store.js";
 import type { Workspace } from "../workspace/manager.js";
 import {
-  executorTargetIdentityEquals,
   locatorExactEqual,
-  type ExecutorBinding,
   type ExecutorDeliveryTargetSnapshot,
 } from "../endpoints/schema.js";
 import { ExecutorControlError } from "./schema.js";
@@ -17,7 +15,7 @@ export interface ProductionSendRequest {
   readonly message: string;
   readonly userConfirmed: true;
   readonly clientId: string;
-  readonly activeBinding: ExecutorBinding;
+  /** R5e：backend 只认 dispatch ledger 冻结的 target snapshot；不再接收 Active binding。 */
   readonly target: ExecutorDeliveryTargetSnapshot;
   readonly authorize: () => void;
 }
@@ -47,26 +45,11 @@ function reject(code: string, message: string): never {
   throw new ExecutorControlError(code, message);
 }
 
-function assertSnapshotMatchesActiveBinding(
-  target: ExecutorDeliveryTargetSnapshot,
-  activeBinding: ExecutorBinding,
-): void {
-  if (!executorTargetIdentityEquals(target, activeBinding)) {
-    reject("EXECUTOR_BINDING_STALE", "delivery snapshot 与 active binding identity 不一致。");
-  }
-}
-
 function assertExactWorkspace(
   workspace: Workspace,
   target: ExecutorDeliveryTargetSnapshot,
-  activeBinding: ExecutorBinding,
 ): void {
-  if (
-    target.workspaceId !== workspace.id ||
-    target.workspaceRoot !== workspace.root ||
-    activeBinding.workspaceId !== workspace.id ||
-    activeBinding.workspaceRoot !== workspace.root
-  ) {
+  if (target.workspaceId !== workspace.id || target.workspaceRoot !== workspace.root) {
     reject("EXECUTOR_CONTROL_WORKSPACE_MISMATCH", "delivery target workspace 与当前 workspace 不一致。");
   }
 }
@@ -128,9 +111,8 @@ export class CodexDesktopProductionBackend implements ExecutorProductionBackend 
   readonly pluginId = CODEX_PLUGIN_ID;
 
   async send(request: ProductionSendRequest): Promise<ProductionSendResult> {
-    const { target, activeBinding, workspace } = request;
-    assertSnapshotMatchesActiveBinding(target, activeBinding);
-    assertExactWorkspace(workspace, target, activeBinding);
+    const { target, workspace } = request;
+    assertExactWorkspace(workspace, target);
     const projectId = assertExactCodexLocator(target);
     const legacyBindingId = assertGenericMatchesLegacyDesktop(workspace, target, projectId);
     const delivered = await deliverCurrentCommand(
@@ -153,9 +135,9 @@ export class CodexDesktopProductionBackend implements ExecutorProductionBackend 
     }
     return {
       commandId: delivery.commandId,
-      pluginId: activeBinding.pluginId,
-      bindingId: activeBinding.bindingId,
-      sessionId: activeBinding.sessionId,
+      pluginId: target.pluginId,
+      bindingId: target.bindingId,
+      sessionId: target.sessionId,
       deliveryStatus: delivery.deliveryStatus,
       ...(delivery.turnId ? { deliveryId: delivery.turnId } : {}),
       ...(delivery.error ? { error: delivery.error } : {}),
@@ -170,4 +152,4 @@ export function createCodexDesktopProductionBackend(): ExecutorProductionBackend
   return new CodexDesktopProductionBackend();
 }
 
-export { assertSnapshotMatchesActiveBinding, assertExactCodexLocator, locatorExactEqual };
+export { assertExactCodexLocator, locatorExactEqual };

@@ -9,11 +9,12 @@ import {
   withExecutionRecordsLock,
   type StoredExecutionRecord,
 } from "../execution/records.js";
-import { listExecutionOutputs, readExecutionOutputMetadataStrict, MAX_OUTPUT_RECORDS, type ExecutionOutputMeta } from "../execution/output.js";
+import { readExecutionOutputIndexStrict, MAX_OUTPUT_RECORDS, type OutputIndex, type ExecutionOutputMeta } from "../execution/output.js";
 import { DesktopError, desktopId, readDesktop, type DesktopDelivery } from "./store.js";
 import { getRetiredLegacyCommandIds, readLegacyRetirements } from "./legacy-retirement.js";
 import { getAbandonedCommandIds, readAbandonedCommandIds } from "./abandonment.js";
 import { LegacyReconciliationError, withEvidenceLock } from "./recovery-evidence.js";
+import { withCommandOperation } from "../command-cleanup/fence.js";
 export { LegacyReconciliationError, withEvidenceLock } from "./recovery-evidence.js";
 
 const terminalStatuses = new Set(["ok", "failed", "blocked"]);
@@ -80,25 +81,25 @@ type DesktopFactsSources = {
   workspace: LegacyReconciliationWorkspace;
   desktop: ReturnType<typeof readDesktop>;
   records: StoredExecutionRecord[];
-  outputs: ExecutionOutputMeta[];
+  outputIndex: OutputIndex;
 };
 
-function evidenceDir(): string {
-  return path.join(getStateDir(), "desktop-legacy-reconciliation");
+function evidenceDir(stateDir = getStateDir()): string {
+  return path.join(path.resolve(stateDir), "desktop-legacy-reconciliation");
 }
 
-export function legacyReconciliationFile(workspaceId: string): string {
-  return path.join(evidenceDir(), `${desktopId.parse(workspaceId)}.json`);
+export function legacyReconciliationFile(workspaceId: string, stateDir = getStateDir()): string {
+  return path.join(evidenceDir(stateDir), `${desktopId.parse(workspaceId)}.json`);
 }
 
-function markerFile(workspaceId: string): string {
-  return `${legacyReconciliationFile(workspaceId)}.initialized`;
+function markerFile(workspaceId: string, stateDir = getStateDir()): string {
+  return `${legacyReconciliationFile(workspaceId, stateDir)}.initialized`;
 }
 
 
-function hasTemporaryEvidence(workspaceId: string): boolean {
-  const dir = path.dirname(legacyReconciliationFile(workspaceId));
-  const base = path.basename(legacyReconciliationFile(workspaceId));
+function hasTemporaryEvidence(workspaceId: string, stateDir = getStateDir()): boolean {
+  const dir = path.dirname(legacyReconciliationFile(workspaceId, stateDir));
+  const base = path.basename(legacyReconciliationFile(workspaceId, stateDir));
   try {
     return fs.readdirSync(dir).some(name => name.startsWith(`${base}.`) && name.endsWith(".tmp"));
   } catch (error) {
@@ -111,11 +112,11 @@ function corruptStore(message = "遗留 reconciliation 证据损坏或未完成�
   throw new LegacyReconciliationError("LEGACY_RECONCILIATION_STORE_CORRUPT", message);
 }
 
-function readEvidenceState(workspaceId: string): { version: 1; workspaceId: string; entries: LegacyReconciliationEvidence[] } {
-  const file = legacyReconciliationFile(workspaceId);
-  if (hasTemporaryEvidence(workspaceId)) corruptStore();
+function readEvidenceState(workspaceId: string, stateDir = getStateDir()): { version: 1; workspaceId: string; entries: LegacyReconciliationEvidence[] } {
+  const file = legacyReconciliationFile(workspaceId, stateDir);
+  if (hasTemporaryEvidence(workspaceId, stateDir)) corruptStore();
   const exists = fs.existsSync(file);
-  const marker = fs.existsSync(markerFile(workspaceId));
+  const marker = fs.existsSync(markerFile(workspaceId, stateDir));
   if (!exists) {
     if (marker) corruptStore("遗留 reconciliation 主文件缺失；拒绝重置证据。");
     return { version: 1, workspaceId, entries: [] };
@@ -129,9 +130,9 @@ function readEvidenceState(workspaceId: string): { version: 1; workspaceId: stri
   return state.data;
 }
 
-function writeEvidenceState(workspaceId: string, state: { version: 1; workspaceId: string; entries: LegacyReconciliationEvidence[] }): void {
-  const file = legacyReconciliationFile(workspaceId);
-  const marker = markerFile(workspaceId);
+function writeEvidenceState(workspaceId: string, state: { version: 1; workspaceId: string; entries: LegacyReconciliationEvidence[] }, stateDir = getStateDir()): void {
+  const file = legacyReconciliationFile(workspaceId, stateDir);
+  const marker = markerFile(workspaceId, stateDir);
   const temporary = `${file}.${randomUUID()}.tmp`;
   const parsed = evidenceStateSchema.parse(state);
   const fd = fs.openSync(temporary, "wx", 0o600);
@@ -167,7 +168,8 @@ function parseAcceptedAt(delivery: DesktopDelivery): number {
 }
 
 function factsFromSources(sources: DesktopFactsSources, commandId: string, evidence?: LegacyReconciliationEvidence): ReconciliationFacts {
-  const { workspace, desktop, records, outputs } = sources;
+  const { workspace, desktop, records, outputIndex } = sources;
+  const outputs = outputIndex.items;
   const requestedId = desktopId.safeParse(commandId);
   if (!requestedId.success) throw new LegacyReconciliationError("LEGACY_RECONCILIATION_INVALID", "commandId 格式无效；拒绝遗留 reconciliation。");
 
@@ -213,7 +215,18 @@ function factsFromSources(sources: DesktopFactsSources, commandId: string, evide
         (parsed && (!parsed.success || JSON.stringify(parsed.data) !== JSON.stringify(snapshot)))) {
       throw new LegacyReconciliationError("LEGACY_RECONCILIATION_CONFLICT", "output metadata 与独立证据不一致；拒绝复用。");
     }
-    if (!output && outputs.length === MAX_OUTPUT_RECORDS && outputs.every(item => item.id > snapshot.id)) {
+    // Allocation distance alone is insufficient: transient outputs may be cleaned
+    // before capacity is reached, and orphan body IDs may be skipped. New indexes
+    // retain the actual eviction watermark. For legacy indexes, nextId - 1 is the
+    // last COMMITTED allocation (even after orphan skipping); all still-retained
+    // earlier items coexisted with it. Capacity newer outputs at that commit proves
+    // this unowned snapshot had to be evicted. Cleanup never increments nextId.
+    const lastAllocated = outputIndex.nextId - 1;
+    const newerAtLastCommit = outputs.filter(item => item.id > snapshot.id && item.id < lastAllocated).length + 1;
+    const retentionProven = (outputIndex.retentionThrough ?? 0) >= snapshot.id ||
+      (lastAllocated > snapshot.id && newerAtLastCommit >= MAX_OUTPUT_RECORDS);
+    if (!output && outputIndex.nextId - snapshot.id - 1 >= MAX_OUTPUT_RECORDS &&
+      outputs.every(item => item.id > snapshot.id) && retentionProven) {
       output = snapshot;
     }
   }
@@ -230,15 +243,15 @@ function factsFromSources(sources: DesktopFactsSources, commandId: string, evide
   return { delivery, record, output, proofSha256 };
 }
 
-function readFactsSources(workspace: LegacyReconciliationWorkspace, readOnly = false): DesktopFactsSources {
+function readFactsSources(workspace: LegacyReconciliationWorkspace): DesktopFactsSources {
   const desktop = readDesktop(workspace.id);
   let records: StoredExecutionRecord[];
   try { records = readExecutionRecordsStrict(workspace.id); }
   catch { throw new LegacyReconciliationError("LEGACY_RECONCILIATION_RECORDS_CORRUPT", "execution JSONL 损坏或不完整；拒绝遗留 reconciliation。"); }
-  let outputs: ExecutionOutputMeta[];
-  try { outputs = readOnly ? readExecutionOutputMetadataStrict(workspace.id) : listExecutionOutputs(workspace.id, Number.MAX_SAFE_INTEGER); }
+  let outputIndex: OutputIndex;
+  try { outputIndex = readExecutionOutputIndexStrict(workspace.id); }
   catch { throw new LegacyReconciliationError("LEGACY_RECONCILIATION_OUTPUT_CORRUPT", "execution output index 损坏；拒绝遗留 reconciliation。"); }
-  return { workspace, desktop, records, outputs };
+  return { workspace, desktop, records, outputIndex };
 }
 
 function factsFor(workspace: LegacyReconciliationWorkspace, commandId: string, evidence?: LegacyReconciliationEvidence): ReconciliationFacts {
@@ -271,9 +284,16 @@ export function legacyReconciliationProof(
   return createHash("sha256").update(JSON.stringify(source), "utf8").digest("hex");
 }
 
-export function readLegacyReconciliations(workspaceId: string): LegacyReconciliationEvidence[] {
+export function readLegacyReconciliations(workspaceId: string, stateDir = getStateDir()): LegacyReconciliationEvidence[] {
   desktopId.parse(workspaceId);
-  return readEvidenceState(workspaceId).entries;
+  return readEvidenceState(workspaceId, stateDir).entries;
+}
+
+/** Must run under the shared evidence lock; removes only this command's strict evidence. */
+export function removeLegacyReconciliationForCommand(workspaceId: string, commandId: string, stateDir = getStateDir()): void {
+  const state = readEvidenceState(desktopId.parse(workspaceId), stateDir);
+  const entries = state.entries.filter(entry => entry.commandId !== desktopId.parse(commandId));
+  if (entries.length !== state.entries.length) writeEvidenceState(workspaceId, { ...state, entries }, stateDir);
 }
 
 function verifyEvidence(sources: DesktopFactsSources, entry: LegacyReconciliationEvidence): void {
@@ -302,7 +322,7 @@ export function listLegacyReconciliations(workspace: LegacyReconciliationWorkspa
   catch (error) {
     if (!(error instanceof DesktopError) || !["LEGACY_RETIREMENT_CONFLICT", "LEGACY_RETIREMENT_NOT_ELIGIBLE"].includes(error.code)) throw error;
   }
-  const sources = readFactsSources(workspace, true);
+  const sources = readFactsSources(workspace);
   if (sources.desktop && sources.desktop.workspaceRoot !== workspace.root) {
     throw new LegacyReconciliationError("LEGACY_RECONCILIATION_CONFLICT", "Desktop workspace 不一致；拒绝发现。");
   }
@@ -366,6 +386,11 @@ export function reconcileLegacyAccepted(
   commandId: string,
 ): LegacyReconciliationResult {
   const workspace = { id: desktopId.parse(workspaceRaw.id), root: workspaceRaw.root };
+  const selected = desktopId.parse(commandId);
+  return withCommandOperation(workspace.id, selected, () => reconcileLegacyAcceptedLocked(workspace, selected));
+}
+
+function reconcileLegacyAcceptedLocked(workspace: LegacyReconciliationWorkspace, commandId: string): LegacyReconciliationResult {
   const rejectRetired = (): void => {
     if (readLegacyRetirements(workspace.id).some(entry => entry.commandId === commandId) || readAbandonedCommandIds(workspace.id).has(commandId)) {
       throw new LegacyReconciliationError("LEGACY_RECONCILIATION_CONFLICT", "已 retirement/abandonment 的 commandId 不得 reconciliation。");

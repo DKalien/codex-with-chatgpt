@@ -24,6 +24,8 @@ from .common import (
 )
 from .identity import (
     _current_target,
+    _decode_runtime_fence,
+    _encode_runtime_fence,
     _query_standard_token,
     _verify_current_runner_ancestor,
     _verify_process_identity,
@@ -49,7 +51,7 @@ def _public_info(state: dict[str, Any], target: dict[str, str], client: _IpcClie
     if (not isinstance(title, str) or not title.strip() or len(title) > 300 or not isinstance(cwd, str)
             or not isinstance(runtime_status, str)):
         raise _error("DESKTOP_STATE_UNAVAILABLE")
-    return {
+    info = {
         "threadId": target["threadId"],
         "hostId": target["hostId"],
         "projectId": target["projectId"],
@@ -62,6 +64,7 @@ def _public_info(state: dict[str, Any], target: dict[str, str], client: _IpcClie
         "requestsCount": len(state.get("requests", [])),
         "ownerClientId": client.owner,
     }
+    return info
 
 
 @dataclass
@@ -180,15 +183,19 @@ class _Prepared:
 
 
 def _prepare(target: dict[str, str], *, purpose: str = "send",
-             require_runner_ancestor: bool = False) -> tuple[_Prepared, dict[str, Any]]:
+             require_runner_ancestor: bool = False,
+             runtime_fence: Any = None,
+             include_runtime_fence: bool = False) -> tuple[_Prepared, dict[str, Any]]:
     """purpose="observe" 只观察（忙/请求/未确认提交都允许）；purpose="send" 才做 send-ready gate。"""
     if purpose not in {"observe", "send"}:
         raise _error("DESKTOP_INVALID_REQUEST")
     _query_standard_token()
     process: dict[str, Any] | None = None
+    expected = _decode_runtime_fence(runtime_fence) if runtime_fence is not None else None
     pipe = _Pipe()
     try:
-        process = _verify_process_identity(pipe, target)
+        process = (_verify_process_identity(pipe, target, expected=expected, require_runner_ancestor=True)
+                   if require_runner_ancestor else _verify_process_identity(pipe, target, expected=expected))
         client = _IpcClient(pipe, target["threadId"], target["hostId"])
         client.initialize()
         client.discover()
@@ -208,11 +215,15 @@ def _prepare(target: dict[str, str], *, purpose: str = "send",
                 raise _error("DESKTOP_STATE_UNAVAILABLE")
             _validate_observed_state(state, target, client.owner or "")
             info = _public_info(state, target, client)
-        process = _verify_process_identity(pipe, target, process)
+        process = (_verify_process_identity(pipe, target, process, require_runner_ancestor=True)
+                   if require_runner_ancestor else _verify_process_identity(pipe, target, process))
         if require_runner_ancestor:
             _verify_current_runner_ancestor(process)
         if client.snapshot_age() > MAX_OBSERVATION_AGE_SECONDS:
             raise _error("DESKTOP_STATE_UNAVAILABLE")
+        if include_runtime_fence and all(key in process for key in (
+                "desktopPid", "desktopExe", "desktopCreation", "appServerPid", "appServerExe", "appServerCreation")):
+            info["runtimeFence"] = _encode_runtime_fence(process)
         prepared = _Prepared(target, pipe, client, process)
         return prepared, info
     except DesktopIpcError as error:
@@ -230,11 +241,12 @@ def _prepare(target: dict[str, str], *, purpose: str = "send",
         raise _error("DESKTOP_INTERNAL_ERROR")
 
 
-def _reconcile_unknown(target: dict[str, str], expectation_value: Any) -> dict[str, Any]:
+def _reconcile_unknown(target: dict[str, str], expectation_value: Any, *, runtime_fence: Any = None) -> dict[str, Any]:
     """Re-attest a possibly delivered command against two stable observations."""
     target = _target(target)
     expectation = _reconcile_expectation(expectation_value)
-    session, _ = _prepare(target, purpose="observe")
+    kwargs = {"runtime_fence": runtime_fence} if runtime_fence is not None else {}
+    session, _ = _prepare(target, purpose="observe", **kwargs)
     try:
         before = session.client.current_state()
         if before is None or session.client.snapshot_age() > MAX_OBSERVATION_AGE_SECONDS:
@@ -266,14 +278,16 @@ def _diagnose(workspace_root: Any) -> dict[str, Any]:
     pipe = _Pipe()
     session: _IpcClient | None = None
     try:
-        before = _verify_process_identity(pipe, target)
+        before = _verify_process_identity(pipe, target, require_runner_ancestor=True)
+        _verify_current_runner_ancestor(before)
         session = _IpcClient(pipe, target["threadId"], target["hostId"])
         session.initialize()
         owner = session.discover()
         state = session.snapshot()
         if not isinstance(state, dict):
             raise _error("DESKTOP_STATE_UNAVAILABLE")
-        _verify_process_identity(pipe, target, before)
+        after = _verify_process_identity(pipe, target, before, require_runner_ancestor=True)
+        _verify_current_runner_ancestor(after)
         return {
             "mode": "behavioral",
             "processStable": True,
@@ -292,8 +306,10 @@ def _diagnose(workspace_root: Any) -> dict[str, Any]:
 
 def _current_identity_checked(workspace_root: Any) -> dict[str, Any]:
     target = _current_target(workspace_root)
-    session, info = _prepare(target, purpose="observe", require_runner_ancestor=True)
+    session, info = _prepare(target, purpose="observe", require_runner_ancestor=True, include_runtime_fence=True)
     try:
+        if not isinstance(info.get("runtimeFence"), dict):
+            raise _error("DESKTOP_PROCESS_CHANGED")
         return info
     finally:
         session.close()
@@ -305,6 +321,10 @@ def _same_current_identity(left: dict[str, Any], right: dict[str, Any]) -> bool:
         if left.get(key) != right.get(key):
             return False
     return _normalize_path(str(left.get("cwd", ""))) == _normalize_path(str(right.get("cwd", "")))
+
+
+def _same_process_fence(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    return left.get("runtimeFence") == right.get("runtimeFence")
 
 
 def _display_metadata(value: str) -> str:
@@ -360,6 +380,8 @@ def _current_confirm(workspace_root: Any) -> dict[str, Any]:
     if confirmed is not True:
         raise _error("DESKTOP_CONFIRMATION_CANCELLED")
     after = _current_identity_checked(workspace_root)
+    if not _same_process_fence(before, after):
+        raise _error("DESKTOP_PROCESS_CHANGED")
     if not _same_current_identity(before, after):
         raise _error("DESKTOP_CURRENT_CONTEXT_INVALID")
     return after

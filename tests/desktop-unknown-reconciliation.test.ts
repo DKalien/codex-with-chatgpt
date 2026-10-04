@@ -17,6 +17,14 @@ const secondTurnId = "01a00000-0000-7000-8000-000000000003";
 const bindingId = "01a00000-0000-7000-8000-000000000004";
 const commandId = "unknown_command";
 const message = "[C2C_CONTROL]\nSTATE: COMMAND\n只读检查";
+const runtimeFence = {
+  desktopPid: 1001,
+  desktopExe: "C:\\Program Files\\ChatGPT\\ChatGPT.exe",
+  desktopCreation: "1000001",
+  appServerPid: 1002,
+  appServerExe: "C:\\Program Files\\ChatGPT\\codex.exe",
+  appServerCreation: "1000002",
+};
 
 let root: string;
 let stateDir: string;
@@ -31,6 +39,7 @@ function seedDelivery(overrides: Record<string, unknown> = {}): void {
       workspaceRoot: workspace.root,
       revision: 1,
       enabled: true,
+      runtimeFence,
       binding: {
         threadId,
         hostId: "local" as const,

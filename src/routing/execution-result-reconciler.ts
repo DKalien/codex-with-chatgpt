@@ -15,6 +15,7 @@ import {
 } from "./result-outbox-store.js";
 import { reconcileWorkspaceResultBus } from "../result-bus/service.js";
 import { RoutingError, routingCommandIdSchema } from "./schema.js";
+import { withCommandOperation } from "../command-cleanup/fence.js";
 
 export type DesktopExecutionResultReconciliation =
   | { status: "not_applicable"; reason: "routing_command_missing" }
@@ -31,6 +32,10 @@ export type DesktopExecutionResultReconciliation =
 export type ResultBusShadowOutcome =
   | { status: "reconciled"; projected: number; replayed: number }
   | { status: "failed"; reasonCode: string };
+
+type DesktopExecutionResultReconciliationCore =
+  | Exclude<DesktopExecutionResultReconciliation, { status: "reconciled" }>
+  | Omit<Extract<DesktopExecutionResultReconciliation, { status: "reconciled" }>, "resultBus">;
 
 function resultBusReasonCode(error: unknown): string {
   const code = reasonCode(error);
@@ -57,8 +62,15 @@ function recordFailure(
   error: unknown,
 ): DesktopExecutionResultReconciliation {
   const code = reasonCode(error);
+  if (code.startsWith("COMMAND_CLEANUP_"))
+    return { status: "reconciliation_needed", reasonCode: code, issuePersisted: false };
   try {
-    markResultReconciliationNeeded(identity, { commandId, reasonCode: code });
+    // Cleanup may complete after the failed operation releases its lifecycle lock.
+    withCommandOperation(identity.id, commandId, () => {
+      if (!readRouting(identity)?.commands.some(item => item.commandId === commandId))
+        throw new RoutingError("ROUTING_COMMAND_NOT_FOUND", "reconciliation source 已不存在；不重新建立诊断 authority。");
+      markResultReconciliationNeeded(identity, { commandId, reasonCode: code });
+    });
     return { status: "reconciliation_needed", reasonCode: code, issuePersisted: true };
   } catch {
     return { status: "reconciliation_needed", reasonCode: code, issuePersisted: false };
@@ -115,24 +127,25 @@ export function reconcileTrustedDesktopExecutionResult(
   }
 
   try {
-    let state = readRouting(identity);
-    let command = state?.commands.find(item => item.commandId === parsedCommandId.data);
-    if (!command) return { status: "not_applicable", reason: "routing_command_missing" };
-    if (command.deliveryStatus === "outcome_unknown") {
-      synchronizeUnknownCommandDelivery(identity, command.commandId, state!);
-      state = readRouting(identity);
-      command = state?.commands.find(item => item.commandId === parsedCommandId.data);
+    const core: DesktopExecutionResultReconciliationCore = withCommandOperation(identity.id, parsedCommandId.data, () => {
+      let state = readRouting(identity);
+      let command = state?.commands.find(item => item.commandId === parsedCommandId.data);
       if (!command) return { status: "not_applicable", reason: "routing_command_missing" };
-    }
-    if (command.deliveryStatus !== "accepted") {
-      throw new RoutingError("ROUTING_COMMAND_NOT_ACCEPTED", "canonical result 只接受已确认 Desktop delivery 的 Command。");
-    }
-    const planner = state!.routes.find(route => route.routeId === command.plannerRouteId);
-    if (!planner || planner.role !== "planner") {
-      throw new RoutingError("ROUTING_RESULT_PLANNER_INVALID", "persisted Command.plannerRouteId 未解析为本 workspace planner route。");
-    }
+      if (command.deliveryStatus === "outcome_unknown") {
+        synchronizeUnknownCommandDelivery(identity, command.commandId, state!);
+        state = readRouting(identity);
+        command = state?.commands.find(item => item.commandId === parsedCommandId.data);
+        if (!command) return { status: "not_applicable", reason: "routing_command_missing" };
+      }
+      if (command.deliveryStatus !== "accepted") {
+        throw new RoutingError("ROUTING_COMMAND_NOT_ACCEPTED", "canonical result 只接受已确认 Desktop delivery 的 Command。");
+      }
+      const planner = state!.routes.find(route => route.routeId === command.plannerRouteId);
+      if (!planner || planner.role !== "planner") {
+        throw new RoutingError("ROUTING_RESULT_PLANNER_INVALID", "persisted Command.plannerRouteId 未解析为本 workspace planner route。");
+      }
 
-    return withExecutionRecordsLock(identity.id, () => {
+      return withExecutionRecordsLock(identity.id, () => {
       try {
         const records = readExecutionRecordsStrict(identity.id);
         const taskId = `desktop_${command.commandId}`;
@@ -189,7 +202,6 @@ export function reconcileTrustedDesktopExecutionResult(
         // R4 result/outbox are durably committed above; the Result Bus shadow is
         // reconciled afterwards and isolated so a bus-side failure can never
         // suppress or invalidate the already valid R4 delivery state.
-        const resultBus = reconcileResultBusShadow(identity);
         return {
           status: "reconciled",
           resultId: result.resultId,
@@ -197,12 +209,16 @@ export function reconcileTrustedDesktopExecutionResult(
           resultReplayed,
           outboxEntryId: queued.entry.outboxEntryId,
           outboxReplayed: queued.replayed,
-          resultBus,
         };
       } catch (error) {
         return recordFailure(identity, command.commandId, error);
       }
+      });
     });
+    if (core.status !== "reconciled") return core;
+    // Batch Result Bus reconciliation must reread its source only after releasing this
+    // command lock; otherwise a multi-command snapshot could invert lifecycle lock order.
+    return { ...core, resultBus: reconcileResultBusShadow(identity) };
   } catch (error) {
     return recordFailure(identity, parsedCommandId.data, error);
   }

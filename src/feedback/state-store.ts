@@ -2,6 +2,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { ensureDir, getStateDir } from "../config/paths.js";
+import { assertFeedbackCommandSnapshot, withFeedbackCommandLocks } from "./command-locks.js";
+import { assertNoLegacyHistoryCleanup } from "../command-cleanup/legacy-history-fence.js";
 import {
   FEEDBACK_CLAIM_STALE_MS,
   FEEDBACK_RESERVATION_STALE_MS,
@@ -47,8 +49,18 @@ function readState(workspaceId: string, stateDir: string): FeedbackState | null 
   }
 }
 
-export function writeState(workspaceId: string, stateDir: string, state: FeedbackState): void {
+export function writeState(
+  workspaceId: string,
+  stateDir: string,
+  state: FeedbackState,
+  options: { allowPreparedCleanupId?: string } = {},
+): void {
+  assertNoLegacyHistoryCleanup(workspaceId, stateDir);
   const file = feedbackStateFile(workspaceId, stateDir);
+  const prepared = readState(workspaceId, stateDir)?.cleanupAdjustments?.find(item => item.state === "prepared");
+  if (prepared && prepared.cleanupId !== options.allowPreparedCleanupId) {
+    throw new FeedbackError("FEEDBACK_CURSOR_CLEANUP_PENDING", "command cleanup cursor adjustment 已 prepared；拒绝其它 Feedback state mutation。");
+  }
   ensureDir(path.dirname(file));
   const tmp = `${file}.${randomUUID()}.tmp`;
   let fd = -1;
@@ -69,6 +81,7 @@ export function writeState(workspaceId: string, stateDir: string, state: Feedbac
 }
 
 export function withFeedbackLock<T>(workspaceId: string, stateDir: string, fn: (read: () => FeedbackState | null) => T): T {
+  assertNoLegacyHistoryCleanup(workspaceId, stateDir);
   const file = feedbackStateFile(workspaceId, stateDir);
   ensureDir(path.dirname(file));
   const lock = `${file}.lock`;
@@ -81,6 +94,7 @@ export function withFeedbackLock<T>(workspaceId: string, stateDir: string, fn: (
   try {
     fs.writeSync(fd, JSON.stringify({ pid: process.pid, createdAt: Date.now() }));
     fs.fsyncSync(fd);
+    assertNoLegacyHistoryCleanup(workspaceId, stateDir);
     return fn(() => readState(workspaceId, stateDir));
   } finally {
     try { fs.closeSync(fd); } catch { /* ignore */ }
@@ -111,6 +125,11 @@ export function readFeedbackState(workspaceId: string, stateDir = getStateDir())
     );
   }
   return existing;
+}
+
+/** Status only: absence is disabled, never initialize a cursor or acquire lifecycle locks. */
+export function readFeedbackStatusState(workspaceId: string, stateDir = getStateDir()): FeedbackState {
+  return readState(workspaceId, stateDir) ?? emptyState(workspaceId);
 }
 
 /** 首次建立 state：cursor = 当前 execution record 数量（历史 baseline，不投影）。 */
@@ -173,18 +192,38 @@ export function recoverStaleInMemory(state: FeedbackState, nowMs: number): Feedb
   return recoverStaleReserved(recoverStaleClaimed(state, nowMs), nowMs);
 }
 
-/** 锁内 stale convergence；reconcile 每次调用，resident 重开仅 status 即可恢复。 */
+/** Lock every command represented in the snapshot before taking the shared Feedback store lock. */
+export function withFeedbackCommandSnapshotLock<T>(
+  workspaceId: string,
+  stateDir: string,
+  action: (state: FeedbackState) => T,
+): T {
+  const snapshot = readFeedbackState(workspaceId, stateDir);
+  const commandIds = snapshot.events.map(event => event.commandId);
+  // ponytail: stale recovery scans the workspace event list; lock all IDs until recovery can target one event.
+  return withFeedbackCommandLocks(workspaceId, commandIds, stateDir, () => withFeedbackLock(workspaceId, stateDir, read => {
+    const current = requireInitializedState(read(), workspaceId);
+    assertFeedbackCommandSnapshot(commandIds, current.events.map(event => event.commandId));
+    return action(current);
+  }));
+}
+
+/** Explicit stale maintenance locks only events whose durable status will change. */
 export function recoverStaleFeedback(
   workspaceId: string,
   stateDir = getStateDir(),
   nowMs: number = Date.now(),
 ): FeedbackState {
-  return withFeedbackLock(workspaceId, stateDir, (read) => {
+  const changedIds = (state: FeedbackState) => recoverStaleInMemory(state, nowMs).events
+    .filter((event, index) => event !== state.events[index]).map(event => event.commandId);
+  const snapshot = readFeedbackState(workspaceId, stateDir);
+  const ids = changedIds(snapshot);
+  if (!ids.length) return snapshot;
+  return withFeedbackCommandLocks(workspaceId, ids, stateDir, () => withFeedbackLock(workspaceId, stateDir, read => {
     const previous = requireInitializedState(read(), workspaceId);
+    assertFeedbackCommandSnapshot(ids, changedIds(previous));
     const recovered = recoverStaleInMemory(previous, nowMs);
-    if (recovered !== previous) {
-      writeState(workspaceId, stateDir, recovered);
-    }
+    if (recovered !== previous) writeState(workspaceId, stateDir, recovered);
     return recovered;
-  });
+  }));
 }

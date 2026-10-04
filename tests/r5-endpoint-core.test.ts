@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   EndpointSchemaError,
   PluginRegistryError,
@@ -46,10 +46,20 @@ import {
   type ExecutorDescriptor,
   type ExecutorTarget,
 } from "../src/executor/index.js";
+import { updateDesktop } from "../src/desktop/store.js";
+import { cleanup, makeTmpDir } from "./helpers.js";
 
 const workspaceId = "2582910bf0d2";
 const workspaceRoot = "D:\\python\\codex-with-chatgpt";
 const instant = "2026-09-29T00:00:00.000Z";
+const runtimeFence = {
+  desktopPid: 1001,
+  desktopExe: "C:\\Program Files\\ChatGPT\\ChatGPT.exe",
+  desktopCreation: "1000001",
+  appServerPid: 1002,
+  appServerExe: "C:\\Program Files\\ChatGPT\\codex.exe",
+  appServerCreation: "1000002",
+};
 
 function validCandidate(overrides: Partial<ExecutorBindingCandidate> = {}): ExecutorBindingCandidate {
   return parseExecutorBindingCandidate({
@@ -601,6 +611,30 @@ describe("R5a Codex Desktop adapter compatibility", () => {
 });
 
 describe("R5a Codex deliver with injected fake adapter", () => {
+  let stateDir = "";
+
+  beforeEach(() => {
+    stateDir = makeTmpDir("r5-endpoint-core-state");
+    vi.stubEnv("C2C_STATE_DIR", stateDir);
+    updateDesktop(workspaceId, () => ({
+      state: {
+        version: 1,
+        workspaceId,
+        workspaceRoot,
+        enabled: false,
+        binding: null,
+        runtimeFence,
+        deliveries: [],
+      },
+      result: undefined,
+    }));
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    cleanup(stateDir);
+  });
+
   const target: ExecutorTarget = {
     threadId: "01a0d6cd-09f3-73e3-9726-4bd65df196d3",
     hostId: "local",
@@ -823,5 +857,15 @@ describe("R5a Codex deliver with injected fake adapter", () => {
     const active = await plugin.inspectActiveExecution(binding);
     expect(active).toEqual({ active: true, executionId: "turn-1" });
     expect(counts.inspectActive).toBe(1);
+  });
+
+  it.each([
+    ["idle", 0, "idle"], ["active", 0, "busy"], ["inProgress", 0, "busy"], ["idle", 1, "approval_required"],
+    ["unknown", 0, "unknown"], [undefined, undefined, "unknown"],
+  ])("read-only activity maps %s / %s conservatively", async (runtimeStatus, requestsCount, activity) => {
+    const { adapter } = countingAdapter();
+    adapter.inspect = async () => ({ ...target, title: "t", runtimeStatus, requestsCount });
+    const plugin = new CodexDesktopExecutorPlugin(adapter);
+    expect((await plugin.inspectSession(binding)).activity).toBe(activity);
   });
 });

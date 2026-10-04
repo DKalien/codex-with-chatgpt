@@ -137,10 +137,11 @@ describe("Browser Companion sleep/wake feedback recovery", () => {
     })).toBe(true);
   });
 
-  it("fails closed for stale, unprotected, missing, or invalid transport", () => {
+  it("allows stale read-only discovery but fails closed for unprotected, missing or invalid transport", () => {
+    expect(wakeWatchdogEligible({ storageProtected: true, transport: transport({ authStale: true }),
+      autonomyMode: "armed", journalState: "NONE" })).toBe(true);
     for (const input of [
       { storageProtected: false, transport: transport(), autonomyMode: "armed", journalState: "NONE" },
-      { storageProtected: true, transport: transport({ authStale: true }), autonomyMode: "armed", journalState: "NONE" },
       { storageProtected: true, transport: null, autonomyMode: "armed", journalState: "NONE" },
       { storageProtected: true, transport: transport({ bridgeOrigin: null }), autonomyMode: "armed", journalState: "NONE" },
     ]) {

@@ -2,6 +2,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { describe, expect, it } from "vitest";
+import { computeBuildId } from "../scripts/write-build-id.mjs";
+import release from "../scripts/core-release.cjs";
 
 const root = process.cwd();
 const python = process.env.C2C_DESKTOP_PYTHON || "python";
@@ -31,6 +33,15 @@ describe("Desktop helper packaging", () => {
       cwd: root,
       windowsHide: true,
     });
+    const publishedId = fs.readFileSync(path.join(dist, "build-id.txt"), "utf8").trim();
+    expect(publishedId).toBe(computeBuildId(dist));
+    expect(publishedId).toBe(release.buildId(dist));
+    const firstArtifacts = release.artifactHash(dist);
+    // 相同源码再次走完整 pipeline：不能依赖上次 dist 残留才能发布正确 ID。
+    execFileSync(buildCommand, buildArgs, { cwd: root, windowsHide: true });
+    expect(fs.readFileSync(path.join(dist, "build-id.txt"), "utf8").trim()).toBe(publishedId);
+    expect(computeBuildId(dist)).toBe(publishedId);
+    expect(release.artifactHash(dist)).toBe(firstArtifacts);
     const packagedFiles = [];
     const visit = (directory, prefix = "") => {
       for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {

@@ -84,6 +84,7 @@
     }
     if (connectState === "WAITING_TAKEOVER") return ["正在等待当前 Chat 接管连接", "warn"];
     if (connectState === "TAKEOVER_DISPATCH" || connectState === "OUTCOME_UNKNOWN") {
+      if (transport?.takeoverRecovery) return ["接管结果待核验，当前页面尚未连接", "warn"];
       return ["连接发送结果待确认，请勿重复发送", "bad"];
     }
     if (connectReason === "bridge_permission_missing") {
@@ -126,6 +127,8 @@
         return "连接消息来源校验未通过，未发送；重新打开扩展后可再次连接。";
       case "bootstrap_capability_missing":
         return "固定连接组件尚未加载，未发送；刷新 ChatGPT 页面后可再次连接。";
+      case "COMPANION_REBIND_NOT_SUCCESSOR":
+        return "服务端尚未确认接管，请等待当前 Chat 完成工具调用；不会重发连接消息。";
       default:
         return "连接遇到问题，请展开连接设置查看详情。";
     }
@@ -218,24 +221,76 @@
     els.autonomyArmConfirm.addEventListener("change", updateAutonomyArmEnabled);
   }
 
+  // UI waiting budget only: a timeout never authorizes retrying a mutation/Send.
+  const POPUP_RPC_TIMEOUT_MS = 10_000;
+  async function boundedRpc(stage, action) {
+    let timer;
+    try {
+      return await Promise.race([Promise.resolve().then(action), new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`popup_timeout:${stage}`)), POPUP_RPC_TIMEOUT_MS);
+      })]);
+    } finally { clearTimeout(timer); }
+  }
+  const tabMessage = (tabId, message) => boundedRpc(message.type, () => chrome.tabs.sendMessage(tabId, message));
+  async function runtimeMessage(message) {
+    try { return await boundedRpc(message.type, () => chrome.runtime.sendMessage(message)); }
+    catch (error) {
+      showStatusTimeout(error);
+      return { ok: false, reason: String(error?.message).startsWith("popup_timeout:")
+        ? `popup_timeout:${message.type}` : "popup_status_unavailable" };
+    }
+  }
+
+  function showStatusTimeout(error) {
+    const stage = String(error?.message || "status_unavailable");
+    setText(els.userConnectionStatus, stage.startsWith("popup_timeout:") ? "连接服务响应超时" : "连接状态暂时不可用", "warn");
+    setText(els.userActionHint, "稍后重新打开扩展检查状态；未自动重连或重发。", "warn");
+    setText(els.connectDiagnostic, stage.startsWith("popup_timeout:") ? stage : "popup_status_unavailable", "warn");
+  }
+  let refreshInFlight = null;
+  async function refresh() {
+    if (refreshInFlight) return refreshInFlight;
+    refreshInFlight = refreshStatus().catch(error => { showStatusTimeout(error); return false; });
+    try { return await refreshInFlight; }
+    finally { refreshInFlight = null; }
+  }
+
+  // The popup can remain open while route confirmation completes in ChatGPT.
+  // Refresh only the local read-only status, never connect/send or Bridge repair.
+  let statusTimer = null;
+  let popupClosed = false;
+  function scheduleStatusRefresh() {
+    clearTimeout(statusTimer);
+    if (popupClosed || document.visibilityState !== "visible") return;
+    statusTimer = setTimeout(async () => {
+      await refresh();
+      scheduleStatusRefresh();
+    }, 2000);
+  }
+  document.addEventListener?.("visibilitychange", scheduleStatusRefresh);
+  globalThis.addEventListener?.("pagehide", () => {
+    popupClosed = true;
+    clearTimeout(statusTimer);
+  });
+
   async function activeTab() {
-    const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+    const tabs = await boundedRpc("active_tab", () => chrome.tabs.query({ active: true, currentWindow: true }));
     return tabs[0] ?? null;
   }
 
   async function pageStatus(tabId) {
-    return chrome.tabs.sendMessage(tabId, { type: "c2c.status.request" });
+    return tabMessage(tabId, { type: "c2c.status.request" });
   }
 
   async function loadPairingPrefs() {
     try {
-      const local = await chrome.storage.local.get(LOCAL_ORIGIN_KEY);
+      const local = await boundedRpc("origin_preferences", () => chrome.storage.local.get(LOCAL_ORIGIN_KEY));
       if (typeof local[LOCAL_ORIGIN_KEY] === "string" && local[LOCAL_ORIGIN_KEY]) {
         els.bridgeOrigin.value = local[LOCAL_ORIGIN_KEY];
       }
     } catch { /* ignore */ }
     try {
-      const session = await chrome.storage.session.get(SESSION_INTENT_KEY);
+      const session = await boundedRpc("pairing_preferences", () => chrome.storage.session.get(SESSION_INTENT_KEY));
       if (typeof session[SESSION_INTENT_KEY] === "string" && session[SESSION_INTENT_KEY]) {
         els.intentId.value = session[SESSION_INTENT_KEY];
       }
@@ -304,7 +359,8 @@
     return { origin: url.origin, pattern: `${url.origin}/*` };
   }
 
-  async function refresh() {
+  async function refreshStatus() {
+    let statusError = null;
     const tab = await activeTab();
     const href = tab?.url ?? "";
     let parsed = null;
@@ -326,11 +382,11 @@
     let status = null;
     if (tab?.id != null && parsed) {
       try {
-        safety = await chrome.tabs.sendMessage(tab.id, { type: "c2c.popup.ping" });
-      } catch { /* ignore */ }
+        safety = await tabMessage(tab.id, { type: "c2c.popup.ping" });
+      } catch (error) { statusError = error; }
       try {
         status = await pageStatus(tab.id);
-      } catch { /* ignore */ }
+      } catch (error) { statusError = error; }
     }
 
     if (safety?.safety) {
@@ -374,7 +430,7 @@
         void saveBridgeOrigin(transport.bridgeOrigin);
       }
     } else if (transport?.authStale) {
-      setText(els.transportStatus, "auth stale — 需重新 pair", "bad");
+      setText(els.transportStatus, `认证待复核 — 保留原配对（${transport.authStaleReason || "auth_revalidation_required"}）`, "warn");
     } else {
       setText(els.transportStatus, "未配对", "warn");
     }
@@ -400,7 +456,7 @@
       els.rebindComplete.disabled = !isOwner || transport?.rebindPending !== true;
     }
     els.applyPairJson.disabled = false;
-    els.fetchState.disabled = !hasTransport;
+    els.fetchState.disabled = !storageProtected || !transport?.bridgeOrigin;
     els.reserve.disabled = !hasTransport || !isOwner;
     els.release.disabled = !hasTransport;
     els.recover.disabled = !hasTransport;
@@ -445,8 +501,11 @@
     );
     const ownerNeedsReconnect = connectionText === "当前页面需要重新连接";
     setText(els.userConnectionStatus, connectionText, connectionClass);
+    if (connectionText === "当前对话已连接") setText(els.connectStatus, connectionText, "ok");
     setText(els.userAutonomyStatus, armed ? "已开启" : "未开启", armed ? "ok" : "warn");
-    const actionHint = ownerNeedsReconnect
+    const actionHint = transport?.takeoverRecovery
+      ? "点击“连接当前对话”核验接管并继续页面验证；不会重发之前的连接消息。"
+      : ownerNeedsReconnect
       ? "页面刷新后需要重新确认当前页面，请点击“连接当前对话”。"
       : connectionText === "当前对话已连接"
       ? (armed ? "执行结果会自动回到当前对话。" : "如需自动回流，请勾选确认后开启。")
@@ -458,6 +517,8 @@
           ? "请回到 ChatGPT 完成确认。"
           : status?.connectState === "WAITING_TAKEOVER"
             ? "正在等待当前 Chat 完成反馈连接接管；完成后会自动继续验证。"
+          : transport?.authStale
+            ? "正在用原配对复核连接，暂不发送；无需清除目标或重新配对。"
           : transport?.connected
             ? "请完成当前对话验证；如未自动出现验证消息，可展开连接设置。"
             : "点击“连接当前对话”开始使用。遇到问题可展开连接设置。");
@@ -466,6 +527,16 @@
       rearmOnConnect && !armed ? `${actionHint} 连接后将自动恢复自动回流。` : actionHint,
       connectionClass,
     );
+    if (els.connectDiagnostic) {
+      els.connectDiagnostic.textContent = [
+        `connectState=${status?.connectState ?? "NONE"}`,
+        `recovery=${transport?.takeoverRecovery ?? "none"}`,
+        `currentPageMatchesBinding=${routeMatchesTransport && isOwner}`,
+        `bindingEpoch=${transport?.epoch ?? "-"}`,
+        `routeAttestFence=${status?.routeAttestFence ?? "NONE"}`,
+        `reason=${status?.connectReason ?? "-"}`,
+      ].join("\n");
+    }
     if (els.autonomyStatus) {
       const hbSafety = autonomy.lastHeartbeatSafety;
       const ev = autonomy.lastEvaluatedEvidence;
@@ -474,8 +545,10 @@
         `bindingId=${transport?.bindingId ?? "-"}`,
         `epoch=${transport?.epoch ?? "-"}`,
         `route=${transport?.routeCanonical ?? "-"}`,
-        `Route verification: ${transport?.routeVerification === "VERIFIED" ? "VERIFIED" : "PENDING"}`,
-        `Production eligible: ${transport?.productionEligible === true ? "yes" : "no"}`,
+        `Stored binding verification: ${transport?.routeVerification === "VERIFIED" ? "VERIFIED" : "PENDING"}`,
+        `Current page matches binding: ${routeMatchesTransport && isOwner ? "yes" : "no"}`,
+        `Current page connected: ${routeMatchesTransport && isOwner && transport?.r5cConnected === true ? "yes" : "no"}`,
+        `Production eligible on current page: ${routeMatchesTransport && isOwner && transport?.productionEligible === true && transport?.r5cConnected === true ? "yes" : "no"}`,
         `identityExact=${autonomy.identityExact === true}`,
         `tickInFlight=${autonomy.tickInFlight === true}`,
         `lastDecision=${autonomy.lastDecision ?? "-"}`,
@@ -603,21 +676,23 @@
         let res;
         try {
           // Fixed command only. Content script forwards real MessageSender identity.
-          res = await chrome.tabs.sendMessage(tabNow.id, { type: "c2c.connect.request" });
+          res = await tabMessage(tabNow.id, { type: "c2c.connect.request" });
         } catch {
           res = { ok: false, reason: "content_script_unavailable" };
         }
+        const converged = await refresh();
         const reason = res?.ok ? "" : (res?.reason || "connect_failed");
+        const connected = res?.ok && res.state === "CONNECTED" && converged;
         const text = res?.ok
           ? (res.state === "CONNECTED"
-              ? "当前对话已连接"
+              ? (connected ? "当前对话已连接" : "当前对话尚未完成连接，请再次点击“连接当前对话”。")
               : res.state === "WAITING_TAKEOVER"
                 ? "正在等待当前 Chat 接管连接"
               : "已发送连接验证，请回到 ChatGPT 完成确认")
           : friendlyConnectReason(reason);
-        setText(els.connectDiagnostic, reason || "ok", res?.ok ? "ok" : "bad");
-        setText(els.connectStatus, text, res?.ok ? "ok" : "bad");
-        await refresh();
+        const outcome = reason || (res.state === "CONNECTED" && !connected ? "连接尚未收敛" : "ok");
+        setText(els.connectDiagnostic, `${outcome}\n${els.connectDiagnostic.textContent}`, res?.ok ? (connected ? "ok" : "warn") : "bad");
+        setText(els.connectStatus, text, connected ? "ok" : res?.ok ? "warn" : "bad");
         if (reason === "cold_pair_required") {
           openFirstUse({ focusPairing: true });
           setText(els.pairConnectHint, friendlyConnectReason(reason), "warn");
@@ -630,7 +705,7 @@
       let bindReason = "";
       let bindOk = false;
       try {
-        const res = await chrome.tabs.sendMessage(tab.id, { type: "c2c.bind.request" });
+        const res = await tabMessage(tab.id, { type: "c2c.bind.request" });
         bindOk = res?.ok === true;
         if (!bindOk) bindReason = res?.reason || "bind_failed";
       } catch {
@@ -644,7 +719,7 @@
     };
 
     els.unbind.onclick = async () => {
-      await chrome.runtime.sendMessage({ type: "c2c.unbind" });
+      await runtimeMessage({ type: "c2c.unbind" });
       await refresh();
     };
 
@@ -706,7 +781,7 @@
 
         let proof;
         try {
-          proof = await chrome.tabs.sendMessage(tabNow.id, { type: "c2c.owner-proof.request" });
+          proof = await tabMessage(tabNow.id, { type: "c2c.owner-proof.request" });
         } catch {
           proof = null;
         }
@@ -720,7 +795,7 @@
         let pairResult;
         try {
           pairAttempted = true;
-          pairResult = await chrome.runtime.sendMessage({
+          pairResult = await runtimeMessage({
             type: "c2c.pair",
             bridgeOrigin: permission.origin,
             intentId: fields.intentId,
@@ -743,20 +818,24 @@
 
         let connectResult;
         try {
-          connectResult = await chrome.tabs.sendMessage(tabNow.id, { type: "c2c.connect.request" });
+          connectResult = await tabMessage(tabNow.id, { type: "c2c.connect.request" });
         } catch {
           connectResult = { ok: false, reason: "content_script_unavailable" };
         }
-        await refresh();
+        const converged = await refresh();
         const connectReason = connectResult?.ok ? "" : (connectResult?.reason || "connect_failed");
         if (connectResult?.ok) {
-          const connected = connectResult.state === "CONNECTED";
+          const connected = connectResult.state === "CONNECTED" && converged;
           setText(els.pairConnectHint, connected
             ? "当前对话已连接。"
-            : "已发送连接验证，请回到 ChatGPT 完成确认。", connected ? "ok" : "warn");
+            : connectResult.state === "CONNECTED"
+              ? "当前对话尚未完成连接，请再次点击“连接当前对话”。"
+              : "已发送连接验证，请回到 ChatGPT 完成确认。", connected ? "ok" : "warn");
           setText(els.connectStatus, connected
             ? "当前对话已连接"
-            : "已发送连接验证，请回到 ChatGPT 完成确认", connected ? "ok" : "warn");
+            : connectResult.state === "CONNECTED"
+              ? "当前对话尚未完成连接，请再次点击“连接当前对话”。"
+              : "已发送连接验证，请回到 ChatGPT 完成确认", connected ? "ok" : "warn");
           if (els.firstUseSettings) els.firstUseSettings.open = false;
         } else {
           setText(els.pairConnectHint, friendlyConnectReason(connectReason), "bad");
@@ -827,7 +906,7 @@
         }
         let proof;
         try {
-          proof = await chrome.tabs.sendMessage(tabNow.id, { type: "c2c.owner-proof.request" });
+          proof = await tabMessage(tabNow.id, { type: "c2c.owner-proof.request" });
         } catch {
           proof = null;
         }
@@ -835,7 +914,7 @@
           setText(els.transportStatus, `owner proof 失败: ${proof?.reason || "no_content"}`, "bad");
           return;
         }
-        const res = await chrome.runtime.sendMessage({
+        const res = await runtimeMessage({
           type: "c2c.pair",
           bridgeOrigin: permission.origin,
           intentId,
@@ -867,7 +946,7 @@
     if (els.verifyRoute) {
       els.verifyRoute.onclick = async () => {
         // Popup MUST NOT supply attestation message text.
-        const res = await chrome.runtime.sendMessage({ type: "c2c.route.attest.send" });
+        const res = await runtimeMessage({ type: "c2c.route.attest.send" });
         setText(
           els.bridgeState,
           `route attest ok=${res?.ok === true} observed=${res?.observed === true} `
@@ -884,10 +963,10 @@
         if (!tabNow?.id) return;
         let proof = null;
         try {
-          proof = await chrome.tabs.sendMessage(tabNow.id, { type: "c2c.owner-proof.request" });
+          proof = await tabMessage(tabNow.id, { type: "c2c.owner-proof.request" });
         } catch { /* ignore */ }
         const res = proof?.ok && proof.proof?.id
-          ? await chrome.runtime.sendMessage({
+          ? await runtimeMessage({
               type: "c2c.rebind.start",
               ownerProofId: proof.proof.id,
             })
@@ -903,7 +982,7 @@
 
     if (els.rebindComplete) {
       els.rebindComplete.onclick = async () => {
-        const res = await chrome.runtime.sendMessage({ type: "c2c.rebind.complete" });
+        const res = await runtimeMessage({ type: "c2c.rebind.complete" });
         setText(
           els.bridgeState,
           res?.ok
@@ -916,7 +995,7 @@
     }
 
     els.fetchState.onclick = async () => {
-      const res = await chrome.runtime.sendMessage({ type: "c2c.fetch.state" });
+      const res = await runtimeMessage({ type: "c2c.fetch.state" });
       if (res?.ok) {
         setText(
           els.bridgeState,
@@ -926,13 +1005,14 @@
       } else {
         setText(els.bridgeState, `state 失败: ${res?.reason || "unknown"}`, "bad");
       }
+      await refresh();
     };
 
     els.reserve.onclick = async () => {
       if (!tab?.id) return;
       let res;
       try {
-        res = await chrome.tabs.sendMessage(tab.id, { type: "c2c.reserve.request" });
+        res = await tabMessage(tab.id, { type: "c2c.reserve.request" });
       } catch {
         res = { ok: false, reason: "no_content" };
       }
@@ -945,7 +1025,7 @@
     };
 
     els.release.onclick = async () => {
-      const res = await chrome.runtime.sendMessage({ type: "c2c.release" });
+      const res = await runtimeMessage({ type: "c2c.release" });
       if (res?.ok) {
         setText(els.bridgeState, "released", "ok");
       } else {
@@ -955,14 +1035,14 @@
     };
 
     els.recover.onclick = async () => {
-      const res = await chrome.runtime.sendMessage({ type: "c2c.recover" });
+      const res = await runtimeMessage({ type: "c2c.recover" });
       setText(els.bridgeState, formatRecoverResult(res), res?.ok ? "ok" : "bad");
       await refresh();
     };
 
     if (els.autonomyShadow) {
       els.autonomyShadow.onclick = async () => {
-        const res = await chrome.runtime.sendMessage({ type: "c2c.autonomy.enable.shadow" });
+        const res = await runtimeMessage({ type: "c2c.autonomy.enable.shadow" });
         setText(els.bridgeState, `shadow ok=${res?.ok === true} mode=${res?.mode ?? "-"} reason=${res?.reason ?? "ok"}`, res?.ok ? "ok" : "bad");
         await refresh();
       };
@@ -970,14 +1050,14 @@
     if (els.autonomyArm) {
       els.autonomyArm.onclick = async () => {
         if (!els.autonomyArmConfirm?.checked) return;
-        const res = await chrome.runtime.sendMessage({ type: "c2c.autonomy.arm" });
+        const res = await runtimeMessage({ type: "c2c.autonomy.arm" });
         setText(els.bridgeState, `arm ok=${res?.ok === true} mode=${res?.mode ?? "-"} reason=${res?.reason ?? "ok"}`, res?.ok ? "ok" : "bad");
         await refresh();
       };
     }
     if (els.autonomyDisable) {
       els.autonomyDisable.onclick = async () => {
-        const res = await chrome.runtime.sendMessage({ type: "c2c.autonomy.disable" });
+        const res = await runtimeMessage({ type: "c2c.autonomy.disable" });
         setText(els.bridgeState, `autonomy disable ok=${res?.ok === true} journal=${res?.journal?.state ?? "-"}`, res?.ok ? "ok" : "bad");
         await refresh();
       };
@@ -999,7 +1079,7 @@
         let res;
         try {
           // Identity always from durable SW journal; popup never supplies identity.
-          res = await chrome.runtime.sendMessage({ type: "c2c.retire.unknown" });
+          res = await runtimeMessage({ type: "c2c.retire.unknown" });
         } catch (e) {
           res = { ok: false, reason: e?.message || "runtime_error" };
         }
@@ -1036,7 +1116,7 @@
         let proof = null;
         try {
           proof = tabNow?.id
-            ? await chrome.tabs.sendMessage(tabNow.id, { type: "c2c.owner-proof.request" })
+            ? await tabMessage(tabNow.id, { type: "c2c.owner-proof.request" })
             : null;
         } catch { /* owner document unreachable; SW will fail closed below. */ }
         let res;
@@ -1044,7 +1124,7 @@
           // Identity (tab/document/route) always from durable SW state; the
           // popup only relays the proof id minted by the owner document.
           res = proof?.ok && proof.proof?.id
-            ? await chrome.runtime.sendMessage({
+            ? await runtimeMessage({
                 type: "c2c.connect.abandon.unknown",
                 ownerProofId: proof.proof.id,
               })
@@ -1083,13 +1163,13 @@
         let proof = null;
         try {
           proof = tabNow?.id
-            ? await chrome.tabs.sendMessage(tabNow.id, { type: "c2c.owner-proof.request" })
+            ? await tabMessage(tabNow.id, { type: "c2c.owner-proof.request" })
             : null;
         } catch { /* owner document unreachable; SW will fail closed below. */ }
         let res;
         try {
           res = proof?.ok && proof.proof?.id
-            ? await chrome.runtime.sendMessage({
+            ? await runtimeMessage({
                 type: "c2c.route-attest.abandon.unknown",
                 ownerProofId: proof.proof.id,
               })
@@ -1115,7 +1195,7 @@
         setText(els.shadowEvidence, "inspecting…", "warn");
         let res;
         try {
-          res = await chrome.runtime.sendMessage({ type: "c2c.shadow.send.inspect" });
+          res = await runtimeMessage({ type: "c2c.shadow.send.inspect" });
         } catch (e) {
           res = { ok: false, reason: e?.message || "runtime_error" };
         }
@@ -1161,7 +1241,7 @@
         let res;
         try {
           // Fixed probe only — never send arbitrary message payload.
-          res = await chrome.runtime.sendMessage({ type: "c2c.write.probe.request" });
+          res = await runtimeMessage({ type: "c2c.write.probe.request" });
         } catch (e) {
           res = { ok: false, reason: e?.message || "runtime_error", retryAllowed: false };
         }
@@ -1218,7 +1298,7 @@
         let res;
         try {
           // Fixed probe only — SW mints attemptId + message. Never supply payload.
-          res = await chrome.runtime.sendMessage({ type: "c2c.send.probe.request" });
+          res = await runtimeMessage({ type: "c2c.send.probe.request" });
         } catch (e) {
           res = { ok: false, reason: e?.message || "runtime_error", retryAllowed: false };
         }
@@ -1240,7 +1320,7 @@
       els.sendProbeReset.onclick = async () => {
         let res;
         try {
-          res = await chrome.runtime.sendMessage({ type: "c2c.send.probe.reset" });
+          res = await runtimeMessage({ type: "c2c.send.probe.reset" });
         } catch (e) {
           res = { ok: false, reason: e?.message || "runtime_error" };
         }
@@ -1277,7 +1357,7 @@
         let res;
         try {
           // Identity/message always from durable SW journal — never supply payload.
-          res = await chrome.runtime.sendMessage({ type: "c2c.production.send.request" });
+          res = await runtimeMessage({ type: "c2c.production.send.request" });
         } catch (e) {
           res = { ok: false, reason: e?.message || "runtime_error", retryAllowed: false };
         }
@@ -1385,9 +1465,12 @@
     }
 
     els.clearTransport.onclick = async () => {
-      await chrome.runtime.sendMessage({ type: "c2c.transport.clear" });
+      await runtimeMessage({ type: "c2c.transport.clear" });
       await refresh();
     };
+    if (statusError) { showStatusTimeout(statusError); return false; }
+    return isOwner && routeMatchesTransport && transport?.routeVerification === "VERIFIED"
+      && transport?.r5cConnected === true;
   }
 
   (async () => {
@@ -1401,6 +1484,7 @@
     });
     // Secret input: never write to storage.
     await refresh();
+    scheduleStatusRefresh();
   })().catch(() => {
     setText(els.pageRoute, "popup 初始化失败", "bad");
   });

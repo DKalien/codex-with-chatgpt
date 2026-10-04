@@ -1,3 +1,4 @@
+import { requestHttp } from "./http-json.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createServer, type Server } from "node:http";
 import { spawn } from "node:child_process";
@@ -8,6 +9,7 @@ import {
   clearRuntimeState,
   findBridgeObservation,
   findLiveBridge,
+  probeBridge,
   readRuntimeState,
   runtimeFile,
   writeRuntimeState,
@@ -17,7 +19,11 @@ import { adminFetch, buildServeArgs, ensureBridge, restartBridge, stopBridge } f
 import { sessionFile, writeSession } from "../src/session/state.js";
 import { SERVICE_NAME, VERSION } from "../src/version.js";
 import { Workspace } from "../src/workspace/manager.js";
-import { cleanup, isolateStateDir, makeTmpDir, write } from "./helpers.js";
+import { isolateStateDir, makeTmpDir, write } from "./helpers.js";
+import { cleanupStrict, fixtureProcessIdentity, stopFixtureProcess, waitForFixtureChildExit } from "./strict-teardown.js";
+import * as processProbe from "../src/process/process-probe.js";
+import * as daemonSpawn from "../src/process/daemon-spawn.js";
+import * as loopback from "../src/bridge/loopback-http.js";
 
 function stubRuntime(workspaceId: string, workspaceRoot: string, pid: number, port: number): RuntimeState {
   return {
@@ -130,11 +136,57 @@ async function startHealthServer(
   };
 }
 
-async function waitForRuntimeClear(workspaceId: string): Promise<void> {
-  for (let attempt = 0; attempt < 80; attempt += 1) {
-    if (!fs.existsSync(runtimeFile(workspaceId))) return;
-    await new Promise((resolve) => setTimeout(resolve, 25));
+async function waitForBridgeExit(workspaceId: string): Promise<void> {
+  const runtime = readRuntimeState(workspaceId);
+  if (!runtime) throw new Error("shutdown must retain its process/runtime pin");
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    if (await processProbe.observeProcessPresence(runtime.pid) === "missing") return;
+    await new Promise(resolve => setTimeout(resolve, 25));
   }
+  throw new Error("fixture Bridge exit not proven");
+}
+
+/** Real legacy process: deletes runtime before exit, exercising the original-process restart fence. */
+async function startLegacyProcess(workspace: Workspace, startedAt: string) {
+  const requests: Array<{ path: string; authorization?: string }> = [];
+  const config = { workspaceId: workspace.id, workspaceRoot: workspace.root, startedAt,
+    service: SERVICE_NAME, version: VERSION, runtimeFile: runtimeFile(workspace.id) };
+  const child = spawn(process.execPath, ["-e", `
+    const http = require('node:http'), fs = require('node:fs');
+    const c = JSON.parse(process.argv[1]);
+    const server = http.createServer((req, res) => {
+      process.send({request:{path:req.url,authorization:req.headers.authorization}});
+      res.setHeader('Content-Type','application/json');
+      if (req.url === '/health') return res.end(JSON.stringify({service:c.service,version:c.version,workspaceId:c.workspaceId,status:'ok'}));
+      if(req.headers.authorization !== 'Bearer test-token'){res.statusCode=401;return res.end('{}');}
+      if(req.url === '/admin/info') return res.end(JSON.stringify({...c,pid:process.pid,port:server.address().port,publicUrl:null,tunnel:{running:false}}));
+      if(req.url === '/admin/shutdown') {
+        res.end(JSON.stringify({shuttingDown:true}));
+        fs.rmSync(c.runtimeFile,{force:true});
+        return server.close(()=>process.exit(0));
+      }
+      res.statusCode=404;res.end('{}');
+    });
+    server.listen(0,'127.0.0.1',()=>process.send({port:server.address().port}));
+  `, JSON.stringify(config)], { windowsHide: true, stdio: ["ignore", "ignore", "inherit", "ipc"] });
+  let timer: ReturnType<typeof setTimeout>;
+  const ready = new Promise<number>((resolve, reject) => {
+    timer = setTimeout(() => reject(new Error("legacy fixture startup timed out")), 10_000);
+    child.on("message", (value: { port?: number; request?: typeof requests[number] }) => {
+      if (value.request) requests.push(value.request);
+      if (value.port) resolve(value.port);
+    });
+    child.once("error", reject);
+  });
+  const identity = fixtureProcessIdentity(await processProbe.probeProcess(child.pid!));
+  try {
+    const port = await ready;
+    return { port, pid: child.pid!, requests, close: async () => {
+      await stopFixtureProcess(identity); await waitForFixtureChildExit(child);
+    } };
+  } catch (error) { await stopFixtureProcess(identity); throw error; }
+  finally { clearTimeout(timer!); }
 }
 
 async function runCliRestart(workspaceRoot: string): Promise<{ code: number | null; stdout: string; stderr: string }> {
@@ -170,6 +222,46 @@ async function runCliRestart(workspaceRoot: string): Promise<{ code: number | nu
 
 describe("findBridgeObservation", () => {
   const dirs: string[] = [];
+
+  it("unknown native exit evidence prevents ensure spawn and preserves runtime", async () => {
+    dirs.push(isolateStateDir());
+    const root = makeTmpDir("unknown-process-exit"); dirs.push(root);
+    const workspace = new Workspace(root);
+    const runtime = stubRuntime(workspace.id, workspace.root, 1234, 9);
+    writeRuntimeState(runtime);
+    const bytes = fs.readFileSync(runtimeFile(workspace.id));
+    vi.spyOn(processProbe, "observeProcessPresence").mockResolvedValue("unknown");
+    vi.spyOn(loopback, "requestLoopback").mockRejectedValue(new Error("closed listener"));
+    const spawn = vi.spyOn(daemonSpawn, "spawnDetachedDaemon");
+    expect(await findBridgeObservation(workspace.id)).toMatchObject({ state: "unknown", reason: "pid_unknown" });
+    await expect(ensureBridge(root)).rejects.toThrow("refusing to start another bridge");
+    expect(spawn).not.toHaveBeenCalled();
+    expect(fs.readFileSync(runtimeFile(workspace.id))).toEqual(bytes);
+  });
+
+  it.each(["present", "unknown"] as const)("legacy shutdown removing runtime cannot restart while original process is %s", async presence => {
+    dirs.push(isolateStateDir());
+    const root = makeTmpDir("restart-exit-fence"); dirs.push(root);
+    const workspace = new Workspace(root);
+    const runtime = stubRuntime(workspace.id, workspace.root, 1234, 9);
+    writeRuntimeState(runtime);
+    let shutdown = false;
+    vi.spyOn(processProbe, "observeProcessPresence").mockImplementation(async () => shutdown ? presence : "present");
+    const spawn = vi.spyOn(daemonSpawn, "spawnDetachedDaemon");
+    const request = vi.spyOn(loopback, "requestLoopback").mockImplementation(async options => {
+      if (options.path === "/admin/shutdown") { shutdown = true; clearRuntimeState(workspace.id, runtime); }
+      return { status: 200, headers: {}, body: JSON.stringify(options.path === "/health"
+        ? healthPayload(workspace.id, runtime) : { shuttingDown: true }) };
+    });
+    vi.useFakeTimers();
+    const result = expect(restartBridge(root, { tunnel: false, shutdownReason: "rollout" })).rejects.toThrow("尚未完成关闭");
+    await vi.advanceTimersByTimeAsync(5100);
+    await result;
+    expect(request.mock.calls.filter(([options]) => options.path === "/admin/shutdown")).toHaveLength(1);
+    expect(spawn).not.toHaveBeenCalled();
+    expect(readRuntimeState(workspace.id)).toBeNull();
+    expect(vi.getTimerCount()).toBe(0);
+  });
 
   it("serve 参数保留显式 port=0", () => {
     const workspaceRoot = path.resolve("port-zero-workspace");
@@ -221,10 +313,84 @@ describe("findBridgeObservation", () => {
     }
   });
 
-  afterEach(() => {
-    for (const dir of dirs) cleanup(dir);
-    dirs.length = 0;
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
     delete process.env.C2C_STATE_DIR;
+    await cleanupStrict(...dirs.splice(0));
+  });
+
+  it.each(["exact", "missing", "failed", "pid", "start", "workspace", "build", "build_absent", "unknown"])(
+    "fast health failure uses one bounded retry only for a present PID (%s)", async mode => {
+      dirs.push(isolateStateDir());
+      vi.useFakeTimers();
+      const runtime = { ...stubRuntime("retry", "unused", 1234, 4567), runtimeBuildId: "build-a" };
+      writeRuntimeState(runtime);
+      const before = fs.readFileSync(runtimeFile(runtime.workspaceId));
+      vi.spyOn(process, "kill").mockImplementation(() => {
+        if (mode === "missing" || mode === "unknown") throw Object.assign(new Error("probe"), { code: mode === "missing" ? "ESRCH" : "EPERM" });
+        return true;
+      });
+      // This case injects absence at the shared evidence boundary, not Windows ESRCH alone.
+      if (mode === "missing") vi.spyOn(processProbe, "observeProcessPresence").mockResolvedValue("missing");
+      const health = { ...healthPayload(runtime.workspaceId, { pid: runtime.pid, startedAt: runtime.startedAt }), runtimeBuildId: "build-a" } as Record<string, unknown>;
+      if (mode === "pid") health.pid = 5678;
+      if (mode === "start") health.startedAt = "2020-01-01T00:00:00.000Z";
+      if (mode === "workspace") health.workspaceId = "foreign";
+      if (mode === "build") health.runtimeBuildId = "build-b";
+      if (mode === "build_absent") delete health.runtimeBuildId;
+      let calls = 0;
+      const fetcher = vi.spyOn(loopback, "requestLoopback").mockImplementation(async () => {
+        calls++;
+        if (calls === 1 || mode === "failed") throw new Error("network stall");
+        return { status: 200, headers: {}, body: JSON.stringify(health) };
+      });
+      const result = await findBridgeObservation(runtime.workspaceId);
+      expect(fetcher).toHaveBeenCalledTimes(mode === "missing" || mode === "unknown" ? 1 : 2);
+      expect(fetcher.mock.calls.map(([options]) => options.timeoutMs)).toEqual(
+        mode === "missing" || mode === "unknown" ? [2000] : [2000, 8000]);
+      if (mode === "exact") expect(result.state).toBe("healthy");
+      else if (mode === "missing") expect(result).toMatchObject({ state: "stopped", reason: "pid_missing" });
+      else expect(result).toMatchObject({ state: "unknown", reason: mode === "failed" ? "probe_failed" : mode === "unknown" ? "pid_unknown" : mode === "workspace" ? "workspace_mismatch" : "identity_mismatch" });
+      expect(vi.getTimerCount()).toBe(0);
+      expect(fs.readFileSync(runtimeFile(runtime.workspaceId))).toEqual(before);
+    },
+  );
+
+  it("failed health observation spends exactly 2s then 8s, never an unbounded retry", async () => {
+    dirs.push(isolateStateDir());
+    vi.useFakeTimers();
+    const runtime = stubRuntime("budgets", "unused", process.pid, 4567);
+    writeRuntimeState(runtime);
+    const fetcher = vi.spyOn(loopback, "requestLoopback").mockImplementation(options => new Promise((_resolve, reject) => {
+      setTimeout(() => reject(new Error("Loopback HTTP response timeout")), options.timeoutMs);
+    }));
+    const observation = findBridgeObservation(runtime.workspaceId);
+    await vi.advanceTimersByTimeAsync(1999);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(7999);
+    expect(vi.getTimerCount()).toBe(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(await observation).toMatchObject({ state: "unknown", reason: "probe_failed" });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("fast exact health does not retry; malformed JSON still fails closed", async () => {
+    dirs.push(isolateStateDir());
+    vi.useFakeTimers();
+    const runtime = stubRuntime("fast", "unused", process.pid, 4567);
+    writeRuntimeState(runtime);
+    const fetcher = vi.spyOn(loopback, "requestLoopback").mockResolvedValue({ status: 200, headers: {}, body: JSON.stringify(healthPayload(runtime.workspaceId, runtime)) });
+    expect((await findBridgeObservation(runtime.workspaceId)).state).toBe("healthy");
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
+    // Real header/body deadline and socket cleanup are exercised in loopback-http.test.ts.
+    fetcher.mockResolvedValue({ status: 200, headers: {}, body: "not json" });
+    expect(await probeBridge(4567)).toBeNull();
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it("treats a missing runtime file as stopped", async () => {
@@ -672,7 +838,7 @@ describe("findBridgeObservation", () => {
     } finally {
       if (staleBridgeAttempted) {
         const stopped = await stopBridge(staleRoot);
-        if (stopped) await waitForRuntimeClear(staleWorkspace.id);
+        if (stopped) await waitForBridgeExit(staleWorkspace.id);
       }
       await liveBridge.close();
     }
@@ -712,7 +878,7 @@ describe("findBridgeObservation", () => {
       expect(fs.readFileSync(sessionPath)).toEqual(beforeSession);
     } finally {
       const stopped = await stopBridge(root);
-      if (stopped) await waitForRuntimeClear(workspace.id);
+      if (stopped) await waitForBridgeExit(workspace.id);
     }
   });
 
@@ -723,31 +889,9 @@ describe("findBridgeObservation", () => {
     write(root, "a.txt", "a");
     const workspace = new Workspace(root);
     const startedAt = "2026-09-12T00:00:00.000Z";
-    const legacyRuntime = {
-      ...stubRuntime(workspace.id, workspace.root, process.pid, 0),
-      startedAt,
-    };
-    const info = adminInfoPayload(workspace.id, workspace.root, {
-      pid: process.pid,
-      port: 0,
-      startedAt,
-    });
-    let legacyClosed = false;
-    let health!: HealthServer;
-    const shutdownHandler = async (): Promise<void> => {
-      legacyClosed = true;
-      clearRuntimeState(workspace.id, legacyRuntime);
-      await health.close();
-    };
-    health = await startHealthServer(
-      healthPayload(workspace.id, { legacy: true }),
-      200,
-      info,
-      "test-token",
-      shutdownHandler
-    );
-    info.port = health.port;
-    writeRuntimeState({ ...legacyRuntime, port: health.port });
+    const health = await startLegacyProcess(workspace, startedAt);
+    const legacyRuntime = { ...stubRuntime(workspace.id, workspace.root, health.pid, health.port), startedAt };
+    writeRuntimeState(legacyRuntime);
     writeSession(workspace.id, {
       url: "https://chatgpt.com/c/legacy",
       projectUrl: "https://chatgpt.com/g/g-p-legacy/project",
@@ -787,12 +931,9 @@ describe("findBridgeObservation", () => {
       expect(upgradedInfo.connectorContractVersion).toBe(1);
       expect(fs.readFileSync(sessionPath)).toEqual(beforeSession);
     } finally {
-      if (!legacyClosed) {
-        clearRuntimeState(workspace.id, legacyRuntime);
-        await health.close();
-      }
+      await health.close();
       const stopped = await stopBridge(root);
-      if (stopped) await waitForRuntimeClear(workspace.id);
+      if (stopped) await waitForBridgeExit(workspace.id);
     }
   });
 
@@ -812,7 +953,7 @@ describe("findBridgeObservation", () => {
     try {
       const observation = await findBridgeObservation(bridge.workspace.id);
       expect(observation.state).toBe("healthy");
-      const health = await (await fetch(`${bridge.localBaseUrl()}/health`)).json() as Record<string, unknown>;
+      const health = await (await requestHttp(`${bridge.localBaseUrl()}/health`)).json() as Record<string, unknown>;
       expect(health.pid).toBe(process.pid);
       expect(health.startedAt).toBe(observation.runtime.startedAt);
       expect(health).not.toHaveProperty("adminToken");
@@ -889,7 +1030,11 @@ describe("findBridgeObservation", () => {
       expect((await findBridgeObservation(workspace.id)).state).toBe("healthy");
       expect(fs.existsSync(path.join(path.dirname(runtimeFile(workspace.id)), `${workspace.id}.start.lock`))).toBe(false);
     } finally {
-      if (await stopBridge(root)) await waitForRuntimeClear(workspace.id);
+      const runtime = readRuntimeState(workspace.id);
+      if (await stopBridge(root)) {
+        await waitForBridgeExit(workspace.id);
+
+      }
     }
   });
 

@@ -300,6 +300,9 @@ describe("content-script fixed feedback bootstrap sender", () => {
       ok: false,
       reason: "bootstrap_sender_invalid",
       mutationAttempted: false,
+      type: "c2c.feedback.bootstrap.result", mode: "feedback_bootstrap_send",
+      canonicalRoute: ROUTE, generation: 1,
+      wrote: false, clickAttempted: false, clicked: false, observed: false,
     });
     expect(runner).not.toHaveBeenCalled();
   });
@@ -315,6 +318,9 @@ describe("content-script fixed feedback bootstrap sender", () => {
       ok: false,
       reason: "bootstrap_capability_missing",
       mutationAttempted: false,
+      type: "c2c.feedback.bootstrap.result", mode: "feedback_bootstrap_send",
+      canonicalRoute: ROUTE, generation: 1,
+      wrote: false, clickAttempted: false, clicked: false, observed: false,
     });
   });
 });

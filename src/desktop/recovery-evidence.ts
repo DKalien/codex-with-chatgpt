@@ -11,12 +11,12 @@ export class LegacyReconciliationError extends DesktopError {
   }
 }
 
-function lockFile(workspaceId: string): string {
-  return path.join(getStateDir(), "desktop-legacy-reconciliation", `${desktopId.parse(workspaceId)}.json.lock`);
+function lockFile(workspaceId: string, stateDir = getStateDir()): string {
+  return path.join(path.resolve(stateDir), "desktop-legacy-reconciliation", `${desktopId.parse(workspaceId)}.json.lock`);
 }
 
-export function withEvidenceLock<T>(workspaceId: string, action: () => T): T {
-  const file = lockFile(workspaceId);
+export function withEvidenceLock<T>(workspaceId: string, action: () => T, stateDir = getStateDir()): T {
+  const file = lockFile(workspaceId, stateDir);
   ensureDir(path.dirname(file));
   let fd: number;
   try { fd = fs.openSync(file, "wx", 0o600); }

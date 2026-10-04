@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import vm from "node:vm";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   areChatgptConversationRoutesEquivalent,
   parseChatgptConversationRoute,
@@ -35,6 +35,9 @@ async function loadPopup(
     savedBridgeOrigin?: string;
     status?: Record<string, unknown>;
     ownerProofResult?: unknown;
+    statusResponse?: () => Promise<unknown>;
+    runtimeResponse?: () => Promise<unknown>;
+    visibility?: "visible" | "hidden";
   } = {},
 ) {
   const html = fs.readFileSync(path.join(sourcePopup, "popup.html"), "utf8");
@@ -64,6 +67,7 @@ async function loadPopup(
           return { safety: { composer: "empty", generation: "idle", safe: true } };
         }
         if (message.type === "c2c.status.request") {
+          if (options.statusResponse) return options.statusResponse();
           return {
             targetRoute: route, isOwner: true, storageProtected: true,
             ownership: { hasOwner: true }, transport: null,
@@ -91,6 +95,7 @@ async function loadPopup(
     runtime: {
       sendMessage: async (message: unknown) => {
         calls.runtime.push(message);
+        if (options.runtimeResponse) return options.runtimeResponse();
         if (typeof message === "object" && message && (message as { type?: string }).type === "c2c.pair") {
           calls.order.push("pair");
           return options.pairResult ?? { ok: true };
@@ -138,15 +143,27 @@ async function loadPopup(
       },
     },
   };
+  const documentListeners = new Map<string, () => void>();
+  const windowListeners = new Map<string, () => void>();
+  const document = {
+    getElementById: (id: string) => elements.get(id),
+    visibilityState: options.visibility,
+    addEventListener: (type: string, listener: () => void) => documentListeners.set(type, listener),
+  };
   const sandbox = {
     chrome,
-    document: { getElementById: (id: string) => elements.get(id) },
+    document,
+    addEventListener: (type: string, listener: () => void) => windowListeners.set(type, listener),
     parseChatgptConversationRoute,
     areChatgptConversationRoutesEquivalent,
     URL,
     console,
+    setTimeout,
+    clearTimeout,
+    testRefresh: null as null | (() => Promise<boolean>),
   };
-  vm.runInNewContext(fs.readFileSync(path.join(sourcePopup, "popup.js"), "utf8"), sandbox);
+  const source = fs.readFileSync(path.join(sourcePopup, "popup.js"), "utf8");
+  vm.runInNewContext(source.replace(/\}\)\(\);\s*$/, "globalThis.testRefresh = refresh; })();"), sandbox);
   for (let i = 0; i < 10 && !elements.get("pair")?.onclick; i += 1) {
     await new Promise(resolve => setImmediate(resolve));
   }
@@ -155,8 +172,135 @@ async function loadPopup(
       if (listener.type === "change") listener.handler();
     }
   };
-  return { calls, elements, fireChange };
+  return { calls, elements, fireChange, refresh: () => sandbox.testRefresh!(),
+    setVisibility: (value: "visible" | "hidden") => { document.visibilityState = value; documentListeners.get("visibilitychange")?.(); },
+    close: () => windowListeners.get("pagehide")?.(),
+  };
 }
+
+afterEach(() => { vi.useRealTimers(); });
+
+describe("popup bounded status RPC", () => {
+  it("visible popup follows completed route verification with read-only polling and stops when hidden/closed", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    let connected = false;
+    let reads = 0;
+    const popup = await loadPopup(true, true, { visibility: "visible", statusResponse: async () => {
+      reads += 1;
+      return { isOwner: true, storageProtected: true, connectState: connected ? "DONE" : "ATTEST_REQUESTED",
+        transport: { connected: true, routeCanonical: route, routeVerification: connected ? "VERIFIED" : "PENDING",
+          r5cConnected: connected, productionEligible: connected }, autonomy: { mode: connected ? "armed" : "off" } };
+    } });
+    connected = true;
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(popup.elements.get("user-connection-status")!.textContent).toBe("当前对话已连接");
+    expect(popup.elements.get("user-autonomy-status")!.textContent).toBe("已开启");
+    expect(popup.elements.get("connect-status")!.textContent).toBe("当前对话已连接");
+    expect(popup.elements.get("connect-diagnostic")!.textContent).toContain("connectState=DONE");
+    const seen = reads;
+    popup.setVisibility("hidden");
+    await vi.advanceTimersByTimeAsync(6000);
+    expect(reads).toBe(seen);
+    popup.setVisibility("visible");
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(reads).toBe(seen + 1);
+    popup.close();
+    expect(vi.getTimerCount()).toBe(0);
+    expect(popup.calls.page).toEqual([]);
+    expect(popup.calls.runtime).toEqual([]);
+  });
+
+  it("GET state refreshes the popup summary without connecting or sending", async () => {
+    let connected = false;
+    const popup = await loadPopup(true, true, { runtimeResponse: async () => ({ ok: true, status: { pendingReady: 0, reserved: 0, claimed: 0, outcomeUnknown: 0, inFlight: null } }), statusResponse: async () => ({
+      isOwner: true, storageProtected: true, connectState: connected ? "DONE" : "ATTEST_REQUESTED",
+      transport: { connected: true, routeCanonical: route, routeVerification: connected ? "VERIFIED" : "PENDING", r5cConnected: connected },
+    }) });
+    connected = true;
+    await popup.elements.get("fetch-state")!.onclick!();
+    expect(popup.elements.get("user-connection-status")!.textContent).toBe("当前对话已连接");
+    expect(popup.calls.page).toEqual([]);
+    expect(popup.calls.runtime).toEqual([{ type: "c2c.fetch.state" }]);
+  });
+
+  it("keeps the durable stage diagnostic when Connect returns an error", async () => {
+    const popup = await loadPopup(true, true, {
+      connectResult: { ok: false, reason: "connect_outcome_unknown" },
+      status: { connectState: "OUTCOME_UNKNOWN", routeAttestFence: "VERIFIED" },
+    });
+    await popup.elements.get("connect-chat")!.onclick!();
+    expect(popup.elements.get("connect-diagnostic")!.textContent).toContain("connect_outcome_unknown\nconnectState=OUTCOME_UNKNOWN");
+    expect(popup.elements.get("connect-diagnostic")!.textContent).toContain("routeAttestFence=VERIFIED");
+  });
+  it("separates a saved VERIFIED route from this page and exposes bootstrap continuation without sending", async () => {
+    const popup = await loadPopup(true, true, { status: {
+      connectState: "OUTCOME_UNKNOWN", routeAttestFence: "VERIFIED",
+      transport: {
+        connected: true, epoch: 11, routeVerification: "VERIFIED", productionEligible: true,
+        routeCanonical: "https://chatgpt.com/c/77777777-7777-4777-8777-777777777777",
+        takeoverRecovery: "verify_takeover",
+      },
+    } });
+    expect(popup.elements.get("user-connection-status")!.textContent).toBe("接管结果待核验，当前页面尚未连接");
+    expect(popup.elements.get("user-action-hint")!.textContent).toContain("不会重发之前的连接消息");
+    expect(popup.elements.get("connect-diagnostic")!.textContent).toContain("connectState=OUTCOME_UNKNOWN");
+    expect(popup.elements.get("connect-diagnostic")!.textContent).toContain("currentPageMatchesBinding=false");
+    expect(popup.elements.get("autonomy-status")!.textContent).toContain("Stored binding verification: VERIFIED");
+    expect(popup.elements.get("autonomy-status")!.textContent).toContain("Production eligible on current page: no");
+    expect(popup.elements.get("autonomy-arm")!.disabled).toBe(true);
+    expect(popup.calls.page).toEqual([]);
+    expect(popup.calls.runtime).toEqual([]);
+  });
+
+  it("does not offer bootstrap continuation for an unknown route-attestation send", async () => {
+    const popup = await loadPopup(true, true, { status: {
+      connectState: "OUTCOME_UNKNOWN",
+      transport: { connected: true, routeCanonical: route, takeoverRecovery: null },
+    } });
+    expect(popup.elements.get("user-connection-status")!.textContent).toBe("连接发送结果待确认，请勿重复发送");
+    expect(popup.elements.get("user-action-hint")!.textContent).not.toContain("核验接管");
+    expect(popup.calls.page).toEqual([]);
+  });
+
+  it("hung status settles with a bounded stage; delayed response cannot overwrite it; next refresh succeeds", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    let release!: (value: unknown) => void;
+    const delayed = new Promise(resolve => { release = resolve; });
+    let hung = true;
+    const popup = await loadPopup(true, true, { statusResponse: () => hung ? delayed : Promise.resolve({
+      targetRoute: route, isOwner: true, storageProtected: true, journal: { state: "NONE" },
+      transport: { connected: true, routeCanonical: route, routeVerification: "VERIFIED", r5cConnected: true, productionEligible: true },
+    }) });
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(popup.elements.get("user-connection-status")!.textContent).toBe("连接服务响应超时");
+    expect(popup.elements.get("connect-diagnostic")!.textContent).toBe("popup_timeout:c2c.status.request");
+    release({ transport: { authStale: true } });
+    await Promise.resolve();
+    expect(popup.elements.get("user-connection-status")!.textContent).toBe("连接服务响应超时");
+    hung = false;
+    expect(await popup.refresh()).toBe(true);
+    expect(popup.elements.get("user-connection-status")!.textContent).toBe("当前对话已连接");
+    expect(popup.calls.runtime).toEqual([]);
+    expect(popup.calls.page).toEqual([]);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("hung runtime.sendMessage settles and a subsequent read-only request succeeds", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    let hung = true;
+    const popup = await loadPopup(true, true, { runtimeResponse: () => hung ? new Promise(() => {})
+      : Promise.resolve({ ok: true, status: { pendingReady: 1 } }) });
+    const first = popup.elements.get("fetch-state")!.onclick!();
+    await vi.advanceTimersByTimeAsync(10_000);
+    await first;
+    expect(popup.elements.get("bridge-state")!.textContent).toContain("popup_timeout:c2c.fetch.state");
+    hung = false;
+    await popup.elements.get("fetch-state")!.onclick!();
+    expect(popup.elements.get("bridge-state")!.textContent).toContain("1");
+    expect(vi.getTimerCount()).toBe(0);
+    expect(popup.calls.runtime).toEqual([{ type: "c2c.fetch.state" }, { type: "c2c.fetch.state" }]);
+  });
+});
 
 describe("popup classic packaging", () => {
   it("does not load SW ESM artifacts as classic scripts", () => {
@@ -179,7 +323,7 @@ describe("popup classic packaging", () => {
 
 describe("popup Bridge permission and Pair separation", () => {
   it("shows the saved auto-rearm preference and restores the pause prompt when cleared", async () => {
-    const transport = { connected: true, routeCanonical: route, routeVerification: "VERIFIED", r5cConnected: true, productionEligible: true, r5cConnected: true };
+    const transport = { connected: true, routeCanonical: route, routeVerification: "VERIFIED", r5cConnected: true, productionEligible: true };
     const saved = await loadPopup(true, true, {
       status: { transport, autonomy: { mode: "off", rearmOnConnect: true } },
     });
@@ -375,7 +519,10 @@ describe("popup Bridge permission and Pair separation", () => {
   });
 
   it("one-click Pair + Connect requests permission before the ordered identity flow", async () => {
-    const { calls, elements } = await loadPopup(true, true, { connectResult: { ok: true, state: "CONNECTED" } });
+    const { calls, elements } = await loadPopup(true, true, {
+      connectResult: { ok: true, state: "CONNECTED" },
+      status: { transport: { connected: true, routeCanonical: route, routeVerification: "VERIFIED", r5cConnected: true } },
+    });
     elements.get("bridge-origin")!.value = "https://bridge.example.test";
     elements.get("pair-json")!.value = JSON.stringify({ intentId: "intent-1", secret: "c2c_pair_secret" });
     const pending = elements.get("pair-connect")!.onclick!();
@@ -387,6 +534,23 @@ describe("popup Bridge permission and Pair separation", () => {
     expect(elements.get("pair-json")!.value).toBe("");
     expect(elements.get("pair-secret")!.value).toBe("");
     expect(elements.get("connect-status")!.textContent).toBe("当前对话已连接");
+  });
+
+  it("both Connect entries keep a retry hint when CONNECTED has no authoritative Web Sink", async () => {
+    for (const button of ["connect-chat", "pair-connect"]) {
+      const { elements } = await loadPopup(true, true, {
+        connectResult: { ok: true, state: "CONNECTED" },
+        status: { transport: { connected: true, routeCanonical: route, routeVerification: "VERIFIED", r5cConnected: false } },
+      });
+      elements.get("bridge-origin")!.value = "https://bridge.example.test";
+      if (button === "pair-connect") {
+        elements.get("pair-json")!.value = JSON.stringify({ intentId: "intent-1", secret: "c2c_pair_secret" });
+      }
+      await elements.get(button)!.onclick!();
+      expect(elements.get("connect-status")!.textContent).toContain("尚未完成连接");
+      expect(elements.get("connect-status")!.textContent).not.toBe("当前对话已连接");
+      expect(elements.get("user-connection-status")!.textContent).toBe("当前对话需要完成连接");
+    }
   });
 
   it("shows a verified connection as healthy only for the current document owner", async () => {
@@ -436,7 +600,7 @@ describe("popup Bridge permission and Pair separation", () => {
       status: {
         isOwner: false,
         transport: {
-          connected: true,
+          connected: false,
           routeVerification: "VERIFIED", r5cConnected: true,
           rebindPending: false,
           authStale: true,
@@ -450,6 +614,10 @@ describe("popup Bridge permission and Pair separation", () => {
     expect(elements.get("user-connection-status")!.className).toContain("bad");
     expect(elements.get("user-connection-status")!.textContent).not.toContain("重新连接");
     expect(elements.get("user-action-hint")!.textContent).not.toContain("连接当前对话");
+    expect(elements.get("transport-status")!.textContent).toContain("保留原配对");
+    expect(elements.get("transport-status")!.textContent).not.toContain("重新 pair");
+    expect(elements.get("fetch-state")!.disabled).toBe(false);
+    expect(elements.get("reserve")!.disabled).toBe(true);
   });
 
   it("does not show or enable a verified old route for a new current page", async () => {

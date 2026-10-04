@@ -11,8 +11,10 @@ import type {
   DesktopResultOwnership,
   DesktopResultOwnershipExpectation,
   DesktopResultTerminalFence,
+  DesktopRuntimeFence,
   DesktopTarget,
   DesktopTargetInfo,
+  DesktopTargetInfoInternal,
   DesktopUnknownReconcileExpectation,
   DesktopUnknownReconcileObservation,
 } from "./ipc-contracts.js";
@@ -30,6 +32,7 @@ import {
   validateDesktopResultActivityMarkerObservation,
   validateDesktopResultTerminalFence,
   validateExecutionInfo,
+  validateInternalInfo,
   validateInfo,
   validateMessage,
   validateReceipt,
@@ -61,11 +64,23 @@ export class DesktopIpcClient {
     this.sendTimeoutMs = timeout(options.sendTimeoutMs, DEFAULT_SEND_TIMEOUT_MS);
   }
 
-  async inspect(rawTarget: DesktopTarget): Promise<DesktopTargetInfo> {
+  async discoverForBinding(rawTarget: DesktopTarget): Promise<DesktopTargetInfoInternal> {
     const target = validateTarget(rawTarget);
     const session = this.open();
     try {
-      const value = await session.request("inspect", { target });
+      const value = await session.request("inspect_for_binding", { target });
+      return validateInternalInfo(value, target);
+    } finally {
+      session.close();
+    }
+  }
+
+  async inspect(rawTarget: DesktopTarget, runtimeFence?: DesktopRuntimeFence): Promise<DesktopTargetInfo> {
+    const target = validateTarget(rawTarget);
+    requireRuntimeFence(runtimeFence);
+    const session = this.open();
+    try {
+      const value = await session.request("inspect", withRuntimeFence({ target }, runtimeFence));
       return validateInfo(value, target);
     } finally {
       session.close();
@@ -82,8 +97,8 @@ export class DesktopIpcClient {
     } finally { session.close(); }
   }
 
-  async currentIdentity(workspaceRoot: string): Promise<DesktopTargetInfo> {
-    return this.currentOperation("current_identity", workspaceRoot);
+  async currentIdentity(workspaceRoot: string): Promise<DesktopTargetInfoInternal> {
+    return this.currentOperation("current_identity", workspaceRoot, validateInternalInfo) as Promise<DesktopTargetInfoInternal>;
   }
 
   async currentExecution(workspaceRoot: string): Promise<DesktopExecutionInfo> {
@@ -91,31 +106,34 @@ export class DesktopIpcClient {
   }
 
   /** Target-scoped active-turn observation for the Bridge server; no runner context required. */
-  async inspectActiveExecution(rawTarget: DesktopTarget): Promise<DesktopExecutionInfo> {
+  async inspectActiveExecution(rawTarget: DesktopTarget, runtimeFence?: DesktopRuntimeFence): Promise<DesktopExecutionInfo> {
     const target = validateTarget(rawTarget);
+    requireRuntimeFence(runtimeFence);
     const session = this.open();
     try {
-      const value = await session.request("inspect_active_execution", { target });
+      const value = await session.request("inspect_active_execution", withRuntimeFence({ target }, runtimeFence));
       return validateExecutionInfo(value, target);
     } finally { session.close(); }
   }
 
   /** Detached receipt finalizer 的显式 target 观察；不读取 runner 环境，也不要求 runner ancestor。 */
-  async inspectResultContext(rawTarget: DesktopTarget): Promise<DesktopResultContext> {
+  async inspectResultContext(rawTarget: DesktopTarget, runtimeFence?: DesktopRuntimeFence): Promise<DesktopResultContext> {
     const target = validateTarget(rawTarget);
+    requireRuntimeFence(runtimeFence);
     const session = this.open();
     try {
-      const value = await session.request("inspect_result_context", { target });
+      const value = await session.request("inspect_result_context", withRuntimeFence({ target }, runtimeFence));
       return validateTargetScopedResultContext(value, target);
     } finally { session.close(); }
   }
 
   /** 读取当前 canonical turn 的无正文、有序 activity marker。 */
-  async inspectResultActivityMarker(rawTarget: DesktopTarget): Promise<DesktopResultActivityMarkerObservation> {
+  async inspectResultActivityMarker(rawTarget: DesktopTarget, runtimeFence?: DesktopRuntimeFence): Promise<DesktopResultActivityMarkerObservation> {
     const target = validateTarget(rawTarget);
+    requireRuntimeFence(runtimeFence);
     const session = this.open();
     try {
-      const value = await session.request("inspect_result_activity_marker", { target });
+      const value = await session.request("inspect_result_activity_marker", withRuntimeFence({ target }, runtimeFence));
       return validateDesktopResultActivityMarkerObservation(value, target);
     } finally { session.close(); }
   }
@@ -124,12 +142,14 @@ export class DesktopIpcClient {
   async inspectResultTerminalFence(
     rawTarget: DesktopTarget,
     rawMarker: DesktopResultActivityMarker,
+    runtimeFence?: DesktopRuntimeFence,
   ): Promise<DesktopResultTerminalFence> {
     const target = validateTarget(rawTarget);
     const marker = validateDesktopResultActivityMarker(rawMarker);
+    requireRuntimeFence(runtimeFence);
     const session = this.open();
     try {
-      const value = await session.request("inspect_result_terminal_fence", { target, marker });
+      const value = await session.request("inspect_result_terminal_fence", withRuntimeFence({ target, marker }, runtimeFence));
       return validateDesktopResultTerminalFence(value, target);
     } finally { session.close(); }
   }
@@ -152,13 +172,41 @@ export class DesktopIpcClient {
   async inspectResultOwnership(
     rawTarget: DesktopTarget,
     rawExpectation: DesktopResultOwnershipExpectation,
+    runtimeFence?: DesktopRuntimeFence,
   ): Promise<DesktopResultOwnership> {
     const target = validateTarget(rawTarget);
     const expectation = validateResultOwnershipExpectation(rawExpectation);
+    requireRuntimeFence(runtimeFence);
     const session = this.open();
     try {
-      const value = await session.request("inspect_result_ownership", { target, expectation });
+      const value = await session.request("inspect_result_ownership", withRuntimeFence({ target, expectation }, runtimeFence));
       return assertResultOwnershipExpectation(validateResultOwnership(value, target), expectation);
+    } finally { session.close(); }
+  }
+
+  /** Frozen v3 draft recovery: exact historical ownership and activity in one snapshot. */
+  async inspectPendingReceipt(
+    rawTarget: DesktopTarget,
+    rawExpectation: DesktopResultOwnershipExpectation,
+    rawMarker: DesktopResultActivityMarker,
+    runtimeFence: DesktopRuntimeFence,
+  ): Promise<DesktopResultOwnership & Pick<DesktopResultTerminalFence, "fence">> {
+    const target = validateTarget(rawTarget);
+    const expectation = validateResultOwnershipExpectation(rawExpectation);
+    const marker = validateDesktopResultActivityMarker(rawMarker);
+    requireRuntimeFence(runtimeFence);
+    const session = this.open();
+    try {
+      const value = await session.request("inspect_pending_receipt", withRuntimeFence({ target, expectation, marker }, runtimeFence));
+      if (!value || typeof value !== "object" || Array.isArray(value) ||
+          Object.keys(value).sort().join(",") !== "fence,ownership") throw error("DESKTOP_PROTOCOL_ERROR");
+      const input = value as { ownership: unknown; fence: DesktopResultTerminalFence["fence"] };
+      const ownership = assertResultOwnershipExpectation(validateResultOwnership(input.ownership, target, true), expectation);
+      if (ownership.resultTurnId !== marker.resultTurnId ||
+          !["inProgress", "safe_terminal", "post_record_activity", "unprovable"].includes(input.fence) ||
+          (input.fence === "safe_terminal" && ownership.resultTurnStatus === "inProgress") ||
+          (input.fence === "inProgress" && ownership.resultTurnStatus !== "inProgress")) throw error("DESKTOP_PROTOCOL_ERROR");
+      return { ...ownership, fence: input.fence };
     } finally { session.close(); }
   }
 
@@ -167,19 +215,21 @@ export class DesktopIpcClient {
     return this.currentOperation("current_result_classification", workspaceRoot, validateResultClassification) as Promise<DesktopResultClassification>;
   }
 
-  async confirmCurrent(workspaceRoot: string): Promise<DesktopTargetInfo> {
-    return this.currentOperation("current_confirm", workspaceRoot);
+  async confirmCurrent(workspaceRoot: string): Promise<DesktopTargetInfoInternal> {
+    return this.currentOperation("current_confirm", workspaceRoot, validateInternalInfo) as Promise<DesktopTargetInfoInternal>;
   }
 
   async reconcileUnknown(
     rawTarget: DesktopTarget,
     rawExpectation: DesktopUnknownReconcileExpectation,
+    runtimeFence?: DesktopRuntimeFence,
   ): Promise<DesktopUnknownReconcileObservation> {
     const target = validateTarget(rawTarget);
     const expectation = validateUnknownReconcileExpectation(rawExpectation);
+    requireRuntimeFence(runtimeFence);
     const session = this.open();
     try {
-      const value = await session.request("reconcile_unknown", { target, expectation });
+      const value = await session.request("reconcile_unknown", withRuntimeFence({ target, expectation }, runtimeFence));
       return validateUnknownReconcileObservation(value, target);
     } finally { session.close(); }
   }
@@ -199,11 +249,12 @@ export class DesktopIpcClient {
     } finally { session.close(); }
   }
 
-  async prepare(rawTarget: DesktopTarget): Promise<DesktopIpcConnection> {
+  async prepare(rawTarget: DesktopTarget, runtimeFence?: DesktopRuntimeFence): Promise<DesktopIpcConnection> {
     const target = validateTarget(rawTarget);
+    requireRuntimeFence(runtimeFence);
     const session = this.open();
     try {
-      const value = await session.request("prepare", { target });
+      const value = await session.request("prepare", withRuntimeFence({ target }, runtimeFence));
       validateInfo(value, target);
       return {
         send: async (message: string) => {
@@ -229,6 +280,15 @@ export class DesktopIpcClient {
       this.sendTimeoutMs,
     );
   }
+}
+
+function withRuntimeFence<T extends Record<string, unknown>>(request: T, runtimeFence?: DesktopRuntimeFence): T & { runtimeFence?: DesktopRuntimeFence } {
+  return runtimeFence === undefined ? request : { ...request, runtimeFence };
+}
+
+function requireRuntimeFence(runtimeFence: DesktopRuntimeFence | undefined): DesktopRuntimeFence {
+  if (!runtimeFence) throw error("DESKTOP_RUNTIME_FENCE_MISSING");
+  return runtimeFence;
 }
 
 export const desktopIpc = new DesktopIpcClient();

@@ -1,4 +1,6 @@
 import { desktopIpc, type DesktopTarget } from "../desktop/ipc.js";
+import type { DesktopRuntimeFence } from "../desktop/ipc-contracts.js";
+import { requireDesktopRuntimeFence } from "../desktop/store.js";
 import {
   parseExecutorBindingCandidate,
   type ExecutorBinding,
@@ -45,6 +47,10 @@ export interface ExecutorTarget {
 
 export interface ExecutorSessionInfo extends ExecutorTarget {
   readonly title: string;
+  readonly runtimeStatus?: string;
+  readonly requestsCount?: number;
+  /** Internal Desktop process fence; omitted from generic projections. */
+  readonly runtimeFence?: DesktopRuntimeFence;
 }
 
 export interface ExecutorExecutionInfo extends ExecutorTarget {
@@ -58,11 +64,13 @@ export interface ExecutorConnection {
 
 export interface ExecutorAdapter {
   readonly descriptor: ExecutorDescriptor;
-  inspect(target: ExecutorTarget): Promise<ExecutorSessionInfo>;
+  /** 首次显式绑定专用 discovery；不接受 runtime fence。 */
+  discoverForBinding?(target: ExecutorTarget): Promise<ExecutorSessionInfo>;
+  inspect(target: ExecutorTarget, runtimeFence?: DesktopRuntimeFence): Promise<ExecutorSessionInfo>;
   currentIdentity(workspaceRoot: string): Promise<ExecutorSessionInfo>;
   confirmCurrent(workspaceRoot: string): Promise<ExecutorSessionInfo>;
-  prepare(target: ExecutorTarget): Promise<ExecutorConnection>;
-  inspectActiveExecution(target: ExecutorTarget): Promise<ExecutorExecutionInfo>;
+  prepare(target: ExecutorTarget, runtimeFence?: DesktopRuntimeFence): Promise<ExecutorConnection>;
+  inspectActiveExecution(target: ExecutorTarget, runtimeFence?: DesktopRuntimeFence): Promise<ExecutorExecutionInfo>;
 }
 
 const CODEX_DESKTOP_CAPABILITIES: ExecutorCapabilities = Object.freeze({
@@ -86,8 +94,12 @@ const CODEX_DESKTOP_DESCRIPTOR: ExecutorDescriptor = Object.freeze({
 export class CodexDesktopAdapter implements ExecutorAdapter {
   readonly descriptor = CODEX_DESKTOP_DESCRIPTOR;
 
-  inspect(target: ExecutorTarget): Promise<ExecutorSessionInfo> {
-    return desktopIpc.inspect(target as DesktopTarget);
+  discoverForBinding(target: ExecutorTarget): Promise<ExecutorSessionInfo> {
+    return desktopIpc.discoverForBinding(target as DesktopTarget) as Promise<ExecutorSessionInfo>;
+  }
+
+  inspect(target: ExecutorTarget, runtimeFence?: DesktopRuntimeFence): Promise<ExecutorSessionInfo> {
+    return desktopIpc.inspect(target as DesktopTarget, runtimeFence) as Promise<ExecutorSessionInfo>;
   }
 
   currentIdentity(workspaceRoot: string): Promise<ExecutorSessionInfo> {
@@ -98,12 +110,12 @@ export class CodexDesktopAdapter implements ExecutorAdapter {
     return desktopIpc.confirmCurrent(workspaceRoot);
   }
 
-  prepare(target: ExecutorTarget): Promise<ExecutorConnection> {
-    return desktopIpc.prepare(target as DesktopTarget);
+  prepare(target: ExecutorTarget, runtimeFence?: DesktopRuntimeFence): Promise<ExecutorConnection> {
+    return desktopIpc.prepare(target as DesktopTarget, runtimeFence);
   }
 
-  inspectActiveExecution(target: ExecutorTarget): Promise<ExecutorExecutionInfo> {
-    return desktopIpc.inspectActiveExecution(target as DesktopTarget);
+  inspectActiveExecution(target: ExecutorTarget, runtimeFence?: DesktopRuntimeFence): Promise<ExecutorExecutionInfo> {
+    return desktopIpc.inspectActiveExecution(target as DesktopTarget, runtimeFence);
   }
 }
 
@@ -280,11 +292,15 @@ export class CodexDesktopExecutorPlugin implements ExecutorPlugin {
 
   async inspectSession(binding: ExecutorBinding): Promise<ExecutorSessionProjection> {
     const target = translateBindingToCodexTarget(binding);
-    const session = await this.adapter.inspect(target);
+    const session = await this.adapter.inspect(target, requireDesktopRuntimeFence(binding.workspaceId, binding.workspaceRoot));
     return {
       sessionId: session.threadId,
       instanceId: session.hostId,
       locator: { executorProjectId: session.projectId },
+      activity: session.requestsCount === undefined ? "unknown"
+        : session.requestsCount > 0 ? "approval_required"
+          : session.runtimeStatus === "idle" ? "idle"
+            : session.runtimeStatus === "active" || session.runtimeStatus === "inProgress" ? "busy" : "unknown",
     };
   }
 
@@ -302,7 +318,7 @@ export class CodexDesktopExecutorPlugin implements ExecutorPlugin {
       }
       throw error;
     }
-    const connection = await this.adapter.prepare(target);
+    const connection = await this.adapter.prepare(target, requireDesktopRuntimeFence(request.target.workspaceId, request.target.workspaceRoot));
     try {
       const sent = await connection.send(request.payload);
       if (sent.threadId !== request.target.sessionId) {
@@ -323,7 +339,7 @@ export class CodexDesktopExecutorPlugin implements ExecutorPlugin {
 
   async inspectActiveExecution(binding: ExecutorBinding): Promise<ExecutorActiveExecutionProjection> {
     const target = translateBindingToCodexTarget(binding);
-    const info = await this.adapter.inspectActiveExecution(target);
+    const info = await this.adapter.inspectActiveExecution(target, requireDesktopRuntimeFence(binding.workspaceId, binding.workspaceRoot));
     return { active: Boolean(info.activeTurnId), executionId: info.activeTurnId };
   }
 }

@@ -2,14 +2,15 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { EventEmitter } from "node:events";
-import { spawnSync, type ChildProcess } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { listExecutionOutputs } from "../src/execution/output.js";
 import { readExecutionRecordsStrict, isTrustedDesktopReceipt } from "../src/execution/records.js";
 import { desktopIpc } from "../src/desktop/ipc.js";
 import * as desktopStore from "../src/desktop/store.js";
+import * as lifecycle from "../src/command-cleanup/fence.js";
+import { CommandCleanupError } from "../src/command-cleanup/schema.js";
 import {
   readReceiptFinalizationAlert,
   readReceiptFinalizationDraft,
@@ -22,6 +23,8 @@ import {
   type ReceiptFinalizationDraft,
   type ReceiptFinalizationOwnershipSnapshot,
 } from "../src/desktop/receipt-finalizer.js";
+import { acquireReceiptFinalizationClaim, readReceiptFinalizationClaim, receiptFinalizationClaimPath, writeReceiptFinalizationWorkerFailureAlert } from "../src/desktop/receipt-finalizer-store.js";
+import { type DaemonSpawnOptions, type DaemonSpawnResult } from "../src/process/daemon-spawn.js";
 import { Workspace } from "../src/workspace/manager.js";
 
 const threadId = "01a00000-0000-7000-8000-000000000101";
@@ -30,6 +33,14 @@ const resultTurnId = "00000000-0000-4000-8000-000000000103";
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const cliEntry = path.join(projectRoot, "src/cli/index.ts");
 const receiptFinalizerCliSource = path.join(projectRoot, "src/cli/desktop-receipt-finalizer.ts");
+const runtimeFence = {
+  desktopPid: 1001,
+  desktopExe: "C:\\Program Files\\ChatGPT\\ChatGPT.exe",
+  desktopCreation: "1000001",
+  appServerPid: 1002,
+  appServerExe: "C:\\Program Files\\ChatGPT\\codex.exe",
+  appServerCreation: "1000002",
+};
 
 function draft(stateDir: string) {
   return stageReceiptFinalization({
@@ -149,6 +160,7 @@ function mockDurableState(pending: ReturnType<typeof draft>) {
     workspaceId: pending.workspaceId,
     workspaceRoot: pending.workspaceRoot,
     enabled: true,
+    runtimeFence,
     binding: {
       bindingId,
       threadId,
@@ -190,7 +202,8 @@ function ownershipResult(
     workspaceRoot: snapshot.workspaceRoot,
     title: "test",
     cwd: snapshot.workspaceRoot,
-    runtimeStatus: "idle",
+    runtimeStatus: "active",
+    fence: "safe_terminal" as const,
     resultTurnId: snapshot.resultTurnId,
     resultTurnStatus: "completed" as const,
     ownership: snapshot.ownership,
@@ -281,7 +294,7 @@ describe("Desktop receipt terminal fence", () => {
       });
     const alert = await runReceiptFinalizer(pending, { stateDir, pollMs: 1000 });
     expect(spy).toHaveBeenCalledTimes(1);
-    expect(spy).toHaveBeenCalledWith({ threadId, hostId: "local", projectId: "project", workspaceRoot: pending.workspaceRoot });
+    expect(spy).toHaveBeenCalledWith({ threadId, hostId: "local", projectId: "project", workspaceRoot: pending.workspaceRoot }, runtimeFence);
     expect(alert?.reason).toBe("post_record_activity_unprovable");
     expect(readReceiptFinalizationAlert(stateDir, pending.workspaceId, pending.commandId)?.alertId).toBe(pending.draftId);
   });
@@ -360,10 +373,10 @@ describe("Desktop receipt terminal fence", () => {
     process.env.C2C_STATE_DIR = stateDir;
     try {
       vi.spyOn(desktopIpc, "inspectResultTerminalFence").mockResolvedValue(safeTerminalFence(pending));
-      const ownership = vi.spyOn(desktopIpc, "inspectResultOwnership").mockResolvedValue(ownershipResult(pending));
+      const ownership = vi.spyOn(desktopIpc, "inspectPendingReceipt").mockResolvedValue(ownershipResult(pending));
       const result = await runReceiptFinalizer(pending, { stateDir });
       expect(result).toMatchObject({ record: { commandId: pending.commandId } });
-      expect(ownership).toHaveBeenCalledOnce();
+      expect(ownership).toHaveBeenCalledTimes(2);
       expect(ownership).toHaveBeenCalledWith(
         { threadId, hostId: "local", projectId: "project", workspaceRoot: pending.workspaceRoot },
         {
@@ -374,6 +387,7 @@ describe("Desktop receipt terminal fence", () => {
           messageSha256: "a".repeat(64),
           originTurnId,
         },
+        pending.marker, runtimeFence,
       );
       expect(readExecutionRecordsStrict(pending.workspaceId)).toHaveLength(1);
       expect(listExecutionOutputs(pending.workspaceId, Number.MAX_SAFE_INTEGER)).toHaveLength(1);
@@ -403,11 +417,11 @@ describe("Desktop receipt terminal fence", () => {
     process.env.C2C_STATE_DIR = stateDir;
     try {
       vi.spyOn(desktopIpc, "inspectResultTerminalFence").mockResolvedValue(safeTerminalFence(pending));
-      const ownership = vi.spyOn(desktopIpc, "inspectResultOwnership").mockResolvedValue(ownershipResult(pending));
+      const ownership = vi.spyOn(desktopIpc, "inspectPendingReceipt").mockResolvedValue(ownershipResult(pending));
       await expect(runReceiptFinalizer(pending, { stateDir })).resolves.toMatchObject({
         record: { commandId: pending.commandId, desktopOriginTurnId: originTurnId, desktopResultTurnId: resultTurnId },
       });
-      expect(ownership).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ originTurnId, deliveryId }));
+      expect(ownership).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ originTurnId, deliveryId }), pending.marker, runtimeFence);
       expect(isTrustedDesktopReceipt(readExecutionRecordsStrict(pending.workspaceId)[0], pending.commandId)).toBe(true);
     } finally {
       if (previousStateDir === undefined) delete process.env.C2C_STATE_DIR;
@@ -431,7 +445,7 @@ describe("Desktop receipt terminal fence", () => {
     process.env.C2C_STATE_DIR = stateDir;
     try {
       vi.spyOn(desktopIpc, "inspectResultTerminalFence").mockResolvedValue(safeTerminalFence(pending));
-      const inspect = vi.spyOn(desktopIpc, "inspectResultOwnership").mockResolvedValue(ownershipResult(pending, {
+      const inspect = vi.spyOn(desktopIpc, "inspectPendingReceipt").mockResolvedValue(ownershipResult(pending, {
         chainSignatures: ["resume_interrupted_task", "resume_interrupted_task"],
       }));
       const alert = await runReceiptFinalizer(pending, { stateDir });
@@ -470,7 +484,7 @@ describe("Desktop receipt terminal fence", () => {
         const changed = drift === "origin" ? { originTurnId: "00000000-0000-4000-8000-000000000107" }
           : drift === "delivery" ? { deliveryId: "00000000-0000-4000-8000-000000000108" }
             : { originAlias: null };
-        vi.spyOn(desktopIpc, "inspectResultOwnership").mockResolvedValue(ownershipResult(pending, changed));
+        vi.spyOn(desktopIpc, "inspectPendingReceipt").mockResolvedValue(ownershipResult(pending, changed));
         const alert = await runReceiptFinalizer(pending, { stateDir });
         expect(alert).toMatchObject({ reason: "identity_drift" });
         expect(readExecutionRecordsStrict(pending.workspaceId)).toEqual([]);
@@ -508,7 +522,7 @@ describe("Desktop receipt terminal fence", () => {
     process.env.C2C_STATE_DIR = stateDir;
     try {
       vi.spyOn(desktopIpc, "inspectResultTerminalFence").mockResolvedValue(safeTerminalFence(pending));
-      const inspect = vi.spyOn(desktopIpc, "inspectResultOwnership");
+      const inspect = vi.spyOn(desktopIpc, "inspectPendingReceipt");
       const alert = await runReceiptFinalizer(pending, { stateDir });
       expect(alert).toMatchObject({ reason: "identity_drift" });
       expect(inspect).not.toHaveBeenCalled();
@@ -750,6 +764,20 @@ describe("Desktop receipt terminal fence", () => {
     expect((await first)?.reason).toBe("timeout");
   });
 
+  it.each([false, true])("startup lock contention re-reads the draft without resurrection (cleaned=%s)", async cleaned => {
+    stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "c2c-receipt-finalizer-"));
+    const pending = v2Draft(stateDir);
+    mockDurableState(pending);
+    const ipc = vi.spyOn(desktopIpc, "inspectResultTerminalFence").mockResolvedValue({ ...safeTerminalFence(pending), fence: "post_record_activity" });
+    vi.spyOn(lifecycle, "withCommandOperationAsync").mockImplementationOnce(async () => {
+      if (cleaned) fs.unlinkSync(receiptFinalizationDraftPath(stateDir, pending.workspaceId, pending.commandId));
+      throw new CommandCleanupError("COMMAND_CLEANUP_BUSY", "record still owns the lifecycle lock");
+    });
+    const result = await runReceiptFinalizer(pending, { stateDir, pollMs: 1000 });
+    if (cleaned) { expect(result).toBeNull(); expect(ipc).not.toHaveBeenCalled(); }
+    else { expect(result).toMatchObject({ reason: "post_record_activity" }); expect(ipc).toHaveBeenCalledOnce(); }
+  });
+
   it("surfaces claim storage failures instead of treating them as contention", async () => {
     stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "c2c-receipt-finalizer-"));
     const pending = draft(stateDir);
@@ -759,26 +787,48 @@ describe("Desktop receipt terminal fence", () => {
       .rejects.toThrow();
   });
 
-  it("detached worker loads source TypeScript and reports unknown terminality on abnormal exit", () => {
+  it("worker awaits the Job-escaping daemon helper with an allowlisted environment", async () => {
     stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "c2c-receipt-finalizer-"));
     const pending = draft(stateDir);
-    const child = Object.assign(new EventEmitter(), { unref: vi.fn() }) as unknown as ChildProcess;
-    const spawnImpl = vi.fn((_command: string, args: string[], options: { env?: NodeJS.ProcessEnv }) => {
-      expect(options.env?.CODEX_THREAD_ID).toBeUndefined();
-      expect(options.env?.CODEX_SESSION_ID).toBeUndefined();
-      expect(options.env?.C2C_STARTUP_LEASE).toBeUndefined();
-      expect(options.env?.C2C_RECEIPT_FINALIZER_STATE_DIR).toBe(path.resolve(stateDir));
-      return child;
+    const spawned = { pid: 1234, mode: "helper-wmi" } as DaemonSpawnResult;
+    const spawnImpl = vi.fn(async (options: DaemonSpawnOptions) => {
+      expect(options.env.CODEX_THREAD_ID).toBeUndefined();
+      expect(options.env.CODEX_SESSION_ID).toBeUndefined();
+      expect(options.env.C2C_STARTUP_LEASE).toBeUndefined();
+      expect(options.env.C2C_RECEIPT_FINALIZER_STATE_DIR).toBe(path.resolve(stateDir));
+      expect(options.logFile).toBe(os.devNull);
+      expect(options.allowUnprovenDirectFallback).toBeUndefined();
+      return spawned;
     });
-    spawnReceiptFinalizerWorker(pending, { stateDir, spawnImpl, entry: "worker-entry.ts" });
-    expect(spawnImpl).toHaveBeenCalledOnce();
-    expect(spawnImpl.mock.calls[0]?.[1]).toEqual([
+    await expect(spawnReceiptFinalizerWorker(pending, { stateDir, spawnImpl, entry: "worker-entry.ts" })).resolves.toBe(spawned);
+    expect(spawnImpl.mock.calls[0]?.[0].args).toEqual([
       "--import", "tsx", "worker-entry.ts", "desktop-receipt-finalizer", "run",
       "-w", pending.workspaceRoot, "--draft", pending.draftId,
     ]);
-    child.emit("exit", 1, null);
-    expect(readReceiptFinalizationAlert(stateDir, pending.workspaceId, pending.commandId))
-      .toMatchObject({ reason: "terminality_unknown" });
+    spawnImpl.mockRejectedValueOnce(new Error("helper escape failed"));
+    await expect(spawnReceiptFinalizerWorker(pending, { stateDir, spawnImpl, entry: "worker-entry.js" })).rejects.toThrow("helper escape failed");
+    expect(readReceiptFinalizationAlert(stateDir, pending.workspaceId, pending.commandId)).toMatchObject({ reason: "worker_spawn_failed" });
+  });
+
+  it.each(["live", "EPERM", "EIO", "ESRCH", "replacement"])("claim recovery requires exact dead owner: %s", code => {
+    stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "c2c-receipt-finalizer-"));
+    const pending = draft(stateDir);
+    const file = receiptFinalizationClaimPath(stateDir, pending.workspaceId, pending.commandId);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const prior = { version: 1, draftId: pending.draftId, pid: 123456, claimedAt: new Date(0).toISOString() };
+    fs.writeFileSync(file, JSON.stringify(prior));
+    vi.spyOn(process, "kill").mockImplementation(() => {
+      if (code === "live") return true;
+      if (code === "replacement") fs.writeFileSync(file, JSON.stringify({ ...prior, pid: 654321 }));
+      throw Object.assign(new Error(), { code: code === "replacement" ? "ESRCH" : code });
+    });
+    if (code === "replacement") {
+      expect(() => acquireReceiptFinalizationClaim(stateDir, pending)).toThrow(/corrupt/);
+      expect(readReceiptFinalizationClaim(stateDir, pending.workspaceId, pending.commandId)?.pid).toBe(654321);
+    } else {
+      expect(acquireReceiptFinalizationClaim(stateDir, pending)).toBe(code === "ESRCH");
+      expect(readReceiptFinalizationClaim(stateDir, pending.workspaceId, pending.commandId)?.pid).toBe(code === "ESRCH" ? process.pid : prior.pid);
+    }
   });
 
   it("does not emit a terminality alert after a trusted receipt was committed", () => {
@@ -809,9 +859,7 @@ describe("Desktop receipt terminal fence", () => {
       desktopBindingId: "00000000-0000-4000-8000-000000000104",
     })}\n`, "utf8");
 
-    const child = Object.assign(new EventEmitter(), { unref: vi.fn() }) as unknown as ChildProcess;
-    spawnReceiptFinalizerWorker(completed, { stateDir, spawnImpl: vi.fn(() => child), entry: "worker-entry.js" });
-    child.emit("exit", 1, null);
+    writeReceiptFinalizationWorkerFailureAlert(completed, { stateDir });
 
     expect(readReceiptFinalizationAlert(stateDir, completed.workspaceId, completed.commandId)).toBeNull();
   });

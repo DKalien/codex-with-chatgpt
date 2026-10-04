@@ -110,6 +110,8 @@ export function parseExecutorDeliveryAcceptance(input: unknown): ExecutorDeliver
 export type ExecutorExecutionEvidence = ExecutorExecutionEvidenceRecord;
 
 export interface ExecutorSessionProjection {
+  /** Observed activity only; never authorizes delivery. Omitted means unknown. */
+  readonly activity?: "idle" | "busy" | "approval_required" | "unknown";
   readonly sessionId: string;
   readonly instanceId: string;
   readonly locator: Readonly<Record<string, string>>;

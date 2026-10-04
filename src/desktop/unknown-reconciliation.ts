@@ -14,6 +14,7 @@ import {
 } from "./store.js";
 import { assertNoOutcomeResolutionForCommand } from "./outcome-resolution.js";
 import { withEvidenceLock } from "./recovery-evidence.js";
+import { withCommandOperationAsync } from "../command-cleanup/fence.js";
 
 export interface UnknownReconciliationWorkspace {
   id: string;
@@ -98,6 +99,15 @@ export async function reconcileUnknownDesktopDelivery(
 ): Promise<UnknownReconciliationResult> {
   const workspace = workspaceInput.parse({ id: workspaceRaw.id, root: workspaceRaw.root });
   desktopId.parse(commandId);
+  return withCommandOperationAsync(workspace.id, commandId,
+    () => reconcileUnknownDesktopDeliveryLocked(workspace, commandId, options));
+}
+
+async function reconcileUnknownDesktopDeliveryLocked(
+  workspace: UnknownReconciliationWorkspace,
+  commandId: string,
+  options: UnknownReconciliationOptions,
+): Promise<UnknownReconciliationResult> {
   if (options.expectedTurnId !== undefined && !strictUuid(options.expectedTurnId)) {
     return fail("DESKTOP_RECONCILIATION_CONFLICT", "expected result turn 无法严格核验；未修改投递状态。");
   }
@@ -111,6 +121,7 @@ export async function reconcileUnknownDesktopDelivery(
   }
   assertNoAdministrativeResolution(workspace.id, commandId);
   const target = checkedTarget(snapshot, workspace, delivery);
+  if (!snapshot.runtimeFence) return fail("DESKTOP_RUNTIME_FENCE_MISSING", "Desktop 绑定缺少运行时身份 fence；请重新绑定当前 Desktop 会话。");
   const observation = await desktopIpc.reconcileUnknown(target, {
     workspaceId: workspace.id,
     commandId,
@@ -118,7 +129,7 @@ export async function reconcileUnknownDesktopDelivery(
     messageBytes: delivery.messageBytes,
     messageSha256: delivery.messageSha256,
     ...(delivery.deliveryId === undefined ? {} : { deliveryId: delivery.deliveryId }),
-  });
+  }, snapshot.runtimeFence);
   const candidates = validateObservation(observation, target);
   if (candidates.length === 0) {
     return { status: "unresolved", commandId, deliveryStatus: "outcome_unknown" };

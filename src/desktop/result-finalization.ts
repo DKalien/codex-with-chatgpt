@@ -1,4 +1,5 @@
-import { listExecutionOutputs } from "../execution/output.js";
+import { getStateDir } from "../config/paths.js";
+import { readExecutionOutputMetadataStrict } from "../execution/output.js";
 import {
   isTrustedDesktopReceipt,
   readExecutionRecordsStrict,
@@ -29,6 +30,7 @@ import {
   receiptHash,
 } from "./result-commit.js";
 import { assertFinalizationOwnership } from "./result-evidence.js";
+import { withCommandOperationAsync } from "../command-cleanup/fence.js";
 
 function assertFinalizationDelivery(
   workspace: DesktopResultWorkspace,
@@ -84,6 +86,18 @@ export async function finalizeReceiptFinalizationDraft(
   target: { threadId: string; hostId: string; projectId: string; workspaceRoot: string },
   fence: ReceiptFinalizationFenceResult,
   beforeReceiptCommit?: (receiptAlreadyExists: boolean) => void,
+  stateDir = getStateDir(),
+): Promise<DesktopResultReceipt> {
+  return withCommandOperationAsync(draft.workspaceId, draft.commandId,
+    () => finalizeReceiptFinalizationDraftLocked(draft, target, fence, beforeReceiptCommit, stateDir), stateDir);
+}
+
+async function finalizeReceiptFinalizationDraftLocked(
+  draft: ReceiptFinalizationMarkedDraft,
+  target: { threadId: string; hostId: string; projectId: string; workspaceRoot: string },
+  fence: ReceiptFinalizationFenceResult,
+  beforeReceiptCommit?: (receiptAlreadyExists: boolean) => void,
+  stateDir = getStateDir(),
 ): Promise<DesktopResultReceipt> {
   const workspace = workspaceInput.parse({ id: draft.workspaceId, root: draft.workspaceRoot });
   assertFinalizationFence(draft, fence);
@@ -98,15 +112,15 @@ export async function finalizeReceiptFinalizationDraft(
     const accepted = assertFinalizationDelivery(workspace, draft, target);
     if (draft.version === 3) await assertFinalizationOwnership(workspace, draft, target, accepted);
     let records: StoredExecutionRecord[];
-    try { records = readExecutionRecordsStrict(workspace.id); }
+    try { records = readExecutionRecordsStrict(workspace.id, stateDir); }
     catch (error) { throw new DesktopResultError("DESKTOP_RESULT_RECORDS_CORRUPT", error instanceof Error ? error.message : "执行记录损坏；拒绝继续。 "); }
     const prior = existingRecord(records, draft.commandId, taskId, digest);
     if (prior) {
       if (!isTrustedDesktopReceipt(prior, draft.commandId)) {
         throw new DesktopResultError("DESKTOP_RESULT_CONFLICT", "已有记录不是唯一可信 Desktop receipt；拒绝重放。 ");
       }
-      const output = outputForRecord(workspace.id, prior);
-      const matchingOutputs = listExecutionOutputs(workspace.id, Number.MAX_SAFE_INTEGER)
+      const output = outputForRecord(workspace.id, prior, stateDir);
+      const matchingOutputs = readExecutionOutputMetadataStrict(workspace.id, stateDir)
         .filter(item => item.taskId === taskId && item.iteration === 1);
       if ((prior.outputId === undefined && matchingOutputs.length !== 0) ||
           (prior.outputId !== undefined && matchingOutputs.length !== 1)) {
@@ -118,7 +132,7 @@ export async function finalizeReceiptFinalizationDraft(
       }
       return { record: prior, output };
     }
-    if (hasPartialOutput(workspace.id, taskId)) {
+    if (hasPartialOutput(workspace.id, taskId, stateDir)) {
       throw new DesktopResultError("DESKTOP_RESULT_PARTIAL", "已有未完成的 Desktop 结果输出但缺少执行记录；拒绝追加。 ");
     }
     if (input.rawSummary !== undefined) {
@@ -145,18 +159,18 @@ export async function finalizeReceiptFinalizationDraft(
       desktopBindingId: acceptedBeforeOutput.bindingId,
     };
     if (draft.version === 3) assertFinalizationDeliveryStable(workspace, draft, target, acceptedBeforeOutput);
-    const committedReceipt = appendTrustedReceiptLocked(workspace.id, input, record);
+    const committedReceipt = appendTrustedReceiptLocked(workspace.id, input, record, stateDir);
     const output = committedReceipt.output;
-    const committed = readExecutionRecordsStrict(workspace.id)
+    const committed = readExecutionRecordsStrict(workspace.id, stateDir)
       .filter(item => item.commandId === draft.commandId && item.taskId === taskId);
     if (committed.length !== 1 || !isTrustedDesktopReceipt(committed[0], draft.commandId)) {
       throw new DesktopResultError("DESKTOP_RESULT_CONFLICT", "Desktop receipt 未形成唯一可信终态；拒绝报告成功。 ");
     }
-    const outputs = listExecutionOutputs(workspace.id, Number.MAX_SAFE_INTEGER)
+    const outputs = readExecutionOutputMetadataStrict(workspace.id, stateDir)
       .filter(item => item.taskId === taskId && item.iteration === 1);
     if ((output === null && outputs.length !== 0) || (output !== null && outputs.length !== 1)) {
       throw new DesktopResultError("DESKTOP_RESULT_PARTIAL", "Desktop receipt output 数量不唯一；拒绝报告成功。 ");
     }
     return { record: committed[0], output };
-  });
+  }, stateDir);
 }

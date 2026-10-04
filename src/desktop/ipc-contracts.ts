@@ -8,6 +8,20 @@ export interface DesktopTarget {
   workspaceRoot: string;
 }
 
+/** Desktop/app-server process identity fence; internal IPC/state data only. */
+export interface DesktopRuntimeFence {
+  desktopPid: number;
+  desktopExe: string;
+  desktopCreation: string;
+  appServerPid: number;
+  appServerExe: string;
+  appServerCreation: string;
+}
+
+export interface DesktopTargetInfoInternal extends DesktopTargetInfo {
+  runtimeFence: DesktopRuntimeFence;
+}
+
 export interface DesktopTargetInfo extends DesktopTarget {
   title: string;
   cwd: string;
@@ -35,6 +49,8 @@ export const DESKTOP_RESULT_ACTIVITY_ITEM_TYPES = [
   "collabAgentToolCall", "error", "modelChanged", "contextCompaction", "fileChange",
   "hookPrompt", "functionCallOutput", "plan", "mcpToolCall", "dynamicToolCall",
   "webSearch", "imageView", "sleep", "imageGeneration", "enteredReviewMode", "exitedReviewMode",
+  // Ordered marker evidence only; steering after record remains post_record_activity.
+  "steeringUserMessage", "steered",
 ] as const;
 
 export type DesktopResultActivityItemType = typeof DESKTOP_RESULT_ACTIVITY_ITEM_TYPES[number];

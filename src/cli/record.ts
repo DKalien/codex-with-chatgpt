@@ -4,6 +4,7 @@ import path from "node:path";
 import { Workspace } from "../workspace/manager.js";
 import { appendExecutionRecord, executionRecordSchema, sanitizeExecutionSummary } from "../execution/records.js";
 import { saveExecutionOutput } from "../execution/output.js";
+import { withCommandOperation } from "../command-cleanup/fence.js";
 import { DesktopResultError, DesktopResultPendingError, discoverCurrentDesktopDelivery, recordDesktopResult } from "../desktop/result.js";
 import { reconcileTrustedDesktopExecutionResult } from "../routing/execution-result-reconciler.js";
 import { prepareResultReconciliation } from "../routing/result-outbox-store.js";
@@ -48,10 +49,12 @@ program
     }) => {
       const workspace = new Workspace(resolveWorkspace(opts.workspace));
       let desktopDelivery: Awaited<ReturnType<typeof discoverCurrentDesktopDelivery>> | null = null;
+      let desktopDiscoveryFailure: DesktopResultError | undefined;
       try {
         desktopDelivery = await discoverCurrentDesktopDelivery({ id: workspace.id, root: workspace.root });
       } catch (error) {
         if (!(error instanceof DesktopResultError) || error.code !== "DESKTOP_RESULT_NOT_APPLICABLE") throw error;
+        desktopDiscoveryFailure = error;
       }
       if (desktopDelivery) {
         if (opts.iteration !== 1) throw new Error("Desktop 自动 receipt 仅允许 iteration=1。");
@@ -114,7 +117,17 @@ program
         if (reconciliationNeeded) process.exitCode = 1;
         return;
       }
-      if (!opts.task) throw new Error("普通执行记录必须提供 --task；当前 turn 不是 Desktop delivery。");
+      if (!opts.task) {
+        if (desktopDiscoveryFailure) {
+          if (opts.json) {
+            say(JSON.stringify({ ok: false, error: desktopDiscoveryFailure.code, stage: "desktop_discovery", message: desktopDiscoveryFailure.message }));
+            process.exitCode = 1;
+            return;
+          }
+          throw desktopDiscoveryFailure;
+        }
+        throw new Error("普通执行记录必须提供 --task；当前 turn 不是 Desktop delivery。");
+      }
       const record = executionRecordSchema.parse({
         taskId: opts.task,
         iteration: opts.iteration,
@@ -129,6 +142,7 @@ program
       });
       let outputId: number | undefined;
       let outputAvailable = false;
+      const commit = () => {
       const rawOutput =
         opts.outputFile !== undefined
           ? readCappedUtf8(path.resolve(opts.outputFile), MAX_RECORD_OUTPUT_READ)
@@ -140,6 +154,7 @@ program
           exitCode: opts.exitCode ?? null,
           taskId: record.taskId,
           iteration: record.iteration,
+          ...(record.commandId === undefined ? {} : { commandId: record.commandId }),
         });
         outputId = savedOutput.id;
         outputAvailable = savedOutput.allowed;
@@ -149,6 +164,9 @@ program
         outputId,
         outputAvailable,
       });
+      };
+      if (record.commandId && record.iteration === 1) withCommandOperation(workspace.id, record.commandId, commit);
+      else commit();
       if (opts.json) {
         say(JSON.stringify({ ok: true, autoPromotedDesktop: false, taskId: record.taskId, outputId, outputAvailable }));
       } else if (outputId !== undefined && !outputAvailable) check("已记录执行摘要（输出未对 ChatGPT 开放）");

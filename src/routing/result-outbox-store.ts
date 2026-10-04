@@ -12,6 +12,7 @@ import {
 } from "./schema.js";
 import {
   readRouting,
+  routingFile,
   resolveWorkspaceIdentity,
   type RoutingWorkspaceIdentity,
 } from "./store.js";
@@ -28,6 +29,9 @@ import {
   type ResultReconciliationQueue,
 } from "./result-outbox-schema.js";
 import { canonicalRoutingResultDigest as sharedCanonicalRoutingResultDigest } from "./execution-result-digest.js";
+import { assertCleanupStoreFile, readCleanupJournal, withCommandOperation } from "../command-cleanup/fence.js";
+import { assertCleanupArtifacts, cleanupArtifact, CommandCleanupError, type CleanupArtifact, type CommandCleanupTarget } from "../command-cleanup/schema.js";
+import { deleteRoutingCommandAndResultsForCleanup } from "./store.js";
 export type {
   ResultOutboxEntry,
   ResultOutboxReconciliationInput,
@@ -352,6 +356,7 @@ export function prepareResultReconciliation(
 ): void {
   const parsedCommandId = routingCommandIdSchema.parse(commandId);
   const resolved = resolveWorkspaceIdentity(identity);
+  withCommandOperation(resolved.id, parsedCommandId, () => {
   let routing: ReturnType<typeof readRouting>;
   try {
     routing = readRouting(resolved, stateDir);
@@ -383,6 +388,7 @@ export function prepareResultReconciliation(
     commandId: parsedCommandId,
     reasonCode: "RESULT_RECONCILIATION_PENDING",
   }, stateDir);
+  }, stateDir);
 }
 
 export function enqueueResultOutboxEntry(
@@ -393,7 +399,7 @@ export function enqueueResultOutboxEntry(
   const parsed = enqueueInputSchema.parse(input);
   const resolved = resolveWorkspaceIdentity(identity);
   const file = resultOutboxFile(resolved.id, stateDir);
-  return withRoutingFileLock(file, "RESULT_OUTBOX_BUSY", "Result Outbox 写锁繁忙；保留状态并稍后重试。", () => {
+  return withCommandOperation(resolved.id, parsed.commandId, () => withRoutingFileLock(file, "RESULT_OUTBOX_BUSY", "Result Outbox 写锁繁忙；保留状态并稍后重试。", () => {
     const { state: stored } = validatedExistingState(resolved, file, stateDir);
     const current = stored ?? emptyState(resolved);
     const routing = readRouting(resolved, stateDir);
@@ -417,7 +423,7 @@ export function enqueueResultOutboxEntry(
       entries: [...current.entries, entry],
     });
     return { entry, replayed: false };
-  });
+  }), stateDir);
 }
 
 export function markResultReconciliationNeeded(
@@ -428,7 +434,7 @@ export function markResultReconciliationNeeded(
   const parsed = reconciliationInputSchema.parse(input);
   const resolved = resolveWorkspaceIdentity(identity);
   const file = resultReconciliationQueueFile(resolved.id, stateDir);
-  return withRoutingFileLock(file, "RESULT_RECONCILIATION_BUSY", "R4 reconciliation queue 写锁繁忙；稍后重试。", () => {
+  return withCommandOperation(resolved.id, parsed.commandId, () => withRoutingFileLock(file, "RESULT_RECONCILIATION_BUSY", "R4 reconciliation queue 写锁繁忙；稍后重试。", () => {
     const stored = readReconciliationQueue(resolved, file);
     const current = stored ?? emptyReconciliationQueue(resolved);
     const existing = current.entries.find((item) => item.commandId === parsed.commandId);
@@ -445,7 +451,7 @@ export function markResultReconciliationNeeded(
         : [...current.entries, issue],
     });
     return issue;
-  });
+  }), stateDir);
 }
 
 export function clearResultReconciliationNeeded(
@@ -456,7 +462,7 @@ export function clearResultReconciliationNeeded(
   const parsedCommandId = routingCommandIdSchema.parse(commandId);
   const resolved = resolveWorkspaceIdentity(identity);
   const file = resultReconciliationQueueFile(resolved.id, stateDir);
-  return withRoutingFileLock(file, "RESULT_RECONCILIATION_BUSY", "R4 reconciliation queue 写锁繁忙；稍后重试。", () => {
+  return withCommandOperation(resolved.id, parsedCommandId, () => withRoutingFileLock(file, "RESULT_RECONCILIATION_BUSY", "R4 reconciliation queue 写锁繁忙；稍后重试。", () => {
     const stored = readReconciliationQueue(resolved, file);
     if (!stored) return false;
     if (!stored.entries.some((item) => item.commandId === parsedCommandId)) return false;
@@ -466,5 +472,140 @@ export function clearResultReconciliationNeeded(
       entries: stored.entries.filter((item) => item.commandId !== parsedCommandId),
     });
     return true;
-  });
+  }), stateDir);
+}
+
+function cleanupWorkspace(target: CommandCleanupTarget): { identity: { id: string; root: string }; stateDir: string } {
+  routingCommandIdSchema.parse(target.commandId);
+  if (target.iteration !== 1) throw new CommandCleanupError("COMMAND_CLEANUP_INVALID", "只支持 cleanup iteration=1。");
+  const identity = resolveWorkspaceIdentity({ id: target.workspaceId, root: target.workspaceRoot });
+  const stateDir = target.stateDir ?? getStateDir();
+  for (const file of [routingFile(identity.id, stateDir), resultOutboxFile(identity.id, stateDir), resultReconciliationQueueFile(identity.id, stateDir)]) assertCleanupStoreFile(file, stateDir);
+  return { identity, stateDir };
+}
+
+function requireCleanupSnapshot(target: CommandCleanupTarget, expected: readonly CleanupArtifact[], stateDir: string) {
+  const journal = readCleanupJournal(target.workspaceId, target.commandId, stateDir);
+  const keys = (items: readonly CleanupArtifact[]) => items.map(item => `${item.kind}\0${item.id}\0${item.sha256}`).sort();
+  if (!journal || journal.workspaceRoot !== target.workspaceRoot || journal.iteration !== target.iteration ||
+      journal.phase === "snapshot_pending" ||
+      JSON.stringify(keys(expected)) !== JSON.stringify(keys(journal.artifacts))) {
+    throw new CommandCleanupError("COMMAND_CLEANUP_REQUIRED", "cleanup projection 删除要求匹配的完整 journal snapshot。");
+  }
+  return journal;
+}
+
+function routingCleanupArtifacts(
+  target: CommandCleanupTarget,
+  identity: RoutingWorkspaceIdentity,
+  stateDir: string,
+): CleanupArtifact[] {
+  const routing = readRouting(identity, stateDir);
+  if (!routing) return [];
+  const commands = routing.commands.filter(item => item.commandId === target.commandId);
+  const results = routing.results.filter(item => item.commandId === target.commandId);
+  if (commands.length > 1 || results.some(item => item.iteration !== target.iteration)) {
+    throw new CommandCleanupError("COMMAND_CLEANUP_AMBIGUOUS", "Routing 存在重复 command 或 sibling iteration；保留状态。");
+  }
+  return [
+    ...commands.map(item => cleanupArtifact("routing_command", item.commandId, item)),
+    ...results.map(item => cleanupArtifact("routing_result", item.resultId, item)),
+  ];
+}
+
+function projectionCleanupArtifacts(
+  target: CommandCleanupTarget,
+  identity: RoutingWorkspaceIdentity,
+  stateDir: string,
+): { outbox: CleanupArtifact[]; reconciliation: CleanupArtifact[] } {
+  const routing = readRouting(identity, stateDir);
+  const outbox = readOutboxState(identity, resultOutboxFile(identity.id, stateDir));
+  validateReferences(outbox, outbox?.entries.length ? routing : null);
+  const targetEntries = (outbox?.entries ?? []).filter(item => item.commandId === target.commandId);
+  if (targetEntries.some(item => item.iteration !== target.iteration) || targetEntries.length > 1) {
+    throw new CommandCleanupError("COMMAND_CLEANUP_AMBIGUOUS", "Result Outbox 存在重复 target 或 sibling iteration；保留状态。");
+  }
+  const queue = readReconciliationQueue(identity, resultReconciliationQueueFile(identity.id, stateDir));
+  const targetIssues = (queue?.entries ?? []).filter(item => item.commandId === target.commandId);
+  if (targetIssues.length > 1) throw new CommandCleanupError("COMMAND_CLEANUP_AMBIGUOUS", "R4 reconciliation queue target 重复；保留状态。");
+  return {
+    outbox: targetEntries.map(item => cleanupArtifact("result_outbox", item.outboxEntryId, item)),
+    reconciliation: targetIssues.map(item => cleanupArtifact("result_reconciliation", item.commandId, item)),
+  };
+}
+
+/** Snapshot only artifacts owned by this exact routing command; unrelated routes and commands remain untouched. */
+export function inspectRoutingCleanupArtifacts(target: CommandCleanupTarget): CleanupArtifact[] {
+  const { identity, stateDir } = cleanupWorkspace(target);
+  const projections = projectionCleanupArtifacts(target, identity, stateDir);
+  return [
+    ...routingCleanupArtifacts(target, identity, stateDir),
+    ...projections.outbox,
+    ...projections.reconciliation,
+  ];
+}
+
+/** Remove the independently locked Result Outbox and reconciliation projections first. */
+export function deleteRoutingCleanupProjections(
+  target: CommandCleanupTarget,
+  expected: readonly CleanupArtifact[],
+): { outbox: number; reconciliation: number } {
+  const { identity, stateDir } = cleanupWorkspace(target);
+  return withCommandOperation(identity.id, target.commandId, () => {
+    requireCleanupSnapshot(target, expected, stateDir);
+    let outboxCount = 0;
+    let reconciliationCount = 0;
+    const outboxFile = resultOutboxFile(identity.id, stateDir);
+    withRoutingFileLock(outboxFile, "RESULT_OUTBOX_BUSY", "Result Outbox 写锁繁忙；保留 cleanup_pending。", () => {
+      const current = readOutboxState(identity, outboxFile);
+      const routing = current?.entries.length ? readRouting(identity, stateDir) : null;
+      validateReferences(current, routing);
+      const owned = (current?.entries ?? []).filter(item => item.commandId === target.commandId);
+      if (owned.some(item => item.iteration !== target.iteration) || owned.length > 1) {
+        throw new CommandCleanupError("COMMAND_CLEANUP_AMBIGUOUS", "Result Outbox target 有 sibling iteration 或重复身份。");
+      }
+      assertCleanupArtifacts(owned.map(item => cleanupArtifact("result_outbox", item.outboxEntryId, item)), expected);
+      if (current && owned.length) {
+        outboxCount = owned.length;
+        writeState(outboxFile, {
+          ...current,
+          revision: bumpedRevision(current),
+          entries: current.entries.filter(item => item.commandId !== target.commandId),
+        });
+      }
+    });
+    const queueFile = resultReconciliationQueueFile(identity.id, stateDir);
+    withRoutingFileLock(queueFile, "RESULT_RECONCILIATION_BUSY", "R4 reconciliation queue 写锁繁忙；保留 cleanup_pending。", () => {
+      const current = readReconciliationQueue(identity, queueFile);
+      const owned = (current?.entries ?? []).filter(item => item.commandId === target.commandId);
+      if (owned.length > 1) throw new CommandCleanupError("COMMAND_CLEANUP_AMBIGUOUS", "R4 reconciliation queue target 重复。");
+      assertCleanupArtifacts(owned.map(item => cleanupArtifact("result_reconciliation", item.commandId, item)), expected);
+      if (current && owned.length) {
+        reconciliationCount = owned.length;
+        writeReconciliationQueue(queueFile, {
+          ...current,
+          revision: bumpedRevision(current),
+          entries: current.entries.filter(item => item.commandId !== target.commandId),
+        });
+      }
+    });
+    return { outbox: outboxCount, reconciliation: reconciliationCount };
+  }, stateDir, true);
+}
+
+/** Routing is the final producer in this module and may be removed only after its projections. */
+export function deleteRoutingCleanupArtifacts(
+  target: CommandCleanupTarget,
+  expected: readonly CleanupArtifact[],
+): { commands: number; results: number } {
+  const { identity, stateDir } = cleanupWorkspace(target);
+  return withCommandOperation(identity.id, target.commandId, () => {
+    requireCleanupSnapshot(target, expected, stateDir);
+    const projections = projectionCleanupArtifacts(target, identity, stateDir);
+    if (projections.outbox.length || projections.reconciliation.length) {
+      throw new CommandCleanupError("COMMAND_CLEANUP_ORDER", "必须先移除 Result Outbox/reconciliation projections，才能删除 Routing producer。");
+    }
+    assertCleanupArtifacts(routingCleanupArtifacts(target, identity, stateDir), expected);
+    return deleteRoutingCommandAndResultsForCleanup(target, expected);
+  }, stateDir, true);
 }

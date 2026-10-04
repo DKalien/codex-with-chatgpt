@@ -1,5 +1,14 @@
 # Security Model
 
+## Companion 任务面板的本机操作授权
+
+面板 GET 状态/任务/操作结果是只读元数据，不从网页接受 workspace 路径。项目全部历史只向当前 VERIFIED Companion + exact active receiver binding/epoch/principal 展示。Pair 凭据本身不授权取消、清理或重排；本机 `operations authorize --local-user` 授予精确 Companion 限时能力（默认15分钟，上限60分钟），撤销/过期/身份漂移立即拒绝新操作。
+
+POST preview/confirm 只允许显式单个 commandId/eventId；摘要绑定请求、grant、当前身份和完整证据。confirm 使用既有 delivery arbiter/command fence，预约重排再持 endpoint fence，不提供任意文件路径、shell 或 force 修锁。扩展 action 仅 operations 自有页面可调用；网页 content script 无此权限。逐条确认前后都重新校验，pending 意图先于任何领域变更落盘。
+
+响应丢失/存储中断不自动重试；相同 command 的 pending 不因新 requestId 绕过。显式 reconciliation 只在已有精确域证据证明请求效果时完成本地操作记录，不能把任务或网页发送标记成功。claimed/outcome_unknown 不得重新排队，accepted 未有可信终态不能直接清理；原历史行政处置/损坏锁修复仍使用本机专用协议。原 OAuth、Grant Bridge access、Pair、route fence、防重放与发送权限不变。
+
+
 ## MCP Remote Control 授权边界
 
 第三阶段新增 `codex.control` / `codex.read`，不属于默认授权，也不复用 probe.write。

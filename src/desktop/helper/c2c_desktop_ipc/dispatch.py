@@ -16,6 +16,7 @@ from .common import (
     _target,
     _uuid,
 )
+from .identity import _decode_runtime_fence
 from .operations import (
     _Prepared,
     _current_confirm,
@@ -36,6 +37,10 @@ from .result import (
     _current_result_ownership,
 )
 
+def _require_runtime_fence(request: dict[str, Any]) -> None:
+    if "runtimeFence" not in request:
+        raise _error("DESKTOP_RUNTIME_FENCE_MISSING")
+
 def _reply(value: dict[str, Any]) -> None:
     raw = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8", "strict") + b"\n"
     sys.stdout.buffer.write(raw)
@@ -55,59 +60,94 @@ def _main() -> int:
         request: Any = None
         try:
             request = json.loads(raw.decode("utf-8", "strict"))
-            if not isinstance(request, dict) or set(request) - {"id", "op", "target", "expectation", "message", "workspaceRoot", "marker"}:
+            if not isinstance(request, dict) or set(request) - {"id", "op", "target", "expectation", "message", "workspaceRoot", "marker", "runtimeFence"}:
                 raise _error("DESKTOP_INVALID_REQUEST")
             request_id = request.get("id")
             op = request.get("op")
             _require(_uuid(request_id) is not None, "DESKTOP_INVALID_REQUEST")
+            if "runtimeFence" in request:
+                _decode_runtime_fence(request["runtimeFence"])
             if sys.version_info < MIN_PYTHON_VERSION:
                 raise _error("DESKTOP_PYTHON_UNSUPPORTED")
-            if op == "inspect":
+            if op == "inspect_for_binding":
+                if set(request) != {"id", "op", "target"} or prepared is not None:
+                    raise _error("DESKTOP_INVALID_REQUEST")
                 target = _target(request.get("target"))
-                session, info = _prepare(target, purpose="observe")
+                session, info = _prepare(target, purpose="observe", include_runtime_fence=True)
+                try:
+                    _reply({"id": request_id, "ok": True, "value": info})
+                finally:
+                    session.close()
+            elif op == "inspect":
+                if set(request) not in ({"id", "op", "target"}, {"id", "op", "target", "runtimeFence"}) or prepared is not None:
+                    raise _error("DESKTOP_INVALID_REQUEST")
+                _require_runtime_fence(request)
+                target = _target(request.get("target"))
+                session, info = _prepare(target, purpose="observe", runtime_fence=request["runtimeFence"])
                 session.close()
                 _reply({"id": request_id, "ok": True, "value": info})
             elif op == "reconcile_unknown":
-                if set(request) != {"id", "op", "target", "expectation"} or prepared is not None:
+                if set(request) not in ({"id", "op", "target", "expectation"}, {"id", "op", "target", "expectation", "runtimeFence"}) or prepared is not None:
                     raise _error("DESKTOP_INVALID_REQUEST")
+                _require_runtime_fence(request)
                 _reply({"id": request_id, "ok": True,
-                        "value": _reconcile_unknown(request.get("target"), request.get("expectation"))})
+                        "value": _reconcile_unknown(request.get("target"), request.get("expectation"),
+                                                     runtime_fence=request["runtimeFence"])})
             elif op == "diagnose":
                 if set(request) != {"id", "op", "workspaceRoot"} or prepared is not None:
                     raise _error("DESKTOP_INVALID_REQUEST")
                 _reply({"id": request_id, "ok": True, "value": _diagnose(request.get("workspaceRoot"))})
             elif op == "inspect_active_execution":
-                if set(request) != {"id", "op", "target"} or prepared is not None:
+                if set(request) not in ({"id", "op", "target"}, {"id", "op", "target", "runtimeFence"}) or prepared is not None:
                     raise _error("DESKTOP_INVALID_REQUEST")
+                _require_runtime_fence(request)
                 target = _target(request.get("target"))
-                _reply({"id": request_id, "ok": True, "value": _inspect_active_execution(target)})
+                _reply({"id": request_id, "ok": True, "value": _inspect_active_execution(
+                    target, runtime_fence=request["runtimeFence"])})
             elif op == "inspect_result_context":
-                if set(request) != {"id", "op", "target"} or prepared is not None:
+                if set(request) not in ({"id", "op", "target"}, {"id", "op", "target", "runtimeFence"}) or prepared is not None:
                     raise _error("DESKTOP_INVALID_REQUEST")
+                _require_runtime_fence(request)
                 target = _target(request.get("target"))
-                _reply({"id": request_id, "ok": True, "value": _inspect_result_context(target)})
+                _reply({"id": request_id, "ok": True, "value": _inspect_result_context(
+                    target, runtime_fence=request["runtimeFence"])})
             elif op == "inspect_result_activity_marker":
-                if set(request) != {"id", "op", "target"} or prepared is not None:
+                if set(request) not in ({"id", "op", "target"}, {"id", "op", "target", "runtimeFence"}) or prepared is not None:
                     raise _error("DESKTOP_INVALID_REQUEST")
+                _require_runtime_fence(request)
                 target = _target(request.get("target"))
-                _reply({"id": request_id, "ok": True, "value": _inspect_result_activity_marker(target)})
+                _reply({"id": request_id, "ok": True, "value": _inspect_result_activity_marker(
+                    target, runtime_fence=request["runtimeFence"])})
             elif op == "inspect_result_terminal_fence":
-                if set(request) != {"id", "op", "target", "marker"} or prepared is not None:
+                if set(request) not in ({"id", "op", "target", "marker"}, {"id", "op", "target", "marker", "runtimeFence"}) or prepared is not None:
                     raise _error("DESKTOP_INVALID_REQUEST")
+                _require_runtime_fence(request)
                 target = _target(request.get("target"))
                 _reply({"id": request_id, "ok": True,
-                        "value": _inspect_result_terminal_fence(target, request.get("marker"))})
+                        "value": _inspect_result_terminal_fence(target, request.get("marker"),
+                                                                 runtime_fence=request["runtimeFence"])})
             elif op == "current_result_ownership":
                 if set(request) != {"id", "op", "workspaceRoot", "expectation"} or prepared is not None:
                     raise _error("DESKTOP_INVALID_REQUEST")
                 _reply({"id": request_id, "ok": True,
                         "value": _current_result_ownership(request.get("workspaceRoot"), request.get("expectation"))})
-            elif op == "inspect_result_ownership":
-                if set(request) != {"id", "op", "target", "expectation"} or prepared is not None:
+            elif op == "inspect_pending_receipt":
+                if set(request) != {"id", "op", "target", "expectation", "marker", "runtimeFence"} or prepared is not None:
                     raise _error("DESKTOP_INVALID_REQUEST")
+                _require(isinstance(request["marker"], dict), "DESKTOP_INVALID_REQUEST")
                 target = _target(request.get("target"))
                 _reply({"id": request_id, "ok": True,
-                        "value": _inspect_result_ownership(target, request.get("expectation"))})
+                        "value": _inspect_result_ownership(target, request.get("expectation"),
+                                                            marker_value=request["marker"],
+                                                            runtime_fence=request["runtimeFence"])})
+            elif op == "inspect_result_ownership":
+                if set(request) not in ({"id", "op", "target", "expectation"}, {"id", "op", "target", "expectation", "runtimeFence"}) or prepared is not None:
+                    raise _error("DESKTOP_INVALID_REQUEST")
+                _require_runtime_fence(request)
+                target = _target(request.get("target"))
+                _reply({"id": request_id, "ok": True,
+                        "value": _inspect_result_ownership(target, request.get("expectation"),
+                                                            runtime_fence=request["runtimeFence"])})
             elif op == "current_result_classification":
                 if set(request) != {"id", "op", "workspaceRoot"} or prepared is not None:
                     raise _error("DESKTOP_INVALID_REQUEST")
@@ -126,12 +166,17 @@ def _main() -> int:
                     info = _current_execution(request["workspaceRoot"])
                 _reply({"id": request_id, "ok": True, "value": info})
             elif op == "prepare":
+                if set(request) not in ({"id", "op", "target"}, {"id", "op", "target", "runtimeFence"}):
+                    raise _error("DESKTOP_INVALID_REQUEST")
                 if prepared is not None:
                     raise _error("DESKTOP_IPC_UNAVAILABLE")
                 target = _target(request.get("target"))
-                prepared, info = _prepare(target, purpose="send")
+                _require_runtime_fence(request)
+                prepared, info = _prepare(target, purpose="send", runtime_fence=request["runtimeFence"])
                 _reply({"id": request_id, "ok": True, "value": info})
             elif op == "send":
+                if set(request) != {"id", "op", "message"}:
+                    raise _error("DESKTOP_INVALID_REQUEST")
                 if prepared is None:
                     raise _error("DESKTOP_IPC_UNAVAILABLE")
                 value = _message(request.get("message"))
@@ -141,6 +186,8 @@ def _main() -> int:
                 send_attempted = True
                 _reply({"id": request_id, "ok": True, "value": prepared.send(value)})
             elif op == "close":
+                if set(request) != {"id", "op"}:
+                    raise _error("DESKTOP_INVALID_REQUEST")
                 if prepared is not None:
                     prepared.close()
                     prepared = None

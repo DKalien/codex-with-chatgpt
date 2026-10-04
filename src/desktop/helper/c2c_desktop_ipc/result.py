@@ -60,6 +60,9 @@ def _active_turn_id(state: dict[str, Any]) -> str:
 
 
 _RESULT_TERMINAL_STATUSES = {"completed", "failed", "interrupted", "cancelled"}
+# Marker-only expansion: preserve steering in the ordered fence without making
+# it eligible as origin input, a native continuation edge, or a safe epilogue.
+_RESULT_ACTIVITY_MARKER_ITEM_TYPES = RESULT_ACTIVITY_ITEM_TYPES | {"steeringUserMessage", "steered"}
 
 
 def _ownership_island_turns(state: dict[str, Any], origin_id: str, result_id: str) -> list[dict[str, Any]]:
@@ -128,7 +131,7 @@ def _result_activity_sequence(turn: dict[str, Any]) -> tuple[list[str], list[str
         item_id = item.get("id")
         item_type = item.get("type")
         if (not isinstance(item_id, str) or _RESULT_ACTIVITY_ITEM_ID_PATTERN.fullmatch(item_id) is None
-                or not isinstance(item_type, str) or item_type not in RESULT_ACTIVITY_ITEM_TYPES or item_id in seen):
+                or not isinstance(item_type, str) or item_type not in _RESULT_ACTIVITY_MARKER_ITEM_TYPES or item_id in seen):
             raise _error("DESKTOP_STATE_UNAVAILABLE")
         seen.add(item_id)
         item_ids.append(item_id)
@@ -170,7 +173,7 @@ def _result_activity_marker_input(value: Any) -> dict[str, Any]:
     seen: set[str] = set()
     for item_id, item_type in zip(item_ids, item_types):
         if (not isinstance(item_id, str) or _RESULT_ACTIVITY_ITEM_ID_PATTERN.fullmatch(item_id) is None
-                or item_id in seen or not isinstance(item_type, str) or item_type not in RESULT_ACTIVITY_ITEM_TYPES):
+                or item_id in seen or not isinstance(item_type, str) or item_type not in _RESULT_ACTIVITY_MARKER_ITEM_TYPES):
             raise _error("DESKTOP_INVALID_REQUEST")
         seen.add(item_id)
     return {
@@ -239,8 +242,9 @@ def _current_execution(workspace_root: Any) -> dict[str, Any]:
         session.close()
 
 
-def _inspect_active_execution(target: dict[str, str]) -> dict[str, Any]:
-    session, _ = _prepare(target, purpose="observe")
+def _inspect_active_execution(target: dict[str, str], *, runtime_fence: Any = None) -> dict[str, Any]:
+    kwargs = {"runtime_fence": runtime_fence} if runtime_fence is not None else {}
+    session, _ = _prepare(target, purpose="observe", **kwargs)
     try:
         session.client.drain(0.1)
         state = session.client.current_state()
@@ -259,9 +263,10 @@ def _inspect_active_execution(target: dict[str, str]) -> dict[str, Any]:
         session.close()
 
 
-def _inspect_result_context(target: dict[str, str]) -> dict[str, Any]:
+def _inspect_result_context(target: dict[str, str], *, runtime_fence: Any = None) -> dict[str, Any]:
     """Detached finalizer 的显式 target 观察；不依赖 runner ancestor。"""
-    session, _ = _prepare(target, purpose="observe")
+    kwargs = {"runtime_fence": runtime_fence} if runtime_fence is not None else {}
+    session, _ = _prepare(target, purpose="observe", **kwargs)
     try:
         session.client.drain(0.1)
         state = session.client.current_state()
@@ -293,10 +298,12 @@ def _inspect_result_context(target: dict[str, str]) -> dict[str, Any]:
         session.close()
 
 
-def _inspect_result_activity(target: dict[str, str], marker_value: Any = None, *, verify: bool = False) -> dict[str, Any]:
+def _inspect_result_activity(target: dict[str, str], marker_value: Any = None, *, verify: bool = False,
+                             runtime_fence: Any = None) -> dict[str, Any]:
     """读取一次 live canonical turn，并只投影有序 item id/type。"""
     marker = _result_activity_marker_input(marker_value) if verify else None
-    session, _ = _prepare(target, purpose="observe")
+    kwargs = {"runtime_fence": runtime_fence} if runtime_fence is not None else {}
+    session, _ = _prepare(target, purpose="observe", **kwargs)
     try:
         session.client.drain(0.1)
         state = session.client.current_state()
@@ -337,12 +344,14 @@ def _inspect_result_activity(target: dict[str, str], marker_value: Any = None, *
         session.close()
 
 
-def _inspect_result_activity_marker(target: dict[str, str]) -> dict[str, Any]:
-    return _inspect_result_activity(target)
+def _inspect_result_activity_marker(target: dict[str, str], *, runtime_fence: Any = None) -> dict[str, Any]:
+    kwargs = {"runtime_fence": runtime_fence} if runtime_fence is not None else {}
+    return _inspect_result_activity(target, **kwargs)
 
 
-def _inspect_result_terminal_fence(target: dict[str, str], marker: Any) -> dict[str, Any]:
-    return _inspect_result_activity(target, marker, verify=True)
+def _inspect_result_terminal_fence(target: dict[str, str], marker: Any, *, runtime_fence: Any = None) -> dict[str, Any]:
+    kwargs = {"runtime_fence": runtime_fence} if runtime_fence is not None else {}
+    return _inspect_result_activity(target, marker, verify=True, **kwargs)
 
 
 def _current_result_context(workspace_root: Any) -> dict[str, Any]:
@@ -472,7 +481,8 @@ def _classification_origin_alias(state: dict[str, Any], origin: dict[str, Any], 
 
 
 def _evaluate_result_ownership(state: dict[str, Any], target: dict[str, str],
-                               expectation: dict[str, Any], client: _IpcClient) -> dict[str, Any]:
+                               expectation: dict[str, Any], client: _IpcClient,
+                               result_context: tuple[str, str] | None = None) -> dict[str, Any]:
     all_turns = _complete_result_turns(state)
     ids = [turn.get("turnId") for turn in all_turns]
     origin_id = expectation["originTurnId"]
@@ -495,7 +505,7 @@ def _evaluate_result_ownership(state: dict[str, Any], target: dict[str, str],
         origin_alias = _EDIT_DELIVERY_ORIGIN_ALIAS
     else:
         raise _error("DESKTOP_STATE_UNAVAILABLE")
-    result_id, result_status = _result_turn_context(state)
+    result_id, result_status = result_context or _result_turn_context(state)
     turns = _ownership_island_turns(state, origin_id, result_id)
     ids = [turn.get("turnId") for turn in turns]
     origin_indices = [index for index, turn_id in enumerate(ids) if turn_id == origin_id]
@@ -586,9 +596,40 @@ def _current_result_ownership(workspace_root: Any, expectation_value: Any) -> di
         session.close()
 
 
-def _inspect_result_ownership(target: dict[str, str], expectation_value: Any) -> dict[str, Any]:
+def _pending_receipt_observation(state: dict[str, Any], target: dict[str, str], expectation: dict[str, Any],
+                                 marker: dict[str, Any], client: _IpcClient) -> dict[str, Any]:
+    # Only a frozen draft selects a historical result. Ordinary record/discovery
+    # still uses the current turn. Never truncate a native continuation chain.
+    current_id, _ = _result_turn_context(state)
+    result_id = marker["resultTurnId"]
+    turns = _ownership_island_turns(state, result_id, current_id)
+    if turns[-1].get("turnId") != current_id:
+        raise _error("DESKTOP_STATE_UNAVAILABLE")
+    matches = [index for index, turn in enumerate(turns) if turn.get("turnId") == result_id]
+    if len(matches) != 1:
+        raise _error("DESKTOP_STATE_UNAVAILABLE")
+    index = matches[0]
+    turn = turns[index]
+    if result_id != current_id:
+        successor = turns[index + 1] if index + 1 < len(turns) else None
+        params = successor.get("params") if isinstance(successor, dict) else None
+        if (turn.get("status") not in _RESULT_TERMINAL_STATUSES or not isinstance(params, dict)
+                or params.get("turnTrigger") != "composer"
+                or params.get("threadId") not in {None, target["threadId"]}):
+            raise _error("DESKTOP_STATE_UNAVAILABLE")
+    context = (result_id, turn["status"])
+    ownership = _evaluate_result_ownership(state, target, expectation, client, context)
+    item_ids, item_types = _result_activity_sequence(turn)
+    fence = _result_activity_fence(*context, item_ids, item_types, marker)
+    return {"ownership": ownership, "fence": fence}
+
+
+def _inspect_result_ownership(target: dict[str, str], expectation_value: Any, *, runtime_fence: Any = None,
+                              marker_value: Any = None) -> dict[str, Any]:
     expectation = _continuation_expectation(expectation_value)
-    session, _ = _prepare(target, purpose="observe")
+    marker = _result_activity_marker_input(marker_value) if marker_value is not None else None
+    kwargs = {"runtime_fence": runtime_fence} if runtime_fence is not None else {}
+    session, _ = _prepare(target, purpose="observe", **kwargs)
     try:
         session.client.drain(0.1)
         state = session.client.current_state()
@@ -609,6 +650,8 @@ def _inspect_result_ownership(target: dict[str, str], expectation_value: Any) ->
             if time.monotonic() >= freshness_deadline or session.client.snapshot_age() > MAX_OBSERVATION_AGE_SECONDS:
                 raise _error("DESKTOP_STATE_UNAVAILABLE")
             _validate_observed_state(state, target, session.client.owner or "")
+        if marker is not None:
+            return _pending_receipt_observation(state, target, expectation, marker, session.client)
         return _evaluate_result_ownership(state, target, expectation, session.client)
     finally:
         session.close()

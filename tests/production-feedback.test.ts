@@ -635,7 +635,7 @@ describe("E1a review-fix", () => {
     const statusMeta = tools.feedback_status as unknown as { _meta?: { /* annotations on register */ } };
     // annotation 断言在 descriptor
     const registered = tools as unknown as Record<string, { annotations?: { readOnlyHint?: boolean } }>;
-    expect(registered.feedback_status!.annotations?.readOnlyHint).toBe(false);
+    expect(registered.feedback_status!.annotations?.readOnlyHint).toBe(true);
   });
 });
 

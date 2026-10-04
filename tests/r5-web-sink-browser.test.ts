@@ -99,6 +99,7 @@ async function loadWorker(opts: {
   ownerRoute?: string;
   connectFlow?: Record<string, unknown>;
   routeFence?: Record<string, unknown>;
+  local?: Record<string, unknown>;
 } = {}) {
   const initial = initialState(opts.route ?? ROUTE_A, opts.routeVerification ?? "VERIFIED");
   if (opts.ownerRoute) {
@@ -108,6 +109,7 @@ async function loadWorker(opts: {
   }
   if (opts.connectFlow) initial.local[CONNECT_KEY] = opts.connectFlow;
   if (opts.routeFence) initial.local[FENCE_KEY] = opts.routeFence;
+  Object.assign(initial.local, opts.local);
   const local = storageArea(initial.local);
   const session = storageArea(initial.session);
   let messageListener: ((message: unknown, sender: unknown, sendResponse: (response: unknown) => void) => unknown) | null = null;
@@ -166,11 +168,268 @@ function bindCalls(fetchMock: ReturnType<typeof vi.fn>) {
   return fetchMock.mock.calls.filter((call) => String(call[0]).includes("/web-sink/bind-current"));
 }
 
+describe("B2 operations read-only RPC", () => {
+  const body = { schemaVersion: 1, readOnly: true, workspaceId: WORKSPACE, companionId: COMPANION,
+    bindingId: BINDING, epoch: EPOCH, routeCanonical: ROUTE_A, commands: [], observedAt: new Date().toISOString() };
+  it("coalesces panel reads into one GET with zero storage, Send, route-bind or journal mutation", async () => {
+    let release!: () => void;
+    const worker = await loadWorker({ fetch: async () => { await new Promise<void>(resolve => { release = resolve; }); return { ok: true, status: 200, json: async () => body }; } });
+    await worker.send({ type: "c2c.status.read", canonicalRoute: ROUTE_A }, worker.ownerSender);
+    const before = JSON.stringify([Object.fromEntries(worker.local.values), Object.fromEntries(worker.session.values)]);
+    const a = worker.send({ type: "c2c.operations.read" }), b = worker.send({ type: "c2c.operations.read" });
+    await vi.waitFor(() => expect(worker.fetchMock).toHaveBeenCalledTimes(1)); release();
+    expect(await a).toMatchObject({ ok: true, snapshot: body }); expect(await b).toMatchObject({ ok: true });
+    expect(worker.fetchMock.mock.calls[0][0]).toMatch(/\/operations$/);
+    expect(worker.fetchMock.mock.calls[0][1]).toMatchObject({ method: "GET", cache: "no-store" });
+    expect(worker.tabsSendMessage).not.toHaveBeenCalled();
+    expect(JSON.stringify([Object.fromEntries(worker.local.values), Object.fromEntries(worker.session.values)])).toBe(before);
+  });
+  it("content scripts cannot request the project-wide history projection", async () => {
+    const worker = await loadWorker();
+    expect(await worker.send({ type: "c2c.operations.read" }, worker.ownerSender)).toEqual({ ok: false, reason: "extension_sender_required" });
+    expect(worker.fetchMock).not.toHaveBeenCalled(); expect(worker.tabsSendMessage).not.toHaveBeenCalled();
+  });
+  it("failed read does not mark auth stale, repair or reset unknown journal", async () => {
+    const worker = await loadWorker({ fetch: async () => ({ ok: false, status: 401, json: async () => ({ error: "COMPANION_UNAUTHORIZED" }) }) });
+    await worker.send({ type: "c2c.status.read", canonicalRoute: ROUTE_A }, worker.ownerSender);
+    const before = JSON.stringify(Object.fromEntries(worker.local.values));
+    expect(await worker.send({ type: "c2c.operations.read" })).toMatchObject({ ok: false, reason: "COMPANION_UNAUTHORIZED" });
+    expect(JSON.stringify(Object.fromEntries(worker.local.values))).toBe(before); expect(worker.tabsSendMessage).not.toHaveBeenCalled();
+  });
+  it("read rejects mismatched response identity without synchronizing binding", async () => {
+    const worker = await loadWorker({ fetch: async () => ({ ok: true, status: 200, json: async () => ({ ...body, epoch: EPOCH + 1 }) }) });
+    expect(await worker.send({ type: "c2c.operations.read" })).toMatchObject({ ok: false, reason: "identity_mismatch:epoch" });
+    expect(worker.local.values.get(TRANSPORT_KEY)).toMatchObject({ epoch: EPOCH });
+  });
+  it("popup status observation never runs connect convergence or mutates owner on route mismatch", async () => {
+    const worker = await loadWorker();
+    await worker.send({ type: "c2c.status.read", canonicalRoute: ROUTE_A }, worker.ownerSender);
+    const before = JSON.stringify([Object.fromEntries(worker.local.values), Object.fromEntries(worker.session.values)]);
+    expect(await worker.send({ type: "c2c.status.read", canonicalRoute: ROUTE_B }, worker.ownerSender)).toMatchObject({ ok: true, isOwner: false });
+    expect(worker.fetchMock).not.toHaveBeenCalled(); expect(worker.tabsSendMessage).not.toHaveBeenCalled();
+    expect(JSON.stringify([Object.fromEntries(worker.local.values), Object.fromEntries(worker.session.values)])).toBe(before);
+  });
+});
+
 afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+describe("authenticated response belongs to its request transport", () => {
+  const JOURNAL = "c2c_companion_journal_v1";
+  const json = (status: number, body: unknown) => ({ ok: status >= 200 && status < 300, status, async json() { return body; } });
+  const stateBody = { workspaceId: WORKSPACE, companionId: COMPANION, bindingId: BINDING,
+    epoch: EPOCH, routeCanonical: ROUTE_A, routeVerification: "VERIFIED", inFlight: null, events: [] };
+  const pairBody = { ...stateBody, credential: "c2c_comp_replacement-only-credential-changed",
+    routeAttestation: { message: "[C2C_ROUTE_ATTEST]\nchallengeId=66666666-6666-4666-8666-666666666666", expiresAt: "2099-01-01T00:00:00.000Z" } };
+  const page = { canonicalRoute: ROUTE_A, generation: 1, safety: { composer: "empty", generation: "idle", safe: true } };
+
+  it.each(["state", "reserve", "ack"])("late old /%s 401 after successful pair cannot mutate replacement transport/journal/fence", async endpoint => {
+    let finish!: (value: unknown) => void;
+    let started!: () => void;
+    const pending = new Promise(resolve => { finish = resolve; });
+    const requested = new Promise<void>(resolve => { started = resolve; });
+    let first = true;
+    const ackJournal = { state: "OBSERVED_PENDING_ACK", eventId: "a".repeat(32), reservationId: "reserved",
+      attemptId: "attempt", routeCanonical: ROUTE_A, bindingId: BINDING, epoch: EPOCH,
+      message: "fixture result", messageSha256: "b".repeat(64), createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+    const worker = await loadWorker({
+      ...(endpoint === "ack" ? { local: { [JOURNAL]: ackJournal } } : {}),
+      fetch: async url => {
+        const pathname = String(url);
+        if (pathname.endsWith(`/${endpoint}`) && first) { first = false; started(); return pending; }
+        if (pathname.endsWith("/pair")) return json(200, pairBody);
+        // Current credential 401 permits repairing an active journal; replacement itself is real Pair.
+        return json(401, { error: "COMPANION_UNAUTHORIZED" });
+      },
+    });
+    const oldResponse = worker.send(endpoint === "state" ? { type: "c2c.fetch.state" }
+      : endpoint === "reserve" ? { type: "c2c.reserve.page", ...page }
+        : { type: "c2c.production.ack", eventId: ackJournal.eventId, attemptId: ackJournal.attemptId }, worker.ownerSender);
+    await Promise.race([requested, oldResponse.then(response => { throw new Error(`request did not reach fetch: ${JSON.stringify(response)}`); })]);
+    if (endpoint !== "state") expect(await worker.send({ type: "c2c.fetch.state" })).toMatchObject({ authStale: true });
+    const proof = await worker.send({ type: "c2c.owner-proof.request", ...page }, worker.ownerSender) as { proof: { id: string } };
+    expect(await worker.send({ type: "c2c.pair", bridgeOrigin: "https://bridge.example.test",
+      intentId: "fixture-intent", secret: "fixture-secret", ownerProofId: proof.proof.id })).toMatchObject({ ok: true });
+    const before = JSON.stringify(Object.fromEntries(worker.local.values));
+    finish(json(401, { error: "COMPANION_UNAUTHORIZED" }));
+    expect(await oldResponse).toMatchObject({ ok: false, reason: "stale_transport_response" });
+    expect(JSON.stringify(Object.fromEntries(worker.local.values))).toBe(before);
+    expect(worker.local.values.get(TRANSPORT_KEY)).toMatchObject({ authStale: false, credential: pairBody.credential });
+    expect(worker.tabsSendMessage).not.toHaveBeenCalled();
+  });
+
+  it("current 401 is durably stale and remains stale after SW hydration", async () => {
+    const worker = await loadWorker({ fetch: async () => json(401, { error: "COMPANION_UNAUTHORIZED" }) });
+    expect(await worker.send({ type: "c2c.fetch.state" })).toMatchObject({ authStale: true });
+    expect(worker.local.values.get(TRANSPORT_KEY)).toMatchObject({ authStale: true });
+    const restarted = await loadWorker({ local: Object.fromEntries(worker.local.values) });
+    expect(await restarted.send({ type: "c2c.transport.status" })).toMatchObject({ transport: { authStale: true } });
+    expect(restarted.local.values.get(TRANSPORT_KEY)).toMatchObject({ authStale: true });
+  });
+
+  it("still-current rebindPending 401 keeps the established special semantics", async () => {
+    const initial = initialState();
+    const worker = await loadWorker({ local: { [TRANSPORT_KEY]: { ...initial.transport, rebindPending: true } },
+      fetch: async () => json(401, { error: "COMPANION_UNAUTHORIZED" }) });
+    expect(await worker.send({ type: "c2c.fetch.state" })).toEqual({ ok: false, reason: "rebind_pending", authStale: false });
+    expect(worker.local.values.get(TRANSPORT_KEY)).toMatchObject({ authStale: false });
+  });
+
+  it("revalidates the original stale credential after restart without pairing, sending or changing authority", async () => {
+    const initial = initialState();
+    const durable = { [TRANSPORT_KEY]: { ...initial.transport, authStale: true },
+      [JOURNAL]: { state: "OUTCOME_UNKNOWN", eventId: "existing" },
+      [FENCE_KEY]: { state: "VERIFIED", companionId: COMPANION, challengeId: "unchanged" } };
+    const worker = await loadWorker({ local: durable, fetch: async () => json(200, stateBody) });
+    const beforeJournal = worker.local.values.get(JOURNAL);
+    const beforeFence = worker.local.values.get(FENCE_KEY);
+    expect(await worker.send({ type: "c2c.fetch.state" })).toMatchObject({ ok: true });
+    const { routeAttestationMessage: _pendingMessage, ...expectedTransport } = initial.transport;
+    expect(worker.local.values.get(TRANSPORT_KEY)).toEqual({ ...expectedTransport, authStale: false });
+    expect(worker.local.values.get(JOURNAL)).toEqual(beforeJournal);
+    expect(worker.local.values.get(FENCE_KEY)).toEqual(beforeFence);
+    expect(worker.fetchMock).toHaveBeenCalledTimes(1);
+    expect(String(worker.fetchMock.mock.calls[0][0])).toMatch(/\/state$/);
+    expect(worker.fetchMock.mock.calls[0][1]).toMatchObject({ method: "GET",
+      headers: { authorization: `Bearer ${initial.transport.credential}` } });
+    expect(worker.tabsSendMessage).not.toHaveBeenCalled();
+  });
+
+  it("current rejection stays blocked, exposes only bounded reason, then exact recheck can recover", async () => {
+    let rejected = true;
+    const worker = await loadWorker({ fetch: async () => rejected
+      ? json(401, { error: "arbitrary-private-response" }) : json(200, stateBody) });
+    await worker.send({ type: "c2c.fetch.state" });
+    expect(worker.local.values.get(TRANSPORT_KEY)).toMatchObject({ authStale: true, authStaleReason: "auth_revalidation_required" });
+    expect(await worker.send({ type: "c2c.transport.status" })).toMatchObject({ transport: { authStale: true, productionEligible: false } });
+    const requestsBeforeReserve = worker.fetchMock.mock.calls.length;
+    expect(await worker.send({ type: "c2c.reserve.page", ...page }, worker.ownerSender)).toMatchObject({ ok: false, reason: "auth_stale" });
+    expect(worker.fetchMock).toHaveBeenCalledTimes(requestsBeforeReserve);
+    rejected = false;
+    expect(await worker.send({ type: "c2c.fetch.state" })).toMatchObject({ ok: true });
+    expect(worker.local.values.get(TRANSPORT_KEY)).toMatchObject({ authStale: false });
+    expect(worker.local.values.get(TRANSPORT_KEY)).not.toHaveProperty("authStaleReason");
+  });
+
+  it.each(["network", "500", "invalid", "identity", "401"])("stale credential recheck fails closed on %s", async failure => {
+    const worker = await loadWorker({ local: { [TRANSPORT_KEY]: { ...initialState().transport, authStale: true } },
+      fetch: async () => {
+        if (failure === "network") throw Error("offline");
+        if (failure === "500") return json(500, {});
+        if (failure === "invalid") return json(200, {});
+        if (failure === "identity") return json(200, { ...stateBody, companionId: "replacement" });
+        return json(401, { error: "COMPANION_UNAUTHORIZED" });
+      } });
+    expect(await worker.send({ type: "c2c.fetch.state" })).toMatchObject({ ok: false });
+    expect(worker.local.values.get(TRANSPORT_KEY)).toMatchObject({ authStale: true, credential: initialState().transport.credential });
+    expect(worker.tabsSendMessage).not.toHaveBeenCalled();
+  });
+
+  it("invalid 200 state is not proof that an otherwise valid pair was revoked", async () => {
+    const worker = await loadWorker({ fetch: async () => json(200, {}) });
+    expect(await worker.send({ type: "c2c.fetch.state" })).toEqual({ ok: false, reason: "state_response_invalid" });
+    expect(worker.local.values.get(TRANSPORT_KEY)).toMatchObject({ authStale: false });
+  });
+
+  it("a state response started before a newer auth failure cannot clear that failure", async () => {
+    let finish!: (value: unknown) => void;
+    let started!: () => void;
+    const pending = new Promise(resolve => { finish = resolve; });
+    const requested = new Promise<void>(resolve => { started = resolve; });
+    let first = true;
+    const worker = await loadWorker({ fetch: async () => {
+      if (first) { first = false; started(); return pending; }
+      return json(401, { error: "COMPANION_UNAUTHORIZED" });
+    } });
+    const old = worker.send({ type: "c2c.fetch.state" });
+    await requested;
+    expect(await worker.send({ type: "c2c.fetch.state" })).toMatchObject({ authStale: true });
+    finish(json(200, stateBody));
+    expect(await old).toEqual({ ok: false, reason: "stale_transport_response" });
+    expect(worker.local.values.get(TRANSPORT_KEY)).toMatchObject({ authStale: true });
+  });
+
+  it("failed persistence cannot unblock mutations during auth recovery", async () => {
+    const worker = await loadWorker({ local: { [TRANSPORT_KEY]: { ...initialState().transport, authStale: true } },
+      fetch: async () => json(200, stateBody) });
+    vi.spyOn(worker.local, "set").mockRejectedValue(Error("disk failure"));
+    expect(await worker.send({ type: "c2c.fetch.state" })).toMatchObject({ ok: false });
+    expect(await worker.send({ type: "c2c.transport.status" })).toMatchObject({ transport: { authStale: true, productionEligible: false } });
+    expect(worker.tabsSendMessage).not.toHaveBeenCalled();
+  });
+});
+
 describe("R5c Browser explicit-connect Web Sink convergence", () => {
+  it("explicit Connect repairs DONE witness for a fresh document when Bridge has no sink", async () => {
+    let sinkBound = false;
+    const { send, local, fetchMock } = await loadWorker({
+      connectFlow: {
+        state: "DONE", workspaceId: WORKSPACE, bindingId: BINDING, epoch: EPOCH,
+        companionId: COMPANION, routeCanonical: ROUTE_A,
+        challengeId: "55555555-5555-4555-8555-555555555555",
+        ownerWitness: { tabId: 7, documentId: "old-document", generation: 1, canonicalRoute: ROUTE_A },
+        updatedAt: Date.now(),
+      },
+      fetch: async (url: unknown) => {
+        const href = String(url);
+        if (href.includes("/web-sink/status")) {
+          return { ok: true, status: 200, async json() {
+            return { workspaceId: WORKSPACE, activeBinding: sinkBound ? validSinkBinding().activeBinding : null,
+              availability: { available: sinkBound } };
+          } };
+        }
+        if (href.includes("/web-sink/bind-current")) {
+          sinkBound = true;
+          return { ok: true, status: 200, async json() { return validSinkBinding(); } };
+        }
+        return { ok: true, status: 200, async json() {
+          return { workspaceId: WORKSPACE, companionId: COMPANION, bindingId: BINDING,
+            epoch: EPOCH, routeCanonical: ROUTE_A, routeVerification: "VERIFIED" };
+        } };
+      },
+    });
+    const freshSender = { tab: { id: 7 }, documentId: "fresh-document", frameId: 0, url: ROUTE_A };
+    await send({ type: "c2c.bind", canonicalRoute: ROUTE_A, generation: 2 }, freshSender);
+    await send({ type: "c2c.heartbeat", canonicalRoute: ROUTE_A, generation: 2 }, freshSender);
+    const before = local.values.get(CONNECT_KEY) as { ownerWitness?: { documentId?: string } };
+    expect(before).toMatchObject({ state: "DONE", ownerWitness: { documentId: "old-document" } });
+    const status = await send({ type: "c2c.transport.status" }) as { transport?: { r5cConnected?: boolean } };
+    expect(status.transport?.r5cConnected).toBe(false);
+    expect(local.values.get(CONNECT_KEY)).toMatchObject({ state: "DONE" });
+    expect((local.values.get(CONNECT_KEY) as typeof before).ownerWitness?.documentId).toBe("old-document");
+    expect(bindCalls(fetchMock)).toHaveLength(0);
+
+    const result = await send({ type: "c2c.connect.page", canonicalRoute: ROUTE_A, generation: 2 }, freshSender) as { ok?: boolean; state?: string };
+    expect(result, JSON.stringify(result)).toMatchObject({ ok: true, state: "CONNECTED" });
+    expect(bindCalls(fetchMock)).toHaveLength(1);
+    expect((local.values.get(CONNECT_KEY) as typeof before).ownerWitness?.documentId).toBe("fresh-document");
+    const after = await send({ type: "c2c.transport.status" }) as { transport?: { r5cConnected?: boolean } };
+    expect(after.transport?.r5cConnected).toBe(true);
+  });
+
+  it("DONE witness repair rejects a different transport identity or route", async () => {
+    for (const mismatch of [
+      { workspaceId: "other-workspace" }, { routeCanonical: ROUTE_B },
+      { bindingId: "33333333-3333-4333-8333-333333333333" }, { epoch: EPOCH + 1 },
+      { companionId: "44444444-4444-4444-8444-444444444444" },
+    ]) {
+      const { send, ownerSender, local, fetchMock } = await loadWorker({
+        connectFlow: {
+          state: "DONE", workspaceId: WORKSPACE, bindingId: BINDING, epoch: EPOCH,
+          companionId: COMPANION, routeCanonical: ROUTE_A,
+          challengeId: "55555555-5555-4555-8555-555555555555",
+          ownerWitness: { tabId: 7, documentId: "old-document", generation: 1, canonicalRoute: ROUTE_A },
+          updatedAt: Date.now(), ...mismatch,
+        },
+      });
+      const result = await send({ type: "c2c.connect.page", canonicalRoute: ROUTE_A, generation: 1 }, ownerSender) as { ok?: boolean; reason?: string };
+      expect(result).toMatchObject({ ok: false, reason: "connect_identity_conflict" });
+      expect(bindCalls(fetchMock)).toHaveLength(0);
+      expect((local.values.get(CONNECT_KEY) as { ownerWitness?: { documentId?: string } }).ownerWitness?.documentId).toBe("old-document");
+    }
+  });
+
   it("existing VERIFIED A + explicit Connect calls bind-current and returns CONNECTED", async () => {
     const { send, ownerSender, fetchMock } = await loadWorker({
       connectFlow: {

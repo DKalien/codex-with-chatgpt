@@ -13,11 +13,18 @@ import {
 import { routingCommandIdSchema, routingIntentSchema } from "../routing/schema.js";
 import { executorMessageSchema } from "../executor-control/schema.js";
 import { ExecutorControlError } from "../executor-control/schema.js";
+import { ExecutorDispatchError } from "../executor-control/dispatch-schema.js";
+import {
+  beginExecutorDispatch,
+  finalizeExecutorDispatch,
+  hashRequestAuthority,
+  markExecutorDispatchOutcomeUnknown,
+} from "../executor-control/dispatch-service.js";
+import { EndpointSwitchLockError } from "../endpoint-switch/lock.js";
+import type { ProductionSendResult } from "../executor-control/codex-backend.js";
 import {
   executorStatus,
-  freezeActiveDeliveryTarget,
   listExecutorPlugins,
-  readActiveExecutorBinding,
   resolveProductionBackend,
 } from "../executor-control/service.js";
 import {
@@ -27,6 +34,7 @@ import {
 } from "./conversation-principal.js";
 import { RoutingError } from "../routing/schema.js";
 import { DesktopError } from "../desktop/store.js";
+import { withCommandOperationAsync } from "../command-cleanup/fence.js";
 
 export { EXECUTOR_CONTROL_SCOPE, EXECUTOR_READ_SCOPE };
 
@@ -152,6 +160,9 @@ function safeError(error: unknown, scope?: string): ToolResult {
       ? fail(error.code, error.message, scope)
       : fail(error.code, error.message);
   }
+  if (error instanceof ExecutorDispatchError || error instanceof EndpointSwitchLockError) {
+    return fail(error.code, error.message);
+  }
   if (error instanceof DesktopError || error instanceof RoutingError) {
     return fail(error.code, error.message);
   }
@@ -218,7 +229,7 @@ export function registerExecutorTools(
     {
       title: "发送到 Active Executor",
       description:
-        "向当前 active Executor Binding 投递任务。必须提供用户本地 bind-current 后的 bindingId；不会重新发现或切换 executor。正文可能被本地编程工具修改文件或执行命令。",
+        "向当前 active Executor Binding 投递任务。必须提供用户本地 bind-current 后的 bindingId；不会重新发现或切换 executor。正文可能被本地编程工具修改文件或执行命令。同 commandId 的重放从 durable dispatch ledger 恢复，绝不自动切换已固定的 target。",
       inputSchema: sendInputSchema,
       outputSchema: sendOutputSchema,
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
@@ -227,36 +238,145 @@ export function registerExecutorTools(
     (input, extra) => result(async () => {
       const auth = requireAuth(extra.authInfo, EXECUTOR_CONTROL_SCOPE);
       authorizeNow(auth);
+      // R5E_AUTH_BEFORE_PIN：durable target pin 之前的 live OAuth 重验证
+      // （token/store 实时校验）；send-time 的 authorize 回调保留为第二道重验证。
+      executorAuthorize?.(auth);
       if (input.workspaceId !== workspace.id) {
         throw new ExecutorControlError("EXECUTOR_CONTROL_WORKSPACE_MISMATCH", "请求工作区不匹配。");
       }
-      const activeBinding = readActiveExecutorBinding(workspace.id, workspace.root);
-      if (!activeBinding) {
-        throw new ExecutorControlError("EXECUTOR_CONTROL_NO_ACTIVE_BINDING", "尚未本地 bind-current。");
-      }
-      if (input.bindingId !== activeBinding.bindingId) {
-        throw new ExecutorControlError(
-          "EXECUTOR_BINDING_STALE",
-          "bindingId 不是当前 active binding；不会自动切换目标。",
-        );
-      }
-      const target = freezeActiveDeliveryTarget(activeBinding);
       const plannerFingerprint = requestPlannerFingerprint(extra);
-      const backend = resolveProductionBackend(activeBinding.pluginId);
-      return backend.send({
-        workspace,
-        plannerFingerprint,
+      return withCommandOperationAsync(workspace.id, input.commandId, async () => {
+      // R5e：新 commandId 的 pin 在 endpoint switch lock 内完成（beginExecutorDispatch
+      // 内部）；existing entry 的 replay/recovery 只走 dispatch-store transaction，
+      // 不需要 switch lock。同 owner 的 live in-flight 重试 → EXECUTOR_DISPATCH_IN_FLIGHT。
+      const pinned = beginExecutorDispatch({
+        workspaceId: workspace.id,
+        workspaceRoot: workspace.root,
+        bindingId: input.bindingId,
         commandId: input.commandId,
         intent: input.intent,
         message: input.message,
-        userConfirmed: input.userConfirmed,
-        clientId: auth.clientId,
-        activeBinding,
-        target,
-        authorize: () => {
-          authorizeNow(auth);
-          executorAuthorize?.(auth);
-        },
+        requestAuthoritySha256: hashRequestAuthority(plannerFingerprint),
+        lifecycle: "ephemeral",
+      });
+      const { entry, target } = pinned;
+      const expectedDispatchGenerationId = entry.dispatchGenerationId;
+      if (pinned.phase === "replay") {
+        // replay：不调用 backend；DTO 从 durable entry + 冻结 target 合成。
+        return {
+          commandId: input.commandId,
+          pluginId: target.pluginId,
+          bindingId: target.bindingId,
+          sessionId: target.sessionId,
+          deliveryStatus: entry.deliveryStatus,
+          ...(entry.deliveryId !== undefined ? { deliveryId: entry.deliveryId } : {}),
+          ...(entry.errorCode !== undefined ? { error: entry.errorCode } : {}),
+          createdAt: entry.createdAt,
+          updatedAt: entry.updatedAt,
+          message: `replay:${entry.deliveryStatus}`,
+        };
+      }
+      if (!expectedDispatchGenerationId || entry.lifecycle !== "ephemeral") {
+        throw new ExecutorDispatchError("EXECUTOR_DISPATCH_GENERATION_MISMATCH", "新 dispatch pin 缺少 lifecycle generation；拒绝发送。");
+      }
+      const backend = resolveProductionBackend(target.pluginId);
+      let sent: ProductionSendResult;
+      try {
+        sent = await backend.send({
+          workspace,
+          plannerFingerprint,
+          commandId: input.commandId,
+          intent: input.intent,
+          message: input.message,
+          userConfirmed: input.userConfirmed,
+          clientId: auth.clientId,
+          target,
+          authorize: () => {
+            authorizeNow(auth);
+            executorAuthorize?.(auth);
+          },
+        });
+      } catch (error) {
+        // backend 抛错 → durable outcome_unknown 收敛；失败不掩盖原始错误。
+        try {
+          markExecutorDispatchOutcomeUnknown({
+            workspaceId: workspace.id,
+            workspaceRoot: workspace.root,
+            commandId: input.commandId,
+            target,
+            expectedDispatchGenerationId,
+            errorCode: error instanceof ExecutorControlError ? error.code : "EXECUTOR_SEND_FAILED",
+          });
+        } catch {
+          // 保留原始投递错误
+        }
+        throw error;
+      }
+      // backend result 必须与冻结 target 精确一致；漂移 → outcome_unknown + fail closed。
+      if (
+        sent.commandId !== input.commandId ||
+        sent.pluginId !== target.pluginId ||
+        sent.bindingId !== target.bindingId ||
+        sent.sessionId !== target.sessionId
+      ) {
+        try {
+          markExecutorDispatchOutcomeUnknown({
+            workspaceId: workspace.id,
+            workspaceRoot: workspace.root,
+            commandId: input.commandId,
+            target,
+            expectedDispatchGenerationId,
+            errorCode: "EXECUTOR_DISPATCH_RESULT_MISMATCH",
+          });
+        } catch {
+          // 保留主错误
+        }
+        throw new ExecutorControlError(
+          "EXECUTOR_DISPATCH_RESULT_MISMATCH",
+          "backend result 与冻结 target 不一致；已收敛 outcome_unknown。",
+        );
+      }
+      let finalized;
+      try {
+        finalized = finalizeExecutorDispatch({
+          workspaceId: workspace.id,
+          workspaceRoot: workspace.root,
+          commandId: input.commandId,
+          target,
+          expectedDispatchGenerationId,
+          result: {
+            deliveryStatus: sent.deliveryStatus,
+            ...(sent.deliveryId !== undefined ? { deliveryId: sent.deliveryId } : {}),
+            ...(sent.error !== undefined ? { errorCode: sent.error } : {}),
+          },
+        });
+      } catch (error) {
+        try {
+          markExecutorDispatchOutcomeUnknown({
+            workspaceId: workspace.id,
+            workspaceRoot: workspace.root,
+            commandId: input.commandId,
+            target,
+            expectedDispatchGenerationId,
+            errorCode: "EXECUTOR_DISPATCH_FINALIZE_FAILED",
+          });
+        } catch {
+          // 保留原始错误
+        }
+        throw error;
+      }
+      return {
+        commandId: sent.commandId,
+        pluginId: sent.pluginId,
+        bindingId: sent.bindingId,
+        sessionId: sent.sessionId,
+        deliveryStatus: finalized.entry.deliveryStatus,
+        ...(finalized.entry.deliveryId !== undefined ? { deliveryId: finalized.entry.deliveryId } : {}),
+        ...(finalized.entry.errorCode !== undefined ? { error: finalized.entry.errorCode } : {}),
+        createdAt: sent.createdAt,
+        updatedAt: sent.updatedAt,
+        message: sent.message,
+      };
       });
     }, EXECUTOR_CONTROL_SCOPE),
   );

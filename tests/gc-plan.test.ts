@@ -4,7 +4,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { planGc, gcPlanSummary, releaseLogicalSize, validateReleaseManifest } from "../src/core/gc-plan.js";
-import { collectReleaseReferences } from "../src/core/release-references.js";
+import { collectReleaseReferences, readReleaseReferenceJson } from "../src/core/release-references.js";
 import { installCore } from "../src/core/install.js";
 import { Workspace } from "../src/workspace/manager.js";
 import { buildCoreFixture, cleanup, makeTmpDir, write } from "./helpers.js";
@@ -114,7 +114,7 @@ describe("immutable Core release GC plan", () => {
     expect(plan.totals.bytesKept).toBe(plan.releases.reduce((sum, item) => sum + item.logicalBytes, 0));
   });
 
-  it("runtime/pending 的悬空 build 引用触发全局 unknown，阻断候选回收", () => {
+  it("runtime/pending 悬空 exact build 只产生 scoped warning，不阻断其他候选", () => {
     const { state, root, releases } = fixture(["A", "B"]);
     const workspaceId = new Workspace(root).id;
     writeRuntime(state, root, "f".repeat(64), workspaceId);
@@ -124,9 +124,13 @@ describe("immutable Core release GC plan", () => {
 
     expect(plan.ok).toBe(false);
     expect(plan.issues.length).toBeGreaterThanOrEqual(2);
-    expect(candidate.disposition).toBe("unknown");
-    expect(candidate.reasons).toContain("global_unknown_reference");
-    expect(plan.totals.bytesCandidateReclaimable).toBe(0);
+    expect(plan).toMatchObject({ safety: "degraded", globalBlockerCount: 0, localIssueCount: 2 });
+    expect(plan.issueDetails.map(issue => issue.scope)).toEqual([
+      { kind: "build", buildId: "e".repeat(64) }, { kind: "build", buildId: "f".repeat(64) },
+    ]);
+    expect(candidate.disposition).toBe("delete-candidate");
+    expect(candidate.reasons).not.toContain("global_unknown_reference");
+    expect(plan.totals.bytesCandidateReclaimable).toBe(candidate.logicalBytes);
   });
 
   it("坏 release manifest 标为 unknown 并阻断回收", () => {
@@ -162,7 +166,7 @@ describe("immutable Core release GC plan", () => {
     expect(plan.ok).toBe(false);
     expect(plan.releases.some(item => item.buildId === "not-a-build-id" && item.disposition === "unknown")).toBe(true);
     expect(plan.issues.some(issue => issue.startsWith("releases/not-a-build-id:"))).toBe(true);
-    // 既有合法 current 仍 keep，但全局阻断使候选为 0
+    // 既有合法 current 仍 keep；局部不合法目录自身 unknown。
     expect(byId(plan).get(releases[0].runtimeBuildId)!.disposition).toBe("keep");
     expect(plan.totals.bytesCandidateReclaimable).toBe(0);
   });
@@ -245,6 +249,42 @@ describe("immutable Core release GC plan", () => {
 });
 
 describe("GC plan fail-closed 状态矩阵", () => {
+  it.each(["runtime", "runtime-upgrades", "post-turn-finalizers", "releases"])("%s directory link is a global traversal blocker", folder => {
+    const { state } = fixture(["A", "B"]);
+    const original = path.join(state, folder), outside = makeTmpDir("gc-directory-target");
+    dirs.push(outside);
+    if (fs.existsSync(original)) fs.renameSync(original, path.join(state, "saved-releases"));
+    dirLink(outside, original);
+    const plan = planGc(state);
+    expect(plan.safety).toBe("blocked");
+    expect(plan.globalBlockerCount).toBeGreaterThan(0);
+    expect(plan.totals.bytesCandidateReclaimable).toBe(0);
+    expect(fs.readdirSync(outside)).toEqual([]);
+  });
+
+  it("authority file replacement during read is rejected", () => {
+    const { state, root, releases } = fixture(["A"]);
+    const ws = new Workspace(root).id;
+    writeRuntime(state, root, releases[0].runtimeBuildId, ws);
+    const file = path.join(state, "runtime", `${ws}.json`);
+    const read = fs.readSync;
+    vi.spyOn(fs, "readSync").mockImplementation(((...args: Parameters<typeof fs.readSync>) => {
+      const result = Reflect.apply(read, fs, args);
+      fs.renameSync(file, `${file}.old`);
+      fs.writeFileSync(file, "{}");
+      return result;
+    }) as typeof fs.readSync);
+    expect(() => readReleaseReferenceJson(file)).toThrow(/replaced/);
+  });
+
+  it("hard-linked exact authority is not accepted as a canonical pin", () => {
+    const { state, root, releases } = fixture(["A", "B"]);
+    const ws = new Workspace(root).id;
+    writeRuntime(state, root, releases[0].runtimeBuildId, ws);
+    fs.linkSync(path.join(state, "runtime", `${ws}.json`), path.join(state, "runtime-copy"));
+    expect(planGc(state)).toMatchObject({ safety: "blocked", globalBlockerCount: 1 });
+  });
+
   it("corrupt runtime JSON -> global unknown", () => {
     const { state, releases } = fixture(["A", "B"]);
     write(state, path.join("runtime", `${"a".repeat(12)}.json`), "{broken}");
@@ -398,7 +438,7 @@ describe("GC plan fail-closed 状态矩阵", () => {
     expect(dryJson.totals.bytesCandidateReclaimable).toBe(planJson.totals.bytesCandidateReclaimable);
     expect(planJson.releases.map((item: { buildId: string }) => item.buildId)).toContain(releases[1].runtimeBuildId);
     // 契约字段稳定
-    expect(Object.keys(planJson).sort()).toEqual(["issues", "ok", "releases", "stateDir", "totals"]);
+    expect(Object.keys(planJson).sort()).toEqual(["globalBlockerCount", "issueDetails", "issues", "localIssueCount", "ok", "releases", "safety", "stateDir", "totals"]);
     expect(Object.keys(planJson.totals).sort()).toEqual([
       "bytesCandidateReclaimable", "bytesKept", "issueCount", "releaseCount", "unknownReleaseCount",
     ]);

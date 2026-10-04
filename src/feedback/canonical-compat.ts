@@ -8,6 +8,9 @@ import { feedbackEventId, applyProjection } from "./projection-store.js";
 import { resolveResultOutboxEntries } from "../routing/result-outbox-store.js";
 import { resolveWorkspaceIdentity } from "../routing/store.js";
 import type { RoutingResult } from "../routing/schema.js";
+import { getStateDir } from "../config/paths.js";
+import { readFeedbackState } from "./state-store.js";
+import { assertFeedbackCommandSnapshot, withFeedbackCommandLocks } from "./command-locks.js";
 
 /**
  * R4 canonical Feedback projection —— R5d3 起 compatibility-only。
@@ -94,38 +97,45 @@ export function reconcileCanonicalResultOutbox(
   stateDir?: string,
 ): { state: FeedbackState; projected: number } {
   const identity = resolveWorkspaceIdentity({ id: workspaceId, root: workspaceRoot });
-  const state = recoverStaleFeedback(workspaceId, stateDir);
-  const resolved = resolveResultOutboxEntries(identity, stateDir);
-  const candidates = resolved.map(({ entry, result, plannerRoute }) => ({
-    entry,
-    result,
-    event: canonicalFeedbackEvent({
-      workspaceId, result, plannerRouteId: plannerRoute.routeId, plannerPrincipalFingerprint: plannerRoute.conversationId,
-      resultSha256: entry.resultSha256,
-      occurredAt: result.createdAt,
-    }),
-  }));
-  const events = candidates
-    .filter(({ result, event }) => {
-      const matches = state.events.filter((item) => item.commandId === result.commandId && item.iteration === result.iteration);
-      if (matches.length > 1) {
-        throw new FeedbackError("FEEDBACK_CANONICAL_ROUTE_CONFLICT", "同一 commandId/iteration 存在多个 feedback 事件；拒绝选择性投影");
-      }
-      const existing = matches[0];
-      if (!existing) return true;
-      if ("plannerRouteId" in existing) {
-        if (!sameCanonicalImmutableIdentity(existing, event)) {
-          throw new FeedbackError("FEEDBACK_CANONICAL_ROUTE_CONFLICT", "canonical feedback 身份已漂移；拒绝覆盖");
+  const resolvedStateDir = stateDir ?? getStateDir();
+  const initialResolved = resolveResultOutboxEntries(identity, resolvedStateDir);
+  const initialState = readFeedbackState(workspaceId, resolvedStateDir);
+  const lockedIds = [
+    ...initialResolved.map(item => item.entry.commandId),
+    ...initialState.events.map(event => event.commandId),
+  ];
+  return withFeedbackCommandLocks(workspaceId, lockedIds, resolvedStateDir, () => {
+    const resolved = resolveResultOutboxEntries(identity, resolvedStateDir);
+    const current = readFeedbackState(workspaceId, resolvedStateDir);
+    assertFeedbackCommandSnapshot(lockedIds, [
+      ...resolved.map(item => item.entry.commandId),
+      ...current.events.map(event => event.commandId),
+    ]);
+    const state = recoverStaleFeedback(workspaceId, resolvedStateDir);
+    const candidates = resolved.map(({ entry, result, plannerRoute }) => ({
+      entry,
+      result,
+      event: canonicalFeedbackEvent({
+        workspaceId, result, plannerRouteId: plannerRoute.routeId, plannerPrincipalFingerprint: plannerRoute.conversationId,
+        resultSha256: entry.resultSha256,
+        occurredAt: result.createdAt,
+      }),
+    }));
+    const events = candidates
+      .filter(({ result, event }) => {
+        const matches = state.events.filter((item) => item.commandId === result.commandId && item.iteration === result.iteration);
+        if (matches.length > 1) throw new FeedbackError("FEEDBACK_CANONICAL_ROUTE_CONFLICT", "同一 commandId/iteration 存在多个 feedback 事件；拒绝选择性投影");
+        const existing = matches[0];
+        if (!existing) return true;
+        if ("plannerRouteId" in existing) {
+          if (!sameCanonicalImmutableIdentity(existing, event)) throw new FeedbackError("FEEDBACK_CANONICAL_ROUTE_CONFLICT", "canonical feedback 身份已漂移；拒绝覆盖");
+          return false;
         }
+        if (!sameLegacyCanonicalIdentity(existing, event)) throw new FeedbackError("FEEDBACK_CANONICAL_ROUTE_CONFLICT", "历史 feedback 事件与 canonical result 冲突；拒绝静默重定向");
         return false;
-      }
-      // Pre-R4c legacy projection is compatible only when its immutable event identity matches.
-      if (!sameLegacyCanonicalIdentity(existing, event)) {
-        throw new FeedbackError("FEEDBACK_CANONICAL_ROUTE_CONFLICT", "历史 feedback 事件与 canonical result 冲突；拒绝静默重定向");
-      }
-      return false;
-    });
-  if (!events.length) return { state, projected: 0 };
-  const newEvents = events.map(({ event }) => event);
-  return { state: applyProjection({ workspaceId, stateDir, nextCursor: state.projectionCursor, newEvents }), projected: newEvents.length };
+      });
+    if (!events.length) return { state, projected: 0 };
+    const newEvents = events.map(({ event }) => event);
+    return { state: applyProjection({ workspaceId, stateDir: resolvedStateDir, nextCursor: state.projectionCursor, newEvents }), projected: newEvents.length };
+  });
 }

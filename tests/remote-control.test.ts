@@ -1,3 +1,4 @@
+import { cleanupStrict, waitForFixtureChildExit } from "./strict-teardown.js";
 import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
@@ -5,7 +6,7 @@ import { EventEmitter } from "node:events";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { cleanup, makeTmpDir } from "./helpers.js";
+import { makeTmpDir } from "./helpers.js";
 import { Workspace } from "../src/workspace/manager.js";
 import { getStateDir } from "../src/config/paths.js";
 import { startBridge } from "../src/bridge/server.js";
@@ -25,9 +26,9 @@ beforeEach(() => {
   oldState = process.env.C2C_STATE_DIR; process.env.C2C_STATE_DIR = stateDir;
   workspace = new Workspace(root);
 });
-afterEach(() => {
+afterEach(async () => {
   if (oldState === undefined) delete process.env.C2C_STATE_DIR; else process.env.C2C_STATE_DIR = oldState;
-  cleanup(root, stateDir);
+  await cleanupStrict(root, stateDir);
 });
 function ready() {
   setRemoteEnabled(workspace, true);
@@ -212,16 +213,14 @@ describe("Controller 状态机", () => {
     const controller = new RemoteController(workspace, fake as unknown as AppServerClient);
     const running = controller.run();
     const lockFile = path.join(getStateDir(), "execution-outputs", workspace.id, "index.json.lock");
-    let unlocker: ReturnType<typeof spawn> | undefined;
+    let unlocked: Promise<void> | undefined;
     try {
       await until(() => readRemote(workspace.id)!.tasks[0].status === "running");
       fs.mkdirSync(path.dirname(lockFile), { recursive: true });
       fs.writeFileSync(lockFile, "{}");
-      unlocker = spawn(process.execPath, ["-e", "const fs=require('node:fs'), file=process.argv[1]; setTimeout(() => { try { fs.unlinkSync(file); } catch {} }, 2000);", lockFile], { stdio: "ignore", windowsHide: true });
-      const unlocked = new Promise<void>((resolve, reject) => {
-        unlocker!.once("error", reject);
-        unlocker!.once("exit", () => resolve());
-      });
+      const unlocker = spawn(process.execPath, ["-e", "const fs=require('node:fs'), file=process.argv[1]; setTimeout(() => { try { fs.unlinkSync(file); } catch {} }, 2000);", lockFile], { stdio: "ignore", windowsHide: true });
+      unlocked = waitForFixtureChildExit(unlocker);
+      void unlocked.catch(() => {}); // Finally still reports failure, even if an earlier assertion throws.
       fake.emit("notification", { method: "item/completed", params: {
         threadId: "thread-1", turnId: "turn-1", item: { type: "agentMessage", text: "锁竞争后的正文" },
       } });
@@ -234,7 +233,7 @@ describe("Controller 状态机", () => {
       expect(readExecutionOutput(workspace.id, record.outputId!)).toMatchObject({ ok: true, text: "锁竞争后的正文" });
     } finally {
       controller.stop(); await running;
-      if (unlocker && !unlocker.killed) unlocker.kill();
+      await unlocked; // Wait on this ChildProcess, never kill a possibly reused PID.
       fs.rmSync(lockFile, { force: true });
     }
   });

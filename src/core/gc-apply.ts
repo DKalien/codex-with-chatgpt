@@ -4,12 +4,14 @@ import { randomUUID } from "node:crypto";
 import { getStateDir } from "../config/paths.js";
 import { planGc, validateReleaseManifest, type GcPlan, type ReleasePlanItem } from "./gc-plan.js";
 import {
-  legacyRolloutLockPath,
   listBridgeStartLocks,
+  assertMaintenanceHandle,
   tryAcquireMaintenanceLock,
   type MaintenanceLockHandle,
 } from "./maintenance-lock.js";
+import { retireLegacyFinalizers, type FinalizerRetirementOptions } from "./post-turn-finalizer.js";
 import { releaseRolloutFence, tryAcquireRolloutFence } from "./rollout-fence.js";
+import { readReleaseReferenceJson, type ReleaseReferenceIssue } from "./release-references.js";
 
 export type GcApplyItemStatus = "deleted" | "tombstoned" | "skipped" | "error";
 
@@ -22,6 +24,11 @@ export interface GcApplyItem {
 
 export interface GcApplyResult {
   ok: boolean;
+  status: "success" | "partial" | "blocked";
+  globalBlockerCount: number;
+  localIssueCount: number;
+  issueDetails: ReleaseReferenceIssue[];
+  retained: ReleasePlanItem[];
   stateDir: string;
   mode: "apply";
   items: GcApplyItem[];
@@ -52,6 +59,7 @@ export interface GcApplyFns {
 }
 
 export interface GcApplyOptions {
+  retirement?: FinalizerRetirementOptions;
   hooks?: GcApplyHooks;
   fns?: GcApplyFns;
   stateDir?: string;
@@ -60,6 +68,11 @@ export interface GcApplyOptions {
 function emptyResult(stateDir: string): GcApplyResult {
   return {
     ok: false,
+    status: "blocked",
+    globalBlockerCount: 0,
+    localIssueCount: 0,
+    issueDetails: [],
+    retained: [],
     stateDir,
     mode: "apply",
     items: [],
@@ -76,6 +89,8 @@ function emptyResult(stateDir: string): GcApplyResult {
 
 function fail(result: GcApplyResult, issue: string, items: GcApplyItem[] = []): GcApplyResult {
   result.issues.push(issue);
+  result.status = "blocked";
+  result.globalBlockerCount = Math.max(1, result.globalBlockerCount);
   result.items = items;
   result.totals.candidateCount = items.length;
   result.totals.deletedCount = items.filter((item) => item.status === "deleted").length;
@@ -90,10 +105,16 @@ function candidateBuildIds(plan: GcPlan): string[] {
   return plan.releases.filter((item) => item.disposition === "delete-candidate").map((item) => item.buildId).sort();
 }
 
-function sameStringSet(a: readonly string[], b: readonly string[]): boolean {
-  if (a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i += 1) if (a[i] !== b[i]) return false;
-  return true;
+function notePlan(result: GcApplyResult, plan: GcPlan): void {
+  for (const detail of plan.issueDetails) {
+    if (!result.issueDetails.some(existing => JSON.stringify(existing) === JSON.stringify(detail))) {
+      result.issueDetails.push(detail);
+      result.issues.push(`${detail.source}: ${detail.message}`);
+    }
+  }
+  result.globalBlockerCount = result.issueDetails.filter(issue => issue.scope.kind === "global").length;
+  result.localIssueCount = result.issueDetails.length - result.globalBlockerCount;
+  result.retained = plan.releases.filter(item => item.disposition !== "delete-candidate");
 }
 
 function ensureCanonicalDir(dir: string): void {
@@ -159,7 +180,8 @@ function skippedItem(item: ReleasePlanItem, reason: string): GcApplyItem {
 
 /**
  * 安全 apply：绝不信任旧 plan。
- * initial plan → lock → fresh plan → candidate set 相等 → 逐项再验证 → tombstone → no-follow delete。
+ * initial plan → maintenance → rollout fence → start check → fresh intersection →
+ * strict retirement → per-item global/reference recheck → tombstone → no-follow delete.
  */
 export function applyGc(options: GcApplyOptions = {}): GcApplyResult {
   const stateDir = path.resolve(options.stateDir ?? getStateDir());
@@ -169,19 +191,23 @@ export function applyGc(options: GcApplyOptions = {}): GcApplyResult {
   const removeTree = options.fns?.removeTree ?? ((root: string) => removeTreeNoFollow(root, path.join(stateDir, "gc-trash")));
 
   const initial = planGc(stateDir);
+  notePlan(result, initial);
   hooks.afterInitialPlan?.(initial);
-  if (!initial.ok) {
-    return fail(result, "initial_plan_unsafe: GC plan 存在 unknown/issue，拒绝 apply", initial.releases
+  if (initial.globalBlockerCount) {
+    return fail(result, "initial_plan_unsafe: GC plan 存在 global blocker，拒绝 apply", initial.releases
       .filter((item) => item.disposition === "delete-candidate" || item.disposition === "unknown")
       .map((item) => skippedItem(item, "initial_plan_unsafe")));
   }
 
   const initialCandidates = candidateBuildIds(initial);
-  const lock = tryAcquireMaintenanceLock(stateDir, "gc-apply");
+  let lock: ReturnType<typeof tryAcquireMaintenanceLock>;
+  try { lock = tryAcquireMaintenanceLock(stateDir, "gc-apply"); }
+  catch { return fail(result, "maintenance_unavailable: maintenance authority 无法确认"); }
   if (!lock.ok) {
     return fail(result, "maintenance_busy: 无法取得 machine maintenance lock");
   }
   const handle: MaintenanceLockHandle = lock.handle;
+  const items: GcApplyItem[] = [];
   let rolloutFence: { ok: true; handle: import("./rollout-fence.js").RolloutFenceHandle } | { ok: false } | null = null;
   try {
     hooks.afterLockAcquired?.();
@@ -191,6 +217,16 @@ export function applyGc(options: GcApplyOptions = {}): GcApplyResult {
     if (!rolloutFence.ok) {
       return fail(result, "legacy_rollout_lock: 无法取得 rollout.lock，拒绝与 rollout 并发");
     }
+    const fenceHandle = rolloutFence.handle;
+    const fenceStat = fs.lstatSync(fenceHandle.path);
+    const fenceContents = JSON.stringify(readReleaseReferenceJson(fenceHandle.path));
+    const checkFences = (): void => {
+      assertMaintenanceHandle(stateDir, handle);
+      const stat = fs.lstatSync(fenceHandle.path);
+      if (stat.dev !== fenceStat.dev || stat.ino !== fenceStat.ino ||
+          JSON.stringify(readReleaseReferenceJson(fenceHandle.path)) !== fenceContents) throw new Error("rollout_fence_owner_lost");
+      if (listBridgeStartLocks(stateDir).length) throw new Error("bridge_start_in_progress");
+    };
 
     // bridge start 关键区间：start.lock 存在则 abort，避免 spawn 窗口内误判 unreferenced。
     const startLocks = listBridgeStartLocks(stateDir);
@@ -199,31 +235,69 @@ export function applyGc(options: GcApplyOptions = {}): GcApplyResult {
     }
 
     const fresh = planGc(stateDir);
+    notePlan(result, fresh);
     hooks.afterFreshPlan?.(fresh);
-    if (!fresh.ok) {
+    if (fresh.globalBlockerCount) {
       return fail(result, "fresh_plan_unsafe: lock 内 plan 不安全，拒绝 apply", fresh.releases
         .filter((item) => item.disposition === "delete-candidate" || item.disposition === "unknown")
         .map((item) => skippedItem(item, "fresh_plan_unsafe")));
     }
 
     const freshCandidates = candidateBuildIds(fresh);
-    if (!sameStringSet(initialCandidates, freshCandidates)) {
-      return fail(result, "stale_candidates: initial 与 fresh candidate set 不一致，整轮 abort", [
-        ...initialCandidates.map((buildId) => ({ buildId, status: "skipped" as const, logicalBytes: 0, reason: "stale_candidates" })),
-        ...freshCandidates.filter((id) => !initialCandidates.includes(id)).map((buildId) => ({
-          buildId, status: "skipped" as const, logicalBytes: 0, reason: "new_candidate_not_deleted",
-        })),
-      ]);
+    for (const buildId of initialCandidates.filter(id => !freshCandidates.includes(id))) {
+      items.push(skippedItem(initial.releases.find(item => item.buildId === buildId)!, "candidate_reference_changed"));
     }
 
-    const items: GcApplyItem[] = [];
-    const trash = ensureTrashDir(stateDir);
-    for (const buildId of freshCandidates) {
-      const item = fresh.releases.find((entry) => entry.buildId === buildId)!;
+    checkFences();
+    // A forward-format exact pin is safe to retain, never safe to retire with the old protocol.
+    let retired: ReturnType<typeof retireLegacyFinalizers> = [];
+    if (!fresh.issueDetails.some(issue => issue.code === "finalizer_corrupt")) {
+      try { retired = retireLegacyFinalizers(stateDir, handle, options.retirement); }
+      catch { return fail(result, "finalizer_retirement_failed: strict retirement proof unavailable", items); }
+    }
+    const afterRetirement = planGc(stateDir);
+    notePlan(result, afterRetirement);
+    if (afterRetirement.globalBlockerCount) return fail(result, "retirement_plan_unsafe", items);
+    const afterCandidates = candidateBuildIds(afterRetirement);
+    const allowed = new Set(initialCandidates.filter(id => freshCandidates.includes(id)));
+    for (const job of retired) {
+      // Only an exact pin present in BOTH snapshots may become eligible in this run.
+      if ([initial, fresh].every(plan => plan.releases.some(item => item.buildId === job.targetBuildId &&
+          item.disposition === "keep" && item.reasons.includes(`finalizer:${job.workspaceId}`)))) allowed.add(job.targetBuildId);
+    }
+    for (const buildId of allowed) {
+      if (!afterCandidates.includes(buildId)) items.push(skippedItem(fresh.releases.find(item => item.buildId === buildId)!, "candidate_reference_changed"));
+    }
+
+    for (const buildId of afterCandidates) {
+      const item = afterRetirement.releases.find((entry) => entry.buildId === buildId)!;
+      if (!allowed.has(buildId)) {
+        if (!items.some(entry => entry.buildId === buildId)) items.push(skippedItem(item, "new_candidate_not_deleted"));
+        continue;
+      }
       try {
         hooks.beforeTombstone?.(buildId);
-        // hook 可能破坏 manifest/path：再校验必须在 mutation 之前。
+        checkFences();
+      } catch {
+        return fail(result, "mutation_fence_unsafe", [...items, ...afterCandidates
+          .filter(id => !items.some(entry => entry.buildId === id))
+          .map(id => skippedItem(afterRetirement.releases.find(entry => entry.buildId === id)!, "mutation_fence_unsafe"))]);
+      }
+      // Unscoped uncertainty halts further mutations; a local failure only skips its build.
+      const current = planGc(stateDir);
+      notePlan(result, current);
+      if (current.globalBlockerCount) return fail(result, "mutation_plan_unsafe", [...items, ...afterCandidates
+        .filter(id => !items.some(entry => entry.buildId === id))
+        .map(id => skippedItem(afterRetirement.releases.find(entry => entry.buildId === id)!, "mutation_plan_unsafe"))]);
+      // Planning may traverse a large tree; recheck ownership after that read window.
+      try { checkFences(); }
+      catch { return fail(result, "mutation_fence_unsafe", [...items, ...afterCandidates
+        .filter(id => !items.some(entry => entry.buildId === id))
+        .map(id => skippedItem(afterRetirement.releases.find(entry => entry.buildId === id)!, "mutation_fence_unsafe"))]); }
+      try {
+        if (!candidateBuildIds(current).includes(buildId)) throw new Error("candidate_reference_changed");
         revalidateCandidate(stateDir, item);
+        const trash = ensureTrashDir(stateDir);
         const nonce = randomUUID();
         const dest = path.join(trash, `${buildId}.${nonce}`);
         renameSync(item.path, dest);
@@ -255,19 +329,27 @@ export function applyGc(options: GcApplyOptions = {}): GcApplyResult {
     for (const item of items) {
       if (item.status === "tombstoned") result.issues.push(`${item.buildId}: tombstone cleanup_failed`);
       if (item.status === "error") result.issues.push(`${item.buildId}: ${item.reason}`);
+      if (item.status === "skipped") result.issues.push(`${item.buildId}: ${item.reason}`);
     }
     result.ok = result.issues.length === 0;
+    result.status = result.ok ? "success" : "partial";
     return result;
+  } catch {
+    return fail(result, "gc_authority_unavailable", items);
   } finally {
     if (rolloutFence?.ok) {
       const report = releaseRolloutFence(rolloutFence.handle);
       if (!report.rolloutReleased) {
         result.ok = false;
+        result.status = "blocked";
+        result.globalBlockerCount += 1;
         result.issues.push(report.issues[0] ?? "rollout_fence_release_failed: rollout.lock 未能安全释放，需人工核对");
       }
     }
     if (!handle.release()) {
       result.ok = false;
+      result.status = "blocked";
+      result.globalBlockerCount += 1;
       result.issues.push("maintenance_release_failed: lock 无法证明已安全释放，需人工核对 maintenance.lock");
     }
   }

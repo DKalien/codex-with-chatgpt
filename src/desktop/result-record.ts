@@ -8,6 +8,7 @@ import { reconcileUnknownDesktopDelivery } from "./unknown-reconciliation.js";
 import {
   sanitizeReceiptFinalizationInput,
   type ReceiptFinalizationDraft,
+  type ReceiptFinalizationInput,
 } from "./receipt-finalizer-schema.js";
 import { stageReceiptFinalization, writeReceiptFinalizationAlert } from "./receipt-finalizer-store.js";
 import { spawnReceiptFinalizerWorker } from "./receipt-finalizer-worker.js";
@@ -39,6 +40,7 @@ import {
   prepareReceiptCommit,
   receiptHash,
 } from "./result-commit.js";
+import { withCommandOperationAsync } from "../command-cleanup/fence.js";
 
 /**
  * 记录已由 Desktop 接受的本次结果。
@@ -58,6 +60,15 @@ export async function recordDesktopResult(
 ): Promise<DesktopResultReceipt> {
   const workspace = workspaceInput.parse(workspaceRaw);
   const input = sanitizeReceiptFinalizationInput(desktopResultInput.parse(rawInput));
+  return withCommandOperationAsync(workspace.id, input.commandId,
+    () => recordDesktopResultLocked(workspace, input, options));
+}
+
+async function recordDesktopResultLocked(
+  workspace: DesktopResultWorkspace,
+  input: ReceiptFinalizationInput,
+  options: { allowInProgress?: boolean; beforeReceiptCommit?: (receiptAlreadyExists: boolean) => void },
+): Promise<DesktopResultReceipt> {
   const threadId = currentThreadId();
   const initial = readDesktopResultDelivery(workspace, input.commandId, threadId);
   let accepted: DesktopDelivery;
@@ -131,7 +142,7 @@ export async function recordDesktopResult(
         ownershipSnapshot: finalizationOwnershipSnapshot(workspace, acceptedNow, firstOwnership),
       });
       try {
-        if (process.env.C2C_RECEIPT_FINALIZER_NO_SPAWN !== "1") spawnReceiptFinalizerWorker(draft);
+        if (process.env.C2C_RECEIPT_FINALIZER_NO_SPAWN !== "1") await spawnReceiptFinalizerWorker(draft);
       } catch {
         // spawn 失败由显式 finalization-required alert 表示，不能回退为 trusted receipt。
         writeReceiptFinalizationAlert(draft, "worker_spawn_failed");
@@ -168,7 +179,7 @@ export async function recordDesktopResult(
       desktopResultTurnId: firstOwnership.resultTurnId,
       desktopBindingId: acceptedNow.bindingId,
     };
-    return appendTrustedReceiptLocked(workspace.id, input, record);
+    return appendTrustedReceiptLocked(workspace.id, { ...input, rawSummary }, record);
   });
 }
 

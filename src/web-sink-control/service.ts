@@ -14,6 +14,7 @@ import {
 } from "./schema.js";
 import { nextWebSinkEpoch, readWebSinkControl, updateWebSinkControlDetailed } from "./store.js";
 import { hasProductionWebSinkSurface, listProductionWebSinkSurfaces } from "./registry.js";
+import { withEndpointSwitchLock } from "../endpoint-switch/lock.js";
 
 export interface ActiveWebSinkBindingResult {
   readonly binding: WebSinkBinding;
@@ -41,6 +42,7 @@ export function readActiveWebSinkBinding(workspaceId: string): WebSinkBinding | 
 /**
  * Bridge 盖章绑定 Web Sink candidate。
  * 同一 candidate 幂等 noWrite；canonicalUrl 变化则新 bindingId + epoch+1。
+ * R5e：全程持有 endpoint switch lock（web-sink 域），与 Result Bus reserve/begin-send 串行。
  */
 export function bindCurrentWebSink(
   workspaceId: string,
@@ -58,34 +60,36 @@ export function bindCurrentWebSink(
       `surface ${candidate.pluginId}/${candidate.surfaceId} 不在 production registry。`,
     );
   }
-  return updateWebSinkControlDetailed<ActiveWebSinkBindingResult>(
-    workspaceId,
-    (previous) => {
-      const active = previous?.activeBinding ?? null;
-      if (active && previous && isSameWebSinkCandidate(active, candidate)) {
+  return withEndpointSwitchLock("web-sink", workspaceId, () =>
+    updateWebSinkControlDetailed<ActiveWebSinkBindingResult>(
+      workspaceId,
+      (previous) => {
+        const active = previous?.activeBinding ?? null;
+        if (active && previous && isSameWebSinkCandidate(active, candidate)) {
+          return {
+            state: previous,
+            result: { binding: active, created: false, noWrite: true },
+            noWrite: true,
+          };
+        }
+        const epoch = active ? nextWebSinkEpoch(active.epoch) : 1;
+        const binding = createWebSinkBinding(candidate, {
+          bindingId: randomUUID(),
+          epoch,
+          boundAt: new Date().toISOString(),
+        });
         return {
-          state: previous,
-          result: { binding: active, created: false, noWrite: true },
-          noWrite: true,
+          state: {
+            version: 1,
+            workspaceId,
+            revision: (previous?.revision ?? 0) + 1,
+            activeBinding: binding,
+          },
+          result: { binding, created: true },
         };
-      }
-      const epoch = active ? nextWebSinkEpoch(active.epoch) : 1;
-      const binding = createWebSinkBinding(candidate, {
-        bindingId: randomUUID(),
-        epoch,
-        boundAt: new Date().toISOString(),
-      });
-      return {
-        state: {
-          version: 1,
-          workspaceId,
-          revision: (previous?.revision ?? 0) + 1,
-          activeBinding: binding,
-        },
-        result: { binding, created: true },
-      };
-    },
-  ).result;
+      },
+    ).result,
+  );
 }
 
 export async function webSinkStatus(

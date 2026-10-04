@@ -171,6 +171,9 @@ export function validateSendJournalShape(journal) {
     return { ok: true };
   }
   if (CLAIMED_SHAPE_STATES.has(journal.state)) {
+    if (journal.terminalWitness !== undefined && (typeof journal.terminalWitness !== "string" || !journal.terminalWitness || journal.terminalWitness.length > 4096)) {
+      return { ok: false, reason: "terminal_witness_invalid" };
+    }
     if (!journal.attemptId) {
       return { ok: false, reason: "attempt_id_missing" };
     }
@@ -243,6 +246,7 @@ const CLAIMED_IDENTITY_FIELDS = [
   "attemptId",
   "message",
   "messageSha256",
+  "terminalWitness",
 ];
 
 export function markReserveRequested(journal, input) {
@@ -361,6 +365,7 @@ export function markClaimed(journal, input) {
       attemptId: input.attemptId,
       message: input.message ?? null,
       messageSha256: input.messageSha256 ?? null,
+      ...(input.terminalWitness === undefined ? {} : { terminalWitness: input.terminalWitness }),
     });
   }
   return transitionJournal(journal, "CLAIMED", {
@@ -369,6 +374,7 @@ export function markClaimed(journal, input) {
     attemptId: input.attemptId,
     message: input.message ?? null,
     messageSha256: input.messageSha256 ?? null,
+    ...(input.terminalWitness === undefined ? {} : { terminalWitness: input.terminalWitness }),
     routeCanonical: input.routeCanonical ?? journal.routeCanonical,
     bindingId: input.bindingId ?? journal.bindingId,
     epoch: input.epoch ?? journal.epoch,
@@ -441,6 +447,9 @@ export function markOutcomeUnknown(journal, input) {
       : {}),
     ...(input?.messageSha256 !== undefined && journal.messageSha256 == null
       ? { messageSha256: input.messageSha256 }
+      : {}),
+    ...(input?.terminalWitness !== undefined && journal.terminalWitness === undefined
+      ? { terminalWitness: input.terminalWitness }
       : {}),
   });
   return assertShape(next);

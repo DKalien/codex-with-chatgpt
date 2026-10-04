@@ -1,3 +1,4 @@
+import { requestHttp } from "./http-json.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -20,6 +21,14 @@ import { cleanup, isolateStateDir, makeTmpDir } from "./helpers.js";
 const THREAD_ID = "01a00000-0000-7000-8000-000000000001";
 const THREAD_ID_2 = "01a00000-0000-7000-8000-000000000003";
 const PLANNER_CONVERSATION_ID = "018c0000-0000-7000-8000-00000000c2c1";
+const runtimeFence = {
+  desktopPid: 1001,
+  desktopExe: "C:\\Program Files\\ChatGPT\\ChatGPT.exe",
+  desktopCreation: "1000001",
+  appServerPid: 1002,
+  appServerExe: "C:\\Program Files\\ChatGPT\\codex.exe",
+  appServerCreation: "1000002",
+};
 
 let root: string;
 let stateDir: string;
@@ -101,6 +110,7 @@ beforeEach(async () => {
   stateDir = isolateStateDir();
   root = makeTmpDir("desktop-interface-workspace");
   bridge = await startBridge({ workspaceRoot: root, port: 0, persistRuntime: false });
+  vi.spyOn(desktopIpc, "discoverForBinding").mockResolvedValue({ title: "测试 Desktop 会话", runtimeFence } as never);
 });
 
 afterEach(async () => {
@@ -139,7 +149,7 @@ describe("Desktop MCP 与本地接口", () => {
   });
 
   it("Desktop Control OAuth 授权页明确显示可修改权限与本机撤权边界", async () => {
-    const registration = await fetch(`${bridge.localBaseUrl()}/oauth/register`, {
+    const registration = await requestHttp(`${bridge.localBaseUrl()}/oauth/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ client_name: "Desktop UI test", redirect_uris: ["http://127.0.0.1:19999/callback"] }),
@@ -153,7 +163,7 @@ describe("Desktop MCP 与本地接口", () => {
     url.searchParams.set("code_challenge", "test-challenge");
     url.searchParams.set("code_challenge_method", "S256");
     url.searchParams.set("scope", `${DESKTOP_CONTROL_SCOPE} ${DESKTOP_READ_SCOPE}`);
-    const page = await fetch(url);
+    const page = await requestHttp(url);
     const html = await page.text();
     expect(pairing.code).toMatch(/^[A-Z0-9]{4}-[A-Z0-9]{4}$/);
     expect(html).toContain("Desktop 任务投递，可修改文件或执行命令");
@@ -548,7 +558,7 @@ describe("Desktop MCP 与本地接口", () => {
     const program = new Command();
     registerDesktopCommands(program);
     const desktop = program.commands.find(command => command.name() === "desktop");
-    expect(desktop?.commands.map(command => command.name())).toEqual(["record-result", "reconcile-result", "result-reconciliation-status", "reconcile-unknown", "legacy-reconcile", "legacy-retire", "abandon", "resolve-unknown", "bind-current", "bind", "enable", "disable", "status", "history", "diagnose"]);
+    expect(desktop?.commands.map(command => command.name())).toEqual(["record-result", "reconcile-result", "result-reconciliation-status", "reconcile-unknown", "legacy-reconcile", "legacy-retire", "abandon-corrupt-lock", "abandon", "resolve-unknown", "bind-current", "bind", "enable", "disable", "status", "history", "diagnose"]);
     expect(desktop?.helpInformation()).toContain("reconcile-result");
     expect(desktop?.helpInformation()).toContain("result-reconciliation-status");
     expect(desktop?.commands.find(command => command.name() === "enable")?.options.map(option => option.long)).toContain("--accept-desktop-permissions");

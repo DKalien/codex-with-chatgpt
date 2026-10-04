@@ -27,6 +27,14 @@ const bindingId = "01a00000-0000-7000-8000-000000000004";
 const maintenanceTurnId = "01a00000-0000-7000-8000-000000000006";
 const commandId = "legacy_waiting_command";
 const acceptedAt = "2026-01-01T00:00:00.000Z";
+const runtimeFence = {
+  desktopPid: 1001,
+  desktopExe: "C:\\Program Files\\ChatGPT\\ChatGPT.exe",
+  desktopCreation: "1000001",
+  appServerPid: 1002,
+  appServerExe: "C:\\Program Files\\ChatGPT\\codex.exe",
+  appServerCreation: "1000002",
+};
 
 let root: string;
 let stateDir: string;
@@ -59,6 +67,7 @@ function seedDelivery(overrides: Record<string, unknown> = {}): void {
       workspaceId: workspace.id,
       workspaceRoot: workspace.root,
       enabled: false,
+      runtimeFence,
       binding: {
         threadId: currentThreadId,
         hostId: "local" as const,

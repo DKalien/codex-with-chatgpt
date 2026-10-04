@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from typing import Any
 
 from .common import (
+    DesktopIpcError,
     MAX_MESSAGE_BYTES,
+    RESULT_ACTIVITY_ITEM_TYPES,
     _error,
     _normalize_path,
     _require,
@@ -121,6 +124,147 @@ def _desktop_task_matches(expectation: dict[str, Any], envelope: dict[str, Any])
                 ("workspaceId", "commandId", "intent", "messageBytes", "messageSha256")) and
             (version == 1 or envelope.get("deliveryId") == expectation["deliveryId"]))
 
+
+_STEERING_USER_MESSAGE_KEYS = frozenset({
+    "type", "id", "targetTurnId", "targetTurnStartedAtMs", "status", "serverUserMessageId",
+    "clientUserMessageId", "serverClientUserMessageId", "input", "attachments", "restoreMessage", "compareKey",
+})
+
+
+def _is_expected_desktop_task(text: str, expectation: dict[str, Any]) -> bool:
+    envelope = _parse_desktop_task(text)
+    return envelope is not None and _desktop_task_matches(expectation, envelope)
+
+
+def _contains_expected_desktop_task(value: Any, expectation: dict[str, Any]) -> bool:
+    pending = [value]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, str):
+            if _is_expected_desktop_task(current, expectation):
+                return True
+        elif isinstance(current, dict):
+            pending.extend(current.keys())
+            pending.extend(current.values())
+        elif isinstance(current, list):
+            pending.extend(current)
+        elif current is not None and type(current) not in {bool, int, float}:
+            raise _error("DESKTOP_STATE_UNAVAILABLE")
+    return False
+
+
+def _validate_unrelated_steering_items(
+    turn: dict[str, Any], expectation: dict[str, Any], known_turn_ids: set[str],
+) -> bool:
+    """Validate the known Desktop steering shape; it is never an accepted start-turn receipt."""
+    items = turn.get("items")
+    if not isinstance(items, list):
+        raise _error("DESKTOP_STATE_UNAVAILABLE")
+    steering_count = 0
+    marker_count = 0
+    pending_marker = False
+    for item in items:
+        if not isinstance(item, dict):
+            raise _error("DESKTOP_STATE_UNAVAILABLE")
+        item_type = item.get("type")
+        if not isinstance(item_type, str):
+            raise _error("DESKTOP_STATE_UNAVAILABLE")
+        if item_type == "steered":
+            if frozenset(item) != frozenset({"type", "id"}) or _uuid(item.get("id")) is None or not pending_marker:
+                raise _error("DESKTOP_STATE_UNAVAILABLE")
+            marker_count += 1
+            pending_marker = False
+            continue
+        if item_type != "steeringUserMessage":
+            continue
+        target_turn_id = _uuid(item.get("targetTurnId"))
+        timestamp = item.get("targetTurnStartedAtMs")
+        valid_timestamp = (
+            type(timestamp) is int and 0 <= timestamp <= 9_007_199_254_740_991
+        ) or (
+            type(timestamp) is float and math.isfinite(timestamp)
+            and 0 <= timestamp <= 9_007_199_254_740_991
+        )
+        if (frozenset(item) != _STEERING_USER_MESSAGE_KEYS or item.get("status") != "accepted"
+                or any(_uuid(item.get(key)) is None for key in (
+                    "id", "targetTurnId", "serverUserMessageId", "clientUserMessageId", "serverClientUserMessageId"))
+                or target_turn_id is None or target_turn_id not in known_turn_ids
+                or not valid_timestamp):
+            raise _error("DESKTOP_STATE_UNAVAILABLE")
+        inputs = item.get("input")
+        attachments = item.get("attachments")
+        restore = item.get("restoreMessage")
+        compare = item.get("compareKey")
+        if (not isinstance(inputs, list) or not 1 <= len(inputs) <= 2
+                or not isinstance(attachments, list) or len(attachments) > 1
+                or not isinstance(restore, dict) or not isinstance(restore.get("text"), str)
+                or not isinstance(compare, dict) or frozenset(compare) != frozenset({"imageCount", "rawText"})
+                or type(compare.get("imageCount")) is not int or compare["imageCount"] < 0
+                or not isinstance(compare.get("rawText"), str)):
+            raise _error("DESKTOP_STATE_UNAVAILABLE")
+        texts = [compare["rawText"]]
+        for index, input_item in enumerate(inputs):
+            if not isinstance(input_item, dict):
+                raise _error("DESKTOP_STATE_UNAVAILABLE")
+            input_type = input_item.get("type")
+            if input_type == "text":
+                if (frozenset(input_item) != frozenset({"type", "text", "text_elements"})
+                        or not isinstance(input_item.get("text"), str)
+                        or input_item.get("text_elements") != []):
+                    raise _error("DESKTOP_STATE_UNAVAILABLE")
+                try:
+                    input_item["text"].encode("utf-8", "strict")
+                except UnicodeEncodeError:
+                    raise _error("DESKTOP_STATE_UNAVAILABLE")
+                texts.append(input_item["text"])
+            elif input_type == "localImage":
+                if (index != 1 or len(inputs) != 2 or frozenset(input_item) != frozenset({"type", "path"})
+                        or not isinstance(input_item.get("path"), str)):
+                    raise _error("DESKTOP_STATE_UNAVAILABLE")
+            else:
+                raise _error("DESKTOP_STATE_UNAVAILABLE")
+        input_types = [input_item["type"] for input_item in inputs]
+        if input_types not in (["text"], ["text", "localImage"]):
+            raise _error("DESKTOP_STATE_UNAVAILABLE")
+        for attachment in attachments:
+            if (not isinstance(attachment, dict)
+                    or frozenset(attachment) != frozenset({"fsPath", "isImageAttachment", "label", "path"})
+                    or any(not isinstance(attachment.get(key), str) for key in ("fsPath", "label", "path"))
+                    or type(attachment.get("isImageAttachment")) is not bool):
+                raise _error("DESKTOP_STATE_UNAVAILABLE")
+            if attachment.get("isImageAttachment") is not True:
+                raise _error("DESKTOP_STATE_UNAVAILABLE")
+        if ((len(inputs) == 2 and len(attachments) != 1)
+                or (len(inputs) == 1 and attachments)):
+            raise _error("DESKTOP_STATE_UNAVAILABLE")
+        if any(_is_expected_desktop_task(text, expectation) for text in texts):
+            # A steering item has no accepted start-turn turnId to reconcile against.
+            raise _error("DESKTOP_STATE_UNAVAILABLE")
+        if _contains_expected_desktop_task(restore, expectation):
+            raise _error("DESKTOP_STATE_UNAVAILABLE")
+        steering_count += 1
+        pending_marker = True
+    if pending_marker or marker_count != steering_count:
+        raise _error("DESKTOP_STATE_UNAVAILABLE")
+    return steering_count > 0
+
+
+def _is_non_submission_activity(turn: dict[str, Any]) -> bool:
+    """Skip only turns with no input and an entirely known assistant/tool activity list."""
+    params = turn.get("params")
+    items = turn.get("items")
+    if (not isinstance(params, dict) or not isinstance(items, list)
+            or "turnTrigger" in params or not set(params).issubset({"threadId", "input"})):
+        return False
+    if "input" in params and params.get("input") != []:
+        return False
+    return bool(items) and all(
+        isinstance(item, dict)
+        and isinstance(item.get("type"), str)
+        and item.get("type") in (RESULT_ACTIVITY_ITEM_TYPES - {"userMessage"}) | {"toolResult"}
+        for item in items
+    )
+
 def _reconcile_turn_ids(state: dict[str, Any], expectation: dict[str, Any], target: dict[str, str]) -> list[str]:
     candidates: list[str] = []
     # reconciliation 只接受 canonical、已 exhaust 的完整历史；flat turns
@@ -153,9 +297,29 @@ def _reconcile_turn_ids(state: dict[str, Any], expectation: dict[str, Any], targ
             predecessor = predecessors.get(turn_id) if turn_id is not None else None
             if predecessor is None:
                 raise _error("DESKTOP_STATE_UNAVAILABLE")
-            _native_continuation_edge(predecessor, turn, target, strict_items=True)
+            items = turn.get("items")
+            has_steering_items = isinstance(items, list) and any(
+                isinstance(item, dict) and item.get("type") in {"steeringUserMessage", "steered"}
+                for item in items
+            )
+            if has_steering_items:
+                has_steering = _validate_unrelated_steering_items(
+                    turn, expectation, {item["turnId"] for item in turns},
+                )
+                _native_continuation_edge(
+                    predecessor, turn, target, strict_items=True,
+                    allow_steering_user_messages=True,
+                    allow_failed_resume=has_steering,
+                )
+            else:
+                _native_continuation_edge(predecessor, turn, target, strict_items=True)
             continue
-        text = _turn_text_for_reconciliation(turn)
+        try:
+            text = _turn_text_for_reconciliation(turn)
+        except DesktopIpcError:
+            if _is_non_submission_activity(turn):
+                continue
+            raise
         if text is None:
             continue
         envelope = _parse_desktop_task(text)

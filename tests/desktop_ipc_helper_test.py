@@ -235,7 +235,7 @@ class DesktopIpcHelperTests(unittest.TestCase):
         wrong_body, _ = self.reconcile_fixture(message="不同正文")
         self.assertEqual(helper_reconciliation._reconcile_turn_ids(wrong_body, expected, TARGET), [])
 
-    def test_reconcile_unknown_skips_only_strict_native_continuation(self) -> None:
+    def test_reconcile_unknown_skips_strict_native_and_result_only_activity(self) -> None:
         delivery_id = "01a00000-0000-7000-8000-000000000200"
         state, expected = self.reconcile_fixture(version=2, delivery_id=delivery_id)
         history = state["turnHistory"]["history"]  # type: ignore[index]
@@ -253,7 +253,108 @@ class DesktopIpcHelperTests(unittest.TestCase):
         ])
 
         history["entitiesByKey"]["turn-2"]["params"] = {"threadId": THREAD, "input": []}  # type: ignore[index]
+        self.assertEqual(helper_reconciliation._reconcile_turn_ids(state, expected, TARGET), [
+            "01a00000-0000-7000-8000-000000000011",
+        ])
+        for item in ({"type": "userMessage"}, {"type": "futureActivity"}):
+            history["entitiesByKey"]["turn-2"]["items"] = [item]  # type: ignore[index]
+            self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: helper_reconciliation._reconcile_turn_ids(state, expected, TARGET))
+
+    def test_reconcile_unknown_skips_only_known_empty_input_activity(self) -> None:
+        state, expected = self.reconcile_fixture()
+        history = state["turnHistory"]["history"]  # type: ignore[index]
+        history["islands"][0]["entries"].append({"value": "activity"})  # type: ignore[index]
+        history["entitiesByKey"]["activity"] = {
+            "turnId": "01a00000-0000-7000-8000-000000000012",
+            "status": "completed",
+            "params": {"threadId": THREAD},
+            "items": [{"type": "reasoning"}, {"type": "commandExecution"}, {"type": "mcpToolCall"}],
+        }  # type: ignore[index]
+        self.assertEqual(helper_reconciliation._reconcile_turn_ids(state, expected, TARGET), [
+            "01a00000-0000-7000-8000-000000000011",
+        ])
+
+        history["entitiesByKey"]["activity"]["params"]["futureInputShape"] = []  # type: ignore[index]
         self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: helper_reconciliation._reconcile_turn_ids(state, expected, TARGET))
+        history["entitiesByKey"]["activity"]["params"].pop("futureInputShape")  # type: ignore[index]
+        history["entitiesByKey"]["activity"]["params"]["turnTrigger"] = "futureTrigger"  # type: ignore[index]
+        self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: helper_reconciliation._reconcile_turn_ids(state, expected, TARGET))
+        history["entitiesByKey"]["activity"]["params"].pop("turnTrigger")  # type: ignore[index]
+        history["entitiesByKey"]["activity"]["items"] = []  # type: ignore[index]
+        self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: helper_reconciliation._reconcile_turn_ids(state, expected, TARGET))
+
+    def test_reconcile_unknown_skips_bounded_live_resume_steering_shape(self) -> None:
+        delivery_id = "01a00000-0000-7000-8000-000000000200"
+        state, expected = self.reconcile_fixture(version=2, delivery_id=delivery_id)
+        history = state["turnHistory"]["history"]  # type: ignore[index]
+        origin = history["entitiesByKey"]["turn-1"]  # type: ignore[index]
+        history["islands"][0]["entries"].insert(0, {"value": "older"})  # type: ignore[index]
+        history["entitiesByKey"]["older"] = {  # type: ignore[index]
+            "turnId": "01a00000-0000-7000-8000-000000000010",
+            "status": "completed",
+            "params": {"threadId": THREAD, "input": [{"type": "text", "text": "ordinary history", "text_elements": []}]},
+            "items": [{"type": "userMessage", "content": [{"type": "text", "text": "ordinary history", "text_elements": []}]}],
+        }
+        history["islands"][0]["entries"].append({"value": "failed-predecessor"})  # type: ignore[index]
+        history["entitiesByKey"]["failed-predecessor"] = {  # type: ignore[index]
+            "turnId": "01a00000-0000-7000-8000-000000000012",
+            "status": "failed",
+            "params": {"threadId": THREAD, "input": [{"type": "text", "text": "other user input", "text_elements": []}]},
+            "items": [{"type": "userMessage", "content": [{"type": "text", "text": "other user input", "text_elements": []}]}],
+        }
+        fixture = json.loads((Path(__file__).parent / "fixtures" / "desktop-native-resume-steering-shape.json").read_text(encoding="utf-8"))
+        turn = fixture["turn"]
+        history["islands"][0]["entries"].append({"value": "turn-3"})  # type: ignore[index]
+        history["entitiesByKey"]["turn-3"] = turn  # type: ignore[index]
+
+        self.assertEqual(helper_reconciliation._reconcile_turn_ids(state, expected, TARGET), [
+            "01a00000-0000-7000-8000-000000000011",
+        ])
+        benign_nested = copy.deepcopy(state)
+        benign_nested["turnHistory"]["history"]["entitiesByKey"]["turn-3"]["items"][0]["restoreMessage"]["futureField"] = "ordinary metadata"  # type: ignore[index]
+        self.assertEqual(helper_reconciliation._reconcile_turn_ids(benign_nested, expected, TARGET), [
+            "01a00000-0000-7000-8000-000000000011",
+        ])
+
+        incomplete = copy.deepcopy(state)
+        incomplete["turnHistory"]["history"]["islands"][0]["newerBoundary"]["status"] = "loading"  # type: ignore[index]
+        self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: helper_reconciliation._reconcile_turn_ids(incomplete, expected, TARGET))
+
+    def test_reconcile_unknown_rejects_candidate_or_unrecognized_resume_steering(self) -> None:
+        delivery_id = "01a00000-0000-7000-8000-000000000200"
+        for mutation in ("candidate", "candidate_in_unknown_restore_shape", "candidate_in_unknown_restore_key",
+                         "malformed_candidate", "unknown_shape",
+                         "unknown_target", "failed_without_steering"):
+            state, expected = self.reconcile_fixture(version=2, delivery_id=delivery_id)
+            history = state["turnHistory"]["history"]  # type: ignore[index]
+            origin = history["entitiesByKey"]["turn-1"]  # type: ignore[index]
+            origin["status"] = "failed"
+            turn = json.loads((Path(__file__).parent / "fixtures" / "desktop-native-resume-steering-shape.json").read_text(encoding="utf-8"))["turn"]
+            turn["items"][0]["targetTurnId"] = origin["turnId"]
+            if mutation in {"candidate", "candidate_in_unknown_restore_shape"}:
+                wire = origin["params"]["input"][0]["text"]  # type: ignore[index]
+                steering = turn["items"][0]
+                if mutation == "candidate":
+                    steering["input"][0]["text"] = wire
+                    steering["restoreMessage"]["text"] = wire
+                    steering["compareKey"]["rawText"] = wire
+                else:
+                    steering["restoreMessage"]["futureField"] = wire
+            elif mutation == "candidate_in_unknown_restore_key":
+                wire = origin["params"]["input"][0]["text"]  # type: ignore[index]
+                turn["items"][0]["restoreMessage"]["futureObject"] = {wire: "redacted"}
+            elif mutation == "malformed_candidate":
+                turn["items"][0]["input"][0]["text"] = '{"type":"C2C_DESKTOP_TASK"'
+            elif mutation == "unknown_shape":
+                turn["items"][0]["futureField"] = "unknown"
+            elif mutation == "unknown_target":
+                turn["items"][0]["targetTurnId"] = "01a00000-0000-7000-8000-000000000099"
+            else:
+                turn["items"] = [{"type": "agentMessage"}]
+            history["islands"][0]["entries"].append({"value": "turn-2"})  # type: ignore[index]
+            history["entitiesByKey"]["turn-2"] = turn  # type: ignore[index]
+            with self.subTest(mutation=mutation):
+                self.assert_code("DESKTOP_STATE_UNAVAILABLE", lambda: helper_reconciliation._reconcile_turn_ids(state, expected, TARGET))
 
     def test_reconcile_unknown_skips_strict_mirrored_multi_input_composer_turn(self) -> None:
         delivery_id = "01a00000-0000-7000-8000-000000000200"
@@ -442,6 +543,45 @@ class DesktopIpcHelperTests(unittest.TestCase):
         self.assertEqual(result["deliveryId"], expected["deliveryId"])
         self.assertEqual(result["chainTurnIds"], ids)
         self.assertEqual(result["chainSignatures"], ["resume_interrupted_task", "capacity_retry_automatic"])
+
+    def test_pending_receipt_uses_frozen_turn_after_later_composer_turn(self) -> None:
+        state, expected, ids = self.delivery_alias_fixture()
+        history = state["turnHistory"]["history"]
+        terminal = history["entitiesByKey"]["turn-2"]
+        terminal["items"] = [{"id": "terminal-message", "type": "agentMessage"}]
+        marker = helper_result._result_activity_marker(["terminal-message"], ["agentMessage"], ids[-1])
+        history["islands"][0]["entries"].append({"value": "later"})
+        history["entitiesByKey"]["later"] = {
+            "turnId": "01a00000-0000-7000-8000-000000000090", "status": "inProgress",
+            "params": {"threadId": THREAD, "turnTrigger": "composer", "input": []}, "items": [],
+        }
+        state["threadRuntimeStatus"] = {"type": "active"}
+
+        def observe():
+            session = self.ownership_session(state)
+            with patch.object(helper_result, "_prepare", return_value=(session, {})), \
+                    patch.object(helper_result, "_verify_process_identity"):
+                return helper_result._inspect_result_ownership(TARGET, expected, marker_value=marker)
+
+        result = observe()
+        self.assertEqual(result["ownership"]["resultTurnId"], ids[-1])
+        self.assertEqual(result["ownership"]["chainTurnIds"], ids)
+        self.assertEqual(result["fence"], "safe_terminal")
+        terminal["items"].append({"id": "late-tool", "type": "commandExecution"})
+        self.assertEqual(observe()["fence"], "post_record_activity")
+        terminal["items"].pop()
+        for trigger in ["resume_interrupted_task", "capacity_retry_automatic", "futureTrigger"]:
+            history["entitiesByKey"]["later"]["params"]["turnTrigger"] = trigger
+            self.assert_code("DESKTOP_STATE_UNAVAILABLE", observe)
+        history["entitiesByKey"]["later"]["params"]["turnTrigger"] = "composer"
+        expected["messageSha256"] = "0" * 64
+        self.assert_code("DESKTOP_STATE_UNAVAILABLE", observe)
+        expected["messageSha256"] = self.delivery_alias_fixture()[1]["messageSha256"]
+        marker["itemSha256"] = "0" * 64
+        self.assertEqual(observe()["fence"], "unprovable")
+        marker["itemSha256"] = helper_result._result_activity_sha256(marker["itemIds"], marker["itemTypes"])
+        history["islands"][0]["newerBoundary"]["status"] = "loading"
+        self.assert_code("DESKTOP_STATE_UNAVAILABLE", observe)
 
     def test_inspect_result_ownership_uses_explicit_target_without_runner_context(self) -> None:
         state, expected, ids = self.delivery_alias_fixture()
@@ -969,6 +1109,96 @@ class DesktopIpcHelperTests(unittest.TestCase):
                 patch.object(helper_identity.os, "getpid", return_value=123):
             self.assert_code("DESKTOP_CURRENT_CONTEXT_INVALID", lambda: helper_identity._verify_current_runner_ancestor({"appServerPid": 101}))
 
+    def test_process_identity_selects_codex_descendants_and_keeps_fences(self) -> None:
+        server_exe = r"C:\ChatGPT\ChatGPT.exe"
+        codex_exe = r"C:\ChatGPT\codex.exe"
+
+        def verify(rows, *, runner=False, expected=None, pid=500):
+            pipe = SimpleNamespace(server_pid=100, server_exe=server_exe, verify_server=lambda: None)
+            with patch.object(helper_identity, "_processes", return_value=rows), \
+                    patch.object(helper_identity, "_verify_project"):
+                with patch.object(helper_identity.os, "getpid", return_value=pid):
+                    return helper_identity._verify_process_identity(
+                        pipe, TARGET, expected, runner)
+
+        direct = [
+            {"pid": 100, "parentPid": 1, "name": "ChatGPT.exe", "exe": server_exe, "creation": 10},
+            {"pid": 101, "parentPid": 100, "name": "codex.exe", "exe": codex_exe, "creation": 11},
+        ]
+        self.assertEqual(verify(direct)["appServerPid"], 101)
+
+        launcher = [
+            *direct[:1],
+            {"pid": 110, "parentPid": 100, "name": "launcher.exe", "exe": "", "creation": 0},
+            {"pid": 111, "parentPid": 110, "name": "codex.exe", "exe": codex_exe, "creation": 11},
+        ]
+        self.assertEqual(verify(launcher)["appServerPid"], 111)
+
+        multiple = [
+            *launcher,
+            {"pid": 121, "parentPid": 100, "name": "codex.exe", "exe": codex_exe, "creation": 12},
+            {"pid": 500, "parentPid": 111, "name": "helper.exe", "exe": "", "creation": 0},
+        ]
+        self.assertEqual(verify(multiple, runner=True)["appServerPid"], 111)
+        self.assert_code("DESKTOP_PROCESS_CHANGED", lambda: verify(multiple))
+        self.assert_code("DESKTOP_CURRENT_CONTEXT_INVALID", lambda: verify(direct, runner=True))
+
+        outside_tree = [
+            *direct,
+            {"pid": 500, "parentPid": 999, "name": "helper.exe", "exe": "", "creation": 0},
+        ]
+        self.assert_code("DESKTOP_CURRENT_CONTEXT_INVALID", lambda: verify(outside_tree, runner=True))
+
+        other_tree = [
+            *direct,
+            {"pid": 200, "parentPid": 1, "name": "ChatGPT.exe", "exe": r"C:\Other\ChatGPT.exe", "creation": 20},
+            {"pid": 201, "parentPid": 200, "name": "codex.exe", "exe": r"C:\Other\codex.exe", "creation": 21},
+            {"pid": 500, "parentPid": 201, "name": "helper.exe", "exe": "", "creation": 0},
+        ]
+        self.assert_code("DESKTOP_CURRENT_CONTEXT_INVALID", lambda: verify(other_tree, runner=True))
+
+        expected = verify(direct)
+        with_extra = [
+            *direct,
+            {"pid": 121, "parentPid": 100, "name": "codex.exe", "exe": codex_exe, "creation": 12},
+        ]
+        self.assertEqual(verify(with_extra, expected=expected)["appServerPid"], 101)
+        restarted = [
+            direct[0],
+            {"pid": 101, "parentPid": 100, "name": "codex.exe", "exe": codex_exe, "creation": 12},
+        ]
+        self.assert_code("DESKTOP_PROCESS_CHANGED", lambda: verify(restarted, expected=expected))
+        replaced = [
+            direct[0],
+            {"pid": 102, "parentPid": 100, "name": "codex.exe", "exe": codex_exe, "creation": 12},
+        ]
+        self.assert_code("DESKTOP_PROCESS_CHANGED", lambda: verify(replaced, expected=expected))
+        desktop_drift = [
+            {"pid": 100, "parentPid": 1, "name": "ChatGPT.exe", "exe": r"C:\ChatGPT\ChatGPT-new.exe", "creation": 10},
+            direct[1],
+        ]
+        self.assert_code("DESKTOP_PROCESS_CHANGED", lambda: verify(desktop_drift, expected=expected))
+        desktop_restart = [
+            {"pid": 100, "parentPid": 1, "name": "ChatGPT.exe", "exe": server_exe, "creation": 12},
+            direct[1],
+        ]
+        self.assert_code("DESKTOP_PROCESS_CHANGED", lambda: verify(desktop_restart, expected=expected))
+
+    def test_runtime_fence_wire_encoding_is_lossless_and_strict(self) -> None:
+        internal = {"desktopPid": 100, "desktopExe": r"C:\ChatGPT\ChatGPT.exe", "desktopCreation": (1 << 64) - 1,
+                    "appServerPid": 101, "appServerExe": r"C:\ChatGPT\codex.exe", "appServerCreation": 11}
+        wire = helper_identity._encode_runtime_fence(internal)
+        self.assertEqual(wire["desktopCreation"], "18446744073709551615")
+        self.assertEqual(helper_identity._decode_runtime_fence(wire), internal)
+        for invalid in (
+            {**wire, "desktopCreation": 11}, {**wire, "desktopCreation": "0"},
+            {**wire, "desktopCreation": "01"}, {**wire, "appServerCreation": "1.0"},
+            {**wire, "desktopPid": True}, {**wire, "extra": 1},
+        ):
+            with self.subTest(invalid=invalid):
+                self.assert_code("DESKTOP_INVALID_REQUEST", lambda invalid=invalid:
+                                  helper_identity._decode_runtime_fence(invalid))
+
     def test_current_confirm_cancel_and_identity_change_never_send(self) -> None:
         info = {**TARGET, "title": "当前会话", "cwd": TARGET["workspaceRoot"], "runtimeStatus": "active"}
         runtime = {"desktopPid": 100, "appServerPid": 101}
@@ -990,6 +1220,13 @@ class DesktopIpcHelperTests(unittest.TestCase):
             self.assertEqual(helper_operations._current_confirm(TARGET["workspaceRoot"]), info)
             self.assertEqual(checked.call_count, 2)
             confirm.assert_called_once_with(info)
+
+        first = {**info, "runtimeFence": {"desktopPid": 100, "desktopExe": "ChatGPT.exe", "desktopCreation": "10",
+                                           "appServerPid": 101, "appServerExe": "codex.exe", "appServerCreation": "11"}}
+        second = {**first, "runtimeFence": {**first["runtimeFence"], "appServerCreation": "12"}}
+        with patch.object(helper_operations, "_current_identity_checked", side_effect=[first, second]), \
+                patch.object(helper_operations, "_show_confirmation", return_value=True):
+            self.assert_code("DESKTOP_PROCESS_CHANGED", lambda: helper_operations._current_confirm(TARGET["workspaceRoot"]))
 
     def test_current_identity_failure_is_before_confirmation_and_main_rejects_remote_text(self) -> None:
         failure = helper_common._error("DESKTOP_STATE_UNAVAILABLE")
@@ -1082,7 +1319,9 @@ class DesktopIpcHelperTests(unittest.TestCase):
                 pass
 
         requests = [
-            {"id": "01a00000-0000-7000-8000-000000000020", "op": "prepare", "target": TARGET},
+            {"id": "01a00000-0000-7000-8000-000000000020", "op": "prepare", "target": TARGET,
+             "runtimeFence": {"desktopPid": 100, "desktopExe": "ChatGPT.exe", "desktopCreation": "10",
+                              "appServerPid": 101, "appServerExe": "codex.exe", "appServerCreation": "11"}},
             {"id": "01a00000-0000-7000-8000-000000000021", "op": "send", "message": "执行中文计划"},
         ]
         class Stream:

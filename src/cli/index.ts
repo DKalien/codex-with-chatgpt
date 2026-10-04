@@ -1,3 +1,4 @@
+import { registerOperationsCommands } from "./operations.js";
 import { Command } from "commander";
 import { PRODUCT_NAME, VERSION } from "../version.js";
 import { cross } from "./shared.js";
@@ -19,6 +20,8 @@ import { registerSessionCommands, registerPreferencesCommands } from "./session.
 import { registerRecordCommand } from "./record.js";
 import { registerTunnelCommands } from "./tunnel.js";
 import { registerExecutorCommands } from "./executor.js";
+import { registerCleanupCommands } from "./cleanup.js";
+import { registerSupervisorCommands } from "./supervisor.js";
 
 const program = new Command();
 registerWebControlCommands(program);
@@ -28,6 +31,9 @@ registerFeedbackControlRepairCommand(program);
 registerRemoteCommands(program);
 registerDesktopCommands(program);
 registerExecutorCommands(program);
+registerCleanupCommands(program);
+registerSupervisorCommands(program);
+registerOperationsCommands(program);
 registerWorkflowCommands(program);
 registerRuntimePruneCommands(program);
 registerFeedbackProbeCommands(program);

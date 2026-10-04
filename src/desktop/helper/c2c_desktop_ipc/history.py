@@ -95,7 +95,9 @@ _NATIVE_CONTINUATION_PREDECESSOR_STATUSES = {
 }
 
 
-def _native_successor(turn: dict[str, Any], target: dict[str, str]) -> str:
+def _native_successor(
+    turn: dict[str, Any], target: dict[str, str], *, allow_steering_user_messages: bool = False,
+) -> str:
     params = turn.get("params")
     items = turn.get("items")
     if not isinstance(params, dict) or not isinstance(items, list):
@@ -109,23 +111,34 @@ def _native_successor(turn: dict[str, Any], target: dict[str, str]) -> str:
         raise _error("DESKTOP_TARGET_NOT_FOUND")
     if any(not isinstance(item, dict) for item in items):
         raise _error("DESKTOP_STATE_UNAVAILABLE")
-    if any(item.get("type") == "userMessage" for item in items):
+    if any(item.get("type") == "userMessage" or
+           (item.get("type") == "steeringUserMessage" and not allow_steering_user_messages)
+           for item in items):
         raise _error("DESKTOP_STATE_UNAVAILABLE")
     return trigger
 
 
 def _native_continuation_edge(
     predecessor: dict[str, Any], successor: dict[str, Any], target: dict[str, str], *, strict_items: bool = False,
+    allow_steering_user_messages: bool = False, allow_failed_resume: bool = False,
 ) -> str:
     if strict_items:
         items = successor.get("items")
+        allowed_types = RESULT_ACTIVITY_ITEM_TYPES | {"toolResult"}
+        if allow_steering_user_messages:
+            allowed_types |= {"steeringUserMessage", "steered"}
         if (not isinstance(items, list) or any(
                 not isinstance(item, dict)
-                or item.get("type") not in RESULT_ACTIVITY_ITEM_TYPES | {"toolResult"}
+                or not isinstance(item.get("type"), str)
+                or item.get("type") not in allowed_types
                 for item in items)):
             raise _error("DESKTOP_STATE_UNAVAILABLE")
-    trigger = _native_successor(successor, target)
-    if predecessor.get("status") not in _NATIVE_CONTINUATION_PREDECESSOR_STATUSES[trigger]:
+    trigger = _native_successor(
+        successor, target, allow_steering_user_messages=allow_steering_user_messages,
+    )
+    predecessor_status = predecessor.get("status")
+    if (predecessor_status not in _NATIVE_CONTINUATION_PREDECESSOR_STATUSES[trigger]
+            and not (allow_failed_resume and trigger == "resume_interrupted_task" and predecessor_status == "failed")):
         raise _error("DESKTOP_STATE_UNAVAILABLE")
     return trigger
 

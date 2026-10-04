@@ -36,6 +36,7 @@ import {
   BINDING_THREAD,
   BINDING_PROJECT,
   BINDING_ID,
+  RUNTIME_FENCE,
   root,
   baseInput,
   saveProjectChat,
@@ -47,7 +48,7 @@ describe("G1a Desktop error projection (collector + structured codes)", () => {
   function mockIdentity(result: unknown): void {
     vi.spyOn(desktopIpc, "currentIdentity").mockImplementation(async () => {
       if (result instanceof Error) throw result;
-      return result as never;
+      return { ...(result as Record<string, unknown>), runtimeFence: RUNTIME_FENCE } as never;
     });
   }
   function mockInspect(result: unknown): void {
@@ -147,6 +148,7 @@ describe("G1a zero-write session/desktop/remote", () => {
       hostId: "local",
       projectId: BINDING_PROJECT,
       title: "t",
+      runtimeFence: RUNTIME_FENCE,
     } as never);
   }
   function mockInspectOk(): void {

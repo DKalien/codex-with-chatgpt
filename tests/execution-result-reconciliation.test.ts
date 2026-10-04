@@ -30,6 +30,14 @@ const MESSAGE = "execute R4b";
 const DIGEST = "a".repeat(64);
 const TURN_2 = "01a00000-0000-7000-8000-000000000107";
 const BINDING_2 = "01a00000-0000-7000-8000-000000000108";
+const runtimeFence = {
+  desktopPid: 1001,
+  desktopExe: "C:\\Program Files\\ChatGPT\\ChatGPT.exe",
+  desktopCreation: "1000001",
+  appServerPid: 1002,
+  appServerExe: "C:\\Program Files\\ChatGPT\\codex.exe",
+  appServerCreation: "1000002",
+};
 
 let stateDir: string;
 let root: string;
@@ -234,7 +242,7 @@ beforeEach(() => {
   executorRouteId = executor.routeId;
   updateDesktop(workspace.id, () => ({
     state: {
-      version: 1, workspaceId: workspace.id, workspaceRoot: root, enabled: true,
+      version: 1, workspaceId: workspace.id, workspaceRoot: root, enabled: true, runtimeFence,
       binding: {
         bindingId: BINDING, threadId: THREAD, hostId: "local", projectId: "project-r4b",
         title: "R4b", boundAt: new Date().toISOString(),

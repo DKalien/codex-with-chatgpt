@@ -152,7 +152,8 @@ export async function collectDesktopFacts(
           hostId: binding.hostId,
           projectId: binding.projectId,
         });
-        await desktopIpc.inspect({ ...target, workspaceRoot: workspace.root });
+        if (!state?.runtimeFence) throw new DesktopError("DESKTOP_RUNTIME_FENCE_MISSING", "Desktop 绑定缺少运行时身份 fence；请重新绑定当前 Desktop 会话。");
+        await desktopIpc.inspect({ ...target, workspaceRoot: workspace.root }, state.runtimeFence);
         bindingAvailability = "available";
       } catch (error) {
         const code = desktopErrorCode(error);

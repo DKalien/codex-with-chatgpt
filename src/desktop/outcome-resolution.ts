@@ -10,6 +10,7 @@ import { readLegacyReconciliations } from "./legacy-reconciliation.js";
 import { withEvidenceLock } from "./recovery-evidence.js";
 import { readLegacyRetirements } from "./legacy-retirement.js";
 import { DesktopError, desktopId, readDesktop, type DesktopDelivery, type DesktopState } from "./store.js";
+import { withCommandOperation } from "../command-cleanup/fence.js";
 
 const uuid = z.string().uuid();
 const sha256 = z.string().regex(/^[a-f0-9]{64}$/);
@@ -87,26 +88,26 @@ function workspaceOf(raw: OutcomeResolutionWorkspace): OutcomeResolutionWorkspac
   catch { return invalid("workspaceId 无效；拒绝行政 resolution。"); }
 }
 
-function resolutionFile(workspaceId: string): string {
-  return path.join(getStateDir(), "desktop-outcome-resolution", `${desktopId.parse(workspaceId)}.json`);
+function resolutionFile(workspaceId: string, stateDir = getStateDir()): string {
+  return path.join(path.resolve(stateDir), "desktop-outcome-resolution", `${desktopId.parse(workspaceId)}.json`);
 }
-export function outcomeResolutionFile(workspaceId: string): string { return resolutionFile(workspaceId); }
-function markerFile(workspaceId: string): string { return `${resolutionFile(workspaceId)}.initialized`; }
-function hasTemp(workspaceId: string): boolean {
-  const file = resolutionFile(workspaceId);
+export function outcomeResolutionFile(workspaceId: string, stateDir = getStateDir()): string { return resolutionFile(workspaceId, stateDir); }
+function markerFile(workspaceId: string, stateDir = getStateDir()): string { return `${resolutionFile(workspaceId, stateDir)}.initialized`; }
+function hasTemp(workspaceId: string, stateDir = getStateDir()): boolean {
+  const file = resolutionFile(workspaceId, stateDir);
   try {
-    return fs.readdirSync(path.dirname(file)).some(name => name.startsWith(`${path.basename(file)}.`) && name.endsWith(".tmp"));
+      return fs.readdirSync(path.dirname(file)).some(name => name.startsWith(`${path.basename(file)}.`) && name.endsWith(".tmp"));
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
     return corrupt("行政 resolution 目录无法读取；拒绝继续。");
   }
 }
 
-function readState(workspaceId: string): ResolutionState {
-  const file = resolutionFile(workspaceId);
-  if (hasTemp(workspaceId)) return corrupt("行政 resolution 含未完成临时文件；拒绝继续。");
+function readState(workspaceId: string, stateDir = getStateDir()): ResolutionState {
+  const file = resolutionFile(workspaceId, stateDir);
+  if (hasTemp(workspaceId, stateDir)) return corrupt("行政 resolution 含未完成临时文件；拒绝继续。");
   const exists = fs.existsSync(file);
-  const marker = fs.existsSync(markerFile(workspaceId));
+  const marker = fs.existsSync(markerFile(workspaceId, stateDir));
   if (!exists) {
     if (marker) return corrupt("行政 resolution 主文件缺失；拒绝重置证据。");
     return { version: 1, workspaceId, entries: [] };
@@ -120,9 +121,9 @@ function readState(workspaceId: string): ResolutionState {
   return state.data;
 }
 
-function writeState(workspaceId: string, state: ResolutionState): void {
-  const file = resolutionFile(workspaceId);
-  const marker = markerFile(workspaceId);
+function writeState(workspaceId: string, state: ResolutionState, stateDir = getStateDir()): void {
+  const file = resolutionFile(workspaceId, stateDir);
+  const marker = markerFile(workspaceId, stateDir);
   const temporary = `${file}.${randomUUID()}.tmp`;
   let fd: number | undefined;
   let prepared = false;
@@ -236,17 +237,23 @@ function parseConfirmation(value: string): string {
   catch { throw new OutcomeResolutionError("DESKTOP_OUTCOME_RESOLUTION_CONFIRMATION_INVALID", "confirmation 摘要必须是 64 位小写十六进制值。"); }
 }
 
-export function readOutcomeResolutions(workspaceId: string): OutcomeResolutionEntry[] {
-  try { return readState(desktopId.parse(workspaceId)).entries; }
+export function readOutcomeResolutions(workspaceId: string, stateDir = getStateDir()): OutcomeResolutionEntry[] {
+  try { return readState(desktopId.parse(workspaceId), stateDir).entries; }
   catch (error) { if (error instanceof OutcomeResolutionError) throw error; return corrupt("行政 resolution 证据无法安全读取；拒绝继续。"); }
 }
 
 /** reconciliation 不能把已有的独立行政决定改写成 accepted。 */
-export function assertNoOutcomeResolutionForCommand(workspaceId: string, commandId: string): void {
-  const entries = readOutcomeResolutions(workspaceId);
+export function assertNoOutcomeResolutionForCommand(workspaceId: string, commandId: string, stateDir = getStateDir()): void {
+  const entries = readOutcomeResolutions(workspaceId, stateDir);
   if (entries.some(entry => entry.commandId === commandId)) {
     throw new OutcomeResolutionError("DESKTOP_OUTCOME_RESOLUTION_CONFLICT", "该 commandId 已有行政 resolution；不得再通过 Desktop reconciliation 改写原 delivery。");
   }
+}
+
+export function removeOutcomeResolutionForCommand(workspaceId: string, commandId: string, stateDir = getStateDir()): void {
+  const state = readState(desktopId.parse(workspaceId), stateDir);
+  if (!state.entries.some(entry => entry.commandId === commandId)) return;
+  writeState(workspaceId, { ...state, entries: state.entries.filter(entry => entry.commandId !== commandId) }, stateDir);
 }
 
 export function previewOutcomeResolution(workspaceRaw: OutcomeResolutionWorkspace, commandIdRaw: string): OutcomeResolutionPreview {
@@ -264,6 +271,16 @@ export function resolveOutcomeUnknown(
   confirmationRaw: string,
 ): OutcomeResolutionResult {
   const workspace = workspaceOf(workspaceRaw);
+  const commandId = desktopId.parse(commandIdRaw);
+  return withCommandOperation(workspace.id, commandId,
+    () => resolveOutcomeUnknownLocked(workspace, commandId, confirmationRaw));
+}
+
+function resolveOutcomeUnknownLocked(
+  workspace: OutcomeResolutionWorkspace,
+  commandIdRaw: string,
+  confirmationRaw: string,
+): OutcomeResolutionResult {
   const confirmationSha256 = parseConfirmation(confirmationRaw);
   const initial = readState(workspace.id);
   const initialFacts = facts(workspace, commandIdRaw, initial);
@@ -319,7 +336,7 @@ export function unresolvedOutcomeUnknownCommandIds(workspaceRaw: OutcomeResoluti
   const desktop = readDesktop(workspace.id);
   if (state !== undefined) {
     const emptyState = { version: 1 as const, workspaceId: workspace.id, workspaceRoot: workspace.root,
-      enabled: false, binding: null, deliveries: [] };
+      enabled: false, binding: null, runtimeFence: null, deliveries: [] };
     const matchesDisk = state === null && desktop === null ||
       state !== null && desktop !== null && JSON.stringify(state) === JSON.stringify(desktop) ||
       state !== null && desktop === null && JSON.stringify(state) === JSON.stringify(emptyState);

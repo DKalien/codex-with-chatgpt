@@ -19,9 +19,17 @@ export const sendInput = z.object({
 }).strict();
 export const statusInput = z.object({ workspaceId: desktopId, commandId: desktopId.optional() }).strict();
 export const targetInput = z.object({ threadId: z.string().uuid(), hostId: z.literal("local"), projectId: desktopId }).strict();
+const decimalCreation = z.string().regex(/^[1-9][0-9]*$/).refine(value => BigInt(value) <= 18446744073709551615n);
+const runtimeFenceSchema = z.object({
+  desktopPid: z.number().int().positive().max(0xffffffff), desktopExe: z.string().min(1).refine(value => !value.includes("\0")),
+  desktopCreation: decimalCreation, appServerPid: z.number().int().positive().max(0xffffffff),
+  appServerExe: z.string().min(1).refine(value => !value.includes("\0")), appServerCreation: decimalCreation,
+}).strict();
 const bindingSchema = targetInput.extend({ bindingId: z.string().uuid(), title: z.string().min(1).max(300), boundAt: z.string().datetime() }).strict();
 const deliverySchema = z.object({
   commandId: desktopId, deliveryId: z.string().uuid().optional(), clientId: z.string().min(1).max(256), bindingId: z.string().uuid(),
+  // 缺失的 lifecycle 表示历史记录；不回填或推断新生命周期。
+  lifecycle: z.literal("ephemeral").optional(),
   // 兼容旧记录：缺失表示历史未记录意图，不回填、不推断确认或授权。
   intent: desktopIntent.optional(),
   messageSha256: z.string().regex(/^[a-f0-9]{64}$/), messageBytes: z.number().int().positive().max(MAX_MESSAGE_BYTES),
@@ -39,7 +47,7 @@ const deliverySchema = z.object({
 const stateSchema = z.object({
   version: z.literal(1), workspaceId: desktopId, workspaceRoot: z.string().min(1),
   revision: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
-  enabled: z.boolean(), binding: bindingSchema.nullable(), deliveries: z.array(deliverySchema).max(10000),
+  enabled: z.boolean(), binding: bindingSchema.nullable(), runtimeFence: runtimeFenceSchema.nullable().optional(), deliveries: z.array(deliverySchema).max(10000),
 }).strict().superRefine((state, ctx) => {
   if ((state.enabled && !state.binding) || new Set(state.deliveries.map(item => item.commandId)).size !== state.deliveries.length)
     ctx.addIssue({ code: z.ZodIssueCode.custom, message: "绑定或投递 ID 历史不一致" });
@@ -47,15 +55,16 @@ const stateSchema = z.object({
 export type DesktopState = z.infer<typeof stateSchema>;
 export type DesktopBinding = z.infer<typeof bindingSchema>;
 export type DesktopDelivery = z.infer<typeof deliverySchema>;
+export type DesktopRuntimeFenceState = z.infer<typeof runtimeFenceSchema>;
 
-export function desktopFile(workspaceId: string): string {
-  return path.join(getStateDir(), "desktop-control", `${desktopId.parse(workspaceId)}.json`);
+export function desktopFile(workspaceId: string, stateDir = getStateDir()): string {
+  return path.join(path.resolve(stateDir), "desktop-control", `${desktopId.parse(workspaceId)}.json`);
 }
 function corrupt(): DesktopError {
   return new DesktopError("DESKTOP_STATE_CORRUPT", "Desktop 状态损坏或已初始化的历史缺失；保留文件并人工核对，不能重置投递 ID。");
 }
-export function readDesktop(workspaceId: string): DesktopState | null {
-  const file = desktopFile(workspaceId);
+export function readDesktop(workspaceId: string, stateDir = getStateDir()): DesktopState | null {
+  const file = desktopFile(workspaceId, stateDir);
   try {
     const state = stateSchema.parse(JSON.parse(fs.readFileSync(file, "utf8")));
     if (state.workspaceId !== workspaceId) throw corrupt();
@@ -66,9 +75,17 @@ export function readDesktop(workspaceId: string): DesktopState | null {
   }
 }
 
+export function requireDesktopRuntimeFence(workspaceId: string, workspaceRoot: string, stateDir = getStateDir()): DesktopRuntimeFenceState {
+  const state = readDesktop(workspaceId, stateDir);
+  if (!state || state.workspaceRoot !== workspaceRoot || !state.runtimeFence) {
+    throw new DesktopError("DESKTOP_RUNTIME_FENCE_MISSING", "Desktop 绑定缺少运行时身份 fence；请重新绑定当前 Desktop 会话。");
+  }
+  return state.runtimeFence;
+}
+
 // ponytail: 每工作区短文件锁和最多一万条永久 ID；容量达到上限后人工迁移，绝不淘汰防重放历史。
-export function updateDesktop<T>(workspaceId: string, change: (state: DesktopState | null) => { state: DesktopState; result: T }): T {
-  const file = desktopFile(workspaceId);
+export function updateDesktop<T>(workspaceId: string, change: (state: DesktopState | null) => { state: DesktopState; result: T }, stateDir = getStateDir()): T {
+  const file = desktopFile(workspaceId, stateDir);
   ensureDir(path.dirname(file));
   let lock: number;
   try { lock = fs.openSync(`${file}.lock`, "wx", 0o600); }
@@ -76,7 +93,7 @@ export function updateDesktop<T>(workspaceId: string, change: (state: DesktopSta
   const temporary = `${file}.${randomUUID()}.tmp`;
   try {
     fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, createdAt: Date.now() })); fs.fsyncSync(lock);
-    const previous = readDesktop(workspaceId);
+    const previous = readDesktop(workspaceId, stateDir);
     const revision = (previous?.revision ?? 0) + 1;
     const next = change(previous);
     const valid = stateSchema.parse({ ...next.state, revision });

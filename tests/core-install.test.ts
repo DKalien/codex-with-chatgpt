@@ -47,6 +47,19 @@ function legacyPointer(state: string, metadata: ReturnType<typeof installCore>) 
 }
 
 describe("immutable installed Core", () => {
+  it.each(["service-worker.js", "popup/popup.js", "manifest.json"])("拒绝发布 ID 后修改的 Companion artifact：%s", file => {
+    const state = machine(), source = checkout();
+    const artifact = write(source.root, `dist/browser-companion/${file}`, "packaged-v1");
+    const id = rebuild(source.root, "A");
+    expect(release.buildId(path.join(source.root, "dist"))).toBe(id);
+    fs.writeFileSync(artifact, "packaged-v2");
+    expect(fs.readFileSync(path.join(source.root, "dist/build-id.txt"), "utf8").trim()).toBe(id);
+    expect(release.buildId(path.join(source.root, "dist"))).not.toBe(id);
+    expect(() => installCore(source.root, id)).toThrow("dist/build-id.txt 与实际 runtime artifact 不一致");
+    expect(fs.existsSync(currentInstallPath(state))).toBe(false);
+    expect(fs.existsSync(path.join(state, "releases"))).toBe(false);
+  });
+
   it("新格式 fast 与实际 launcher 不递归扫描 dist/node_modules；full 默认仍扫描", () => {
     const state = machine(), source = checkout();
     const installed = installCore(source.root, rebuild(source.root, "A"));

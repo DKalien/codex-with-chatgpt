@@ -7,8 +7,9 @@ import * as installModule from "../src/core/install.js";
 import * as buildId from "../src/build-id.js";
 import * as runtimeModule from "../src/bridge/runtime.js";
 import * as daemon from "../src/process/daemon.js";
+import * as finalizer from "../src/core/post-turn-finalizer.js";
 import { desktopIpc } from "../src/desktop/ipc.js";
-import { updateDesktop } from "../src/desktop/store.js";
+import { desktopFile, updateDesktop } from "../src/desktop/store.js";
 import { updateRemote } from "../src/remote/store.js";
 import { writeRuntimeState, type RuntimeState } from "../src/bridge/runtime.js";
 import { writeTunnelState } from "../src/tunnel/state.js";
@@ -23,12 +24,21 @@ import { listDesktopHistory } from "../src/desktop/history.js";
 import { SERVICE_NAME, VERSION } from "../src/version.js";
 import { Workspace } from "../src/workspace/manager.js";
 import { cleanup, makeTmpDir, write } from "./helpers.js";
+import { confirmCommandCleanup, previewCommandCleanup } from "../src/command-cleanup/service.js";
 
 const targetBuildId = "a".repeat(64);
 const oldBuildId = "b".repeat(64);
 const threadId = "01a00000-0000-7000-8000-000000000001";
 const historicalThreadId = "01a00000-0000-7000-8000-000000000002";
 const reboundCommandId = "rebound-command";
+const runtimeFence = {
+  desktopPid: 1001,
+  desktopExe: "C:\\Program Files\\ChatGPT\\ChatGPT.exe",
+  desktopCreation: "1000001",
+  appServerPid: 1002,
+  appServerExe: "C:\\Program Files\\ChatGPT\\codex.exe",
+  appServerCreation: "1000002",
+};
 let stateDir: string;
 const roots: string[] = [];
 const contexts = new Map<string, Context>();
@@ -76,6 +86,7 @@ beforeEach(() => {
       status: "ok",
       pid: context.runtime.pid,
       startedAt: context.runtime.startedAt,
+      runtimeBuildId: context.runtime.runtimeBuildId,
     } : {}), { status: context ? 200 : 404, headers: { "content-type": "application/json" } });
   }));
   vi.spyOn(installModule, "readCurrentInstall").mockReturnValue({
@@ -89,6 +100,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.unstubAllGlobals();
   vi.unstubAllEnvs();
   vi.restoreAllMocks();
@@ -161,6 +173,7 @@ function seedDesktop(context: Context, status: "active" | "awaiting_approval" | 
       workspaceId: context.workspace.id,
       workspaceRoot: context.workspace.root,
       enabled: false,
+      runtimeFence,
       binding: {
         threadId,
         hostId: "local" as const,
@@ -247,6 +260,7 @@ function seedDesktopRebound(context: Context, deliveryAt = new Date().toISOStrin
       workspaceId: context.workspace.id,
       workspaceRoot: context.workspace.root,
       enabled: false,
+      runtimeFence,
       binding: {
         threadId,
         hostId: "local" as const,
@@ -413,18 +427,96 @@ describe("core rollout", () => {
     expect(summary.counts).toMatchObject({ current: 1, stopped: 1, upgraded: 1 });
     expect(vi.mocked(daemon.restartBridge)).toHaveBeenCalledTimes(1);
     expect(vi.mocked(daemon.restartBridge).mock.calls[0][1]).toMatchObject({ tunnel: true, expectedRuntime });
+    expect(fetch).toHaveBeenCalledTimes(3); // one exact response per phase
+  });
+
+  it.each(["network", "timeout"])("named %s retry succeeds before restart is allowed", async kind => {
+    vi.useFakeTimers();
+    const context = addContext("named-retry"); makeAfter(context);
+    vi.mocked(fetch).mockImplementationOnce(async (_url, init) => {
+      expect(daemon.restartBridge).not.toHaveBeenCalled();
+      if (kind === "network") throw new Error("private error text");
+      return new Promise<never>((_resolve, reject) => init!.signal!.addEventListener("abort", () => reject(new Error("timeout")), { once: true }));
+    });
+    const pending = rollout();
+    await vi.advanceTimersByTimeAsync(kind === "timeout" ? 5000 : 0);
+    expect(daemon.restartBridge).not.toHaveBeenCalled();
+    await vi.runAllTimersAsync();
+    expect(resultFor(await pending, context.workspace.id)).toMatchObject({ status: "upgraded" });
+    expect(fetch).toHaveBeenCalledTimes(4);
+    expect(daemon.restartBridge).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each(["preflight", "pre_shutdown"] as const)("failed named %s preserves runtime/tunnel/business bytes and exposes bounded phase", async phase => {
+    vi.useFakeTimers();
+    const context = addContext("named-failed"); makeAfter(context);
+    seedDesktop(context, "active"); seedSession(context, "named-failed");
+    const old = context.runtime;
+    const before = new Map(fs.readdirSync(stateDir, { recursive: true }).filter((name): name is string =>
+      typeof name === "string" && fs.statSync(path.join(stateDir, name)).isFile())
+      .map(name => [name, fs.readFileSync(path.join(stateDir, name))]));
+    const success = vi.mocked(fetch).getMockImplementation()!;
+    vi.mocked(fetch).mockRejectedValue(new Error("secret transport error"));
+    if (phase === "pre_shutdown") vi.mocked(fetch).mockImplementationOnce(success);
+    const pending = rollout(); await vi.runAllTimersAsync();
+    const result = resultFor(await pending, context.workspace.id);
+    expect(result).toMatchObject({ status: "pending", reason: "named_unhealthy",
+      namedHealth: { phase, failure: "network", attempts: 3 } });
+    expect(JSON.stringify(result)).not.toContain("secret");
+    expect(fetch).toHaveBeenCalledTimes(phase === "preflight" ? 3 : 4);
+    expect(daemon.restartBridge).toHaveBeenCalledTimes(phase === "preflight" ? 0 : 1);
+    expect(context.runtime).toBe(old); // beforeShutdown rejected before the mock's stop/start
+    for (const [name, bytes] of before) expect(fs.readFileSync(path.join(stateDir, name)), name).toEqual(bytes);
+    const added = fs.readdirSync(stateDir, { recursive: true }).filter((name): name is string =>
+      typeof name === "string" && fs.statSync(path.join(stateDir, name)).isFile() && !before.has(name));
+    expect(added).toEqual([path.relative(stateDir, pendingFile(context.workspace.id))]);
+    expect(readPending(context.workspace)).toMatchObject({ reason: "named_unhealthy" });
+    expect(readPending(context.workspace)).not.toHaveProperty("namedHealth");
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each([
+    ["service", "foreign", "wrong_service"], ["workspaceId", "foreign", "workspace_mismatch"],
+    ["pid", 42, "pid_mismatch"], ["startedAt", "2020-01-01T00:00:00.000Z", "started_at_mismatch"],
+    ["runtimeBuildId", "c".repeat(64), "build_mismatch"],
+  ])("named preflight mismatching %s does not restart", async (field, value, failure) => {
+    const context = addContext("named-mismatch"); makeAfter(context);
+    vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({ ...context.info, status: "ok", [field]: value })));
+    expect(resultFor(await rollout(), context.workspace.id)).toMatchObject({ status: "pending", reason: "named_unhealthy",
+      namedHealth: { phase: "preflight", failure, attempts: 1 } });
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(daemon.restartBridge).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])("postcheck exact old runtime converges=%s, never falsely reports upgraded", async converges => {
+    vi.useFakeTimers();
+    const context = addContext("edge-old"); makeAfter(context);
+    const oldHealth = { ...context.info, status: "ok" };
+    const success = vi.mocked(fetch).getMockImplementation()!;
+    vi.mocked(fetch).mockImplementation(async () => new Response(JSON.stringify(oldHealth)));
+    vi.mocked(fetch).mockImplementationOnce(success).mockImplementationOnce(success);
+    if (converges) vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify(oldHealth))).mockImplementationOnce(success);
+    const pending = rollout(); await vi.runAllTimersAsync();
+    const result = resultFor(await pending, context.workspace.id);
+    expect(result).toMatchObject(converges ? { status: "upgraded" } : { status: "pending", reason: "named_unhealthy",
+      namedHealth: { phase: "postcheck", failure: "stale_runtime", attempts: 3 } });
+    expect(fetch).toHaveBeenCalledTimes(converges ? 4 : 5);
+    expect(daemon.restartBridge).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it.each([
     ["quick", "skipped_quick", "quick"],
     ["pairing", "pending_busy", "pairing_active"],
-    ["busy", "pending_busy", "busy"],
-    ["approval", "pending_busy", "approval_pending"],
+    ["busy", "upgraded", undefined],
+    ["approval", "upgraded", undefined],
     ["unresolved", "pending", "desktop_unresolved"],
     ["remote", "pending", "remote_active"],
     ["unknown", "pending", "runtime_unknown"],
-  ] as const)("%s gate 不重启并保留 pending", async (name, expectedStatus, expectedReason) => {
+  ] as const)("%s gate 保留安全边界并按生命周期语义处理", async (name, expectedStatus, expectedReason) => {
     const context = addContext(name);
+    if (expectedStatus === "upgraded") makeAfter(context);
     if (name === "quick") {
       writeTunnelState({ workspaceId: context.workspace.id, preference: "quick", provider: "cloudflare-quick" });
       context.info.tunnel = { running: true, url: context.host, provider: "cloudflare-quick" };
@@ -444,20 +536,57 @@ describe("core rollout", () => {
     }
 
     const summary = await rollout();
-    expect(resultFor(summary, context.workspace.id)).toMatchObject({ status: expectedStatus, reason: expectedReason });
-    expect(vi.mocked(daemon.restartBridge)).not.toHaveBeenCalled();
+    const item = resultFor(summary, context.workspace.id);
+    expect(item.status).toBe(expectedStatus);
+    if (expectedReason) expect(item.reason).toBe(expectedReason);
+    else expect(item.reason).toBeUndefined();
+    expect(vi.mocked(daemon.restartBridge)).toHaveBeenCalledTimes(expectedStatus === "upgraded" ? 1 : 0);
+    if (expectedStatus === "upgraded") {
+      expect(fs.existsSync(path.join(stateDir, "post-turn-finalizers", `${context.workspace.id}.json`))).toBe(false);
+    }
   });
 
-  it("当前 CODEX caller workspace 保守跳过且不重启", async () => {
+  it("当前 CODEX caller workspace 不再阻断 Bridge rollout", async () => {
     const context = addContext("caller");
+    makeAfter(context);
     vi.spyOn(process, "cwd").mockReturnValue(context.workspace.root);
     vi.stubEnv("CODEX_THREAD_ID", threadId);
+    const inspect = vi.mocked(desktopIpc.inspect);
+    const currentExecution = vi.spyOn(desktopIpc, "currentExecution");
     const summary = await rollout();
-    expect(resultFor(summary, context.workspace.id)).toMatchObject({ status: "pending_busy", reason: "busy" });
-    expect(vi.mocked(daemon.restartBridge)).not.toHaveBeenCalled();
+    expect(resultFor(summary, context.workspace.id)).toMatchObject({ status: "upgraded" });
+    expect(vi.mocked(daemon.restartBridge)).toHaveBeenCalledTimes(1);
+    expect(inspect).not.toHaveBeenCalled();
+    expect(currentExecution).not.toHaveBeenCalled();
+    expect(fs.existsSync(path.join(stateDir, "post-turn-finalizers", `${context.workspace.id}.json`))).toBe(false);
   });
 
-  it("二次 gate 在关闭前变 busy 时失败安全并保留 pending", async () => {
+  it.each(["active", "inProgress", "DESKTOP_BUSY", "DESKTOP_APPROVAL_PENDING"])(
+    "绑定的当前 self-turn %s 直接升级且不调度或启动 finalizer", async activity => {
+      const context = addContext("self-turn");
+      makeAfter(context);
+      seedDesktop(context, "active");
+      vi.spyOn(process, "cwd").mockReturnValue(context.workspace.root);
+      vi.stubEnv("CODEX_THREAD_ID", threadId);
+      vi.mocked(desktopIpc.inspect).mockImplementation(async target => {
+        if (activity.startsWith("DESKTOP_")) throw Object.assign(new Error("activity"), { code: activity });
+        return { ...target, runtimeStatus: activity } as never;
+      });
+      const currentExecution = vi.spyOn(desktopIpc, "currentExecution");
+
+      const item = resultFor(await rollout(), context.workspace.id);
+
+      expect(item).toMatchObject({ status: "upgraded" });
+      expect(item).not.toHaveProperty("finalizer");
+      expect(daemon.restartBridge).toHaveBeenCalledTimes(1);
+      expect(desktopIpc.inspect).toHaveBeenCalledTimes(2);
+      expect(currentExecution).not.toHaveBeenCalled();
+      expect(finalizer).not.toHaveProperty("schedulePostTurnFinalizer");
+      expect(finalizer).not.toHaveProperty("spawnFinalizerWorker");
+      expect(fs.existsSync(path.join(stateDir, "post-turn-finalizers", `${context.workspace.id}.json`))).toBe(false);
+    });
+
+  it("Desktop 在关闭前变 busy 不再阻断 Bridge rollout", async () => {
     const context = addContext("second-gate");
     makeAfter(context);
     seedDesktop(context, "active");
@@ -472,9 +601,9 @@ describe("core rollout", () => {
       runtimeStatus: inspectCount++ === 0 ? "idle" : "active",
     }));
     const summary = await rollout();
-    expect(resultFor(summary, context.workspace.id)).toMatchObject({ status: "pending_busy", reason: "busy" });
+    expect(resultFor(summary, context.workspace.id)).toMatchObject({ status: "upgraded" });
     expect(vi.mocked(daemon.restartBridge)).toHaveBeenCalledTimes(1);
-    expect(context.runtime.runtimeBuildId).toBe(oldBuildId);
+    expect(context.runtime.runtimeBuildId).toBe(targetBuildId);
   });
 
   it.each(["wrong-build", "wrong-url"] as const)("postverify %s 保留 pending 且不报升级成功", async variant => {
@@ -500,6 +629,24 @@ describe("core rollout", () => {
     const summary = await rollout();
     expect(resultFor(summary, context.workspace.id)).toMatchObject({ status: "pending", reason: "identity_mismatch" });
     expect(vi.mocked(daemon.restartBridge)).not.toHaveBeenCalled();
+  });
+
+  it.each(["missing", "corrupt"])("Desktop 活跃时 runtime fence %s 仍阻断 rollout", async mode => {
+    const context = addContext("runtime-fence");
+    makeAfter(context);
+    seedDesktop(context, "active");
+    const file = desktopFile(context.workspace.id);
+    const state = JSON.parse(fs.readFileSync(file, "utf8"));
+    if (mode === "missing") delete state.runtimeFence;
+    else state.runtimeFence.appServerCreation = "0";
+    fs.writeFileSync(file, JSON.stringify(state));
+    vi.mocked(desktopIpc.inspect).mockClear();
+
+    expect(resultFor(await rollout(), context.workspace.id)).toMatchObject({
+      status: "pending", reason: "desktop_unknown",
+    });
+    expect(desktopIpc.inspect).not.toHaveBeenCalled();
+    expect(daemon.restartBridge).not.toHaveBeenCalled();
   });
 
   it("rollout 不改写 session/auth/endpoint/desktop 业务状态字节", async () => {
@@ -601,9 +748,9 @@ describe("core rollout", () => {
 
   it.each([
     ["DESKTOP_TARGET_NOT_FOUND", "upgraded", undefined], ["idle", "upgraded", undefined],
-    ["active", "pending_busy", "busy"], ["inProgress", "pending_busy", "busy"],
-    ["DESKTOP_BUSY", "pending_busy", "busy"], ["DESKTOP_STATE_UNAVAILABLE", "pending", "desktop_unknown"],
-    ["DESKTOP_APPROVAL_PENDING", "pending", "desktop_unknown"], ["DESKTOP_NO_OWNER", "pending", "desktop_unknown"],
+    ["active", "upgraded", undefined], ["inProgress", "upgraded", undefined],
+    ["DESKTOP_BUSY", "upgraded", undefined], ["DESKTOP_STATE_UNAVAILABLE", "pending", "desktop_unknown"],
+    ["DESKTOP_APPROVAL_PENDING", "upgraded", undefined], ["DESKTOP_NO_OWNER", "pending", "desktop_unknown"],
   ] as const)("retired 旧目标 %s 每次仍检查", async (observation, status, reason) => {
     const context = addContext("desktop-retired");
     makeAfter(context);
@@ -636,17 +783,17 @@ describe("core rollout", () => {
       return { runtimeStatus: observation } as never;
     });
     expect(resultFor(await rollout(), context.workspace.id)).toMatchObject({
-      status: observation === "active" ? "pending_busy" : "pending",
-      reason: observation === "active" ? "busy" : "desktop_unknown",
+      status: observation === "active" ? "upgraded" : "pending",
+      ...(observation === "active" ? {} : { reason: "desktop_unknown" }),
     });
-    expect(daemon.restartBridge).not.toHaveBeenCalled();
+    expect(daemon.restartBridge).toHaveBeenCalledTimes(observation === "active" ? 1 : 0);
   });
 
   it.each([
     ["DESKTOP_NO_OWNER", "upgraded"], ["DESKTOP_TARGET_NOT_FOUND", "upgraded"], ["idle", "upgraded"],
-    ["active", "pending_busy"], ["inProgress", "pending_busy"], ["DESKTOP_BUSY", "pending_busy"],
+    ["active", "upgraded"], ["inProgress", "upgraded"], ["DESKTOP_BUSY", "upgraded"],
     ["DESKTOP_STATE_UNAVAILABLE", "pending"], ["DESKTOP_PROJECT_MISMATCH", "pending"],
-    ["DESKTOP_OWNER_CHANGED", "pending"], ["DESKTOP_APPROVAL_PENDING", "pending"],
+    ["DESKTOP_OWNER_CHANGED", "pending"], ["DESKTOP_APPROVAL_PENDING", "upgraded"],
   ])("ownerless 处置后 rebind 仍实时检查新 binding 与旧 thread %s", async (observation, status) => {
     const context = addContext("ownerless-retired");
     makeAfter(context); seedDesktopRebound(context);
@@ -700,10 +847,10 @@ describe("core rollout", () => {
     });
     const summary = await rollout();
     expect(resultFor(summary, context.workspace.id)).toMatchObject({
-      status: mode === "current_active" ? "pending_busy" : "pending",
-      reason: mode === "current_active" ? "busy" : mode === "outcome_unknown" ? "desktop_unresolved" : "desktop_unknown",
+      status: mode === "current_active" ? "upgraded" : "pending",
+      ...(mode === "current_active" ? {} : { reason: mode === "outcome_unknown" ? "desktop_unresolved" : "desktop_unknown" }),
     });
-    expect(daemon.restartBridge).not.toHaveBeenCalled();
+    expect(daemon.restartBridge).toHaveBeenCalledTimes(mode === "current_active" ? 1 : 0);
     if (mode === "outcome_unknown") expect(desktopIpc.inspect).not.toHaveBeenCalled();
   });
 
@@ -736,8 +883,7 @@ describe("core rollout", () => {
         runtimeStatus: target.threadId === historicalThreadId || mode === "current_active" ? "active" : "idle",
       }));
       const summary = await rollout();
-      const expected = mode === "historical_active" ? "upgraded" :
-        mode === "current_active" || mode === "future_accepted" ? "pending_busy" : "pending";
+      const expected = mode === "historical_active" || mode === "current_active" || mode === "future_accepted" ? "upgraded" : "pending";
       expect(resultFor(summary, context.workspace.id)).toMatchObject({ status: expected });
       expect(daemon.restartBridge).toHaveBeenCalledTimes(expected === "upgraded" ? 1 : 0);
       if (mode === "historical_active") {
@@ -813,7 +959,7 @@ describe("core rollout", () => {
     expect(vi.mocked(desktopIpc.inspect).mock.calls.every(([target]) => target.threadId === threadId)).toBe(true);
   });
 
-  it("legacy reconciliation 在 retention 淘汰 output 后仍跳过旧 thread 并检查当前 binding", async () => {
+  it.each([0, 1, 7])("legacy reconciliation 在 retention 后 cleanup %i 条仍跳过旧 thread 并检查当前 binding", async holes => {
     const context = addContext("desktop-legacy-retention");
     makeAfter(context);
     seedDesktopRebound(context, "2026-09-11T00:00:00.000Z");
@@ -826,12 +972,18 @@ describe("core rollout", () => {
         exitCode: 0,
         taskId: `retention-task-${index}`,
         iteration: 1,
+        commandId: `new-flow-${index}`,
       });
     }
     const retained = listExecutionOutputs(context.workspace.id, MAX_OUTPUT_RECORDS);
     expect(retained).toHaveLength(MAX_OUTPUT_RECORDS);
     expect(retained.some(item => item.id === reconciledOutputId)).toBe(false);
     expect(new Set(retained.map(item => item.taskId)).size).toBe(MAX_OUTPUT_RECORDS);
+    for (let i = 0; i < holes; i++) {
+      const target = { workspaceId: context.workspace.id, workspaceRoot: context.workspace.root, commandId: `new-flow-${i}`, iteration: 1 as const, stateDir };
+      expect(confirmCommandCleanup(target, previewCommandCleanup(target).confirmationSha256!).status).toBe("cleaned");
+    }
+    expect(listExecutionOutputs(context.workspace.id, MAX_OUTPUT_RECORDS)).toHaveLength(MAX_OUTPUT_RECORDS - holes);
     mockReboundInspect();
 
     const summary = await rollout();

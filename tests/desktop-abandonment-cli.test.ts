@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Command } from "commander";
 import { registerDesktopCommands } from "../src/cli/desktop.js";
 import * as abandonment from "../src/desktop/abandonment.js";
+import * as repair from "../src/desktop/abandonment-repair.js";
 import * as history from "../src/desktop/history.js";
 import { DesktopError } from "../src/desktop/store.js";
 import { Workspace } from "../src/workspace/manager.js";
@@ -54,6 +55,35 @@ function jsonOf(stdout: string): Record<string, unknown> {
 }
 
 describe("desktop abandonment/history CLI", () => {
+  it("corrupt-lock preview uses only explicit exact selections and returns a saveable proof", async () => {
+    const value = { commandIds: COMMAND_IDS, repairCommandIds: [COMMAND_IDS[0]], confirmationSha256: CONFIRMATION,
+      repairConfirmationSha256: "b".repeat(64), proof: { version: 1 }, notice: "administrative only" };
+    const preview = vi.spyOn(repair, "previewCorruptLockAbandonment").mockResolvedValue(value as never);
+    const confirm = vi.spyOn(repair, "confirmCorruptLockAbandonment");
+    const result = await runCli(["desktop", "abandon-corrupt-lock", "-w", root, "--command-ids", COMMAND_IDS.join(","), "--repair-command-ids", COMMAND_IDS[0]!, "--json"]);
+    expect(jsonOf(result.stdout)).toEqual({ ok: true, ...value }); expect(result.exitCode).toBe(0);
+    expect(preview).toHaveBeenCalledWith(expect.objectContaining({ id: workspace.id }), COMMAND_IDS, [COMMAND_IDS[0]]);
+    expect(confirm).not.toHaveBeenCalled();
+  });
+
+  it.each([["--confirm", CONFIRMATION], ["--repair-confirm", "b".repeat(64)], ["--preview-file", "missing"]])("corrupt-lock confirm refuses incomplete double confirmation %j", async (...extra) => {
+    const confirm = vi.spyOn(repair, "confirmCorruptLockAbandonment");
+    const result = await runCli(["desktop", "abandon-corrupt-lock", "-w", root, "--command-ids", COMMAND_IDS.join(","), "--repair-command-ids", COMMAND_IDS[0]!, ...extra, "--json"]);
+    expect(result.exitCode).toBe(1); expect(jsonOf(result.stdout).error).toBe("DESKTOP_ABANDONMENT_REPAIR_BLOCKED"); expect(confirm).not.toHaveBeenCalled();
+  });
+
+  it("corrupt-lock confirm passes saved proof and both digests without any force/all option", async () => {
+    const proof = { version: 1 }, file = `${root}/preview.json`;
+    fs.writeFileSync(file, JSON.stringify({ proof }));
+    const confirm = vi.spyOn(repair, "confirmCorruptLockAbandonment").mockResolvedValue({ status: "abandoned", commandIds: COMMAND_IDS } as never);
+    const result = await runCli(["desktop", "abandon-corrupt-lock", "-w", root, "--command-ids", COMMAND_IDS.join(","), "--repair-command-ids", COMMAND_IDS[0]!,
+      "--preview-file", file, "--confirm", CONFIRMATION, "--repair-confirm", "b".repeat(64), "--json"]);
+    expect(result.exitCode).toBe(0); expect(confirm).toHaveBeenCalledWith(expect.objectContaining({ id: workspace.id }), COMMAND_IDS, [COMMAND_IDS[0]], proof, CONFIRMATION, "b".repeat(64));
+    const program = new Command(); registerDesktopCommands(program);
+    const command = program.commands.find(x => x.name() === "desktop")!.commands.find(x => x.name() === "abandon-corrupt-lock")!;
+    expect(command.helpInformation()).not.toMatch(/--force|--all/);
+  });
+
   it("省略 confirmation 时只做 preview，不写入状态并保留固定 notice", async () => {
     const preview = vi.spyOn(abandonment, "previewAbandonment").mockReturnValue({
       commandIds: COMMAND_IDS,

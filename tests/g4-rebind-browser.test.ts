@@ -1,4 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import fs from "node:fs";
+import vm from "node:vm";
 
 const ROUTE = "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111";
 const OLD_ROUTE = "https://chatgpt.com/c/77777777-7777-4777-8777-777777777777";
@@ -446,6 +448,20 @@ describe("G4c one-click connect orchestration", () => {
   });
 
   it("proven no-mutation bootstrap failure stays retryable only on a later explicit Connect", async () => {
+    // Exercise the actual content-script reply, not a hand-built success envelope.
+    let contentListener: (message: unknown, sender: unknown, reply: (value: unknown) => void) => boolean;
+    const content = {
+      chrome: { runtime: {
+        id: "test-extension", lastError: null,
+        sendMessage: (_message: unknown, reply: (value: unknown) => void) => reply({ ok: true }),
+        onMessage: { addListener: (listener: typeof contentListener) => { contentListener = listener; } },
+      } },
+      document: { hidden: false, addEventListener() {} },
+      window: { addEventListener() {} },
+      location: { href: ROUTE }, setInterval() {},
+      parseChatgptConversationRoute: () => ({ canonical: ROUTE }),
+    };
+    vm.runInNewContext(fs.readFileSync("browser-companion/content-script.js", "utf8"), content);
     let dispatches = 0;
     const worker = await loadWorker(responseBody(), {
       oldRoute: OLD_ROUTE,
@@ -453,20 +469,10 @@ describe("G4c one-click connect orchestration", () => {
       fetch: async (url) => String(url).includes("/rebind/init")
         ? jsonResponse(409, { error: "COMPANION_REBIND_NOT_SUCCESSOR" })
         : Promise.reject(new Error(`unexpected URL ${String(url)}`)),
-      tabsSendMessage: async () => {
+      tabsSendMessage: async (_tabId, message) => {
         dispatches += 1;
         if (dispatches === 1) {
-          return {
-            type: "c2c.feedback.bootstrap.result",
-            mode: "feedback_bootstrap_send",
-            ok: false,
-            reason: "bootstrap_sender_invalid",
-            mutationAttempted: false,
-            clickAttempted: false,
-            observed: false,
-            canonicalRoute: ROUTE,
-            generation: 1,
-          };
+          return new Promise(resolve => contentListener(message, { id: "test-extension" }, resolve));
         }
         return {
           type: "c2c.feedback.bootstrap.result",
@@ -490,13 +496,17 @@ describe("G4c one-click connect orchestration", () => {
     };
 
     const failed = await worker.send(message, sender) as Record<string, unknown>;
-    expect(failed).toMatchObject({ ok: false, reason: "bootstrap_sender_invalid", retryAllowed: true });
+    expect(failed).toMatchObject({ ok: false, reason: "bootstrap_capability_missing", retryAllowed: true });
     expect(worker.tabsSendMessage).toHaveBeenCalledTimes(1);
     expect(worker.local.values.get(CONNECT_KEY)).toMatchObject({ state: "NONE" });
+    expect(await worker.send({ type: "c2c.status.read", canonicalRoute: ROUTE }, sender))
+      .toMatchObject({ connectReason: "bootstrap_capability_missing", connectState: "NONE" });
 
     const retried = await worker.send(message, sender) as Record<string, unknown>;
     expect(retried).toMatchObject({ ok: true, state: "WAITING_TAKEOVER" });
     expect(worker.tabsSendMessage).toHaveBeenCalledTimes(2);
+    expect(await worker.send({ type: "c2c.status.read", canonicalRoute: ROUTE }, sender))
+      .toMatchObject({ connectReason: null, connectState: "WAITING_TAKEOVER" });
   });
 
   it("C. repeated exact-owner heartbeat waits for takeover without resending bootstrap", async () => {
@@ -624,7 +634,7 @@ describe("G4c one-click connect orchestration", () => {
         epoch: OLD_EPOCH, companionId: OLD_COMPANION, routeCanonical: ROUTE,
         challengeId: null, updatedAt: Date.now(),
       },
-      fetch: async () => { throw new Error("durable dispatch must not retry /rebind/init"); },
+      fetch: async () => jsonResponse(409, { error: "COMPANION_REBIND_NOT_SUCCESSOR" }),
       tabsSendMessage: async () => { throw new Error("durable dispatch must not resend bootstrap"); },
     });
     const sender = { tab: { id: 7 }, documentId: "document-g4-rebind", frameId: 0, url: ROUTE };
@@ -633,10 +643,121 @@ describe("G4c one-click connect orchestration", () => {
       canonicalRoute: ROUTE,
       safety: { composer: "empty", generation: "idle", safe: true },
     }, sender);
-    expect(result).toMatchObject({ ok: false, reason: "connect_outcome_unknown", state: "OUTCOME_UNKNOWN" });
-    expect(worker.fetchMock).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ ok: false, reason: "COMPANION_REBIND_NOT_SUCCESSOR", state: "TAKEOVER_DISPATCH" });
+    expect(worker.fetchMock).toHaveBeenCalledTimes(1);
+    expect(String(worker.fetchMock.mock.calls[0][0])).toContain("/rebind/init");
+    expect(worker.local.values.get(CONNECT_KEY)).toMatchObject({ state: "TAKEOVER_DISPATCH" });
     expect(worker.tabsSendMessage).not.toHaveBeenCalled();
   });
+
+  const unknownBootstrap = {
+    state: "OUTCOME_UNKNOWN", workspaceId: WORKSPACE, bindingId: OLD_BINDING,
+    epoch: OLD_EPOCH, companionId: OLD_COMPANION, routeCanonical: ROUTE,
+    challengeId: null, updatedAt: 1,
+  };
+  const connectSender = { tab: { id: 7 }, documentId: "document-g4-rebind", frameId: 0, url: ROUTE };
+  const connectPage = {
+    type: "c2c.connect.page", generation: 1, canonicalRoute: ROUTE,
+    safety: { composer: "empty", generation: "idle", safe: true },
+  };
+
+  it.each(["OUTCOME_UNKNOWN", "TAKEOVER_DISPATCH", "durable_successor", "old_verified", "old_verified_pruned"])(
+    "explicit Connect verifies a lost bootstrap (%s) and completes the new route without resending bootstrap",
+    async (stage) => {
+      const urls: string[] = [];
+      const worker = await loadWorker(responseBody(), {
+        oldRoute: OLD_ROUTE,
+        connectFlow: { ...unknownBootstrap, state: stage.startsWith("old_verified") || stage === "durable_successor" ? "OUTCOME_UNKNOWN" : stage },
+        ...(stage.startsWith("old_verified") ? { routeFence: {
+          state: "VERIFIED", companionId: OLD_COMPANION, challengeId: CHALLENGE, routeCanonical: OLD_ROUTE,
+        }, transport: {
+          routeVerification: "VERIFIED",
+          ...(stage === "old_verified_pruned" ? { routeAttestationMessage: undefined } : {}),
+        } } : {}),
+        ...(stage === "durable_successor" ? { transport: {
+          companionId: NEW_COMPANION, bindingId: NEW_BINDING, epoch: OLD_EPOCH + 1,
+          routeCanonical: ROUTE, rebindPending: true,
+        } } : {}),
+        fetch: async (url) => {
+          const value = String(url); urls.push(value);
+          if (value.includes("/rebind/init")) return jsonResponse(200, responseBody());
+          if (value.includes("/rebind/status")) return jsonResponse(200, {
+            workspaceId: WORKSPACE, companionId: NEW_COMPANION, bindingId: NEW_BINDING,
+            epoch: OLD_EPOCH + 1, routeCanonical: ROUTE, challengeId: CHALLENGE, state: "CONFIRMED",
+          });
+          if (value.includes("/rebind/complete")) return jsonResponse(200, completedBody());
+          if (value.endsWith("/state")) return urls.some(item => item.includes("/rebind/complete"))
+            ? jsonResponse(200, verifiedState())
+            : jsonResponse(401, { error: "COMPANION_EPOCH_STALE" });
+          throw new Error(`unexpected URL ${value}`);
+        },
+        tabsSendMessage: async (_id, message) => {
+          expect(message.type).toBe("c2c.route.attest.execute");
+          return { ok: true, observed: true, mutationAttempted: true, clickAttempted: true };
+        },
+      });
+      const result = await worker.send(connectPage, connectSender);
+      expect(result).toMatchObject({ ok: true });
+      await worker.send({ ...connectPage, type: "c2c.heartbeat" }, connectSender);
+      expect(worker.local.values.get(CONNECT_KEY)).toMatchObject({ state: "DONE", bindingId: NEW_BINDING });
+      expect(worker.local.values.get(TRANSPORT_KEY)).toMatchObject({ routeVerification: "VERIFIED", rebindPending: false });
+      expect(worker.tabsSendMessage).toHaveBeenCalledTimes(1);
+      expect(urls.filter(url => url.includes("/rebind/init"))).toHaveLength(stage === "durable_successor" ? 0 : 1);
+      expect(urls.filter(url => url.includes("/rebind/complete"))).toHaveLength(1);
+    },
+  );
+
+  it("heartbeat does not resolve or resend an unknown bootstrap", async () => {
+    const worker = await loadWorker(responseBody(), { oldRoute: OLD_ROUTE, connectFlow: unknownBootstrap });
+    await worker.send({ ...connectPage, type: "c2c.heartbeat" }, connectSender);
+    expect(worker.tabsSendMessage).not.toHaveBeenCalled();
+    expect(worker.fetchMock.mock.calls.some(([url]) => String(url).includes("/rebind/"))).toBe(false);
+    expect(worker.local.values.get(CONNECT_KEY)).toMatchObject(unknownBootstrap);
+  });
+
+  it.each(["wrong_target", "wrong_binding", "attestation_unknown", "corrupt", "uncertain_rebind", "uncertain_attestation"])(
+    "bootstrap recovery refuses %s without network or DOM mutation", async (kind) => {
+      const worker = await loadWorker(responseBody(), {
+        oldRoute: OLD_ROUTE,
+        connectFlow: {
+          ...unknownBootstrap,
+          ...(kind === "wrong_target" ? { routeCanonical: OLD_ROUTE } : {}),
+          ...(kind === "wrong_binding" ? { bindingId: NEW_BINDING } : {}),
+          ...(kind === "attestation_unknown" ? { challengeId: CHALLENGE } : {}),
+          ...(kind === "corrupt" ? { epoch: "bad" } : {}),
+        },
+        ...(["uncertain_rebind", "uncertain_attestation"].includes(kind) ? { routeFence: {
+          state: kind === "uncertain_rebind" ? "PAIRING_TRANSITION" : "OUTCOME_UNKNOWN",
+          companionId: OLD_COMPANION, challengeId: CHALLENGE, routeCanonical: OLD_ROUTE,
+        } } : {}),
+      });
+      expect(await worker.send(connectPage, connectSender)).toMatchObject({ ok: false, reason: "connect_outcome_unknown" });
+      expect(worker.fetchMock).not.toHaveBeenCalled();
+      expect(worker.tabsSendMessage).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["network", "wrong_successor", "flow_persist"])(
+    "preserves uncertainty after %s and performs no DOM send", async (failure) => {
+      const worker = await loadWorker(responseBody(), {
+        oldRoute: OLD_ROUTE, connectFlow: unknownBootstrap,
+        ...(failure === "flow_persist" ? { failConnectFlowSetAt: [1] } : {}),
+        fetch: async () => {
+          if (failure === "network") throw new Error("lost response");
+          return jsonResponse(200, responseBody(failure === "wrong_successor" ? { epoch: OLD_EPOCH + 2 } : {}));
+        },
+      });
+      expect(await worker.send(connectPage, connectSender)).toMatchObject({ ok: false });
+      expect(worker.local.values.get(CONNECT_KEY)).toMatchObject(unknownBootstrap);
+      expect(worker.tabsSendMessage).not.toHaveBeenCalled();
+      if (failure !== "flow_persist") {
+        expect(worker.local.values.get(FENCE_KEY)).toMatchObject({ state: "PAIRING_TRANSITION" });
+        const calls = worker.fetchMock.mock.calls.length;
+        expect(await worker.send(connectPage, connectSender)).toMatchObject({ ok: false });
+        expect(worker.fetchMock).toHaveBeenCalledTimes(calls);
+      }
+    },
+  );
 
   it("hydration disarms a changed identity but retains the explicit rearm preference", async () => {
     const worker = await loadWorker(responseBody(), {
@@ -1569,7 +1690,14 @@ describe("G4 R3p recoverable written-unsent bootstrap + abandon connect unknown"
       state: "OUTCOME_UNKNOWN",
       retryAllowed: false,
     });
-    expect(worker.local.values.get(CONNECT_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN" });
+    const savedFlow = worker.local.values.get(CONNECT_KEY) as Record<string, unknown>;
+    expect(savedFlow).toMatchObject({ state: "OUTCOME_UNKNOWN", failureReason: "bootstrap_click_outcome_unknown" });
+    const restarted = await loadWorker(responseBody(), { oldRoute: OLD_ROUTE, connectFlow: savedFlow });
+    for (let read = 0; read < 2; read += 1) {
+      expect(await restarted.send({ type: "c2c.status.read", canonicalRoute: ROUTE }, sender))
+        .toMatchObject({ connectState: "OUTCOME_UNKNOWN", connectReason: "bootstrap_click_outcome_unknown" });
+    }
+    expect(restarted.tabsSendMessage).not.toHaveBeenCalled();
   });
 
   it("a response without mutationAttempted but wrote=true fails closed (never proven no-mutation)", async () => {

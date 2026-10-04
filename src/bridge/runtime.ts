@@ -2,6 +2,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { getStateDir, readJsonIfExists, writeSecureJson } from "../config/paths.js";
 import { SERVICE_NAME, VERSION } from "../version.js";
+import { requestLoopback } from "./loopback-http.js";
+import { observeProcessPresence } from "../process/process-probe.js";
 
 /** Capabilities are explicit; an absent token means the runtime is legacy/unknown. */
 export const RUNTIME_CAPABILITY_FINAL_RECEIPT_REQUIRED = "feedback.final_receipt_required" as const;
@@ -70,17 +72,18 @@ export function hasRuntimeCapability(
 }
 
 /** Probe a port and check whether a healthy c2c bridge for the workspace answers. */
+// Normal observations stay fast; only a failed probe with a definitely live PID
+// earns one 8s retry, covering the reproduced >4s host/event-loop stall.
+const HEALTH_PROBE_TIMEOUT_MS = 2000;
+const LIVE_PID_HEALTH_RETRY_TIMEOUT_MS = 8000;
 export async function probeBridge(
   port: number,
-  timeoutMs = 2000
+  timeoutMs = HEALTH_PROBE_TIMEOUT_MS
 ): Promise<HealthPayload | null> {
   try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    const response = await fetch(`http://127.0.0.1:${port}/health`, { signal: controller.signal });
-    clearTimeout(timer);
-    if (!response.ok) return null;
-    const body = (await response.json()) as HealthPayload;
+    const response = await requestLoopback({ port, path: "/health", timeoutMs });
+    if (response.status < 200 || response.status >= 300) return null;
+    const body = JSON.parse(response.body) as HealthPayload;
     if (body.service !== SERVICE_NAME) return null;
     return body;
   } catch {
@@ -92,41 +95,27 @@ export async function adminFetch<T = unknown>(
   runtime: RuntimeState,
   method: "GET" | "POST",
   route: string,
-  timeoutMs = 60_000
+  timeoutMs = 60_000,
+  diagnostics?: { shutdownReason: "restart" | "rollout" },
 ): Promise<T> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const response = await fetch(`http://127.0.0.1:${runtime.port}${route}`, {
-      method,
-      headers: { Authorization: `Bearer ${runtime.adminToken}` },
-      signal: controller.signal,
-      redirect: "error",
-    });
-    const body = (await response.json().catch(() => ({}))) as T & { message?: string };
-    if (!response.ok) {
-      throw new Error((body as { message?: string }).message ?? `Admin request failed (${response.status})`);
-    }
-    return body;
-  } finally {
-    clearTimeout(timer);
+  const response = await requestLoopback({
+    port: runtime.port, path: route, method, timeoutMs,
+    headers: { Authorization: `Bearer ${runtime.adminToken}`,
+      ...(diagnostics ? { "X-C2C-Shutdown-Reason": diagnostics.shutdownReason } : {}) },
+  });
+  let body: T & { message?: string };
+  try { body = JSON.parse(response.body); }
+  catch { body = {} as T & { message?: string }; } // Preserve the existing non-JSON admin error fallback.
+  if (response.status < 200 || response.status >= 300) {
+    throw new Error(body?.message ?? `Admin request failed (${response.status})`);
   }
+  return body;
 }
 
 export type BridgeObservation =
   | { state: "healthy"; runtime: RuntimeState }
   | { state: "stopped"; runtime: RuntimeState | null; reason: "runtime_missing" | "pid_missing" | "stale_runtime" }
   | { state: "unknown"; runtime: RuntimeState | null; reason: "probe_failed" | "pid_unknown" | "workspace_mismatch" | "identity_mismatch" };
-
-function observePid(pid: number): "present" | "missing" | "unknown" {
-  if (!Number.isInteger(pid) || pid <= 0) return "unknown";
-  try {
-    process.kill(pid, 0);
-    return "present";
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "ESRCH" ? "missing" : "unknown";
-  }
-}
 
 async function authenticateRuntimeIdentity(runtime: RuntimeState, health: HealthPayload): Promise<boolean> {
   if (health.pid !== runtime.pid || typeof health.startedAt !== "string" || health.startedAt !== runtime.startedAt)
@@ -159,8 +148,12 @@ export async function findBridgeObservation(workspaceId: string): Promise<Bridge
     return { state: "unknown", runtime, reason: "workspace_mismatch" };
   }
 
-  const health = await probeBridge(runtime.port);
-  const pid = observePid(runtime.pid);
+  let health = await probeBridge(runtime.port);
+  let pid = await observeProcessPresence(runtime.pid);
+  if (!health && pid === "present") {
+    health = await probeBridge(runtime.port, LIVE_PID_HEALTH_RETRY_TIMEOUT_MS);
+    pid = await observeProcessPresence(runtime.pid);
+  }
   if (health) {
     if (health.status !== "ok" || typeof health.workspaceId !== "string" || !health.workspaceId) {
       return { state: "unknown", runtime, reason: "identity_mismatch" };
@@ -181,20 +174,24 @@ export async function findBridgeObservation(workspaceId: string): Promise<Bridge
     if (health.workspaceId !== workspaceId) {
       return { state: "unknown", runtime, reason: "workspace_mismatch" };
     }
+    if (runtime.runtimeBuildId !== undefined && health.runtimeBuildId !== undefined &&
+      health.runtimeBuildId !== runtime.runtimeBuildId) return { state: "unknown", runtime, reason: "identity_mismatch" };
     if (legacy && pid === "present" && Number.isFinite(savedStart) &&
       typeof runtime.adminToken === "string" && runtime.adminToken.length > 0) {
       try {
         const info = await adminFetch<Partial<RuntimeState>>(runtime, "GET", "/admin/info", 2000);
         if (info.service === runtime.service && info.workspaceId === workspaceId &&
           info.pid === runtime.pid && info.startedAt === runtime.startedAt &&
-          observePid(runtime.pid) === "present") return { state: "healthy", runtime };
+          (runtime.runtimeBuildId === undefined || info.runtimeBuildId === runtime.runtimeBuildId) &&
+          await observeProcessPresence(runtime.pid) === "present") return { state: "healthy", runtime };
       } catch {
         // 旧 health 不是授权证明；认证失败、重定向或端口复用均保持 unknown。
       }
     }
     if (!legacy && identified && samePid && pid === "unknown" && Number.isFinite(savedStart) &&
       await authenticateRuntimeIdentity(runtime, health)) return { state: "healthy", runtime };
-    if (pid === "present" && identified && samePid && sameStart) return { state: "healthy", runtime };
+    if (pid === "present" && identified && samePid && sameStart &&
+      (runtime.runtimeBuildId === undefined || health.runtimeBuildId === runtime.runtimeBuildId)) return { state: "healthy", runtime };
     return { state: "unknown", runtime, reason: "identity_mismatch" };
   }
 

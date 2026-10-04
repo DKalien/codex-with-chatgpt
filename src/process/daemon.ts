@@ -1,4 +1,3 @@
-import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -7,6 +6,10 @@ import { adminFetch, findBridgeObservation, findLiveBridge, type RuntimeState } 
 import { Workspace } from "../workspace/manager.js";
 import type { DesktopCompatibility } from "../auth/store.js";
 import { detectTunnelBinaries } from "../tunnel/detect.js";
+import { buildDaemonEnv, spawnDetachedDaemon, resolveDaemonSpawnHelperPath, resolveDaemonSpawnPython } from "./daemon-spawn.js";
+import { observeProcessPresence, probeProcess } from "./process-probe.js";
+import { persistSpawnProvenance, type LaunchIdentity, type readBridgeProvenance } from "./bridge-provenance.js";
+import { isRuntimeBuildId } from "../build-id.js";
 import {
   tryAcquireMaintenanceLock,
   assertMaintenanceHandle,
@@ -122,7 +125,6 @@ async function ensureUnlocked(workspace: Workspace, opts: { port?: number; start
 
   const logDir = ensureDir(path.join(getStateDir(), "logs"));
   const logFile = path.join(logDir, `bridge-${workspace.id}.out.log`);
-  const out = fs.openSync(logFile, "a", 0o600);
   try {
     // Existing files may have been created with a permissive umask. Keep the
     // daemon's inherited stdout/stderr log owner-readable only.
@@ -131,28 +133,44 @@ async function ensureUnlocked(workspace: Workspace, opts: { port?: number; start
     // Windows / filesystems without chmod semantics
   }
   const { cmd, args } = cliEntry();
-  const env = { ...process.env };
+  // R5f prework（DAEMON_ENV_SANITIZATION，exact allowlist）：env 交接文件落盘，
+  // 禁止把完整父 process.env 写盘——只投影 OS/runtime/path 变量与 Bridge 实际
+  // 读取的显式 C2C 配置（未知父 secrets/上下文一律排除）；startup lease 在投影
+  // 之后显式注入 fresh 值，不继承旧父进程 lease。
+  const env = buildDaemonEnv(process.env);
   if (opts.startupLease) env[STARTUP_LEASE_ENV] = encodeStartupLease(opts.startupLease);
-  const child = spawn(
-    cmd,
-    buildServeArgs(args, workspace.root, opts.port),
-    {
-      detached: true,
-      stdio: ["ignore", out, out],
-      env,
-      windowsHide: true,
-    }
-  );
-  child.unref();
-  fs.closeSync(out);
+  // detached 只脱离父进程生命周期；Windows 下还需脱离 Job（kill-on-close）与
+  // taskkill /T 父链，否则宿主（如 Codex）退出时会连带杀死 daemon。
+  const entryPath = args[args.length - 1];
+  let buildId: string | null = null;
+  try {
+    const value = fs.readFileSync(path.resolve(path.dirname(entryPath), "..", "build-id.txt"), "utf8").trim();
+    if (isRuntimeBuildId(value)) buildId = value;
+  } catch { /* source launch: build identity unavailable */ }
+  const launch: LaunchIdentity = { entryPath, buildId };
+  const spawned = await spawnDetachedDaemon({ cmd, args: buildServeArgs(args, workspace.root, opts.port), logFile, env });
+  const { pid } = spawned;
 
   const deadline = Date.now() + 20_000;
   while (Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 300));
     const runtime = await findLiveBridge(workspace.id);
-    if (runtime) return { runtime, spawned: true };
-    if (child.exitCode !== null && child.exitCode !== 0) {
-      throw new Error(`Bridge process exited with code ${child.exitCode}. See ${logFile}`);
+    if (runtime) {
+      try {
+        const confirmed = await adminFetch<BridgeAdminInfo>(runtime, "GET", "/admin/info", 2000);
+        if (confirmed.pid !== pid || confirmed.startedAt !== runtime.startedAt || confirmed.workspaceId !== workspace.id ||
+          confirmed.workspaceRoot !== workspace.root || (confirmed.runtimeBuildId ?? null) !== (runtime.runtimeBuildId ?? null))
+          throw new Error("BRIDGE_PROVENANCE_CONFLICT");
+        const healthyProcess = await probeProcess(pid, resolveDaemonSpawnPython(), resolveDaemonSpawnHelperPath(), spawned.finalProcess.creationTime ?? undefined);
+        persistSpawnProvenance(runtime, workspace, spawned, launch, healthyProcess);
+      } catch {
+        // Diagnostics cannot make an already healthy Bridge unavailable. Never log raw errors/argv/env.
+        try { fs.appendFileSync(logFile, "[bridge-provenance] unavailable_or_conflict\n"); } catch { /* diagnostic only */ }
+      }
+      return { runtime, spawned: true };
+    }
+    if (await observeProcessPresence(pid) === "missing") {
+      throw new Error(`Bridge process exited during startup. See ${logFile}`);
     }
   }
   throw new Error(`Bridge did not become healthy within 20s. See ${logFile}`);
@@ -163,7 +181,8 @@ function sameRuntime(a: RuntimeState, b: RuntimeState): boolean {
     a.pid === b.pid && a.startedAt === b.startedAt && a.port === b.port && a.adminToken === b.adminToken;
 }
 
-export async function stopBridge(workspaceRoot: string, expectedRuntime?: RuntimeState): Promise<boolean> {
+/** True confirms authenticated shutdown acceptance only; it does not prove OS process exit. */
+export async function stopBridge(workspaceRoot: string, expectedRuntime?: RuntimeState, reason?: "restart" | "rollout"): Promise<boolean> {
   const workspace = new Workspace(workspaceRoot);
   const observation = await findBridgeObservation(workspace.id);
   if (observation.state !== "healthy") return false;
@@ -171,7 +190,7 @@ export async function stopBridge(workspaceRoot: string, expectedRuntime?: Runtim
     (expectedRuntime && !sameRuntime(observation.runtime, expectedRuntime))) return false;
   try {
     // admin token 绑定此 runtime；端口在检查后被复用也不能关闭对方。绝不按旧 PID 盲目 kill。
-    await adminFetch(observation.runtime, "POST", "/admin/shutdown", 5000);
+    await adminFetch(observation.runtime, "POST", "/admin/shutdown", 5000, reason ? { shutdownReason: reason } : undefined);
     return true;
   } catch {
     return false;
@@ -195,6 +214,7 @@ export interface BridgeAdminInfo {
   writeProbeEnabled?: boolean;
   pid: number;
   startedAt: string;
+  bridgeProvenance?: ReturnType<typeof readBridgeProvenance>;
 }
 
 export async function ensureBridgeAndTunnel(
@@ -219,7 +239,7 @@ export async function ensureBridgeAndTunnel(
 /** 所有重启共用认证 shutdown；等待关闭期间绝不按 PID kill 或猜测已停止。 */
 export async function restartBridge(
   workspaceRoot: string,
-  opts: { tunnel: boolean; expectedRuntime?: RuntimeState; beforeShutdown?: () => Promise<void>; maintenance?: MaintenanceLockHandle }
+  opts: { tunnel: boolean; expectedRuntime?: RuntimeState; beforeShutdown?: () => Promise<void>; maintenance?: MaintenanceLockHandle; shutdownReason?: "restart" | "rollout" }
 ): Promise<{ runtime: RuntimeState; info: BridgeAdminInfo; mcpUrl: string | null }> {
   const workspace = new Workspace(workspaceRoot);
   const before = await findBridgeObservation(workspace.id);
@@ -229,13 +249,16 @@ export async function restartBridge(
   }
   if (before.state === "healthy") {
     await opts.beforeShutdown?.();
-    if (!await stopBridge(workspace.root, before.runtime)) throw new Error("Bridge 认证关闭失败，未重启。");
+    if (!await stopBridge(workspace.root, before.runtime, opts.shutdownReason ?? "restart")) throw new Error("Bridge 认证关闭失败，未重启。");
     const deadline = Date.now() + 5000;
     while (true) {
       await new Promise((resolve) => setTimeout(resolve, 100));
       const current = await findBridgeObservation(workspace.id);
-      if (current.state === "stopped") break;
-      if (!current.runtime || !sameRuntime(current.runtime, before.runtime)) {
+      if (current.state === "stopped") {
+        // A legacy server may delete runtime before exiting. Never lose the original
+        // process fence just because its HTTP listener or runtime file disappeared.
+        if (await observeProcessPresence(before.runtime.pid) === "missing") break;
+      } else if (!current.runtime || !sameRuntime(current.runtime, before.runtime)) {
         throw new Error("Bridge runtime 已被替换，未继续重启。");
       }
       // 认证关闭之后 server 可能已退出但进程仍在收尾；只能等待，不能将 unknown 当作 stopped。

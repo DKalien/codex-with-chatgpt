@@ -82,12 +82,13 @@ export function wakeWatchdogEligible(input = {}) {
   if (
     input.storageProtected !== true
     || !transport
-    || transport.authStale === true
     || typeof transport.bridgeOrigin !== "string"
     || transport.bridgeOrigin.length === 0
   ) {
     return false;
   }
+  // Discovery only: a stale credential may be rechecked, never used to Send.
+  // The existing one-minute alarm bounds recovery without a new retry loop.
   return input.autonomyMode === "armed"
     || input.autonomyMode === "shadow"
     || ACTIVE_JOURNAL_STATES.has(input.journalState);

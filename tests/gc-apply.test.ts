@@ -1,5 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
+import { activeFinalizerPath, workerClaimPath, readFinalizerRetirement } from "../src/core/post-turn-finalizer.js";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -51,6 +53,137 @@ function writePending(state: string, root: string, targetBuildId: string, worksp
     updatedAt: "2026-09-13T00:00:00.000Z",
   }));
 }
+
+describe("scoped GC progress", () => {
+  it.each(["pending", "finalizer"])("exact %s A allows unrelated B to delete even with future fields", kind => {
+    const { state, root, releases } = fixture(["A", "B", "current"]);
+    const ws = new Workspace(root).id;
+    const authority = kind === "pending" ? path.join(state, "runtime-upgrades", `${ws}.json`) : activeFinalizerPath(state, ws);
+    write(state, path.relative(state, authority), JSON.stringify({ workspaceId: ws, workspaceRoot: root,
+      targetBuildId: releases[0].runtimeBuildId, futureField: true }));
+    const before = fs.readFileSync(authority);
+    const result = applyGc({ stateDir: state });
+    expect(result.globalBlockerCount).toBe(0);
+    expect(result.localIssueCount).toBe(kind === "pending" ? 0 : 1);
+    expect(result.totals.deletedCount).toBe(1);
+    expect(fs.existsSync(releases[0].releaseRoot)).toBe(true);
+    expect(fs.existsSync(releases[1].releaseRoot)).toBe(false);
+    expect(fs.readFileSync(authority)).toEqual(before);
+  });
+
+  it.each(["runtime-missing", "runtime-invalid", "pending", "finalizer", "worker", "retirement"])("unscoped %s authority blocks all destruction", kind => {
+    const { state, root, releases } = fixture(["A", "B", "current"]);
+    const ws = new Workspace(root).id;
+    const folder = kind.startsWith("runtime") ? "runtime" : kind === "pending" ? "runtime-upgrades" :
+      kind === "finalizer" ? "post-turn-finalizers" : kind === "worker" ? "post-turn-finalizer-workers" : "post-turn-finalizer-retirements";
+    write(state, path.join(folder, `${ws}.${kind === "worker" ? "claim" : "json"}`), JSON.stringify({
+      workspaceId: ws, workspaceRoot: root, ...(kind === "runtime-invalid" ? { runtimeBuildId: "invalid" } : {}),
+    }));
+    const mutate = vi.fn();
+    const result = applyGc({ stateDir: state, hooks: { afterLockAcquired: mutate }, fns: { renameSync: mutate, removeTree: mutate } });
+    expect(result).toMatchObject({ ok: false, status: "blocked" });
+    expect(result.globalBlockerCount).toBeGreaterThan(0);
+    expect(result.totals.deletedCount).toBe(0);
+    expect(mutate).not.toHaveBeenCalled();
+    for (const release of releases) expect(fs.existsSync(release.releaseRoot)).toBe(true);
+  });
+
+  it.each([0, 1])("new global blocker after %i deletions halts every remaining item", alreadyDeleted => {
+    const { state, releases } = fixture(["A", "B", "C", "current"]);
+    let calls = 0;
+    const result = applyGc({ stateDir: state, hooks: { beforeTombstone() {
+      if (calls++ === alreadyDeleted) write(state, path.join("runtime", "unknown.json"), "{}");
+    } } });
+    expect(result).toMatchObject({ ok: false, status: "blocked" });
+    expect(result.globalBlockerCount).toBeGreaterThan(0);
+    expect(result.totals.deletedCount).toBe(alreadyDeleted);
+    expect(result.totals.skippedCount).toBe(3 - alreadyDeleted);
+    expect(releases.filter(release => !fs.existsSync(release.releaseRoot))).toHaveLength(alreadyDeleted);
+  });
+
+  it("start lock appearing before a later tombstone halts remaining deletions", () => {
+    const { state } = fixture(["A", "B", "current"]);
+    let calls = 0;
+    const result = applyGc({ stateDir: state, hooks: { beforeTombstone() {
+      if (calls++ === 1) write(state, path.join("runtime", `${"a".repeat(12)}.start.lock`), "busy");
+    } } });
+    expect(result).toMatchObject({ ok: false, status: "blocked" });
+    expect(result.totals.deletedCount).toBe(1);
+    expect(result.totals.skippedCount).toBe(1);
+  });
+
+  it("reclaims ten valid candidates while preserving an unrelated malformed release", () => {
+    const { state, releases } = fixture([...Array.from({ length: 10 }, (_, i) => `old-${i}`), "broken", "current"]);
+    fs.writeFileSync(path.join(releases[10].releaseRoot, "release.json"), "{}");
+    const result = applyGc({ stateDir: state });
+    expect(result).toMatchObject({ ok: false, status: "partial", globalBlockerCount: 0, localIssueCount: 1 });
+    expect(result.totals.deletedCount).toBe(10);
+    for (const release of releases.slice(0, 10)) expect(fs.existsSync(release.releaseRoot)).toBe(false);
+    for (const release of releases.slice(10)) expect(fs.existsSync(release.releaseRoot)).toBe(true);
+    expect(result.totals.bytesDeleted).toBe(result.items.filter(i => i.status === "deleted").reduce((n, i) => n + i.logicalBytes, 0));
+  });
+
+  it("dangling exact reference preserves its authority but does not pin unrelated A/B", () => {
+    const { state, root, releases } = fixture(["A", "B", "current"]);
+    const ws = new Workspace(root).id;
+    writeRuntime(state, root, "f".repeat(64), ws);
+    const file = path.join(state, "runtime", `${ws}.json`), before = fs.readFileSync(file);
+    const result = applyGc({ stateDir: state });
+    expect(result).toMatchObject({ ok: false, status: "partial", globalBlockerCount: 0, localIssueCount: 1 });
+    expect(result.totals.deletedCount).toBe(2);
+    expect(fs.readFileSync(file)).toEqual(before);
+    expect(fs.existsSync(path.join(state, "releases", "f".repeat(64)))).toBe(false);
+    expect(fs.existsSync(releases[2].releaseRoot)).toBe(true);
+  });
+
+  it.each(["capabilities", "futureField"])("runtime with %s pins exact A while B is reclaimed", extra => {
+    const { state, root, releases } = fixture(["A", "B", "current"]);
+    const ws = new Workspace(root).id;
+    writeRuntime(state, root, releases[0].runtimeBuildId, ws);
+    const file = path.join(state, "runtime", `${ws}.json`);
+    fs.writeFileSync(file, JSON.stringify({ ...JSON.parse(fs.readFileSync(file, "utf8")), [extra]: { extension: true } }));
+    const result = applyGc({ stateDir: state });
+    expect(result.ok).toBe(true);
+    expect(result.totals.deletedCount).toBe(1);
+    expect(fs.existsSync(releases[0].releaseRoot)).toBe(true);
+    expect(fs.existsSync(releases[1].releaseRoot)).toBe(false);
+  });
+
+  it("candidate becoming referenced only skips itself", () => {
+    const { state, root, releases } = fixture(["A", "B", "current"]);
+    const result = applyGc({ stateDir: state, hooks: { afterLockAcquired() {
+      writeRuntime(state, root, releases[0].runtimeBuildId, new Workspace(root).id);
+    } } });
+    expect(result.totals.deletedCount).toBe(1);
+    expect(result.items).toContainEqual(expect.objectContaining({ buildId: releases[0].runtimeBuildId, status: "skipped" }));
+    expect(fs.existsSync(releases[0].releaseRoot)).toBe(true);
+    expect(fs.existsSync(releases[1].releaseRoot)).toBe(false);
+  });
+
+  it("a newly appearing candidate is deferred while the original candidate is reclaimed", () => {
+    const { state, releases } = fixture(["A", "current"]);
+    const added = "f".repeat(64), addedRoot = path.join(state, "releases", added);
+    const result = applyGc({ stateDir: state, hooks: { afterLockAcquired() {
+      write(addedRoot, "release.json", JSON.stringify({ version: 1, runtimeBuildId: added, artifactSha256: "a".repeat(64) }));
+    } } });
+    expect(result.totals.deletedCount).toBe(1);
+    expect(result.items).toContainEqual(expect.objectContaining({ buildId: added, status: "skipped", reason: "new_candidate_not_deleted" }));
+    expect(fs.existsSync(addedRoot)).toBe(true);
+    expect(fs.existsSync(releases[0].releaseRoot)).toBe(false);
+  });
+
+  it("pre-tombstone local manifest failure does not prevent processing an independent candidate", () => {
+    const { state, releases } = fixture(["A", "B", "current"]);
+    const candidates = releases.slice(0, 2).sort((a, b) => a.runtimeBuildId.localeCompare(b.runtimeBuildId));
+    const result = applyGc({ stateDir: state, hooks: { beforeTombstone(id) {
+      if (id === candidates[0].runtimeBuildId) fs.writeFileSync(path.join(candidates[0].releaseRoot, "release.json"), "{}");
+    } } });
+    expect(result).toMatchObject({ ok: false, status: "partial" });
+    expect(result.totals.deletedCount).toBe(1);
+    expect(fs.existsSync(candidates[0].releaseRoot)).toBe(true);
+    expect(fs.existsSync(candidates[1].releaseRoot)).toBe(false);
+  });
+});
 
 describe("gc apply 安全算法", () => {
   it("无候选时 success no-op", () => {
@@ -152,7 +285,7 @@ describe("gc apply 安全算法", () => {
     });
     expect(result.ok).toBe(false);
     expect(result.totals.deletedCount).toBe(0);
-    expect(result.issues.some(i => i.includes("stale_candidates") || i.includes("fresh_plan_unsafe"))).toBe(true);
+    expect(result.items).toContainEqual(expect.objectContaining({ buildId: old.runtimeBuildId, status: "skipped", reason: "candidate_reference_changed" }));
     expect(fs.existsSync(old.releaseRoot)).toBe(true);
   });
 
@@ -251,7 +384,7 @@ describe("gc apply 安全算法", () => {
       },
     });
     expect(result.ok).toBe(false);
-    expect(result.issues.some(i => i.includes("stale_candidates") || i.includes("fresh_plan_unsafe"))).toBe(true);
+    expect(result.items).toContainEqual(expect.objectContaining({ buildId: old.runtimeBuildId, status: "skipped", reason: "candidate_reference_changed" }));
     expect(fs.existsSync(old.releaseRoot)).toBe(true);
   });
 
@@ -379,7 +512,8 @@ describe("gc apply 安全算法", () => {
     fs.symlinkSync(secret, path.join(old.releaseRoot, "escape.txt"));
     const result = applyGc({ stateDir: state });
     expect(result.ok).toBe(false);
-    expect(result.issues.some(i => i.includes("initial_plan_unsafe") || i.includes("fresh_plan_unsafe"))).toBe(true);
+    expect(result).toMatchObject({ status: "partial", globalBlockerCount: 0, localIssueCount: 1 });
+    expect(result.retained).toContainEqual(expect.objectContaining({ buildId: old.runtimeBuildId, disposition: "unknown", reasons: ["size_unsafe"] }));
     expect(fs.existsSync(old.releaseRoot)).toBe(true);
     expect(fs.readFileSync(secret, "utf8")).toBe("keep-me");
   });
@@ -455,4 +589,95 @@ describe("gc apply CLI contract", () => {
     expect(plan.status).toBe(0);
     expect(JSON.parse(plan.stdout).ok).toBe(true);
   }, 60000);
+});
+
+
+describe("gc legacy retirement", () => {
+  const dead = () => { throw Object.assign(new Error("dead"), { code: "ESRCH" }); };
+  function legacyFixture(expired = true, markers = ["old", "current"]) {
+    const f = fixture(markers);
+    const workspace = new Workspace(f.root);
+    const job = {
+      version: 1, jobId: randomUUID(), token: randomUUID(), workspaceId: workspace.id, workspaceRoot: workspace.root,
+      targetBuildId: f.releases[0].runtimeBuildId, originThreadId: randomUUID(), originHostId: "local", originProjectId: "test",
+      expectedRuntime: {}, createdAt: new Date(Date.now() - 120000).toISOString(),
+      expiresAt: new Date(Date.now() + (expired ? -60000 : 60000)).toISOString(), status: "waiting",
+    };
+    const claim = { version: 1, jobId: job.jobId, jobToken: job.token, workerToken: randomUUID(), pid: 987654, claimedAt: job.createdAt };
+    write(f.state, path.relative(f.state, activeFinalizerPath(f.state, workspace.id)), JSON.stringify(job));
+    write(f.state, path.relative(f.state, workerClaimPath(f.state, workspace.id)), JSON.stringify(claim));
+    return { ...f, workspace, job, claim };
+  }
+  it.each([false, true])("live exact finalizer with future field=%s only pins its target", extra => {
+    const f = legacyFixture(true, ["old", "other", "current"]);
+    if (extra) fs.writeFileSync(activeFinalizerPath(f.state, f.workspace.id), JSON.stringify({ ...f.job, future: true }));
+    const result = applyGc({ stateDir: f.state, retirement: { probeProcess: () => {} } });
+    expect(result.globalBlockerCount).toBe(0);
+    expect(result.totals.deletedCount).toBe(1);
+    expect(fs.existsSync(f.releases[0].releaseRoot)).toBe(true);
+    expect(fs.existsSync(f.releases[1].releaseRoot)).toBe(false);
+    expect(fs.existsSync(f.releases[2].releaseRoot)).toBe(true);
+    expect(fs.existsSync(activeFinalizerPath(f.state, f.workspace.id))).toBe(true);
+  });
+  it("dry plan preserves pin; apply retires dead expired worker then collects old release", () => {
+    const f = legacyFixture();
+    expect(planGc(f.state).releases.find(r => r.buildId === f.job.targetBuildId)?.disposition).not.toBe("delete-candidate");
+    expect(readFinalizerRetirement(f.state, f.workspace.id)).toBeNull();
+    const result = applyGc({ stateDir: f.state, retirement: { probeProcess: dead } });
+    expect(result.ok).toBe(true);
+    expect(result.totals.deletedCount).toBe(1);
+    expect(fs.existsSync(f.releases[0].releaseRoot)).toBe(false);
+    expect(fs.existsSync(f.releases[1].releaseRoot)).toBe(true);
+    expect(readFinalizerRetirement(f.state, f.workspace.id)).toMatchObject({ active: f.job, claim: f.claim });
+    expect(() => fs.openSync(workerClaimPath(f.state, f.workspace.id), "wx")).toThrow();
+  });
+  it.each(["nonexpired", "live", "unknown", "missing"])("%s keeps old release pinned", mode => {
+    const f = legacyFixture(mode !== "nonexpired");
+    if (mode === "missing") fs.unlinkSync(workerClaimPath(f.state, f.workspace.id));
+    const probeProcess = mode === "live" ? () => {} : mode === "unknown" ? () => { throw Object.assign(new Error("denied"), { code: "EPERM" }); } : dead;
+    const result = applyGc({ stateDir: f.state, retirement: { probeProcess } });
+    expect(result.ok).toBe(true);
+    expect(result.totals.deletedCount).toBe(0);
+    expect(fs.existsSync(f.releases[0].releaseRoot)).toBe(true);
+    expect(fs.existsSync(activeFinalizerPath(f.state, f.workspace.id))).toBe(true);
+    expect(readFinalizerRetirement(f.state, f.workspace.id)).toBeNull();
+  });
+  it("maintenance first rejects old worker rollout lock and does not retire live claim", () => {
+    const f = legacyFixture();
+    const result = applyGc({ stateDir: f.state, retirement: { probeProcess: () => {} }, hooks: {
+      afterFreshPlan() { expect(() => fs.openSync(path.join(f.state, "rollout.lock"), "wx")).toThrow(); },
+    } });
+    expect(result.ok).toBe(true);
+    expect(fs.existsSync(activeFinalizerPath(f.state, f.workspace.id))).toBe(true);
+    expect(fs.existsSync(f.releases[0].releaseRoot)).toBe(true);
+  });
+  it("old maintenance owner first makes cleanup entirely read-only", () => {
+    const f = legacyFixture();
+    const held = tryAcquireMaintenanceLock(f.state, "old-worker");
+    if (!held.ok) throw new Error("test lock busy");
+    const before = fs.readFileSync(activeFinalizerPath(f.state, f.workspace.id));
+    try {
+      const result = applyGc({ stateDir: f.state, retirement: { probeProcess: dead } });
+      expect(result.ok).toBe(false);
+      expect(fs.readFileSync(activeFinalizerPath(f.state, f.workspace.id))).toEqual(before);
+      expect(readFinalizerRetirement(f.state, f.workspace.id)).toBeNull();
+      expect(fs.existsSync(f.releases[0].releaseRoot)).toBe(true);
+    } finally { held.handle.release(); }
+  });
+});
+
+
+describe("GC final reference validation", () => {
+  it.each(["runtime", "pending"])("beforeTombstone new %s reference keeps release", kind => {
+    const { state, root, releases } = fixture(["old", "current"]);
+    const old = releases[0];
+    const workspaceId = new Workspace(root).id;
+    const result = applyGc({ stateDir: state, hooks: { beforeTombstone() {
+      if (kind === "runtime") writeRuntime(state, root, old.runtimeBuildId, workspaceId);
+      else writePending(state, root, old.runtimeBuildId, workspaceId);
+    } } });
+    expect(result.ok).toBe(false);
+    expect(result.totals.deletedCount).toBe(0);
+    expect(fs.existsSync(old.releaseRoot)).toBe(true);
+  });
 });

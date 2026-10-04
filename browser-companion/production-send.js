@@ -29,6 +29,7 @@ const IDENTITY_FIELDS = [
   "epoch",
   "message",
   "messageSha256",
+  "terminalWitness",
 ];
 
 function sameNull(a, b) {
@@ -90,6 +91,7 @@ export function validateProductionJournalCommit(current, proposed, expectedPrevi
       || proof.attemptId !== proposed.attemptId
       || proof.message !== proposed.message
       || proof.messageSha256 !== proposed.messageSha256
+      || !sameNull(proof.terminalWitness, proposed.terminalWitness)
     ) {
       return { ok: false, reason: "claim_proof_mismatch" };
     }
@@ -110,14 +112,14 @@ export function validateProductionJournalCommit(current, proposed, expectedPrevi
     if (
       proof.eventId !== current.eventId
       || proof.attemptId !== current.attemptId
-      || proof.status !== "observed"
+      || (proof.status !== "observed" && !(proof.status === "terminal_gone" && current.terminalWitness && proof.terminalWitness === current.terminalWitness))
     ) {
       return { ok: false, reason: "ack_proof_mismatch" };
     }
   }
 
   if (proposed.state !== "NONE") {
-    for (const field of ["eventId", "reservationId", "routeCanonical", "bindingId", "epoch"]) {
+    for (const field of ["eventId", "reservationId", "routeCanonical", "bindingId", "epoch", "terminalWitness"]) {
       if (current[field] != null && proposed[field] !== current[field]) {
         return { ok: false, reason: `identity_immutable:${field}` };
       }
@@ -140,7 +142,7 @@ export function validateProductionJournalCommit(current, proposed, expectedPrevi
 }
 
 /** Build a short-lived claim proof from a fully validated /begin-send DTO. */
-export function buildClaimProof({ eventId, reservationId, attemptId, message, messageSha256 }) {
+export function buildClaimProof({ eventId, reservationId, attemptId, message, messageSha256, terminalWitness }) {
   if (
     !eventId
     || !reservationId
@@ -152,13 +154,14 @@ export function buildClaimProof({ eventId, reservationId, attemptId, message, me
   ) {
     return null;
   }
-  return { eventId, reservationId, attemptId, message, messageSha256 };
+  if (terminalWitness !== undefined && (typeof terminalWitness !== "string" || !terminalWitness || terminalWitness.length > 4096)) return null;
+  return { eventId, reservationId, attemptId, message, messageSha256, ...(terminalWitness === undefined ? {} : { terminalWitness }) };
 }
 
 /** Build a short-lived ack proof from a fully validated /ack DTO. */
-export function buildAckProof({ eventId, attemptId, status }) {
-  if (!eventId || !attemptId || status !== "observed") return null;
-  return { eventId, attemptId, status: "observed" };
+export function buildAckProof({ eventId, attemptId, status, terminalWitness }) {
+  if (!eventId || !attemptId || (status !== "observed" && !(status === "terminal_gone" && typeof terminalWitness === "string" && terminalWitness.length > 0 && terminalWitness.length <= 4096))) return null;
+  return { eventId, attemptId, status, ...(status === "terminal_gone" ? { terminalWitness } : {}) };
 }
 
 /**
@@ -216,6 +219,7 @@ export function reconcileClaimedAgainstServer(journal, inFlight) {
         attemptId: journal.attemptId,
         message: journal.message,
         messageSha256: journal.messageSha256,
+        ...(journal.terminalWitness === undefined ? {} : { terminalWitness: journal.terminalWitness }),
       }),
     };
   }
@@ -353,6 +357,7 @@ export function buildProductionRecoverRequest(owner, journal, inFlight) {
         attemptId: inFlight.attemptId ?? null,
         message: typeof inFlight.message === "string" ? inFlight.message : null,
         messageSha256: typeof inFlight.messageSha256 === "string" ? inFlight.messageSha256 : null,
+        ...(inFlight.terminalWitness === undefined ? {} : { terminalWitness: inFlight.terminalWitness }),
       }
     : null;
   return {
@@ -373,6 +378,7 @@ export function buildProductionRecoverRequest(owner, journal, inFlight) {
         epoch: journal.epoch ?? null,
         message: typeof journal.message === "string" ? journal.message : null,
         messageSha256: typeof journal.messageSha256 === "string" ? journal.messageSha256 : null,
+        ...(journal.terminalWitness === undefined ? {} : { terminalWitness: journal.terminalWitness }),
       },
       inFlight: safeInFlight,
     },
@@ -483,6 +489,7 @@ export function sanitizeInFlightForRecovery(inFlight) {
     attemptId: inFlight.attemptId ?? null,
     message: typeof inFlight.message === "string" ? inFlight.message : null,
     messageSha256: typeof inFlight.messageSha256 === "string" ? inFlight.messageSha256 : null,
+    ...(inFlight.terminalWitness === undefined ? {} : { terminalWitness: inFlight.terminalWitness }),
   };
 }
 
@@ -620,4 +627,15 @@ export function evaluateServerObservedCloseout(input) {
     return { ok: false, reason: "server_observed_mismatch" };
   }
   return { ok: true, action: "server_observed_clear" };
+}
+
+/** An authenticated exact terminal-gone response retires local state, never proves observation. */
+export function evaluateTerminalGoneCloseout({ journal, inFlight, serverTerminal } = {}) {
+  if (inFlight != null || !journal || !["CLAIMED", "COMPOSER_WRITE_INTENT", "SEND_DISPATCH_INTENT", "OUTCOME_UNKNOWN", "OBSERVED_PENDING_ACK"].includes(journal.state))
+    return { ok: false, reason: "terminal_gone_not_eligible" };
+  if (typeof journal.terminalWitness !== "string" || !journal.terminalWitness || journal.terminalWitness.length > 4096 ||
+      !journal.eventId || !journal.attemptId || serverTerminal?.status !== "terminal_gone" ||
+      serverTerminal.eventId !== journal.eventId || serverTerminal.attemptId !== journal.attemptId)
+    return { ok: false, reason: "terminal_gone_identity_mismatch" };
+  return { ok: true, action: "terminal_gone_clear" };
 }

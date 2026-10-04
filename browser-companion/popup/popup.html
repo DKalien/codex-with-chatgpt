@@ -67,6 +67,11 @@
       <div class="row"><div class="label">自动回流</div><div class="value" id="user-autonomy-status">检查中…</div></div>
       <div class="note" id="user-action-hint">正在检查连接状态…</div>
     </section>
+    <section class="card" aria-label="消息与任务概览">
+      <div class="section-title">消息与任务</div>
+      <div id="operations-summary" class="note" style="white-space:pre-line">正在只读查询两端状态…</div>
+      <a href="../operations/operations.html" target="_blank" rel="noopener" style="color:#a8c7fa">打开任务面板 →</a>
+    </section>
     <button id="connect-chat" class="primary">连接当前对话</button>
     <label class="note" style="display:flex;gap:8px;align-items:flex-start;color:#fdd663;">
       <input type="checkbox" id="autonomy-arm-confirm" style="margin-top:2px;" />
@@ -231,5 +236,7 @@
   </main>
   <script src="../route-global.js"></script>
   <script src="popup.js"></script>
+  <script src="../operations/view.js"></script>
+  <script src="operations-summary.js"></script>
 </body>
 </html>

@@ -13,6 +13,7 @@ import { cleanup, isolateStateDir } from "./helpers.js";
 let dir: string;
 const workspace = { id: "desktop_test", root: process.cwd() };
 const target = { threadId: "01a00000-0000-7000-8000-000000000001", projectId: "project_test", hostId: "local" as const };
+const runtimeFence = { desktopPid: 1001, desktopExe: "C:\\Program Files\\ChatGPT\\ChatGPT.exe", desktopCreation: "1000001", appServerPid: 1002, appServerExe: "C:\\Program Files\\ChatGPT\\codex.exe", appServerCreation: "1000002" };
 let bindingId: string;
 let send: ReturnType<typeof vi.fn>;
 let close: ReturnType<typeof vi.fn>;
@@ -28,7 +29,8 @@ beforeEach(async () => {
   dir = isolateStateDir();
   send = vi.fn(async () => ({ threadId: target.threadId, turnId: randomUUID() }));
   close = vi.fn();
-  vi.spyOn(desktopIpc, "inspect").mockResolvedValue({ ...target, workspaceRoot: workspace.root, cwd: workspace.root, title: "明确绑定的测试任务" } as never);
+  vi.spyOn(desktopIpc, "inspect").mockResolvedValue({ ...target, workspaceRoot: workspace.root, cwd: workspace.root, title: "明确绑定的测试任务", runtimeFence } as never);
+  vi.spyOn(desktopIpc, "discoverForBinding").mockResolvedValue({ ...target, workspaceRoot: workspace.root, cwd: workspace.root, title: "明确绑定的测试任务", runtimeFence } as never);
   vi.spyOn(desktopIpc, "prepare").mockImplementation(async () => ({ send, close }));
   vi.spyOn(desktopIpc, "currentExecution").mockRejectedValue(new DesktopError("DESKTOP_STATE_UNAVAILABLE", "无 active turn"));
   vi.spyOn(desktopIpc, "inspectActiveExecution").mockRejectedValue(new DesktopError("DESKTOP_STATE_UNAVAILABLE", "无 active turn"));
@@ -66,7 +68,7 @@ describe("Desktop 持久化投递", () => {
     enableDesktop(workspace, bindingId);
     const activeTurnId = "01a00000-0000-7000-8000-000000000002";
     seedReceiptBackedTail(activeTurnId);
-    const active = { ...target, workspaceRoot: workspace.root, cwd: workspace.root, title: "tail", runtimeStatus: "active", activeTurnId };
+    const active = { ...target, workspaceRoot: workspace.root, cwd: workspace.root, title: "tail", runtimeStatus: "active", activeTurnId, runtimeFence };
     vi.mocked(desktopIpc.inspectActiveExecution).mockResolvedValue(active as never);
     vi.mocked(desktopIpc.prepare)
       .mockRejectedValueOnce(new DesktopError("DESKTOP_BUSY", "busy"))
@@ -120,7 +122,7 @@ describe("Desktop 持久化投递", () => {
 
     const activeTurnId = "01a00000-0000-7000-8000-000000000002";
     seedReceiptBackedTail(activeTurnId);
-    const active = { ...target, workspaceRoot: workspace.root, cwd: workspace.root, title: "tail", runtimeStatus: "active", activeTurnId };
+    const active = { ...target, workspaceRoot: workspace.root, cwd: workspace.root, title: "tail", runtimeStatus: "active", activeTurnId, runtimeFence };
     vi.mocked(desktopIpc.inspectActiveExecution).mockResolvedValue(active as never);
     vi.mocked(desktopIpc.prepare)
       .mockRejectedValueOnce(new DesktopError("DESKTOP_BUSY", "busy"))
@@ -135,7 +137,7 @@ describe("Desktop 持久化投递", () => {
     expect(readDesktop(workspace.id)?.deliveries.find(item => item.commandId === "resolved_unknown")?.deliveryStatus).toBe("outcome_unknown");
   });
 
-  it("行政 resolution 与 send receipt 交错时不接受原投递", async () => {
+  it("send receipt 仍在途时行政 resolution fail closed；原投递只提交一次", async () => {
     enableDesktop(workspace, bindingId);
     const started = deferred<void>();
     const release = deferred<{ threadId: string; turnId: string }>();
@@ -148,19 +150,18 @@ describe("Desktop 持久化投递", () => {
     await started.promise;
 
     const preview = previewOutcomeResolution(workspace, commandId);
-    resolveOutcomeUnknown(workspace, commandId, preview.confirmationSha256);
+    expect(() => resolveOutcomeUnknown(workspace, commandId, preview.confirmationSha256)).toThrow(expect.objectContaining({ code: "COMMAND_CLEANUP_BUSY" }));
     const turnId = randomUUID();
     release.resolve({ threadId: target.threadId, turnId });
 
     const result = await sending;
-    expect(result.deliveryStatus).toBe("outcome_unknown");
-    expect(readDesktop(workspace.id)?.deliveries.find(item => item.commandId === commandId)).toMatchObject({ deliveryStatus: "outcome_unknown" });
-    expect(readDesktop(workspace.id)?.deliveries.find(item => item.commandId === commandId)).not.toHaveProperty("turnId");
-    expect(readOutcomeResolutions(workspace.id)).toHaveLength(1);
+    expect(result.deliveryStatus).toBe("accepted");
+    expect(readDesktop(workspace.id)?.deliveries.find(item => item.commandId === commandId)).toMatchObject({ deliveryStatus: "accepted", turnId });
+    expect(readOutcomeResolutions(workspace.id)).toHaveLength(0);
     expect(send).toHaveBeenCalledTimes(1);
   });
 
-  it("行政 resolution 与可确定 rejected 交错时不改写原投递", async () => {
+  it("send 仍在途时行政 resolution fail closed；确定 rejected 仍可安全提交", async () => {
     enableDesktop(workspace, bindingId);
     const started = deferred<void>();
     const release = deferred<void>();
@@ -174,21 +175,20 @@ describe("Desktop 持久化投递", () => {
     await started.promise;
 
     const preview = previewOutcomeResolution(workspace, commandId);
-    resolveOutcomeUnknown(workspace, commandId, preview.confirmationSha256);
+    expect(() => resolveOutcomeUnknown(workspace, commandId, preview.confirmationSha256)).toThrow(expect.objectContaining({ code: "COMMAND_CLEANUP_BUSY" }));
     release.resolve();
 
     const result = await sending;
-    expect(result.deliveryStatus).toBe("outcome_unknown");
-    expect(readDesktop(workspace.id)?.deliveries.find(item => item.commandId === commandId)).toMatchObject({ deliveryStatus: "outcome_unknown" });
-    expect(readDesktop(workspace.id)?.deliveries.find(item => item.commandId === commandId)).not.toHaveProperty("errorCode");
-    expect(readOutcomeResolutions(workspace.id)).toHaveLength(1);
+    expect(result.deliveryStatus).toBe("rejected");
+    expect(readDesktop(workspace.id)?.deliveries.find(item => item.commandId === commandId)).toMatchObject({ deliveryStatus: "rejected", errorCode: "DESKTOP_BUSY" });
+    expect(readOutcomeResolutions(workspace.id)).toHaveLength(0);
     expect(send).toHaveBeenCalledTimes(1);
   });
 
   it("unrelated busy 不等待且不创建 delivery/send", async () => {
     enableDesktop(workspace, bindingId);
     const inspectActiveExecution = vi.mocked(desktopIpc.inspectActiveExecution);
-    inspectActiveExecution.mockResolvedValue({ ...target, workspaceRoot: workspace.root, cwd: workspace.root, title: "other", runtimeStatus: "active", activeTurnId: "01a00000-0000-7000-8000-000000000002" } as never);
+    inspectActiveExecution.mockResolvedValue({ ...target, workspaceRoot: workspace.root, cwd: workspace.root, title: "other", runtimeStatus: "active", activeTurnId: "01a00000-0000-7000-8000-000000000002", runtimeFence } as never);
     vi.mocked(desktopIpc.prepare).mockRejectedValue(new DesktopError("DESKTOP_BUSY", "busy"));
     const sleep = vi.fn(async () => {});
     await expect(sendDesktop(workspace, input(), "client", () => {}, { timeoutMs: 1000, pollMs: 1, sleep })).rejects.toMatchObject({ code: "DESKTOP_BUSY" });
@@ -216,7 +216,7 @@ describe("Desktop 持久化投递", () => {
       }
       vi.mocked(desktopIpc.inspectActiveExecution).mockResolvedValue({
         ...target, workspaceRoot: workspace.root, cwd: workspace.root, title: "tail",
-        runtimeStatus: "active", activeTurnId,
+        runtimeStatus: "active", activeTurnId, runtimeFence,
       } as never);
       vi.mocked(desktopIpc.prepare).mockRejectedValue(new DesktopError("DESKTOP_BUSY", "busy"));
       const sleep = vi.fn(async () => {});
@@ -233,7 +233,7 @@ describe("Desktop 持久化投递", () => {
     enableDesktop(workspace, bindingId);
     const activeTurnId = "01a00000-0000-7000-8000-000000000002";
     seedReceiptBackedTail(activeTurnId);
-    vi.mocked(desktopIpc.inspectActiveExecution).mockResolvedValue({ ...target, workspaceRoot: workspace.root, cwd: workspace.root, title: "tail", runtimeStatus: "active", activeTurnId } as never);
+    vi.mocked(desktopIpc.inspectActiveExecution).mockResolvedValue({ ...target, workspaceRoot: workspace.root, cwd: workspace.root, title: "tail", runtimeStatus: "active", activeTurnId, runtimeFence } as never);
     vi.mocked(desktopIpc.prepare).mockRejectedValue(new DesktopError("DESKTOP_BUSY", "busy"));
     let now = 0;
     const sleep = vi.fn(async () => { now += 10; });
@@ -248,8 +248,8 @@ describe("Desktop 持久化投递", () => {
     seedReceiptBackedTail(activeTurnId);
     vi.mocked(desktopIpc.prepare).mockRejectedValue(new DesktopError("DESKTOP_BUSY", "busy"));
     vi.mocked(desktopIpc.inspectActiveExecution)
-      .mockResolvedValueOnce({ ...target, workspaceRoot: workspace.root, cwd: workspace.root, title: "tail", runtimeStatus: "active", activeTurnId } as never)
-      .mockResolvedValueOnce({ ...target, workspaceRoot: workspace.root, cwd: workspace.root, title: "new", runtimeStatus: "active", activeTurnId: "01a00000-0000-7000-8000-000000000003" } as never);
+      .mockResolvedValueOnce({ ...target, workspaceRoot: workspace.root, cwd: workspace.root, title: "tail", runtimeStatus: "active", activeTurnId, runtimeFence } as never)
+      .mockResolvedValueOnce({ ...target, workspaceRoot: workspace.root, cwd: workspace.root, title: "new", runtimeStatus: "active", activeTurnId: "01a00000-0000-7000-8000-000000000003", runtimeFence } as never);
     const sleep = vi.fn(async () => {});
     await expect(sendDesktop(workspace, input({ commandId: "next_command" }), "client", () => {}, { timeoutMs: 1000, pollMs: 1, sleep })).rejects.toMatchObject({ code: "DESKTOP_BUSY" });
     expect(sleep).toHaveBeenCalledTimes(1);
@@ -261,7 +261,7 @@ describe("Desktop 持久化投递", () => {
     enableDesktop(workspace, bindingId);
     const activeTurnId = "01a00000-0000-7000-8000-000000000002";
     seedReceiptBackedTail(activeTurnId);
-    vi.mocked(desktopIpc.inspectActiveExecution).mockResolvedValue({ ...target, workspaceRoot: workspace.root, cwd: workspace.root, title: "tail", runtimeStatus: "active", activeTurnId } as never);
+    vi.mocked(desktopIpc.inspectActiveExecution).mockResolvedValue({ ...target, workspaceRoot: workspace.root, cwd: workspace.root, title: "tail", runtimeStatus: "active", activeTurnId, runtimeFence } as never);
     vi.mocked(desktopIpc.prepare).mockRejectedValue(new DesktopError("DESKTOP_BUSY", "busy"));
     let calls = 0;
     const authorize = () => { calls += 1; if (calls === 2) disableDesktop(workspace); };
@@ -274,7 +274,7 @@ describe("Desktop 持久化投递", () => {
     enableDesktop(workspace, bindingId);
     const activeTurnId = "01a00000-0000-7000-8000-000000000002";
     seedReceiptBackedTail(activeTurnId);
-    vi.mocked(desktopIpc.inspectActiveExecution).mockResolvedValue({ ...target, workspaceRoot: workspace.root, cwd: workspace.root, title: "tail", runtimeStatus: "active", activeTurnId } as never);
+    vi.mocked(desktopIpc.inspectActiveExecution).mockResolvedValue({ ...target, workspaceRoot: workspace.root, cwd: workspace.root, title: "tail", runtimeStatus: "active", activeTurnId, runtimeFence } as never);
     vi.mocked(desktopIpc.prepare).mockRejectedValue(new DesktopError("DESKTOP_BUSY", "busy"));
     let calls = 0;
     const authorize = () => { calls += 1; if (calls === 2) throw new DesktopError("INSUFFICIENT_SCOPE", "授权已撤销"); };
@@ -287,7 +287,7 @@ describe("Desktop 持久化投递", () => {
     enableDesktop(workspace, bindingId);
     const activeTurnId = "01a00000-0000-7000-8000-000000000002";
     seedReceiptBackedTail(activeTurnId);
-    vi.mocked(desktopIpc.inspectActiveExecution).mockResolvedValue({ ...target, workspaceRoot: workspace.root, cwd: workspace.root, title: "tail", runtimeStatus: "active", activeTurnId } as never);
+    vi.mocked(desktopIpc.inspectActiveExecution).mockResolvedValue({ ...target, workspaceRoot: workspace.root, cwd: workspace.root, title: "tail", runtimeStatus: "active", activeTurnId, runtimeFence } as never);
     vi.mocked(desktopIpc.prepare).mockRejectedValue(new DesktopError("DESKTOP_BUSY", "busy"));
     await expect(sendDesktop(workspace, input({ commandId: "next_command" }), "client", () => {
       updateDesktop(workspace.id, state => {
@@ -321,7 +321,7 @@ describe("Desktop 持久化投递", () => {
     enableDesktop(workspace, bindingId);
     const activeTurnId = "01a00000-0000-0000-0000-000000000002";
     seedReceiptBackedTail(activeTurnId);
-    vi.mocked(desktopIpc.inspectActiveExecution).mockResolvedValue({ ...target, workspaceRoot: workspace.root, cwd: workspace.root, title: "tail", runtimeStatus: "active", activeTurnId } as never);
+    vi.mocked(desktopIpc.inspectActiveExecution).mockResolvedValue({ ...target, workspaceRoot: workspace.root, cwd: workspace.root, title: "tail", runtimeStatus: "active", activeTurnId, runtimeFence } as never);
     vi.mocked(desktopIpc.prepare)
       .mockRejectedValueOnce(new DesktopError("DESKTOP_BUSY", "busy"))
       .mockRejectedValueOnce(new DesktopError("DESKTOP_APPROVAL_PENDING", "approval"));
@@ -419,21 +419,21 @@ describe("Desktop 持久化投递", () => {
     expect(status).not.toContain("deliveryId");
   });
 
-  it("并发预提交命中已有记录时复用唯一 deliveryId 且只发送一次", async () => {
+  it("并发同 command fail closed；fresh replay 复用唯一 deliveryId 且只发送一次", async () => {
     enableDesktop(workspace, bindingId);
-    const bothPrepared = deferred<void>();
+    const prepared = deferred<void>();
     const release = deferred<void>();
-    let prepareCount = 0;
     vi.mocked(desktopIpc.prepare).mockImplementation(async () => {
-      if (++prepareCount === 2) bothPrepared.resolve();
+      prepared.resolve();
       await release.promise;
       return { send, close };
     });
 
-    const requests = [sendDesktop(workspace, input(), "client"), sendDesktop(workspace, input(), "client")];
-    await bothPrepared.promise;
+    const first = sendDesktop(workspace, input(), "client");
+    await prepared.promise;
+    await expect(sendDesktop(workspace, input(), "client")).rejects.toMatchObject({ code: "COMMAND_CLEANUP_BUSY" });
     release.resolve();
-    const results = await Promise.all(requests);
+    const results = [await first, await sendDesktop(workspace, input(), "client")];
     const deliveries = readDesktop(workspace.id)?.deliveries.filter(item => item.commandId === "command_1") ?? [];
     expect(deliveries).toHaveLength(1);
     expect(deliveries[0].deliveryId).toMatch(/^[0-9a-f-]{36}$/i);
@@ -638,7 +638,7 @@ desktopIpc.prepare = async () => {
   }};
 };
 try { await sendDesktop(${JSON.stringify(workspace)}, ${JSON.stringify(input())}, 'client'); }
-catch(e) { if (!['DESKTOP_STORE_BUSY','DESKTOP_OUTCOME_UNRESOLVED'].includes(e.code)) throw e; }
+catch(e) { if (!['DESKTOP_STORE_BUSY','DESKTOP_OUTCOME_UNRESOLVED','COMMAND_CLEANUP_BUSY'].includes(e.code)) throw e; }
 `);
   return script;
 }

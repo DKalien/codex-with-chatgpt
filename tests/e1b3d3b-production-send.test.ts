@@ -31,6 +31,7 @@ import {
   commitJournalDurably,
   findExactObservedEvent,
   evaluateServerObservedCloseout,
+  evaluateTerminalGoneCloseout,
   isServerObservedCloseoutEligible,
   SERVER_OBSERVED_CLOSEOUT_STATES,
 } from "../browser-companion/production-send.js";
@@ -727,6 +728,43 @@ describe("E1b3d3b production runtime happy path", () => {
 });
 
 describe("E1b3d3b recovery", () => {
+  it("R5h manual force cleanup exact witness releases local fences without claiming observed", () => {
+    const terminal = { status: "terminal_gone", eventId: EVENT_ID, attemptId: ATTEMPT };
+    const base = { ...claimedJournal(), terminalWitness: "signed-attempt" };
+    for (const state of ["CLAIMED", "COMPOSER_WRITE_INTENT", "SEND_DISPATCH_INTENT", "OUTCOME_UNKNOWN", "OBSERVED_PENDING_ACK"]) {
+      expect(evaluateTerminalGoneCloseout({ journal: { ...base, state }, inFlight: null, serverTerminal: terminal })).toEqual({ ok: true, action: "terminal_gone_clear" });
+    }
+    for (const serverTerminal of [{ ...terminal, status: "observed" }, { ...terminal, eventId: "f".repeat(32) }, { ...terminal, attemptId: RES_ID }])
+      expect(evaluateTerminalGoneCloseout({ journal: base, inFlight: null, serverTerminal }).ok).toBe(false);
+    expect(evaluateTerminalGoneCloseout({ journal: { ...base, terminalWitness: undefined }, inFlight: null, serverTerminal: terminal }).ok).toBe(false);
+    expect(evaluateTerminalGoneCloseout({ journal: base, inFlight: { status: "claimed" }, serverTerminal: terminal }).ok).toBe(false);
+  });
+  it("R5h lost ACK response closes exact terminal-gone witness with zero second write/click", async () => {
+    let journal = markClaimed(markSendIntent(reservedJournal(), {}), {
+      eventId: EVENT_ID, reservationId: RES_ID, attemptId: ATTEMPT,
+      message: MESSAGE, messageSha256: MESSAGE_SHA, terminalWitness: "exact-signed-attempt-witness",
+    });
+    journal = markComposerWriteIntent(journal, {});
+    journal = markSendDispatchIntent(journal, {});
+    journal = markObservedPendingAck(journal, {});
+    const spy = makeSpies({ journal, inFlight: null, ackObserved: async () => ({
+      eventId: EVENT_ID, attemptId: ATTEMPT, status: "terminal_gone",
+    }) });
+    expect((await recoverProductionSend(spy)).ok).toBe(true);
+    expect(spy.journal.state).toBe("NONE");
+    expect(spy.calls).toMatchObject({ write: 0, click: 0, beginSend: 0 });
+    const witnessless = makeSpies({ journal: { ...journal, terminalWitness: undefined }, ackObserved: async () => ({
+      eventId: EVENT_ID, attemptId: ATTEMPT, status: "terminal_gone",
+    }) });
+    expect((await recoverProductionSend(witnessless)).ok).toBe(false);
+    expect(witnessless.journal.state).toBe("OBSERVED_PENDING_ACK");
+    const wrongAttempt = makeSpies({ journal, ackObserved: async () => ({
+      eventId: EVENT_ID, attemptId: RES_ID, status: "terminal_gone",
+    }) });
+    expect((await recoverProductionSend(wrongAttempt)).ok).toBe(false);
+    expect(wrongAttempt.journal.state).toBe("OBSERVED_PENDING_ACK");
+  });
+
   it("allows CLAIMED recovery across a legacy Project slug alias", async () => {
     const spy = makeSpies({
       journal: aliasClaimedJournal(PROJECT_SLUG),
@@ -3616,5 +3654,145 @@ describe("E1b3d3b2 exact message-body observation", () => {
     const findBody = src.slice(findStart, findStart + 2000);
     expect(findBody).toMatch(/canonicalTurnBodyMatch/);
     expect(findBody).not.toMatch(/includes\(want\)|startsWith\(want\)/);
+  });
+});
+
+describe("command29 rich USER paragraph observation", () => {
+  // Content-free live shape: one paragraph with SPAN/BR, an external link with
+  // an empty block favicon, then a sibling spacer and collapse button. Desktop
+  // message text is synthetic; neither user content nor runtime IDs are saved.
+  const url = "https://example.test/health";
+  const message = `${MESSAGE}Summary: healthy ${url}.\nDone.  Preserve  spaces.`;
+  type Node = ReturnType<typeof element>;
+  function text(value: string): any {
+    return { nodeType: 3, nodeValue: value, textContent: value, childNodes: [] };
+  }
+  function element(tag: string, children: any[] = [], className = ""): any {
+    const node: any = {
+      nodeType: 1, tagName: tag, className, childNodes: children,
+      style: { display: ["DIV", "P", "BUTTON", "svg"].includes(tag) ? "block" : "inline", visibility: "visible", opacity: "1", textTransform: "none" },
+      attrs: {}, parentElement: null,
+      classList: { contains: (name: string) => className.split(/\s+/).includes(name) },
+      getAttribute(name: string) { return this.attrs[name] ?? null; },
+      closest: () => null,
+      get children() { return this.childNodes.filter((child: any) => child.nodeType === 1); },
+      get firstChild() { return this.childNodes[0]; },
+      get textContent() { return this.childNodes.map((child: any) => child.textContent).join(""); },
+      get innerText() { return this.rendered ?? (tag === "BR" ? "\n" : this.childNodes.map((child: any) => child.nodeType === 3 ? child.nodeValue : child.innerText).join("")); },
+    };
+    for (const child of children) child.parentElement = node;
+    node.ownerDocument = { defaultView: { getComputedStyle: (child: any) => child.style } };
+    return node;
+  }
+  function fixture() {
+    const label = element("SPAN", [element("SPAN", [text(url)])], "Label-example");
+    const icon = element("SPAN", [element("SPAN", [element("SPAN", [element("svg", [element("path")])]), element("IMG")])], "IconContainer-example");
+    const link = element("A", [element("SPAN", [icon, label], "Mention-example")], "ExternalMarkdownLink-example InlineMentionFocusRing-example");
+    link.attrs["aria-hidden"] = "true"; // Actual visible link is AT-hidden, not CSS-hidden.
+    const lines = message.split("\n"), nodes: Node[] = [];
+    for (const [i, line] of lines.entries()) {
+      if (i) nodes.push(element("BR"));
+      if (line.includes(url)) {
+        const [before, after] = line.split(url);
+        nodes.push(element("SPAN", [text(before)]), link, text(after));
+      } else nodes.push(element("SPAN", [text(line)]));
+    }
+    const paragraph = element("P", nodes);
+    paragraph.rendered = message.replace(url, `\n${url}`); // Empty block favicon inserts a layout LF.
+    const rich = element("DIV", [paragraph], "MarkdownRoot-example rich-text-user-turn");
+    const spacer = element("SPAN", [text("+")]); spacer.style.display = "block";
+    const bubble = element("DIV", [element("DIV", [element("DIV", [element("DIV", [rich]), spacer]), element("BUTTON", [text("More")])])]);
+    bubble.attrs["data-user-message-bubble"] = "true";
+    bubble.rendered = `${paragraph.innerText}\n\n+\nMore`;
+    return { bubble, paragraph, rich, link, label, icon, doc: { querySelectorAll: () => [bubble] } as never };
+  }
+  const find = (f: ReturnType<typeof fixture>, expected = message) =>
+    findCanonicalUserTurn(f.doc, { message: expected, attemptId: ATTEMPT });
+
+  it("reconstructs real BRs and inline link text despite the favicon LF and outer controls", () => {
+    const f = fixture();
+    expect(f.paragraph.innerText.length - message.length).toBe(1);
+    expect(f.bubble.innerText.length - message.length).toBe(9);
+    expect(f.paragraph.textContent).toBe(message.replace(/\n/g, ""));
+    expect(find(f).ok).toBe(true);
+    const classic: Record<string, any> = { normalizeCanonicalDomText };
+    vm.runInNewContext(fs.readFileSync(path.join(distCompanion, "turn-observer-global.js"), "utf8"), classic);
+    expect(classic.findCanonicalUserTurn(f.doc, { message, attemptId: ATTEMPT }).ok).toBe(true);
+  });
+
+  it.each(["hidden", "opacity", "display", "transform", "inline_text", "unknown", "extra_paragraph", "missing_BR", "changed_text", "link_label", "hidden_link_text"])(
+    "%s cannot be normalized into observed", kind => {
+      const f = fixture();
+      if (kind === "hidden") f.rich.style.visibility = "hidden";
+      if (kind === "opacity") f.paragraph.style.opacity = "0";
+      if (kind === "display") f.paragraph.childNodes[0].style.display = "block";
+      if (kind === "transform") f.paragraph.style.textTransform = "uppercase";
+      if (kind === "inline_text") f.paragraph.childNodes[0].rendered = "different";
+      if (kind === "unknown") f.paragraph.childNodes[0].tagName = "EM";
+      if (kind === "extra_paragraph") f.rich.childNodes.push(element("P", [text("extra")]));
+      if (kind === "missing_BR") f.paragraph.childNodes.splice(1, 1);
+      if (kind === "changed_text") f.paragraph.childNodes[0].childNodes[0].nodeValue = "[different]";
+      if (kind === "link_label") f.label.childNodes[0].childNodes[0].nodeValue = "example.test";
+      if (kind === "hidden_link_text") f.link.rendered = "";
+      expect(find(f).ok).toBe(false);
+    },
+  );
+
+  it("does not fold spaces, trim, trust href or take textContent as general authority", () => {
+    const f = fixture();
+    f.link.attrs.href = url;
+    expect(find(f, message.replace("Preserve  spaces", "Preserve spaces")).ok).toBe(false);
+    expect(find(f, message + " ").ok).toBe(false);
+    f.label.childNodes[0].childNodes[0].nodeValue = "different";
+    expect(find(f).ok).toBe(false);
+  });
+
+  it("requires modern USER proof, exact parent marker and one body", () => {
+    const f = fixture();
+    f.bubble.attrs["data-user-message-bubble"] = null;
+    f.bubble.attrs["data-message-author-role"] = "assistant";
+    expect(find(f).ok).toBe(false);
+    f.bubble.attrs["data-user-message-bubble"] = "true";
+    f.bubble.rendered = "no marker";
+    expect(find(f).ok).toBe(false);
+    f.bubble.rendered = `${message}UI`;
+    f.bubble.childNodes.push(fixture().rich);
+    expect(find(f).ok).toBe(false);
+  });
+
+  it("exhaustion, unknown styling and DOM faults fail closed", () => {
+    const f = fixture();
+    f.paragraph.childNodes.push(...Array.from({ length: 129 }, () => element("SPAN")));
+    expect(find(f).ok).toBe(false);
+    const large = fixture();
+    large.bubble.childNodes.push(...Array.from({ length: 65 }, () => element("DIV")));
+    expect(find(large).ok).toBe(false);
+    const unknown = fixture();
+    unknown.bubble.ownerDocument.defaultView.getComputedStyle = () => { throw Error("unknown"); };
+    expect(find(unknown).ok).toBe(false);
+  });
+
+  it("baseline and ambiguous independent turns still reject", () => {
+    const a = fixture(), b = fixture();
+    expect(findCanonicalUserTurn(a.doc, { message, attemptId: ATTEMPT, baseline: snapshotUserTurns(a.doc) }).ok).toBe(false);
+    expect(findCanonicalUserTurn({ querySelectorAll: () => [a.bubble, b.bubble] } as never, { message, attemptId: ATTEMPT }).reason).toBe("ambiguous");
+  });
+
+  it("late-positive recovery ACKs the same attempt with zero write/click/reserve/begin-send", async () => {
+    const f = fixture();
+    const journal = markClaimed(markSendIntent(reservedJournal(), {}), {
+      eventId: EVENT_ID, reservationId: RES_ID, attemptId: ATTEMPT, message, messageSha256: MESSAGE_SHA,
+    });
+    const spy = makeSpies({
+      journal: markOutcomeUnknown(journal, {}), doc: f.doc, findCanonicalUserTurn,
+      inFlight: { status: "outcome_unknown", eventId: EVENT_ID, reservationId: RES_ID, attemptId: ATTEMPT, message, messageSha256: MESSAGE_SHA },
+    });
+    const result = await recoverProductionSend(spy);
+    expect(result.ok).toBe(true);
+    expect(result.action).toBe("late_positive_observed_then_acked");
+    expect(spy.calls).toMatchObject({ write: 0, click: 0, beginSend: 0, ack: 1 });
+    expect(spy.journal.state).toBe("NONE");
+    expect(result.zeroWrite).toBe(true);
+    expect(result.zeroClick).toBe(true);
   });
 });

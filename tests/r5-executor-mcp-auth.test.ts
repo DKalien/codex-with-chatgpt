@@ -23,6 +23,14 @@ import { cleanup, isolateStateDir, makeTmpDir } from "./helpers.js";
 const THREAD_ID = "01a00000-0000-7000-8000-000000000001";
 const PROJECT_ID = "project_test";
 const PLANNER_CONVERSATION_ID = "018c0000-0000-7000-8000-00000000c2c1";
+const runtimeFence = {
+  desktopPid: 1001,
+  desktopExe: "C:\\Program Files\\ChatGPT\\ChatGPT.exe",
+  desktopCreation: "1000001",
+  appServerPid: 1002,
+  appServerExe: "C:\\Program Files\\ChatGPT\\codex.exe",
+  appServerCreation: "1000002",
+};
 
 let root: string;
 let stateDir: string;
@@ -94,6 +102,7 @@ function seedVerifiedPlannerRoute(): void {
 
 async function bindGenericAndDesktop(): Promise<string> {
   vi.spyOn(desktopIpc, "inspect").mockResolvedValue({ title: "测试 Desktop 会话" } as never);
+  vi.spyOn(desktopIpc, "discoverForBinding").mockResolvedValue({ title: "测试 Desktop 会话", runtimeFence } as never);
   const desktop = await bindDesktop(bridge.workspace, {
     threadId: THREAD_ID,
     hostId: "local",

@@ -111,6 +111,10 @@ export function parseConnectFlow(value) {
       canonicalRoute: value.ownerWitness.canonicalRoute,
     };
   }
+  // Diagnostic only; never changes whether a dispatch may be retried.
+  if (typeof value.failureReason === "string" && /^[a-zA-Z][a-zA-Z0-9_]{0,95}$/.test(value.failureReason)) {
+    parsed.failureReason = value.failureReason;
+  }
   return parsed;
 }
 
@@ -201,6 +205,25 @@ export function observeConnectTakeover(current, identity, now = Date.now()) {
   return { ...parsed, state: "WAITING_TAKEOVER", updatedAt: now };
 }
 
+/** Explicit Connect may verify a lost bootstrap response, never resend it.
+ * The successor transport is durable only after authenticated /rebind/init.
+ * A route-attestation unknown (non-null challenge) is deliberately excluded.
+ */
+export function connectTakeoverRecoveryStage(current, transport, routeCanonical) {
+  const flow = parseConnectFlow(current);
+  if (!["TAKEOVER_DISPATCH", "OUTCOME_UNKNOWN"].includes(flow.state)
+    || !validTakeoverIdentity(flow)
+    || !connectFlowTargetMatches(flow, transport?.workspaceId, routeCanonical)) return null;
+  if (transport?.rebindPending !== true) {
+    return connectFlowMatches(flow, takeoverConnectFlowIdentity(transport, routeCanonical))
+      ? "verify_takeover" : null;
+  }
+  const successor = beginConnectAttestation(
+    { ...flow, state: "WAITING_TAKEOVER" }, connectFlowIdentity(transport),
+  );
+  return successor.ok ? "verify_page" : null;
+}
+
 export function beginConnectAttestation(current, identity, ownerWitnessOrNow = null, maybeNow = Date.now()) {
   // Compatibility: legacy third argument is numeric `now`.
   const ownerWitness = ownerWitnessOrNow && typeof ownerWitnessOrNow === "object" ? ownerWitnessOrNow : null;
@@ -278,7 +301,7 @@ export function refreshExplicitConnectOwnerWitness(current, owner, now = Date.no
   if (!validOwnerWitness(owner)) {
     return { ok: false, reason: "owner_witness_invalid", flow: parsed };
   }
-  if (parsed.state !== "ATTEST_REQUESTED" && parsed.state !== "COMPLETE_REQUESTED") {
+  if (!["ATTEST_REQUESTED", "COMPLETE_REQUESTED", "DONE"].includes(parsed.state)) {
     return { ok: false, reason: "connect_not_pending", flow: parsed };
   }
   return {

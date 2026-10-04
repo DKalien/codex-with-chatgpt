@@ -33,6 +33,10 @@ export interface GcPlanTotals {
 
 export interface GcPlan {
   ok: boolean;
+  safety: "clean" | "degraded" | "blocked";
+  globalBlockerCount: number;
+  localIssueCount: number;
+  issueDetails: ReleaseReferenceIssue[];
   stateDir: string;
   releases: ReleasePlanItem[];
   issues: string[];
@@ -166,12 +170,15 @@ function scanReleases(releaseDir: string, graph: ReleaseReferenceGraph): {
 
   let names: string[];
   try {
+    const stat = fs.lstatSync(releaseDir);
+    if (!stat.isDirectory() || stat.isSymbolicLink() || fs.realpathSync(releaseDir) !== releaseDir) throw new Error("release directory");
     names = fs.readdirSync(releaseDir).sort();
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
       return { items, presentBuildIds, localIssues };
     }
-    throw error;
+    localIssues.push({ code: "release_root_invalid", source: "releases", message: "release 目录无法完整安全读取", scope: { kind: "global" } });
+    return { items, presentBuildIds, localIssues };
   }
 
   for (const name of names) {
@@ -216,7 +223,7 @@ function scanReleases(releaseDir: string, graph: ReleaseReferenceGraph): {
     }
 
     if (localError) {
-      localIssues.push({ code, source: `releases/${name}`, message: localError });
+      localIssues.push({ code, source: `releases/${name}`, message: localError, scope: { kind: "release", entryName: name } });
       items.push({ buildId: name, path: itemPath, disposition: "unknown", reasons: [code], logicalBytes });
       continue;
     }
@@ -234,8 +241,8 @@ function scanReleases(releaseDir: string, graph: ReleaseReferenceGraph): {
 }
 
 /**
- * 只读 GC plan。任何未知/损坏/悬空引用都 fail closed：
- * 原本 delete-candidate 一律降为 unknown，bytesCandidateReclaimable = 0。
+ * Read-only plan: only unscoped authority uncertainty blocks all candidates.
+ * ok=false still reports every warning for existing CLI/install consumers.
  */
 export function planGc(stateDir = getStateDir()): GcPlan {
   const root = path.resolve(stateDir);
@@ -246,7 +253,9 @@ export function planGc(stateDir = getStateDir()): GcPlan {
   markDanglingReferences(graph, presentBuildIds);
   const allIssues: ReleaseReferenceIssue[] = [...graph.issues, ...localIssues];
   const issueMessages = allIssues.map(formatReferenceIssue);
-  const blocked = issueMessages.length > 0;
+  const globalBlockerCount = allIssues.filter(item => item.scope.kind === "global").length;
+  const localIssueCount = allIssues.length - globalBlockerCount;
+  const blocked = globalBlockerCount > 0;
 
   if (blocked) {
     for (const item of items) {
@@ -268,7 +277,11 @@ export function planGc(stateDir = getStateDir()): GcPlan {
   };
 
   return {
-    ok: !blocked,
+    ok: allIssues.length === 0,
+    safety: blocked ? "blocked" : localIssueCount ? "degraded" : "clean",
+    globalBlockerCount,
+    localIssueCount,
+    issueDetails: allIssues,
     stateDir: root,
     releases: items,
     issues: issueMessages,
@@ -279,6 +292,9 @@ export function planGc(stateDir = getStateDir()): GcPlan {
 /** doctor / CLI 摘要；不自动清理。 */
 export function gcPlanSummary(plan: GcPlan): {
   ok: boolean;
+  safety: GcPlan["safety"];
+  globalBlockerCount: number;
+  localIssueCount: number;
   releaseCount: number;
   bytesTotal: number;
   bytesKept: number;
@@ -288,6 +304,9 @@ export function gcPlanSummary(plan: GcPlan): {
 } {
   return {
     ok: plan.ok,
+    safety: plan.safety,
+    globalBlockerCount: plan.globalBlockerCount,
+    localIssueCount: plan.localIssueCount,
     releaseCount: plan.totals.releaseCount,
     bytesTotal: plan.releases.reduce((sum, item) => sum + item.logicalBytes, 0),
     bytesKept: plan.totals.bytesKept,

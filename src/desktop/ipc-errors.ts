@@ -38,6 +38,7 @@ export const SAFE_CODES = new Set([
   "DESKTOP_CURRENT_CONTEXT_INVALID",
   "DESKTOP_CONFIRMATION_CANCELLED",
   "DESKTOP_RECONCILIATION_CONFLICT",
+  "DESKTOP_RUNTIME_FENCE_MISSING",
 ]);
 
 export const ERROR_MESSAGES: Record<string, string> = {
@@ -67,6 +68,7 @@ export const ERROR_MESSAGES: Record<string, string> = {
   DESKTOP_CURRENT_CONTEXT_INVALID: "无法确认当前 Desktop 会话身份或来源；未绑定或启用。",
   DESKTOP_CONFIRMATION_CANCELLED: "本机确认被取消或未完成；未绑定或启用。",
   DESKTOP_RECONCILIATION_CONFLICT: "Desktop 历史无法唯一核对；未恢复结果或修改投递状态。",
+  DESKTOP_RUNTIME_FENCE_MISSING: "Desktop 绑定缺少运行时身份 fence；请重新绑定当前 Desktop 会话。",
 };
 
 function messageFor(code: string, fallback = "DESKTOP_INTERNAL_ERROR"): string {

@@ -5,6 +5,7 @@ import {
   type DesktopResultOwnership,
   type DesktopResultOwnershipExpectation,
   type DesktopResultActivityMarkerObservation,
+  type DesktopRuntimeFence,
   type DesktopTarget,
 } from "./ipc.js";
 import {
@@ -12,6 +13,7 @@ import {
   readDesktop,
   type DesktopDelivery,
 } from "./store.js";
+import { SAFE_CODES } from "./ipc-errors.js";
 import {
   CurrentDesktopDelivery,
   DesktopResultError,
@@ -161,8 +163,8 @@ export async function readCurrentResultContext(workspace: DesktopResultWorkspace
   return context as DesktopResultContext;
 }
 
-export async function inspectResultActivityMarker(target: DesktopTarget): Promise<DesktopResultActivityMarkerObservation> {
-  return desktopIpc.inspectResultActivityMarker(target);
+export async function inspectResultActivityMarker(target: DesktopTarget, runtimeFence: DesktopRuntimeFence): Promise<DesktopResultActivityMarkerObservation> {
+  return desktopIpc.inspectResultActivityMarker(target, runtimeFence);
 }
 
 export function resolveReceiptFinalizationTarget(draft: ReceiptFinalizationDraft): DesktopTarget {
@@ -178,6 +180,14 @@ export function resolveReceiptFinalizationTarget(draft: ReceiptFinalizationDraft
   if (deliveries.length !== 1) {
     throw new DesktopError("DESKTOP_RECONCILIATION_CONFLICT", "pending receipt has no unique accepted delivery.");
   }
+  if (draft.version === 3) {
+    const accepted = deliveries[0]!;
+    const expected = draft.ownershipSnapshot;
+    if (accepted.deliveryId !== expected.deliveryId || accepted.intent !== expected.intent ||
+        accepted.messageBytes !== expected.messageBytes || accepted.messageSha256 !== expected.messageSha256) {
+      throw new DesktopError("DESKTOP_RECONCILIATION_CONFLICT", "pending receipt accepted identity changed.");
+    }
+  }
   return {
     threadId: state.binding.threadId,
     hostId: state.binding.hostId,
@@ -190,7 +200,20 @@ export async function inspectReceiptFinalizationFence(
   target: DesktopTarget,
   draft: ReceiptFinalizationMarkedDraft,
 ): Promise<ReceiptFinalizationFenceResult> {
-  const fence = await desktopIpc.inspectResultTerminalFence(target, draft.marker);
+  const state = readDesktop(draft.workspaceId);
+  if (!state || state.workspaceRoot !== draft.workspaceRoot || !state.runtimeFence) {
+    throw new DesktopError("DESKTOP_RUNTIME_FENCE_MISSING", "Desktop 绑定缺少运行时身份 fence；请重新绑定当前 Desktop 会话。");
+  }
+  let fence: ReceiptFinalizationFenceResult;
+  if (draft.version === 3) {
+    const observed = await inspectPendingReceipt(target, draft, state.runtimeFence);
+    if (!finalizationOwnershipMatches(draft.ownershipSnapshot, observed)) {
+      throw new DesktopError("DESKTOP_PROCESS_CHANGED", "pending receipt ownership chain changed.");
+    }
+    fence = observed;
+  } else {
+    fence = await desktopIpc.inspectResultTerminalFence(target, draft.marker, state.runtimeFence);
+  }
   if (fence.threadId !== target.threadId || fence.hostId !== target.hostId ||
       fence.projectId !== target.projectId || fence.workspaceRoot !== target.workspaceRoot) {
     throw new DesktopError("DESKTOP_PROCESS_CHANGED", "Desktop receipt terminal fence identity changed.");
@@ -205,7 +228,11 @@ export async function inspectLegacyReceiptFinalizationContext(
   target: DesktopTarget,
   draft: ReceiptFinalizationDraft,
 ): Promise<DesktopResultContext> {
-  const context = await desktopIpc.inspectResultContext(target);
+  const state = readDesktop(draft.workspaceId);
+  if (!state || state.workspaceRoot !== draft.workspaceRoot || !state.runtimeFence) {
+    throw new DesktopError("DESKTOP_RUNTIME_FENCE_MISSING", "Desktop 绑定缺少运行时身份 fence；请重新绑定当前 Desktop 会话。");
+  }
+  const context = await desktopIpc.inspectResultContext(target, state.runtimeFence);
   if (context.threadId !== draft.threadId || context.workspaceRoot !== draft.workspaceRoot ||
       context.projectId !== target.projectId || context.hostId !== target.hostId) {
     throw new DesktopError("DESKTOP_PROCESS_CHANGED", "Desktop receipt result context identity changed.");
@@ -220,8 +247,15 @@ export async function assertResultActivityMarker(
   resultTurnId: string,
 ): Promise<DesktopResultActivityMarkerObservation> {
   let observed: DesktopResultActivityMarkerObservation;
-  try { observed = await inspectResultActivityMarker(target); }
-  catch { throw new DesktopResultError("DESKTOP_RESULT_CURRENT_EXECUTION", "无法建立 Desktop receipt activity marker；未写入 pending receipt。 "); }
+  const state = readDesktop(workspace.id);
+  if (!state || state.workspaceRoot !== workspace.root || !state.runtimeFence) {
+    throw new DesktopResultError("DESKTOP_RESULT_CURRENT_EXECUTION", "Desktop 绑定缺少运行时身份 fence；未写入 pending receipt。 ");
+  }
+  try { observed = await desktopIpc.inspectResultActivityMarker(target, state.runtimeFence); }
+  catch (error) {
+    const code = error instanceof DesktopError && SAFE_CODES.has(error.code) ? error.code : "DESKTOP_INTERNAL_ERROR";
+    throw new DesktopResultError("DESKTOP_RESULT_CURRENT_EXECUTION", `无法建立 Desktop receipt activity marker（${code}）；未写入 pending receipt。 `);
+  }
   const marker = observed.marker;
   if (observed.threadId !== expectedThreadId || observed.workspaceRoot !== workspace.root || observed.hostId !== target.hostId ||
       observed.projectId !== target.projectId || observed.resultTurnId !== resultTurnId || observed.resultTurnStatus !== "inProgress" ||
@@ -256,6 +290,21 @@ export function finalizationOwnershipSnapshot(
   };
 }
 
+function inspectPendingReceipt(
+  target: DesktopTarget,
+  draft: Extract<ReceiptFinalizationMarkedDraft, { version: 3 }>,
+  runtimeFence: DesktopRuntimeFence,
+) {
+  const snapshot = draft.ownershipSnapshot;
+  const expectation: DesktopResultOwnershipExpectation = {
+    workspaceId: draft.workspaceId, commandId: draft.commandId, intent: snapshot.intent,
+    messageBytes: snapshot.messageBytes, messageSha256: snapshot.messageSha256,
+    originTurnId: draft.originTurnId,
+    ...(snapshot.deliveryId === undefined ? {} : { deliveryId: snapshot.deliveryId }),
+  };
+  return desktopIpc.inspectPendingReceipt(target, expectation, draft.marker, runtimeFence);
+}
+
 function finalizationOwnershipMatches(snapshot: ReceiptFinalizationOwnershipSnapshot, ownership: DesktopResultOwnership): boolean {
   return snapshot.threadId === ownership.threadId && snapshot.hostId === ownership.hostId &&
     snapshot.projectId === ownership.projectId && snapshot.workspaceRoot === ownership.workspaceRoot &&
@@ -282,13 +331,16 @@ export async function assertFinalizationOwnership(
       snapshot.resultTurnId !== draft.resultTurnId || snapshot.resultTurnId !== draft.marker.resultTurnId) {
     throw new DesktopResultError("DESKTOP_RESULT_CURRENT_EXECUTION", "pending receipt ownership snapshot 身份不一致；拒绝写入。 ");
   }
-  const expectation: DesktopResultOwnershipExpectation = {
-    workspaceId: workspace.id, commandId: accepted.commandId, intent: accepted.intent,
-    messageBytes: accepted.messageBytes, messageSha256: accepted.messageSha256,
-    originTurnId: accepted.turnId, ...(accepted.deliveryId === undefined ? {} : { deliveryId: accepted.deliveryId }),
-  };
+  const state = readDesktop(workspace.id);
+  if (!state || state.workspaceRoot !== workspace.root || !state.runtimeFence) {
+    throw new DesktopResultError("DESKTOP_RESULT_CURRENT_EXECUTION", "Desktop 绑定缺少运行时身份 fence；拒绝写入。 ");
+  }
   let ownership: DesktopResultOwnership;
-  try { ownership = await desktopIpc.inspectResultOwnership(target, expectation); }
+  try {
+    const observed = await inspectPendingReceipt(target, draft, state.runtimeFence);
+    if (observed.fence !== "safe_terminal") throw new Error("terminal fence changed before commit");
+    ownership = observed;
+  }
   catch { throw new DesktopResultError("DESKTOP_RESULT_CURRENT_EXECUTION", "无法按精确 Desktop target 重新证明 pending receipt ownership；拒绝写入。 "); }
   if (ownership.resultTurnId !== draft.resultTurnId || !finalizationOwnershipMatches(snapshot, ownership)) {
     throw new DesktopResultError("DESKTOP_RESULT_CURRENT_EXECUTION", "pending receipt ownership chain 在终态期间发生漂移；拒绝写入。 ");

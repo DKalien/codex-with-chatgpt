@@ -7,6 +7,7 @@ import { cleanup, isolateStateDir } from "./helpers.js";
 
 const workspace = { id: "desktop_envelope_test", root: process.cwd() };
 const target = { threadId: "01a00000-0000-7000-8000-000000000001", projectId: "project_test", hostId: "local" as const };
+const runtimeFence = { desktopPid: 1001, desktopExe: "C:\\Program Files\\ChatGPT\\ChatGPT.exe", desktopCreation: "1000001", appServerPid: 1002, appServerExe: "C:\\Program Files\\ChatGPT\\codex.exe", appServerCreation: "1000002" };
 let stateDir: string;
 let bindingId: string;
 let sent: string[];
@@ -31,7 +32,8 @@ beforeEach(async () => {
     sent.push(message);
     return { threadId: target.threadId, turnId: randomUUID() };
   });
-  vi.spyOn(desktopIpc, "inspect").mockResolvedValue({ title: "固定 envelope 测试会话" } as never);
+  vi.spyOn(desktopIpc, "inspect").mockResolvedValue({ title: "固定 envelope 测试会话", runtimeFence } as never);
+  vi.spyOn(desktopIpc, "discoverForBinding").mockResolvedValue({ title: "固定 envelope 测试会话", runtimeFence } as never);
   vi.spyOn(desktopIpc, "prepare").mockResolvedValue({ send, close: vi.fn() } as never);
   bindingId = (await bindDesktop(workspace, target)).bindingId;
   enableDesktop(workspace, bindingId);

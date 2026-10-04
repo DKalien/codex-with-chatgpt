@@ -11,7 +11,9 @@ import { reconcileFeedbackOutbox } from "../src/feedback/projector.js";
 import { resolveConversationPrincipal } from "../src/mcp/conversation-principal.js";
 import { CODEX_FEEDBACK_SCOPE } from "../src/feedback/store.js";
 import { readActiveWebSinkBinding } from "../src/web-sink-control/index.js";
-import { cleanup, isolateStateDir, makeTmpDir } from "./helpers.js";
+import { isolateStateDir, makeTmpDir } from "./helpers.js";
+import { cleanupStrict } from "./strict-teardown.js";
+import { requestJson } from "./http-json.js";
 
 const ROUTE_A = "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111";
 const ROUTE_B = "https://chatgpt.com/c/22222222-2222-4222-8222-222222222222";
@@ -28,10 +30,8 @@ describe("R5c production Companion HTTP web-sink bind-current", () => {
     _meta: { "openai/session": "sess-A" },
   });
 
-  async function fetchJson(p: string, init: RequestInit = {}) {
-    const res = await fetch(`${base}${p}`, init);
-    const body = await res.json().catch(() => ({}));
-    return { status: res.status, body };
+  function fetchJson(p: string, init: Parameters<typeof requestJson>[1] = {}) {
+    return requestJson(`${base}${p}`, init);
   }
 
   async function pairAndVerify(route: string) {
@@ -90,8 +90,7 @@ describe("R5c production Companion HTTP web-sink bind-current", () => {
     await bridge.close();
     if (previousStateDir === undefined) delete process.env.C2C_STATE_DIR;
     else process.env.C2C_STATE_DIR = previousStateDir;
-    cleanup(wsRoot);
-    cleanup(stateDir);
+    await cleanupStrict(wsRoot, stateDir);
   });
 
   it("rejects missing or wrong credential with exactly 401", async () => {

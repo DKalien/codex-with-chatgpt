@@ -3,6 +3,8 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { Workspace, WorkspaceError } from "../workspace/manager.js";
 import { ensureDir, getStateDir } from "../config/paths.js";
+import { assertCleanupStoreFile, readCleanupJournal, withCommandOperation } from "../command-cleanup/fence.js";
+import { assertCleanupArtifacts, cleanupArtifact, CommandCleanupError, type CleanupArtifact, type CommandCleanupTarget } from "../command-cleanup/schema.js";
 import {
   RoutingError,
   commandDeliveryTransitionInputSchema,
@@ -288,8 +290,9 @@ export function createCommand(
   stateDir = getStateDir(),
 ): RoutingCommand {
   const parsed = commandInputSchema.parse(input);
-  return updateRouting(
-    identity,
+  const resolved = resolveWorkspaceIdentity(identity);
+  return withCommandOperation(resolved.id, parsed.commandId, () => updateRouting(
+    resolved,
     (previous) => {
       const state = previous ?? emptyState(identity);
       const existing = state.commands.find((item) => item.commandId === parsed.commandId);
@@ -327,7 +330,7 @@ export function createCommand(
       return { state: { ...state, commands: [...state.commands, command] }, result: command };
     },
     stateDir,
-  );
+  ), stateDir);
 }
 
 /** 持久化首次 Desktop delivery outcome；相同终态 replay 只读返回。 */
@@ -337,7 +340,8 @@ export function transitionCommandDelivery(
   stateDir = getStateDir(),
 ): RoutingCommand {
   const parsed = commandDeliveryTransitionInputSchema.parse(input);
-  return updateRouting(identity, (previous) => {
+  const resolved = resolveWorkspaceIdentity(identity);
+  return withCommandOperation(resolved.id, parsed.commandId, () => updateRouting(resolved, (previous) => {
     const state = previous ?? emptyState(identity);
     const command = state.commands.find((item) => item.commandId === parsed.commandId);
     if (!command) {
@@ -364,7 +368,7 @@ export function transitionCommandDelivery(
       },
       result: updated,
     };
-  }, stateDir);
+  }, stateDir), stateDir);
 }
 
 /**
@@ -385,7 +389,8 @@ export function reconcileCommandDeliveryFromDesktopProof(
   stateDir = getStateDir(),
 ): RoutingCommand {
   const commandId = routingCommandIdSchema.parse(input.commandId);
-  return updateRouting(identity, (previous) => {
+  const resolved = resolveWorkspaceIdentity(identity);
+  return withCommandOperation(resolved.id, commandId, () => updateRouting(resolved, (previous) => {
     const state = previous ?? emptyState(identity);
     const command = state.commands.find(item => item.commandId === commandId);
     if (!command) throw new RoutingError("ROUTING_COMMAND_NOT_FOUND", "Desktop recovery 引用的 Command 不存在。");
@@ -407,7 +412,7 @@ export function reconcileCommandDeliveryFromDesktopProof(
       state: { ...state, commands: state.commands.map(item => item.commandId === commandId ? updated : item) },
       result: updated,
     };
-  }, stateDir);
+  }, stateDir), stateDir);
 }
 
 /**
@@ -425,8 +430,9 @@ export function appendResultWithReplay(
   stateDir = getStateDir(),
 ): AppendResultOutcome {
   const parsed = resultInputSchema.parse(input);
-  return updateRouting<AppendResultOutcome>(
-    identity,
+  const resolved = resolveWorkspaceIdentity(identity);
+  return withCommandOperation(resolved.id, parsed.commandId, () => updateRouting<AppendResultOutcome>(
+    resolved,
     (previous) => {
       const state = previous ?? emptyState(identity);
       const command = state.commands.find((item) => item.commandId === parsed.commandId);
@@ -461,7 +467,54 @@ export function appendResultWithReplay(
       return { state: { ...state, results: [...state.results, result] }, result: { result, replayed: false } };
     },
     stateDir,
-  );
+  ), stateDir);
+}
+
+/** Cleanup-only semantic mutation. The caller must hold the command lifecycle fence and
+ * must remove independently persisted projections before this producer record. */
+export function deleteRoutingCommandAndResultsForCleanup(
+  target: CommandCleanupTarget,
+  expected: readonly CleanupArtifact[],
+): { commands: number; results: number } {
+  if (target.iteration !== 1) throw new CommandCleanupError("COMMAND_CLEANUP_INVALID", "只支持 cleanup iteration=1。");
+  const identity = resolveWorkspaceIdentity({ id: target.workspaceId, root: target.workspaceRoot });
+  const stateDir = target.stateDir ?? getStateDir();
+  assertCleanupStoreFile(routingFile(identity.id, stateDir), stateDir);
+  return withCommandOperation(identity.id, target.commandId, () => {
+    const journal = readCleanupJournal(identity.id, target.commandId, stateDir);
+    if (!journal || journal.workspaceRoot !== identity.root || journal.iteration !== target.iteration) {
+      throw new CommandCleanupError("COMMAND_CLEANUP_REQUIRED", "删除 Routing producer 前必须存在匹配的 cleanup_pending journal。");
+    }
+    const snapshotKeys = (items: readonly CleanupArtifact[]) => items
+      .map(item => `${item.kind}\0${item.id}\0${item.sha256}`).sort();
+    if (journal.phase === "snapshot_pending" ||
+        JSON.stringify(snapshotKeys(expected)) !== JSON.stringify(snapshotKeys(journal.artifacts))) {
+      throw new CommandCleanupError("COMMAND_CLEANUP_REQUIRED", "Routing producer 删除要求完成 snapshot 且 expected 必须等于 journal.artifacts。");
+    }
+    if (!readRouting(identity, stateDir)) return { commands: 0, results: 0 };
+    return updateRouting(identity, previous => {
+      if (!previous) return { state: emptyState(identity), result: { commands: 0, results: 0 } };
+      const commands = previous.commands.filter(item => item.commandId === target.commandId);
+      const results = previous.results.filter(item => item.commandId === target.commandId);
+      if (commands.length > 1 || results.some(item => item.iteration !== target.iteration)) {
+        throw new CommandCleanupError("COMMAND_CLEANUP_AMBIGUOUS", "Routing command/result 存在重复或 sibling iteration；fail closed。");
+      }
+      const artifacts = [
+        ...commands.map(item => cleanupArtifact("routing_command", item.commandId, item)),
+        ...results.map(item => cleanupArtifact("routing_result", item.resultId, item)),
+      ];
+      assertCleanupArtifacts(artifacts, expected);
+      if (commands.length === 0 && results.length === 0) {
+        return { state: previous, result: { commands: 0, results: 0 }, noWrite: true };
+      }
+      const next: RoutingState = {
+        ...previous,
+        commands: previous.commands.filter(item => item.commandId !== target.commandId),
+        results: previous.results.filter(item => item.commandId !== target.commandId),
+      };
+      return { state: next, result: { commands: commands.length, results: results.length } };
+    }, stateDir);
+  }, stateDir, true);
 }
 
 export function appendResult(
@@ -491,4 +544,24 @@ export function listResults(
   stateDir = getStateDir(),
 ): RoutingResult[] {
   return readRouting(identity, stateDir)?.results ?? [];
+}
+
+/** Core use-case holds command authority and proves no dispatch/receipt before this write. */
+export function cancelPendingCommand(identity: RoutingWorkspaceIdentity, commandId: string, stateDir = getStateDir()): RoutingCommand {
+  return withCommandOperation(identity.id, commandId, () => updateRouting(identity, previous => {
+    const command = previous?.commands.find(item => item.commandId === commandId);
+    if (!previous || !command || command.deliveryStatus !== "pending") throw new RoutingError("ROUTING_CANCEL_UNSAFE", "只有尚未投递的 pending 命令可取消。");
+    const now = new Date().toISOString();
+    const updated = { ...command, deliveryStatus: "rejected" as const, cancelledAt: now, updatedAt: now };
+    return { state: { ...previous, commands: previous.commands.map(item => item === command ? updated : item) }, result: updated };
+  }, stateDir), stateDir);
+}
+
+export function assertCommandNotCancelled(identity: RoutingWorkspaceIdentity, commandId: string, stateDir = getStateDir()): void {
+  // Legacy Desktop can operate before Routing exists. Its lifecycle lock also
+  // prevents the first cancellation writer from racing this absence check.
+  try { fs.lstatSync(path.join(stateDir, "routing")); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
+  if (readRouting(identity, stateDir)?.commands.some(item => item.commandId === commandId && item.cancelledAt))
+    throw new RoutingError("ROUTING_COMMAND_CANCELLED", "本机用户已取消该尚未发送的命令；禁止重新投递。");
 }

@@ -506,11 +506,11 @@ describe("E1b2 recovery / authStale / storage policy (final closeout)", () => {
   it("fetchCompanion preserves Response.ok for 200 success paths", () => {
     const sw = fs.readFileSync(path.join(projectRoot, "browser-companion", "service-worker.js"), "utf8");
     const fetchIdx = sw.indexOf("async function fetchCompanion");
-    const fetchBody = sw.slice(fetchIdx, fetchIdx + 700);
+    const fetchBody = sw.slice(fetchIdx, sw.indexOf("\n}", fetchIdx) + 2);
     expect(fetchBody).toMatch(/wrapFetchResponse/);
     // Callers must branch on res.ok, not only status===200
     const stateIdx = sw.indexOf("async function handleFetchState");
-    const stateBody = sw.slice(stateIdx, stateIdx + 900);
+    const stateBody = sw.slice(stateIdx, sw.indexOf("\nasync function handleReservePage", stateIdx));
     expect(stateBody).toMatch(/res\.ok/);
     expect(stateBody).not.toMatch(/status\s*===\s*200/);
     const reserveIdx = sw.indexOf("async function handleReservePage");

@@ -3,6 +3,7 @@ import path from "node:path";
 import { randomUUID, createHash } from "node:crypto";
 import { z } from "zod";
 import { ensureDir, getStateDir } from "../config/paths.js";
+import { withCommandOperation } from "../command-cleanup/fence.js";
 import {
   isTrustedDesktopReceipt,
   readExecutionRecordsStrict,
@@ -26,6 +27,7 @@ import {
 const claimSchema = z.object({
   version: z.literal(1), draftId: z.string().uuid(), pid: z.number().int().positive(), claimedAt: z.string().datetime(),
 }).strict();
+type ReceiptFinalizationClaim = z.infer<typeof claimSchema>;
 
 function baseDir(stateDir = getStateDir()): string {
   return path.join(path.resolve(stateDir), "desktop-receipt-finalization");
@@ -98,6 +100,14 @@ export function readReceiptFinalizationAlert(
   return readRegular(receiptFinalizationAlertPath(stateDir, workspaceId, commandId), receiptFinalizationAlertSchema);
 }
 
+export function readReceiptFinalizationClaim(
+  stateDir: string,
+  workspaceId: string,
+  commandId: string,
+): ReceiptFinalizationClaim | null {
+  return readRegular(receiptFinalizationClaimPath(stateDir, workspaceId, commandId), claimSchema);
+}
+
 export function findReceiptFinalizationDraft(
   stateDir: string,
   workspaceId: string,
@@ -129,17 +139,28 @@ export function listReceiptFinalizationAlerts(stateDir = getStateDir()): Receipt
   }
 }
 
+type StageReceiptFinalizationInput = Omit<ReceiptFinalizationDraft, "version" | "draftId" | "createdAt" | "expiresAt" | "inputDigest" | "input" | "marker" | "ownershipSnapshot"> &
+  ({ inputMaterial: string } | {
+    input: ReceiptFinalizationInput;
+    marker: ReceiptFinalizationMarker;
+    ownershipSnapshot: ReceiptFinalizationOwnershipSnapshot;
+  });
+
 export function stageReceiptFinalization(
-  input: Omit<ReceiptFinalizationDraft, "version" | "draftId" | "createdAt" | "expiresAt" | "inputDigest" | "input" | "marker" | "ownershipSnapshot"> &
-    ({ inputMaterial: string } | {
-      input: ReceiptFinalizationInput;
-      marker: ReceiptFinalizationMarker;
-      ownershipSnapshot: ReceiptFinalizationOwnershipSnapshot;
-    }),
+  input: StageReceiptFinalizationInput,
   options: { stateDir?: string; nowMs?: number } = {},
 ): ReceiptFinalizationDraft {
   const stateDir = options.stateDir ?? getStateDir();
-  const now = options.nowMs ?? Date.now();
+  return withCommandOperation(input.workspaceId, input.commandId,
+    () => stageReceiptFinalizationLocked(input, stateDir, options.nowMs), stateDir);
+}
+
+function stageReceiptFinalizationLocked(
+  input: StageReceiptFinalizationInput,
+  stateDir: string,
+  nowMs?: number,
+): ReceiptFinalizationDraft {
+  const now = nowMs ?? Date.now();
   const isV3 = !("inputMaterial" in input);
   let sanitizedInput: ReceiptFinalizationInput | undefined;
   let marker: ReceiptFinalizationMarker | undefined;
@@ -193,19 +214,23 @@ export function writeReceiptFinalizationAlert(
   options: { stateDir?: string; nowMs?: number } = {},
 ): ReceiptFinalizationAlert {
   const stateDir = options.stateDir ?? getStateDir();
-  const alert = receiptFinalizationAlertSchema.parse({
-    version: 1,
-    alertId: draft.draftId,
-    workspaceId: draft.workspaceId,
-    commandId: draft.commandId,
-    reason,
-    occurredAt: new Date(options.nowMs ?? Date.now()).toISOString(),
-  });
-  const file = receiptFinalizationAlertPath(stateDir, draft.workspaceId, draft.commandId);
-  const prior = readRegular(file, receiptFinalizationAlertSchema);
-  if (prior) return prior;
-  if (!writeExclusive(file, alert)) return readRegular(file, receiptFinalizationAlertSchema) ?? alert;
-  return alert;
+  return withCommandOperation(draft.workspaceId, draft.commandId, () => {
+    const current = readReceiptFinalizationDraft(stateDir, draft.workspaceId, draft.commandId);
+    if (current?.draftId !== draft.draftId) throw new Error("pending receipt draft changed; refusing to recreate alert");
+    const alert = receiptFinalizationAlertSchema.parse({
+      version: 1,
+      alertId: draft.draftId,
+      workspaceId: draft.workspaceId,
+      commandId: draft.commandId,
+      reason,
+      occurredAt: new Date(options.nowMs ?? Date.now()).toISOString(),
+    });
+    const file = receiptFinalizationAlertPath(stateDir, draft.workspaceId, draft.commandId);
+    const prior = readRegular(file, receiptFinalizationAlertSchema);
+    if (prior) return prior;
+    if (!writeExclusive(file, alert)) return readRegular(file, receiptFinalizationAlertSchema) ?? alert;
+    return alert;
+  }, stateDir);
 }
 
 export function writeReceiptFinalizationWorkerFailureAlert(
@@ -213,42 +238,66 @@ export function writeReceiptFinalizationWorkerFailureAlert(
   options: { stateDir?: string } = {},
 ): ReceiptFinalizationAlert | null {
   const stateDir = options.stateDir ?? getStateDir();
-  // Reuse the existing v1 reason so older strict alert readers remain compatible.
-  try {
-    const records = readExecutionRecordsStrict(draft.workspaceId, stateDir)
-      .filter(record => record.commandId === draft.commandId);
-    if (records.length === 1 && isTrustedDesktopReceipt(records[0]!, draft.commandId)) return null;
-  } catch { /* Unable to prove a receipt; keep the bounded alert. */ }
-  return writeReceiptFinalizationAlert(draft, "terminality_unknown", { stateDir });
+  return withCommandOperation(draft.workspaceId, draft.commandId, () => {
+    // Reuse the existing v1 reason so older strict alert readers remain compatible.
+    try {
+      const records = readExecutionRecordsStrict(draft.workspaceId, stateDir)
+        .filter(record => record.commandId === draft.commandId);
+      if (records.length === 1 && isTrustedDesktopReceipt(records[0]!, draft.commandId)) return null;
+    } catch { /* Unable to prove a receipt; keep the bounded alert. */ }
+    return writeReceiptFinalizationAlert(draft, "terminality_unknown", { stateDir });
+  }, stateDir);
 }
 
 export function acquireReceiptFinalizationClaim(stateDir: string, draft: ReceiptFinalizationDraft): boolean {
-  const file = receiptFinalizationClaimPath(stateDir, draft.workspaceId, draft.commandId);
-  const claim = { version: 1, draftId: draft.draftId, pid: process.pid, claimedAt: new Date().toISOString() };
-  if (writeExclusive(file, claim)) return true;
-  const prior = readRegular(file, claimSchema);
-  if (prior && Date.now() - Date.parse(prior.claimedAt) < 2 * 60_000) return false;
-  if (prior) fs.rmSync(file, { force: true });
-  if (writeExclusive(file, claim)) return true;
-  const raced = readRegular(file, claimSchema);
-  if (raced && Date.now() - Date.parse(raced.claimedAt) < 2 * 60_000) return false;
-  throw new Error("receipt finalization claim changed while acquiring it");
+  return withCommandOperation(draft.workspaceId, draft.commandId, () => {
+    const currentDraft = readReceiptFinalizationDraft(stateDir, draft.workspaceId, draft.commandId);
+    if (currentDraft?.draftId !== draft.draftId) return false;
+    const file = receiptFinalizationClaimPath(stateDir, draft.workspaceId, draft.commandId);
+    const claim = { version: 1 as const, draftId: draft.draftId, pid: process.pid, claimedAt: new Date().toISOString() };
+    if (writeExclusive(file, claim)) return true;
+    const prior = readRegular(file, claimSchema);
+    if (prior) {
+      if (prior.draftId !== draft.draftId) throw new ReceiptFinalizationStateError(file);
+      const identity = fs.lstatSync(file);
+      const raw = fs.readFileSync(file, "utf8");
+      // Elapsed time cannot prove worker death. PID reuse/EPERM/unknown retain
+      // the claim; only exact ESRCH plus unchanged file permits recovery.
+      try { process.kill(prior.pid, 0); return false; }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") return false; }
+      const fresh = readRegular(file, claimSchema);
+      const stat = fs.lstatSync(file);
+      if (JSON.stringify(fresh) !== JSON.stringify(prior) || stat.dev !== identity.dev || stat.ino !== identity.ino ||
+          fs.readFileSync(file, "utf8") !== raw) throw new ReceiptFinalizationStateError(file);
+      fs.unlinkSync(file);
+    }
+    if (writeExclusive(file, claim)) return true;
+    const raced = readRegular(file, claimSchema);
+    if (raced) return false;
+    throw new Error("receipt finalization claim changed while acquiring it");
+  }, stateDir);
 }
 
 export function releaseReceiptFinalizationClaim(stateDir: string, draft: ReceiptFinalizationDraft): void {
-  const file = receiptFinalizationClaimPath(stateDir, draft.workspaceId, draft.commandId);
-  const claim = readRegular(file, claimSchema);
-  if (claim?.draftId === draft.draftId && claim.pid === process.pid) fs.rmSync(file, { force: true });
+  withCommandOperation(draft.workspaceId, draft.commandId, () => {
+    const file = receiptFinalizationClaimPath(stateDir, draft.workspaceId, draft.commandId);
+    const claim = readRegular(file, claimSchema);
+    if (claim?.draftId === draft.draftId && claim.pid === process.pid) fs.rmSync(file, { force: true });
+  }, stateDir);
 }
 
 export function removeReceiptFinalizationDraft(stateDir: string, draft: ReceiptFinalizationDraft): void {
-  const file = receiptFinalizationDraftPath(stateDir, draft.workspaceId, draft.commandId);
-  const current = readRegular(file, receiptFinalizationDraftSchema);
-  if (current?.draftId === draft.draftId) fs.rmSync(file, { force: true });
+  withCommandOperation(draft.workspaceId, draft.commandId, () => {
+    const file = receiptFinalizationDraftPath(stateDir, draft.workspaceId, draft.commandId);
+    const current = readRegular(file, receiptFinalizationDraftSchema);
+    if (current?.draftId === draft.draftId) fs.rmSync(file, { force: true });
+  }, stateDir);
 }
 
 export function removeReceiptFinalizationAlert(stateDir: string, draft: ReceiptFinalizationDraft): void {
-  const file = receiptFinalizationAlertPath(stateDir, draft.workspaceId, draft.commandId);
-  const current = readRegular(file, receiptFinalizationAlertSchema);
-  if (current?.alertId === draft.draftId) fs.rmSync(file, { force: true });
+  withCommandOperation(draft.workspaceId, draft.commandId, () => {
+    const file = receiptFinalizationAlertPath(stateDir, draft.workspaceId, draft.commandId);
+    const current = readRegular(file, receiptFinalizationAlertSchema);
+    if (current?.alertId === draft.draftId) fs.rmSync(file, { force: true });
+  }, stateDir);
 }

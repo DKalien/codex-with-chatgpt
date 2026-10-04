@@ -15,7 +15,8 @@ import { cleanup, isolateStateDir } from "./helpers.js";
 
 const workspace = { id: "executor_core_test", root: process.cwd() };
 const target = { threadId: "01a00000-0000-7000-8000-000000000011", hostId: "local" as const, projectId: "executor_project" };
-const info = { ...target, workspaceRoot: workspace.root, title: "Executor Core 测试会话" };
+const runtimeFence = { desktopPid: 1001, desktopExe: "C:\\Program Files\\ChatGPT\\ChatGPT.exe", desktopCreation: "1000001", appServerPid: 1002, appServerExe: "C:\\Program Files\\ChatGPT\\codex.exe", appServerCreation: "1000002" };
+const info = { ...target, workspaceRoot: workspace.root, title: "Executor Core 测试会话", runtimeFence };
 let stateDirectory: string;
 
 afterEach(() => {

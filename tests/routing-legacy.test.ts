@@ -31,6 +31,14 @@ const HEX32 = "a".repeat(32);
 const HEX32_OTHER = "c".repeat(32);
 const HEX64 = "b".repeat(64);
 const CURRENT_PAYLOAD = "交付当前 route：中文 + ✅";
+const runtimeFence = {
+  desktopPid: 1001,
+  desktopExe: "C:\\Program Files\\ChatGPT\\ChatGPT.exe",
+  desktopCreation: "1000001",
+  appServerPid: 1002,
+  appServerExe: "C:\\Program Files\\ChatGPT\\codex.exe",
+  appServerCreation: "1000002",
+};
 
 // Existing transport coverage uses one stable request principal; dedicated tests exercise distinct fingerprints.
 function ensureCurrentPlannerRoute(workspace: RoutingWorkspaceIdentity, fingerprint = HEX32) {
@@ -97,6 +105,7 @@ function writeLegacyStates(options: {
       workspaceId: identity.id,
       workspaceRoot: identity.root,
       enabled: options.desktopEnabled ?? true,
+      runtimeFence,
       binding: options.desktopBindingPresent === false ? null : {
         threadId: options.desktopThreadId ?? THREAD_ID,
         hostId: "local",

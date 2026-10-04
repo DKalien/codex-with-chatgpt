@@ -2,73 +2,51 @@ import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { Command } from "commander";
 import { assessRolloutIdle, currentCodexThread } from "../src/core/rollout-idle.js";
 import {
   activeFinalizerPath,
-  assertCanonicalTargetEntry,
-  claimFinalizerWorker,
-  commitFinalizerResult,
-  projectFinalizerExecution,
+  finalizerRetirementPath,
+  retireLegacyFinalizers,
+  readFinalizerRetirement,
   readActiveFinalizer,
   readFinalizerResult,
-  releaseFinalizerWorkerClaim,
-  runFinalizerAttempt,
-  schedulePostTurnFinalizer,
-  FinalizerActiveReleaseError,
-  spawnFinalizerWorker,
-  stripWorkerEnv,
   workerClaimPath,
   type ActiveFinalizer,
 } from "../src/core/post-turn-finalizer.js";
+import * as finalizerModule from "../src/core/post-turn-finalizer.js";
+import { tryAcquireMaintenanceLock } from "../src/core/maintenance-lock.js";
+import { registerPostTurnFinalizerCommands } from "../src/cli/post-turn-finalizer.js";
 import { collectReleaseReferences } from "../src/core/release-references.js";
 import { planGc } from "../src/core/gc-plan.js";
-import { installCore } from "../src/core/install.js";
-import * as installModule from "../src/core/install.js";
 import { desktopIpc } from "../src/desktop/ipc.js";
 import { desktopFile } from "../src/desktop/store.js";
 import { Workspace } from "../src/workspace/manager.js";
-import { rollout } from "../src/core/rollout.js";
-import { getRuntimeBuildId } from "../src/build-id.js";
-import * as runtimeModule from "../src/bridge/runtime.js";
-import * as daemon from "../src/process/daemon.js";
-import { buildCoreFixture, cleanup, isolateStateDir, makeTmpDir, write } from "./helpers.js";
+import { cleanup, isolateStateDir, makeTmpDir, write } from "./helpers.js";
 
 let stateDir: string;
 let wsRoot: string;
 let workspace: Workspace;
 const THREAD = "01a00000-0000-7000-8000-000000000011";
+const runtimeFence = {
+  desktopPid: 1001,
+  desktopExe: "C:\\Program Files\\ChatGPT\\ChatGPT.exe",
+  desktopCreation: "1000001",
+  appServerPid: 1002,
+  appServerExe: "C:\\Program Files\\ChatGPT\\codex.exe",
+  appServerCreation: "1000002",
+};
 
 function writeDesktopBinding(threadId = THREAD): void {
   const file = desktopFile(workspace.id);
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, JSON.stringify({
     version: 1, workspaceId: workspace.id, workspaceRoot: workspace.root, revision: 1, enabled: true,
+    runtimeFence,
     binding: { threadId, hostId: "local", projectId: "proj-finalizer", bindingId: randomUUID(), title: "B", boundAt: "2026-09-13T00:00:00.000Z" },
     deliveries: [],
   }));
   fs.writeFileSync(`${file}.initialized`, "1\n");
-}
-
-function installTwo(): { oldId: string; newId: string } {
-  write(wsRoot, "bin/c2c.js", "// f");
-  write(wsRoot, "dist/cli/index.js", "// f");
-  write(wsRoot, "package.json", '{"type":"module"}');
-  fs.mkdirSync(path.join(wsRoot, "node_modules"), { recursive: true });
-  const oldId = installCore(wsRoot, buildCoreFixture(wsRoot)).runtimeBuildId;
-  write(wsRoot, "dist/cli/index.js", "// newer");
-  const newId = installCore(wsRoot, buildCoreFixture(wsRoot)).runtimeBuildId;
-  return { oldId, newId };
-}
-
-function proofAssessment() {
-  return {
-    idle: false,
-    blockers: [{ kind: "self_turn" as const, threadId: THREAD }],
-    selfBusyProof: {
-      threadId: THREAD, hostId: "local", projectId: "proj-finalizer",
-      workspaceRoot: wsRoot, runtimeStatus: "active" as const,
-    },
-  };
 }
 
 function job(overrides: Partial<ActiveFinalizer> = {}): ActiveFinalizer {
@@ -100,7 +78,6 @@ afterEach(() => {
   delete process.env.C2C_STATE_DIR;
   delete process.env.CODEX_THREAD_ID;
 });
-
 describe("self-busy proof", () => {
   it("CODEX_THREAD_ID alone 不能 schedule", async () => {
     const assessment = await assessRolloutIdle(workspace, { pairingActive: false });
@@ -176,373 +153,31 @@ describe("self-busy proof", () => {
   });
 });
 
-describe("schedule / no-clobber / launch", () => {
-  it("新 job scheduled 自动 spawn 一次；existing 不再 spawn", async () => {
-    const { newId } = installTwo();
-    let spawnCount = 0;
-    const spawnImpl = ((cmd: string, args: string[], opts: Record<string, unknown>) => {
-      spawnCount += 1;
-      expect(args[0]).toContain("releases");
-      expect(opts.detached).toBe(true);
-      return { pid: 111, unref() {} } as never;
-    }) as never;
-    const first = await schedulePostTurnFinalizer(workspace, newId, {
-      stateDir, assessment: proofAssessment() as never, runtime: null, spawnImpl,
-    });
-    expect(first.ok && first.status).toBe("scheduled");
-    expect(spawnCount).toBe(1);
-    const second = await schedulePostTurnFinalizer(workspace, newId, {
-      stateDir, assessment: proofAssessment() as never, runtime: null, spawnImpl,
-    });
-    expect(second.ok && second.status).toBe("existing");
-    expect(spawnCount).toBe(1);
-  });
-
-  it("origin/runtime identity 不同即使同 target 也 conflict", async () => {
-    const { newId } = installTwo();
-    const spawnImpl = (() => ({ pid: 1, unref() {} })) as never;
-    const first = await schedulePostTurnFinalizer(workspace, newId, {
-      stateDir, assessment: proofAssessment() as never, runtime: { pid: 1, startedAt: "2026-09-13T00:00:00.000Z", runtimeBuildId: newId } as never, spawnImpl,
-    });
-    expect(first.ok).toBe(true);
-    const conflict = await schedulePostTurnFinalizer(workspace, newId, {
-      stateDir, assessment: proofAssessment() as never, runtime: { pid: 2, startedAt: "2026-09-13T00:00:00.000Z", runtimeBuildId: newId } as never, spawnImpl,
-    });
-    expect(conflict.ok).toBe(false);
-    if (!conflict.ok) expect(conflict.code).toBe("FINALIZER_CONFLICT");
-  });
-
-  it("spawn 失败写 worker_spawn_failed，不留 scheduled 空壳", async () => {
-    const { newId } = installTwo();
-    const result = await schedulePostTurnFinalizer(workspace, newId, {
-      stateDir, assessment: proofAssessment() as never, runtime: null,
-      spawnImpl: (() => { throw new Error("spawn boom"); }) as never,
-    });
-    expect(result.ok).toBe(false);
-    if (!result.ok) expect(result.code).toBe("FINALIZER_SPAWN_FAILED");
-    expect(readActiveFinalizer(stateDir, workspace.id)).toBeNull();
-    expect(readFinalizerResult(stateDir, workspace.id)?.reason).toBe("worker_spawn_failed");
-  });
-
-  it("corrupt active fail closed；strict reference / symlink / extra field", () => {
+describe("strict legacy reads", () => {
+  it("corrupt / extra field / symlink active fail closed", () => {
     const file = activeFinalizerPath(stateDir, workspace.id);
     fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, "{broken}");
-    expect(() => readActiveFinalizer(stateDir, workspace.id)).toThrow();
-    expect(collectReleaseReferences(stateDir).ok).toBe(false);
-
-    const good = job({ targetBuildId: "a".repeat(64) });
-    fs.writeFileSync(file, JSON.stringify({ ...good, extra: 1 }));
-    expect(collectReleaseReferences(stateDir).ok).toBe(false);
-
-    fs.writeFileSync(file, JSON.stringify(good));
-    const outside = makeTmpDir("ptf-outside");
-    dirsPush(outside);
+    for (const raw of ["{broken}", JSON.stringify({ ...job(), extra: 1 })]) {
+      fs.writeFileSync(file, raw);
+      expect(() => readActiveFinalizer(stateDir, workspace.id)).toThrow();
+      expect(collectReleaseReferences(stateDir).ok).toBe(false);
+    }
+    const target = path.join(wsRoot, "outside.json");
+    fs.writeFileSync(target, JSON.stringify(job()));
     fs.unlinkSync(file);
-    fs.symlinkSync(path.join(outside, "x.json"), file);
-    expect(collectReleaseReferences(stateDir).ok).toBe(false);
+    fs.symlinkSync(target, file);
+    expect(() => readActiveFinalizer(stateDir, workspace.id)).toThrow();
   });
-
-  it("stripWorkerEnv 只清允许字段", () => {
-    const env = stripWorkerEnv({
-      CODEX_THREAD_ID: "x", CODEX_SESSION_ID: "y", C2C_STARTUP_LEASE: "z",
-      C2C_STATE_DIR: "/state", KEEP: "1",
-    } as NodeJS.ProcessEnv);
-    expect(env.CODEX_THREAD_ID).toBeUndefined();
-    expect(env.C2C_STATE_DIR).toBe("/state");
-    expect(env.KEEP).toBe("1");
-  });
-});
-
-const extraDirs: string[] = [];
-function dirsPush(dir: string) { extraDirs.push(dir); }
-afterEach(() => { extraDirs.splice(0).forEach(cleanup); });
-
-describe("worker claim / ownership", () => {
-  it("duplicate claim fail closed；wrong token 不释放", () => {
-    const j = job();
-    const file = activeFinalizerPath(stateDir, workspace.id);
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, JSON.stringify(j));
-    const claim = claimFinalizerWorker(stateDir, j);
-    expect(() => claimFinalizerWorker(stateDir, j)).toThrow();
-    expect(releaseFinalizerWorkerClaim(stateDir, j, { ...claim, workerToken: randomUUID() })).toBe(false);
-    expect(fs.existsSync(workerClaimPath(stateDir, workspace.id))).toBe(true);
-    expect(releaseFinalizerWorkerClaim(stateDir, j, claim)).toBe(true);
-  });
-
-  it("stale worker 不能覆盖 newer result", () => {
-    const j = job();
-    const file = activeFinalizerPath(stateDir, workspace.id);
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, JSON.stringify(j));
-    commitFinalizerResult(stateDir, j, {
-      status: "ok", reason: "already_converged",
-      scheduledAt: j.createdAt, startedAt: new Date().toISOString(), finishedAt: new Date().toISOString(),
-    });
-    expect(() => commitFinalizerResult(stateDir, j, {
-      status: "failed", reason: "should_not_overwrite",
-      scheduledAt: j.createdAt, startedAt: new Date().toISOString(), finishedAt: new Date().toISOString(),
-    })).toThrow();
-    expect(readFinalizerResult(stateDir, workspace.id)?.reason).toBe("already_converged");
-  });
-
-  it("result corrupt 明确报错，不当 null", () => {
-    const file = path.join(stateDir, "post-turn-finalizer-results", `${workspace.id}.json`);
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, "{bad}");
-    expect(() => readFinalizerResult(stateDir, workspace.id)).toThrow(/FINALIZER_RESULT_CORRUPT|finalizer result/);
-  });
-});
-
-describe("worker attempts", () => {
-  it("origin active/DESKTOP_BUSY → wait；absolute expiry → timeout_self_busy", async () => {
-    const j = job({ expiresAt: new Date(Date.now() - 1).toISOString() });
-    const file = activeFinalizerPath(stateDir, workspace.id);
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, JSON.stringify(j));
-    const expired = await runFinalizerAttempt(j, stateDir, {
-      inspect: async () => ({ runtimeStatus: "idle" } as never),
-    });
-    expect(expired.kind).toBe("terminal");
-    if (expired.kind === "terminal") expect(expired.result.reason).toBe("timeout_self_busy");
-
-    const fresh = job();
-    fs.writeFileSync(activeFinalizerPath(stateDir, workspace.id), JSON.stringify(fresh));
-    const active = await runFinalizerAttempt(fresh, stateDir, {
-      inspect: async () => ({ runtimeStatus: "active" } as never),
-    });
-    expect(active.kind).toBe("wait");
-
-    const busy = job();
-    fs.writeFileSync(activeFinalizerPath(stateDir, workspace.id), JSON.stringify(busy));
-    const busyError = await runFinalizerAttempt(busy, stateDir, {
-      inspect: async () => { throw Object.assign(new Error("busy"), { code: "DESKTOP_BUSY" }); },
-    });
-    expect(busyError).toEqual({ kind: "wait", reason: "origin_still_active" });
-    expect(readFinalizerResult(stateDir, workspace.id)).toBeNull();
-  });
-
-  it.each(["DESKTOP_TARGET_NOT_FOUND", "DESKTOP_STATE_UNAVAILABLE", "DESKTOP_APPROVAL_PENDING", "DESKTOP_IDENTITY_MISMATCH"])("origin %s → blocked 不 rollout", async (code) => {
-    let rolled = false;
-    const j = job();
-    fs.mkdirSync(path.dirname(activeFinalizerPath(stateDir, workspace.id)), { recursive: true });
-    fs.writeFileSync(activeFinalizerPath(stateDir, workspace.id), JSON.stringify(j));
-    const result = await runFinalizerAttempt(j, stateDir, {
-      inspect: async () => { throw Object.assign(new Error("x"), { code }); },
-      rollout: async () => { rolled = true; return { targetBuildId: "c".repeat(64), workspaces: [] }; },
-    });
-    expect(result.kind).toBe("terminal");
-    if (result.kind === "terminal") expect(result.result.reason).toBe("origin_unknown");
-    expect(rolled).toBe(false);
-  });
-
-  it("precondition 期间 ownership 丢失 → 不 rollout", async () => {
-    const { newId } = installTwo();
-    const j = job({ targetBuildId: newId });
-    const file = activeFinalizerPath(stateDir, workspace.id);
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, JSON.stringify(j));
-    write(stateDir, path.join("runtime-upgrades", `${workspace.id}.json`), JSON.stringify({
-      workspaceId: workspace.id, workspaceRoot: wsRoot, targetBuildId: newId, reason: "busy",
-      updatedAt: new Date().toISOString(),
-    }));
-    let rolled = 0;
-    vi.spyOn(await import("../src/bridge/runtime.js"), "findBridgeObservation").mockImplementation(async () => {
-      // verifyFinalizerPreconditions 读 runtime：此处替换 active ownership
-      fs.writeFileSync(file, JSON.stringify({ ...j, token: randomUUID() }));
-      return {
-        state: "healthy",
-        runtime: {
-          service: "c2c-bridge", version: "t", workspaceId: workspace.id, workspaceRoot: wsRoot,
-          pid: 1, port: 1, adminToken: "t", publicUrl: null,
-          startedAt: "2026-09-13T00:00:00.000Z", runtimeBuildId: "d".repeat(64),
-        },
-      } as never;
-    });
-    const result = await runFinalizerAttempt(j, stateDir, {
-      inspect: async () => ({ runtimeStatus: "idle" } as never),
-      rollout: async () => { rolled += 1; return { targetBuildId: newId, workspaces: [] }; },
-    });
-    expect(result.kind).toBe("terminal");
-    if (result.kind === "terminal") expect(result.result.reason).toBe("owner_lost");
-    expect(rolled).toBe(0);
-  });
-
-  it("already_converged + pending missing 仍可 ok", async () => {
-    const { newId } = installTwo();
-    vi.spyOn(await import("../src/bridge/runtime.js"), "findBridgeObservation").mockResolvedValue({
-      state: "healthy",
-      runtime: {
-        service: "codex-with-chatgpt", version: "t", workspaceId: workspace.id, workspaceRoot: wsRoot,
-        pid: process.pid, port: 48001, adminToken: "t", publicUrl: null,
-        startedAt: "2026-09-13T00:00:00.000Z", runtimeBuildId: newId,
-      },
-    } as never);
-    const j = job({ targetBuildId: newId });
-    fs.mkdirSync(path.dirname(activeFinalizerPath(stateDir, workspace.id)), { recursive: true });
-    fs.writeFileSync(activeFinalizerPath(stateDir, workspace.id), JSON.stringify(j));
-    const result = await runFinalizerAttempt(j, stateDir, {
-      inspect: async () => ({ runtimeStatus: "idle" } as never),
-    });
-    expect(result.kind).toBe("terminal");
-    if (result.kind === "terminal") {
-      expect(result.result.status).toBe("ok");
-      expect(result.result.reason).toBe("already_converged");
-    }
-  });
-
-  it("expectedRuntime pid/startedAt/build 变化 → runtime_replaced", async () => {
-    const { newId } = installTwo();
-    vi.spyOn(await import("../src/bridge/runtime.js"), "findBridgeObservation").mockResolvedValue({
-      state: "healthy",
-      runtime: {
-        service: "codex-with-chatgpt", version: "t", workspaceId: workspace.id, workspaceRoot: wsRoot,
-        pid: 999, port: 48001, adminToken: "t", publicUrl: null,
-        startedAt: "2026-09-13T01:00:00.000Z", runtimeBuildId: "d".repeat(64),
-      },
-    } as never);
-    write(stateDir, path.join("runtime-upgrades", `${workspace.id}.json`), JSON.stringify({
-      workspaceId: workspace.id, workspaceRoot: wsRoot, targetBuildId: newId, reason: "busy",
-      updatedAt: new Date().toISOString(),
-    }));
-    const j = job({
-      targetBuildId: newId,
-      expectedRuntime: { runtimeBuildId: newId, pid: 1, startedAt: "2026-09-13T00:00:00.000Z" },
-    });
-    fs.mkdirSync(path.dirname(activeFinalizerPath(stateDir, workspace.id)), { recursive: true });
-    fs.writeFileSync(activeFinalizerPath(stateDir, workspace.id), JSON.stringify(j));
-    const result = await runFinalizerAttempt(j, stateDir, {
-      inspect: async () => ({ runtimeStatus: "idle" } as never),
-    });
-    expect(result.kind).toBe("terminal");
-    if (result.kind === "terminal") expect(result.result.reason).toBe("runtime_replaced");
-  });
-
-  it("assertCanonicalTargetEntry 拒绝缺失/symlink/非 current", () => {
-    const { oldId, newId } = installTwo();
-    expect(() => assertCanonicalTargetEntry(stateDir, oldId)).toThrow();
-    // old is not current → target_changed; new is current and canonical
-    expect(assertCanonicalTargetEntry(stateDir, newId)).toContain(newId);
-  });
-
-  it("projection 无 fake commandId", () => {
-    const { newId } = installTwo();
-    const j = job({ targetBuildId: newId });
-    const file = activeFinalizerPath(stateDir, workspace.id);
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, JSON.stringify(j));
-    const committed = commitFinalizerResult(stateDir, j, {
-      status: "ok", reason: "already_converged",
-      scheduledAt: j.createdAt, startedAt: new Date().toISOString(), finishedAt: new Date().toISOString(),
-    });
-    projectFinalizerExecution(workspace.id, j, committed);
-    const records = fs.readFileSync(path.join(stateDir, "executions", `${workspace.id}.jsonl`), "utf8");
-    expect(records).toContain(`post_turn_${j.jobId}`);
-    expect(records).not.toContain("commandId");
-  });
-});
-
-describe("real self-busy integration", () => {
-  it("rollout busy + schedule + launch once；idle 后 upgraded → durable ok", async () => {
-    const { oldId, newId } = installTwo();
-    writeDesktopBinding();
-    // runtime stale (old build)
-    write(stateDir, path.join("runtime", `${workspace.id}.json`), JSON.stringify({
-      service: "codex-with-chatgpt", version: "t", workspaceId: workspace.id, workspaceRoot: wsRoot,
-      pid: 12345, port: 48100, adminToken: "t", publicUrl: null,
-      startedAt: "2026-09-13T00:00:00.000Z", runtimeBuildId: oldId,
-    }));
-    vi.spyOn(desktopIpc, "inspect").mockRejectedValue(Object.assign(new Error("busy"), { code: "DESKTOP_BUSY" }));
-    vi.spyOn(desktopIpc, "currentExecution").mockResolvedValue({
-      threadId: THREAD, hostId: "local", projectId: "proj-finalizer",
-      workspaceRoot: wsRoot, title: "当前执行会话", cwd: wsRoot,
-      runtimeStatus: "active", activeTurnId: randomUUID(),
-    } as never);
-    const assessment = await assessRolloutIdle(workspace, { pairingActive: false });
-    expect(assessment.selfBusyProof).toBeDefined();
-    let spawnCount = 0;
-    const spawnImpl = (() => { spawnCount += 1; return { pid: 9, unref() {} }; }) as never;
-    const scheduled = await schedulePostTurnFinalizer(workspace, newId, {
-      stateDir, assessment: assessment as never, runtime: null, spawnImpl,
-    });
-    expect(scheduled.ok && scheduled.status).toBe("scheduled");
-    expect(spawnCount).toBe(1);
-
-    // pending written as busy by first rollout path
-    write(stateDir, path.join("runtime-upgrades", `${workspace.id}.json`), JSON.stringify({
-      workspaceId: workspace.id, workspaceRoot: wsRoot, targetBuildId: newId, reason: "busy",
-      updatedAt: new Date().toISOString(),
-    }));
-    vi.mocked(desktopIpc.inspect).mockResolvedValue({ runtimeStatus: "idle" } as never);
-    vi.spyOn(await import("../src/bridge/runtime.js"), "findBridgeObservation").mockResolvedValue({
-      state: "healthy",
-      runtime: {
-        service: "codex-with-chatgpt", version: "t", workspaceId: workspace.id, workspaceRoot: wsRoot,
-        pid: 12345, port: 48100, adminToken: "t", publicUrl: null,
-        startedAt: "2026-09-13T00:00:00.000Z", runtimeBuildId: oldId,
-      },
-    } as never);
-    const j = scheduled.ok ? scheduled.job : job();
-    const attempt = await runFinalizerAttempt(j, stateDir, {
-      inspect: async () => ({ runtimeStatus: "idle" } as never),
-      rollout: async () => ({ targetBuildId: newId, workspaces: [{ workspaceId: workspace.id, status: "upgraded" }] }),
-    });
-    expect(attempt.kind).toBe("terminal");
-    if (attempt.kind !== "terminal") return;
-    expect(attempt.result.status).toBe("ok");
-    const committed = commitFinalizerResult(stateDir, j, { ...attempt.result, startedAt: new Date().toISOString() });
-    expect(committed.status).toBe("ok");
-    expect(readActiveFinalizer(stateDir, workspace.id)).toBeNull();
-    const graph = collectReleaseReferences(stateDir);
-    expect([...graph.references.values()].flat().some(r => r.kind === "finalizer")).toBe(false);
-  });
-});
-
-
-describe("cleanup failure strictness", () => {
-  it("active unlink failure 抛 FINALIZER_ACTIVE_RELEASE_FAILED 且 result 可读", () => {
-    const { newId } = installTwo();
-    const j = job({ targetBuildId: newId });
-    const file = activeFinalizerPath(stateDir, workspace.id);
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, JSON.stringify(j));
-    const realUnlink = fs.unlinkSync.bind(fs);
-    vi.spyOn(fs, "unlinkSync").mockImplementation((target) => {
-      if (String(target) === file) throw new Error("simulated unlink failure");
-      return realUnlink(target as fs.PathLike);
-    });
-    let thrown: unknown;
-    try {
-      commitFinalizerResult(stateDir, j, {
-        status: "ok", reason: "already_converged",
-        scheduledAt: j.createdAt, startedAt: new Date().toISOString(), finishedAt: new Date().toISOString(),
-      });
-    } catch (error) {
-      thrown = error;
-    }
-    vi.restoreAllMocks();
-    expect(thrown).toBeInstanceOf(FinalizerActiveReleaseError);
-    expect((thrown as FinalizerActiveReleaseError).result.reason).toBe("already_converged");
-    expect(readFinalizerResult(stateDir, workspace.id)?.reason).toBe("already_converged");
-    expect(fs.existsSync(file)).toBe(true);
-  });
-
-  it("worker claim release mismatch 仍可观察 failure", () => {
-    const j = job();
-    const file = activeFinalizerPath(stateDir, workspace.id);
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, JSON.stringify(j));
-    const claim = claimFinalizerWorker(stateDir, j);
-    expect(releaseFinalizerWorkerClaim(stateDir, j, { ...claim, workerToken: randomUUID() })).toBe(false);
-    fs.unlinkSync(workerClaimPath(stateDir, workspace.id));
+  it("corrupt result throws", () => {
+    write(stateDir, path.join("post-turn-finalizer-results", `${workspace.id}.json`), "{bad}");
+    expect(() => readFinalizerResult(stateDir, workspace.id)).toThrow();
   });
 });
 
 describe("strict finalizer reference identity", () => {
   it("workspaceRoot 对应错误 workspaceId → finalizer_corrupt", () => {
-    const other = new Workspace(makeTmpDir("ptf-other-ws"));
-    const j = job({ workspaceId: other.id });
+    const otherId = "f".repeat(12);
+    const j = job({ workspaceId: otherId });
     const file = activeFinalizerPath(stateDir, workspace.id);
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, JSON.stringify(j));
@@ -573,91 +208,162 @@ describe("strict finalizer reference identity", () => {
     expect([...graph.references.values()].flat().some(r => r.kind === "finalizer")).toBe(false);
   });
 });
-
-
-describe("real rollout integration", () => {
-  it("rollout busy schedules worker once；second existing 不 spawn；idle upgraded → ok", async () => {
-    const { oldId, newId } = installTwo();
-    writeDesktopBinding();
-    const startedAt = "2026-09-13T00:00:00.000Z";
-    const runtime = {
-      service: "c2c-bridge", version: "t", workspaceId: workspace.id, workspaceRoot: wsRoot,
-      pid: 4242, port: 48200, adminToken: "t", publicUrl: null, startedAt, runtimeBuildId: oldId,
+describe("retired CLI", () => {
+  it("status 只读历史 active/result 并显示 retired", async () => {
+    const j = job();
+    const activeFile = activeFinalizerPath(stateDir, workspace.id);
+    write(stateDir, path.relative(stateDir, activeFile), JSON.stringify(j));
+    const result = {
+      version: 1, jobId: j.jobId, workspaceId: workspace.id, targetBuildId: j.targetBuildId,
+      status: "blocked", reason: "legacy", scheduledAt: j.createdAt,
+      startedAt: j.createdAt, finishedAt: j.createdAt,
     };
-    write(stateDir, path.join("runtime", `${workspace.id}.json`), JSON.stringify(runtime));
-    vi.spyOn(await import("../src/build-id.js"), "getRuntimeBuildId").mockReturnValue(newId);
-    vi.spyOn(installModule, "readCurrentInstall").mockReturnValue({
-      version: 3, checkoutRoot: wsRoot, releaseRoot: path.join(stateDir, "releases", newId),
-      runtimeBuildId: newId, artifactSha256: "a".repeat(64), manifestSha256: "b".repeat(64),
-      installedAt: startedAt,
-    } as never);
-    vi.spyOn(runtimeModule, "findBridgeObservation").mockResolvedValue({ state: "healthy", runtime } as never);
-    vi.spyOn(runtimeModule, "adminFetch").mockResolvedValue({
-      service: "c2c-bridge", workspaceId: workspace.id, workspaceName: "w", workspaceRoot: wsRoot,
-      pid: runtime.pid, startedAt, port: runtime.port, runtimeBuildId: oldId,
-      publicUrl: null, tunnel: { running: false, url: null, provider: "cloudflare-named" },
-      tokenCount: 0, pairingActive: false,
-    } as never);
-    vi.spyOn(daemon, "restartBridge").mockResolvedValue({
-      runtime: { ...runtime, runtimeBuildId: newId }, info: { runtimeBuildId: newId } as never, mcpUrl: "https://x/mcp",
-    });
-    vi.spyOn(desktopIpc, "inspect").mockRejectedValue(Object.assign(new Error("busy"), { code: "DESKTOP_BUSY" }));
-    const currentExecution = vi.spyOn(desktopIpc, "currentExecution").mockResolvedValueOnce({
-      threadId: THREAD, hostId: "local", projectId: "proj-finalizer",
-      workspaceRoot: wsRoot, title: "当前执行会话", cwd: wsRoot,
-      runtimeStatus: "active", activeTurnId: randomUUID(),
-    } as never);
-    currentExecution.mockRejectedValueOnce(Object.assign(new Error("unavailable"), { code: "DESKTOP_STATE_UNAVAILABLE" }));
+    const resultFile = path.join(stateDir, "post-turn-finalizer-results", `${workspace.id}.json`);
+    write(stateDir, path.relative(stateDir, resultFile), JSON.stringify(result));
+    const output: string[] = [];
+    const writeOut = vi.spyOn(process.stdout, "write").mockImplementation((chunk) => { output.push(String(chunk)); return true; });
+    const cli = new Command();
+    registerPostTurnFinalizerCommands(cli);
+    await cli.parseAsync(["node", "test", "post-turn-finalizer", "status", "-w", wsRoot]);
+    writeOut.mockRestore();
+    expect(JSON.parse(output.join("")).mode).toBe("retired");
+    expect(readActiveFinalizer(stateDir, workspace.id)).toEqual(j);
+    expect(readFinalizerResult(stateDir, workspace.id)).toEqual(result);
+  });
 
-    let spawnCount = 0;
-    const finalizerSpawnImpl = (() => {
-      spawnCount += 1;
-      return { pid: 7, unref() {} };
-    }) as never;
+  it("run 只读旧状态并明确拒绝，不 claim 或删除文件", async () => {
+    const j = job();
+    const activeFile = activeFinalizerPath(stateDir, workspace.id);
+    const resultFile = path.join(stateDir, "post-turn-finalizer-results", `${workspace.id}.json`);
+    const claimFile = workerClaimPath(stateDir, workspace.id);
+    const result = {
+      version: 1, jobId: j.jobId, workspaceId: workspace.id, targetBuildId: j.targetBuildId,
+      status: "blocked", reason: "legacy", scheduledAt: j.createdAt,
+      startedAt: j.createdAt, finishedAt: j.createdAt,
+    };
+    write(stateDir, path.relative(stateDir, activeFile), JSON.stringify(j));
+    write(stateDir, path.relative(stateDir, resultFile), JSON.stringify(result));
+    write(stateDir, path.relative(stateDir, claimFile), "legacy-claim");
+    const before = [activeFile, resultFile, claimFile].map(file => fs.readFileSync(file));
+    const writeOut = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const cli = new Command();
+    registerPostTurnFinalizerCommands(cli);
+    process.exitCode = 0;
+    await cli.parseAsync(["node", "test", "post-turn-finalizer", "run", "-w", wsRoot]);
+    writeOut.mockRestore();
+    expect(process.exitCode).toBe(1);
+    [activeFile, resultFile, claimFile].forEach((file, index) => expect(fs.readFileSync(file)).toEqual(before[index]));
+    process.exitCode = 0;
+  });
+});
 
-    const summary = await rollout({ workspaceRoot: wsRoot, finalizerSpawnImpl });
-    const item = summary.workspaces.find(w => w.workspaceId === workspace.id)!;
-    expect(item.status).toBe("pending_busy");
-    expect(item.reason).toBe("busy");
-    expect(item.finalizer?.status).toBe("scheduled");
-    expect(spawnCount).toBe(1);
-    expect(currentExecution).toHaveBeenCalledTimes(1);
-    expect(daemon.restartBridge).not.toHaveBeenCalled();
-    expect(readActiveFinalizer(stateDir, workspace.id)).toBeTruthy();
 
-    currentExecution.mockReset().mockResolvedValue({
-      threadId: THREAD, hostId: "local", projectId: "proj-finalizer",
-      workspaceRoot: wsRoot, title: "当前执行会话", cwd: wsRoot,
-      runtimeStatus: "active", activeTurnId: randomUUID(),
-    } as never);
-    const summary2 = await rollout({ workspaceRoot: wsRoot, finalizerSpawnImpl });
-    const item2 = summary2.workspaces.find(w => w.workspaceId === workspace.id)!;
-    expect(item2.finalizer?.status).toBe("existing");
-    expect(spawnCount).toBe(1);
-
-    const active = readActiveFinalizer(stateDir, workspace.id)!;
-    write(stateDir, path.join("runtime-upgrades", `${workspace.id}.json`), JSON.stringify({
-      workspaceId: workspace.id, workspaceRoot: wsRoot, targetBuildId: newId, reason: "busy",
-      updatedAt: new Date().toISOString(),
-    }));
-    const workerRollout = vi.fn(async () => ({ targetBuildId: newId, workspaces: [{ workspaceId: workspace.id, status: "upgraded" as const }] }));
-    const waiting = await runFinalizerAttempt(active, stateDir, {
-      inspect: async () => { throw Object.assign(new Error("busy"), { code: "DESKTOP_BUSY" }); },
-      rollout: workerRollout,
-    });
-    expect(waiting).toEqual({ kind: "wait", reason: "origin_still_active" });
-    expect(readFinalizerResult(stateDir, workspace.id)).toBeNull();
-    expect(readActiveFinalizer(stateDir, workspace.id)?.jobId).toBe(active.jobId);
-    expect(workerRollout).not.toHaveBeenCalled();
-    const attempt = await runFinalizerAttempt(active, stateDir, {
-      inspect: async () => ({ runtimeStatus: "idle" } as never),
-      rollout: workerRollout,
-    });
-    expect(attempt.kind).toBe("terminal");
-    if (attempt.kind !== "terminal") return;
-    expect(attempt.result.status).toBe("ok");
-    const committed = commitFinalizerResult(stateDir, active, { ...attempt.result, startedAt: new Date().toISOString() });
-    expect(committed.status).toBe("ok");
+describe("legacy retirement", () => {
+  const dead = () => { throw Object.assign(new Error("dead"), { code: "ESRCH" }); };
+  function legacy(expired = true) {
+    const j = job({ expiresAt: new Date(Date.now() + (expired ? -60000 : 60000)).toISOString() });
+    const claim = { version: 1, jobId: j.jobId, jobToken: j.token, workerToken: randomUUID(), pid: 987654, claimedAt: j.createdAt };
+    write(stateDir, path.relative(stateDir, activeFinalizerPath(stateDir, workspace.id)), JSON.stringify(j));
+    write(stateDir, path.relative(stateDir, workerClaimPath(stateDir, workspace.id)), JSON.stringify(claim));
+    return { j, claim };
+  }
+  function retire(options: Parameters<typeof retireLegacyFinalizers>[2] = { probeProcess: dead }) {
+    const lock = tryAcquireMaintenanceLock(stateDir, "test-retirement");
+    if (!lock.ok) throw new Error("test lock busy");
+    try { return retireLegacyFinalizers(stateDir, lock.handle, options); }
+    finally { lock.handle.release(); }
+  }
+  it("production surface exposes no legacy mutation helpers", () => {
+    for (const key of ["schedulePostTurnFinalizer", "spawnFinalizerWorker", "runFinalizerAttempt", "claimFinalizerWorker", "commitFinalizerResult", "verifyFinalizerPreconditions", "projectFinalizerExecution"])
+      expect(key in finalizerModule).toBe(false);
+  });
+  it("expired exact dead claim retires, keeps result and permanent wx fence", () => {
+    const { j, claim } = legacy();
+    const resultFile = path.join(stateDir, "post-turn-finalizer-results", `${workspace.id}.json`);
+    write(stateDir, path.relative(stateDir, resultFile), "historical evidence");
+    expect(retire()).toEqual([j]);
     expect(readActiveFinalizer(stateDir, workspace.id)).toBeNull();
-  }, 60000);
+    expect(readFinalizerRetirement(stateDir, workspace.id)).toMatchObject({ active: j, claim });
+    expect(JSON.parse(fs.readFileSync(workerClaimPath(stateDir, workspace.id), "utf8"))).toEqual(claim);
+    expect(() => fs.openSync(workerClaimPath(stateDir, workspace.id), "wx")).toThrow();
+    expect(fs.readFileSync(resultFile, "utf8")).toBe("historical evidence");
+    expect(retire()).toEqual([]);
+  });
+  it.each(["alive", "EPERM", "unknown", "missing", "nonexpired"])("%s remains pinned without ledger", mode => {
+    const { j } = legacy(mode !== "nonexpired");
+    if (mode === "missing") fs.unlinkSync(workerClaimPath(stateDir, workspace.id));
+    const probeProcess = mode === "alive" ? () => {} : mode === "EPERM" ? () => { throw Object.assign(new Error("denied"), { code: "EPERM" }); } : mode === "unknown" ? () => { throw new Error("unknown"); } : dead;
+    expect(retire({ probeProcess })).toEqual([]);
+    expect(readActiveFinalizer(stateDir, workspace.id)).toEqual(j);
+    expect(readFinalizerRetirement(stateDir, workspace.id)).toBeNull();
+  });
+  it.each(["beforeLedger", "afterLedger", "beforeActiveRemoval"] as const)("crash at %s preserves pin and retry evidence", stage => {
+    const { j, claim } = legacy();
+    expect(() => retire({ probeProcess: dead, hooks: { [stage]: () => { throw new Error("crash"); } } })).toThrow("crash");
+    expect(readActiveFinalizer(stateDir, workspace.id)).toEqual(j);
+    expect(JSON.parse(fs.readFileSync(workerClaimPath(stateDir, workspace.id), "utf8"))).toEqual(claim);
+    expect(Boolean(readFinalizerRetirement(stateDir, workspace.id))).toBe(stage !== "beforeLedger");
+    expect(retire()).toEqual([j]);
+    expect(readFinalizerRetirement(stateDir, workspace.id)).not.toBeNull();
+  });
+  it.each(["jobId", "jobToken"] as const)("claim exact %s mismatch refuses retirement", field => {
+    const { j, claim } = legacy();
+    write(stateDir, path.relative(stateDir, workerClaimPath(stateDir, workspace.id)), JSON.stringify({ ...claim, [field]: randomUUID() }));
+    expect(() => retire()).toThrow();
+    expect(readActiveFinalizer(stateDir, workspace.id)).toEqual(j);
+  });
+  it.each(["active", "claim"] as const)("%s replacement after ledger fails closed", kind => {
+    const { j } = legacy();
+    const file = kind === "active" ? activeFinalizerPath(stateDir, workspace.id) : workerClaimPath(stateDir, workspace.id);
+    expect(() => retire({ probeProcess: dead, hooks: { afterLedger() {
+      const content = fs.readFileSync(file); fs.renameSync(file, path.join(wsRoot, "original-evidence")); fs.writeFileSync(file, content);
+    } } })).toThrow();
+    expect(readActiveFinalizer(stateDir, workspace.id)).toEqual(j);
+    expect(() => readFinalizerRetirement(stateDir, workspace.id)).toThrow();
+    expect(JSON.parse(fs.readFileSync(finalizerRetirementPath(stateDir, workspace.id), "utf8"))).toMatchObject({ active: j });
+  });
+  it("corrupt or symlink claim fails closed", () => {
+    const { j } = legacy();
+    const file = workerClaimPath(stateDir, workspace.id);
+    fs.writeFileSync(file, "{bad}");
+    expect(() => retire()).toThrow();
+    fs.unlinkSync(file);
+    const target = path.join(wsRoot, "claim.json"); fs.writeFileSync(target, "{}"); fs.symlinkSync(target, file);
+    expect(() => retire()).toThrow();
+    expect(readActiveFinalizer(stateDir, workspace.id)).toEqual(j);
+  });
+  it("corrupt ledger preserves active and prevents retry mutation", () => {
+    const { j } = legacy();
+    expect(() => retire({ probeProcess: dead, hooks: { afterLedger() { throw new Error("crash"); } } })).toThrow();
+    fs.writeFileSync(finalizerRetirementPath(stateDir, workspace.id), "{bad}");
+    expect(() => retire()).toThrow();
+    expect(readActiveFinalizer(stateDir, workspace.id)).toEqual(j);
+    expect(collectReleaseReferences(stateDir).ok).toBe(false);
+  });
+
+  it.each(["ledger", "claim"])("retired %s disappearance blocks all reference plans", kind => {
+    legacy(); retire();
+    fs.unlinkSync(kind === "ledger" ? finalizerRetirementPath(stateDir, workspace.id) : workerClaimPath(stateDir, workspace.id));
+    expect(collectReleaseReferences(stateDir).ok).toBe(false);
+    expect(planGc(stateDir).ok).toBe(false);
+  });
+
+  it("default probe only uses signal 0; reused live PID keeps pin", () => {
+    const { j } = legacy();
+    const probe = vi.spyOn(process, "kill").mockReturnValue(true);
+    expect(retire({})).toEqual([]);
+    expect(probe).toHaveBeenCalledWith(987654, 0);
+    expect(probe.mock.calls.every(([, signal]) => signal === 0)).toBe(true);
+    expect(readActiveFinalizer(stateDir, workspace.id)).toEqual(j);
+  });
+  it.each(["afterLedger", "beforeActiveRemoval"] as const)("ledger replacement at %s preserves pin", stage => {
+    const { j } = legacy();
+    expect(() => retire({ probeProcess: dead, hooks: { [stage]: () => {
+      const file = finalizerRetirementPath(stateDir, workspace.id);
+      const content = fs.readFileSync(file); fs.renameSync(file, path.join(wsRoot, "ledger-evidence")); fs.writeFileSync(file, content);
+    } } })).toThrow();
+    expect(readActiveFinalizer(stateDir, workspace.id)).toEqual(j);
+    expect(fs.existsSync(workerClaimPath(stateDir, workspace.id))).toBe(true);
+  });
+
 });
