@@ -1,3 +1,4 @@
+import { isResultBusInFlight } from "../result-bus/schema.js";
 import fs from "node:fs";
 import path from "node:path";
 import { getStateDir } from "../config/paths.js";
@@ -25,7 +26,7 @@ import { ResultBusDeliveryError } from "./result-bus-delivery.js";
  * Result Bus core 不 import 本模块；依赖方向 bridge → result-bus/feedback 单向。
  */
 
-const BUS_INFLIGHT = new Set(["reserved", "claimed", "outcome_unknown"]);
+
 const FEEDBACK_INFLIGHT = new Set(["reserved", "claimed", "outcome_unknown"]);
 
 export function deliveryArbiterLockFile(workspaceId: string, stateDir = getStateDir()): string {
@@ -78,7 +79,7 @@ export function assertNoResultBusInFlight(input: {
   const stateDir = input.stateDir ?? getStateDir();
   const identity = resolveWorkspaceIdentity({ id: input.workspaceId, root: input.workspaceRoot! });
   const busInFlight = (readResultBus(identity, stateDir)?.entries ?? [])
-    .filter(entry => BUS_INFLIGHT.has(entry.deliveryStatus));
+    .filter(isResultBusInFlight);
   if (busInFlight.length > 0) {
     throw new FeedbackError(
       "FEEDBACK_INFLIGHT_FENCE",
@@ -94,7 +95,7 @@ export function assertNoProductionInFlight(input: {
 }): void {
   const stateDir = input.stateDir ?? getStateDir();
   const busInFlight = (readResultBus(input.identity, stateDir)?.entries ?? [])
-    .filter(entry => BUS_INFLIGHT.has(entry.deliveryStatus));
+    .filter(isResultBusInFlight);
   const feedbackInFlight = recoverStaleFeedback(input.identity.id, stateDir)
     .events.filter(event => FEEDBACK_INFLIGHT.has(event.status));
   if (busInFlight.length > 0 && feedbackInFlight.length > 0) {

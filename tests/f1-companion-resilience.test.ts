@@ -484,7 +484,9 @@ describe("F1b 4. OBSERVED_PENDING_ACK", () => {
 
     const sw = swSource();
     const start = sw.indexOf("const closeout = evaluateServerObservedCloseout");
-    const end = sw.indexOf("return recoverProductionSendSide(inFlight);", start);
+    const end = sw.indexOf("// Unknown + no inFlight must never use /ack", start);
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
     const block = sw.slice(start, end);
     expect(block).toMatch(/isServerObservedCloseoutEligible\(journal\) && closeout\.ok/);
     expect(block).not.toMatch(/ownerState/);
@@ -725,11 +727,20 @@ describe("F1b 7. SPA route / conversation drift", () => {
 describe("F1b 8. Bridge temporary offline", () => {
   it("SW recover fetch failure must not clear durable journal", () => {
     const sw = swSource();
-    const idx = sw.indexOf("async function handleRecover()");
-    expect(idx).toBeGreaterThan(-1);
-    const body = sw.slice(idx, idx + 400);
+    const wrapper = sw.indexOf("async function handleRecover()");
+    const recovery = sw.indexOf("async function handleRecoverOnce()", wrapper);
+    expect(wrapper).toBeGreaterThan(-1);
+    expect(recovery).toBeGreaterThan(wrapper);
+    const wrapperBody = sw.slice(wrapper, recovery);
+    expect(wrapperBody).toMatch(/if \(productionRecoveryInFlight \|\| productionSendInFlight\)/);
+    expect(wrapperBody).toMatch(/try \{ return await handleRecoverOnce\(\); \}/);
+    expect(wrapperBody).toMatch(/finally \{ productionRecoveryInFlight = false; \}/);
+    const earlyReturn = sw.indexOf("if (journal.state === \"RESERVED\")", recovery);
+    expect(earlyReturn).toBeGreaterThan(recovery);
+    const body = sw.slice(recovery, earlyReturn);
     expect(body).toMatch(/const stateRes = await handleFetchState\(\);/);
     expect(body).toMatch(/if \(!stateRes\.ok\) return stateRes;/);
+    expect(body).toMatch(/const inFlight = stateRes\.status\.inFlight;/);
   });
 
   it("beginSend network throw keeps SEND_INTENT; zero write/click; no auto-clear", async () => {

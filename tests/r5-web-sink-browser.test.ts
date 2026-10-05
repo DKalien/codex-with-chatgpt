@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createHash } from "node:crypto";
 
 const ROUTE_A = "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111";
 const ROUTE_B = "https://chatgpt.com/c/22222222-2222-4222-8222-222222222222";
@@ -15,6 +16,67 @@ const EVIDENCE_KEY = "c2c_companion_evidence_v1";
 const CONNECT_KEY = "c2c_companion_connect_flow_v1";
 const AUTONOMY_KEY = "c2c_companion_autonomy_v1";
 const FENCE_KEY = "c2c_route_attest_fence_v1";
+const JOURNAL_KEY = "c2c_companion_journal_v1";
+const ISOLATION_ARCHIVE_KEY = "c2c_companion_outcome_unknown_archive_v1";
+const EVENT_ID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const RESERVATION_ID = "33333333-3333-4333-8333-333333333333";
+const ATTEMPT_ID = "44444444-4444-4444-8444-444444444444";
+const MESSAGE = "原始回流正文保留在本机 archive";
+const MESSAGE_HASH = createHash("sha256").update(MESSAGE, "utf8").digest("hex");
+
+function unknownJournal() {
+  return {
+    state: "OUTCOME_UNKNOWN",
+    eventId: EVENT_ID,
+    reservationId: RESERVATION_ID,
+    attemptId: ATTEMPT_ID,
+    routeCanonical: ROUTE_A,
+    bindingId: BINDING,
+    epoch: EPOCH,
+    message: MESSAGE,
+    messageSha256: MESSAGE_HASH,
+    createdAt: "2026-10-01T00:00:00.000Z",
+    updatedAt: "2026-10-01T00:00:01.000Z",
+    terminalWitness: "terminal-witness-exact",
+  };
+}
+
+function unknownInFlight() {
+  const journal = unknownJournal();
+  return {
+    status: "outcome_unknown", eventId: journal.eventId, reservationId: journal.reservationId,
+    attemptId: journal.attemptId, message: journal.message, messageSha256: journal.messageSha256,
+  };
+}
+
+function unknownRecoveryProbe() {
+  return {
+    ok: false, mode: "production_recover", reason: "outcome_unknown", journalState: "OUTCOME_UNKNOWN",
+    zeroWrite: true, zeroClick: true, ownerFresh: true, canonicalRoute: ROUTE_A, generation: 1,
+    composerEmpty: true, generationIdle: true, nativeProductionInFlight: false,
+  };
+}
+
+function apiState(inFlight: unknown, isolatedAttempts: unknown[] = []) {
+  return {
+    workspaceId: WORKSPACE, companionId: COMPANION, bindingId: BINDING, epoch: EPOCH,
+    routeCanonical: ROUTE_A, routeVerification: "VERIFIED", inFlight, isolatedAttempts, events: [],
+  };
+}
+
+function isolateProof() {
+  const journal = unknownJournal();
+  return {
+    routeCanonical: journal.routeCanonical, eventId: journal.eventId, reservationId: journal.reservationId,
+    attemptId: journal.attemptId, messageSha256: journal.messageSha256,
+    status: "outcome_unknown", isolated: true, observed: false,
+  };
+}
+
+function stateIsolatedAttempt() {
+  const { observed: _observed, ...attempt } = isolateProof();
+  return attempt;
+}
 
 function storageArea(initial: Record<string, unknown>) {
   const values = new Map(Object.entries(initial));
@@ -94,6 +156,7 @@ function validSinkBinding(overrides: Record<string, unknown> = {}) {
 
 async function loadWorker(opts: {
   fetch?: (url: unknown, init?: unknown) => Promise<unknown>;
+  tabsSendMessage?: (tabId: number, message: unknown, sendOptions?: unknown) => Promise<unknown>;
   route?: string;
   routeVerification?: "VERIFIED" | "PENDING";
   ownerRoute?: string;
@@ -113,7 +176,7 @@ async function loadWorker(opts: {
   const local = storageArea(initial.local);
   const session = storageArea(initial.session);
   let messageListener: ((message: unknown, sender: unknown, sendResponse: (response: unknown) => void) => unknown) | null = null;
-  const tabsSendMessage = vi.fn(async () => ({ ok: true, observed: true, mutationAttempted: true, clickAttempted: true }));
+  const tabsSendMessage = vi.fn(opts.tabsSendMessage ?? (async () => ({ ok: true, observed: true, mutationAttempted: true, clickAttempted: true })));
   const fetchMock = vi.fn(opts.fetch ?? (async (url: unknown) => {
     const href = String(url);
     if (href.includes("/web-sink/bind-current")) {
@@ -137,6 +200,8 @@ async function loadWorker(opts: {
   const chrome = {
     storage: { local, session },
     runtime: {
+      id: "browser-companion-test-id",
+      getURL(path: string) { return `chrome-extension://browser-companion-test-id/${path}`; },
       onMessage: { addListener(listener: typeof messageListener) { messageListener = listener; } },
       onInstalled: { addListener() {} },
       onStartup: { addListener() {} },
@@ -161,7 +226,11 @@ async function loadWorker(opts: {
     frameId: 0,
     url: opts.route ?? ROUTE_A,
   };
-  return { initial, local, session, fetchMock, send, ownerSender, tabsSendMessage };
+  const panelSender = {
+    id: chrome.runtime.id,
+    url: chrome.runtime.getURL("operations/operations.html"),
+  };
+  return { initial, local, session, fetchMock, send, ownerSender, panelSender, tabsSendMessage };
 }
 
 function bindCalls(fetchMock: ReturnType<typeof vi.fn>) {
@@ -208,6 +277,297 @@ describe("B2 operations read-only RPC", () => {
     expect(await worker.send({ type: "c2c.status.read", canonicalRoute: ROUTE_B }, worker.ownerSender)).toMatchObject({ ok: true, isOwner: false });
     expect(worker.fetchMock).not.toHaveBeenCalled(); expect(worker.tabsSendMessage).not.toHaveBeenCalled();
     expect(JSON.stringify([Object.fromEntries(worker.local.values), Object.fromEntries(worker.session.values)])).toBe(before);
+  });
+});
+
+describe("durable outcome-unknown isolation mailbox", () => {
+  const json = (status: number, body: unknown) => ({
+    ok: status >= 200 && status < 300, status, async json() { return body; },
+  });
+  const terminalGoneProof = (status = "terminal_gone") => ({
+    routeCanonical: ROUTE_A, eventId: EVENT_ID, attemptId: ATTEMPT_ID, status,
+  });
+
+  it("durably archives before exact isolate request, clears only after proof, and accepts the next reservation", async () => {
+    const paths: string[] = [];
+    const requests: Array<{ path: string; init: any }> = [];
+    const worker = await loadWorker({
+      local: { [JOURNAL_KEY]: unknownJournal() },
+      tabsSendMessage: async (_tabId, message) => {
+        expect(message).toMatchObject({ type: "c2c.production.send.recover", startJournal: { state: "OUTCOME_UNKNOWN" } });
+        return unknownRecoveryProbe();
+      },
+      fetch: async (url, init = {}) => {
+        const path = new URL(String(url)).pathname;
+        paths.push(path); requests.push({ path, init });
+        if (path.endsWith("/state")) return json(200, apiState(unknownInFlight()));
+        if (path.endsWith("/isolate-attempt")) return json(200, isolateProof());
+        if (path.endsWith("/reserve")) return json(200, {
+          delivery: { eventId: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", status: "reserved" },
+          reservationId: "55555555-5555-4555-8555-555555555555",
+        });
+        return json(404, { error: "unexpected_endpoint" });
+      },
+    });
+
+    const recovered = await worker.send({ type: "c2c.recover" });
+    expect(recovered).toMatchObject({ ok: true, isolated: true, observed: false, journal: { state: "NONE" } });
+    const archive = worker.local.values.get(ISOLATION_ARCHIVE_KEY) as any;
+    expect(archive.entries[0]).toMatchObject({ status: "isolated", journal: { message: MESSAGE, messageSha256: MESSAGE_HASH } });
+    const isolateRequest = requests.find(request => request.path.endsWith("/isolate-attempt"));
+    expect(isolateRequest?.init.method).toBe("POST");
+    expect(isolateRequest?.init.headers.authorization).toBe("Bearer c2c_comp_test-credential");
+    expect(JSON.parse(isolateRequest?.init.body)).toEqual({
+      routeCanonical: ROUTE_A, eventId: EVENT_ID, reservationId: RESERVATION_ID,
+      attemptId: ATTEMPT_ID, messageSha256: MESSAGE_HASH,
+    });
+    expect(worker.fetchMock.mock.calls.some(call => String(call[0]).endsWith("/ack"))).toBe(false);
+    expect(worker.tabsSendMessage).toHaveBeenCalledTimes(1);
+    expect(worker.tabsSendMessage.mock.calls[0]?.[1]).toMatchObject({ type: "c2c.production.send.recover" });
+
+    const next = await worker.send({
+      type: "c2c.reserve.page", canonicalRoute: ROUTE_A, generation: 1,
+      safety: { composer: "empty", generation: "idle", safe: true },
+    }, worker.ownerSender);
+    expect(next).toMatchObject({ ok: true, journal: { state: "RESERVED" } });
+    expect(paths.some(path => path.endsWith("/reserve"))).toBe(true);
+  });
+
+  it("keeps the original journal on lost response, then restart closes only from exact server isolation evidence", async () => {
+    let serverIsolated = false;
+    const first = await loadWorker({
+      local: { [JOURNAL_KEY]: unknownJournal() },
+      tabsSendMessage: async () => unknownRecoveryProbe(),
+      fetch: async url => {
+        const path = new URL(String(url)).pathname;
+        if (path.endsWith("/state")) return json(200, apiState(unknownInFlight()));
+        if (path.endsWith("/isolate-attempt")) { serverIsolated = true; throw new Error("committed response lost"); }
+        return json(404, {});
+      },
+    });
+    expect(await first.send({ type: "c2c.recover" })).toMatchObject({ ok: false, reason: "network_unreachable" });
+    expect(first.local.values.get(JOURNAL_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN", message: MESSAGE });
+    expect(first.local.values.get(ISOLATION_ARCHIVE_KEY)).toMatchObject({ entries: [{ status: "pending", journal: { message: MESSAGE } }] });
+    expect(serverIsolated).toBe(true);
+
+    const restarted = await loadWorker({
+      local: Object.fromEntries(first.local.values),
+      fetch: async url => {
+        const path = new URL(String(url)).pathname;
+        if (path.endsWith("/state")) return json(200, apiState(null, [stateIsolatedAttempt()]));
+        return json(404, { error: "unexpected_endpoint" });
+      },
+    });
+    expect(await restarted.send({ type: "c2c.recover" })).toMatchObject({ ok: true, isolated: true, observed: false });
+    expect(restarted.local.values.get(JOURNAL_KEY)).toMatchObject({ state: "NONE" });
+    expect(restarted.local.values.get(ISOLATION_ARCHIVE_KEY)).toMatchObject({ entries: [{ status: "isolated", journal: { message: MESSAGE } }] });
+    expect(restarted.fetchMock.mock.calls.some(call => String(call[0]).endsWith("/ack"))).toBe(false);
+    expect(restarted.tabsSendMessage).not.toHaveBeenCalled();
+  });
+
+  it("refuses stale content proof, bad response target, and local archive write failure without clearing or ACK", async () => {
+    const stale = await loadWorker({
+      local: { [JOURNAL_KEY]: unknownJournal() },
+      tabsSendMessage: async () => ({ ...unknownRecoveryProbe(), composerEmpty: false }),
+      fetch: async url => new URL(String(url)).pathname.endsWith("/state")
+        ? json(200, apiState(unknownInFlight())) : json(200, isolateProof()),
+    });
+    expect(await stale.send({ type: "c2c.recover" })).toMatchObject({ ok: false, reason: "outcome_unknown" });
+    expect(stale.local.values.has(ISOLATION_ARCHIVE_KEY)).toBe(false);
+    expect(stale.fetchMock.mock.calls.some(call => String(call[0]).endsWith("/isolate-attempt"))).toBe(false);
+
+    const wrongTarget = await loadWorker({
+      local: { [JOURNAL_KEY]: unknownJournal() },
+      tabsSendMessage: async () => unknownRecoveryProbe(),
+      fetch: async url => {
+        const path = new URL(String(url)).pathname;
+        if (path.endsWith("/state")) return json(200, apiState(unknownInFlight()));
+        if (path.endsWith("/isolate-attempt")) return json(200, { ...isolateProof(), attemptId: "66666666-6666-4666-8666-666666666666" });
+        return json(404, {});
+      },
+    });
+    expect(await wrongTarget.send({ type: "c2c.recover" })).toMatchObject({ ok: false, reason: "isolation_response_invalid" });
+    expect(wrongTarget.local.values.get(JOURNAL_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN" });
+    expect(wrongTarget.local.values.get(ISOLATION_ARCHIVE_KEY)).toMatchObject({ entries: [{ status: "pending" }] });
+    expect(wrongTarget.fetchMock.mock.calls.some(call => String(call[0]).endsWith("/ack"))).toBe(false);
+
+    const storageFailure = await loadWorker({
+      local: { [JOURNAL_KEY]: unknownJournal() }, tabsSendMessage: async () => unknownRecoveryProbe(),
+      fetch: async url => new URL(String(url)).pathname.endsWith("/state")
+        ? json(200, apiState(unknownInFlight())) : json(200, isolateProof()),
+    });
+    const originalSet = storageFailure.local.set.bind(storageFailure.local);
+    storageFailure.local.set = async row => {
+      if (Object.hasOwn(row, ISOLATION_ARCHIVE_KEY)) throw new Error("protected storage write failed");
+      await originalSet(row);
+    };
+    expect(await storageFailure.send({ type: "c2c.recover" })).toMatchObject({ ok: false, reason: "isolation_archive_persist_failed" });
+    expect(storageFailure.local.values.get(JOURNAL_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN" });
+    expect(storageFailure.fetchMock.mock.calls.some(call => String(call[0]).endsWith("/isolate-attempt"))).toBe(false);
+  });
+
+  it("gives observe-only recovery first chance when an unknown journal has no server inFlight or archive", async () => {
+    const worker = await loadWorker({
+      local: { [JOURNAL_KEY]: unknownJournal() },
+      tabsSendMessage: async () => ({ ...unknownRecoveryProbe(), composerEmpty: false }),
+      fetch: async url => new URL(String(url)).pathname.endsWith("/state")
+        ? json(200, apiState(null)) : json(404, { error: "unexpected_endpoint" }),
+    });
+    expect(await worker.send({ type: "c2c.recover" })).toMatchObject({ ok: false, reason: "outcome_unknown" });
+    expect(worker.tabsSendMessage).toHaveBeenCalledTimes(1);
+    expect(worker.local.values.get(JOURNAL_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN", message: MESSAGE });
+    expect(worker.local.values.has(ISOLATION_ARCHIVE_KEY)).toBe(false);
+    expect(worker.fetchMock.mock.calls.some(call => /\/(?:ack|isolate-attempt|operations\/terminal-gone)$/.test(String(call[0])))).toBe(false);
+  });
+
+  it("serializes recovery races so only one exact isolate call can run", async () => {
+    let release!: () => void;
+    const worker = await loadWorker({
+      local: { [JOURNAL_KEY]: unknownJournal() }, tabsSendMessage: async () => unknownRecoveryProbe(),
+      fetch: async url => {
+        const path = new URL(String(url)).pathname;
+        if (path.endsWith("/state")) { await new Promise<void>(resolve => { release = resolve; }); return json(200, apiState(unknownInFlight())); }
+        if (path.endsWith("/isolate-attempt")) return json(200, isolateProof());
+        return json(404, {});
+      },
+    });
+    const first = worker.send({ type: "c2c.recover" });
+    const second = worker.send({ type: "c2c.recover" });
+    await vi.waitFor(() => expect(worker.fetchMock.mock.calls.filter(call => String(call[0]).endsWith("/state"))).toHaveLength(1));
+    expect(await second).toMatchObject({ ok: false, reason: "production_recovery_busy" });
+    release();
+    expect(await first).toMatchObject({ ok: true, isolated: true, observed: false });
+    expect(worker.fetchMock.mock.calls.filter(call => String(call[0]).endsWith("/isolate-attempt"))).toHaveLength(1);
+  });
+
+  it("archives explicit terminal-gone evidence before clearing, without ACK or observation", async () => {
+    const requests: Array<{ path: string; init: any }> = [];
+    const steps: string[] = [];
+    const worker = await loadWorker({
+      local: { [JOURNAL_KEY]: unknownJournal() },
+      tabsSendMessage: async () => { steps.push("observe"); return unknownRecoveryProbe(); },
+      fetch: async (url, init = {}) => {
+        const path = new URL(String(url)).pathname;
+        requests.push({ path, init });
+        steps.push(path);
+        if (path.endsWith("/state")) return json(200, apiState(null));
+        if (path.endsWith("/operations/terminal-gone")) return json(200, terminalGoneProof());
+        return json(404, { error: "unexpected_endpoint" });
+      },
+    });
+    expect(await worker.send({ type: "c2c.recover" })).toMatchObject({
+      ok: true, terminalGone: true, isolated: false, observed: false, journal: { state: "NONE" },
+    });
+    expect(worker.local.values.get(ISOLATION_ARCHIVE_KEY)).toMatchObject({
+      entries: [{ status: "terminal_gone", journal: { message: MESSAGE, messageSha256: MESSAGE_HASH } }],
+    });
+    const request = requests.find(item => item.path.endsWith("/operations/terminal-gone"));
+    expect(request?.init.method).toBe("POST");
+    expect(JSON.parse(request?.init.body)).toEqual({
+      routeCanonical: ROUTE_A, eventId: EVENT_ID, attemptId: ATTEMPT_ID, terminalWitness: "terminal-witness-exact",
+    });
+    expect(steps.indexOf("observe")).toBeLessThan(steps.indexOf("/api/companion/v1/operations/terminal-gone"));
+    expect(requests.some(item => item.path.endsWith("/ack") || item.path.endsWith("/isolate-attempt"))).toBe(false);
+    expect(worker.tabsSendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("only isolates after the read-only terminal query proves source still present", async () => {
+    const paths: string[] = [];
+    const worker = await loadWorker({
+      local: { [JOURNAL_KEY]: unknownJournal() },
+      tabsSendMessage: async () => unknownRecoveryProbe(),
+      fetch: async (url, init = {}) => {
+        const path = new URL(String(url)).pathname;
+        paths.push(path);
+        if (path.endsWith("/state")) return json(200, apiState(null));
+        if (path.endsWith("/operations/terminal-gone")) return json(409, terminalGoneProof("still_present"));
+        if (path.endsWith("/isolate-attempt")) return json(200, isolateProof());
+        return json(404, {});
+      },
+    });
+    expect(await worker.send({ type: "c2c.recover" })).toMatchObject({ ok: true, isolated: true, observed: false });
+    expect(paths.indexOf("/api/companion/v1/operations/terminal-gone"))
+      .toBeLessThan(paths.indexOf("/api/companion/v1/isolate-attempt"));
+    expect(worker.local.values.get(ISOLATION_ARCHIVE_KEY)).toMatchObject({ entries: [{ status: "isolated" }] });
+    expect(worker.fetchMock.mock.calls.some(call => String(call[0]).endsWith("/ack"))).toBe(false);
+  });
+
+  it("retries a lost terminal-gone response with archived evidence and blocks on archive storage failure", async () => {
+    let gone = false;
+    const first = await loadWorker({
+      local: { [JOURNAL_KEY]: unknownJournal() },
+      tabsSendMessage: async () => unknownRecoveryProbe(),
+      fetch: async url => {
+        const path = new URL(String(url)).pathname;
+        if (path.endsWith("/state")) return json(200, apiState(null));
+        if (path.endsWith("/operations/terminal-gone")) { gone = true; throw new Error("terminal proof response lost"); }
+        return json(404, {});
+      },
+    });
+    expect(await first.send({ type: "c2c.recover" })).toMatchObject({ ok: false, reason: "network_unreachable" });
+    expect(first.local.values.get(JOURNAL_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN", message: MESSAGE });
+    expect(first.local.values.get(ISOLATION_ARCHIVE_KEY)).toMatchObject({ entries: [{ status: "pending", journal: { message: MESSAGE } }] });
+    expect(gone).toBe(true);
+
+    const restarted = await loadWorker({
+      local: Object.fromEntries(first.local.values),
+      fetch: async url => new URL(String(url)).pathname.endsWith("/state")
+        ? json(200, apiState(null)) : json(200, terminalGoneProof()),
+    });
+    expect(await restarted.send({ type: "c2c.recover" })).toMatchObject({ ok: true, terminalGone: true, observed: false });
+    expect(restarted.local.values.get(JOURNAL_KEY)).toMatchObject({ state: "NONE" });
+    expect(restarted.local.values.get(ISOLATION_ARCHIVE_KEY)).toMatchObject({ entries: [{ status: "terminal_gone" }] });
+
+    const storageFailure = await loadWorker({
+      local: { [JOURNAL_KEY]: unknownJournal() },
+      tabsSendMessage: async () => unknownRecoveryProbe(),
+      fetch: async url => new URL(String(url)).pathname.endsWith("/state")
+        ? json(200, apiState(null)) : json(200, terminalGoneProof()),
+    });
+    const originalSet = storageFailure.local.set.bind(storageFailure.local);
+    storageFailure.local.set = async row => {
+      if (Object.hasOwn(row, ISOLATION_ARCHIVE_KEY)) throw new Error("protected storage write failed");
+      await originalSet(row);
+    };
+    expect(await storageFailure.send({ type: "c2c.recover" })).toMatchObject({ ok: false, reason: "isolation_archive_persist_failed" });
+    expect(storageFailure.local.values.get(JOURNAL_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN" });
+    expect(storageFailure.fetchMock.mock.calls.some(call => String(call[0]).endsWith("/operations/terminal-gone"))).toBe(false);
+  });
+});
+
+describe("read-only execution result panel proxy", () => {
+  const json = (status: number, body: unknown) => ({
+    ok: status >= 200 && status < 300, status, async json() { return body; },
+  });
+  it("reads only a canonical result through the verified route and bounds the exact text projection", async () => {
+    const result = {
+      commandId: "mailbox_1", iteration: 2, resultId: "77777777-7777-4777-8777-777777777777",
+      resultSha256: "b".repeat(64), status: "ok", deliveryStatus: "queued",
+      rawSummary: "Codex execution summary", testsSummary: "Focused tests passed",
+    };
+    const worker = await loadWorker({ fetch: async url => {
+      const path = new URL(String(url)).pathname;
+      return path.endsWith("/operations/result") ? json(200, result) : json(404, {});
+    } });
+    const reply = await worker.send({ type: "c2c.operations.result.read", commandId: "mailbox_1", iteration: 2 }, worker.panelSender);
+    expect(reply).toEqual({ ok: true, result });
+    const [url, init] = worker.fetchMock.mock.calls.find(call => String(call[0]).includes("/operations/result"))!;
+    expect(String(url)).toMatch(/\/operations\/result\?commandId=mailbox_1&iteration=2$/);
+    expect(init).toMatchObject({ method: "GET", cache: "no-store" });
+    expect(init.headers.authorization).toBe("Bearer c2c_comp_test-credential");
+    expect(worker.tabsSendMessage).not.toHaveBeenCalled();
+    expect(await worker.send({ type: "c2c.operations.result.read", commandId: "mailbox_1", iteration: 2, route: ROUTE_B }, worker.panelSender))
+      .toMatchObject({ ok: false, reason: "bad_message" });
+    expect(await worker.send({ type: "c2c.operations.result.read", commandId: "mailbox_1", iteration: 2 }, worker.ownerSender))
+      .toMatchObject({ ok: false, reason: "extension_panel_required" });
+  });
+
+  it("does not expose historical result summaries", async () => {
+    const worker = await loadWorker({ fetch: async url => new URL(String(url)).pathname.endsWith("/operations/result")
+      ? json(409, { error: "COMPANION_RESULT_HISTORICAL_REFUSED", rawSummary: "must not reach UI" })
+      : json(404, {}) });
+    expect(await worker.send({ type: "c2c.operations.result.read", commandId: "mailbox_1", iteration: 2 }, worker.panelSender))
+      .toEqual({ ok: false, reason: "COMPANION_RESULT_HISTORICAL_REFUSED" });
   });
 });
 

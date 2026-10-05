@@ -1,8 +1,16 @@
 # R5 Endpoint Architecture
 
-## 当前 endpoint 合同与实施状态（2026-10-04）
+## 消息与 endpoint 的职责更新（2026-10-05，源码与后端部署）
 
-运行/版本/测试快照统一见 [开发计划当前事实](development-plan.md#当前事实与开发阶段2026-10-04-2144asiashanghai)。B1/B2/B4/B5 已落地，B3 选择保留现有存储；“仅目标设计、尚未改变部署”已不适用于这些已交付路径。下方 command 与 R5 阶段记录保留当时证据，其 build、计数、未部署或 NEXT 不是当前结论。
+[双向消息收件箱](agent-mailbox.md) 将“Bridge 已接收 queued”“Executor 已接受 accepted”“可信执行终态”“网页 observed/ACK”四件事分开。MCP 接收不等待 Executor 空闲；后台发送仍实时验证原 frozen target 和权限。未知任务不能换 ID 重发，但独立新任务可继续排队。Command 的 corrupt lifecycle authority 保留，worker 只跳过这条，不抢锁。
+
+canonical Result Bus 的 isolatedAt 保留原 outcome_unknown/target/reservation/attempt，单条不再占用全局回流槽；不生成成功或 ACK。旧 legacy/control 未获得此合同。当前 VERIFIED Companion 可在权限允许的 frozen route 查询 canonical summary/tests；旧目标结果不因当前面板连接而自动转投或泄漏。
+
+关闭排队 worker 与已有 Bridge shutdown 共享退出流程；maintenance → command → endpoint/store 的锁顺序保留 rollout/安装隔离。修订后的正式串行门禁161 files /3403 tests PASS，465项冻结哈希稳定、残留0，typecheck/build/diff通过；构建三方身份为 `1326542c3601b2919b1872c1d80ac22aab258b05774c5ce438513b0c5aeba3a8`。canonical install 与 Skill 精确替换已核验，workspace `2582910bf0d2` 已 scoped rollout；08:32 复核 build/install/runtime 一致、runtimeUpgrade=current。Companion Reload 已由用户确认。页面组件与真实下发/回流端到端尚未独立观察；Desktop 本机确认已完成，Desktop 与 generic Executor availability=true（采样 activity=busy），投递权限门禁已恢复；真实消息链尚未端到端验收。最终只读核验见[部署快照](development-plan.md#当前事实与开发阶段2026-10-04-2144asiashanghai)。
+
+## 2026-10-04 历史 endpoint 合同与实施状态
+
+最新源码与运行部署快照见[开发计划当前事实](development-plan.md#当前事实与开发阶段2026-10-04-2144asiashanghai)；下文状态表及后续 command/R5 切片保留当时证据。
 
 | 现役边界 | 当前实现与核验要求 |
 | --- | --- |
@@ -15,6 +23,8 @@
 | 生命周期 | 复用稳定 launcher、maintenance/start/startup-lease。supervisor 只能在 desired=running 且正向证明 stopped 时调用现有启动权威；unknown 不启动或强杀 |
 
 当前网页连接现场已验证为 epoch13，Web Sink 同 route；这是连接事实，真实任务终态回流仍须按 command/attempt 证据确认。历史清零是受授权的一次处置；新任务仍会正常产生记录。Supervisor 已有安装代码，实际任务/配置/runtime 仍未创建，真实独立恢复验收继续待授权。
+
+Bridge 的认证 shutdown 只表示已接收关闭请求。HTTP server 先停止接受新连接，允许在途请求在 1 秒内完成，再关闭剩余连接，避免未传完的请求无限阻塞退出；并发 shutdown 共享完成 Promise。runtime/release pin 仍保留到外部精确退出证明，rollout 的 5 秒退出门禁不放宽。关闭开始、排空期限到达和关闭完成有有界日志。
 
 详细当前合同见 [职责边界第12节](core-plugin-boundaries.md#12-b2b5-剩余源码交付2026-10-04)，历史 repair/abandon 仍使用专用严格协议，不因新面板或连接恢复而放宽。
 

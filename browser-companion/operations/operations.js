@@ -21,6 +21,34 @@
     document.body.classList.toggle("stale", !view.serviceFresh);
     for (const key of ["codex", "web", "bridge", "autonomy"]) el(key).textContent = view[key];
     el("checked-at").textContent = `最近观察：${time(view.observedAt)}`;
+    const archive = response?.isolationArchive;
+    const entries = Array.isArray(archive?.entries) ? archive.entries : [];
+    const currentUnknown = response?.journal?.state === "OUTCOME_UNKNOWN";
+    el("isolation-status").textContent = !archive?.available
+      ? "本机隔离档案不可读或格式无效；当前 journal 保持原样。"
+      : currentUnknown ? "当前发送日志仍为结果不明：不会自动确认或重发，正在等待安全隔离证据。"
+        : entries.length ? "归档保留供核验；隔离不会声称网页已观察，也不会自动删除证据。"
+          : "当前没有结果不明隔离记录。";
+    const archiveRows = entries.map(entry => {
+      const observed = (response?.snapshot?.commands ?? []).some(command =>
+        (command.feedback ?? []).some(event => event.eventId === entry.eventId
+          && event.attemptId === entry.attemptId && event.status === "observed"));
+      const isCurrent = currentUnknown && entry.eventId === response?.journal?.eventId
+        && entry.attemptId === response?.journal?.attemptId;
+      const status = entry.status === "terminal_gone"
+        ? "旧 attempt 已确认离开服务端来源并归档 · 网页未观察确认"
+        : entry.status === "pending" && observed
+          ? "服务端已有精确观察记录 · 原正文档案保留"
+          : entry.status === "pending"
+            ? isCurrent ? "本地正文已安全归档 · 等待服务器隔离确认" : "本地正文已安全归档 · 隔离待确认"
+            : isCurrent ? "服务器已隔离 · 原发送日志清理待恢复" : "已隔离 · 网页未观察确认";
+      return `${status} · ${entry.routeCanonical} · event ${entry.eventId} · reservation ${entry.reservationId} · attempt ${entry.attemptId} · ${time(entry.archivedAt)}`;
+    });
+    if (currentUnknown && !entries.some(entry => entry.eventId === response?.journal?.eventId && entry.attemptId === response?.journal?.attemptId)) {
+      archiveRows.unshift("当前 OUTCOME_UNKNOWN 没有匹配的归档条目；journal 保持阻塞，等待安全恢复核验。");
+    }
+    el("isolation-entries").replaceChildren(...(archiveRows.length
+      ? archiveRows.map(value => text("li", value)) : [text("li", "无归档记录")]));
     el("scope").textContent = view.workspaceId ? `项目 ${view.workspaceId} · 全部任务  /  当前连接 ${view.route}` : "尚未取得当前连接；请在伴侣 popup 中完成配对与对话验证。";
     el("diagnostic").textContent = !view.serviceFresh ? `当前状态无法核验${view.reason ? `（${view.reason}）` : ""}。请勿据此重发消息。`
       : view.reason ? `Codex 状态待核验（${view.reason}）。` : "状态仅代表最近一次观察，发送前仍会重新检查。";
@@ -81,6 +109,37 @@
       ...row.executions.map(item => `执行 record：第 ${item.iteration} 次 · ${C2COperations.resultLabels[item.status] ?? "未知"} · ${time(item.createdAt)}`),
       ...row.feedback.map(item => `返回网页：第 ${item.iteration} 次 · ${item.label} · ${item.target === "historical" ? "历史目标" : item.target === "current" ? "当前目标" : "目标尚未冻结"} · ${time(item.updatedAt)}`)];
     for (const step of steps) el("timeline").append(text("li", step));
+    el("execution-results").replaceChildren();
+    el("execution-result").hidden = true;
+    for (const execution of row.executions) {
+      const resultButton = text("button", `读取第 ${execution.iteration} 次执行结果`, "quiet");
+      resultButton.type = "button";
+      resultButton.disabled = !view.serviceFresh || response?.web?.verified !== true;
+      resultButton.title = resultButton.disabled ? "需要当前已验证 route；历史 route 的结果不会显示" : "只读读取原始执行摘要，不表示网页已观察或确认";
+      resultButton.onclick = async () => {
+        resultButton.disabled = true;
+        el("execution-result").hidden = false;
+        el("execution-result").textContent = "正在读取当前 verified route 可见的 canonical 结果…";
+        try {
+          const reply = await chrome.runtime.sendMessage({ type: "c2c.operations.result.read", commandId: row.commandId, iteration: execution.iteration });
+          if (!reply?.ok) {
+            const reason = reply?.reason === "COMPANION_RESULT_HISTORICAL_REFUSED"
+              ? "此结果冻结到其他 verified route，服务端拒绝显示历史摘要。"
+              : reply?.reason === "COMPANION_RESULT_NOT_FOUND" ? "当前 route 范围内没有此 canonical 结果。"
+                : `结果读取失败：${reply?.reason ?? "unknown"}。`;
+            el("execution-result").textContent = reason;
+            return;
+          }
+          const result = reply.result;
+          el("execution-result").textContent = `执行状态：${result.status} · 网页投递状态：${result.deliveryStatus}\nresultId：${result.resultId}\nSHA-256：${result.resultSha256}\n\n执行摘要：\n${result.rawSummary}\n\n测试摘要：\n${result.testsSummary}\n\n此处仅展示 canonical 执行结果，不代表网页已观察或确认。`;
+        } catch {
+          el("execution-result").textContent = "结果读取失败；没有执行或确认任何操作。";
+        } finally {
+          resultButton.disabled = !view.serviceFresh || response?.web?.verified !== true;
+        }
+      };
+      el("execution-results").append(resultButton);
+    }
     el("task-actions").replaceChildren();
     const allowed = view.serviceFresh && permission?.enabled && !actionPending && response?.autonomy !== "armed";
     const button = (label, action, eventId, supported = true, reason = "") => {
@@ -90,7 +149,10 @@
       item.onclick = () => previewAction({ requestId: crypto.randomUUID(), commandId: row.commandId, action, ...(eventId ? { eventId } : {}) });
       el("task-actions").append(item);
     };
-    button("取消尚未下发的指令", "cancel_command", null, row.delivery.status === "pending", "仅当核心证明尚无外部投递或执行证据时可用");
+    button("取消尚未下发的指令", "cancel_command", null,
+      row.delivery.status === "pending" && (row.delivery.queueStatus === undefined || row.delivery.cancelable === true),
+      row.delivery.cancelReason === "PANEL_OPERATION_PENDING" ? "此前取消请求待核验，不能换 requestId 重试"
+        : row.delivery.cancelable === false ? "核心证据无法证明安全取消，队列保持原样" : "仅当核心证明尚无外部投递或执行证据时可用");
     button("重发指令", "cancel_command", null, false, "面板不保存原指令正文，无法证明重发内容与原指令精确一致；已接受或结果不明的指令禁止重发");
     for (const event of row.feedback) {
       if (event.source !== "result_bus") continue;

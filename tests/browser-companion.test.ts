@@ -20,6 +20,16 @@ import {
   applyObserveOwnership,
 } from "../browser-companion/ownership.js";
 import { observeChatGptSafety, fakeDom } from "../browser-companion/dom-adapter.js";
+import { companionApiUrl, BridgeOriginError } from "../browser-companion/bridge-origin.js";
+import {
+  emptyOutcomeUnknownArchive,
+  appendOutcomeUnknownArchive,
+  parseOutcomeUnknownArchive,
+  summarizeOutcomeUnknownArchive,
+  parseServerIsolatedAttempts,
+  canParkOutcomeUnknown,
+} from "../browser-companion/outcome-unknown-isolation.js";
+import "../browser-companion/operations/view.js";
 import {
   parseChatgptConversationRoute,
   normalizeChatgptConversationRoute,
@@ -29,6 +39,114 @@ import {
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const ROUTE = "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111";
 const ROUTE_B = "https://chatgpt.com/c/22222222-2222-4222-8222-222222222222";
+
+describe("Browser Companion isolated outcome archive", () => {
+  const journal = {
+    state: "OUTCOME_UNKNOWN",
+    eventId: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    reservationId: "33333333-3333-4333-8333-333333333333",
+    attemptId: "44444444-4444-4444-8444-444444444444",
+    routeCanonical: ROUTE,
+    bindingId: "22222222-2222-4222-8222-222222222222",
+    epoch: 3,
+    message: "原始发送内容只留在受保护档案",
+    messageSha256: "a".repeat(64),
+    createdAt: "2026-10-01T00:00:00.000Z",
+    updatedAt: "2026-10-01T00:00:01.000Z",
+  };
+
+  it("parses only bounded exact journal snapshots and shows metadata without正文", () => {
+    const added = appendOutcomeUnknownArchive(emptyOutcomeUnknownArchive(), journal, "2026-10-01T00:00:02.000Z");
+    expect(added.ok).toBe(true);
+    if (!added.ok) return;
+    expect(parseOutcomeUnknownArchive(JSON.parse(JSON.stringify(added.archive))).ok).toBe(true);
+    expect(parseOutcomeUnknownArchive({ ...added.archive, extra: true }).ok).toBe(false);
+    expect(parseOutcomeUnknownArchive({ ...added.archive, entries: [{ ...added.entry, journal: { ...journal, extra: true } }] }).ok).toBe(false);
+    expect(JSON.stringify(summarizeOutcomeUnknownArchive(added.archive))).not.toContain(journal.message);
+    expect(summarizeOutcomeUnknownArchive(added.archive).entries[0]).toMatchObject({
+      eventId: journal.eventId, attemptId: journal.attemptId, status: "pending",
+    });
+  });
+
+  it("parks only on exact unknown target and complete fresh zero-mutation proof", () => {
+    const inFlight = { ...journal, routeCanonical: ROUTE, status: "outcome_unknown" };
+    const owner = { tabId: 7, documentId: "doc", canonicalRoute: ROUTE, generation: 9 };
+    const probe = {
+      reason: "outcome_unknown", journalState: "OUTCOME_UNKNOWN", zeroWrite: true, zeroClick: true,
+      ownerFresh: true, composerEmpty: true, generationIdle: true, nativeProductionInFlight: false,
+      routeCanonical: ROUTE, generation: 9,
+    };
+    const input = { journal, inFlight, probe, owner, ownerExact: true, concurrentNativeProduction: false };
+    expect(canParkOutcomeUnknown(input)).toBe(true);
+    expect(canParkOutcomeUnknown({ ...input, probe: { ...probe, zeroClick: false } })).toBe(false);
+    expect(canParkOutcomeUnknown({ ...input, probe: { ...probe, composerEmpty: false } })).toBe(false);
+    expect(canParkOutcomeUnknown({ ...input, inFlight: { ...inFlight, attemptId: "55555555-5555-4555-8555-555555555555" } })).toBe(false);
+    expect(canParkOutcomeUnknown({ ...input, ownerExact: false })).toBe(false);
+  });
+});
+
+describe("Browser Companion exact isolation/result routes", () => {
+  it("allows only the fixed isolate endpoint and canonical result query", () => {
+    expect(companionApiUrl("https://bridge.example.test", "/isolate-attempt"))
+      .toBe("https://bridge.example.test/api/companion/v1/isolate-attempt");
+    expect(companionApiUrl("https://bridge.example.test", "/operations/terminal-gone"))
+      .toBe("https://bridge.example.test/api/companion/v1/operations/terminal-gone");
+    expect(companionApiUrl("https://bridge.example.test", "/operations/result?commandId=task_1&iteration=2"))
+      .toBe("https://bridge.example.test/api/companion/v1/operations/result?commandId=task_1&iteration=2");
+    for (const path of [
+      "/isolate-attempt?eventId=any",
+      "/operations/result?commandId=task%2Fone&iteration=1",
+      "/operations/result?iteration=1&commandId=task_1",
+      "/operations/result?commandId=task_1&iteration=01",
+      "/operations/result?commandId=task_1&iteration=9007199254740992",
+      "/operations/result?commandId=task_1&iteration=1&route=other",
+    ]) expect(() => companionApiUrl("https://bridge.example.test", path)).toThrow(BridgeOriginError);
+  });
+
+  it("accepts the exact authenticated state projection including delivery status", () => {
+    const actualProjection = [{
+      routeCanonical: ROUTE,
+      eventId: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      reservationId: "33333333-3333-4333-8333-333333333333",
+      attemptId: "44444444-4444-4444-8444-444444444444",
+      messageSha256: "a".repeat(64),
+      isolated: true,
+      status: "outcome_unknown",
+    }];
+    expect(parseServerIsolatedAttempts(actualProjection)).toMatchObject({ ok: true, attempts: actualProjection });
+    expect(parseServerIsolatedAttempts([{ ...actualProjection[0], observed: false }]).ok).toBe(false);
+    expect(parseServerIsolatedAttempts([{ ...actualProjection[0], status: "observed" }]).ok).toBe(false);
+  });
+});
+
+describe("Browser Companion mailbox presentation", () => {
+  it("explains queued Codex work, attention-blocked queue entries, and isolated unknown feedback", () => {
+    const now = Date.parse("2026-10-01T00:00:00.000Z");
+    const view = (globalThis as any).C2COperations.derive({
+      ok: true,
+      snapshot: {
+        workspaceId: "a".repeat(12), routeCanonical: ROUTE, observedAt: new Date(now).toISOString(),
+        executor: { state: "busy", observedAt: new Date(now).toISOString() },
+        commands: [
+          { commandId: "queued_1", delivery: { status: "pending", queueStatus: "queued" }, executions: [], feedback: [] },
+          { commandId: "blocked_1", delivery: { status: "pending", queueStatus: "blocked", queueReason: "CODEX_BUSY" }, executions: [], feedback: [] },
+          { commandId: "isolated_1", delivery: { status: "accepted" }, executions: [], feedback: [
+            { eventId: "event_1", attemptId: "attempt_1", status: "outcome_unknown", isolated: true },
+          ] },
+        ],
+      },
+      web: { observedAt: new Date(now).toISOString(), verified: true, ownerAvailable: true, routeMatches: true, composer: "empty", generation: "idle", safe: true },
+    }, now);
+    expect(view.codex).toBe("忙碌 · 可排队");
+    expect(view.rows.find((row: any) => row.commandId === "queued_1").deliveryLabel).toBe("已排队 · 等待 Codex 处理");
+    expect(view.rows.find((row: any) => row.commandId === "blocked_1")).toMatchObject({
+      needsAttention: true, deliveryLabel: "派发受阻 · CODEX_BUSY",
+    });
+    expect(view.rows.find((row: any) => row.commandId === "isolated_1")).toMatchObject({ needsAttention: true });
+    expect(view.rows.find((row: any) => row.commandId === "isolated_1").feedback[0].label)
+      .toBe("本条已隔离 · 未确认送达 · 后续继续");
+  });
+});
 
 function doc(tabId: number, documentId: string, canonicalRoute: string, generation = 1) {
   return { tabId, documentId, canonicalRoute, generation, frameId: 0, lastSeen: Date.now() };

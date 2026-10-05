@@ -1,5 +1,7 @@
 # 核心与插件职责边界
 
+2026-10-05 的职责增量见 [双向消息收件箱](agent-mailbox.md)：Routing 负责持久接收和排队，既有安全 sender 负责真实投递，Result Bus 负责 canonical 结果，Companion 保存逐条 DOM attempt 证据。busy 不拒收，单条 unknown 可隔离；所有权和原请求防重放仍核验。当前为未部署源码开发，下方部署事实是此前阶段记录。
+
 日期：2026-10-04。B0/B1/B2/B4/B5 对应源码已落地，B3 已评估并决定不迁移 SQLite；安装、扩展现场验收与未完成场景以 [开发计划当前事实](development-plan.md#当前事实与开发阶段2026-10-04-2144asiashanghai) 为唯一快照。Supervisor foundation 随 Core 部署，但真实 Scheduled Task 尚未注册。
 
 第1–9节描述设计约束及已采纳边界；第10–15节保留各轮实施和现场证据，后续完成状态覆盖其中当轮“未部署/待验证”的表述。[现有架构](architecture.md)说明主链，[R5 endpoint 合同](r5-endpoint-architecture.md)说明协议。未实施的数据库迁移或后续生命周期场景不能因设计文字视为完成。

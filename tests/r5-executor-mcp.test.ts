@@ -25,14 +25,11 @@ describe("R5b MCP tool contract surface", () => {
       /authorizeNow\(auth\);\s*\n(?:\s*\/\/[^\n]*\n)*\s*executorAuthorize\?\.\(auth\);\s*\n\s*if \(input\.workspaceId/,
     );
     // send-time authorize 回调保留为第二道重验证。
-    expect(source).toMatch(
-      /authorize:\s*\(\)\s*=>\s*\{\s*authorizeNow\(auth\);\s*executorAuthorize\?\.\(auth\);/,
-    );
-    // pin 前不得有任何 beginExecutorDispatch 调用先于 executorAuthorize。
-    const prePinIndex = source.indexOf("executorAuthorize?.(auth);");
-    const pinIndex = source.indexOf("beginExecutorDispatch({");
-    expect(prePinIndex).toBeGreaterThanOrEqual(0);
-    expect(pinIndex).toBeGreaterThan(prePinIndex);
+    expect(source).toMatch(/dispatchExecutorCommand\([\s\S]*?\(\)\s*=>\s*\{\s*authorizeNow\(auth\);\s*executorAuthorize\?\.\(auth\);/);
+    const transport = fs.readFileSync(path.join(process.cwd(), "src/executor-control/send.ts"), "utf8");
+    expect(transport.indexOf("authorize();")).toBeGreaterThanOrEqual(0);
+    expect(transport.indexOf("beginExecutorDispatch({")).toBeGreaterThan(transport.indexOf("authorize();"));
+    expect(transport).toMatch(/authorize[,\s]/);
     // userConfirmed:true 不得削弱。
     expect(source).toMatch(/userConfirmed:\s*z\.literal\(true\)/);
   });

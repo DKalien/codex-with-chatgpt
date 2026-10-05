@@ -1,4 +1,5 @@
 import { assertCommandNotCancelled } from "../routing/store.js";
+import { readDesktop } from "../desktop/store.js";
 import { createHash, randomUUID } from "node:crypto";
 import { getStateDir } from "../config/paths.js";
 import {
@@ -401,6 +402,28 @@ export function finalizeExecutorDispatch(input: FinalizeExecutorDispatchInput): 
   return CLEANUP_COMMAND_ID.test(input.commandId)
     ? withCommandOperation(input.workspaceId, input.commandId, update, input.stateDir)
     : update();
+}
+
+/** Queue-only rollback after Codex's controlled preflight reports DESKTOP_BUSY.
+ * Never called after an attempted send. The immutable mailbox still pins the binding.
+ * Command authority excludes a concurrent sender/cleanup, generation + owner exclude
+ * delayed callbacks, and any durable Desktop delivery forbids rollback.
+ */
+export function releaseUnsentExecutorPin(input: Omit<FinalizeExecutorDispatchInput, "result">): void {
+  withCommandOperation(input.workspaceId, input.commandId, () => {
+    const desktop = readDesktop(input.workspaceId, input.stateDir);
+    if (desktop?.workspaceRoot !== input.workspaceRoot || desktop.deliveries.some(item => item.commandId === input.commandId))
+      throw new ExecutorDispatchError("EXECUTOR_DISPATCH_INVALID_TRANSITION", "已有投递证据或工作区不符，不能撤销 pin。");
+    updateExecutorDispatchDetailed(input.workspaceId, input.workspaceRoot, previous => {
+      const entry = requireEntry(previous?.entries ?? [], input.commandId);
+      assertDispatchGeneration(entry, input.expectedDispatchGenerationId);
+      if (entry.deliveryStatus !== "started" || entry.ownerId !== PROCESS_DISPATCH_OWNER_ID ||
+          !deliveryTargetEquals(entry.target, input.target))
+        throw new ExecutorDispatchError("EXECUTOR_DISPATCH_INVALID_TRANSITION", "仅本次未发送的精确 pin 可撤销。");
+      return { state: { ...previous!, revision: previous!.revision + 1,
+        entries: previous!.entries.filter(item => item !== entry) }, result: undefined };
+    }, input.stateDir);
+  }, input.stateDir);
 }
 
 /**

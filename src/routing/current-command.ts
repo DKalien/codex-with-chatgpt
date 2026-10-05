@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { ensureCurrentExecutorRoute, resolveCurrentExecutorRoute } from "./current-executor-route.js";
 import { ensureCurrentPlannerRoute, resolveCurrentPlannerRoute } from "./current-planner-route.js";
-import { RoutingError, type CommandInput, type RoutingCommand } from "./schema.js";
+import { RoutingError, type CommandInput, type RoutingCommand, type CommandMailbox } from "./schema.js";
 import { createCommand, type RoutingWorkspaceIdentity } from "./store.js";
 
 /** 创建当前 planner/executor route 对应的 pending Command；不投递、不授权发送。 */
@@ -9,6 +9,7 @@ export function createCurrentCommand(
   identity: RoutingWorkspaceIdentity,
   plannerFingerprint: string,
   input: Pick<CommandInput, "commandId" | "intent"> & { payload: string },
+  mailbox?: CommandMailbox,
 ): RoutingCommand {
   const planner = ensureCurrentPlannerRoute(identity, plannerFingerprint);
   if (!planner) {
@@ -45,5 +46,5 @@ export function createCurrentCommand(
     intent: input.intent,
     payloadBytes,
     payloadSha256,
-  });
+  }, undefined, mailbox);
 }

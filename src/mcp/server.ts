@@ -27,13 +27,13 @@ export function createMcpServer(ctx: McpContext): McpServer {
   registerExecutionTools(server, ctx);
   registerWriteProbeTools(server, ctx);
   registerRemoteTools(server, ctx.workspace);
-  registerDesktopTools(server, ctx.workspace, ctx.desktopAuthorize);
+  registerDesktopTools(server, ctx.workspace, ctx.desktopAuthorize, ctx.commandMailbox);
   // 默认关闭；C2C_ENABLE_FEEDBACK_PROBE=1 时注册 UI resource + 探针工具。
   registerFeedbackProbeTools(server, ctx.workspace);
   // production feedback：永久 scope codex.feedback；与 synthetic probe 分离。
   registerFeedbackTools(server, ctx.workspace);
   // R5b generic executor control plane（不提供 MCP bind）。
-  registerExecutorTools(server, ctx.workspace, ctx.executorAuthorize);
+  registerExecutorTools(server, ctx.workspace, ctx.executorAuthorize, ctx.commandMailbox);
   // R5c generic Web Sink read-only（不提供 MCP bind/switch）。
   registerWebSinkTools(server, ctx.workspace);
   return server;

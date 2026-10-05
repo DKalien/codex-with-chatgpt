@@ -1,8 +1,14 @@
 # Architecture
 
-## 当前实现与部署边界（2026-10-04）
+## 双向消息模型（2026-10-05，源码与后端部署）
 
-当前运行、构建、测试及下一阶段的唯一快照见 [开发计划当前事实](development-plan.md#当前事实与开发阶段2026-10-04-2144asiashanghai)。checkout 扩展构建与已安装/运行 Core 不同；历史全量、清零和部署记录仅证明对应阶段，不能据它们宣称当前队列为空或当前源码通过全量。
+当前改造合同见 [双向消息收件箱](agent-mailbox.md)：MCP 持久接收 queued，busy 留在队列，idle 后复用安全 Desktop sender；accepted 与可信执行终态分开。Routing 独占任务接收状态，Result Bus 独占 canonical 回流状态，Companion 独占 DOM attempt 证据；单条未知不作为所有新消息的全局阻断。维护/升级与消息权限仍独立严格核验。canonical 回流可逐条隔离原未知 attempt，并在合格目标的面板只读查看结果。
+
+本轮源码门禁已完成：正式串行161 files /3403 tests PASS、unhandled0，465项冻结稳定且进程/监听/temp残留0；typecheck/build/diff通过。构建三方身份精确为 `1326542c3601b2919b1872c1d80ac22aab258b05774c5ce438513b0c5aeba3a8`。canonical installer 完整 artifacts/bootstrap 与 Skill 精确替换通过，稳定 launcher 已将目标部署到 workspace `2582910bf0d2`；08:26 scoped rollout current=1，08:32 复核 built=installed=running、local/admin/named health 同身份且 `runtimeUpgrade=current`。Companion Reload 已由用户确认；页面组件就绪及真实下发/回流端到端未独立观察。Desktop 本机确认已完成，Desktop 与 generic Executor availability=true（采样 activity=busy），投递权限门禁已恢复；真实消息链尚未端到端验收。详见[部署快照](development-plan.md#当前事实与开发阶段2026-10-04-2144asiashanghai)。
+
+## 2026-10-04 历史实现与部署边界
+
+最新源码、运行与部署快照见[开发计划当前事实](development-plan.md#当前事实与开发阶段2026-10-04-2144asiashanghai)；下文保留 2026-10-04 的历史实现与部署边界说明。
 
 B1 进程退出证据、B2 查询/连接与维护分离、B4 canonical 主链、B5 受控任务面板已实现；B3 已评估并决定不迁移 SQLite。固定 registry、Executor/Web Sink 合同、领域存储与安全启动协议继续复用。Supervisor foundation 已随 Core 安装，实际 Scheduled Task/config/runtime 仍 absent/null，独立自动恢复尚未启用。
 
@@ -10,7 +16,7 @@ B1 进程退出证据、B2 查询/连接与维护分离、B4 canonical 主链、
 - 网页命令经 MCP 与核心执行路由进入 Desktop；Companion 负责回流及面板，不下发开发任务。Desktop accepted、可信终态 record、canonical result、网页 observed/ACK 分别表示不同事实。
 - 显式连接依次完成主体接管、route attestation、凭据轮换与 Web Sink 收敛。旧绑定 VERIFIED 不代表当前页面已连接；刷新产生的新 document 需显式确认 owner。接管自举结果未知时只可验证原服务端下一代身份，不自动重发或清除未知；精确零写入拒绝可在后续显式操作重试。
 - 面板聚合当前 workspace 全部存续任务和异常历史；清理过的历史不重建。写操作需本机限时授权和精确 preview/confirm，不能任意重发 accepted/unknown 或终止执行。长期记录保留不是首版功能。
-- 运行判断分别核验进程身份、OS 退出证据和应用健康。shutdown ACK/端口关闭/exit code 都不能替代 HANDLE signaled；不确定时保留 runtime/release pin，不另起实例。
+- 运行判断分别核验进程身份、OS 退出证据和应用健康。shutdown ACK/端口关闭/exit code 都不能替代 HANDLE signaled；不确定时保留 runtime/release pin，不另起实例。 Bridge 关闭入口共享一个完成 Promise：先禁止新增 mailbox 派发并等待已准入调用，再停止接收新 HTTP 连接，给在途连接 1 秒排空期，用 Node 原生 `closeAllConnections()` 关闭剩余连接；所有并发关闭调用等待同一次完整关闭。排空阶段不替代进程退出证明，也不自动强杀外部 unknown 进程。
 
 详细职责与操作条件见 [职责边界第12节](core-plugin-boundaries.md#12-b2b5-剩余源码交付2026-10-04)，连接修复及现场结果见第14–15节。下方 command/B 切片中的未部署或 NEXT 均为当轮历史，当前进度以开发计划为准。
 

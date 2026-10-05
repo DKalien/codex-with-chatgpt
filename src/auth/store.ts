@@ -331,7 +331,12 @@ export class AuthStore {
   }
 
   verifyAccessToken(token: string): VerifyTokenResult {
-    const record = this.tokens.get(sha256hex(token));
+    return this.verifyAccessTokenHash(sha256hex(token));
+  }
+
+  /** Local mailbox reference only; a digest is never accepted as a bearer token. */
+  verifyAccessTokenHash(hash: string): VerifyTokenResult {
+    const record = this.tokens.get(hash);
     if (!record) return { ok: false, reason: "unknown" };
     if (record.kind !== "access") return { ok: false, reason: "wrong_kind" };
     if (record.revoked) return { ok: false, reason: "revoked" };

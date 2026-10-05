@@ -21,6 +21,21 @@ import {
 import { areChatgptConversationRoutesEquivalent } from "./route-esm.js";
 import { parseBridgeOrigin, companionApiUrl, BridgeOriginError } from "./bridge-origin.js";
 import {
+  emptyOutcomeUnknownArchive,
+  parseOutcomeUnknownArchive,
+  appendOutcomeUnknownArchive,
+  findOutcomeUnknownArchiveEntry,
+  findServerIsolatedAttempt,
+  markOutcomeUnknownArchiveIsolated,
+  markOutcomeUnknownArchiveTerminalGone,
+  parseServerIsolatedAttempts,
+  canParkOutcomeUnknown,
+  hasSafeUnknownRecoveryProof,
+  validateIsolationResponse,
+  validateTerminalGoneResponse,
+  summarizeOutcomeUnknownArchive,
+} from "./outcome-unknown-isolation.js";
+import {
   emptyJournal,
   markReserveRequested,
   markReserved,
@@ -151,6 +166,7 @@ import {
 const LOCAL_KEY = "c2c_companion_local_v1";
 const TRANSPORT_KEY = "c2c_companion_transport_v1";
 const JOURNAL_KEY = "c2c_companion_journal_v1";
+const OUTCOME_UNKNOWN_ARCHIVE_KEY = "c2c_companion_outcome_unknown_archive_v1";
 const SESSION_OWNER_KEY = "c2c_companion_owner_v1";
 const SESSION_REG_KEY = "c2c_companion_registry_v1";
 const SESSION_EVIDENCE_KEY = "c2c_companion_evidence_v1";
@@ -161,6 +177,8 @@ let localState = { schemaVersion: 1, targetRoute: null, paired: false };
 let ownerState = emptyOwnerState();
 let transport = null;
 let journal = emptyJournal();
+let outcomeUnknownArchive = emptyOutcomeUnknownArchive();
+let outcomeUnknownArchiveValid = true;
 let evidence = null;
 /** @type {null | ReturnType<typeof mintOwnerProof>} */
 let ownerProof = null;
@@ -185,6 +203,8 @@ let connectInFlight = false;
 let transportMutationInFlight = false;
 /** E1b3d3b concurrent production send gate (memory only; durable truth is journal). */
 let productionSendInFlight = false;
+/** Serializes manual and autonomous recovery so native production cannot overlap its proof. */
+let productionRecoveryInFlight = false;
 /** Short-lived SW transition proofs. Bound to current journal identity. Never from CS. */
 let productionClaimProof = null;
 let productionAckProof = null;
@@ -242,6 +262,7 @@ async function hydrate() {
     LOCAL_KEY,
     TRANSPORT_KEY,
     JOURNAL_KEY,
+    OUTCOME_UNKNOWN_ARCHIVE_KEY,
     AUTONOMY_STORAGE_KEY,
     ROUTE_ATTEST_FENCE_KEY,
     CONNECT_FLOW_KEY,
@@ -265,6 +286,9 @@ async function hydrate() {
 
   const j = stored[JOURNAL_KEY];
   journal = j && typeof j === "object" && typeof j.state === "string" ? j : emptyJournal();
+  const archivedUnknown = parseOutcomeUnknownArchive(stored[OUTCOME_UNKNOWN_ARCHIVE_KEY]);
+  outcomeUnknownArchiveValid = archivedUnknown.ok;
+  outcomeUnknownArchive = archivedUnknown.ok ? archivedUnknown.archive : null;
 
   // Default OFF. Never auto-arm on hydrate/pair/bind.
   autonomyPolicy = parseAutonomyPolicy(stored[AUTONOMY_STORAGE_KEY]);
@@ -445,6 +469,15 @@ async function persistTransport() {
 
 async function persistJournal() {
   await chrome.storage.local.set({ [JOURNAL_KEY]: journal });
+}
+
+async function persistOutcomeUnknownArchive(next) {
+  if (!storageProtected) throw new Error("storage_unprotected");
+  const parsed = parseOutcomeUnknownArchive(next);
+  if (!parsed.ok) throw new Error(parsed.reason);
+  await chrome.storage.local.set({ [OUTCOME_UNKNOWN_ARCHIVE_KEY]: parsed.archive });
+  outcomeUnknownArchive = parsed.archive;
+  outcomeUnknownArchiveValid = true;
 }
 
 async function persistAutonomyPolicy() {
@@ -2327,6 +2360,8 @@ async function handleFetchState() {
       || !["workspaceId", "bindingId", "epoch", "companionId", "routeCanonical"].every(key => key in res.body)) {
       return { ok: false, reason: "state_response_invalid" };
     }
+    const isolatedAttempts = parseServerIsolatedAttempts(res.body.isolatedAttempts);
+    if (!isolatedAttempts.ok) return { ok: false, reason: "state_response_invalid" };
     const idCheck = validateStateIdentity(transport, res.body);
     if (!idCheck.ok) {
       return markAuthStale(idCheck.reason, res);
@@ -2381,7 +2416,10 @@ async function handleFetchState() {
         reserved: res.body.reserved,
         claimed: res.body.claimed,
         outcomeUnknown: res.body.outcomeUnknown,
-        inFlight: res.body.inFlight ?? null,
+        inFlight: res.body.inFlight && typeof res.body.inFlight === "object"
+          ? { ...res.body.inFlight, routeCanonical: res.body.routeCanonical }
+          : null,
+        isolatedAttempts: isolatedAttempts.attempts,
         enabled: res.body.enabled,
         serverObserved: observedLookup.ok ? observedLookup.observed : null,
         routeVerification: transport?.routeVerification === "VERIFIED" ? "VERIFIED" : "PENDING",
@@ -2510,10 +2548,271 @@ async function handleRelease() {
   return { ok: false, reason: res.body?.error || `http_${res.status}`, status: res.status };
 }
 
+function exactJournalSnapshot(journal) {
+  return JSON.stringify(journal);
+}
+
+async function unknownJournalMessageHashMatches(journal) {
+  if (typeof journal?.message !== "string" || typeof journal?.messageSha256 !== "string"
+    || !/^[a-f0-9]{64}$/.test(journal.messageSha256)) return false;
+  try {
+    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(journal.message)));
+    const hex = Array.from(digest, byte => byte.toString(16).padStart(2, "0")).join("");
+    return hex === journal.messageSha256;
+  } catch { return false; }
+}
+
+function unknownIsolationResult(reason, extra = {}) {
+  return {
+    ok: false,
+    reason,
+    action: "block",
+    journal: summarizeProductionJournal(journal),
+    zeroWrite: true,
+    zeroClick: true,
+    beginSendCalled: false,
+    ackCalled: false,
+    ...extra,
+  };
+}
+
+async function clearIsolatedUnknownFromState(serverAttempt) {
+  if (!outcomeUnknownArchiveValid) return unknownIsolationResult("isolation_archive_invalid");
+  const archived = findOutcomeUnknownArchiveEntry(outcomeUnknownArchive, journal);
+  if (!archived) return unknownIsolationResult("isolation_archive_missing");
+  if (!serverAttempt || serverAttempt.isolated !== true) return unknownIsolationResult("isolated_attempt_unverified");
+  const snapshot = exactJournalSnapshot(journal);
+  if (!await unknownJournalMessageHashMatches(journal)
+    || !await unknownJournalMessageHashMatches(archived.journal)
+    || exactJournalSnapshot(journal) !== snapshot) return unknownIsolationResult("isolation_message_hash_mismatch");
+  if (archived.status !== "isolated") {
+    const marked = markOutcomeUnknownArchiveIsolated(outcomeUnknownArchive, journal);
+    if (!marked.ok) return unknownIsolationResult(marked.reason);
+    try { await persistOutcomeUnknownArchive(marked.archive); }
+    catch { return unknownIsolationResult("isolation_archive_persist_failed", { serverIsolated: true }); }
+  }
+  const previous = journal;
+  journal = clearJournal();
+  try { await persistJournal(); }
+  catch {
+    journal = previous;
+    return unknownIsolationResult("journal_persist_failed", { serverIsolated: true });
+  }
+  productionClaimProof = null;
+  productionAckProof = null;
+  return {
+    ok: true,
+    recovered: true,
+    action: "isolated_unknown_clear",
+    isolated: true,
+    observed: false,
+    archived: true,
+    journal: { state: "NONE" },
+    zeroWrite: true,
+    zeroClick: true,
+    beginSendCalled: false,
+    ackCalled: false,
+  };
+}
+
+async function requestUnknownTerminalGone(journalAtStart) {
+  if (!outcomeUnknownArchiveValid) return unknownIsolationResult("isolation_archive_invalid");
+  if (journalAtStart?.state !== "OUTCOME_UNKNOWN" || typeof journalAtStart.terminalWitness !== "string"
+    || !journalAtStart.terminalWitness || journalAtStart.terminalWitness.length > 4096) {
+    return unknownIsolationResult("terminal_witness_missing");
+  }
+  if (!await unknownJournalMessageHashMatches(journalAtStart)) return unknownIsolationResult("isolation_message_hash_mismatch");
+  const snapshot = exactJournalSnapshot(journalAtStart);
+  let archived = findOutcomeUnknownArchiveEntry(outcomeUnknownArchive, journalAtStart);
+  if (!archived) {
+    const next = appendOutcomeUnknownArchive(outcomeUnknownArchive, journalAtStart);
+    if (!next.ok) return unknownIsolationResult(next.reason);
+    try { await persistOutcomeUnknownArchive(next.archive); }
+    catch { return unknownIsolationResult("isolation_archive_persist_failed"); }
+    archived = findOutcomeUnknownArchiveEntry(outcomeUnknownArchive, journalAtStart);
+  }
+  if (!archived) return unknownIsolationResult("terminal_gone_archive_missing");
+  if (journal.state !== "OUTCOME_UNKNOWN" || exactJournalSnapshot(journal) !== snapshot) {
+    return unknownIsolationResult("journal_identity_changed");
+  }
+  if (!storageProtected || transport?.routeVerification !== "VERIFIED"
+    || transport.routeCanonical !== journalAtStart.routeCanonical) {
+    return unknownIsolationResult("route_not_verified");
+  }
+
+  let response;
+  try {
+    response = await fetchCompanion("/operations/terminal-gone", {
+      method: "POST",
+      body: JSON.stringify({
+        routeCanonical: journalAtStart.routeCanonical,
+        eventId: journalAtStart.eventId,
+        attemptId: journalAtStart.attemptId,
+        terminalWitness: journalAtStart.terminalWitness,
+      }),
+    });
+  } catch { return unknownIsolationResult("network_unreachable", { archiveStatus: archived.status }); }
+  if (!isCurrentTransportResponse(response)
+    || requestTransports.get(response)?.requestAuthRevision !== authFailureRevision) {
+    return unknownIsolationResult("stale_transport_response", { archiveStatus: archived.status });
+  }
+  if (response.status === 401) {
+    markAuthStale(response.body?.error || "COMPANION_UNAUTHORIZED", response);
+    return unknownIsolationResult("COMPANION_UNAUTHORIZED", { archiveStatus: archived.status });
+  }
+  const proof = validateTerminalGoneResponse(response.body, journalAtStart);
+  if (response.status === 409 && proof.ok && proof.status === "still_present") {
+    return { ok: true, terminalGone: false, stillPresent: true, archived: true, status: "still_present" };
+  }
+  if (!response.ok || !proof.ok || proof.status !== "terminal_gone") {
+    return unknownIsolationResult(proof.ok ? "terminal_gone_response_invalid" : proof.reason, {
+      status: response.status,
+      archiveStatus: archived.status,
+    });
+  }
+  if (journal.state !== "OUTCOME_UNKNOWN" || exactJournalSnapshot(journal) !== snapshot) {
+    return unknownIsolationResult("journal_identity_changed", { serverTerminalGone: true, archiveStatus: archived.status });
+  }
+  const marked = markOutcomeUnknownArchiveTerminalGone(outcomeUnknownArchive, journalAtStart);
+  if (!marked.ok) return unknownIsolationResult(marked.reason, { serverTerminalGone: true, archiveStatus: archived.status });
+  if (archived.status !== "terminal_gone") {
+    try { await persistOutcomeUnknownArchive(marked.archive); }
+    catch { return unknownIsolationResult("isolation_archive_persist_failed", { serverTerminalGone: true, archiveStatus: archived.status }); }
+  }
+  if (journal.state !== "OUTCOME_UNKNOWN" || exactJournalSnapshot(journal) !== snapshot) {
+    return unknownIsolationResult("journal_identity_changed", { serverTerminalGone: true, archiveStatus: "terminal_gone" });
+  }
+  const previous = journal;
+  journal = clearJournal();
+  try { await persistJournal(); }
+  catch {
+    journal = previous;
+    return unknownIsolationResult("journal_persist_failed", { serverTerminalGone: true, archiveStatus: "terminal_gone" });
+  }
+  productionClaimProof = null;
+  productionAckProof = null;
+  return {
+    ok: true,
+    recovered: true,
+    action: "terminal_gone_clear",
+    terminalGone: true,
+    isolated: false,
+    observed: false,
+    archived: true,
+    journal: { state: "NONE" },
+    zeroWrite: true,
+    zeroClick: true,
+    beginSendCalled: false,
+    ackCalled: false,
+  };
+}
+
+async function requestUnknownIsolation(journalAtStart) {
+  if (!outcomeUnknownArchiveValid) return unknownIsolationResult("isolation_archive_invalid");
+  if (!await unknownJournalMessageHashMatches(journalAtStart)) return unknownIsolationResult("isolation_message_hash_mismatch");
+  const existing = findOutcomeUnknownArchiveEntry(outcomeUnknownArchive, journalAtStart);
+  if (!existing) {
+    const next = appendOutcomeUnknownArchive(outcomeUnknownArchive, journalAtStart);
+    if (!next.ok) return unknownIsolationResult(next.reason);
+    try { await persistOutcomeUnknownArchive(next.archive); }
+    catch { return unknownIsolationResult("isolation_archive_persist_failed"); }
+  }
+  const archived = findOutcomeUnknownArchiveEntry(outcomeUnknownArchive, journalAtStart);
+  if (archived?.status === "terminal_gone") return unknownIsolationResult("isolation_terminal_gone_conflict");
+  if (journal.state !== "OUTCOME_UNKNOWN" || exactJournalSnapshot(journal) !== exactJournalSnapshot(journalAtStart)) {
+    return unknownIsolationResult("journal_identity_changed");
+  }
+  if (!storageProtected || transport?.routeVerification !== "VERIFIED"
+    || transport.routeCanonical !== journalAtStart.routeCanonical) {
+    return unknownIsolationResult("route_not_verified");
+  }
+
+  let response;
+  try {
+    response = await fetchCompanion("/isolate-attempt", {
+      method: "POST",
+      body: JSON.stringify({
+        routeCanonical: journalAtStart.routeCanonical,
+        eventId: journalAtStart.eventId,
+        reservationId: journalAtStart.reservationId,
+        attemptId: journalAtStart.attemptId,
+        messageSha256: journalAtStart.messageSha256,
+      }),
+    });
+  } catch {
+    return unknownIsolationResult("network_unreachable", { archiveStatus: "pending" });
+  }
+  if (!isCurrentTransportResponse(response)
+    || requestTransports.get(response)?.requestAuthRevision !== authFailureRevision) {
+    return unknownIsolationResult("stale_transport_response", { archiveStatus: "pending" });
+  }
+  if (response.status === 401) {
+    markAuthStale(response.body?.error || "COMPANION_UNAUTHORIZED", response);
+    return unknownIsolationResult("COMPANION_UNAUTHORIZED", { archiveStatus: "pending" });
+  }
+  if (!response.ok) {
+    return unknownIsolationResult(response.body?.error || `http_${response.status}`, {
+      status: response.status,
+      archiveStatus: "pending",
+    });
+  }
+  try { assertNoForbiddenFields(response.body); }
+  catch { return unknownIsolationResult("isolation_response_invalid", { archiveStatus: "pending" }); }
+  const proof = validateIsolationResponse(response.body, journalAtStart);
+  if (!proof.ok) return unknownIsolationResult(proof.reason, { archiveStatus: "pending" });
+  if (journal.state !== "OUTCOME_UNKNOWN" || exactJournalSnapshot(journal) !== exactJournalSnapshot(journalAtStart)) {
+    return unknownIsolationResult("journal_identity_changed", { serverIsolated: true, archiveStatus: "pending" });
+  }
+
+  const marked = markOutcomeUnknownArchiveIsolated(outcomeUnknownArchive, journalAtStart);
+  if (!marked.ok) return unknownIsolationResult(marked.reason, { serverIsolated: true, archiveStatus: "pending" });
+  try { await persistOutcomeUnknownArchive(marked.archive); }
+  catch { return unknownIsolationResult("isolation_archive_persist_failed", { serverIsolated: true, archiveStatus: "pending" }); }
+
+  const previous = journal;
+  journal = clearJournal();
+  try { await persistJournal(); }
+  catch {
+    journal = previous;
+    return unknownIsolationResult("journal_persist_failed", { serverIsolated: true, archiveStatus: "isolated" });
+  }
+  productionClaimProof = null;
+  productionAckProof = null;
+  return {
+    ok: true,
+    recovered: true,
+    action: "isolated_unknown_clear",
+    isolated: true,
+    observed: false,
+    archived: true,
+    journal: { state: "NONE" },
+    zeroWrite: true,
+    zeroClick: true,
+    beginSendCalled: false,
+    ackCalled: false,
+  };
+}
+
 async function handleRecover() {
+  if (productionRecoveryInFlight || productionSendInFlight) {
+    return unknownIsolationResult("production_recovery_busy", { retryAllowed: true });
+  }
+  productionRecoveryInFlight = true;
+  try { return await handleRecoverOnce(); }
+  finally { productionRecoveryInFlight = false; }
+}
+
+async function handleRecoverOnce() {
   const stateRes = await handleFetchState();
   if (!stateRes.ok) return stateRes;
   const inFlight = stateRes.status.inFlight;
+
+  // Isolation proof takes precedence over legacy !inFlight -> /ack closeout.
+  // Clearing requires both the exact durable local archive and authenticated /state evidence.
+  if (journal.state === "OUTCOME_UNKNOWN") {
+    const serverIsolated = findServerIsolatedAttempt(stateRes.status.isolatedAttempts, journal);
+    if (serverIsolated) return clearIsolatedUnknownFromState(serverIsolated);
+  }
 
   // RESERVED: server is authority for whether reservation still exists.
   if (journal.state === "RESERVED") {
@@ -2567,29 +2866,6 @@ async function handleRecover() {
 
   // E1b3d3b: send-side durable states recover through exact-document production runtime.
   if (journalIsSendSide(journal)) {
-    // Manual force cleanup also deletes server authority. Clear only this exact
-    // issued attempt; no CS, DOM, begin-send, or fabricated observed evidence.
-    if (!inFlight && journal.terminalWitness) {
-      const previous = journal;
-      const snapshot = JSON.stringify(previous);
-      let terminal;
-      try {
-        terminal = await fetchCompanion("/ack", { method: "POST", body: JSON.stringify({
-          routeCanonical: previous.routeCanonical, eventId: previous.eventId,
-          attemptId: previous.attemptId, terminalWitness: previous.terminalWitness,
-        }) });
-      } catch { return { ok: false, reason: "network_unreachable", zeroWrite: true, zeroClick: true }; }
-      if (!isCurrentTransportResponse(terminal)) return { ok: false, reason: "stale_transport_response" };
-      if (terminal.status === 401) return markAuthStale(terminal.body?.error || "COMPANION_UNAUTHORIZED", terminal);
-      if (JSON.stringify(journal) !== snapshot) return { ok: false, reason: "journal_identity_changed", zeroWrite: true, zeroClick: true };
-      if (terminal.ok && evaluateTerminalGoneCloseout({ journal, inFlight, serverTerminal: terminal.body }).ok) {
-        journal = clearJournal();
-        try { await persistJournal(); }
-        catch { journal = previous; return { ok: false, reason: "terminal_gone_persist_failed", zeroWrite: true, zeroClick: true }; }
-        productionClaimProof = null; productionAckProof = null;
-        return { ok: true, recovered: true, action: "terminal_gone_clear", journal: { state: "NONE" }, zeroWrite: true, zeroClick: true };
-      }
-    }
     // Server-observed closeout: trusted ACK already moved server event to observed.
     // Eligible durable states (OUTCOME_UNKNOWN | OBSERVED_PENDING_ACK) + exact
     // identity proof + inFlight=null may SW-only clear. Zero DOM / ACK / Send / CS.
@@ -2630,7 +2906,75 @@ async function handleRecover() {
         beginSendCalled: false,
       };
     }
-    return recoverProductionSendSide(inFlight);
+    // Unknown + no inFlight must never use /ack. Legacy explicit terminal
+    // witnesses get a read-only source check; only still_present proceeds to
+    // exact-attempt isolation, while terminal_gone is durably archived first.
+    if (journal.state === "OUTCOME_UNKNOWN" && !inFlight) {
+      const archived = outcomeUnknownArchiveValid
+        ? findOutcomeUnknownArchiveEntry(outcomeUnknownArchive, journal)
+        : null;
+      // A durable archive proves the zero-write/zero-click recovery gate already
+      // passed. It permits an idempotent retry after a crash or lost response.
+      // Without one, observe-only recovery below must get its late-positive chance
+      // before terminal-gone or isolation can release the journal.
+      if (!archived) {
+        // Fall through to the exact-document, observe-only recovery below.
+      } else if (journal.terminalWitness) {
+        const terminal = await requestUnknownTerminalGone(journal);
+        if (terminal.terminalGone === true || terminal.serverTerminalGone === true) return terminal;
+        if (!terminal.ok || terminal.stillPresent !== true) return terminal;
+        if (archived.status === "terminal_gone") return unknownIsolationResult("terminal_gone_archive_conflict");
+        return requestUnknownIsolation(journal);
+      } else if (archived.status === "pending" || archived.status === "isolated") {
+        return requestUnknownIsolation(journal);
+      } else {
+        return unknownIsolationResult("terminal_gone_archive_conflict");
+      }
+    }
+    // Legacy terminal-witness ACK applies only to non-unknown send-side states.
+    if (journal.state !== "OUTCOME_UNKNOWN" && !inFlight && journal.terminalWitness) {
+      const previous = journal;
+      const snapshot = exactJournalSnapshot(previous);
+      let terminal;
+      try {
+        terminal = await fetchCompanion("/ack", { method: "POST", body: JSON.stringify({
+          routeCanonical: previous.routeCanonical, eventId: previous.eventId,
+          attemptId: previous.attemptId, terminalWitness: previous.terminalWitness,
+        }) });
+      } catch { return { ok: false, reason: "network_unreachable", zeroWrite: true, zeroClick: true }; }
+      if (!isCurrentTransportResponse(terminal)) return { ok: false, reason: "stale_transport_response" };
+      if (terminal.status === 401) return markAuthStale(terminal.body?.error || "COMPANION_UNAUTHORIZED", terminal);
+      if (exactJournalSnapshot(journal) !== snapshot) return { ok: false, reason: "journal_identity_changed", zeroWrite: true, zeroClick: true };
+      if (terminal.ok && evaluateTerminalGoneCloseout({ journal, inFlight, serverTerminal: terminal.body }).ok) {
+        journal = clearJournal();
+        try { await persistJournal(); }
+        catch { journal = previous; return { ok: false, reason: "terminal_gone_persist_failed", zeroWrite: true, zeroClick: true }; }
+        productionClaimProof = null; productionAckProof = null;
+        return { ok: true, recovered: true, action: "terminal_gone_clear", journal: { state: "NONE" }, zeroWrite: true, zeroClick: true };
+      }
+    }
+    const recovery = await recoverProductionSendSide(inFlight);
+    if (journal.state === "OUTCOME_UNKNOWN" && recovery?.reason === "outcome_unknown") {
+      const proof = {
+        journal,
+        probe: recovery.isolationProbe,
+        owner: ownerState.owner,
+        ownerExact: !!ownerState.owner && isOwner(ownerState, ownerState.owner.tabId, ownerState.owner.documentId)
+          && Number.isFinite(ownerState.owner.lastSeen) && Date.now() - ownerState.owner.lastSeen <= 12_000
+          && ownerState.owner.generation === recovery.isolationProbe?.generation,
+        concurrentNativeProduction: productionSendInFlight,
+      };
+      if (canParkOutcomeUnknown({ ...proof, inFlight })) return requestUnknownIsolation(journal);
+      if (!inFlight && hasSafeUnknownRecoveryProof(proof)) {
+        if (journal.terminalWitness) {
+          const terminal = await requestUnknownTerminalGone(journal);
+          if (terminal.terminalGone === true || terminal.serverTerminalGone === true) return terminal;
+          if (!terminal.ok || terminal.stillPresent !== true) return terminal;
+        }
+        return requestUnknownIsolation(journal);
+      }
+    }
+    return recovery;
   }
 
   return { ok: true, recovered: false, journal: { state: journal.state }, inFlight };
@@ -2666,6 +3010,9 @@ async function readOperations() {
       verified: transport?.routeVerification === "VERIFIED",
     },
     journal: { state: journal.state, eventId: journal.eventId ?? null, attemptId: journal.attemptId ?? null },
+    isolationArchive: outcomeUnknownArchiveValid
+      ? summarizeOutcomeUnknownArchive(outcomeUnknownArchive)
+      : { available: false, entries: [] },
   });
   if (!storageProtected || !transport?.credential) return { ok: false, reason: "transport_unavailable", ...local() };
   try {
@@ -2682,6 +3029,50 @@ async function readOperations() {
     }
     return { ok: true, snapshot: response.body, ...local() };
   } catch { return { ok: false, reason: "bridge_unavailable", ...local() }; }
+}
+
+async function readOperationResult(message) {
+  if (!storageProtected || !transport?.credential) return { ok: false, reason: "transport_unavailable" };
+  if (transport.routeVerification !== "VERIFIED") return { ok: false, reason: "route_not_verified" };
+  if (typeof message.commandId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(message.commandId)
+    || !Number.isSafeInteger(message.iteration) || message.iteration < 1) {
+    return { ok: false, reason: "bad_message" };
+  }
+  const expected = { commandId: message.commandId, iteration: message.iteration };
+  const path = `/operations/result?commandId=${encodeURIComponent(message.commandId)}&iteration=${message.iteration}`;
+  let response;
+  try { response = await fetchCompanion(path, { method: "GET", cache: "no-store" }); }
+  catch { return { ok: false, reason: "bridge_unavailable" }; }
+  if (!isCurrentTransportResponse(response)
+    || requestTransports.get(response)?.requestAuthRevision !== authFailureRevision) {
+    return { ok: false, reason: "stale_transport_response" };
+  }
+  if (response.status === 401) return markAuthStale(response.body?.error || "COMPANION_UNAUTHORIZED", response);
+  if (!response.ok) {
+    const reason = response.status === 404 && response.body?.error === "COMPANION_RESULT_NOT_FOUND"
+      ? "COMPANION_RESULT_NOT_FOUND"
+      : response.status === 409 && response.body?.error === "COMPANION_RESULT_HISTORICAL_REFUSED"
+        ? "COMPANION_RESULT_HISTORICAL_REFUSED"
+        : response.body?.error || `http_${response.status}`;
+    return { ok: false, reason };
+  }
+  try { assertNoForbiddenFields(response.body); }
+  catch { return { ok: false, reason: "result_response_invalid" }; }
+  const body = response.body;
+  const keys = ["commandId", "iteration", "resultId", "resultSha256", "status", "deliveryStatus", "rawSummary", "testsSummary"];
+  const lifecycle = ["queued", "reserved", "claimed", "observed", "outcome_unknown", "retired_unknown", "cancelled"];
+  if (!body || typeof body !== "object" || Array.isArray(body)
+    || Object.keys(body).length !== keys.length || keys.some(key => !Object.hasOwn(body, key))
+    || body.commandId !== expected.commandId || body.iteration !== expected.iteration
+    || typeof body.resultId !== "string" || !UUID.test(body.resultId)
+    || typeof body.resultSha256 !== "string" || !/^[a-f0-9]{64}$/.test(body.resultSha256)
+    || !["ok", "failed", "blocked"].includes(body.status) || !lifecycle.includes(body.deliveryStatus)
+    || typeof body.rawSummary !== "string" || body.rawSummary.length === 0
+    || new TextEncoder().encode(body.rawSummary).byteLength > 8192
+    || typeof body.testsSummary !== "string" || body.testsSummary.length === 0 || body.testsSummary.length > 16_384) {
+    return { ok: false, reason: "result_response_invalid" };
+  }
+  return { ok: true, result: body };
 }
 
 const PANEL_ACTION_KEY = "c2c.panel.action.v1";
@@ -2782,6 +3173,14 @@ async function handleMessage(message, sender, { transportMutationHeld = false, m
     if (Object.keys(message).length !== 1) return { ok: false, reason: "bad_message" };
     if (!operationsReadInFlight) operationsReadInFlight = readOperations().finally(() => { operationsReadInFlight = null; });
     return operationsReadInFlight;
+  }
+
+  if (message.type === "c2c.operations.result.read") {
+    const ownPanel = typeof chrome.runtime.id === "string" && sender?.id === chrome.runtime.id
+      && sender?.url === chrome.runtime.getURL?.("operations/operations.html");
+    if (!ownPanel || sender?.tab?.url?.startsWith("https://")) return { ok: false, reason: "extension_panel_required" };
+    if (Object.keys(message).some(key => !["type", "commandId", "iteration"].includes(key))) return { ok: false, reason: "bad_message" };
+    return readOperationResult(message);
   }
 
   if (message.type === "c2c.unbind") return unbindAll();
@@ -4543,6 +4942,20 @@ async function recoverProductionSendSide(inFlight) {
       zeroWrite: response.zeroWrite === true,
       zeroClick: response.zeroClick === true,
       diagnostic: response.diagnostic ?? null,
+      ...(journal.state === "OUTCOME_UNKNOWN" ? {
+        isolationProbe: {
+          reason: response.reason,
+          journalState: response.journalState,
+          zeroWrite: response.zeroWrite === true,
+          zeroClick: response.zeroClick === true,
+          ownerFresh: response.ownerFresh === true,
+          routeCanonical: response.canonicalRoute,
+          generation: response.generation,
+          composerEmpty: response.composerEmpty === true,
+          generationIdle: response.generationIdle === true,
+          nativeProductionInFlight: response.nativeProductionInFlight,
+        },
+      } : {}),
     };
   } finally {
     productionSendInFlight = false;

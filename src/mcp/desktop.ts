@@ -1,3 +1,4 @@
+import type { CommandMailboxSubmit } from "../routing/mailbox.js";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
@@ -30,7 +31,7 @@ const deliveryOutputSchema = z.object({
   bindingId: z.string().uuid(),
   threadId: z.string().uuid(),
   turnId: z.string().uuid().optional(),
-  deliveryStatus: z.enum(["outcome_unknown", "accepted", "rejected"]),
+  deliveryStatus: z.enum(["queued", "outcome_unknown", "accepted", "rejected"]),
   resolutionStatus: z.literal("administratively_resolved").optional(),
   error: z.string().optional(),
   createdAt: z.string(),
@@ -49,6 +50,7 @@ const statusOutputSchema = {
   }).strict(),
   unresolvedDelivery: z.boolean(),
   delivery: deliveryOutputSchema.nullable(),
+  commandQueue: z.object({ commandId: z.string(), state: z.enum(["queued", "dispatching", "blocked"]), reason: z.string().optional() }).strict().nullable(),
 };
 
 type ToolResult = {
@@ -124,17 +126,19 @@ export function registerDesktopTools(
   server: McpServer,
   workspace: Workspace,
   desktopAuthorize?: (auth: AuthInfo) => void,
+  mailbox?: CommandMailboxSubmit,
 ): void {
   server.registerTool(
     "codex_desktop_send",
     {
       title: "发送任务到 Desktop",
-      description: "向已绑定且已授权的 Desktop 会话投递完整开发计划（development_plan）或修订（revision）。只有用户在当前对话明确确认后，才设置 userConfirmed:true 并调用。该字段仅为模型可填写的意图/审计信号，不是授权凭证，不能替代 OAuth、本机 enable、bindingId 或 Desktop 审批，也不改变或绕过平台安全策略，不保证计划不会被拦截。正文可能由 Desktop 按现有权限修改文件或执行命令。仅等待接受，不等待完成；idempotent 仅表示同 commandId 防重复尝试。",
+      description: "向已绑定且已授权的 Desktop 会话提交完整开发计划（development_plan）或修订（revision）。Bridge 持久排队并返回 queued，Codex 空闲后通过现有安全入口投递；queued/accepted 都不是执行完成。只有用户在当前对话明确确认后，才设置 userConfirmed:true；它是意图信号，不能替代 OAuth、本机 enable、bindingId 或 Desktop 审批。同 commandId 防重复尝试；不明结果不自动重发，其他独立消息仍可排队。",
       inputSchema: sendInput,
       outputSchema: {
         commandId: z.string(), bindingId: z.string().uuid(), threadId: z.string().uuid(),
         intent: desktopIntent.optional(),
-        turnId: z.string().uuid().optional(), deliveryStatus: z.enum(["outcome_unknown", "accepted", "rejected"]), error: z.string().optional(),
+        turnId: z.string().uuid().optional(), deliveryStatus: z.enum(["queued", "outcome_unknown", "accepted", "rejected"]), error: z.string().optional(),
+        queueStatus: z.enum(["queued", "dispatching", "blocked"]).optional(),
         createdAt: z.string(), updatedAt: z.string(), message: z.string(),
       },
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
@@ -147,6 +151,7 @@ export function registerDesktopTools(
         throw new DesktopError("DESKTOP_WRONG_WORKSPACE", "请求工作区不匹配。" );
       }
       const plannerFingerprint = requestPlannerFingerprint(extra);
+      if (mailbox) { desktopAuthorize?.(auth); return mailbox("desktop", input, plannerFingerprint, auth); }
       const delivered = await deliverCurrentCommand(workspace, plannerFingerprint, {
         commandId: input.commandId,
         intent: input.intent,

@@ -23,10 +23,13 @@ const FEEDBACK_ENDPOINTS = new Set([
   "/rebind/status",
   "/state",
   "/operations",
+  "/operations/result",
+  "/operations/terminal-gone",
   "/reserve",
   "/release",
   "/begin-send",
   "/ack",
+  "/isolate-attempt",
   "/retire-unknown",
   "/web-sink/status",
   "/web-sink/bind-current",
@@ -47,6 +50,13 @@ function feedbackEndpointPath(path) {
 
   if (pathname.includes("%") || !FEEDBACK_ENDPOINTS.has(endpoint)) {
     throw new BridgeOriginError("仅允许 Browser Companion feedback API endpoint");
+  }
+  if (endpoint === "/operations/result") {
+    const match = /^\?commandId=([A-Za-z0-9_-]{1,128})&iteration=([1-9][0-9]*)$/.exec(query);
+    if (!match || !Number.isSafeInteger(Number(match[2])) || Number(match[2]) < 1) {
+      throw new BridgeOriginError("operations/result query 无效");
+    }
+    return `${COMPANION_API_PREFIX}${endpoint}${query}`;
   }
   if (endpoint !== "/rebind/status") {
     if (query) throw new BridgeOriginError("feedback API endpoint 不接受 query");

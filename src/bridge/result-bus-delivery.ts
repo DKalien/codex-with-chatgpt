@@ -1,3 +1,4 @@
+import { isResultBusInFlight } from "../result-bus/schema.js";
 import { canonicalRoutingResultDigest } from "../routing/execution-result-digest.js";
 import { createHash } from "node:crypto";
 import { resolveWorkspaceIdentity, listResults, type RoutingWorkspaceIdentity } from "../routing/store.js";
@@ -18,6 +19,7 @@ import {
   releaseResultBusReservation,
   reserveNextResultBusEntry,
   retireResultBusOutcomeUnknown,
+  isolateResultBusAttempt,
 } from "../result-bus/delivery-lifecycle.js";
 import type { ResultBusCutoverEntry } from "../result-bus/cutover-schema.js";
 import {
@@ -85,7 +87,7 @@ export function resultBusCompanionDeliveryId(busEntryId: string): string {
 }
 
 const LEGACY_INFLIGHT_STATUSES = new Set(["reserved", "claimed", "outcome_unknown"]);
-const BUS_INFLIGHT_STATUSES = new Set(["reserved", "claimed", "outcome_unknown"]);
+
 
 function identityOf(workspaceId: string, workspaceRoot: string): RoutingWorkspaceIdentity {
   return resolveWorkspaceIdentity({ id: workspaceId, root: workspaceRoot });
@@ -157,7 +159,7 @@ function legacyInFlightEvents(state: ReturnType<typeof recoverStaleFeedback>): F
 }
 
 function busInFlightEntries(entries: readonly ResultBusEntry[]): ResultBusEntry[] {
-  return entries.filter(entry => BUS_INFLIGHT_STATUSES.has(entry.deliveryStatus));
+  return entries.filter(isResultBusInFlight);
 }
 
 function busDeliveryDto(entry: ResultBusEntry): Record<string, unknown> {
@@ -899,6 +901,93 @@ export function resultBusCompanionAck(input: {
   });
 }
 
+/** An explicit local journal handoff releases only scheduling, not receipt authority. */
+export function resultBusCompanionIsolate(input: {
+  workspaceId: string; workspaceRoot: string; credential: string; routeCanonical: string;
+  eventId: string; reservationId: string; attemptId: string; messageSha256: string; stateDir?: string;
+}) {
+  // Authenticate before creating the arbiter lock directory/file, then recheck
+  // inside the serialized transition in case the credential was revoked meanwhile.
+  const initialAuth = verifyCompanionCredentialForWebSink(input);
+  if (input.routeCanonical !== initialAuth.routeCanonical) throw companionRouteMismatch();
+  return withDeliveryArbiter(input, identity => {
+    const auth = verifyCompanionCredentialForWebSink(input);
+    if (auth.companionId !== initialAuth.companionId || auth.routeCanonical !== initialAuth.routeCanonical)
+      throw new CompanionError("COMPANION_EPOCH_STALE", "隔离期间 companion 身份改变；请重新核验。 ");
+    if (input.routeCanonical !== auth.routeCanonical) throw companionRouteMismatch();
+    const source = resolveDeliverySource({ identity, eventId: input.eventId, stateDir: input.stateDir });
+    if (source?.source !== "bus") throw new ResultBusDeliveryError("RESULT_BUS_ISOLATION_UNSUPPORTED", "仅 canonical result 支持独立隔离。");
+    const entry = source.entry;
+    if (!entry.sendTarget || entry.sendTarget.canonicalUrl !== input.routeCanonical ||
+        entry.attempt?.attemptId !== input.attemptId || entry.reservation?.reservationId !== input.reservationId ||
+        resultBusDeliveryMessage(entry, input.attemptId).messageSha256 !== input.messageSha256)
+      throw new ResultBusDeliveryError("RESULT_BUS_ATTEMPT_MISMATCH", "隔离目标与原发送证据不一致。");
+    if (entry.deliveryStatus !== "claimed" && entry.deliveryStatus !== "outcome_unknown")
+      throw new ResultBusDeliveryError("RESULT_BUS_ATTEMPT_MISMATCH", "隔离只接受尚未观察的原发送 attempt。");
+    const isolated = isolateResultBusAttempt(identity, { busEntryId: entry.busEntryId, attemptId: input.attemptId,
+      reservationId: input.reservationId }, input.stateDir);
+    return { routeCanonical: entry.sendTarget.canonicalUrl, eventId: input.eventId,
+      reservationId: input.reservationId, attemptId: input.attemptId, messageSha256: input.messageSha256,
+      status: "outcome_unknown" as const, isolated: true as const, observed: false as const };
+  });
+}
+
+/** Read only the immutable canonical result that is unassigned or frozen to this verified route. */
+export function resultBusCompanionResult(input: {
+  workspaceId: string; workspaceRoot: string; credential: string;
+  commandId: string; iteration: number; stateDir?: string;
+}) {
+  const auth = verifyCompanionCredentialForWebSink(input);
+  const identity = resolveWorkspaceIdentity({ id: input.workspaceId, root: input.workspaceRoot });
+  const entry = listResultBusEntries(identity, input.stateDir)
+    .find(item => item.commandId === input.commandId && item.iteration === input.iteration);
+  if (!entry) throw new ResultBusDeliveryError("COMPANION_RESULT_NOT_FOUND", "canonical result 不存在。");
+  const canonical = canonicalOf(entry);
+  if (entry.result.commandId !== entry.commandId || entry.result.iteration !== entry.iteration ||
+      entry.result.resultId !== entry.resultId || canonicalRoutingResultDigest(entry.result) !== entry.resultSha256)
+    throw new ResultBusDeliveryError("RESULT_BUS_CONFLICT", "canonical result 与 Result Bus immutable identity 不一致。");
+  const routingResult = listResults(identity, input.stateDir)
+    .find(item => item.commandId === entry.commandId && item.iteration === entry.iteration);
+  if (routingResult && (routingResult.resultId !== entry.resultId || !("machineEvidence" in routingResult)
+      || canonicalRoutingResultDigest(routingResult) !== entry.resultSha256))
+    throw new ResultBusDeliveryError("RESULT_BUS_CONFLICT", "Routing result 与 Result Bus immutable identity 不一致。");
+  if (entry.sendTarget && entry.sendTarget.canonicalUrl !== auth.routeCanonical)
+    throw new ResultBusDeliveryError("COMPANION_RESULT_HISTORICAL_REFUSED", "结果冻结到其他 verified route。");
+  return {
+    commandId: entry.commandId,
+    iteration: entry.iteration,
+    resultId: entry.resultId,
+    resultSha256: entry.resultSha256,
+    status: canonical.status,
+    rawSummary: canonical.rawSummary,
+    testsSummary: canonical.machineEvidence.testsSummary,
+    deliveryStatus: entry.deliveryStatus,
+  };
+}
+
+/** Read-only terminal-witness check. A live source is never acknowledged here. */
+export function resultBusCompanionTerminalGone(input: {
+  workspaceId: string; workspaceRoot: string; credential: string;
+  routeCanonical: string; eventId: string; attemptId: string; terminalWitness: string; stateDir?: string;
+}) {
+  const auth = verifyCompanionCredentialForWebSink(input);
+  if (input.routeCanonical !== auth.routeCanonical) throw companionRouteMismatch();
+  if (!verifyTerminalWitness(input.terminalWitness, {
+    workspaceId: input.workspaceId, eventId: input.eventId, attemptId: input.attemptId,
+    routeCanonical: auth.routeCanonical, companionId: auth.companionId,
+  }, input.stateDir)) {
+    throw new ResultBusDeliveryError("COMPANION_TERMINAL_WITNESS_INVALID", "terminal witness 与当前精确 attempt 不匹配。");
+  }
+  const identity = identityOf(input.workspaceId, input.workspaceRoot);
+  const source = resolveDeliverySource({ identity, eventId: input.eventId, stateDir: input.stateDir });
+  return {
+    routeCanonical: auth.routeCanonical,
+    eventId: input.eventId,
+    attemptId: input.attemptId,
+    status: source ? "still_present" as const : "terminal_gone" as const,
+  };
+}
+
 /** /retire-unknown：Bus compat → retireResultBusOutcomeUnknown；legacy → 旧 retire。 */
 export function resultBusCompanionRetire(input: {
   workspaceId: string;
@@ -1009,6 +1098,20 @@ export function resultBusCompanionState(input: {
       : [];
     const legacyInFlight = legacyInFlightEvents(feedbackState);
     const busInFlight = busInFlightEntries(busEntries);
+    const isolatedAttempts = busEntries
+      .filter(entry => entry.isolatedAt != null && entry.sendTarget != null && entry.reservation != null
+        && entry.attempt != null && entry.sendTarget.canonicalUrl === sinkAuth.routeCanonical)
+      .sort((a, b) => b.isolatedAt!.localeCompare(a.isolatedAt!) || a.busEntryId.localeCompare(b.busEntryId))
+      .slice(0, 20)
+      .map(entry => ({
+        routeCanonical: entry.sendTarget!.canonicalUrl,
+        eventId: resultBusCompanionDeliveryId(entry.busEntryId),
+        reservationId: entry.reservation!.reservationId,
+        attemptId: entry.attempt!.attemptId,
+        messageSha256: resultBusDeliveryMessage(entry, entry.attempt!.attemptId).messageSha256,
+        isolated: true as const,
+        status: entry.deliveryStatus,
+      }));
     // 双源 in-flight 属于损坏状态：只读诊断 fail closed。
     if (legacyInFlight.length > 0 && busInFlight.length > 0) {
       throw new ResultBusDeliveryError(
@@ -1097,6 +1200,7 @@ export function resultBusCompanionState(input: {
         scoped.filter((e) => e.status === "retired_unknown").length
         + busEntries.filter((e) => e.deliveryStatus === "retired_unknown").length,
       inFlight,
+      isolatedAttempts,
       unsafeLegacyInFlight: cutover.unsafeLegacyInFlight,
       events,
     };

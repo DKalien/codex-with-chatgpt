@@ -45,13 +45,17 @@ describe("R5b architecture fence", () => {
     const service = read("src/executor-control/service.ts");
     const backend = read("src/executor-control/codex-backend.ts");
     const tools = read("src/mcp/executor-tools.ts");
+    const send = read("src/executor-control/send.ts");
     expect(service).toMatch(/createCodexDesktopProductionBackend|resolveProductionBackend/);
     expect(service).not.toMatch(/deliverCurrentCommand/);
     expect(backend).toMatch(/deliverCurrentCommand/);
     expect(backend).not.toMatch(/codexDesktopExecutorPlugin\.deliver|plugin\.deliver\(/);
     expect(tools).not.toMatch(/deliverCurrentCommand/);
     expect(tools).not.toMatch(/plugin\.deliver\(/);
-    expect(tools).toMatch(/resolveProductionBackend/);
+    expect(tools).toMatch(/dispatchExecutorCommand/);
+    expect(tools).toMatch(/if \(mailbox\) return mailbox\("executor"/);
+    expect(send).toMatch(/resolveProductionBackend\(target\.pluginId\)/);
+    expect(send).not.toMatch(/deliverCurrentCommand|desktopIpc|plugin\.deliver\(/);
   });
 
   it("no Claude production registry and no plugin discovery", () => {

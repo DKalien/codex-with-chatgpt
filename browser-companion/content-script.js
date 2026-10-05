@@ -11,6 +11,8 @@
   let lastHref = location.href;
   let generation = 1;
   let lastWakeHeartbeatAt = 0;
+  let nativeProductionInFlight = false;
+  let nativeProductionOperationInFlight = false;
 
   function parseRoute(href) {
     try {
@@ -600,45 +602,61 @@
       });
       return false;
     }
-    void (async () => {
-      const dom = buildProductionDomDeps();
-      const net = buildProductionNetworkDeps();
-      net.setCurrentJournal(startJournal);
-      let result;
-      try {
-        result = await globalThis.__c2cRunProductionSend({
-          ...dom,
-          journal: startJournal,
-          expectedRoute,
-          expectedGeneration,
-          routeCanonical: startJournal.routeCanonical,
-          bindingId: startJournal.bindingId,
-          epoch: startJournal.epoch,
-          persistJournal: net.persistJournal,
-          beginSend: net.beginSend,
-          ackObserved: net.ackObserved,
-        });
-      } catch {
-        result = {
-          ok: false,
-          reason: "production_send_error",
-          journal: net.currentJournal,
-        };
-      }
+    if (nativeProductionOperationInFlight) {
       sendResponse({
-        ok: result?.ok === true,
+        ok: false,
+        reason: "native_production_in_flight",
         mode: "production_send",
-        reason: result?.ok ? undefined : (result?.reason || "production_send_failed"),
-        attemptId: result?.attemptId ?? result?.journal?.attemptId ?? null,
-        eventId: result?.journal?.eventId ?? startJournal.eventId,
-        journalState: result?.journal?.state ?? net.currentJournal?.state ?? startJournal.state,
-        retryAck: result?.retryAck === true,
-        zeroWrite: result?.zeroWrite === true,
-        zeroClick: result?.zeroClick === true,
-        action: result?.action,
-        generation,
-        type: "c2c.production.send.result",
+        journalState: startJournal.state,
+        zeroWrite: true,
+        zeroClick: true,
+        nativeProductionInFlight: true,
       });
+      return false;
+    }
+    nativeProductionOperationInFlight = true;
+    nativeProductionInFlight = true;
+    void (async () => {
+      let result;
+      let net;
+      try {
+        try {
+          const dom = buildProductionDomDeps();
+          net = buildProductionNetworkDeps();
+          net.setCurrentJournal(startJournal);
+          result = await globalThis.__c2cRunProductionSend({
+            ...dom,
+            journal: startJournal,
+            expectedRoute,
+            expectedGeneration,
+            routeCanonical: startJournal.routeCanonical,
+            bindingId: startJournal.bindingId,
+            epoch: startJournal.epoch,
+            persistJournal: net.persistJournal,
+            beginSend: net.beginSend,
+            ackObserved: net.ackObserved,
+          });
+        } catch {
+          result = { ok: false, reason: "production_send_error", journal: net?.currentJournal ?? startJournal };
+        }
+        sendResponse({
+          ok: result?.ok === true,
+          mode: "production_send",
+          reason: result?.ok ? undefined : (result?.reason || "production_send_failed"),
+          attemptId: result?.attemptId ?? result?.journal?.attemptId ?? null,
+          eventId: result?.journal?.eventId ?? startJournal.eventId,
+          journalState: result?.journal?.state ?? startJournal.state,
+          retryAck: result?.retryAck === true,
+          zeroWrite: result?.zeroWrite === true,
+          zeroClick: result?.zeroClick === true,
+          action: result?.action,
+          generation,
+          type: "c2c.production.send.result",
+        });
+      } finally {
+        nativeProductionInFlight = false;
+        nativeProductionOperationInFlight = false;
+      }
     })();
     return true;
   }
@@ -648,6 +666,18 @@
     const expectedGeneration = message.expectedGeneration;
     const startJournal = message.startJournal;
     const inFlight = message.inFlight ?? null;
+    if (nativeProductionOperationInFlight) {
+      sendResponse({
+        ok: false,
+        reason: "native_production_in_flight",
+        mode: "production_recover",
+        journalState: startJournal?.state ?? "NONE",
+        zeroWrite: true,
+        zeroClick: true,
+        nativeProductionInFlight: true,
+      });
+      return false;
+    }
     if (typeof globalThis.__c2cRecoverProductionSend !== "function") {
       sendResponse({
         ok: false,
@@ -659,48 +689,71 @@
       });
       return false;
     }
+    nativeProductionOperationInFlight = true;
     void (async () => {
-      const dom = buildProductionDomDeps();
-      const net = buildProductionNetworkDeps();
-      net.setCurrentJournal(startJournal);
       let result;
+      let net;
       try {
-        result = await globalThis.__c2cRecoverProductionSend({
-          ...dom,
-          journal: startJournal,
-          expectedRoute,
-          expectedGeneration,
-          routeCanonical: startJournal.routeCanonical,
-          bindingId: startJournal.bindingId,
-          epoch: startJournal.epoch,
-          inFlight,
-          persistJournal: net.persistJournal,
-          beginSend: net.beginSend,
-          ackObserved: net.ackObserved,
+        try {
+          const dom = buildProductionDomDeps();
+          net = buildProductionNetworkDeps();
+          net.setCurrentJournal(startJournal);
+          result = await globalThis.__c2cRecoverProductionSend({
+            ...dom,
+            journal: startJournal,
+            expectedRoute,
+            expectedGeneration,
+            routeCanonical: startJournal.routeCanonical,
+            bindingId: startJournal.bindingId,
+            epoch: startJournal.epoch,
+            inFlight,
+            persistJournal: net.persistJournal,
+            beginSend: net.beginSend,
+            ackObserved: net.ackObserved,
+          });
+        } catch {
+          result = {
+            ok: false,
+            reason: "production_recover_error",
+            journal: net?.currentJournal ?? startJournal,
+            zeroWrite: true,
+            zeroClick: true,
+          };
+        }
+        const routeCanonical = parseRoute(location.href)?.canonical ?? null;
+        let safety = null;
+        if (startJournal?.state === "OUTCOME_UNKNOWN" && result?.reason === "outcome_unknown") {
+          try { safety = observeSafety(); } catch { safety = null; }
+        }
+        const isolationProbe = startJournal?.state === "OUTCOME_UNKNOWN" && result?.reason === "outcome_unknown"
+          ? {
+              ownerFresh: routeCanonical === expectedRoute && generation === expectedGeneration,
+              routeCanonical,
+              generation,
+              composerEmpty: safety?.composer === "empty",
+              generationIdle: safety?.generation === "idle" && safety?.safe === true,
+              nativeProductionInFlight,
+            }
+          : null;
+        sendResponse({
+          ok: result?.ok === true,
+          mode: "production_recover",
+          reason: result?.ok ? undefined : (result?.reason || "production_recover_failed"),
+          recovered: result?.ok === true,
+          action: result?.action,
+          journalState: result?.journal?.state ?? net?.currentJournal?.state ?? startJournal?.state,
+          retryAck: result?.retryAck === true,
+          zeroWrite: result?.zeroWrite === true,
+          zeroClick: result?.zeroClick === true,
+          diagnostic: result?.diagnostic ?? null,
+          ...(isolationProbe ? isolationProbe : {}),
+          generation,
+          canonicalRoute: routeCanonical,
+          type: "c2c.production.recover.result",
         });
-      } catch {
-        result = {
-          ok: false,
-          reason: "production_recover_error",
-          journal: net.currentJournal,
-          zeroWrite: true,
-          zeroClick: true,
-        };
+      } finally {
+        nativeProductionOperationInFlight = false;
       }
-      sendResponse({
-        ok: result?.ok === true,
-        mode: "production_recover",
-        reason: result?.ok ? undefined : (result?.reason || "production_recover_failed"),
-        recovered: result?.ok === true,
-        action: result?.action,
-        journalState: result?.journal?.state ?? net.currentJournal?.state ?? startJournal?.state,
-        retryAck: result?.retryAck === true,
-        zeroWrite: result?.zeroWrite === true,
-        zeroClick: result?.zeroClick === true,
-        diagnostic: result?.diagnostic ?? null,
-        generation,
-        type: "c2c.production.recover.result",
-      });
     })();
     return true;
   }

@@ -3,6 +3,8 @@
 
 .search{display:flex;gap:12px;align-items:center;padding:0 22px 18px;color:var(--muted);font-size:12px}.search input{min-width:260px;max-width:70%;padding:8px 12px;background:var(--paper);color:var(--ink);border:1px solid var(--line);border-radius:7px;font:inherit}.pagination{display:flex;justify-content:flex-end;gap:14px;align-items:center;padding:14px 22px;font-size:12px;color:var(--muted)}td .issue{color:#a87525}
 .heading>button{white-space:nowrap;flex-shrink:0}
+.isolation{margin:18px 0;padding:18px 22px;border:1px solid var(--line);border-radius:12px;background:#fff}.isolation h2{margin-bottom:6px}.isolation p{font-size:12px}.isolation ul{margin:8px 0 0;padding-left:22px}.isolation li{padding:4px 0;font-size:12px;overflow-wrap:anywhere}.execution-results{display:flex;gap:8px;flex-wrap:wrap;margin:12px 24px}.detail pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:420px;overflow:auto;margin:8px 24px 18px;padding:14px;background:#f4f7f3;border-radius:8px;font:12px/1.6 Consolas,"Microsoft YaHei",sans-serif}.isolation{color:var(--ink)}
+@media(prefers-color-scheme:dark){.isolation{background:#1d2b23}.detail pre{background:#223328}}
 
 .authorization { margin: 18px 0; padding: 14px 20px; border: 1px solid #d8e3e8; border-radius: 12px; background: #f7fafb; }
 dialog { max-width: 560px; padding: 28px; border: 1px solid #cbd8dd; border-radius: 16px; color: #17353a; }

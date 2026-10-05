@@ -1,5 +1,12 @@
 # Security Model
 
+## 消息收件箱与单条隔离（2026-10-05，源码开发）
+
+[双向消息收件箱](agent-mailbox.md) 在当前授权范围内保存排队正文和 token 的 hash 引用，原始 bearer 不落盘，正文不会进入公开 status、任务元数据或日志。入队事务校验正文 UTF-8 长度/hash、MCP 对话主体与 frozen target；投递提交点仍重新验证 OAuth、enable 和 owner。重启的 dispatching 不回到 queued；不存在已验证 steer 协议时不向 active turn 注入。
+
+浏览器 archive 严格限定大小和字段，隔离前核对原正文 hash；服务端保存原 outcome_unknown 并绑定精确 route/event/reservation/attempt。隔离释放调度槽，不产生 observed/ACK，也不授权原请求重发。旧 legacy/control 未迁移时保持其安全恢复合同。四状态卡只是最新观察，不能代替真正发送边界的权限和防重复验证。
+
+
 ## Companion 任务面板的本机操作授权
 
 面板 GET 状态/任务/操作结果是只读元数据，不从网页接受 workspace 路径。项目全部历史只向当前 VERIFIED Companion + exact active receiver binding/epoch/principal 展示。Pair 凭据本身不授权取消、清理或重排；本机 `operations authorize --local-user` 授予精确 Companion 限时能力（默认15分钟，上限60分钟），撤销/过期/身份漂移立即拒绝新操作。
@@ -168,8 +175,7 @@ ID；必要的 `bindingId`、`threadId` 和 `turnId` 等投递元数据可以返
 状态查询、日志或 `execution_summary`。跨进程锁和原子写保证同 client、
 同 ID、同参数重放返回原记录，`intent` 或其他参数冲突时拒绝；实际发送前先保存“可能已发送”。回执超时、
 断线、崩溃或落盘不明返回 `outcome_unknown`，不自动重发，也不能换 `commandId` 绕过；
-整个 workspace（包括重新绑定后的目标）的后续投递暂停，必须由本机用户人工核对。除非本机用户
-完成独立且两阶段确认的行政 resolution，否则不能解除等待；resolution 也不改写 raw delivery。
+原 commandId 不会重发或转投，独立的新消息可以持久入队并按现有权限投递。维护、重新绑定和 rollout 对未决事实继续严格核验；本机两阶段行政 resolution 只解除这些流程对该条的等待，不改写 raw delivery。
 本机显式
 `desktop reconcile-unknown` 仅在 exact workspace/binding/thread、完整且最新边界为 `exhausted`
 的 canonical history、完整 envelope/message bytes/SHA-256 与唯一真实 UUID turnId 全部匹配时，
@@ -187,7 +193,7 @@ ID；必要的 `bindingId`、`threadId` 和 `turnId` 等投递元数据可以返
 记录必须保存 `intent`。读取不迁移、回填或修改旧历史，旧记录在 `status` 返回中继续缺省
 `intent`。使用缺少该字段的旧 `commandId` 再次 `send` 时，无法证明新的 `intent` 与原请求
 相同，按 `DESKTOP_COMMAND_CONFLICT` 拒绝，并引导先用 `status` 查看原记录；`outcome_unknown`
-阻断规则保持不变。
+原请求防重放和维护门禁保留；普通新消息改为逐条隔离。
 
 Desktop 执行结果必须另按现有 `record` 流程以 command/task ID 记录真实摘要、测试和可读
 `execution_output`。投递记录不等于执行记录；历史测试也不等于本次任务通过。profile 标识、

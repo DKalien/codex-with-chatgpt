@@ -346,8 +346,16 @@ describe("Desktop outcome_unknown administrative resolution", () => {
     expect((await collectDesktopFacts(workspace)).unresolvedDelivery).toBe(false);
   });
 
-  it("第二个 raw unknown 仍阻断发送，原 commandId 仍不可重发", async () => {
+  it("未决 raw unknown 不阻断独立 command；原 unknown ID replay 不重发", async () => {
     seedUnknown();
+    const originalInput = { workspaceId: workspace.id, bindingId, commandId: "unknown_one",
+      intent: "development_plan" as const, userConfirmed: true as const, message: "x" };
+    updateDesktop(workspace.id, state => {
+      if (!state) throw new Error("missing state");
+      state.deliveries[0]!.messageSha256 = createHash("sha256").update(originalInput.message, "utf8").digest("hex");
+      state.deliveries[0]!.messageBytes = Buffer.byteLength(originalInput.message, "utf8");
+      return { state, result: undefined };
+    });
     const preview = previewOutcomeResolution(workspace, "unknown_one");
     resolveOutcomeUnknown(workspace, "unknown_one", preview.confirmationSha256);
     updateDesktop(workspace.id, state => {
@@ -356,10 +364,29 @@ describe("Desktop outcome_unknown administrative resolution", () => {
         messageSha256: "b".repeat(64), messageBytes: 1, threadId, deliveryStatus: "outcome_unknown", createdAt: now, updatedAt: now });
       return { state, result: undefined };
     });
-    await expect(sendDesktop(workspace, { workspaceId: workspace.id, bindingId, commandId: "unknown_one", intent: "development_plan", userConfirmed: true, message: "x" }, "client"))
-      .rejects.toMatchObject({ code: "DESKTOP_COMMAND_CONFLICT" });
-    await expect(sendDesktop(workspace, { workspaceId: workspace.id, bindingId, commandId: "new_command", intent: "development_plan", userConfirmed: true, message: "x" }, "client"))
-      .rejects.toMatchObject({ code: "DESKTOP_OUTCOME_UNRESOLVED" });
+    const unknownBefore = readDesktop(workspace.id)!.deliveries.map(item => ({ ...item }));
+    expect(unresolvedOutcomeUnknownCommandIds(workspace)).toEqual(new Set(["unknown_two"]));
+
+    const send = vi.fn(async () => ({ threadId, turnId: "01a00000-0000-7000-8000-000000000006" }));
+    vi.spyOn(desktopIpc, "prepare").mockResolvedValue({ send, close: vi.fn() } as never);
+    expect((await sendDesktop(workspace, originalInput, "client")).deliveryStatus).toBe("outcome_unknown");
+    expect(send).not.toHaveBeenCalled();
+
+    const independentInput = { workspaceId: workspace.id, bindingId, commandId: "new_command",
+      intent: "development_plan" as const, userConfirmed: true as const, message: "independent task" };
+    expect((await sendDesktop(workspace, independentInput, "client")).deliveryStatus).toBe("accepted");
+    expect(send).toHaveBeenCalledTimes(1);
+    const afterSend = readDesktop(workspace.id)!;
+    expect(afterSend.deliveries.filter(item => item.commandId === "unknown_one" || item.commandId === "unknown_two"))
+      .toEqual(unknownBefore);
+    expect(afterSend.deliveries.find(item => item.commandId === "new_command")).toMatchObject({
+      deliveryStatus: "accepted", turnId: "01a00000-0000-7000-8000-000000000006",
+    });
+    expect(unresolvedOutcomeUnknownCommandIds(workspace)).toEqual(new Set(["unknown_two"]));
+
+    expect((await sendDesktop(workspace, originalInput, "client")).deliveryStatus).toBe("outcome_unknown");
+    expect((await sendDesktop(workspace, independentInput, "client")).deliveryStatus).toBe("accepted");
+    expect(send).toHaveBeenCalledTimes(1);
   });
 
   it("rollout idle 只绕过已有行政 resolution，仍阻断第二个 unresolved unknown", async () => {

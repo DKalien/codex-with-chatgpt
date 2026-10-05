@@ -17,6 +17,7 @@ import { feedbackStateFile } from "../src/feedback/store.js";
 import { bindCurrentExecutor } from "../src/executor-control/service.js";
 import { projectCodexDesktopTargetToExecutorBindingCandidate } from "../src/executor/index.js";
 import { listCommands, listRoutes } from "../src/routing/store.js";
+import { createCommandMailbox } from "../src/routing/mailbox.js";
 import { resolveConversationPrincipal } from "../src/mcp/conversation-principal.js";
 import { cleanup, isolateStateDir, makeTmpDir } from "./helpers.js";
 
@@ -101,7 +102,7 @@ function seedVerifiedPlannerRoute(): void {
 }
 
 async function bindGenericAndDesktop(): Promise<string> {
-  vi.spyOn(desktopIpc, "inspect").mockResolvedValue({ title: "测试 Desktop 会话" } as never);
+  vi.spyOn(desktopIpc, "inspect").mockResolvedValue({ title: "测试 Desktop 会话", runtimeStatus: "idle", requestsCount: 0 } as never);
   vi.spyOn(desktopIpc, "discoverForBinding").mockResolvedValue({ title: "测试 Desktop 会话", runtimeFence } as never);
   const desktop = await bindDesktop(bridge.workspace, {
     threadId: THREAD_ID,
@@ -274,8 +275,11 @@ describe("R5b real MCP executor authorization", () => {
         message: "should not send",
       },
     });
-    expect(result.isError).toBe(true);
-    expect(textOf(result)).toMatch(/UNAUTHORIZED|INSUFFICIENT_SCOPE|AUTH/);
+    expect(result.isError).not.toBe(true);
+    expect(jsonOf<{ deliveryStatus: string }>(result).deliveryStatus).toBe("queued");
+    expect(send).not.toHaveBeenCalled();
+    await createCommandMailbox(bridge.workspace, bridge.authStore).tick();
+    expect(listCommands(bridge.workspace).find(item => item.commandId === "revoked_command")?.mailbox).toMatchObject({ state: "blocked", reason: "UNAUTHORIZED" });
     expect(send).not.toHaveBeenCalled();
     await client.close();
   });
@@ -287,21 +291,23 @@ describe("R5b real MCP executor authorization", () => {
     vi.spyOn(desktopIpc, "prepare").mockResolvedValue({ send, close: vi.fn() } as never);
     const session = "session-accepted";
     const client = await clientFor([EXECUTOR_CONTROL_SCOPE], "accepted-executor", session);
+    const args = {
+      workspaceId: bridge.workspace.id, bindingId, commandId: "accepted_command",
+      intent: "development_plan", userConfirmed: true, message: "SECRET_TASK_BODY",
+    };
     const result = await client.callTool({
       name: "executor_send",
-      arguments: {
-        workspaceId: bridge.workspace.id,
-        bindingId,
-        commandId: "accepted_command",
-        intent: "development_plan",
-        userConfirmed: true,
-        message: "SECRET_TASK_BODY",
-      },
+      arguments: args,
     });
     expect(result.isError).not.toBe(true);
-    const payload = jsonOf<Record<string, unknown>>(result);
+    expect(jsonOf<{ deliveryStatus: string }>(result).deliveryStatus).toBe("queued");
+    expect(send).not.toHaveBeenCalled();
+    await createCommandMailbox(bridge.workspace, bridge.authStore).tick();
+    const payload = jsonOf<Record<string, unknown>>(await client.callTool({ name: "executor_send", arguments: args }));
     expect(payload.commandId).toBe("accepted_command");
     expect(payload.bindingId).toBe(bindingId);
+    expect(payload.deliveryStatus).toBe("accepted");
+    expect(send).toHaveBeenCalledOnce();
     expect(payload.deliveryId).toBe("01a00000-0000-7000-8000-000000000009");
     expect(JSON.stringify(payload)).not.toContain("SECRET_TASK_BODY");
     expect(JSON.stringify(payload)).not.toContain("threadId");

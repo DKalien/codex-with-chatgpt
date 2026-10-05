@@ -3,6 +3,7 @@ import { authenticateOperations as authenticate } from "./companion-operation-au
 import { readPanelAuthorization } from "../feedback/panel.js";
 import { readFeedbackState } from "../feedback/state-store.js";
 import { readRouting } from "../routing/store.js";
+import { canCancelMailbox } from "../routing/schema.js";
 import { readDesktop } from "../desktop/store.js";
 import { listResultBusEntries } from "../result-bus/store.js";
 import { resultBusCompanionDeliveryId } from "./result-bus-delivery.js";
@@ -75,6 +76,8 @@ export async function readCompanionOperations(input: {
     throw new CompanionError("COMPANION_WORKSPACE_MISMATCH", "workspace 身份不一致。");
   }
   const feedback = readFeedbackState(identity.id, input.stateDir);
+  const pendingPanelCommandIds = new Set((feedback.panelOperations ?? [])
+    .filter(operation => operation.status === "pending").map(operation => operation.commandId));
   // Current-command transport stores the authenticated principal fingerprint as planner identity,
   // never a caller-supplied URL or a guessed timestamp/body match.
   const plannerIds = new Set(routing?.routes.filter(route => route.role === "planner"
@@ -113,6 +116,7 @@ export async function readCompanionOperations(input: {
       .map(entry => ({ source: "result_bus", eventId: resultBusCompanionDeliveryId(entry.busEntryId),
         iteration: entry.iteration, status: entry.deliveryStatus, result: entry.result.status,
         resultId: entry.resultId, attemptId: entry.attempt?.attemptId ?? null,
+        ...(entry.isolatedAt != null ? { isolated: true as const } : {}),
         target: entry.sendTarget ? (areChatgptConversationRoutesEquivalent(entry.sendTarget.canonicalUrl, auth.routeCanonical) ? "current" : "historical") : "unassigned",
         createdAt: entry.createdAt, updatedAt: entry.observedAt ?? entry.outcomeUnknownAt ?? entry.attempt?.claimedAt ?? entry.createdAt }));
     const executions = results.flatMap(result => "machineEvidence" in result ? [{ iteration: result.iteration, status: result.status, resultId: result.resultId as string | null,
@@ -124,12 +128,23 @@ export async function readCompanionOperations(input: {
     }
     const issues = lifecycleDiagnostics(identity.id, commandId, stateDir);
     if (candidate && command && !delivery) issues.push("delivery_identity_conflict");
+    const queueStatus = command?.deliveryStatus === "pending" ? command.mailbox?.state : undefined;
+    const queueReason = queueStatus === "blocked" ? command?.mailbox?.reason?.slice(0, 80) ?? null : undefined;
+    const pendingPanelOperation = pendingPanelCommandIds.has(commandId);
+    const cancelable = !!command && command.deliveryStatus === "pending" && !command.cancelledAt
+      && canCancelMailbox(command.mailbox) && !candidate && !dispatch
+      && !(recordsMap.get(commandId)?.length) && !(busMap.get(commandId)?.length) && !events.length
+      && !(routing?.results.some(result => result.commandId === commandId))
+      && !pendingPanelOperation;
+    const cancelReason = cancelable ? undefined : pendingPanelOperation ? "PANEL_OPERATION_PENDING" : "PANEL_CANCEL_UNSAFE";
     return {
       commandId, intent: command?.intent ?? candidate?.intent ?? dispatch?.intent ?? null,
       scope: command ? (plannerIds.has(command.plannerRouteId) ? "current" : "historical")
         : candidate && candidate.bindingId === desktop?.binding?.bindingId ? "current_target" : "historical",
       issues, administrative: abandonedIds.has(commandId) ? "abandoned" : retiredIds.has(commandId) ? "retired" : resolvedIds.has(commandId) ? "resolved_unknown" : null,
       delivery: { status: command?.cancelledAt ? "cancelled" : delivery?.deliveryStatus ?? command?.deliveryStatus ?? (dispatch?.deliveryStatus === "started" ? "outcome_unknown" : dispatch?.deliveryStatus) ?? "unknown", deliveryId: delivery?.deliveryId ?? null,
+        cancelable, ...(!cancelable ? { cancelReason } : {}),
+        ...(queueStatus ? { queueStatus, ...(queueStatus === "blocked" ? { queueReason: queueReason ?? null } : {}) } : {}),
         updatedAt: delivery?.updatedAt ?? command?.updatedAt ?? dispatch?.updatedAt ?? null, reason: delivery?.errorCode ?? null },
       // Routing results have canonical trusted machineEvidence. Generic record drafts are never read here.
       executions,

@@ -1,4 +1,5 @@
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { z } from "zod";
 
 /**
@@ -124,6 +125,26 @@ export const commandDeliveryStatusSchema = z.enum([
 ]);
 export type CommandDeliveryStatus = z.infer<typeof commandDeliveryStatusSchema>;
 
+/** Accepted into the local inbox; no raw OAuth token is stored. */
+export const commandMailboxSchema = z.object({
+  kind: z.enum(["desktop", "executor"]),
+  state: z.enum(["queued", "dispatching", "blocked"]),
+  message: z.string().min(1).max(65536),
+  clientId: z.string().min(1).max(256),
+  tokenHash: z.string().regex(HEX64),
+  bindingId: routingUuidSchema,
+  desktopBindingId: routingUuidSchema,
+  plannerFingerprint: z.string().min(1).max(256),
+  reason: z.string().regex(/^[A-Z][A-Z0-9_]{0,79}$/).optional(),
+}).strict();
+export type CommandMailbox = z.infer<typeof commandMailboxSchema>;
+
+/** Additional inbox check; the caller must also prove absence of durable send/result evidence. */
+export function canCancelMailbox(mailbox: CommandMailbox | undefined): boolean {
+  return !mailbox || mailbox.state === "queued" || (mailbox.state === "blocked" &&
+    ["UNAUTHORIZED", "DESKTOP_BINDING_MISMATCH", "DESKTOP_RUNTIME_FENCE_MISSING"].includes(mailbox.reason ?? ""));
+}
+
 export const commandSchema = z
   .object({
     commandId: routingCommandIdSchema,
@@ -134,6 +155,7 @@ export const commandSchema = z
     payloadSha256: z.string().regex(HEX64),
     deliveryStatus: commandDeliveryStatusSchema,
     cancelledAt: z.string().datetime().optional(),
+    mailbox: commandMailboxSchema.optional(),
     createdAt: z.string().datetime(),
     updatedAt: z.string().datetime(),
   })
@@ -146,7 +168,7 @@ export type RoutingCommand = z.infer<typeof commandSchema>;
  * transition API 写入。
  */
 export const commandInputSchema = commandSchema
-  .omit({ deliveryStatus: true, cancelledAt: true, createdAt: true, updatedAt: true })
+  .omit({ deliveryStatus: true, cancelledAt: true, mailbox: true, createdAt: true, updatedAt: true })
   .strict();
 export type CommandInput = z.infer<typeof commandInputSchema>;
 
@@ -256,6 +278,10 @@ export const routingStateSchema = z
     }
     const commandIds = new Set<string>();
     for (const command of state.commands) {
+      if (command.mailbox && (command.deliveryStatus !== "pending" || command.cancelledAt ||
+          Buffer.byteLength(command.mailbox.message, "utf8") !== command.payloadBytes ||
+          createHash("sha256").update(command.mailbox.message).digest("hex") !== command.payloadSha256))
+        issue("收件箱正文指纹或命令状态不一致");
       if (command.cancelledAt && command.deliveryStatus !== "rejected") issue("cancelled command 必须保持 rejected 投递终态");
       if (commandIds.has(command.commandId)) issue(`commandId 重复：${command.commandId}`);
       commandIds.add(command.commandId);
@@ -264,6 +290,8 @@ export const routingStateSchema = z
       } else if (roleByRouteId.get(command.plannerRouteId) !== "planner") {
         issue(`command ${command.commandId} 的 plannerRouteId 不是 planner role`);
       }
+      if (command.mailbox && state.routes.find(route => route.routeId === command.plannerRouteId)?.conversationId !== command.mailbox.plannerFingerprint)
+        issue("收件箱主体与原 planner route 不一致");
       if (!routeIds.has(command.executorRouteId)) {
         issue(`command ${command.commandId} 引用不存在的 executor route`);
       } else if (roleByRouteId.get(command.executorRouteId) !== "executor") {

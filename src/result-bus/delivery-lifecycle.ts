@@ -5,6 +5,7 @@ import { freezeActiveWebSinkTarget, readActiveWebSinkBinding } from "../web-sink
 import type { WebSinkBinding, WebSinkSendTargetSnapshot } from "../endpoints/schema.js";
 import {
   resultBusReasonCodeSchema,
+  isResultBusInFlight,
   type ResultBusAttempt,
   type ResultBusEntry,
   type ResultBusReservation,
@@ -109,7 +110,7 @@ export function reserveNextResultBusEntry(
 ): ReserveNextResultBusEntryOutcome {
   const resolved = resolveWorkspaceIdentity(identity);
   const candidates = listResultBusEntries(resolved, stateDir).sort(compareResultBusEntries);
-  const hint = candidates.find(entry => ["reserved", "claimed", "outcome_unknown"].includes(entry.deliveryStatus))
+  const hint = candidates.find(isResultBusInFlight)
     ?? candidates.find(entry => entry.deliveryStatus === "queued" && !options.excludeBusEntryIds?.has(entry.busEntryId));
   const reserve = (): ReserveNextResultBusEntryOutcome => withEndpointSwitchLock("web-sink", resolved.id, () => {
     const active = readActiveWebSinkBinding(resolved.id);
@@ -124,7 +125,7 @@ export function reserveNextResultBusEntry(
     return withResultBusTransaction<ReserveNextResultBusEntryOutcome>(resolved, previous => {
       const entries = previous?.entries ?? [];
       const inFlight = entries
-        .filter(entry => entry.deliveryStatus === "reserved" || entry.deliveryStatus === "claimed" || entry.deliveryStatus === "outcome_unknown")
+        .filter(isResultBusInFlight)
         .sort(compareResultBusEntries)[0];
       if (inFlight) {
         if (inFlight.busEntryId !== hint.busEntryId) throw new ResultBusError("RESULT_BUS_BUSY", "预约候选已变化；重读后再预约。");
@@ -272,6 +273,7 @@ export function ackResultBusObserved(
       ...entry,
       deliveryStatus: "observed",
       observedAt: isoNow(options.nowMs),
+      isolatedAt: null,
       outcomeUnknownAt: null,
       outcomeReasonCode: null,
     };
@@ -325,6 +327,23 @@ export function markResultBusOutcomeUnknown(
       outcomeReasonCode: reasonCode ?? null,
     };
     return { state: replaceEntry(state, index, outcome), result: { status: "outcome_unknown", entry: outcome, noWrite: false } };
+  }, stateDir));
+}
+
+/** Browser has durably parked this exact attempt. Never requeue it or imply ACK. */
+export function isolateResultBusAttempt(identity: RoutingWorkspaceIdentity,
+  input: { busEntryId: string; attemptId: string; reservationId: string }, stateDir = getStateDir()): ResultBusEntry {
+  const resolved = resolveWorkspaceIdentity(identity);
+  return withEntryOperation(resolved, input.busEntryId, stateDir, () => withResultBusTransaction(resolved, previous => {
+    const { state, index, entry } = requireEntry(previous, input.busEntryId);
+    if (!["claimed", "outcome_unknown"].includes(entry.deliveryStatus) || entry.attempt?.attemptId !== input.attemptId ||
+        entry.reservation?.reservationId !== input.reservationId)
+      throw new ResultBusError("RESULT_BUS_ATTEMPT_MISMATCH", "隔离仅适用于本条已开始发送的精确 attempt。");
+    if (entry.isolatedAt) return { state: previous, noWrite: true, result: entry };
+    const now = new Date().toISOString();
+    const isolated: ResultBusEntry = { ...entry, deliveryStatus: "outcome_unknown", isolatedAt: now,
+      outcomeUnknownAt: entry.outcomeUnknownAt ?? now, outcomeReasonCode: "BROWSER_ATTEMPT_ISOLATED" };
+    return { state: replaceEntry(state, index, isolated), result: isolated };
   }, stateDir));
 }
 

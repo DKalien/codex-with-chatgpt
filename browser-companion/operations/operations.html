@@ -8,13 +8,14 @@
     <div class="heading"><div><p class="eyebrow">连接与任务</p><h1>项目任务总览</h1><p class="muted">查看指令是否送达、执行结果是否产生，以及回流是否确认。</p></div><button id="refresh" type="button">刷新状态</button></div>
     <p id="scope" class="scope">正在读取当前连接…</p>
     <section class="cards" aria-label="两端状态">
-      <article><span class="card-label">CODEX 端</span><h2 id="codex">检查中…</h2><p>空闲状态仍需在发送时核验。</p></article>
+      <article><span class="card-label">CODEX 端</span><h2 id="codex">检查中…</h2><p>忙碌时消息可排队；队列不会触发网页发送。</p></article>
       <article><span class="card-label">CHATGPT 网页端</span><h2 id="web">检查中…</h2><p>对话、owner、输入框与生成状态。</p></article>
       <article><span class="card-label">连接服务</span><h2 id="bridge">检查中…</h2><p id="checked-at">尚无成功观察</p></article>
       <article><span class="card-label">自动回流</span><h2 id="autonomy">检查中…</h2><p>在伴侣 popup 中开启或暂停。</p></article>
     </section>
     <p id="diagnostic" class="diagnostic" role="status" aria-live="polite"></p>
     <section class="authorization"><p id="authorization" class="muted"></p><button id="check-operation" type="button" class="quiet">核验上次操作</button><p id="operation-status" role="status" aria-live="polite"></p><div id="pending-actions" class="filters"></div></section>
+    <section class="isolation" aria-label="结果不明隔离档案"><h2>结果不明隔离档案</h2><p class="muted">隔离表示原 attempt 已让出发送队列，但网页未观察确认。原正文只保存在本机受保护存储中。</p><p id="isolation-status" role="status"></p><ul id="isolation-entries"></ul></section>
     <section class="tasks" aria-label="消息与任务">
       <div class="toolbar"><h2>消息与任务 <span id="count" class="count">0</span></h2><div class="filters" aria-label="筛选任务">
         <button type="button" data-filter="all" aria-pressed="true">全部任务</button><button type="button" data-filter="active" aria-pressed="false">进行中</button><button type="button" data-filter="attention" aria-pressed="false">需要处理</button><button type="button" data-filter="historical" aria-pressed="false">历史遗留</button>
@@ -25,7 +26,7 @@
       <nav class="pagination" aria-label="任务分页"><button id="previous" class="quiet" type="button">上一页</button><span id="page-count">第 1 页</span><button id="next" class="quiet" type="button">下一页</button></nav>
       <p class="footnote">包括本项目仍存在的历史任务、异常投递和清理残留，仅展示状态与标识。已清理记录不会恢复；记录消失不代表回流成功。</p>
     </section>
-    <section id="detail" class="detail" hidden aria-label="任务详情"><div class="toolbar"><h2 id="detail-title">任务详情</h2><button id="close-detail" class="quiet" type="button">收起详情</button></div><p id="detail-note" class="muted"></p><ol id="timeline"></ol><dl id="identities"></dl><div id="task-actions" class="filters"></div><p id="action-note" class="muted"></p></section>
+    <section id="detail" class="detail" hidden aria-label="任务详情"><div class="toolbar"><h2 id="detail-title">任务详情</h2><button id="close-detail" class="quiet" type="button">收起详情</button></div><p id="detail-note" class="muted"></p><ol id="timeline"></ol><div id="execution-results" class="execution-results"></div><pre id="execution-result" hidden aria-live="polite"></pre><dl id="identities"></dl><div id="task-actions" class="filters"></div><p id="action-note" class="muted"></p></section>
     <dialog id="confirm-dialog"><h2>确认任务操作</h2><p id="confirm-task"></p><p id="confirm-notice"></p><label><input id="confirm-check" type="checkbox">我已核对任务及影响范围</label><div class="filters"><button id="confirm-cancel" type="button" class="quiet">返回</button><button id="confirm-action" type="button" disabled>确认操作</button></div></dialog>
     <footer>本页刷新保持只读。操作需本机限时授权及逐条确认；结果不明不会自动重试。已执行任务不能从本面板强制中断。</footer>
   </main>

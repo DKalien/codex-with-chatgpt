@@ -36,7 +36,7 @@ Normal 使用 `[C2C]`。状态不互相推进，同一 Agent 不并行执行两�
 
 **Desktop Control（独立实验性 MVP）:** 默认关闭，只支持本机用户绑定、已在 Desktop 加载的
 已有会话。ChatGPT 只有在网页用户确认完整方案后，才可调用 `codex_desktop_send`；它只等待真实
-投递接受回执，收到 `deliveryStatus=accepted` 后本轮即可结束，不等待任务完成。不要自动新建
+Bridge 持久接收回执，收到 `deliveryStatus=queued` 后本轮即可结束；后台在目标空闲后投递，`accepted` 才表示真实接收，二者均不表示执行完成。不要自动新建
 会话、steer、interrupt、轮询或通知；本机绑定、授权和恢复规则见 `docs/desktop-control.md`。
 
 **Golden rules**
@@ -954,10 +954,7 @@ Desktop 行为；不能声称 Desktop Control 能抵御已经获授权客户端�
 `readOnlyHint:false`、`destructiveHint:true`、`openWorldHint:true`、`idempotentHint:true`；
 `idempotent` 仅表示同一 `commandId` 防止重复尝试，不是网络 exactly-once。
 
-收到真实 `threadId`/`turnId` 且投递接受后，只报告 `deliveryStatus=accepted`。`accepted` 不
-是 `completed`，也不是测试通过；当前网页回合可以结束，不要等待 Desktop 任务完成，不要
-持续查询状态。目标忙、待审批、无 owner、Desktop 离线、live 协议不兼容、错 project/workspace
-或需要提权时必须零发送并报告明确原因，也不创建隐藏队列。
+Bridge 返回 `deliveryStatus=queued` 表示完整任务已持久接收；网页本轮可以结束。目标 busy 时排队，不猜测 steer/插播协议。只有真实 `threadId`/`turnId` 接受凭据才表示 `accepted`；二者都不是 `completed` 或测试通过。后台提交点重新验证 OAuth、enable、frozen target、owner 与审批，不能借入队绕过权限。无 owner、离线或身份不明时不发送，保留本条明确状态；不要持续轮询等待完成。
 
 只有在用户主动回来要求“干完了，检查一下”时，才调用现有只读 MCP 检查当次代码、Git 和
 执行记录。先保留刚才 delivery 的 exact `commandId`，从 `execution_summary`（可取 limit=50）
@@ -967,7 +964,7 @@ Desktop 行为；不能声称 Desktop Control 能抵御已经获授权客户端�
 可以继续 git/diff 审查，但不能引用历史测试为本轮通过；输出不可读、tests=not run 或 failed/blocked
 也不能视为测试通过。投递记录不能冒充执行记录。
 如需修订，向同一绑定会话发送完整修订指令并使用新的 `commandId`；前一条若为
-`outcome_unknown`，不得改 ID 绕过。
+`outcome_unknown`，不得换 ID 重发其原请求；独立的新指令可正常入队，不阻塞所有消息。
 适配器最后重检若能明确证明尚未进入 start，会保留 `rejected` 和具体错误；同 ID 不再尝试。
 只有用户明确发起新请求才可使用新 ID。写入已开始、断线或回执不明不能当作确定未发送。
 

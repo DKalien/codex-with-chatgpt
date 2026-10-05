@@ -1,7 +1,7 @@
 # 实验性 Desktop Control（MVP）
 
 Desktop Control 是默认关闭的 MCP 写入能力。它只把 ChatGPT 已确认的完整计划
-投递到本机已经绑定、已经在 Desktop 中加载且当前空闲的会话；它不会创建新的会话。
+持久排队到本机已经绑定、已经在 Desktop 中加载的会话；busy 时等待，空闲后通过原安全入口投递。它不会创建新的会话或直接 steer active turn。
 本功能依赖 Desktop 的版本绑定内部 IPC，不能当作公开稳定 API。
 
 ## 用户流程
@@ -9,7 +9,8 @@ Desktop Control 是默认关闭的 MCP 写入能力。它只把 ChatGPT 已确�
 ```text
 ChatGPT 讨论并确认完整方案
   → codex_desktop_send
-  → Desktop 返回真实投递接受结果
+  → Bridge 返回 queued（本轮可结束）
+  → 后台等待 idle，再取得 Desktop 真实 accepted 凭据
   → ChatGPT 结束本轮，用户在 Desktop 观看执行
   → Desktop 执行 Agent 在最终回复前用统一 `c2c record` 请求本轮 commandId 的终态回执
   → 用户回来要求“干完了，检查一下”
@@ -19,6 +20,12 @@ ChatGPT 讨论并确认完整方案
 
 第一版不提供自动新建会话、steer、interrupt、实时进度、推送通知或网页持续轮询。
 `accepted` 只表示 Desktop 已接受投递，不表示任务 `completed`，也不表示测试通过。
+
+## Bridge 收件箱与回流隔离（2026-10-05）
+
+当前源码合同见 [双向消息收件箱](agent-mailbox.md)。MCP 入口先返回 queued；下文 prepare/30秒 busy-tail 属于复用的底层 sender，不是 MCP 请求持久等待或新的全局队列。`codex_desktop_status` 的 commandQueue 只返回排队状态/原因，不把它伪装成真实 delivery。dispatching 重启中断封为 outcome_unknown，绝不原请求重发；某条历史坏锁不阻断其他独立 Command。
+
+canonical Result Bus 可逐条隔离未知浏览器 attempt，保留 evidence 且不伪 ACK；网页生成或草稿非空时等待，不覆盖输入框。当前源码仍未部署，机器现场验收另行进行。rollout、binding/enable、OAuth、本机确认和 trusted receipt 的安全规则保持。
 
 ## 自动验收记录
 
@@ -354,8 +361,7 @@ prepare 成功前持久化新 delivery。该同步等待必须保持在有效的
 
 投递只等待有界的接受回执。收到真实 `threadId`/`turnId` 后返回
 `deliveryStatus=accepted`；不要等待 Codex 完成，也不要把接受回执写成执行完成记录。
-回执超时、断线或落盘不明时返回 `outcome_unknown`，提醒不要重发。结果不明期间整个
-workspace（包括重新绑定后的目标）暂停后续投递，不能换一个 `commandId` 或重新绑定绕过它；只有本机
+回执超时、断线或落盘不明时返回 `outcome_unknown`，提醒不要重发。原任务结果不明时禁止重发原请求，独立新指令仍可入队；不能换一个 `commandId` 或重新绑定重发原请求。只有本机
 用户完成严格的行政 resolution 后，workflow/rollout 才可停止等待该项，raw delivery 仍是
 `outcome_unknown`；该 commandId 永远不能重发或被改写成成功。只要其他门禁均满足，
 后续新的、经过授权的 Desktop command 仍可继续发送。
@@ -445,11 +451,10 @@ C2C 自有状态会保存 `commandId`、v2 delivery 的 `deliveryId`、OAuth `cl
 记录必须保存 `intent`。读取不会迁移、回填或修改旧历史，旧记录在 `status` 返回中继续缺省
 `intent`。使用缺少该字段的旧 `commandId` 再次 `send` 时，无法证明新的 `intent` 与原请求
 相同，按 `DESKTOP_COMMAND_CONFLICT` 拒绝，并引导先用 `status` 查看原记录。`outcome_unknown`
-的 workspace 阻断规则不变。
+仍禁止原请求重发；独立新消息不受该条阻断，维护/rollout 仍按原未决事实核验。
 
 `disable` 或重新绑定不能撤回已经越过提交点的在途请求，也不能把它伪装成未发送；
-状态查询应如实保留该阶段。重新绑定后的新会话必须重新本地授权，且不能绕过 workspace
-级别的 `outcome_unknown` 阻断。
+状态查询应如实保留该阶段。重新绑定后的新会话必须重新本地授权，且不能用重绑定重发原 `outcome_unknown` 请求或绕过维护/rollout 的未决检查。
 
 ## 本机 IPC 与 live 行为证明
 

@@ -1,4 +1,5 @@
 import { createWorkspaceMaintenance } from "./maintenance.js";
+import { createCommandMailbox } from "../routing/mailbox.js";
 import express, { type Request, type Response, type NextFunction } from "express";
 import type { Server } from "node:http";
 import { randomBytes } from "node:crypto";
@@ -105,6 +106,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   }
 
   const authStore = new AuthStore(workspace.id, { file: opts.authStoreFile });
+  const commandMailbox = createCommandMailbox(workspace, authStore);
   const pairing = new PairingManager(workspace.id, { ttlMs: opts.pairingTtlMs });
   const tunnel = opts.tunnelProvider ?? tunnelForWorkspace(workspace.id, logger);
   const adminToken = `c2c_admin_${randomBytes(24).toString("base64url")}`;
@@ -150,6 +152,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   // ---- MCP endpoint (bearer-protected) --------------------------------------
 
   const mcpHandler = createMcpHttpHandler(() => createMcpServer({
+    commandMailbox: commandMailbox.submit,
     workspace,
     logger,
     desktopAuthorize: (auth: AuthInfo) => {
@@ -310,8 +313,12 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     }
   }, 30_000);
   maintenanceTimer?.unref();
+  const mailboxTimer = opts.persistRuntime === false ? null : setInterval(() => {
+    void commandMailbox.tick().catch(() => logger.warn("Command mailbox unavailable; pending tasks retained"));
+  }, 2000);
+  mailboxTimer?.unref();
 
-  let closed = false;
+  let shutdownPromise: Promise<void> | undefined;
   let shutdownNoted = false;
   const noteShutdown = (reason: ShutdownReason): void => {
     if (shutdownNoted || opts.persistRuntime === false) return;
@@ -319,18 +326,31 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     try { recordShutdownIntent(runtimeState(), reason); }
     catch { logger.warn("Bridge shutdown diagnostic unavailable_or_conflict"); }
   };
-  const shutdown = async (reason: ShutdownReason = "close"): Promise<void> => {
-    if (closed) return;
+  const shutdown = (reason: ShutdownReason = "close"): Promise<void> => {
+    if (shutdownPromise) return shutdownPromise;
     noteShutdown(reason);
-    closed = true;
     if (maintenanceTimer) clearInterval(maintenanceTimer);
-    await tunnel.stop().catch(() => undefined);
-    await new Promise<void>((resolve) => server.close(() => resolve()));
-    // A process-exit path cannot prove its own exit. Keep the runtime/release pin
-    // until an external observer proves exit; a subsequent safe start replaces it.
-    // Embedded callers closing only this server retain the existing close contract.
-    if (reason === "close" && opts.persistRuntime !== false) clearRuntimeState(workspace.id, { pid: process.pid, startedAt, adminToken });
-    logger.info("Bridge stopped");
+    if (mailboxTimer) clearInterval(mailboxTimer);
+    shutdownPromise = (async () => {
+      await commandMailbox.close();
+      logger.info(`Bridge stopping (${reason})`);
+      const httpClosed = new Promise<void>((resolve) => {
+        // Stop accepting first; unfinished headers/bodies must not pin shutdown
+        // forever. Leave headroom in restartBridge's 5-second exact-exit fence.
+        const deadline = setTimeout(() => {
+          logger.warn("Bridge HTTP drain deadline reached; closing remaining connections");
+          server.closeAllConnections();
+        }, 1000);
+        server.close(() => { clearTimeout(deadline); resolve(); });
+      });
+      await Promise.all([tunnel.stop().catch(() => undefined), httpClosed]);
+      // A process-exit path cannot prove its own exit. Keep the runtime/release pin
+      // until an external observer proves exit; a subsequent safe start replaces it.
+      // Embedded callers closing only this server retain the existing close contract.
+      if (reason === "close" && opts.persistRuntime !== false) clearRuntimeState(workspace.id, { pid: process.pid, startedAt, adminToken });
+      logger.info("Bridge stopped");
+    })();
+    return shutdownPromise;
   };
 
   return {

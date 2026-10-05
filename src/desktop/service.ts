@@ -1,4 +1,4 @@
-import { assertCommandNotCancelled } from "../routing/store.js";
+import { assertCommandNotCancelled, listCommands } from "../routing/store.js";
 import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 import type { Workspace } from "../workspace/manager.js";
@@ -226,7 +226,7 @@ async function sendDesktopLocked(workspace: LocalWorkspace, input: z.infer<typeo
   if (prior) return publicDelivery(prior);
   // UUID is fixed-width, so this validates the exact envelope byte size before the send commit.
   validateDesktopWireMessage(desktopTaskEnvelope(input, "00000000-0000-4000-8000-000000000000"));
-  assertNoUncertainDelivery(workspace, snapshot);
+  if (snapshot.deliveries.length >= 10000) throw new DesktopError("DESKTOP_HISTORY_FULL", "投递历史容量已满。");
   const connection = await prepareWithPostResultSettle(workspace, snapshot.binding, authorize, settleOptions, executor);
   try {
     // 不跨 IPC 预检持锁；提交点前在短锁内重新读取授权和绑定，防止旧快照越过撤权。
@@ -236,7 +236,7 @@ async function sendDesktopLocked(workspace: LocalWorkspace, input: z.infer<typeo
       const state = authorized(workspace, previous, input.bindingId);
       const existing = replay(state, input, clientId, digest);
       if (existing) return { state, result: { record: existing, attempt: false } };
-      assertNoUncertainDelivery(workspace, state);
+      if (state.deliveries.length >= 10000) throw new DesktopError("DESKTOP_HISTORY_FULL", "投递历史容量已满。");
       const now = new Date().toISOString();
       const record: DesktopDelivery = { commandId: input.commandId, deliveryId: randomUUID(), clientId, bindingId: input.bindingId,
         lifecycle: "ephemeral", intent: input.intent,
@@ -316,10 +316,16 @@ export async function desktopStatus(workspace: LocalWorkspace, commandId?: strin
     state = latest;
   }
   const delivery = commandId ? state.deliveries.find(item => item.commandId === commandId) : undefined;
+  // Legacy Desktop adapters also accept non-canonical IDs. They never own a
+  // Routing inbox, so a read-only status must not introduce that dependency.
+  const mailbox = commandId && /^[a-f0-9]{12}$/.test(workspace.id)
+    ? listCommands(workspace).find(item => item.commandId === commandId)?.mailbox : undefined;
   const unresolved = unresolvedOutcomeUnknownCommandIds(workspace, state);
   const resolutionStatus = delivery && delivery.deliveryStatus === "outcome_unknown" &&
     isOutcomeUnknownAdministrativelyResolved(workspace, delivery.commandId) ? "administratively_resolved" as const : undefined;
   return { workspaceId: workspace.id, enabled: state.enabled, binding: state.binding, availability,
     unresolvedDelivery: unresolved.size > 0,
+    commandQueue: mailbox ? { commandId: commandId!, state: mailbox.state,
+      ...(mailbox.reason ? { reason: mailbox.reason } : {}) } : null,
     delivery: delivery ? { ...publicDelivery(delivery), ...(resolutionStatus ? { resolutionStatus } : {}) } : null };
 }

@@ -48,7 +48,7 @@
       "file": "tests/browser-companion.test.ts",
       "group": "parallel",
       "dist": "read",
-      "sha256": "3febdfdbbfe8d34de2d8345231f922e34dc3fbfc1a9bb918d4a6d4c29dc3e500"
+      "sha256": "796da8cbc44f29af183a226d876a5df9fe0f6c99549fcd6924ba427ae893c784"
     },
     {
       "file": "tests/build-id.test.ts",
@@ -75,6 +75,12 @@
       "sha256": "fb262c99c4926248dbfea2f5b63cc1a33517e4b6856de36fdfd6ab2a065c61dc"
     },
     {
+      "file": "tests/command-mailbox.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "32b5ab419dc00c6e64358519cf49328b7ac05ff40aff57559e563c316d23000d"
+    },
+    {
       "file": "tests/companion-feedback.test.ts",
       "group": "parallel",
       "dist": "none",
@@ -84,7 +90,7 @@
       "file": "tests/companion-operations.test.ts",
       "group": "parallel",
       "dist": "none",
-      "sha256": "0bf22e6e8c4f38b9c1698264b9f9ef94f9f27e326de856621aec2fc3fccd19ec"
+      "sha256": "c50d24150b5d25bfb3e5ea77b9cf6c7b361439de7d80116f97ca4c03d799b96b"
     },
     {
       "file": "tests/control-protocol.test.ts",
@@ -138,7 +144,7 @@
       "file": "tests/desktop-control.test.ts",
       "group": "parallel",
       "dist": "none",
-      "sha256": "d9ccd3f25b5b98da9600b830b0786f5c6e340ff764f4355015cf17e769f331ad"
+      "sha256": "5410f0e080470b9471b10722db7c25144d36dfca08a68fee7f41da013503f202"
     },
     {
       "file": "tests/desktop-current.test.ts",
@@ -162,7 +168,7 @@
       "file": "tests/desktop-interfaces.test.ts",
       "group": "parallel",
       "dist": "none",
-      "sha256": "5164a881c4ac4a7203297ff9866cd9c1b90d293de43c9641d0b1cd69eb572632"
+      "sha256": "640891a4e6dcfbf641f48af8e26dd67b575a392e5b5f6b3f10fc63827af0288a"
     },
     {
       "file": "tests/desktop-ipc.test.ts",
@@ -174,7 +180,7 @@
       "file": "tests/desktop-outcome-resolution.test.ts",
       "group": "parallel",
       "dist": "none",
-      "sha256": "3ddaf32f805e691d674bc4c5bb30ac5bc0e283184f37a32aa98a1c7ccf44eda2"
+      "sha256": "e33f5f4a05bc53986c3d0b49ceda6ada44cfddf9a8f05639312ec59d0aa0f08b"
     },
     {
       "file": "tests/desktop-python.test.ts",
@@ -270,7 +276,7 @@
       "file": "tests/e1b3d3b-production-send.test.ts",
       "group": "parallel",
       "dist": "read",
-      "sha256": "9ecd5d4020aa94bfe13eec5e88148e136f6cbe2bb5bfc066c9aac08c467c8366"
+      "sha256": "190b0fc20e1edef84df917f6301297f0b06cf781a6c8bb27e13155421de3e427"
     },
     {
       "file": "tests/e1b3d3b2-autonomy.test.ts",
@@ -318,13 +324,13 @@
       "file": "tests/executor-core.test.ts",
       "group": "parallel",
       "dist": "none",
-      "sha256": "e924ac6188027c6cb33a008095965d92b4242038f02423d44f8d314412b3fb1f"
+      "sha256": "b3d0ca8e698427fb38a6fc1cfac6fe074f5ae4e92a8628760b312f23210f5a0c"
     },
     {
       "file": "tests/f1-companion-resilience.test.ts",
       "group": "parallel",
       "dist": "none",
-      "sha256": "f12c071a263ac26e98e41184ad68ba4fba3eb0a324ba95cec6df6fa71553172d"
+      "sha256": "317ec2e956ec3fb40b19c7b11953db3f69595d1822a58a992b26ef073f9ea935"
     },
     {
       "file": "tests/feedback-bootstrap-runner.test.ts",
@@ -540,13 +546,13 @@
       "file": "tests/r5-executor-mcp-auth.test.ts",
       "group": "parallel",
       "dist": "none",
-      "sha256": "dfd37c868d5af9ae778f6caca911e2130cf1d94c2bcb3f7db74170e1f1b64248"
+      "sha256": "fb266ab184e8d97f398c28f0e110777db158cca69549664151eabde177cc701c"
     },
     {
       "file": "tests/r5-executor-mcp.test.ts",
       "group": "parallel",
       "dist": "none",
-      "sha256": "8ee61a97d156b51baaca90e95d74316fc82aa5603944779fab011ce6be83bdc4"
+      "sha256": "764b1f327709db1f79b6bdf224fcb3f507e898901122d9063a79ed13b57257e0"
     },
     {
       "file": "tests/r5-executor-service.test.ts",
@@ -564,7 +570,7 @@
       "file": "tests/r5-web-sink-browser.test.ts",
       "group": "parallel",
       "dist": "none",
-      "sha256": "8eff5dc4c2ee4171b5b9261c7e9028ab08882725b4f60baea3d7ba03b8f38cb5"
+      "sha256": "858f4f9efb176f4052e76445ceeb3258f6a35734dd469343c785a6d1a9165ac7"
     },
     {
       "file": "tests/r5-web-sink-companion.test.ts",
@@ -606,7 +612,7 @@
       "file": "tests/r5b-architecture.test.ts",
       "group": "parallel",
       "dist": "none",
-      "sha256": "c2f6ccdf43bc2067f77849854d7a300215c67acdd78599732b25d6147986941f"
+      "sha256": "6527970e69e626d3941098019a98007ef732ec0ec1170b70e256ba51b28fbb2b"
     },
     {
       "file": "tests/r5c-architecture.test.ts",
@@ -630,13 +636,13 @@
       "file": "tests/r5d3-result-bus-cutover.test.ts",
       "group": "parallel",
       "dist": "none",
-      "sha256": "e62be62376fc33a18fdd0535201aea9936a080f639a512ca7f8817af56db3e8a"
+      "sha256": "6cd9ecf6b70fe1131de9baa512c77ca7a75223d43bd4c36c9f026c5935309fbe"
     },
     {
       "file": "tests/r5e-architecture.test.ts",
       "group": "parallel",
       "dist": "none",
-      "sha256": "feb9d951b3f42aec2a4ee477baae535350e8b3032bbed1376e68c515df69fb12"
+      "sha256": "f2cf5ca85922eda53c094950ae124283385677d4534d9feab61c7c9812f97750"
     },
     {
       "file": "tests/r5e-executor-dispatch.test.ts",
@@ -780,7 +786,7 @@
       "file": "tests/runtime.test.ts",
       "group": "serial",
       "dist": "none",
-      "sha256": "e4d17415120ebe264979841c7e8aa09951e21dc0a359dee6c855b490a9fb75c8"
+      "sha256": "988f7107abf1b4eb1e0568d4f5cafcf2a1e8e787b762dc08c7a70b37dbb13958"
     },
     {
       "file": "tests/sandbox-allow.test.ts",
@@ -858,7 +864,7 @@
       "file": "tests/test-full-candidate.test.ts",
       "group": "parallel",
       "dist": "none",
-      "sha256": "2e8001d174ebbd658ef536289770e85599f08914a11145b6d9733c2848512771"
+      "sha256": "fdf77076d128f098b28c6bf2740816dfabc3b5e0369dc90a3c7b88fe4decbbad"
     },
     {
       "file": "tests/tunnel.test.ts",
@@ -975,7 +981,7 @@
     "scripts/measure-core-release.cjs": "a284cfe2f9b4c932196e5f072207c6a3cc60fa26bfde98e7f503d7d838946df7",
     "scripts/poc-client.mjs": "7d2f02e98c62b1a574f42ecdcfa5142c25d2ad420b3d005cd30d64cd0147c1da",
     "scripts/test-full-candidate-reporter.mjs": "ed9ffb26880b12cee89dbb16997cfb47f57c77cfccd698a7598298fc5890fbba",
-    "scripts/test-full-candidate.mjs": "f0fdf8be90b6574174a6dcd4ad3a02417b5807fb4423b6863447eabead82b222",
+    "scripts/test-full-candidate.mjs": "c642b9d31de7f00ae43ddfad6938beb2ca3b634913e081ee569302190257047a",
     "scripts/update-upstream-track.ps1": "4f4b2cbca4dff0b69810b388646d74d7658ad01605fa022d62e0fc829f0c2ea1",
     "scripts/write-build-id.mjs": "9df9fe47d6499d89931ba3dce7e77410c58598ad70fe1728ce14caf83f6af7cf",
     "tests/daemon_spawn_protocol_test.py": "fa9ab2663dc2f8592e7440f309a81d01cd99d6b519c41acbf28243d0537fa38c",

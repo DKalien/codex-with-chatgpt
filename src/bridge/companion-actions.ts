@@ -6,6 +6,7 @@ import { getStateDir } from "../config/paths.js";
 import { panelActionSchema, FeedbackError } from "../feedback/schema.js";
 import { readFeedbackState } from "../feedback/state-store.js";
 import { changePanelState, readPanelAuthorization } from "../feedback/panel.js";
+import { canCancelMailbox } from "../routing/schema.js";
 import { readRouting, resolveWorkspaceIdentity, cancelPendingCommand } from "../routing/store.js";
 import { readDesktop } from "../desktop/store.js";
 import { readExecutorDispatchState } from "../executor-control/dispatch-store.js";
@@ -66,7 +67,7 @@ export function previewPanelAction(input: PanelContext, raw: unknown) {
   let evidence: unknown, cleanupDigest: string | undefined, sourceSha256: string | undefined, reservationId: string | undefined;
   let notice: string;
   if (request.action === "cancel_command") {
-    if (!command || command.deliveryStatus !== "pending" || desktop || dispatch || records.length || bus.length || events.length
+    if (!command || command.deliveryStatus !== "pending" || !canCancelMailbox(command.mailbox) || desktop || dispatch || records.length || bus.length || events.length
       || routing?.results.some(item => item.commandId === request.commandId))
       blocked("PANEL_CANCEL_UNSAFE", "无法证明该命令尚未进入外部投递边界；不能取消执行中的或结果不明的任务。");
     evidence = command;

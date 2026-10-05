@@ -4,7 +4,10 @@ import type { Logger } from "../logger/index.js";
 import type { DesktopCompatibility } from "../auth/store.js";
 import type { ConnectionRuntimeUpgrade } from "../workflow/readiness-model.js";
 
+import type { CommandMailboxSubmit } from "../routing/mailbox.js";
+
 export interface McpContext {
+  commandMailbox?: CommandMailboxSubmit;
   workspace: Workspace;
   logger: Logger;
   /** Revalidate the bearer token immediately before a Desktop delivery commit. */

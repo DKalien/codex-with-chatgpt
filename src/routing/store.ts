@@ -1,12 +1,17 @@
 import fs from "node:fs";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { Workspace, WorkspaceError } from "../workspace/manager.js";
+import { readDesktop } from "../desktop/store.js";
+import { readExecutorDispatchState } from "../executor-control/dispatch-store.js";
 import { ensureDir, getStateDir } from "../config/paths.js";
 import { assertCleanupStoreFile, readCleanupJournal, withCommandOperation } from "../command-cleanup/fence.js";
 import { assertCleanupArtifacts, cleanupArtifact, CommandCleanupError, type CleanupArtifact, type CommandCleanupTarget } from "../command-cleanup/schema.js";
 import {
   RoutingError,
+  commandMailboxSchema,
+  canCancelMailbox,
+  type CommandMailbox,
   commandDeliveryTransitionInputSchema,
   commandInputSchema,
   resultInputSchema,
@@ -288,8 +293,10 @@ export function createCommand(
   identity: RoutingWorkspaceIdentity,
   input: CommandInput,
   stateDir = getStateDir(),
+  mailbox?: CommandMailbox,
 ): RoutingCommand {
   const parsed = commandInputSchema.parse(input);
+  const inbox = mailbox === undefined ? undefined : commandMailboxSchema.parse(mailbox);
   const resolved = resolveWorkspaceIdentity(identity);
   return withCommandOperation(resolved.id, parsed.commandId, () => updateRouting(
     resolved,
@@ -323,6 +330,7 @@ export function createCommand(
       const now = new Date().toISOString();
       const command: RoutingCommand = {
         ...parsed,
+        ...(inbox ? { mailbox: inbox } : {}),
         deliveryStatus: "pending",
         createdAt: now,
         updatedAt: now,
@@ -358,6 +366,7 @@ export function transitionCommandDelivery(
     }
     const updated: RoutingCommand = {
       ...command,
+      mailbox: undefined,
       deliveryStatus: parsed.deliveryStatus,
       updatedAt: new Date().toISOString(),
     };
@@ -551,8 +560,16 @@ export function cancelPendingCommand(identity: RoutingWorkspaceIdentity, command
   return withCommandOperation(identity.id, commandId, () => updateRouting(identity, previous => {
     const command = previous?.commands.find(item => item.commandId === commandId);
     if (!previous || !command || command.deliveryStatus !== "pending") throw new RoutingError("ROUTING_CANCEL_UNSAFE", "只有尚未投递的 pending 命令可取消。");
+    if (!canCancelMailbox(command.mailbox))
+      throw new RoutingError("ROUTING_CANCEL_UNSAFE", "本条可能已进入投递；不能将不明结果取消为未发送。");
+    const desktop = readDesktop(identity.id, stateDir);
+    const dispatch = readExecutorDispatchState(identity.id, stateDir);
+    if ((desktop && desktop.workspaceRoot !== identity.root) || (dispatch && dispatch.workspaceRoot !== identity.root) ||
+        desktop?.deliveries.some(item => item.commandId === commandId) || dispatch?.entries.some(item => item.commandId === commandId) ||
+        previous.results.some(item => item.commandId === commandId))
+      throw new RoutingError("ROUTING_CANCEL_UNSAFE", "本条存在投递或结果证据；不能当作尚未发送取消。");
     const now = new Date().toISOString();
-    const updated = { ...command, deliveryStatus: "rejected" as const, cancelledAt: now, updatedAt: now };
+    const updated = { ...command, mailbox: undefined, deliveryStatus: "rejected" as const, cancelledAt: now, updatedAt: now };
     return { state: { ...previous, commands: previous.commands.map(item => item === command ? updated : item) }, result: updated };
   }, stateDir), stateDir);
 }
@@ -564,4 +581,25 @@ export function assertCommandNotCancelled(identity: RoutingWorkspaceIdentity, co
   catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
   if (readRouting(identity, stateDir)?.commands.some(item => item.commandId === commandId && item.cancelledAt))
     throw new RoutingError("ROUTING_COMMAND_CANCELLED", "本机用户已取消该尚未发送的命令；禁止重新投递。");
+}
+
+/** Reuse the command transaction/cleanup fence; queue payload disappears with the command. */
+export function setCommandMailbox(identity: RoutingWorkspaceIdentity, commandId: string, value: CommandMailbox): RoutingCommand {
+  const mailbox = commandMailboxSchema.parse(value);
+  return withCommandOperation(identity.id, commandId, () => updateRouting(identity, previous => {
+    const command = previous?.commands.find(item => item.commandId === commandId);
+    if (!previous || !command || command.deliveryStatus !== "pending" || command.cancelledAt)
+      throw new RoutingError("ROUTING_MAILBOX_CONFLICT", "仅尚未投递的命令可进入收件箱。");
+    if (Buffer.byteLength(mailbox.message, "utf8") !== command.payloadBytes ||
+        createHash("sha256").update(mailbox.message).digest("hex") !== command.payloadSha256)
+      throw new RoutingError("ROUTING_MAILBOX_CONFLICT", "收件箱正文与命令指纹不一致。");
+    if (command.mailbox) {
+      const { state: _state, reason: _reason, ...before } = command.mailbox;
+      const { state: _nextState, reason: _nextReason, ...after } = mailbox;
+      if (JSON.stringify(before) !== JSON.stringify(after))
+        throw new RoutingError("ROUTING_MAILBOX_CONFLICT", "不得替换已接收任务的目标、正文或授权。");
+    }
+    const updated = { ...command, mailbox, updatedAt: new Date().toISOString() };
+    return { state: { ...previous, commands: previous.commands.map(item => item === command ? updated : item) }, result: updated };
+  }));
 }

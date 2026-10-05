@@ -1,8 +1,51 @@
 # 长期开发计划
 
-## 当前事实与开发阶段（2026-10-04 21:44，Asia/Shanghai）
+<a id="当前事实与开发阶段2026-10-04-2144asiashanghai"></a>
 
-本节是当前状态入口；下方 command/B 阶段条目保存各轮历史证据，其中“下一步”“未部署”“门禁失败”只适用于该轮，不能覆盖本节。事实来自当前源码、Git、已安装稳定入口的只读 status/supervisor status，以及既有门禁产物；本次仅同步文档，不重新测试、构建、安装或 rollout。
+## 当前事实与开发阶段
+
+### 2026-10-05 双向收件箱源码开发
+
+用户授权参考主代理/子代理的消息方式改造，并授权自主推进后续开发。本轮实现 [双向消息收件箱](agent-mailbox.md)：MCP 原子入队，后台通过现有安全入口投递；busy 可排队，旧条目坏锁或未知尝试不饿死其他条目。canonical 回流未知 attempt 可以保留原证据后逐条隔离，后续回流继续；面板独立只读读取已有 canonical summary/tests。没有加入未验证的 active-turn steer、第二个执行权威或数据库。
+
+**开发与源码门禁已完成**：定向测试、独立职责/安全审查、typecheck、`git diff --check` 和 canonical build PASS。修订后的正式串行全量 **161 files /3403 tests PASS、exit0、unhandled0、skip/pending/todo0**；wall **1389.35s**、runner **1385.90s**，465 项冻结 source/test/support 哈希稳定，新增进程/监听/temp 均0。构建 stored==computeBuildId==core-release==**`1326542c3601b2919b1872c1d80ac22aab258b05774c5ce438513b0c5aeba3a8`**，新 mailbox/shared sender/未知尝试归档均已打包。测试清单为 packaging1/serial6/parallel154、support32，仅 bookkeeping；R5j 仍 workers3、experimental/deferred，没有运行 candidate/parallel。
+
+首轮正式全量保留为失败证据：157 files PASS、4 files/5 assertions FAIL，unhandled0、冻结稳定、残留0。原因是原结构检查仍按抽取前的 MCP dispatcher 与恢复函数边界定位；仅修正4份测试的定位，保留 no-owner/no-CS/no-Send、offline、生产 backend/pin/finalize/authority 断言，生产代码未因此修改。修订后的全量是新冻结版本的重新验证，不是 unchanged retry。关闭 prepare/commit 竞态也已修复并覆盖两类下发：确证未发送保留 queued，已提交等待原尝试，不重排。
+
+源码验收证据保存在 ignored `.tooling/agent-mailbox-20261005/`（首轮日志与定向验证）和 `.tooling/agent-mailbox-20261005-final/`（revision-proof、frozen/full-result/full-vitest/build-identity）；后端部署与现场核验见 ignored `.tooling/agent-mailbox-deploy-20261005/` 及下方当前部署快照。
+
+日志还保留 `route-esm.js` 引用的 `route.js.map` 缺失诊断；本轮未改相关打包脚本，该调试映射资产问题未扩大修复。正式门禁仍为 exit0/unhandled0；原始诊断可在 full.log 查阅。
+
+**仍待完成**：用户已确认 Companion Reload；08:32 after-confirm 只读核验与465项冻结哈希复核均通过。Desktop 本机确认完成，Desktop 与 generic Executor 可用，当前采样 activity=busy；真实新任务的 busy 排队→单次发送、unknown 隔离→回流、晚到 ACK 与面板结果读取尚无独立端到端验收。Supervisor 注册及独立恢复验收仍需单独授权。
+
+### 2026-10-05 08:32 后端部署快照
+
+最终只读核验时间为 `2026-10-05T00:32:47.556Z`（北京时间 08:32:47.556）；安装与 scoped rollout 在 08:26 前已完成。目标 build `1326542c3601b2919b1872c1d80ac22aab258b05774c5ce438513b0c5aeba3a8` 已通过 canonical installer 的完整 artifacts/bootstrap 与 Skill 占位符精确替换核验；稳定 launcher 对 workspace `2582910bf0d2` 的 scoped rollout 返回 current=1、upgraded/stopped/pending/error 均为0。最终核验 built=installed=running，`runtimeUpgrade=current`、`upgradePending=false`；本机与认证 admin health、named public health 对应同一 immutable entry 和进程。PID `13876`，startedAt `2026-10-05T00:25:05.058Z`，creationTime `134356335037544263`。
+
+启动前旧 PID `16348` 已正向证明 missing。首次新进程 `18856` 的调用因 `Start-Process -Wait` 让工具 wrapper 等待后台子进程而被取消并退出；该失败调用证据保留。改用仅等待 launcher 的 `WaitForExit` 后再次启动成功。部署保留原 public URL、named tunnelId、endpoint binding ID/thread/boundAt 与 binding 哈希；另一个 workspace 的 runtime 文件身份与字节未变，Feedback/Result Bus in-flight 均为0。用户已确认 Companion Reload，但页面组件当前就绪状态和真实消息是否送达未独立观察。用户完成 Desktop 本机确认后，08:32 核验 Desktop 与 generic Executor availability=true，Executor epoch=3、activity=busy；绑定目标未变，仅 Desktop runtimeFence 按确认流程从预读旧值更新为预读的新精确值。投递权限门禁已恢复，但真实新任务仍未发送验收。
+
+08:32 复核时465项冻结哈希稳定；没有重跑 full/build。安装自带 GC 删除 `70b189e97b32c73c73ad4cccf80f97db024237f6331bcc3d964ba39decda5bb9` 和 `fb6ac93f47884ff7ea85ac5a9299913c8a6c03e05d3844f990c5c7f677b035a3`，共 `145057624` bytes。遗留 runtime `d94af68105aa` 指向缺失 build `9c33929c545edbe2242770baede0cef9f1f189712d9ce0060f307bc88ce0732a` 的 dangling reference 保持原样；部署后只读 GC plan 仅将旧 `d0b085bb1b6445da312068e6014b0f026fc345fde2ae702af8675268062875d5` 列为 72,533,432-byte delete candidate，没有再次 apply。Supervisor task absent、config/runtime null；本轮未做真实 C2C 消息端到端验收，也未 commit/push。
+
+### 2026-10-05 00:06 历史恢复快照
+
+核验时间：2026-10-05 00:06，Asia/Shanghai。用户已自行重启电脑，本轮继续恢复当前 workspace 的 Bridge。下面 21:44 及 command 条目保留历史，不覆盖本节。
+
+- **源码/提交**：HEAD `063caf07962d6dd58b952885702640aa0d6c7d52` 已整合此前 249 个文件；关闭修复仍是未提交改动，没有 push。生产只改 `src/bridge/server.ts`，并补测试、清单 bookkeeping 和文档；重启后未再修改生产代码。
+- **修复**：隔离真实 HTTP 测试证明未传完的 headers/body 会使旧 `server.close()` 超过退出等待窗口；已加入 1 秒排空期限和原生连接关闭，并让并发 shutdown 等待同一 Promise。正常宽限期响应、真实 daemon 退出及 runtime pin 保留都有回归。现场旧实例没有阶段日志，不能将此复现写成已证明当时唯一触发原因。
+- **验证**：focused 5 files /236 tests、typecheck、canonical build PASS。唯一正式串行全量 160 files /3361 tests PASS，exit0/unhandled0，无 skip/pending；wall1554.95s、runner1550.82s；461 项冻结哈希稳定，新增进程/监听/temp 均0。重启后重新核验冻结哈希与完整安装身份，均未漂移，因此没有重复 full/build/install。实验 candidate 未运行，仍 workers3/deferred。
+- **构建/安装/运行一致**：stored==computeBuildId==core-release==installed==running **`d0b085bb1b6445da312068e6014b0f026fc345fde2ae702af8675268062875d5`**。此前 canonical installer full artifact/bootstrap/helper/Browser/supervisor 与 Skill 校验均通过。新 Bridge PID **16348**，startedAt `2026-10-04T15:56:42.137Z`，creationTime `134356030009127412`；Node executable 与该 build 的 immutable release entry 精确匹配。
+- **恢复完成**：重启后原 PID12676 已正向证明 missing；通过已安装稳定 launcher 执行当前 workspace `start --tunnel`，随后 scoped rollout 返回 **current1/pending0/error0**，runtimeUpgrade=current、upgradePending=false。本机 HTTP、认证 admin、named public health 均与同一 workspace/PID/startedAt/build 匹配；固定域名与 tunnelId 保留。没有第二次 termination 或再次重启新实例，maintenance/start/rollout 锁均已释放。
+- **重启前故障证据**：旧 runtime `fb6ac93f…b035a3` / PID12676 已接受认证关闭且端口已关闭，但没有退出。此前仅一次精确 HANDLE TerminateProcess 被 Windows 接受，同 HANDLE10秒仍未 signaled；之后两组各三次复核均 exitCode=1、WaitForSingleObject=258，CIM仍有线程10280。具体系统 I/O/驱动原因未确定；未用退出码或端口关闭冒充 stopped，用户自行重启后才重新启动。
+- **投递恢复**：整机重启曾使旧 Desktop runtimeFence 返回 `DESKTOP_PROCESS_CHANGED`。用户明确要求显示本机确认窗后，通过现役 `desktop disable` → `desktop bind-current` 并由用户亲自确认，保留原 thread/bindingId/boundAt，仅更新新进程 runtimeFence。复核 Desktop 与 Executor available=true，Executor epoch3 不变；activity=busy 对应本轮执行。Desktop/Feedback/Companion/Executor/Web Sink 绑定哈希、其他 workspace runtime 文件身份均与重启前相同，Feedback/Result Bus in-flight=0、unresolvedDelivery=false。这是可用性核验，不是新网页任务的回流或 ACK 验收。
+- **Supervisor/GC**：只读 status 为 task absent、config/runtime=null，没有注册或启动 Scheduled Task。此前正常 installer GC 删除0、tombstone0、回收0 bytes；本轮仅只读 GC plan，新 build 因 current/runtime 保留，`70b189e9…a5bb9` 与 `fb6ac93f…b035a3` 成为候选，未 apply。既有 `d94af68105aa` dangling runtime reference 为一项局部问题，globalBlockerCount=0，原文件完整保留。
+
+**下一步**：本次 Bridge 恢复与 Desktop 本机确认已完成。真实新网页任务的可信终态与网页回流验收仍独立待办，本轮没有发送测试任务或补记历史 receipt。独立 supervisor 注册及登录/重启/Codex-close 自动恢复仍需单独授权；本轮手动恢复不代表这些验收已完成。
+
+本轮证据位于 ignored `.tooling/rollout-shutdown-fix/`：既有 `full-result.json`、`build-identity.json`、`installed-verification.json`、`recovery-terminate-result.json`、`exit-observation.json` 保留；新增 `resume-preflight.json`、`resume-start.json`、`resume-rollout.json`、`resume-health.json`、`resume-supervisor.json`、`resume-gc-plan.json`、`resume-final-readonly.json` 记录重启后结果，`resume-confirm-preflight.json`、`resume-desktop-confirm.json`、`resume-after-confirm.json` 记录用户确认及最终身份/健康核验。这些不是 trusted receipt 或网页 ACK。
+
+## 2026-10-04 21:44 历史快照
+
+以下保留 21:44 文档同步时的历史状态；“当前”“下一步”“未部署”“门禁失败”仅适用于当时，以前述最新核验为准。事实来自当前源码、Git、已安装稳定入口的只读 status/supervisor status，以及既有门禁产物；本次仅同步文档，不重新测试、构建、安装或 rollout。
 
 | 事实面 | 当前核对结果 |
 | --- | --- |

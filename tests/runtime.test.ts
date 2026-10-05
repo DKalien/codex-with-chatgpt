@@ -2,6 +2,8 @@ import { requestHttp } from "./http-json.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createServer, type Server } from "node:http";
 import { spawn } from "node:child_process";
+import { connect } from "node:net";
+import { once } from "node:events";
 import fs from "node:fs";
 import path from "node:path";
 import { startBridge } from "../src/bridge/server.js";
@@ -318,6 +320,109 @@ describe("findBridgeObservation", () => {
     vi.useRealTimers();
     delete process.env.C2C_STATE_DIR;
     await cleanupStrict(...dirs.splice(0));
+  });
+
+  it.each(["headers", "body"])("shutdown drains an unfinished HTTP %s within the restart window", async phase => {
+    dirs.push(isolateStateDir());
+    const root = makeTmpDir("shutdown-http-drain"); dirs.push(root);
+    const bridge = await startBridge({ workspaceRoot: root, port: 0, persistRuntime: false });
+    const socket = connect(bridge.port, "127.0.0.1");
+    socket.on("error", () => undefined);
+    socket.resume();
+    let closing: Promise<void> | undefined;
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await once(socket, "connect");
+      socket.write(phase === "headers" ? "POST /mcp HTTP/1.1\r\nHost: localhost\r\n" :
+        "POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{");
+      // A second real request proves the server accepted the first connection.
+      expect((await requestHttp(`${bridge.localBaseUrl()}/health`)).status).toBe(200);
+      closing = bridge.close();
+      const closed = await Promise.race([closing.then(() => true), new Promise<false>(resolve => {
+        deadline = setTimeout(() => resolve(false), 4000);
+      })]);
+      expect(closed).toBe(true);
+    } finally {
+      clearTimeout(deadline);
+      socket.destroy();
+      await (closing ?? bridge.close());
+    }
+  });
+
+  it("concurrent shutdown callers await the same complete shutdown", async () => {
+    dirs.push(isolateStateDir());
+    const root = makeTmpDir("shutdown-concurrent"); dirs.push(root);
+    const bridge = await startBridge({ workspaceRoot: root, port: 0 });
+    let finish!: () => void;
+    const stop = vi.spyOn(bridge.tunnel, "stop").mockImplementation(() => new Promise<void>(resolve => { finish = resolve; }));
+    const first = bridge.close();
+    const second = bridge.close();
+    let complete = false;
+    void second.then(() => { complete = true; });
+    try {
+      await new Promise(resolve => setTimeout(resolve, 20));
+      expect(complete).toBe(false);
+      expect(readRuntimeState(bridge.workspace.id)).not.toBeNull();
+      expect(stop).toHaveBeenCalledTimes(1);
+    } finally {
+      finish();
+      await Promise.all([first, second]);
+    }
+    expect(readRuntimeState(bridge.workspace.id)).toBeNull();
+  });
+
+  it("shutdown lets a real HTTP request finish during the drain grace", async () => {
+    dirs.push(isolateStateDir());
+    const root = makeTmpDir("shutdown-grace"); dirs.push(root);
+    const bridge = await startBridge({ workspaceRoot: root, port: 0, persistRuntime: false });
+    const socket = connect(bridge.port, "127.0.0.1");
+    socket.on("error", () => undefined);
+    let response = "";
+    socket.on("data", data => { response += data.toString(); });
+    let closing: Promise<void> | undefined;
+    try {
+      await once(socket, "connect");
+      socket.write("GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n");
+      expect((await requestHttp(`${bridge.localBaseUrl()}/health`)).status).toBe(200);
+      closing = bridge.close();
+      const ended = once(socket, "end");
+      socket.write("\r\n");
+      await ended;
+      await closing;
+      expect(response).toContain("HTTP/1.1 200 OK");
+      expect(response).toContain(bridge.workspace.id);
+    } finally {
+      socket.destroy();
+      await (closing ?? bridge.close());
+    }
+  });
+
+  it("authenticated shutdown exits the exact daemon despite an unfinished request and retains its runtime pin", async () => {
+    dirs.push(isolateStateDir());
+    const root = makeTmpDir("shutdown-daemon-drain"); dirs.push(root);
+    const { runtime } = await ensureBridge(root, { port: 0 });
+    const before = fs.readFileSync(runtimeFile(runtime.workspaceId));
+    const socket = connect(runtime.port, "127.0.0.1");
+    socket.on("error", () => undefined);
+    socket.resume();
+    try {
+      await once(socket, "connect");
+      socket.write("POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{");
+      expect(await stopBridge(root)).toBe(true);
+      const deadline = Date.now() + 4000;
+      let presence = await processProbe.observeProcessPresence(runtime.pid);
+      while (presence !== "missing" && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 50));
+        presence = await processProbe.observeProcessPresence(runtime.pid);
+      }
+      expect(presence).toBe("missing");
+      expect(fs.readFileSync(runtimeFile(runtime.workspaceId))).toEqual(before);
+      expect(await findBridgeObservation(runtime.workspaceId)).toMatchObject({ state: "stopped" });
+    } finally {
+      socket.destroy();
+      await stopBridge(root);
+      await waitForBridgeExit(runtime.workspaceId);
+    }
   });
 
   it.each(["exact", "missing", "failed", "pid", "start", "workspace", "build", "build_absent", "unknown"])(

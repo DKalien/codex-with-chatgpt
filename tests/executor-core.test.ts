@@ -226,11 +226,12 @@ it("注入 adapter 的 DESKTOP_BUSY receipt-backed tail 先 inspectActiveExecuti
     });
     return { state, result: undefined };
   });
+  prepare.mockResolvedValueOnce({ send: vi.fn().mockResolvedValue({ threadId: target.threadId, turnId: randomUUID() }), close: vi.fn() });
   await expect(sendDesktop(workspace, {
     ...request, commandId: "executor-after-unknown",
-  }, "executor-client", undefined, undefined, adapter)).rejects.toMatchObject({ code: "DESKTOP_OUTCOME_UNRESOLVED" });
-  expect(readDesktop(workspace.id)?.deliveries.find(item => item.commandId === "executor-after-unknown")).toBeUndefined();
-  expect(prepare).toHaveBeenCalledTimes(2);
+  }, "executor-client", undefined, undefined, adapter)).resolves.toMatchObject({ deliveryStatus: "accepted" });
+  expect(readDesktop(workspace.id)?.deliveries.find(item => item.commandId === "executor-unknown")?.deliveryStatus).toBe("outcome_unknown");
+  expect(prepare).toHaveBeenCalledTimes(3);
 });
 
 it("注入 adapter 的 ambiguous send 保持 outcome_unknown，同 commandId 不重发", async () => {

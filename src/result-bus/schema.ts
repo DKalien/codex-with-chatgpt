@@ -96,6 +96,7 @@ export const resultBusEntrySchema = z.object({
   retiredAt: nullable(endpointInstantSchema),
   outcomeReasonCode: nullable(resultBusReasonCodeSchema),
   cancelledAt: nullable(endpointInstantSchema),
+  isolatedAt: nullable(endpointInstantSchema),
 }).strict().superRefine((entry, ctx) => {
   const issue = (path: string[], message: string) =>
     ctx.addIssue({ code: z.ZodIssueCode.custom, path, message });
@@ -127,6 +128,8 @@ export const resultBusEntrySchema = z.object({
   const hasRetiredAt = entry.retiredAt != null;
   const hasReasonCode = entry.outcomeReasonCode != null;
   if ((entry.deliveryStatus === "cancelled") !== (entry.cancelledAt != null)) issue(["cancelledAt"], "只有 cancelled 必须保留取消时间。");
+  if (entry.isolatedAt && !["outcome_unknown", "retired_unknown"].includes(entry.deliveryStatus))
+    issue(["isolatedAt"], "只有未确认发送及其行政终态允许保留隔离标记。");
   switch (entry.deliveryStatus) {
     case "cancelled":
     case "queued":
@@ -212,7 +215,7 @@ export const resultBusStateSchema = z.object({
     if (entry.workspaceId !== state.workspaceId) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["entries"], message: "entry workspaceId 与 state 不一致。" });
     // 持久化单飞不变量：reserved/claimed/outcome_unknown 同时至多一条；
     // observed/retired_unknown 是终态，不计入。
-    if (entry.deliveryStatus === "reserved" || entry.deliveryStatus === "claimed" || entry.deliveryStatus === "outcome_unknown") {
+    if (isResultBusInFlight(entry)) {
       inFlight += 1;
     }
   }
@@ -228,4 +231,10 @@ export type CanonicalRoutingResult = Extract<RoutingResult, { rawSummary: string
 
 export function isCanonicalRoutingResult(result: RoutingResult): result is CanonicalRoutingResult {
   return "rawSummary" in result && "machineEvidence" in result;
+}
+
+/** Isolated unknown attempts retain evidence but occupy no send slot. */
+export function isResultBusInFlight(entry: { deliveryStatus: string; isolatedAt?: string | null }): boolean {
+  return entry.deliveryStatus === "reserved" || entry.deliveryStatus === "claimed" ||
+    (entry.deliveryStatus === "outcome_unknown" && !entry.isolatedAt);
 }

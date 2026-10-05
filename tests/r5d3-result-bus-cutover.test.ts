@@ -1,5 +1,6 @@
 import { listResultBusCutoverDispositions } from "../src/result-bus/cutover-store.js";
 import fs from "node:fs";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 import http from "node:http";
 import express from "express";
@@ -47,10 +48,12 @@ import { canonicalFeedbackEvent } from "../src/feedback/canonical-compat.js";
 import { reconcileFeedbackOutbox } from "../src/feedback/projector.js";
 import { writeState, feedbackStateFile } from "../src/feedback/state-store.js";
 import { cleanupJournalFile } from "../src/command-cleanup/fence.js";
+import { confirmCommandCleanup, previewCommandCleanup } from "../src/command-cleanup/service.js";
 import { resolveConversationPrincipal } from "../src/mcp/conversation-principal.js";
 import { bindCurrentWebSink, readActiveWebSinkBinding } from "../src/web-sink-control/index.js";
 import { projectChatgptRouteToWebSinkCandidate } from "../src/web-sink-control/index.js";
 import { createCompanionRouter } from "../src/bridge/companion.js";
+import { readCompanionOperations } from "../src/bridge/companion-operations.js";
 import { claimNextForMcp } from "../src/mcp/feedback.js";
 import { evaluateServerObservedCloseout, findExactObservedEvent } from "../browser-companion/production-send.js";
 import { requestJson } from "./http-json.js";
@@ -120,6 +123,27 @@ function seedBusEntry(commandId: string) {
   const result = routingResult(commandId);
   const entry = enqueueResultBusEntry(workspace, result, stateDir).entry;
   return { entry, result };
+}
+
+function seedEphemeralBusEntry(commandId: string) {
+  const now = new Date().toISOString();
+  updateDesktop(workspace.id, previous => {
+    const base = previous ?? { version: 1 as const, workspaceId: workspace.id, workspaceRoot: wsRoot,
+      enabled: false, binding: null, deliveries: [] };
+    return { state: { ...base, deliveries: [...base.deliveries.filter(item => item.commandId !== commandId), {
+      commandId, deliveryId: randomUUID(), lifecycle: "ephemeral" as const, intent: "development_plan" as const,
+      clientId: "terminal-gone-client", bindingId: BINDING, messageSha256: "a".repeat(64), messageBytes: 1,
+      threadId: EXECUTOR, turnId: randomUUID(), deliveryStatus: "accepted" as const, createdAt: now, updatedAt: now,
+    }] }, result: null };
+  }, stateDir);
+  return seedBusEntry(commandId);
+}
+
+function stateSnapshot(directory: string): unknown {
+  return fs.readdirSync(directory, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name)).map(item => {
+    const file = path.join(directory, item.name);
+    return item.isDirectory() ? [item.name, stateSnapshot(file)] : [item.name, fs.readFileSync(file).toString("base64")];
+  });
 }
 
 function enableBinding() {
@@ -1222,6 +1246,182 @@ describe("R5d3 Result Bus cutover", () => {
       expect(sent.status).toBe(200);
       expect(sent.body.status).toBe("claimed");
       expect(sent.body.message).toContain("[C2C_CONTROL]");
+    });
+
+    it("HTTP: exact isolate frees the next result; retry is idempotent and late ACK remains observed", async () => {
+      enableBinding();
+      const paired = pairCompanion();
+      bindSink(ROUTE_A);
+      const first = seedBusEntry("r5d3-isolate-first");
+      const headers = { authorization: `Bearer ${paired.credential}`, "content-type": "application/json" };
+      const resultPath = `/api/companion/v1/operations/result?commandId=${first.result.commandId}&iteration=1`;
+      const routingBeforeRead = fs.readFileSync(routingFile(workspace.id, stateDir));
+      const busBeforeRead = fs.readFileSync(resultBusFile(workspace.id, stateDir));
+      expect(await fetchJson(resultPath, { headers })).toMatchObject({ status: 200, body: {
+        commandId: first.result.commandId, iteration: 1, resultId: first.result.resultId,
+        resultSha256: canonicalRoutingResultDigest(first.result), status: "ok",
+        rawSummary: first.result.rawSummary, testsSummary: first.result.machineEvidence.testsSummary,
+        deliveryStatus: "queued",
+      } });
+      expect(fs.readFileSync(routingFile(workspace.id, stateDir))).toEqual(routingBeforeRead);
+      expect(fs.readFileSync(resultBusFile(workspace.id, stateDir))).toEqual(busBeforeRead);
+
+      const reserved = await fetchJson("/api/companion/v1/reserve", { method: "POST", headers,
+        body: JSON.stringify({ routeCanonical: ROUTE_A }) });
+      expect(reserved).toMatchObject({ status: 200, body: { delivery: { commandId: first.result.commandId } } });
+      const second = seedBusEntry("r5d3-isolate-second");
+      const eventId = reserved.body.delivery.eventId as string;
+      const reservationId = reserved.body.reservationId as string;
+      const sent = await fetchJson("/api/companion/v1/begin-send", { method: "POST", headers,
+        body: JSON.stringify({ routeCanonical: ROUTE_A, eventId, reservationId }) });
+      expect(sent.status).toBe(200);
+      const target = { routeCanonical: ROUTE_A, eventId, reservationId,
+        attemptId: sent.body.attemptId as string, messageSha256: sent.body.messageSha256 as string };
+      const revision = readResultBus(workspace, stateDir)!.revision;
+      const unauthorized = await fetchJson("/api/companion/v1/isolate-attempt", { method: "POST",
+        headers: { "content-type": "application/json" }, body: JSON.stringify(target) });
+      expect(unauthorized.status).toBe(401);
+      const extraField = await fetchJson("/api/companion/v1/isolate-attempt", { method: "POST", headers,
+        body: JSON.stringify({ ...target, message: "must not be accepted" }) });
+      expect(extraField.status).toBe(400);
+      const wrongAttempt = await fetchJson("/api/companion/v1/isolate-attempt", { method: "POST", headers,
+        body: JSON.stringify({ ...target, attemptId: "01a00000-0000-7000-8000-0000000007d3" }) });
+      expect(wrongAttempt.status).toBe(409);
+      const wrongRoute = await fetchJson("/api/companion/v1/isolate-attempt", { method: "POST", headers,
+        body: JSON.stringify({ ...target, routeCanonical: ROUTE_B }) });
+      expect(wrongRoute.status).toBe(400);
+      expect(readResultBus(workspace, stateDir)!.revision).toBe(revision);
+
+      const isolated = await fetchJson("/api/companion/v1/isolate-attempt", { method: "POST", headers,
+        body: JSON.stringify(target) });
+      expect(isolated).toMatchObject({ status: 200, body: { ...target,
+        status: "outcome_unknown", isolated: true, observed: false } });
+      expect(isolated.body).not.toHaveProperty("message");
+      expect(readResultBus(workspace, stateDir)!.entries.find(entry => entry.commandId === first.result.commandId))
+        .toMatchObject({ deliveryStatus: "outcome_unknown", isolatedAt: expect.any(String) });
+      const state = await fetchJson("/api/companion/v1/state", { headers });
+      expect(state).toMatchObject({ status: 200, body: { inFlight: null, isolatedAttempts: [{
+        ...target, isolated: true, status: "outcome_unknown",
+      }] } });
+      expect(JSON.stringify(state.body)).not.toContain(sent.body.message);
+      const frozenReadBytes = fs.readFileSync(resultBusFile(workspace.id, stateDir));
+      expect(await fetchJson(resultPath, { headers })).toMatchObject({ status: 200, body: {
+        resultId: first.result.resultId, resultSha256: canonicalRoutingResultDigest(first.result),
+        status: "ok", rawSummary: first.result.rawSummary,
+        testsSummary: first.result.machineEvidence.testsSummary, deliveryStatus: "outcome_unknown",
+      } });
+      expect(fs.readFileSync(resultBusFile(workspace.id, stateDir))).toEqual(frozenReadBytes);
+
+      const isolatedRevision = readResultBus(workspace, stateDir)!.revision;
+      const retry = await fetchJson("/api/companion/v1/isolate-attempt", { method: "POST", headers,
+        body: JSON.stringify(target) });
+      expect(retry).toEqual(isolated);
+      expect(readResultBus(workspace, stateDir)!.revision).toBe(isolatedRevision);
+      const operations = await readCompanionOperations({ workspaceId: workspace.id, workspaceRoot: wsRoot,
+        credential: paired.credential, stateDir }, async () => ({ workspaceId: workspace.id, activeBinding: null,
+        plugins: [], availability: { available: false, reasonCode: "inspect_failed", message: "unavailable" } } as never));
+      expect(operations.commands.find(command => command.commandId === first.result.commandId)?.feedback)
+        .toContainEqual(expect.objectContaining({ source: "result_bus", status: "outcome_unknown", isolated: true }));
+
+      const next = await fetchJson("/api/companion/v1/reserve", { method: "POST", headers,
+        body: JSON.stringify({ routeCanonical: ROUTE_A }) });
+      expect(next).toMatchObject({ status: 200, body: { delivery: { commandId: second.result.commandId } } });
+      const lateAck = await fetchJson("/api/companion/v1/ack", { method: "POST", headers,
+        body: JSON.stringify({ routeCanonical: ROUTE_A, eventId, attemptId: target.attemptId }) });
+      expect(lateAck).toMatchObject({ status: 200, body: { eventId, status: "observed" } });
+      const afterLateAck = await fetchJson("/api/companion/v1/state", { headers });
+      expect(afterLateAck.body.isolatedAttempts).toEqual([]);
+      expect(afterLateAck.body.events).toContainEqual({ eventId, status: "observed", attemptId: target.attemptId });
+    });
+
+    it("HTTP: new verified route gets an explicit refusal for a frozen historical result", async () => {
+      enableBinding();
+      const pairedA = pairCompanion(ROUTE_A);
+      bindSink(ROUTE_A);
+      const { result } = seedBusEntry("r5d3-isolate-history");
+      const headersA = { authorization: `Bearer ${pairedA.credential}`, "content-type": "application/json" };
+      const reserved = await fetchJson("/api/companion/v1/reserve", { method: "POST", headers: headersA,
+        body: JSON.stringify({ routeCanonical: ROUTE_A }) });
+      const eventId = reserved.body.delivery.eventId as string;
+      const sent = await fetchJson("/api/companion/v1/begin-send", { method: "POST", headers: headersA,
+        body: JSON.stringify({ routeCanonical: ROUTE_A, eventId, reservationId: reserved.body.reservationId }) });
+      const target = { routeCanonical: ROUTE_A, eventId, reservationId: reserved.body.reservationId,
+        attemptId: sent.body.attemptId, messageSha256: sent.body.messageSha256 };
+      expect((await fetchJson("/api/companion/v1/isolate-attempt", { method: "POST", headers: headersA,
+        body: JSON.stringify(target) })).status).toBe(200);
+
+      const pairedB = pairCompanion(ROUTE_B);
+      const headersB = { authorization: `Bearer ${pairedB.credential}` };
+      const query = `/api/companion/v1/operations/result?commandId=${result.commandId}&iteration=1`;
+      const refused = await fetchJson(query, { headers: headersB });
+      expect(refused).toMatchObject({ status: 409, body: { error: "COMPANION_RESULT_HISTORICAL_REFUSED" } });
+      expect(JSON.stringify(refused.body)).not.toContain(result.rawSummary);
+      expect(JSON.stringify(refused.body)).not.toContain(result.machineEvidence.testsSummary);
+      const state = await fetchJson("/api/companion/v1/state", { headers: headersB });
+      expect(state.body.isolatedAttempts).toEqual([]);
+      expect(JSON.stringify(state.body)).not.toContain(target.attemptId);
+    });
+
+    it("HTTP: canonical result read fails closed on immutable digest drift", async () => {
+      enableBinding();
+      const paired = pairCompanion();
+      bindSink(ROUTE_A);
+      const { result } = seedBusEntry("r5d3-result-digest-drift");
+      const file = routingFile(workspace.id, stateDir);
+      const state = JSON.parse(fs.readFileSync(file, "utf8"));
+      state.results[0].rawSummary = `${result.rawSummary} tampered`;
+      fs.writeFileSync(file, JSON.stringify(state));
+      const routingBeforeRead = fs.readFileSync(file);
+      const headers = { authorization: `Bearer ${paired.credential}` };
+      const response = await fetchJson(`/api/companion/v1/operations/result?commandId=${result.commandId}&iteration=1`, { headers });
+      expect(response.status).toBe(409);
+      expect(response.body.error).toBe("RESULT_BUS_CONFLICT");
+      expect(JSON.stringify(response.body)).not.toContain(result.rawSummary);
+      expect(fs.readFileSync(file)).toEqual(routingBeforeRead);
+    });
+
+    it("HTTP: terminal-gone query is read-only and never ACKs a still-present attempt", async () => {
+      enableBinding();
+      const paired = pairCompanion();
+      bindSink(ROUTE_A);
+      const commandId = "r5d3-terminal-gone-query";
+      const { entry } = seedEphemeralBusEntry(commandId);
+      expect(entry.lifecycle).toBe("ephemeral");
+      const headers = { authorization: `Bearer ${paired.credential}`, "content-type": "application/json" };
+      const reserved = await fetchJson("/api/companion/v1/reserve", { method: "POST", headers,
+        body: JSON.stringify({ routeCanonical: ROUTE_A }) });
+      const eventId = reserved.body.delivery.eventId as string;
+      const sent = await fetchJson("/api/companion/v1/begin-send", { method: "POST", headers,
+        body: JSON.stringify({ routeCanonical: ROUTE_A, eventId, reservationId: reserved.body.reservationId }) });
+      const target = { routeCanonical: ROUTE_A, eventId, attemptId: sent.body.attemptId as string,
+        terminalWitness: sent.body.terminalWitness as string };
+      expect(target.terminalWitness).toBeTruthy();
+
+      const unauthorized = await fetchJson("/api/companion/v1/operations/terminal-gone", {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(target),
+      });
+      expect(unauthorized.status).toBe(401);
+      const extraField = await fetchJson("/api/companion/v1/operations/terminal-gone", { method: "POST", headers,
+        body: JSON.stringify({ ...target, extra: true }) });
+      expect(extraField.status).toBe(400);
+
+      const beforePresentRead = stateSnapshot(stateDir);
+      const present = await fetchJson("/api/companion/v1/operations/terminal-gone", { method: "POST", headers,
+        body: JSON.stringify(target) });
+      expect(present).toEqual({ status: 409, body: { routeCanonical: ROUTE_A, eventId,
+        attemptId: target.attemptId, status: "still_present" } });
+      expect(readResultBus(workspace, stateDir)!.entries.find(item => item.commandId === commandId)?.deliveryStatus).toBe("claimed");
+      expect(stateSnapshot(stateDir)).toEqual(beforePresentRead);
+
+      const cleanupTarget = { workspaceId: workspace.id, workspaceRoot: wsRoot, commandId, iteration: 1 as const, stateDir };
+      const preview = previewCommandCleanup(cleanupTarget);
+      expect(confirmCommandCleanup(cleanupTarget, preview.confirmationSha256!)).toMatchObject({ status: "cleaned" });
+      const beforeGoneRead = stateSnapshot(stateDir);
+      const gone = await fetchJson("/api/companion/v1/operations/terminal-gone", { method: "POST", headers,
+        body: JSON.stringify(target) });
+      expect(gone).toEqual({ status: 200, body: { routeCanonical: ROUTE_A, eventId,
+        attemptId: target.attemptId, status: "terminal_gone" } });
+      expect(stateSnapshot(stateDir)).toEqual(beforeGoneRead);
     });
 
     it("HTTP: valid Web Sink state/reserve bypass only unrelated unavailable legacy enrichment", async () => {

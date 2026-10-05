@@ -3051,7 +3051,7 @@ describe("E1b3d3b server-observed local closeout", () => {
     expect(sw).toMatch(/if \(isServerObservedCloseoutEligible\(journal\) && closeout\.ok\)/);
     expect(sw).not.toMatch(/if \(journal\.state === "OUTCOME_UNKNOWN" && closeout\.ok\)/);
     const start = sw.indexOf("const closeout = evaluateServerObservedCloseout");
-    const end = sw.indexOf("return recoverProductionSendSide(inFlight);", start);
+    const end = sw.indexOf("// Unknown + no inFlight must never use /ack", start);
     expect(start).toBeGreaterThan(0);
     expect(end).toBeGreaterThan(start);
     const block = sw.slice(start, end);

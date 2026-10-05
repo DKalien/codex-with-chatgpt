@@ -14,6 +14,7 @@ import { desktopIpc } from "../src/desktop/ipc.js";
 import { DESKTOP_CONTROL_SCOPE, DESKTOP_READ_SCOPE, filterScopes, getSupportedScopes, SUPPORTED_SCOPES } from "../src/auth/store.js";
 import { registerDesktopCommands } from "../src/cli/desktop.js";
 import { createCurrentCommand } from "../src/routing/current-command.js";
+import { createCommandMailbox } from "../src/routing/mailbox.js";
 import { listCommands, listRoutes, registerRoute } from "../src/routing/store.js";
 import { resolveConversationPrincipal } from "../src/mcp/conversation-principal.js";
 import { cleanup, isolateStateDir, makeTmpDir } from "./helpers.js";
@@ -124,7 +125,7 @@ afterEach(async () => {
 
 describe("Desktop MCP 与本地接口", () => {
   it("已绑定状态损坏时返回明确错误，不隐藏故障或重新初始化", async () => {
-    vi.spyOn(desktopIpc, "inspect").mockResolvedValue({ title: "测试 Desktop 会话" } as never);
+    vi.spyOn(desktopIpc, "inspect").mockResolvedValue({ title: "测试 Desktop 会话", runtimeStatus: "idle", requestsCount: 0 } as never);
     await bindDesktop(bridge.workspace, { threadId: THREAD_ID, hostId: "local", projectId: "project_test" });
     fs.writeFileSync(desktopFile(bridge.workspace.id), "broken state");
     const client = await clientFor([DESKTOP_READ_SCOPE]);
@@ -201,7 +202,7 @@ describe("Desktop MCP 与本地接口", () => {
     expect(prepare).not.toHaveBeenCalled();
     await control.close();
 
-    vi.spyOn(desktopIpc, "inspect").mockResolvedValue({ title: "测试 Desktop 会话" } as never);
+    vi.spyOn(desktopIpc, "inspect").mockResolvedValue({ title: "测试 Desktop 会话", runtimeStatus: "idle", requestsCount: 0 } as never);
     const binding = await bindDesktop(bridge.workspace, { threadId: THREAD_ID, hostId: "local", projectId: "project_test" });
     const client = await clientFor([DESKTOP_READ_SCOPE]);
     const tools = (await client.listTools()).tools;
@@ -229,7 +230,7 @@ describe("Desktop MCP 与本地接口", () => {
   });
 
   it.each(["development_plan", "revision"])("Bridge %s 保留完整中文正文，并只返回真实 accepted 回执", async intent => {
-    vi.spyOn(desktopIpc, "inspect").mockResolvedValue({ title: "测试 Desktop 会话" } as never);
+    vi.spyOn(desktopIpc, "inspect").mockResolvedValue({ title: "测试 Desktop 会话", runtimeStatus: "idle", requestsCount: 0 } as never);
     seedVerifiedPlannerRoute();
     registerRoute(bridge.workspace, {
       role: "planner",
@@ -253,10 +254,15 @@ describe("Desktop MCP 与本地接口", () => {
     const binding = await bindDesktop(bridge.workspace, { threadId: THREAD_ID, hostId: "local", projectId: "project_test" });
     enableDesktop(bridge.workspace, binding.bindingId);
     const client = await clientFor([DESKTOP_CONTROL_SCOPE]);
-    const result = jsonOf<{ deliveryStatus: string; threadId: string; turnId?: string }>(await client.callTool({
+    const args = { intent, userConfirmed: true, workspaceId: bridge.workspace.id, bindingId: binding.bindingId, commandId: "accepted_command", message };
+    const queued = jsonOf<{ deliveryStatus: string }>(await client.callTool({
       name: "codex_desktop_send",
-      arguments: { intent, userConfirmed: true, workspaceId: bridge.workspace.id, bindingId: binding.bindingId, commandId: "accepted_command", message },
+      arguments: args,
     }));
+    expect(queued.deliveryStatus).toBe("queued");
+    expect(send).not.toHaveBeenCalled();
+    await createCommandMailbox(bridge.workspace, bridge.authStore).tick();
+    const result = jsonOf(await client.callTool({ name: "codex_desktop_send", arguments: args }));
     expect(result).toMatchObject({ deliveryStatus: "accepted", threadId: THREAD_ID, turnId: "01a00000-0000-7000-8000-000000000002" });
     const command = listCommands(bridge.workspace)[0];
     const routes = listRoutes(bridge.workspace);
@@ -275,7 +281,7 @@ describe("Desktop MCP 与本地接口", () => {
   });
 
   it("新 command 的 stale bindingId 不会自动切换目标或进入 IPC", async () => {
-    vi.spyOn(desktopIpc, "inspect").mockResolvedValue({ title: "测试 Desktop 会话" } as never);
+    vi.spyOn(desktopIpc, "inspect").mockResolvedValue({ title: "测试 Desktop 会话", runtimeStatus: "idle", requestsCount: 0 } as never);
     seedVerifiedPlannerRoute();
     const binding = await bindDesktop(bridge.workspace, { threadId: THREAD_ID, hostId: "local", projectId: "project_test" });
     enableDesktop(bridge.workspace, binding.bindingId);
@@ -297,7 +303,7 @@ describe("Desktop MCP 与本地接口", () => {
   });
 
   it("pending 且无 Desktop durable record 时，bindingId 仍须匹配当前 target", async () => {
-    vi.spyOn(desktopIpc, "inspect").mockResolvedValue({ title: "测试 Desktop 会话" } as never);
+    vi.spyOn(desktopIpc, "inspect").mockResolvedValue({ title: "测试 Desktop 会话", runtimeStatus: "idle", requestsCount: 0 } as never);
     seedVerifiedPlannerRoute();
     const originalBinding = await bindDesktop(bridge.workspace, { threadId: THREAD_ID, hostId: "local", projectId: "project_test" });
     enableDesktop(bridge.workspace, originalBinding.bindingId);
@@ -325,14 +331,14 @@ describe("Desktop MCP 与本地接口", () => {
       name: "codex_desktop_send", arguments: { ...input, bindingId: currentBinding.bindingId },
     });
     expect(changedRoute.isError).toBe(true);
-    expect(jsonOf<{ error: string }>(changedRoute).error).toBe("ROUTE_AUTHORITY_CHANGED");
+    expect(jsonOf<{ error: string }>(changedRoute).error).toBe("ROUTING_MAILBOX_CONFLICT");
     expect(prepare).not.toHaveBeenCalled();
     expect(listCommands(bridge.workspace)).toMatchObject([{ commandId: "pending_binding_switch", deliveryStatus: "pending" }]);
     await client.close();
   });
 
   it("durable replay 返回原 delivery、保留原 bindingId，改 bindingId 冲突且不二次发送", async () => {
-    vi.spyOn(desktopIpc, "inspect").mockResolvedValue({ title: "测试 Desktop 会话" } as never);
+    vi.spyOn(desktopIpc, "inspect").mockResolvedValue({ title: "测试 Desktop 会话", runtimeStatus: "idle", requestsCount: 0 } as never);
     seedVerifiedPlannerRoute();
     const binding = await bindDesktop(bridge.workspace, { threadId: THREAD_ID, hostId: "local", projectId: "project_test" });
     enableDesktop(bridge.workspace, binding.bindingId);
@@ -343,6 +349,10 @@ describe("Desktop MCP 与本地接口", () => {
       intent: "revision", userConfirmed: true, workspaceId: bridge.workspace.id,
       bindingId: binding.bindingId, commandId: "durable_binding_replay", message: "完整修订",
     };
+    const queued = await client.callTool({ name: "codex_desktop_send", arguments: input });
+    expect(jsonOf<{ deliveryStatus: string }>(queued).deliveryStatus).toBe("queued");
+    expect(send).not.toHaveBeenCalled();
+    await createCommandMailbox(bridge.workspace, bridge.authStore).tick();
     const first = await client.callTool({ name: "codex_desktop_send", arguments: input });
     const sameBindingReplay = await client.callTool({ name: "codex_desktop_send", arguments: input });
 
@@ -371,7 +381,7 @@ describe("Desktop MCP 与本地接口", () => {
   });
 
   it("workspace mismatch 被拒绝；Browser feedback 不存在、损坏或未 VERIFIED 均不阻断投递", async () => {
-    vi.spyOn(desktopIpc, "inspect").mockResolvedValue({ title: "测试 Desktop 会话" } as never);
+    vi.spyOn(desktopIpc, "inspect").mockResolvedValue({ title: "测试 Desktop 会话", runtimeStatus: "idle", requestsCount: 0 } as never);
     const binding = await bindDesktop(bridge.workspace, { threadId: THREAD_ID, hostId: "local", projectId: "project_test" });
     enableDesktop(bridge.workspace, binding.bindingId);
     const prepare = vi.spyOn(desktopIpc, "prepare");
@@ -411,7 +421,10 @@ describe("Desktop MCP 与本地接口", () => {
         },
       });
       expect(delivered.isError).not.toBe(true);
-      expect(jsonOf<{ deliveryStatus: string }>(delivered).deliveryStatus).toBe("accepted");
+      expect(jsonOf<{ deliveryStatus: string }>(delivered).deliveryStatus).toBe("queued");
+      expect(send).not.toHaveBeenCalled();
+      await createCommandMailbox(bridge.workspace, bridge.authStore).tick();
+      expect(listCommands(bridge.workspace).find(item => item.commandId === `feedback-independent-${index}`)?.deliveryStatus).toBe("accepted");
       expect(send).toHaveBeenCalledOnce();
     }
     expect(prepare).toHaveBeenCalledTimes(3);
@@ -419,7 +432,7 @@ describe("Desktop MCP 与本地接口", () => {
   });
 
   it("缺少官方 openai/session 时不从参数或历史 planner route 回退，且不写 Command/发送", async () => {
-    vi.spyOn(desktopIpc, "inspect").mockResolvedValue({ title: "测试 Desktop 会话" } as never);
+    vi.spyOn(desktopIpc, "inspect").mockResolvedValue({ title: "测试 Desktop 会话", runtimeStatus: "idle", requestsCount: 0 } as never);
     seedVerifiedPlannerRoute();
     registerRoute(bridge.workspace, {
       role: "planner",
@@ -446,7 +459,7 @@ describe("Desktop MCP 与本地接口", () => {
   });
 
   it("同 OAuth client 不同 MCP conversation principal 使用不同 planner route", async () => {
-    vi.spyOn(desktopIpc, "inspect").mockResolvedValue({ title: "测试 Desktop 会话" } as never);
+    vi.spyOn(desktopIpc, "inspect").mockResolvedValue({ title: "测试 Desktop 会话", runtimeStatus: "idle", requestsCount: 0 } as never);
     const binding = await bindDesktop(bridge.workspace, { threadId: THREAD_ID, hostId: "local", projectId: "project_test" });
     enableDesktop(bridge.workspace, binding.bindingId);
     const send = vi.fn(async () => ({ threadId: THREAD_ID, turnId: randomUUID() }));
@@ -480,6 +493,9 @@ describe("Desktop MCP 与本地接口", () => {
     expect(new Set(plannerIds).size).toBe(2);
     expect(commands[0]?.plannerRouteId).toBe(commands[1]?.plannerRouteId);
     expect(JSON.stringify(routes)).not.toContain("session-A");
+    expect(send).not.toHaveBeenCalled();
+    const inbox = createCommandMailbox(bridge.workspace, bridge.authStore);
+    for (let index = 0; index < 3; index++) await inbox.tick();
     expect(send).toHaveBeenCalledTimes(3);
     await clientA.close();
     await clientB.close();
@@ -502,7 +518,7 @@ describe("Desktop MCP 与本地接口", () => {
   });
 
   it("提交点重新验证已撤销的 OAuth，撤销期间不发送且不写投递记录", async () => {
-    vi.spyOn(desktopIpc, "inspect").mockResolvedValue({ title: "测试 Desktop 会话" } as never);
+    vi.spyOn(desktopIpc, "inspect").mockResolvedValue({ title: "测试 Desktop 会话", runtimeStatus: "idle", requestsCount: 0 } as never);
     seedVerifiedPlannerRoute();
     const binding = await bindDesktop(bridge.workspace, { threadId: THREAD_ID, hostId: "local", projectId: "project_test" });
     enableDesktop(bridge.workspace, binding.bindingId);
@@ -516,14 +532,16 @@ describe("Desktop MCP 与本地接口", () => {
       name: "codex_desktop_send",
       arguments: { intent: "development_plan", userConfirmed: true, workspaceId: bridge.workspace.id, bindingId: binding.bindingId, commandId: "revoked_command", message: "完整计划" },
     });
-    expect(result.isError).toBe(true);
-    expect(jsonOf<{ error: string }>(result).error).toBe("UNAUTHORIZED");
+    expect(result.isError).not.toBe(true);
+    expect(jsonOf<{ deliveryStatus: string }>(result).deliveryStatus).toBe("queued");
+    await createCommandMailbox(bridge.workspace, bridge.authStore).tick();
+    expect(listCommands(bridge.workspace).find(item => item.commandId === "revoked_command")?.mailbox).toMatchObject({ state: "blocked", reason: "UNAUTHORIZED" });
     expect(send).not.toHaveBeenCalled();
     await tokenClient.close();
   });
 
   it("read scope 的状态请求拒绝错误 workspaceId", async () => {
-    vi.spyOn(desktopIpc, "inspect").mockResolvedValue({ title: "测试 Desktop 会话" } as never);
+    vi.spyOn(desktopIpc, "inspect").mockResolvedValue({ title: "测试 Desktop 会话", runtimeStatus: "idle", requestsCount: 0 } as never);
     await bindDesktop(bridge.workspace, { threadId: THREAD_ID, hostId: "local", projectId: "project_test" });
     const client = await clientFor([DESKTOP_READ_SCOPE]);
     const result = await client.callTool({ name: "codex_desktop_status", arguments: { workspaceId: "wrong_workspace" } });
@@ -533,7 +551,7 @@ describe("Desktop MCP 与本地接口", () => {
   });
 
   it("Desktop 工具分别校验 control/read scope 与 workspaceId", async () => {
-    vi.spyOn(desktopIpc, "inspect").mockResolvedValue({ title: "测试 Desktop 会话" } as never);
+    vi.spyOn(desktopIpc, "inspect").mockResolvedValue({ title: "测试 Desktop 会话", runtimeStatus: "idle", requestsCount: 0 } as never);
     const binding = await bindDesktop(bridge.workspace, { threadId: THREAD_ID, hostId: "local", projectId: "project_test" });
     const readClient = await clientFor([DESKTOP_READ_SCOPE], "read-client");
     const deniedSend = await readClient.callTool({

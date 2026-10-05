@@ -63,8 +63,12 @@ describe("R5e architecture fence", () => {
     const executorTools = read("src/mcp/executor-tools.ts");
     expect(executorTools).not.toMatch(/registerTool\(\s*"executor_bind"/);
     expect(executorTools).not.toMatch(/registerTool\(\s*"executor_switch"/);
-    expect(executorTools).toMatch(/beginExecutorDispatch/);
-    expect(executorTools).toMatch(/hashRequestAuthority/);
+    expect(executorTools).toMatch(/dispatchExecutorCommand/);
+    const executorSend = read("src/executor-control/send.ts");
+    expect(executorSend).toMatch(/beginExecutorDispatch/);
+    expect(executorSend).toMatch(/hashRequestAuthority\(plannerFingerprint\)/);
+    expect(executorSend).toMatch(/expectedDispatchGenerationId/);
+    expect(executorSend).toMatch(/finalizeExecutorDispatch/);
     const webSinkTools = read("src/mcp/web-sink-tools.ts");
     expect(webSinkTools).not.toMatch(/registerTool\(\s*"web_sink_switch"/);
   });

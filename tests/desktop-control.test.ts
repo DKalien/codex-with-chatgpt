@@ -83,11 +83,12 @@ describe("Desktop 持久化投递", () => {
     expect(readDesktop(workspace.id)?.deliveries.filter(item => item.commandId === "next_command")).toHaveLength(1);
   });
 
-  it("unresolved gate 把并发变更分类为 store busy 且不发送", async () => {
+  it("并发出现的独立 unknown 保留原证据，不阻断新 command", async () => {
     enableDesktop(workspace, bindingId);
     const file = desktopFile(workspace.id);
     const originalRead = fs.readFileSync.bind(fs) as (...args: any[]) => any;
     let changed = false;
+    let uncertainEvidence: string | undefined;
     vi.spyOn(fs, "readFileSync").mockImplementation(((filename: any, ...args: any[]) => {
       const contents = originalRead(filename, ...args);
       if (!changed && String(filename) === file) {
@@ -98,19 +99,21 @@ describe("Desktop 持久化投递", () => {
             intent: "development_plan", messageSha256: "a".repeat(64), messageBytes: 1,
             threadId: target.threadId, deliveryStatus: "outcome_unknown", createdAt: new Date().toISOString(),
             updatedAt: new Date().toISOString() });
+          uncertainEvidence = JSON.stringify(previous.deliveries.at(-1));
           return { state: previous, result: undefined };
         });
       }
       return contents;
     }) as typeof fs.readFileSync);
 
-    await expect(sendDesktop(workspace, input(), "client")).rejects.toMatchObject({ code: "DESKTOP_STORE_BUSY" });
+    expect((await sendDesktop(workspace, input(), "client")).deliveryStatus).toBe("accepted");
     expect(changed).toBe(true);
-    expect(desktopIpc.prepare).not.toHaveBeenCalled();
-    expect(send).not.toHaveBeenCalled();
+    expect(desktopIpc.prepare).toHaveBeenCalledTimes(1);
+    expect(send).toHaveBeenCalledTimes(1);
     expect(readDesktop(workspace.id)?.deliveries).toContainEqual(expect.objectContaining({
       commandId: "concurrent_unknown", deliveryStatus: "outcome_unknown",
     }));
+    expect(JSON.stringify(readDesktop(workspace.id)?.deliveries.find(item => item.commandId === "concurrent_unknown"))).toBe(uncertainEvidence);
   });
 
   it("已解决的 unknown 不阻断 receipt-backed busy-tail settle", async () => {
@@ -366,11 +369,31 @@ describe("Desktop 持久化投递", () => {
     expect((await desktopStatus(workspace, "command_1")).delivery).toMatchObject({ deliveryStatus, intent: undefined });
     await expect(sendDesktop(workspace, input(), "client")).rejects.toMatchObject({ code: "DESKTOP_COMMAND_CONFLICT" });
     expect(fs.readFileSync(file, "utf8")).toBe(original);
-    if (deliveryStatus === "outcome_unknown")
-      await expect(sendDesktop(workspace, input({ commandId: "new_command" }), "client")).rejects.toMatchObject({ code: "DESKTOP_OUTCOME_UNRESOLVED" });
+    const historicalRecord = { ...readDesktop(workspace.id)!.deliveries.find(item => item.commandId === "command_1")! };
+    if (deliveryStatus === "outcome_unknown") {
+      const independentTurnId = "01a00000-0000-7000-8000-000000000091";
+      send.mockResolvedValueOnce({ threadId: target.threadId, turnId: independentTurnId });
+      const independent = input({ commandId: "new_command", message: "独立任务" });
+      expect((await sendDesktop(workspace, independent, "client")).deliveryStatus).toBe("accepted");
+      expect(readDesktop(workspace.id)?.deliveries.find(item => item.commandId === "command_1")).toEqual(historicalRecord);
+      expect(readDesktop(workspace.id)?.deliveries.find(item => item.commandId === "new_command")).toMatchObject({
+        deliveryStatus: "accepted", turnId: independentTurnId,
+      });
+      await expect(sendDesktop(workspace, input(), "client")).rejects.toMatchObject({ code: "DESKTOP_COMMAND_CONFLICT" });
+    }
     disableDesktop(workspace);
-    expect(readDesktop(workspace.id)?.deliveries).toEqual(old.deliveries);
-    expect(send).toHaveBeenCalledTimes(1);
+    const finalDeliveries = readDesktop(workspace.id)?.deliveries ?? [];
+    expect(finalDeliveries.find(item => item.commandId === "command_1")).toEqual(historicalRecord);
+    if (deliveryStatus === "outcome_unknown") {
+      expect(finalDeliveries.find(item => item.commandId === "new_command")).toMatchObject({
+        deliveryStatus: "accepted", turnId: "01a00000-0000-7000-8000-000000000091",
+      });
+      expect(finalDeliveries).toHaveLength(old.deliveries.length + 1);
+      expect(send).toHaveBeenCalledTimes(2);
+    } else {
+      expect(finalDeliveries).toEqual(old.deliveries);
+      expect(send).toHaveBeenCalledTimes(1);
+    }
   });
   it("新workspace状态查询不创建状态、不连接Desktop", async () => {
     const other = { ...workspace, id: "unbound_test" };
@@ -479,7 +502,7 @@ describe("Desktop 持久化投递", () => {
     expect(readDesktop(workspace.id)?.deliveries).toHaveLength(0);
   });
 
-  it("先持久化可能已发送；回执丢失不重发也不能更换commandId或绑定绕过", async () => {
+  it("回执丢失保留原 unknown 且不重发；独立新消息可发送，换绑定不能重用原 ID", async () => {
     enableDesktop(workspace, bindingId);
     send.mockImplementation(async () => {
       expect(readDesktop(workspace.id)?.deliveries[0].deliveryStatus).toBe("outcome_unknown");
@@ -488,12 +511,16 @@ describe("Desktop 持久化投递", () => {
     const result = await sendDesktop(workspace, input(), "client");
     expect(result.deliveryStatus).toBe("outcome_unknown");
     expect(JSON.stringify(result)).not.toContain("机密正文");
+    const uncertainEvidence = JSON.stringify(readDesktop(workspace.id)?.deliveries[0]);
     expect(await sendDesktop(workspace, input(), "client")).toEqual(result);
-    await expect(sendDesktop(workspace, input({ commandId: "command_2" }), "client")).rejects.toMatchObject({ code: "DESKTOP_OUTCOME_UNRESOLVED" });
+    send.mockImplementation(async () => ({ threadId: target.threadId, turnId: randomUUID() }));
+    expect((await sendDesktop(workspace, input({ commandId: "command_2", message: "独立的新请求" }), "client")).deliveryStatus).toBe("accepted");
+    expect(JSON.stringify(readDesktop(workspace.id)?.deliveries[0])).toBe(uncertainEvidence);
     const next = await bindDesktop(workspace, target);
     enableDesktop(workspace, next.bindingId);
-    await expect(sendDesktop(workspace, input({ bindingId: next.bindingId, commandId: "command_2" }), "client")).rejects.toMatchObject({ code: "DESKTOP_OUTCOME_UNRESOLVED" });
-    expect(send).toHaveBeenCalledTimes(1);
+    await expect(sendDesktop(workspace, input({ bindingId: next.bindingId }), "client")).rejects.toMatchObject({ code: "DESKTOP_COMMAND_CONFLICT" });
+    expect(JSON.stringify(readDesktop(workspace.id)?.deliveries[0])).toBe(uncertainEvidence);
+    expect(send).toHaveBeenCalledTimes(2);
   });
 
   it("已越过提交点后撤权不会伪称撤回消息", async () => {

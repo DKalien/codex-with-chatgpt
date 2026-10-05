@@ -24,6 +24,7 @@ import { enableReceiver } from "../src/feedback/receiver.js";
 import { ensureFeedbackState, feedbackStateFile } from "../src/feedback/state-store.js";
 import { confirmRouteAttestation, createPairingIntent, exchangePairingIntent, revokeCompanion } from "../src/feedback/companion.js";
 import { appendResult, createCommand, registerRoute, transitionCommandDelivery, routingFile } from "../src/routing/store.js";
+import type { CommandMailbox } from "../src/routing/schema.js";
 import { enqueueResultBusEntry } from "../src/result-bus/store.js";
 import { cleanupJournalFile, withCommandOperation } from "../src/command-cleanup/fence.js";
 import { CodexDesktopExecutorPlugin, type ExecutorAdapter } from "../src/executor/index.js";
@@ -99,7 +100,58 @@ describe("B2 read-only status boundary", () => {
     expect(result.commands.find(command => command.commandId === "foreign")).toMatchObject({ scope: "historical" });
     expect(result.commands.find(command => command.commandId === "accepted-only")).toMatchObject({ delivery: { status: "accepted" }, executions: [], feedback: [] });
     expect(result.commands.find(command => command.commandId === "record-ready")).toMatchObject({ executions: [{ status: "ok", outputId: 42 }], feedback: [{ source: "result_bus", status: "queued", iteration: 1 }] });
+    expect(result.commands.find(command => command.commandId === "accepted-only")?.delivery).toMatchObject({ cancelable: false, cancelReason: "PANEL_CANCEL_UNSAFE" });
+    expect(result.commands.find(command => command.commandId === "record-ready")?.delivery).toMatchObject({ cancelable: false, cancelReason: "PANEL_CANCEL_UNSAFE" });
     for (const secret of [input.credential, principal().fingerprint, "private output text", "other-principal", root]) expect(JSON.stringify(result)).not.toContain(secret);
+    expect(snapshot(stateDir)).toEqual(before);
+  });
+  it("queued command mailbox exposes bounded scheduling metadata without payload or grant secrets", async () => {
+    const input = pair(), message = "private queued task payload";
+    const planner = registerRoute(workspace, { platform: "chatgpt_web", role: "planner",
+      conversationId: principal().fingerprint, locator: {} }, stateDir);
+    for (const state of ["queued", "dispatching", "blocked"] as const) {
+      const executor = registerRoute(workspace, { platform: "codex_desktop", role: "executor",
+        conversationId: randomUUID(), locator: { hostId: "local", executorProjectId: "test" } }, stateDir);
+      createCommand(workspace, { commandId: `mailbox-${state}`, plannerRouteId: planner.routeId,
+        executorRouteId: executor.routeId, intent: "revision", payloadBytes: Buffer.byteLength(message),
+        payloadSha256: createHash("sha256").update(message).digest("hex") }, stateDir, {
+        kind: "executor", state, message, clientId: "private-client", tokenHash: "f".repeat(64),
+        bindingId: randomUUID(), desktopBindingId: randomUUID(), plannerFingerprint: principal().fingerprint,
+        ...(state === "blocked" ? { reason: "DESKTOP_BUSY" } : {}),
+      });
+    }
+    const before = snapshot(stateDir), result = await readCompanionOperations(input, inspect);
+    for (const state of ["queued", "dispatching", "blocked"] as const) {
+      const row = result.commands.find(command => command.commandId === `mailbox-${state}`)!;
+      expect(row.delivery.status).toBe("pending");
+      expect(row.delivery.queueStatus).toBe(state);
+      expect(row.delivery.cancelable).toBe(state === "queued");
+      if (state !== "queued") expect(row.delivery.cancelReason).toBe("PANEL_CANCEL_UNSAFE");
+      expect(row.delivery.queueReason).toBe(state === "blocked" ? "DESKTOP_BUSY" : undefined);
+      expect(row.delivery.reason).toBeNull();
+    }
+    for (const secret of [message, "private-client", "f".repeat(64), principal().fingerprint])
+      expect(JSON.stringify(result)).not.toContain(secret);
+    expect(snapshot(stateDir)).toEqual(before);
+  });
+  it("whitelisted blocked mailbox is eligible for cancel without exposing mailbox identity", async () => {
+    const input = pair();
+    const planner = registerRoute(workspace, { platform: "chatgpt_web", role: "planner",
+      conversationId: principal().fingerprint, locator: {} }, stateDir);
+    const executor = registerRoute(workspace, { platform: "codex_desktop", role: "executor",
+      conversationId: randomUUID(), locator: { hostId: "local", executorProjectId: "test" } }, stateDir);
+    const mailbox = { kind: "executor" as const, state: "blocked" as const, reason: "UNAUTHORIZED",
+      message: "private payload", clientId: "private-client", tokenHash: "f".repeat(64), bindingId: randomUUID(),
+      desktopBindingId: randomUUID(), plannerFingerprint: principal().fingerprint };
+    createCommand(workspace, { commandId: "mailbox-blocked-safe", plannerRouteId: planner.routeId,
+      executorRouteId: executor.routeId, intent: "revision", payloadBytes: 15,
+      payloadSha256: createHash("sha256").update(mailbox.message).digest("hex") }, stateDir, mailbox);
+    const before = snapshot(stateDir), result = await readCompanionOperations(input, inspect);
+    const delivery = result.commands.find(command => command.commandId === "mailbox-blocked-safe")!.delivery;
+    expect(delivery).toMatchObject({ status: "pending", queueStatus: "blocked", queueReason: "UNAUTHORIZED", cancelable: true });
+    expect(delivery).not.toHaveProperty("cancelReason");
+    for (const secret of [mailbox.message, mailbox.clientId, mailbox.tokenHash, mailbox.plannerFingerprint])
+      expect(JSON.stringify(result)).not.toContain(secret);
     expect(snapshot(stateDir)).toEqual(before);
   });
   it("old unrouted Desktop accepted and unknown deliveries plus orphan zero-byte lock stay visible", async () => {
@@ -169,7 +221,7 @@ describe("Companion read-only presentation", () => {
   function response(overrides = {}) { return { ok: true, autonomy: "off", snapshot: { observedAt: new Date(now).toISOString(), executor: { state: "busy", observedAt: new Date(now).toISOString() }, commands: [] },
     web: { observedAt: now, ownerAvailable: true, routeMatches: true, verified: true, composer: "empty", generation: "idle", safe: true }, ...overrides }; }
   it("Codex busy and webpage available are independent; pause is not offline", () => {
-    expect(model().derive(response(), now)).toMatchObject({ codex: "忙碌", web: "可接收结果", autonomy: "已暂停" });
+    expect(model().derive(response(), now)).toMatchObject({ codex: "忙碌 · 可排队", web: "可接收结果", autonomy: "已暂停" });
   });
   it.each(["generating", "nonempty", "mismatch"])("web %s cannot appear ready", condition => {
     const data = response();
@@ -199,7 +251,10 @@ describe("Companion read-only presentation", () => {
       expect(source).not.toMatch(/innerHTML|chrome\.storage|localStorage|\.click\(/);
     }
     const source = fs.readFileSync("browser-companion/operations/operations.js", "utf8");
-    expect([...source.matchAll(/type: "([^"]+)"/g)].map(match => match[1])).toEqual(["c2c.operations.action", "c2c.operations.action", "c2c.operations.action", "c2c.operations.action", "c2c.operations.read"]);
+    expect([...source.matchAll(/type: "([^"]+)"/g)].map(match => match[1])).toEqual([
+      "c2c.operations.action", "c2c.operations.result.read", "c2c.operations.action",
+      "c2c.operations.action", "c2c.operations.action", "c2c.operations.read",
+    ]);
   });
   it("historical accepted without a record is debt; administrative closure never displays success", () => {
     const data = response() as any;
@@ -220,10 +275,12 @@ describe("B2 connection/maintenance and B5 manual panel actions", () => {
   }
   const request = (commandId: string, action: "cancel_command" | "cancel_return" | "cleanup" | "requeue_return" = "cleanup", eventId?: string) =>
     ({ requestId: randomUUID(), commandId, action, ...(eventId ? { eventId } : {}) });
-  function pendingCommand(commandId: string) {
+  function pendingCommand(commandId: string, mailbox?: CommandMailbox) {
     const planner = registerRoute(workspace, { platform: "chatgpt_web", role: "planner", conversationId: principal().fingerprint, locator: {} }, stateDir);
     const executor = registerRoute(workspace, { platform: "codex_desktop", role: "executor", conversationId: randomUUID(), locator: { hostId: "local", executorProjectId: "test" } }, stateDir);
-    createCommand(workspace, { commandId, plannerRouteId: planner.routeId, executorRouteId: executor.routeId, intent: "revision", payloadBytes: 1, payloadSha256: "a".repeat(64) }, stateDir);
+    const message = mailbox?.message ?? "x";
+    createCommand(workspace, { commandId, plannerRouteId: planner.routeId, executorRouteId: executor.routeId, intent: "revision",
+      payloadBytes: Buffer.byteLength(message), payloadSha256: createHash("sha256").update(message).digest("hex") }, stateDir, mailbox);
   }
   it("connection ignores unrelated historical corrupt locks and performs no cleanup", async () => {
     pair(); seed("old");
@@ -321,6 +378,25 @@ describe("B2 connection/maintenance and B5 manual panel actions", () => {
     expect(confirmPanelAction(input, raw, preview.confirmationSha256)).toMatchObject({ status: "completed", replayed: true });
     // The arbiter/command directory already exists; exact replay is no-write.
     expect(snapshot(stateDir)).toEqual(before);
+  });
+  it("cancel preview rejects dispatching and non-whitelisted blocked inboxes before writing a marker", () => {
+    const input = authorized();
+    const inbox = (state: CommandMailbox["state"], reason?: string): CommandMailbox => ({
+      kind: "executor", state, message: "private payload", clientId: "private-client", tokenHash: "f".repeat(64),
+      bindingId: randomUUID(), desktopBindingId: randomUUID(), plannerFingerprint: principal().fingerprint,
+      ...(reason ? { reason } : {}),
+    });
+    for (const [commandId, mailbox] of [
+      ["dispatching", inbox("dispatching")], ["unsafe-blocked", inbox("blocked", "DESKTOP_BUSY")],
+    ] as const) {
+      pendingCommand(commandId, mailbox);
+      const before = snapshot(stateDir);
+      expect(() => previewPanelAction(input, request(commandId, "cancel_command"))).toThrow("尚未进入外部投递边界");
+      expect(readFeedbackState(workspace.id, stateDir).panelOperations).toBeUndefined();
+      expect(snapshot(stateDir)).toEqual(before);
+    }
+    pendingCommand("safe-blocked", inbox("blocked", "UNAUTHORIZED"));
+    expect(previewPanelAction(input, request("safe-blocked", "cancel_command")).confirmationSha256).toMatch(/^[a-f0-9]{64}$/);
   });
   it("accepted task cannot be cancelled or cleaned as if unsent", () => {
     const input = authorized(); seed("accepted");

@@ -7,21 +7,23 @@
   };
   const deliveryLabels = { cancelled: "下发已取消", pending: "等待送达", accepted: "Codex 已接受", rejected: "明确未送出", outcome_unknown: "送达待核实" };
   const resultLabels = { ok: "已完成", failed: "执行失败", blocked: "执行受阻" };
-  const feedbackLabels = { cancelled: "回流已取消", queued: "等待回流", ready: "等待回流", reserved: "已预约回流", claimed: "发送中 · 待确认",
+  const feedbackLabels = { cancelled: "网页回流已取消", queued: "已排队 · 等待网页可接收", ready: "已准备 · 等待网页接收", reserved: "已预约网页回流", claimed: "网页发送中 · 待确认",
     observed: "回流已确认", outcome_unknown: "发送结果待核实", retired_unknown: "已行政结束等待" };
-  const activityLabels = { idle: "空闲", busy: "忙碌", approval_required: "等待本机处理", unknown: "无法确认" };
+  const activityLabels = { idle: "空闲", busy: "忙碌 · 可排队", approval_required: "等待本机处理", unknown: "无法确认" };
   const issueLabels = { cleanup_pending: "清理事务待收敛", empty_lifecycle_lock: "空生命周期锁，需人工核验", lifecycle_lock_present: "存在生命周期锁，所有者待核验",
     repair_fence_present: "存在修复隔离标记", lifecycle_state_unreadable: "生命周期证据不可读", delivery_identity_conflict: "投递身份冲突" };
   const administrativeLabels = { abandoned: "已行政结束等待", retired: "已行政退役", resolved_unknown: "已接受结果不明并结束等待" };
   function row(command, journal) {
     const feedback = (command.feedback ?? []).map(event => ({ ...event,
-      label: event.status !== "observed" && journal?.state === "OBSERVED_PENDING_ACK"
-        && journal.eventId === event.eventId && journal.attemptId && journal.attemptId === event.attemptId
-        ? "网页已观察 · 待确认" : feedbackLabels[event.status] ?? "回流状态未知" }));
+      label: event.isolated === true ? "本条已隔离 · 未确认送达 · 后续继续"
+        : event.status !== "observed" && journal?.state === "OBSERVED_PENDING_ACK"
+          && journal.eventId === event.eventId && journal.attemptId && journal.attemptId === event.attemptId
+          ? "网页已观察 · 待确认" : feedbackLabels[event.status] ?? "回流状态未知" }));
     const executions = command.executions ?? [];
     const needsAttention = ["rejected", "outcome_unknown"].includes(command.delivery?.status)
       || executions.some(result => result.status !== "ok")
-      || feedback.some(event => ["outcome_unknown", "retired_unknown"].includes(event.status))
+      || feedback.some(event => event.isolated === true || ["outcome_unknown", "retired_unknown"].includes(event.status))
+      || command.delivery?.queueStatus === "blocked"
       || (command.issues ?? []).length > 0
       || command.scope === "historical" && command.delivery?.status === "accepted" && !executions.length && !command.administrative;
     return { ...command, feedback, executions, needsAttention,
@@ -29,7 +31,10 @@
       scopeLabel: command.scope === "current" ? "当前对话" : command.scope === "current_target" ? "当前 Codex 目标" : "历史遗留",
       issueLabels: (command.issues ?? []).map(issue => issueLabels[issue] ?? issue),
       administrativeLabel: administrativeLabels[command.administrative] ?? null,
-      deliveryLabel: deliveryLabels[command.delivery?.status] ?? "送达未确认",
+      deliveryLabel: command.delivery?.queueStatus === "queued" ? "已排队 · 等待 Codex 处理"
+        : command.delivery?.queueStatus === "dispatching" ? "正在派发"
+          : command.delivery?.queueStatus === "blocked" ? `派发受阻 · ${command.delivery.queueReason ?? "需核验"}`
+            : deliveryLabels[command.delivery?.status] ?? "送达未确认",
       executionLabel: executions.length ? executions.map(result => `第 ${result.iteration} 次 · ${resultLabels[result.status] ?? "未知"}`).join("；") : "执行未确认",
       feedbackLabel: feedback.length ? [...new Set(feedback.map(event => event.label))].join("；") : "尚无回流证据" };
   }
