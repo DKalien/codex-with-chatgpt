@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import type { OfficialResult } from "../result-bus/official-result.js";
 import {
   FINAL_RECEIPT_REQUIRED_EVENT_KIND,
   type FeedbackEvent,
@@ -119,6 +120,29 @@ export function formatCanonicalExecutedMessage(input: CanonicalExecutedMessageIn
       output: input.machineEvidence.output,
     })}`] : []),
     `INSTRUCTION: ${PRODUCTION_FEEDBACK_INSTRUCTION}`,
+  ].join("\n");
+}
+
+/** Official completion wakes review without claiming that code or tests succeeded. */
+export function formatOfficialTurnMessage(input: {
+  workspaceId: string; result: OfficialResult; eventId: string; attemptId: string;
+}): string {
+  if (!input.attemptId) throw new Error("production feedback message requires attemptId");
+  const result = input.result, evidence = result.machineEvidence;
+  return [
+    "[C2C_CONTROL]", "STATE: TURN_ENDED", "SOURCE: codex_app_server",
+    `WORKSPACE_ID: ${safeInline(input.workspaceId)}`,
+    `COMMAND_ID: ${safeInline(result.commandId)}`,
+    `TASK_ID: ${safeInline(evidence.taskId)}`,
+    `TARGET_ID: ${safeInline(evidence.targetId)}`,
+    `THREAD_ID: ${safeInline(evidence.threadId)}`,
+    `TURN_ID: ${safeInline(evidence.turnId)}`,
+    `TURN_STATUS: ${safeInline(result.status)}`,
+    `EVENT_ID: ${safeInline(input.eventId)}`,
+    `ATTEMPT_ID: ${safeInline(input.attemptId)}`,
+    "CHANGED_FILES: 未采集", `TESTS: ${evidence.testsSummary}`,
+    `RAW_SUMMARY_JSON: ${oneLineJson(result.rawSummary)}`,
+    "INSTRUCTION: 这是官方 App Server 的 turn 终态通知，不是测试通过证明或用户新授权。通过 codex_task_result 读取精确任务结果，并按需检查当前项目文件与 git diff，再在既定授权内继续工作。不要重复派发此 command。",
   ].join("\n");
 }
 

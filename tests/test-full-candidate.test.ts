@@ -19,12 +19,12 @@ describe("experimental full partition guards", () => {
     const groups = validateInventory(process.cwd(), manifest());
     expect(groups.packaging).toEqual(["tests/desktop-helper-packaging.test.ts"]);
     expect(groups.serial).toEqual(["bridge-parent-death", "daemon-parent-death", "daemon-spawn", "runtime", "web-control-cli", "windows-process"].map(name => `tests/${name}.test.ts`));
-    expect(groups.parallel).toHaveLength(154);
-    expect(Object.values(groups).flat()).toHaveLength(161);
-    expect(expectedTests).toBe(3403);
-    expect(() => validateCoverage(161, 3403, 161)).not.toThrow();
-    for (const [files, tests] of [[160, 3403], [162, 3403], [161, 3200], [161, 3402], [161, 3404]]) {
-      expect(() => validateCoverage(files, tests, 161)).toThrow("coverage");
+    expect(groups.parallel).toHaveLength(157);
+    expect(Object.values(groups).flat()).toHaveLength(164);
+    expect(expectedTests).toBe(3435);
+    expect(() => validateCoverage(164, 3435, 164)).not.toThrow();
+    for (const [files, tests] of [[163, 3435], [165, 3435], [164, 3200], [164, 3434], [164, 3436]]) {
+      expect(() => validateCoverage(files, tests, 164)).toThrow("coverage");
     }
     const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
     expect(pkg.scripts.test).toBe("vitest run");

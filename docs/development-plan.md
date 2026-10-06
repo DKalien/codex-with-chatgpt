@@ -1,8 +1,80 @@
 # 长期开发计划
 
+当前单机多 workspace Gateway、单插件整合的唯一现役路线见[统一 Gateway 计划](unified-gateway-plan.md)。本文其余部分保留各阶段历史记录；旧条目的“当前/NEXT”不覆盖该计划与其新鲜运行状态。
+
 <a id="当前事实与开发阶段2026-10-04-2144asiashanghai"></a>
 
 ## 当前事实与开发阶段
+
+### 2026-10-05 官方路线全面源码改造
+
+用户已授权在 `codex/official-mcp-events` 开始改造。实现范围见[官方路线合同](official-route.md)：显式 workspace/target/thread；复用官方 App Server 客户端与持久队列；独立 MCP 入口；Bridge official 模式停用旧任务下发；官方终态进入现有 Result Bus 和 Companion 面板。本段记录源码阶段：保留原有 dirty 工作，截至源码验收未 commit/push 或部署；后续显式部署见下。
+
+此前持久会话验证已经完成：官方创建的持久 thread 能在 Desktop 可见，用户接管后复述随机码及 active turn 插话均成功。但独立 App Server 对 Desktop 持有的 writer 再次 resume 被明确拒绝；新源码必须展示这个限制，不能把 idle 当作释放 writer。此前“尚未开始持久会话实验”是当轮历史，详细证据以[最新实验记录](../experiments/official-dispatch/README.md)为准。
+
+**源码验收完成（2026-10-05 21:10，Asia/Shanghai）**：typecheck、定向回归、正式串行全量 **164 files /3435 tests PASS、exit0、unhandled0、skip/pending/todo0**；wall **1604.82s**、runner **1600.50s**。471 项冻结 source/test/support 哈希稳定，最终运行新增进程/监听/temp 均0。全量通过后执行一次 canonical build，stored==computeBuildId==core-release==**`c4b4c18d050137aaae1130b99257e3e13ded21eefbdf6359db2ee22798e28d97`**；官方 gateway/controller/results、Result Bus 新来源与 Companion 面板资产均已打包。证据位于 ignored `.tooling/official-route-20261005-verified/`。测试清单为 packaging1/serial6/parallel157，仅更新清单，不代表运行或验收 R5j candidate/parallel。
+
+首个完整全量为 **163 files /3434 tests PASS，1 file /1 assertion FAIL**：旧结构测试按全文首次出现位置判断工具注册顺序，不能区分新增 official/feedback 分支。只修正该测试与清单哈希，明确验证三种 profile 各自的注册集合和顺序，保留其余边界断言；469 项其他冻结文件（包含全部生产源码）未变，再冻结执行上述正式全量。失败证据在 `.tooling/official-route-20261005-final/`，修订对比在 `revision-proof.json`，没有以 unchanged retry 掩盖失败。
+
+更早的启动轮在发现独立 gateway 与 Bridge 共用缓存式 AuthStore 后主动中止；修复为独立 OAuth 凭据文件并补回归后才进入上述完整门禁。该中止轮的三个隔离测试目录保留作证据，删除被自动审批以 `blocked by policy` 拒绝，未绕过；最终“新增残留0”以保留它们后的基线计算。日志仍包含既有 `route-esm.js` 缺少 `route.js.map` 的调试映射诊断，未扩展修改打包机制。
+
+源码验收时（2026-10-05 21:10，Asia/Shanghai）的下一阶段计划为经部署授权切换独立入口。本段未 install/rollout、启用 official 模式、启动真实 App Server/Tunnel、切换绑定、注册 Scheduled Task 或 commit/push；随后实际部署状态如下。普通 Chat 原生 Events、跨进程 writer 无缝移交和 machine supervisor live acceptance 仍未完成。
+
+### 2026-10-05 官方路线部署与 OAuth 待验收
+
+截至 21:52（Asia/Shanghai），当前 branch/HEAD 未变（`codex/official-mcp-events` / `1379fd61a5dbd3220311032682b490b2431a586d`）。471 项冻结文件保持稳定；此前正式串行全量 **164 files /3435 tests** 沿用，本次未重跑。build、installed、running ID 相同：`c4b4c18d050137aaae1130b99257e3e13ded21eefbdf6359db2ee22798e28d97`。Bridge PID `19516` 的 `startedAt=2026-10-05T13:41:24.570Z`；workspace `2582910bf0d2` local/admin/named health 全部 PASS，scoped rollout upgraded 1、pending 0、error 0。
+
+通过稳定 launcher 启用 `deliveryMode=official` 后，controller PID `24508`、App Server PID `20172` 及 Codex `0.160.0` 运行。原 bindings、其他 workspace runtimes 和历史 tasks/threads/audit 均未改变；supervisor registration absent，config/runtime 均为 null。Bridge 原反馈 URL `https://c2c-codex-with-chatgpt.devworklink.com` 保留。
+
+**历史快照（2026-10-05 22:27）**：新 OAuth origin `https://c2c-official-2582910bf0d2.devworklink.com` 与 Cloudflare tunnel `2186ac70-4742-42a4-90d0-745cc7568402` 已创建；22:27 gateway 已在本地端口 `48766` 运行（PID `19912`），Cloudflare PID `20304`、官方 Tunnel 客户端 PID `24788`。本机/公网 OAuth metadata 200、issuer 精确、匿名 MCP 401；官方 Tunnel readyz 200（initialize requires auth），网页 OAuth 和真实任务仍未验收。首轮部署脚本先启动 Tunnel 导致 OAuth discovery connection refused，用户 Ctrl+C 后已证明两个自有隧道退出、端口无监听；只修 ignored 启动脚本为 gateway 与公网 OAuth 就绪后再启动官方客户端，加入精确 trusted origin 与原生 startup wait，第二轮就绪。此修正没有改动被冻结的业务源码，也没有重启 Bridge/Controller。Secure MCP Tunnel 可承载 OAuth discovery，但不会自动 tunnel authorization server；因此新 origin 使用独立 OAuth store，不能套用 Bridge origin 的共享 store。[OpenAI Secure MCP Tunnel 文档](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)说明了此边界。
+
+安装器 best-effort GC 已删除 `d0b085bb1b6445da312068e6014b0f026fc345fde2ae702af8675268062875d5`（72,533,432 bytes）。最终只读 GC plan 将旧 release `1326542c3601b2919b1872c1d80ac22aab258b05774c5ce438513b0c5aeba3a8` 列为候选，未删除；dangling runtime `d94af68105aa` 局部保留，引用的 build `9c33929c545edbe2242770baede0cef9f1f189712d9ce0060f307bc88ce0732a` 不存在。
+
+后续待验收：输入 Key 后启动 OAuth gateway 与独立 Tunnel，验证真实网页工具刷新/OAuth、target 创建/选择、连续投递、结果读取及 Companion 回流。本次没有 commit/push、注册 supervisor 或 reload 浏览器扩展。
+
+### 2026-10-06 00:58—01:45 部署与 OAuth 历史阻断快照
+
+截至 00:58:32（Asia/Shanghai），最新实际 run `.tooling/official-route-deploy-20261005/run-20261005T162626765Z-d6f6ba64590d4a3d85a02743e81c693e/gateway-live.json` 显示独立 gateway 于 00:31:49 因用户 Ctrl+C 停止；gateway PID `12196`、Cloudflare PID `15448`、官方 Tunnel PID `9368` 均已 missing，端口 `48766` 已关闭。测试入口已停止不表示生产 Bridge 关闭：Bridge PID `19516` 仍 healthy，installed/running build 为 `c4b4c18d050137aaae1130b99257e3e13ded21eefbdf6359db2ee22798e28d97`，`runtimeUpgrade.state=current`、`upgradePending=false`；Controller PID `24508` 和 App Server PID `20172` 保持原 identity，`deliveryMode=official`，feedback/result-bus inflight 均为 0。bindings、history、其他 workspace runtimes 均 unchanged，supervisor config/runtime 为 null。471 项冻结哈希全部匹配。
+
+**00:58 历史阻断状态**：最初 trusted-origin 不足，Harpoon target=0 并报 unsupported channel；regex 修正受 `private-host-registration-disabled` 限制。之后显式登记的 5 个精确 HTTPS 授权地址已加载（target 登记成功，另有两个 OAuth metadata endpoint 返回 200；未实际 POST 验证 register/token/revoke；`enabled=true`、`count=5`、`discovery_complete=true`），但网页仍显示“无法发现 OAuth 设置”。8 次 Harpoon 工具调用的 transport 200 只证明 HTTP transport，不证明 RPC/授权成功；AuthStore 未创建，因此 OAuth 修复与真实下发均未通过。
+
+截至 2026-10-06 01:45:17（Asia/Shanghai），只读范围复核见 `.tooling/official-route-deploy-20261005/overnight-final-scope-20261006.json`：Bridge PID `19516`、Controller PID `24508`、App Server PID `20172` identity 保持，runtime build 仍为 `c4b4c18d050137aaae1130b99257e3e13ded21eefbdf6359db2ee22798e28d97`；bindings、history、其他 workspace runtimes 未变，feedback/Result Bus inflight 为 0，maintenance/rollout/start 无锁，official AuthStore 不存在。471 项 frozen hash 零漂移。本轮无业务源码改动或正式 full/build 重跑，未 install/restart/启动 gateway，未使用 Key。
+
+**本机 fake control plane A/B 通过**：`.tooling/official-route-deploy-20261005/offline-oauth-harpoon-acceptance-20261006.json` 记录 cross-origin 显式配置 5 targets / OAuth auto 0，same-origin auto 8 个 OAuth targets，覆盖 PRMD、auth server、issuer、token、registration、revocation 等角色；metadata 重写符合预期，匿名及无效 bearer GET/POST 为 401，有效 bearer POST 为 200 且 Authorization 按正常机制透传，未知 label 返回工具错误且不发起 HTTP 请求，register GET 为 405（没有 DCR POST）。两组进程、监听端口和临时文件清理均通过。该 fixture 仅用 loopback HTTP、fake control plane 和 dummy credentials，不证明公网 TLS、网页 OAuth、真实授权交换，也不证明 hosted 根因已修。
+
+**same-origin-auto 候选配置已准备，尚未启动**：`run-official-gateway.ps1` SHA-256 为 `2BA62A7AAA5BC6411070A4919BC6BA95E9C25483541C0B27D8477E97A8B34606`；`.tooling/official-route-deploy-20261005/harpoon-target-validation-20261006-same-origin-auto.json` 记录 PowerShell AST、精确 hostname regex 与 5 个拒绝反例、native client help/profile 隔离校验通过；`check-gateway.mjs --self-test` 通过 8 个 OAuth URL/角色精确检查及 6 个拒绝反例。候选将 MCP upstream 指向同一 public HTTPS origin 的 `/mcp`，使用精确 host regex，移除五个手工 target，保留 trustedOrigin、TLS 与 loopback 防护，private include、plaintext HTTP 和 request capture 均关闭。候选尚未用于真实 Tunnel/gateway 启动，没有请求真实 control plane，也未读取生产凭据。
+
+**01:45 历史状态**：候选配置尚未实际启动，hosted 根因也未确认已修。
+
+**01:45 历史计划（08:15 OAuth 后续已推进）**：明天用户回来后，先打开新的 App OAuth 表单并隐藏输入原 Key；主代理先检查 same-origin auto 8 个角色、公网 metadata、匿名 MCP 401 与 Tunnel readyz，再用新的 5 分钟本机码完成 OAuth，然后验收 target/tasks/result/feedback。
+
+本轮仅修改 ignored 部署脚本并运行离线验证；没有业务源码改动、正式 full/build 重跑、install、restart 或 supervisor 变更。Bridge 原反馈绑定保持不变。
+
+### 2026-10-06 08:15 起 OAuth、target 与官方 turn 验收
+
+用户在新 App OAuth 页面确认“已连接并显示工具”。run `20261006T001123769Z-912dc4e0dd044f1e80b52e9b176796c3` 的 `gateway-oauth-confirmed-<run>.json`（08:15:28）记录 clientCount=1、active access/refresh 各 1、workspaceExact=true，scope 含 workspace.read、codex.read、codex.control 等；`gateway-check-<run>.json` 对 8 个 native source=oauth 角色、精确 URL 与 group 检查 PASS，TLS 与 plaintext/capture 约束检查正确。
+
+边界仍需如实保留：Tunnel readyz 返回 HTTP 200，但正文报告 startup probe 2s timeout；随后 fresh 未授权 initialize 本机 401/40ms、公网 401/1255ms，符合未授权拒绝。截至 08:15 首次 OAuth 检查时，用户页面显示工具可见确认连接，但尚无独立证据证明网页授权业务 RPC 已执行；后续两个 turn 与网页按需读取见下文。
+
+08:16:57 的 `gateway-oauth-scope-<run>.json` 确认 Bridge PID `19516` 仍 healthy、build `c4b4c18d050137aaae1130b99257e3e13ded21eefbdf6359db2ee22798e28d97`，bindings/history/其他 workspace 未变，feedback 与 Result Bus inflight 均为 0，deliveryMode 仍为 official。普通 Chat 的用户提供只读结果为 workspace_info 对应 `codex-with-chatgpt / 2582910bf0d2 / D:\python\codex-with-chatgpt`；`codex_list_targets` 显示 controller=running、targets=[]。该只读 smoke 通过；用户确认没有创建 target、投递任务或改文件。
+
+08:19:12.630，requestId `official-gateway-live-20261006-01` 创建成功：targetId `b90a0577-2174-409f-8228-13fe8722ddef`、threadId `01a10e94-2366-7dc0-ae7b-0f948f24bef3`，本机 state 仅有该对象且 tasksForThread=0。task01（taskId `927502f2-3fb9-47bc-9a82-4e838282035b`，turnId `01a10e96-2cca-7382-a24c-4291d1d92c79`）于 08:21:34.580 完成，网页按需读取返回 completed，finalResponse 精确匹配 `C2C_OFFICIAL_GATEWAY_OK_7a4f2c91`，outputId `254` available=true。
+
+随后同一 thread 的 task02 连续性测试（taskId `b3abf503-db6f-4d58-9d05-d30d8058ce21`，turnId `01a10e98-0700-79d2-bbaf-2fd83bb5c695`）于 08:23:35.501 本机完成；finalResponse 两行精确为 `C2C_OFFICIAL_GATEWAY_OK_7a4f2c91` 与 `C2C_CONTINUITY_OK_82d19f6a`，outputId `255` available=true。网页按需读取 task02 也返回 completed 且完整两行匹配；同 thread 上下文连续性通过。
+
+截至 08:25 的历史快照：`gateway-two-turn-scope-20261006.json` 确认本轮只新增 1 thread、1 target、2 tasks；排除这些新增对象后的原 Remote 历史 SHA 与部署前匹配，旧 bindings、其他 workspace 未变，471 项冻结哈希零漂移。两条 Result Bus 记录当时均为 source=`codex_app_server`、status=`queued`，无 reservation/attempt；当时自动回流与 Companion feedback/ACK 尚待验收。普通 Chat 原生 Events 未通过。
+
+08:31:01.919（Asia/Shanghai；状态快照 `companion-after-connect-*.json`）：用户点击 Connect 并确认当前对话已连接、自动回流开启。快照记录 Feedback binding `0f7d038a-08bb-4b1b-b899-8ddc01a0f7cd` epoch 14、Companion `d0c62b46-93c0-477d-87fe-eb943303aa0c`，Web Sink binding `4874ab53-02e4-4e5b-ae36-94dacaac2af7` epoch 4，route `https://chatgpt.com/c/6ac43e04-28c0-83ec-9651-0b32ba0617e4`。最终核验 `.tooling/official-route-deploy-20261005/gateway-companion-feedback-acceptance-20261006-verified.json` 确认 route attested 于 `2026-10-06T00:28:54.420Z`；Bus `11b81a1e…` 与 `355d0ebd…` 分别于 `00:29:01.994Z`、`00:29:31.996Z`（本地 08:29）observed，对应真实 Browser attempt `7a353a29-7155-436a-9dd8-5ffa05dc0e13`、`aee30ae6-ee3c-4c12-bca9-14ea52a131cc`，task 均 completed。既有 Connect 后的真实 Browser Send+ACK 通过，不是手工改状态；普通 Chat 原生 Events 仍未通过。核验另确认 Bridge PID `19516` healthy、installed/running build `c4b4c18d050137aaae1130b99257e3e13ded21eefbdf6359db2ee22798e28d97`，旧 Remote 历史 SHA 与部署前精确匹配，其他 Desktop/Executor binding hash、workspace runtime 与 named tunnel 未变，471 项冻结零漂移，inflight/locks 为 0、supervisor config/runtime 为 null。本轮用户输入 Key 启动独立 Gateway 与隧道；业务源码未改，Bridge/Controller/App Server 未重启，也未额外 install/full/build。
+
+### 2026-10-05 官方消息与事件路线实验
+
+用户授权冻结现有路线，并从包含全部56项累计改动的快照 `1379fd61` 创建 `codex/official-mcp-events`。冻结分支为 `codex/frozen-c2c-20261005`；原 `main` 提交位置及已部署服务保持不变，没有 push。目标是 MCP 下发任务、官方事件唤醒 Chat、按需读取结果，不要求把回流全文写入网页输入框。
+
+独立 Events 探针单测 **61/61 PASS、check=0**；两项 syntax 检查、PowerShell Parser、diff checks 也通过，验收日志为 `.tooling/official-mcp-events-20261005/proxy-validation-20261005T131912218.log`。一次 Work 单结果 live 测试收到 HTTP 200 accepted event，并在同一对话自动 `read_result`；截图 proof 与主代理独立插件读取精确匹配，该独立审计读取另计。随后普通 Project Chat 按修订指令复试；日志显示 `server/discover=1`，`subscribe`、subscription、event attempt、tool read、RPC fault 均为 0。Chat 回复自述无平台原生事件入口，但这不作为底层工具清单证明；本次会话未发起订阅，不代表所有普通 Chat 永久不支持。用户已确认退出，主代理只读核实端口 `43871`、`11294` 无监听且精确实验路径下 `tunnel-client` 进程数为 0。详细观测见[实验记录](../experiments/official-events/README.md)。
+
+本次 Work 单结果闭环仅证明一个 Work 对话可收到已接受事件并读取匹配结果；本账号本次普通 Project Chat 的 Events 修订指令试验未发起订阅，不能据此验收普通 Chat 的 Events 自动唤醒，也不能推断所有普通 Chat 永久不支持。另一次普通 Project Chat 经独立 Tunnel 的官方下发与按需读取已单次通过，见下文；Work Events 成功不替代这项普通 Chat 验收。没有生产服务改动。后续待验证范围为持久会话、连续投递及这些情形下的普通 Chat 回流；尚未启动下一轮任务。生产链路接入、持久化恢复、长期订阅 refresh、跨重启与 key rotation 均未验收。其他账户/route 的可用性及费用仍按前述边界处理。
+
+**普通 Chat 官方下发进展（2026-10-05）**：通过既有独立 Tunnel，在普通 Project Chat 中完成一次官方 App Server 下发与显式按需读取：唯一执行调用在 45 秒界限返回 `running`，用户随后发起一次 `read_official_dispatch_state` 查询后得到 `completed`；两轮 turn 均完成且精确匹配。主代理将完整报告与本机证据逐字段比对一致，详情与 SHA-256 见[隔离投递记录](../experiments/official-dispatch/README.md)。这只证明本次单次实验的官方下发和按需读取；持久会话、连续投递及这些情形下的普通 Chat 回流仍待验证，普通 Chat 的 Events 自动唤醒与既有 Desktop thread 控制也未验收。用户已 `quit`；主代理于 `2026-10-05 16:46:30 +08:00` 只读核验端口 `43872` 和本 run health `2367` 均无监听、probe PID `24328` 不存在、指定 `tunnel-client.exe` 进程数为 0；既有 Codex 进程 PID/创建时间未变。下一步仅为上述持久会话、连续投递与普通 Chat 回流验证；本次没有发起下一轮任务。
 
 ### 2026-10-05 双向收件箱源码开发
 

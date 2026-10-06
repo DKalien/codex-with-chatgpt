@@ -1,6 +1,20 @@
 # Architecture
 
-## 双向消息模型（2026-10-05，源码与后端部署）
+## 官方路线源码改造（2026-10-05，当前分支）
+
+当前分支按[官方投递与 Companion 回流](official-route.md)分离执行与回流：独立受 OAuth 保护的 MCP 复用安全文件/Git 读取，通过明确 targetId 向既有 Remote Controller 和官方 App Server 投递；Bridge 在显式 official 模式只保留回流相关入口。官方 turn 结果带独立来源进入 Result Bus，不伪造 Desktop receipt 或测试通过。旧部署、旧消息链及历史记录保留兼容；源码改造阶段本身未迁移机器状态，之后的显式部署见下方快照。
+
+本轮源码验收通过正式串行全量 **164 files /3435 tests**、typecheck 与 canonical build；471 项冻结哈希对应 build `c4b4c18d050137aaae1130b99257e3e13ded21eefbdf6359db2ee22798e28d97`。该全量沿用于部署验收，本次未重跑。在 2026-10-06 00:58:32 的历史快照中，最新独立 gateway run 已于 00:31:49 因用户 Ctrl+C 停止，gateway 与两个隧道进程均已 missing、端口 `48766` 关闭；这不表示生产 Bridge 停止。只读复核确认 Bridge PID `19516` 仍以该 build healthy，`runtimeUpgrade.state=current` 且 `upgradePending=false`；Controller PID `24508`、App Server PID `20172` 保持原 identity，`deliveryMode=official`，471 项冻结哈希匹配。网页 OAuth、真实投递、普通 Project Chat 原生 Events 和 Companion 真实回流仍未验收；22:27 gateway 运行记录是历史快照，OAuth 阻断详情见[开发计划](development-plan.md)。
+
+01:45:17 历史只读复核仍确认 Bridge、Controller、App Server identity 与 build 不变。same-origin-auto 候选配置只通过离线验证，未启动；网页 OAuth、真实投递及 hosted 根因修复仍 pending，A/B 证据与下一步见[开发计划](development-plan.md)。
+
+截至 2026-10-06 08:25 的历史快照：网页 OAuth、普通 Chat 只读 workspace/target 查询、唯一 target 创建、task01/task02 官方投递及按需结果读取均已通过；同 thread 连续性 marker 精确匹配。两条 Result Bus 当时仍 queued 且无 reservation/attempt，自动回流与 Companion 尚未验收；普通 Chat 原生 Events 未通过。
+
+2026-10-06 08:31，用户 Connect 后确认当前对话已连接且自动回流开启；两条 Result Bus 均经真实 Browser Send+ACK 进入 observed，Companion 回流通过。普通 Chat 原生 Events 仍未通过。本轮输入 Key 启动独立 Gateway/隧道，Bridge、Controller、App Server 未重启，业务源码未改，也未额外 install/full/build；细节见[开发计划](development-plan.md)。
+
+08:31–08:34 是单 workspace 历史 live 验收。09:01–09:02 新鲜观察显示旧 Bridge/Gateway/Controller/App Server/Tunnel 进程均 missing、48766 无监听且 Bridge stopped；installed build 与旧 durable runtime 记录不能证明当前运行版本。恢复未执行。多 workspace Gateway 仍是后续计划，见[统一 Gateway 计划](unified-gateway-plan.md)。
+
+## 官方路线之前的双向消息模型基线（2026-10-05，历史源码与后端部署）
 
 当前改造合同见 [双向消息收件箱](agent-mailbox.md)：MCP 持久接收 queued，busy 留在队列，idle 后复用安全 Desktop sender；accepted 与可信执行终态分开。Routing 独占任务接收状态，Result Bus 独占 canonical 回流状态，Companion 独占 DOM attempt 证据；单条未知不作为所有新消息的全局阻断。维护/升级与消息权限仍独立严格核验。canonical 回流可逐条隔离原未知 attempt，并在合格目标的面板只读查看结果。
 
@@ -9,6 +23,8 @@
 ## 2026-10-04 历史实现与部署边界
 
 最新源码、运行与部署快照见[开发计划当前事实](development-plan.md#当前事实与开发阶段2026-10-04-2144asiashanghai)；下文保留 2026-10-04 的历史实现与部署边界说明。
+
+本节下方“网页命令 → Desktop”图和对应文字描述的是兼容的 legacy profile；当前 official profile 通过独立 Remote Controller 与 App Server 投递，Bridge official mode 保留 feedback。单机多 workspace 聚合尚未实现，后续路线见[统一 Gateway 计划](unified-gateway-plan.md)。
 
 B1 进程退出证据、B2 查询/连接与维护分离、B4 canonical 主链、B5 受控任务面板已实现；B3 已评估并决定不迁移 SQLite。固定 registry、Executor/Web Sink 合同、领域存储与安全启动协议继续复用。Supervisor foundation 已随 Core 安装，实际 Scheduled Task/config/runtime 仍 absent/null，独立自动恢复尚未启用。
 

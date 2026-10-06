@@ -40,7 +40,11 @@ function ready() {
 function thread() {
   const t = enqueueThread(workspace.id, { workspaceId: workspace.id, requestId: "req" }, "client");
   updateRemote(workspace.id, state => {
-    state!.threads[0].threadId = "thread-1"; state!.threads[0].status = "completed";
+    const now = new Date().toISOString();
+    const target = { targetId: "11111111-1111-4111-8111-111111111111", hostId: "local" as const, workspaceId: workspace.id,
+      workspaceRoot: root, threadId: "thread-1", createdAt: now, source: "created" as const, clientId: "client" };
+    state!.targets = [target];
+    state!.threads[0]!.threadId = "thread-1"; state!.threads[0]!.targetId = target.targetId; state!.threads[0]!.status = "completed";
     return { state: state!, result: undefined };
   });
   return t;
@@ -184,7 +188,7 @@ describe("Controller 状态机", () => {
       await until(() => readRemote(workspace.id)!.tasks[0].status === "running");
       setRemoteEnabled(workspace, false);
       fake.emit("notification", { method: "item/completed", params: {
-        threadId: "thread-1", turnId: "turn-1", item: { type: "agentMessage", text: "完成输出\nAuthorization: Bearer c2c_at_abcdefghijklmnopqrstuv" },
+        threadId: "thread-1", turnId: "turn-1", item: { type: "agentMessage", phase: "final_answer", text: "完成输出\nAuthorization: Bearer c2c_at_abcdefghijklmnopqrstuv" },
       } });
       fake.emit("notification", { method: "turn/completed", params: {
         threadId: "thread-1", turnId: "turn-1", turn: { id: "turn-1", status: "completed" },
@@ -222,7 +226,7 @@ describe("Controller 状态机", () => {
       unlocked = waitForFixtureChildExit(unlocker);
       void unlocked.catch(() => {}); // Finally still reports failure, even if an earlier assertion throws.
       fake.emit("notification", { method: "item/completed", params: {
-        threadId: "thread-1", turnId: "turn-1", item: { type: "agentMessage", text: "锁竞争后的正文" },
+        threadId: "thread-1", turnId: "turn-1", item: { type: "agentMessage", phase: "final_answer", text: "锁竞争后的正文" },
       } });
       fake.emit("notification", { method: "turn/completed", params: {
         threadId: "thread-1", turnId: "turn-1", turn: { id: "turn-1", status: "completed" },
@@ -254,8 +258,6 @@ describe("Controller 状态机", () => {
     const controller = new RemoteController(workspace, fake as unknown as AppServerClient), running = controller.run();
     try {
       await until(() => readRemote(workspace.id)!.tasks[0].status === "running");
-      fake.emit("request", { id: 43, method: "account/chatgptAuthTokens/refresh", params: {} });
-      await until(() => readRemote(workspace.id)!.tasks[0].status === "awaiting_approval");
       fake.emit("request", { id: 44, method: "item/commandExecution/requestApproval", params: { threadId: "thread-1", turnId: "turn-1" } });
       await until(() => readRemote(workspace.id)!.tasks[0].status === "awaiting_approval");
       expect(readRemote(workspace.id)!.tasks[1].status).toBe("queued");
@@ -299,6 +301,6 @@ it("真实 MCP 传输校验 scopes、本地授权及工作区；默认包含九�
     setRemoteEnabled(workspace, false);
     expect((await write.listTools()).tools).toHaveLength(27);
     fs.writeFileSync(remoteFile(workspace.id), "broken");
-    expect((await read.listTools()).tools).toHaveLength(27);
+    await expect(read.listTools()).rejects.toThrow("remote_mode_unavailable");
   } finally { for (const client of clients) await client.close(); await bridge.close(); }
 });

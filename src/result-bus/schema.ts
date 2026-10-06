@@ -8,7 +8,7 @@ import {
   routingWorkspaceIdSchema,
   type RoutingResult,
 } from "../routing/schema.js";
-import { canonicalRoutingResultDigest } from "../routing/execution-result-digest.js";
+import { officialResultSchema, resultBusResultDigest, type OfficialResult } from "./official-result.js";
 import {
   endpointBindingIdSchema,
   endpointEpochSchema,
@@ -85,7 +85,7 @@ export const resultBusEntrySchema = z.object({
   iteration: z.number().int().positive(),
   resultId: routingUuidSchema,
   resultSha256: z.string().regex(HEX64),
-  result: canonicalResultSchema,
+  result: z.union([officialResultSchema, canonicalResultSchema]),
   createdAt: z.string().datetime(),
   deliveryStatus: resultBusLifecycleSchema,
   sendTarget: nullable(webSinkSendTargetSnapshotSchema),
@@ -108,7 +108,7 @@ export const resultBusEntrySchema = z.object({
   }
   let expectedDigest: string | null = null;
   try {
-    expectedDigest = canonicalRoutingResultDigest(entry.result);
+    expectedDigest = resultBusResultDigest(entry.result);
   } catch {
     expectedDigest = null;
   }
@@ -228,6 +228,7 @@ export type ResultBusLifecycle = z.infer<typeof resultBusLifecycleSchema>;
 export type ResultBusEntry = z.infer<typeof resultBusEntrySchema>;
 export type ResultBusState = z.infer<typeof resultBusStateSchema>;
 export type CanonicalRoutingResult = Extract<RoutingResult, { rawSummary: string }>;
+export type ResultBusResult = CanonicalRoutingResult | OfficialResult;
 
 export function isCanonicalRoutingResult(result: RoutingResult): result is CanonicalRoutingResult {
   return "rawSummary" in result && "machineEvidence" in result;

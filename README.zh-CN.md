@@ -12,6 +12,9 @@
 正式权限是 `codex.control` / `codex.read`，write_probe 仍默认关闭。
 首次使用、启停、状态位置和崩溃恢复见 [Remote Control 操作说明](docs/remote-control.md)。
 
+单机多 workspace 官方 Gateway 与旧 feedback 插件整合仍在规划中，当前实施路线见
+[统一 Gateway 计划](docs/unified-gateway-plan.md)。
+
 ## 实验性 Desktop Control（默认关闭）
 
 Desktop Control 只在本机用户明确绑定并启用一个已经在 Desktop 中加载、当前空闲的已有
@@ -71,6 +74,7 @@ OAuth、本机 enable、binding 或 Desktop 审批，也不承诺能够影响或
 ChatGPT 付费订阅的网页版额度大量闲置，Codex 却在消耗紧张的 API 额度做
 规划和 Review。本项目把"思考"交给你已付费的网页版 ChatGPT，Codex 只负责
 执行。不用 API Key、不搞逆向代理——官方网页 + 默认只读 MCP 桥接。
+“不用 API Key”仅适用于旧 Bridge Connector 流程；当前官方 Tunnel 启动需要本机 Read+Use 运行 Key。
 
 ## 这是什么
 

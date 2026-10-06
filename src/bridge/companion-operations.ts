@@ -1,4 +1,6 @@
 import { readExecutorDispatchState } from "../executor-control/dispatch-store.js";
+import { readRemote, controllerOnline } from "../remote/store.js";
+import { isOfficialResult } from "../result-bus/official-result.js";
 import { authenticateOperations as authenticate } from "./companion-operation-auth.js";
 import { readPanelAuthorization } from "../feedback/panel.js";
 import { readFeedbackState } from "../feedback/state-store.js";
@@ -61,15 +63,20 @@ export async function readCompanionOperations(input: {
   const { auth, ctx } = authenticate(input);
   const stateDir = input.stateDir ?? getStateDir();
   const identity = { id: input.workspaceId, root: input.workspaceRoot };
+  const remote = readRemote(identity.id, stateDir);
+  if (remote && remote.workspaceRoot !== identity.root) throw new CompanionError("COMPANION_WORKSPACE_MISMATCH", "official workspace 身份不一致。");
+  const officialMode = remote?.deliveryMode === "official";
   let endpoint: ExecutorStatusProjection;
-  try { endpoint = await inspect(identity.id, identity.root); }
+  try { endpoint = officialMode
+    ? { workspaceId: identity.id, activeBinding: null, plugins: [], availability: { available: false, reasonCode: "official_mode", message: "Official App Server" } }
+    : await inspect(identity.id, identity.root); }
   catch { endpoint = { workspaceId: identity.id, activeBinding: null, plugins: [],
     availability: { available: false, reasonCode: "inspect_failed", message: "无法核验" } }; }
   // IPC awaits may race a re-pair/rebind. Never return old-scope observations to a new caller.
   if (JSON.stringify(authenticate(input)) !== JSON.stringify({ auth, ctx })) {
     throw new CompanionError("COMPANION_EPOCH_STALE", "查询期间连接身份改变；请刷新。");
   }
-  const bindingStable = JSON.stringify(readActiveExecutorBinding(identity.id, identity.root)) === JSON.stringify(endpoint.activeBinding);
+  const bindingStable = officialMode || JSON.stringify(readActiveExecutorBinding(identity.id, identity.root)) === JSON.stringify(endpoint.activeBinding);
   const routing = readRouting(identity, input.stateDir);
   const desktop = readDesktop(identity.id, input.stateDir);
   if (desktop && desktop.workspaceRoot !== identity.root) {
@@ -93,7 +100,7 @@ export async function readCompanionOperations(input: {
   const retired = readLegacyRetirements(identity.id, stateDir);
   const resolved = readOutcomeResolutions(identity.id, stateDir);
   const ids = [...new Set([...commands, ...dispatches, ...(desktop?.deliveries ?? []), ...feedback.events, ...bus,
-    ...abandoned, ...retired, ...resolved].map(item => item.commandId).concat(records.map(record => record.commandId!), cleanupInventory(identity.id, stateDir)))];
+    ...abandoned, ...retired, ...resolved, ...(remote?.tasks ?? [])].map(item => item.commandId).concat(records.map(record => record.commandId!), cleanupInventory(identity.id, stateDir)))];
   const commandMap = new Map(commands.map(command => [command.commandId, command]));
   const deliveryMap = new Map(desktop?.deliveries.map(delivery => [delivery.commandId, delivery]));
   const resultMap = groupByCommand(routing?.results ?? []);
@@ -102,6 +109,7 @@ export async function readCompanionOperations(input: {
   const recordsMap = groupByCommand(records.map(record => ({ ...record, commandId: record.commandId! })));
   const abandonedIds = new Set(abandoned.map(item => item.commandId)), retiredIds = new Set(retired.map(item => item.commandId)), resolvedIds = new Set(resolved.map(item => item.commandId));
   const rows = ids.map(commandId => {
+    const official = remote?.tasks.find(task => task.commandId === commandId);
     const command = commandMap.get(commandId);
     const dispatch = dispatches.find(item => item.commandId === commandId);
     const candidate = deliveryMap.get(commandId);
@@ -127,6 +135,7 @@ export async function readCompanionOperations(input: {
           outputId: record.outputId ?? null, createdAt: record.timestamp });
     }
     const issues = lifecycleDiagnostics(identity.id, commandId, stateDir);
+    if (official && (command || candidate || dispatch)) issues.push("delivery_identity_conflict");
     if (candidate && command && !delivery) issues.push("delivery_identity_conflict");
     const queueStatus = command?.deliveryStatus === "pending" ? command.mailbox?.state : undefined;
     const queueReason = queueStatus === "blocked" ? command?.mailbox?.reason?.slice(0, 80) ?? null : undefined;
@@ -138,8 +147,12 @@ export async function readCompanionOperations(input: {
       && !pendingPanelOperation;
     const cancelReason = cancelable ? undefined : pendingPanelOperation ? "PANEL_OPERATION_PENDING" : "PANEL_CANCEL_UNSAFE";
     return {
+      ...(official ? { appServerTurn: { taskId: official.taskId, targetId: official.targetId ?? null,
+        threadId: official.threadId, turnId: official.turnId ?? null, status: official.status,
+        reason: official.error ?? null, updatedAt: official.updatedAt,
+        resultId: (busMap.get(commandId) ?? []).find(entry => isOfficialResult(entry.result))?.resultId ?? null } } : {}),
       commandId, intent: command?.intent ?? candidate?.intent ?? dispatch?.intent ?? null,
-      scope: command ? (plannerIds.has(command.plannerRouteId) ? "current" : "historical")
+      scope: official ? "current_target" : command ? (plannerIds.has(command.plannerRouteId) ? "current" : "historical")
         : candidate && candidate.bindingId === desktop?.binding?.bindingId ? "current_target" : "historical",
       issues, administrative: abandonedIds.has(commandId) ? "abandoned" : retiredIds.has(commandId) ? "retired" : resolvedIds.has(commandId) ? "resolved_unknown" : null,
       delivery: { status: command?.cancelledAt ? "cancelled" : delivery?.deliveryStatus ?? command?.deliveryStatus ?? (dispatch?.deliveryStatus === "started" ? "outcome_unknown" : dispatch?.deliveryStatus) ?? "unknown", deliveryId: delivery?.deliveryId ?? null,
@@ -153,12 +166,18 @@ export async function readCompanionOperations(input: {
         resultId: null, attemptId: event.attemptId ?? null,
         target: event.targetBindingId === ctx.bindingId && event.targetEpoch === ctx.epoch && event.targetPrincipalFingerprint === ctx.principalFingerprint ? "current" : "historical",
         createdAt: event.createdAt, updatedAt: event.updatedAt }))],
-      updatedAt: command?.updatedAt ?? candidate?.updatedAt ?? dispatch?.updatedAt ?? events.at(-1)?.updatedAt ?? executions.at(-1)?.createdAt ?? null,
+      updatedAt: official?.updatedAt ?? command?.updatedAt ?? candidate?.updatedAt ?? dispatch?.updatedAt ?? events.at(-1)?.updatedAt ?? executions.at(-1)?.createdAt ?? null,
     };
   }).sort((a, b) => (b.updatedAt ?? "").localeCompare(a.updatedAt ?? "") || a.commandId.localeCompare(b.commandId));
   return {
     schemaVersion: 1, ...auth, panelAuthorization: readPanelAuthorization(identity.id, stateDir), observedAt: new Date().toISOString(), readOnly: true,
-    executor: { state: bindingStable && endpoint.availability.available ? endpoint.activity ?? "unknown" : "unknown",
+    executor: officialMode ? { source: "codex_app_server", state: !remote.enabled || !controllerOnline(remote) || remote.controller?.appServer !== "running" ? "unknown"
+      : remote.tasks.some(task => task.status === "awaiting_approval") ? "approval_required"
+        : remote.tasks.some(task => ["starting", "running"].includes(task.status)) ? "busy" : "idle",
+      reason: !remote.enabled ? "REMOTE_CONTROL_DISABLED" : !controllerOnline(remote) ? "CONTROLLER_OFFLINE"
+        : remote.controller?.appServer !== "running" ? "APP_SERVER_NOT_READY" : null,
+      observedAt: new Date().toISOString(), sessionId: null }
+    : { state: bindingStable && endpoint.availability.available ? endpoint.activity ?? "unknown" : "unknown",
       reason: !bindingStable ? "binding_changed" : endpoint.availability.available ? null : endpoint.availability.reasonCode,
       observedAt: bindingStable && endpoint.availability.available ? new Date().toISOString() : null,
       sessionId: endpoint.activeBinding?.sessionId ?? null },

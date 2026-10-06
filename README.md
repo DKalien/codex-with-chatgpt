@@ -12,11 +12,13 @@
 **中文** — ChatGPT 付费订阅的网页版额度大量闲置，Codex 却在消耗紧张的
 API 额度做规划和 Review。本项目把"思考"交给你已付费的网页版 ChatGPT，
 Codex 只负责执行。不用 API Key、不搞逆向代理——官方网页 + 默认只读 MCP 桥接。
+“不用 API Key”仅适用于旧 Bridge Connector 流程；当前官方 Tunnel 启动需要本机 Read+Use 运行 Key。
 
 **EN** — ChatGPT Plus/Pro web quota sits idle while your coding agent burns
 scarce API/Codex tokens on planning and review. This project moves the
 thinking to the subscription you already pay for; Codex only executes.
 No API keys, no reverse proxy — official web UI plus a default read-only MCP bridge.
+The no-API-key statement applies to the legacy Bridge Connector flow; the current official Tunnel startup requires a local Read+Use runtime key.
 
 ## What it is · 这是什么
 
@@ -38,6 +40,8 @@ Detailed docs below are in English · 详细中文文档见 **[README.zh-CN.md](
 提交任务并查询状态。独立 Controller 使用官方 app-server，不需要 Desktop 对话或内置浏览器保持打开。
 默认关闭，新增 `codex.control` / `codex.read`；基础只读工具边界不变，feedback/Desktop 独立鉴权。
 操作步骤、持久化与恢复限制见 [Remote Control](docs/remote-control.md)。
+
+单机多 workspace 官方 Gateway 与旧 feedback 插件整合计划见 [统一 Gateway 计划](docs/unified-gateway-plan.md)；该聚合能力仍在开发规划中。
 
 ## Experimental Desktop Control · 实验性桌面控制
 

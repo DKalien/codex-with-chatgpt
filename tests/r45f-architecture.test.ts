@@ -66,15 +66,24 @@ describe("R4.5f structural boundaries", () => {
     }
     expect(read("src/mcp/server.ts")).not.toMatch(/server\.registerTool\s*\(/);
     const server = read("src/mcp/server.ts");
-    let previousGroup = -1;
-    for (const group of [
-      "registerWorkspaceTools", "registerExecutionTools", "registerWriteProbeTools",
-      "registerRemoteTools", "registerDesktopTools", "registerFeedbackProbeTools", "registerFeedbackTools",
-    ]) {
-      const index = server.indexOf(`${group}(`);
-      expect(index).toBeGreaterThan(previousGroup);
-      previousGroup = index;
-    }
+    const officialStart = server.indexOf('if (ctx.profile === "official")');
+    const feedbackStart = server.indexOf('if (ctx.profile === "feedback")');
+    const legacyStart = server.indexOf("// Keep registration order stable:");
+    expect(officialStart).toBeGreaterThanOrEqual(0);
+    expect(feedbackStart).toBeGreaterThan(officialStart);
+    expect(legacyStart).toBeGreaterThan(feedbackStart);
+    const officialProfile = server.slice(officialStart, feedbackStart);
+    const feedbackProfile = server.slice(feedbackStart, legacyStart);
+    const legacyProfile = server.slice(legacyStart);
+    const registeredGroups = (source: string) => [...source.matchAll(/\b(register[A-Z][A-Za-z0-9]*)\s*\(/g)].map(match => match[1]);
+    expect(registeredGroups(officialProfile)).toEqual(["registerWorkspaceTools", "registerRemoteTools"]);
+    expect(officialProfile).toMatch(/registerRemoteTools\([\s\S]*return server;/);
+    expect(registeredGroups(feedbackProfile)).toEqual(["registerExecutionTools", "registerFeedbackTools", "registerWebSinkTools"]);
+    expect(feedbackProfile).toMatch(/registerWebSinkTools\([\s\S]*return server;/);
+    expect(registeredGroups(legacyProfile)).toEqual([
+      "registerWorkspaceTools", "registerExecutionTools", "registerWriteProbeTools", "registerRemoteTools",
+      "registerDesktopTools", "registerFeedbackProbeTools", "registerFeedbackTools", "registerExecutorTools", "registerWebSinkTools",
+    ]);
     const toolOrder = ["src/mcp/workspace-tools.ts", "src/mcp/execution-tools.ts", "src/mcp/write-probe-tools.ts"]
       .map(file => read(file)).join("\n");
     let previous = -1;

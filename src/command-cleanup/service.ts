@@ -1,4 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
+import { isOfficialResult } from "../result-bus/official-result.js";
+import { readRemote } from "../remote/store.js";
 import fs from "node:fs";
 import path from "node:path";
 import { getStateDir } from "../config/paths.js";
@@ -25,6 +27,9 @@ function targetIdentity(target: CommandCleanupTarget): CommandCleanupTarget & { 
 
 export function inspectCommandCleanupArtifacts(raw: CommandCleanupTarget): CleanupArtifact[] {
   const target = targetIdentity(raw);
+  // Remote owns its replay ledger. Desktop cleanup cannot partially erase its output/Bus.
+  if (readRemote(target.workspaceId, target.stateDir)?.tasks.some(task => task.commandId === target.commandId))
+    throw new CommandCleanupError("COMMAND_CLEANUP_UNSUPPORTED_OFFICIAL", "官方任务仍有持久幂等身份；Desktop 清理不能部分删除其记录。未发送任务可用 codex_cancel_task 取消。");
   const artifacts = sortArtifacts([
     ...inspectDesktopCleanupArtifacts(target), ...inspectExecutionCleanupArtifacts(target),
     ...inspectExecutorDispatchCleanupArtifacts(target), ...inspectRoutingCleanupArtifacts(target),
@@ -56,7 +61,7 @@ export type CommandCleanupOutcome = { status: "cleaned" | "not_found"; workspace
 function verifyAutoProof(target: CommandCleanupTarget): void {
   const entries = listResultBusEntries({ id: target.workspaceId, root: target.workspaceRoot }, target.stateDir).filter(entry => entry.commandId === target.commandId);
   const entry = entries[0];
-  if (entries.length !== 1 || !entry || entry.iteration !== 1 || entry.lifecycle !== "ephemeral" || entry.deliveryStatus !== "observed" || !entry.attempt || !entry.sendTarget || !("machineEvidence" in entry.result))
+  if (entries.length !== 1 || !entry || entry.iteration !== 1 || entry.lifecycle !== "ephemeral" || entry.deliveryStatus !== "observed" || !entry.attempt || !entry.sendTarget || !("machineEvidence" in entry.result) || isOfficialResult(entry.result))
     throw new CommandCleanupError("COMMAND_CLEANUP_NOT_TERMINAL", "auto cleanup 必须是新 ephemeral flow 的 exact observed canonical result。");
   const candidate = projectTrustedDesktopExecutionResult({ id: target.workspaceId, root: target.workspaceRoot }, { commandId: target.commandId, desktopReceiptSha256: entry.result.machineEvidence.desktopReceiptSha256 }, target.stateDir);
   const { resultId: _resultId, createdAt: _createdAt, updatedAt: _updatedAt, ...persisted } = entry.result;

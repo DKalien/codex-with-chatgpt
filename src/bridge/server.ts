@@ -9,6 +9,7 @@ import { createOAuthRouter } from "../auth/oauth.js";
 import { bearerAuth } from "../auth/middleware.js";
 import { PairingManager } from "../pairing/manager.js";
 import { createMcpServer } from "../mcp/server.js";
+import { isOfficialRemoteMode } from "../remote/store.js";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import { DesktopError } from "../desktop/store.js";
 import { isWriteProbeEnabled } from "../mcp/write-probe.js";
@@ -151,17 +152,24 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
 
   // ---- MCP endpoint (bearer-protected) --------------------------------------
 
-  const mcpHandler = createMcpHttpHandler(() => createMcpServer({
+  const createMcpHandler = (profile: "legacy" | "feedback") => createMcpHttpHandler(() => createMcpServer({
+    profile,
     commandMailbox: commandMailbox.submit,
     workspace,
     logger,
     desktopAuthorize: (auth: AuthInfo) => {
+      if (isOfficialRemoteMode(workspace.id)) {
+        throw new DesktopError("REMOTE_CONTROL_DISABLED", "官方 Remote 模式下不允许通过 Bridge 投递 Desktop 任务。");
+      }
       const verdict = authStore.verifyAccessToken(auth.token);
       if (!verdict.ok || verdict.record.workspaceId !== workspace.id || verdict.record.clientId !== auth.clientId || !verdict.record.scopes.includes(DESKTOP_CONTROL_SCOPE)) {
         throw new DesktopError("UNAUTHORIZED", "OAuth 授权已失效，请重新授权后再发送。" );
       }
     },
     executorAuthorize: (auth: AuthInfo) => {
+      if (isOfficialRemoteMode(workspace.id)) {
+        throw new DesktopError("REMOTE_CONTROL_DISABLED", "官方 Remote 模式下不允许通过 Bridge 投递 Executor 任务。");
+      }
       const verdict = authStore.verifyAccessToken(auth.token);
       if (!verdict.ok || verdict.record.workspaceId !== workspace.id || verdict.record.clientId !== auth.clientId || !verdict.record.scopes.includes(EXECUTOR_CONTROL_SCOPE)) {
         throw new DesktopError("UNAUTHORIZED", "OAuth 授权已失效，请重新授权后再发送。");
@@ -182,12 +190,22 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
       }
     },
   }), logger);
+  const mcpHandlers = {
+    legacy: createMcpHandler("legacy"),
+    feedback: createMcpHandler("feedback"),
+  };
   app.all(
     "/mcp",
     express.json({ limit: "8mb" }),
     bearerAuth({ store: authStore, workspaceId: workspace.id, getBaseUrl, logger }),
     (req: Request, res: Response) => {
-      void mcpHandler(req, res);
+      try {
+        const profile = isOfficialRemoteMode(workspace.id) ? "feedback" : "legacy";
+        void mcpHandlers[profile](req, res);
+      } catch (error) {
+        logger.error("Remote mode unavailable; MCP request denied", { message: (error as Error).message });
+        res.status(503).json({ error: "remote_mode_unavailable" });
+      }
     }
   );
 
@@ -313,7 +331,16 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     }
   }, 30_000);
   maintenanceTimer?.unref();
+  let mailboxModeUnavailableLogged = false;
   const mailboxTimer = opts.persistRuntime === false ? null : setInterval(() => {
+    try {
+      if (isOfficialRemoteMode(workspace.id)) { mailboxModeUnavailableLogged = false; return; }
+    } catch {
+      if (!mailboxModeUnavailableLogged) logger.warn("Remote mode unavailable; command mailbox dispatch skipped");
+      mailboxModeUnavailableLogged = true;
+      return;
+    }
+    mailboxModeUnavailableLogged = false;
     void commandMailbox.tick().catch(() => logger.warn("Command mailbox unavailable; pending tasks retained"));
   }, 2000);
   mailboxTimer?.unref();

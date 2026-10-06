@@ -21,6 +21,19 @@ export function createMcpServer(ctx: McpContext): McpServer {
     { capabilities: { tools: {}, resources: {} }, instructions: UNTRUSTED_NOTE },
   );
 
+  if (ctx.profile === "official") {
+    registerWorkspaceTools(server, ctx, "official");
+    registerRemoteTools(server, ctx.workspace, "official");
+    return server;
+  }
+
+  if (ctx.profile === "feedback") {
+    registerExecutionTools(server, ctx);
+    registerFeedbackTools(server, ctx.workspace);
+    registerWebSinkTools(server, ctx.workspace);
+    return server;
+  }
+
   // Keep registration order stable: base workspace, execution, optional write probe,
   // then the existing remote/Desktop/feedback groups, then generic executor tools.
   registerWorkspaceTools(server, ctx);

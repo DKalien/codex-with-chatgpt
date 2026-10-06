@@ -34,6 +34,13 @@ Normal 使用 `[C2C]`。状态不互相推进，同一 Agent 不并行执行两�
 正式 codex.control/codex.read 独立于默认 scopes 与 probe.write；不得自动批准远程任务、修改模型/provider
 或降低 sandbox。新线程由官方 app-server 创建，继承本机配置。Normal 与下方 DOM 模式的限制仍各自适用。
 
+**Official 路线（显式本机启用）:** 见仓库 `docs/official-route.md`。独立 `remote serve` 的 MCP 使用
+`codex_list_targets` 核对项目与登记目标，以 targetId 投递并按 taskId 读取结果；文件/Git 查询限定到该
+endpoint 的 workspace。`TURN_ENDED` 是 App Server 生命周期事实，不是 Desktop receipt 或测试成功。
+不得为它写 `desktop_*` 回执。Desktop 持有 writer 时不得抢占、修改私有状态或自动换线程。
+本机 `deliveryMode=official` 后 Bridge 停用旧任务投递，只保留反馈相关功能；Remote disable 不回退旧入口。
+仅开发或读取文档不授权启用、部署、重启服务或更改现有绑定。普通 Chat 的自动回流仍使用 Companion。
+
 **Desktop Control（独立实验性 MVP）:** 默认关闭，只支持本机用户绑定、已在 Desktop 加载的
 已有会话。ChatGPT 只有在网页用户确认完整方案后，才可调用 `codex_desktop_send`；它只等待真实
 Bridge 持久接收回执，收到 `deliveryStatus=queued` 后本轮即可结束；后台在目标空闲后投递，`accepted` 才表示真实接收，二者均不表示执行完成。不要自动新建

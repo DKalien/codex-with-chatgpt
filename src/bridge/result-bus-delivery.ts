@@ -1,5 +1,6 @@
 import { isResultBusInFlight } from "../result-bus/schema.js";
 import { canonicalRoutingResultDigest } from "../routing/execution-result-digest.js";
+import { isOfficialResult, resultBusResultDigest } from "../result-bus/official-result.js";
 import { createHash } from "node:crypto";
 import { resolveWorkspaceIdentity, listResults, type RoutingWorkspaceIdentity } from "../routing/store.js";
 import { areChatgptConversationRoutesEquivalent } from "../chatgpt/route.js";
@@ -33,6 +34,7 @@ import { verifyCompanionCredentialReadOnly } from "../feedback/companion-deliver
 import { reconcileFeedbackOutbox } from "../feedback/projector.js";
 import {
   formatCanonicalExecutedMessage,
+  formatOfficialTurnMessage,
   productionFeedbackDelivery,
   productionFeedbackMessageSha256,
 } from "../feedback/message.js";
@@ -111,7 +113,7 @@ function isCanonicalLikeCandidate(event: FeedbackEvent): boolean {
 }
 
 function canonicalOf(entry: ResultBusEntry): CanonicalRoutingResult {
-  if (!("machineEvidence" in entry.result) || !("rawSummary" in entry.result)) {
+  if (isOfficialResult(entry.result) || !("machineEvidence" in entry.result) || !("rawSummary" in entry.result)) {
     throw new ResultBusDeliveryError("RESULT_BUS_ENTRY_NOT_CANONICAL", "Bus entry 不含 canonical RoutingResult；fail closed。");
   }
   return entry.result;
@@ -137,6 +139,7 @@ function expectedPreR4cEventId(entry: ResultBusEntry): string {
 
 /** pre-R4c exact legacy 匹配：同 canonical execution identity、无 planner 元数据。 */
 function matchesPreR4cIdentity(entry: ResultBusEntry, event: FeedbackEvent): boolean {
+  if (isOfficialResult(entry.result)) return false;
   if (isPinnedCanonicalEvent(event)) return false;
   const canonical = canonicalOf(entry);
   const evidence = canonical.machineEvidence;
@@ -163,6 +166,15 @@ function busInFlightEntries(entries: readonly ResultBusEntry[]): ResultBusEntry[
 }
 
 function busDeliveryDto(entry: ResultBusEntry): Record<string, unknown> {
+  if (isOfficialResult(entry.result)) {
+    const result = entry.result, evidence = result.machineEvidence;
+    return { eventId: resultBusCompanionDeliveryId(entry.busEntryId), kind: "C2C_TURN_ENDED",
+      source: "codex_app_server", commandId: entry.commandId, taskId: evidence.taskId,
+      iteration: entry.iteration, result: result.status, status: entry.deliveryStatus,
+      testsSummary: evidence.testsSummary, changedFilesSummary: [], changedFilesCollected: false,
+      outputAvailable: evidence.output?.outputAvailable ?? false,
+      occurredAt: result.createdAt, createdAt: entry.createdAt, updatedAt: entry.createdAt };
+  }
   const canonical = canonicalOf(entry);
   const evidence = canonical.machineEvidence;
   return {
@@ -185,6 +197,11 @@ function busDeliveryDto(entry: ResultBusEntry): Record<string, unknown> {
 
 /** claimed/outcome_unknown 的确定性 canonical message（server 唯一生成）。 */
 export function resultBusDeliveryMessage(entry: ResultBusEntry, attemptId: string): { message: string; messageSha256: string } {
+  if (isOfficialResult(entry.result)) {
+    const message = formatOfficialTurnMessage({ workspaceId: entry.workspaceId, result: entry.result,
+      eventId: resultBusCompanionDeliveryId(entry.busEntryId), attemptId });
+    return { message, messageSha256: productionFeedbackMessageSha256(message) };
+  }
   const canonical = canonicalOf(entry);
   const evidence = canonical.machineEvidence;
   const message = formatCanonicalExecutedMessage({
@@ -942,9 +959,9 @@ export function resultBusCompanionResult(input: {
   const entry = listResultBusEntries(identity, input.stateDir)
     .find(item => item.commandId === input.commandId && item.iteration === input.iteration);
   if (!entry) throw new ResultBusDeliveryError("COMPANION_RESULT_NOT_FOUND", "canonical result 不存在。");
-  const canonical = canonicalOf(entry);
+  const canonical = isOfficialResult(entry.result) ? entry.result : canonicalOf(entry);
   if (entry.result.commandId !== entry.commandId || entry.result.iteration !== entry.iteration ||
-      entry.result.resultId !== entry.resultId || canonicalRoutingResultDigest(entry.result) !== entry.resultSha256)
+      entry.result.resultId !== entry.resultId || resultBusResultDigest(entry.result) !== entry.resultSha256)
     throw new ResultBusDeliveryError("RESULT_BUS_CONFLICT", "canonical result 与 Result Bus immutable identity 不一致。");
   const routingResult = listResults(identity, input.stateDir)
     .find(item => item.commandId === entry.commandId && item.iteration === entry.iteration);
@@ -961,6 +978,8 @@ export function resultBusCompanionResult(input: {
     status: canonical.status,
     rawSummary: canonical.rawSummary,
     testsSummary: canonical.machineEvidence.testsSummary,
+    ...(isOfficialResult(canonical) ? { source: "codex_app_server", taskId: canonical.machineEvidence.taskId,
+      threadId: canonical.machineEvidence.threadId, turnId: canonical.machineEvidence.turnId } : {}),
     deliveryStatus: entry.deliveryStatus,
   };
 }

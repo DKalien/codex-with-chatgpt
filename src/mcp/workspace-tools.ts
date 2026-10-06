@@ -18,6 +18,7 @@ import {
   type WorkflowReadinessInput,
 } from "../workflow/readiness-model.js";
 import { Workspace } from "../workspace/manager.js";
+import { controllerOnline, readRemote, RemoteError } from "../remote/store.js";
 import {
   gitDiffOutputSchema,
   gitStatusOutputSchema,
@@ -85,7 +86,7 @@ async function buildWorkspaceInfoWorkflow(
 
 export { buildWorkspaceInfoWorkflow };
 
-export function registerWorkspaceTools(server: McpServer, ctx: McpContext): void {
+export function registerWorkspaceTools(server: McpServer, ctx: McpContext, profile: "legacy" | "official" = "legacy"): void {
   const { workspace } = ctx;
   server.registerTool(
     "workspace_info",
@@ -106,10 +107,14 @@ export function registerWorkspaceTools(server: McpServer, ctx: McpContext): void
       try {
         const project = workspace.detectProject();
         const git = gitInfo(workspace.root);
-        const requestDesktopCompatibility = ctx.desktopCompatibility?.(extra.authInfo) ?? { status: "unknown" as const };
+        const requestDesktopCompatibility = profile === "official"
+          ? { status: "unknown" as const }
+          : ctx.desktopCompatibility?.(extra.authInfo) ?? { status: "unknown" as const };
         let workflow: WorkflowMcpProjection;
         try {
-          workflow = await buildWorkspaceInfoWorkflow(workspace, ctx, extra, requestDesktopCompatibility);
+          workflow = profile === "official"
+            ? buildOfficialWorkspaceInfoWorkflow(workspace, extra.authInfo)
+            : await buildWorkspaceInfoWorkflow(workspace, ctx, extra, requestDesktopCompatibility);
         } catch {
           // workspace identity is the recovery entry: never fail the whole tool on readiness projection.
           // Fallback must still match workflowOutputSchema (full projection shape).
@@ -286,4 +291,84 @@ export function registerWorkspaceTools(server: McpServer, ctx: McpContext): void
       }
     },
   );
+}
+
+function buildOfficialWorkspaceInfoWorkflow(workspace: Workspace, authInfo: AuthInfo | undefined): WorkflowMcpProjection {
+  const capability = remoteRequestCapability(authInfo?.scopes);
+  let remote: WorkflowMcpProjection["remote"] = {
+    enabled: false,
+    controller: "unknown",
+    activeWork: false,
+    needsReconciliation: false,
+  };
+  try {
+    const state = readRemote(workspace.id);
+    if (state) {
+      if (state.workspaceRoot !== workspace.root) throw new RemoteError("UNKNOWN_WORKSPACE");
+      const activeStatuses = new Set(["queued", "starting", "running", "awaiting_approval"]);
+      remote = {
+        enabled: state.enabled,
+        controller: !state.controller ? "unknown"
+          : !controllerOnline(state) ? "offline"
+            : state.controller.appServer === "running" ? "online" : "unknown",
+        activeWork: state.tasks.some(task => activeStatuses.has(task.status)),
+        needsReconciliation: [...state.tasks, ...state.threads].some(task => task.status === "needs_reconciliation"),
+      };
+    }
+  } catch {
+    // Corrupt or mismatched remote state must never turn the official profile Ready.
+  }
+  const controllerReady = remote.controller === "online";
+  const authorizedRemote = capability === "current";
+  const overall: WorkflowMcpProjection["overall"] = !remote.enabled || !controllerReady
+      ? "needs_connection"
+      : !authorizedRemote
+        ? "needs_authorization"
+        : "ready_remote";
+  const nextAction: WorkflowMcpProjection["nextAction"] = !remote.enabled || !controllerReady
+      ? "repair_connection"
+      : !authorizedRemote
+        ? "resume_authorization"
+        : "use_remote";
+  const blockers: WorkflowMcpProjection["blockers"] = !remote.enabled || !controllerReady
+      ? [{ code: "remote_controller_unknown" }]
+      : capability === "incomplete"
+        ? [{ code: "remote_request_scope_incomplete" }]
+        : capability === "none"
+          ? [{ code: "remote_request_scope_missing" }]
+          : [];
+  return {
+    schemaVersion: WORKFLOW_READINESS_SCHEMA_VERSION,
+    overall,
+    nextAction,
+    requestContext: {
+      source: "mcp_request",
+      conversationIdentity: "unavailable",
+      remote: capability,
+    },
+    connection: {
+      running: "running",
+      runtimeUpgrade: "unknown",
+      authorization: requestAuthorization(authInfo),
+      connectorContract: CONNECTOR_CONTRACT_VERSION === 1 ? "current" : "unknown",
+      desktopCompatibility: "unknown",
+    },
+    conversation: {
+      mode: "unknown",
+      projectReady: false,
+      chatKnown: false,
+      chatBinding: "none",
+      checkpoint: "none",
+      sessionCorrupt: false,
+    },
+    desktop: {
+      configured: false,
+      enabled: false,
+      currentTarget: "unknown",
+      bindingAvailability: "unknown",
+      unresolvedDelivery: false,
+    },
+    remote,
+    blockers,
+  };
 }

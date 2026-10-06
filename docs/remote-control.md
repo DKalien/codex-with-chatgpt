@@ -1,4 +1,6 @@
-# MCP Remote Control（第三阶段）
+# MCP Remote Control
+
+当前分支新增独立官方入口与明确 target，完整职责和部署边界见[官方投递与 Companion 回流](official-route.md)。`remote enable --official` 选择新模式后，独立 `remote serve` 承担任务及项目读取，Bridge 保留回流；下文的 Bridge 投递与旧工具清单只适用于 legacy 模式。源码实现不代表机器已经切换。
 
 | 模式 | 控制路径 | 在线条件 |
 | --- | --- | --- |
@@ -63,7 +65,7 @@ tests:null、changedFiles:[] 表示 Controller 未自动采集测试与文件列
 
 kind 仅 TASK/ANALYZE/TEST/REVIEW；ID 仅 1–128 位字母数字、下划线、连字符，单段任务文本最多 8192 字符。
 不接受 cwd、shellCommand、argv、rawRpc、model、model_provider、base_url、api_key。
-每 Bridge 只接受其自身 workspaceId；线程必须由本工作区 C2C 创建。只读状态不返回完整输入、transcript 或配置。
+每 endpoint 只接受其自身 workspaceId；目标必须来自本工作区创建记录，或经过本机显式选择、官方 API 核验的已有线程。只读状态不返回完整输入、transcript 或配置；官方 profile 的 `codex_task_result` 单独返回脱敏的最终正文。
 写工具标注 readOnlyHint:false、destructiveHint:true、idempotentHint:true、openWorldHint:true。
 幂等标注依赖持久 ID 去重；底层 thread/start、turn/start 不能盲目重试。
 权限由 _meta.securitySchemes 声明，服务端独立检查，缺权返回 INSUFFICIENT_SCOPE 和 OAuth challenge。
@@ -74,14 +76,14 @@ OAuth codex.control **且** 本地 enabled 才能派发，网页不能启用工�
 
 `%LOCALAPPDATA%\codex-with-chatgpt\remote-control\<workspaceId>.json` 保存 enabled、规范化 root、
 线程请求、任务队列、Controller 心跳及审计元数据；遵循 C2C_STATE_DIR 覆盖。
-目标仅保存在任务记录，审计不复制 prompt 或 token。目录/文件用现有 0700/0600 模式，Windows 另依赖用户目录 ACL。
+目标登记保存精确 workspace/root/thread，任务提交时冻结 targetId，审计不复制 prompt 或 token。旧已创建线程仅在明确提交事务中按原 workspace/client/thread 兼容登记，查询不迁移状态。目录/文件用现有 0700/0600 模式，Windows 另依赖用户目录 ACL。
 修改使用 .lock 短锁、临时文件 fsync + rename。损坏或遗留锁停止操作；先核对锁内 PID，保留 JSON 后人工恢复锁。
 不能删除 JSON 清空历史。相同 requestId/commandId 和参数返回原记录，不同参数或 client 冲突拒绝。
 各类最多 100 queued、10000 历史，满后拒绝，永不淘汰幂等 ID。
 
 每工作区一 Controller、一专属 stdio app-server，同时最多一个 turn，其他任务排队。
 不同工作区独立；手动 Desktop 任务或其他程序不受这个队列的串行限制。
-重启保留 queued，starting/running/awaiting_approval 改为 needs_reconciliation 并占用槽位，禁止重跑。
+重启保留 queued，starting/running/awaiting_approval 改为 needs_reconciliation，禁止同一 thread 重跑；其他已核验 target 可继续排队执行。
 即使创建响应丢失，也保留 requestId：可能有一个需人工认领的线程，但不会重试创建第二个。
 
 ```powershell
@@ -105,12 +107,11 @@ node $c2cLauncher remote reconcile -w $c2cWorkspace --task <taskId> --confirm-st
 ```
 
 reconcile 要求旧 Controller PID 退出，只将待核对记录结束为 cancelled 并保留 ID，不重跑。
-执行记录是队列终态的投影，崩溃可能重复一条 summary，但不会重复执行任务。
-最终回答只在当前 Controller 内短暂缓存，崩溃后可能缺该条 execution_output，任务历史仍保留。
+执行记录、输出和官方 Result Bus 都是持久化终态的幂等投影；按 task/command/turn 精确核验，冲突停止，不重复派发。最终回答在收到匹配的 thread/turn 证据后脱敏持久保存；已持久化终态可恢复投影，尚未观察到终态的中断仍保持待核验。
 
 ## 实际协议与限制
 
-本机 codex-cli 0.148.0 / 0.153.4 的 `codex app-server generate-ts` 用于核对类型，真实任务使用 0.153.4。
+早期验证使用 codex-cli 0.148.0 / 0.153.4；2026-10-05 隔离实验已核对 0.160.0 并验证网页官方投递及 Desktop 接管，详见[实验记录](../experiments/official-dispatch/README.md)。这些是历史实测版本，不代替部署时读取实际可执行文件身份。
 启动 `codex app-server --stdio`，JSONL JSON-RPC initialize / initialized 后：
 thread/start `{cwd}` → thread/resume `{threadId}`（跨 Controller 恢复时）→ turn/start `{threadId,input}`。
 核对响应 cwd。模型/provider、sandbox、approval 继承本机配置，项目 AGENTS.md 由 Codex 正常发现。

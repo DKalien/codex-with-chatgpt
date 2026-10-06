@@ -111,7 +111,8 @@
     for (const step of steps) el("timeline").append(text("li", step));
     el("execution-results").replaceChildren();
     el("execution-result").hidden = true;
-    for (const execution of row.executions) {
+    const readableResults = row.appServerTurn?.resultId ? [{ iteration: 1 }] : row.executions;
+    for (const execution of readableResults) {
       const resultButton = text("button", `读取第 ${execution.iteration} 次执行结果`, "quiet");
       resultButton.type = "button";
       resultButton.disabled = !view.serviceFresh || response?.web?.verified !== true;
@@ -159,12 +160,13 @@
       if (event.status === "queued") button(`取消第 ${event.iteration} 次回流`, "cancel_return", event.eventId);
       if (event.status === "reserved") button(`重新排队第 ${event.iteration} 次回流`, "requeue_return", event.eventId);
     }
-    button("预览清理本地记录", "cleanup");
+    button("预览清理本地记录", "cleanup", null, !row.appServerTurn, "官方任务保留幂等身份；此处不能通过清除记录授权重发");
     el("action-note").textContent = row.feedback.some(item => ["claimed", "outcome_unknown"].includes(item.status))
       ? "此任务存在已经开始或结果不明的回流，不能重新排队。保留原 attempt，先核验网页或使用本机行政处置入口。"
       : row.issues.length ? "残留锁不会由面板自动修复。清理若被阻止，会保留全部证据并显示原因。" : "清理前请核对任务；取消回流不撤回 Codex 已执行的工作。";
     el("identities").replaceChildren();
     const identities = [["commandId", row.commandId], ["deliveryId", row.delivery.deliveryId],
+      ...(row.appServerTurn ? [["targetId", row.appServerTurn.targetId], ["threadId", row.appServerTurn.threadId], ["turnId", row.appServerTurn.turnId]] : []),
       ...row.executions.flatMap(item => [["resultId", item.resultId], ["outputId", item.outputId]]),
       ...row.feedback.flatMap(item => [["eventId", item.eventId], ["attemptId", item.attemptId]])];
     for (const [key, value] of identities) if (value != null) el("identities").append(text("dt", key), text("dd", value));

@@ -13,6 +13,8 @@
   const issueLabels = { cleanup_pending: "清理事务待收敛", empty_lifecycle_lock: "空生命周期锁，需人工核验", lifecycle_lock_present: "存在生命周期锁，所有者待核验",
     repair_fence_present: "存在修复隔离标记", lifecycle_state_unreadable: "生命周期证据不可读", delivery_identity_conflict: "投递身份冲突" };
   const administrativeLabels = { abandoned: "已行政结束等待", retired: "已行政退役", resolved_unknown: "已接受结果不明并结束等待" };
+  const turnLabels = { queued: "已排队", starting: "正在派发", running: "执行中", completed: "turn 已结束 · 待 Review",
+    failed: "turn 失败", cancelled: "已取消或中断", awaiting_approval: "等待本机审批", needs_reconciliation: "官方会话待核验" };
   function row(command, journal) {
     const feedback = (command.feedback ?? []).map(event => ({ ...event,
       label: event.isolated === true ? "本条已隔离 · 未确认送达 · 后续继续"
@@ -21,21 +23,25 @@
           ? "网页已观察 · 待确认" : feedbackLabels[event.status] ?? "回流状态未知" }));
     const executions = command.executions ?? [];
     const needsAttention = ["rejected", "outcome_unknown"].includes(command.delivery?.status)
+      || ["failed", "awaiting_approval", "needs_reconciliation"].includes(command.appServerTurn?.status)
       || executions.some(result => result.status !== "ok")
       || feedback.some(event => event.isolated === true || ["outcome_unknown", "retired_unknown"].includes(event.status))
       || command.delivery?.queueStatus === "blocked"
       || (command.issues ?? []).length > 0
       || command.scope === "historical" && command.delivery?.status === "accepted" && !executions.length && !command.administrative;
     return { ...command, feedback, executions, needsAttention,
-      active: !command.administrative && command.delivery?.status !== "cancelled" && !needsAttention && (!feedback.length || feedback.some(event => !["observed", "cancelled", "retired_unknown"].includes(event.status))),
+      active: !command.administrative && command.delivery?.status !== "cancelled" && !needsAttention
+        && (feedback.length ? feedback.some(event => !["observed", "cancelled", "retired_unknown"].includes(event.status)) : command.appServerTurn?.status !== "cancelled"),
       scopeLabel: command.scope === "current" ? "当前对话" : command.scope === "current_target" ? "当前 Codex 目标" : "历史遗留",
       issueLabels: (command.issues ?? []).map(issue => issueLabels[issue] ?? issue),
       administrativeLabel: administrativeLabels[command.administrative] ?? null,
-      deliveryLabel: command.delivery?.queueStatus === "queued" ? "已排队 · 等待 Codex 处理"
+      deliveryLabel: command.appServerTurn ? `官方 App Server · ${turnLabels[command.appServerTurn.status] ?? "待核验"}`
+        : command.delivery?.queueStatus === "queued" ? "已排队 · 等待 Codex 处理"
         : command.delivery?.queueStatus === "dispatching" ? "正在派发"
           : command.delivery?.queueStatus === "blocked" ? `派发受阻 · ${command.delivery.queueReason ?? "需核验"}`
             : deliveryLabels[command.delivery?.status] ?? "送达未确认",
-      executionLabel: executions.length ? executions.map(result => `第 ${result.iteration} 次 · ${resultLabels[result.status] ?? "未知"}`).join("；") : "执行未确认",
+      executionLabel: command.appServerTurn ? `${turnLabels[command.appServerTurn.status] ?? "待核验"}；测试结果未判定`
+        : executions.length ? executions.map(result => `第 ${result.iteration} 次 · ${resultLabels[result.status] ?? "未知"}`).join("；") : "执行未确认",
       feedbackLabel: feedback.length ? [...new Set(feedback.map(event => event.label))].join("；") : "尚无回流证据" };
   }
   function derive(response, now = Date.now()) {

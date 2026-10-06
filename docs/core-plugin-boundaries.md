@@ -1,8 +1,10 @@
 # 核心与插件职责边界
 
-2026-10-05 的职责增量见 [双向消息收件箱](agent-mailbox.md)：Routing 负责持久接收和排队，既有安全 sender 负责真实投递，Result Bus 负责 canonical 结果，Companion 保存逐条 DOM attempt 证据。busy 不拒收，单条 unknown 可隔离；所有权和原请求防重放仍核验。当前为未部署源码开发，下方部署事实是此前阶段记录。
+当前分支的新边界见[官方路线](official-route.md)：Remote store/controller 负责精确执行目标与官方 turn；独立 MCP 负责项目读取与接单；Bridge 在显式 official 模式保留反馈连接和投递结果，Companion 保留网页安全发送证据。该单 workspace 模式于 08:31 完成 live 闭环验收；09:01 新鲜观察为 Bridge stopped，后续未恢复。多 workspace 统一 Gateway 和旧 feedback 插件整合仍未实现，现役后续计划见[统一 Gateway 计划](unified-gateway-plan.md)。下面记录的 Desktop mailbox 是兼容路径。
 
-日期：2026-10-04。B0/B1/B2/B4/B5 对应源码已落地，B3 已评估并决定不迁移 SQLite；安装、扩展现场验收与未完成场景以 [开发计划当前事实](development-plan.md#当前事实与开发阶段2026-10-04-2144asiashanghai) 为唯一快照。Supervisor foundation 随 Core 部署，但真实 Scheduled Task 尚未注册。
+2026-10-05 的职责增量见 [双向消息收件箱](agent-mailbox.md)：Routing 负责持久接收和排队，既有安全 sender 负责真实投递，Result Bus 负责 canonical 结果，Companion 保存逐条 DOM attempt 证据。busy 不拒收，单条 unknown 可隔离；所有权和原请求防重放仍核验。此段“未部署源码开发”是当时快照；其后单 workspace official route 于 08:31 完成 live 闭环，09:01 Bridge fresh observation 为 stopped。当前运行状态和后续阶段以[统一 Gateway 计划](unified-gateway-plan.md)为准。
+
+日期：2026-10-04。B0/B1/B2/B4/B5 对应源码已落地，B3 已评估并决定不迁移 SQLite；安装、扩展现场验收与未完成场景以[统一 Gateway 计划](unified-gateway-plan.md)中的最新观察为准。Supervisor foundation 随 Core 部署，但真实 Scheduled Task 尚未注册。
 
 第1–9节描述设计约束及已采纳边界；第10–15节保留各轮实施和现场证据，后续完成状态覆盖其中当轮“未部署/待验证”的表述。[现有架构](architecture.md)说明主链，[R5 endpoint 合同](r5-endpoint-architecture.md)说明协议。未实施的数据库迁移或后续生命周期场景不能因设计文字视为完成。
 

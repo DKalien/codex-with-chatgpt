@@ -12,7 +12,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const phases = ['packaging', 'serial', 'parallel'];
 // Current exhaustive inventory, including the supervisor foundation regressions.
 // R5j remains deferred; this is a coverage guard, not candidate acceptance evidence.
-export const expectedTests = 3403;
+export const expectedTests = 3435;
 export const hashFile = file => createHash('sha256').update(fs.readFileSync(file)).digest('hex');
 
 export function treeSnapshot(directory, prefix = '') {

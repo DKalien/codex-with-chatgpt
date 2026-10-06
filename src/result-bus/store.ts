@@ -3,7 +3,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { ensureDir, getStateDir } from "../config/paths.js";
 import { resolveWorkspaceIdentity, type RoutingWorkspaceIdentity } from "../routing/store.js";
-import { canonicalRoutingResultDigest } from "../routing/execution-result-digest.js";
+import { resultBusResultDigest, type OfficialResult } from "./official-result.js";
 import { routingCommandIdSchema, routingWorkspaceIdSchema, type RoutingResult } from "../routing/schema.js";
 import { resultBusEntryId, resultBusEntrySchema, resultBusStateSchema, type ResultBusEntry, type ResultBusState } from "./schema.js";
 import { isEphemeralCommand } from "../command-cleanup/ownership.js";
@@ -116,9 +116,9 @@ function withLock<T>(identity: RoutingWorkspaceIdentity, stateDir: string, fn: (
   }
 }
 
-function canonicalEntry(identity: RoutingWorkspaceIdentity, result: RoutingResult, stateDir: string): ResultBusEntry {
+function canonicalEntry(identity: RoutingWorkspaceIdentity, result: RoutingResult | OfficialResult, stateDir: string): ResultBusEntry {
   const parsedCommandId = routingCommandIdSchema.parse(result.commandId);
-  const digest = canonicalRoutingResultDigest(result);
+  const digest = resultBusResultDigest(result);
   const now = new Date().toISOString();
   return resultBusEntrySchema.parse({
     version: 1,
@@ -180,7 +180,7 @@ export function listResultBusEntries(identity: RoutingWorkspaceIdentity, stateDi
   return readResultBus(identity, stateDir)?.entries ?? [];
 }
 
-export function enqueueResultBusEntry(identity: RoutingWorkspaceIdentity, result: RoutingResult, stateDir = getStateDir()): { entry: ResultBusEntry; replayed: boolean } {
+export function enqueueResultBusEntry(identity: RoutingWorkspaceIdentity, result: RoutingResult | OfficialResult, stateDir = getStateDir()): { entry: ResultBusEntry; replayed: boolean } {
   const resolved = resolveWorkspaceIdentity(identity);
   return withCommandOperation(resolved.id, result.commandId, () => {
   const expected = canonicalEntry(resolved, result, stateDir);

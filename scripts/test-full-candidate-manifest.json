@@ -471,6 +471,24 @@
       "sha256": "7356b357dbc42661d74c758917c981e68a400a63d6d871e1cf506dc79cee5ade"
     },
     {
+      "file": "tests/official-gateway.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "6e13b90d106adf10231efc4944deb69e0664640ea4058367d96362c0858e1f9a"
+    },
+    {
+      "file": "tests/official-results.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "30d077c7d511191631b3aa1d4ee944cbe78a77e177c03d52b73272cc1a018a88"
+    },
+    {
+      "file": "tests/official-runtime.test.ts",
+      "group": "parallel",
+      "dist": "none",
+      "sha256": "b61072ccf29afacc5efa2439eddc26dad9b265deaeee7ebc0252759fa146ac0b"
+    },
+    {
       "file": "tests/output-atomicity.test.ts",
       "group": "parallel",
       "dist": "none",
@@ -522,7 +540,7 @@
       "file": "tests/r45f-architecture.test.ts",
       "group": "parallel",
       "dist": "none",
-      "sha256": "ff729f72f8b403fe467bf20548b8bd92065b21fa39ba1ef2eb64dc6565f9c0a9"
+      "sha256": "d7eb3d193bf84e8c346060425f0ea565b4ad00c83c25ed2ac1be2b6de9b8485f"
     },
     {
       "file": "tests/r5-endpoint-architecture.test.ts",
@@ -636,7 +654,7 @@
       "file": "tests/r5d3-result-bus-cutover.test.ts",
       "group": "parallel",
       "dist": "none",
-      "sha256": "6cd9ecf6b70fe1131de9baa512c77ca7a75223d43bd4c36c9f026c5935309fbe"
+      "sha256": "4e8b0059cd55c58f0e59e25d44ba9eb6c014daa44bf2124baa0561e940bf65e1"
     },
     {
       "file": "tests/r5e-architecture.test.ts",
@@ -738,7 +756,7 @@
       "file": "tests/remote-control.test.ts",
       "group": "parallel",
       "dist": "none",
-      "sha256": "a58caef9d95c33acd9db2a971cc95e4aa93845572b95706bfd58deb363e779a3"
+      "sha256": "dc60aa753c8db38b27cb5bdd099d9cb93c83f014a63143fbba921938070435a8"
     },
     {
       "file": "tests/rollout.test.ts",
@@ -864,7 +882,7 @@
       "file": "tests/test-full-candidate.test.ts",
       "group": "parallel",
       "dist": "none",
-      "sha256": "fdf77076d128f098b28c6bf2740816dfabc3b5e0369dc90a3c7b88fe4decbbad"
+      "sha256": "124689460d637a9bc6e32668a64f5e1bf07584970b21f37137180f7fe855c654"
     },
     {
       "file": "tests/tunnel.test.ts",
@@ -981,7 +999,7 @@
     "scripts/measure-core-release.cjs": "a284cfe2f9b4c932196e5f072207c6a3cc60fa26bfde98e7f503d7d838946df7",
     "scripts/poc-client.mjs": "7d2f02e98c62b1a574f42ecdcfa5142c25d2ad420b3d005cd30d64cd0147c1da",
     "scripts/test-full-candidate-reporter.mjs": "ed9ffb26880b12cee89dbb16997cfb47f57c77cfccd698a7598298fc5890fbba",
-    "scripts/test-full-candidate.mjs": "c642b9d31de7f00ae43ddfad6938beb2ca3b634913e081ee569302190257047a",
+    "scripts/test-full-candidate.mjs": "dfbc508eea570ff035f3c5e64f7096e2ef66e617a07a24a5451c1b832769efdb",
     "scripts/update-upstream-track.ps1": "4f4b2cbca4dff0b69810b388646d74d7658ad01605fa022d62e0fc829f0c2ea1",
     "scripts/write-build-id.mjs": "9df9fe47d6499d89931ba3dce7e77410c58598ad70fe1728ce14caf83f6af7cf",
     "tests/daemon_spawn_protocol_test.py": "fa9ab2663dc2f8592e7440f309a81d01cd99d6b519c41acbf28243d0537fa38c",

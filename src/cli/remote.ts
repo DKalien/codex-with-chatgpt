@@ -1,4 +1,4 @@
-import type { Command } from "commander";
+import { InvalidArgumentError, type Command } from "commander";
 import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
@@ -8,7 +8,8 @@ import { ensureDir, getStateDir } from "../config/paths.js";
 import { findBridgeObservation } from "../bridge/runtime.js";
 import { adminFetch } from "../process/daemon.js";
 import { RemoteController, processAlive } from "../remote/controller.js";
-import { authorized, controllerOnline, readRemote, remoteFile, RemoteError, setRemoteEnabled, updateRemote } from "../remote/store.js";
+import { authorized, controllerOnline, enqueueTargetSelection, isOfficialRemoteMode, readRemote, remoteFile, RemoteError, setRemoteEnabled, updateRemote } from "../remote/store.js";
+import { startOfficialRemoteServer } from "../remote/server.js";
 
 export function remoteStatus(workspaceId: string) {
   const state = readRemote(workspaceId);
@@ -29,13 +30,57 @@ async function status(workspace: Workspace) {
 }
 export function registerRemoteCommands(program: Command): void {
   const remote = program.command("remote").description("本地授权和检查跨设备 MCP Remote Control");
-  for (const action of ["enable", "disable", "status"] as const) {
+  remote.command("enable").option("-w, --workspace <path>").option("--official", "启用官方 MCP Remote 投递模式").option("--json").action(async opts => {
+    const workspace = new Workspace(opts.workspace ?? process.cwd());
+    setRemoteEnabled(workspace, true, opts.official ? { deliveryMode: "official" } : undefined);
+    process.stdout.write(JSON.stringify(await status(workspace), null, opts.json ? undefined : 2) + "\n");
+  });
+  for (const action of ["disable", "status"] as const) {
     remote.command(action).option("-w, --workspace <path>").option("--json").action(async opts => {
       const workspace = new Workspace(opts.workspace ?? process.cwd());
-      if (action !== "status") setRemoteEnabled(workspace, action === "enable");
+      if (action === "disable") setRemoteEnabled(workspace, false);
       process.stdout.write(JSON.stringify(await status(workspace), null, opts.json ? undefined : 2) + "\n");
     });
   }
+
+  remote.command("serve").description("启动独立官方 MCP 服务；只绑定 loopback，不创建 Tunnel")
+    .requiredOption("-w, --workspace <path>")
+    .requiredOption("--port <port>", "loopback 监听端口", parsePort)
+    .requiredOption("--public-url <url>", "由操作者明确配置的 HTTPS OAuth metadata 公网地址")
+    .action(async (opts: { workspace: string; port: number; publicUrl: string }) => {
+      const service = await startOfficialRemoteServer({ workspaceRoot: opts.workspace, port: opts.port, publicUrl: opts.publicUrl });
+      process.stdout.write(`Official MCP ready at ${service.localBaseUrl()}/mcp\n`);
+      process.stdout.write(`OAuth public URL: ${service.publicUrl}\n`);
+      process.stdout.write(`Local pairing code: ${service.pairingCode} (expires ${new Date(service.pairingExpiresAt).toISOString()})\n`);
+      const stop = (): void => {
+        process.off("SIGINT", stop);
+        process.off("SIGTERM", stop);
+        void service.close();
+      };
+      process.once("SIGINT", stop);
+      process.once("SIGTERM", stop);
+    });
+
+  const target = remote.command("target").description("查看或显式选择本机 Codex target");
+  target.command("list").option("-w, --workspace <path>").option("--json").action(opts => {
+    const workspace = new Workspace(opts.workspace ?? process.cwd());
+    const state = readRemote(workspace.id);
+    const result = {
+      hostId: "local",
+      workspaceId: workspace.id,
+      workspaceRoot: workspace.root,
+      controller: state && controllerOnline(state) ? state.controller!.appServer : "offline",
+      targets: state?.targets ?? [],
+    };
+    process.stdout.write(JSON.stringify(result, null, opts.json ? undefined : 2) + "\n");
+  });
+  target.command("select").option("-w, --workspace <path>").requiredOption("--thread <id>").requiredOption("--request <id>").option("--json")
+    .action(opts => {
+      const workspace = new Workspace(opts.workspace ?? process.cwd());
+      if (!isOfficialRemoteMode(workspace.id)) throw new RemoteError("OFFICIAL_MODE_REQUIRED");
+      const queued = enqueueTargetSelection(workspace.id, { workspaceId: workspace.id, threadId: opts.thread, requestId: opts.request });
+      process.stdout.write(JSON.stringify({ accepted: true, ...queued }, null, opts.json ? undefined : 2) + "\n");
+    });
   remote.command("reconcile").description("仅在人工确认旧执行已停止后，保留 ID 并结束待核对记录")
     .option("-w, --workspace <path>").option("--task <taskId>").option("--request <requestId>")
     .requiredOption("--confirm-stopped", "确认已在本机核对旧 Codex 执行已停止")
@@ -105,4 +150,11 @@ export function registerRemoteCommands(program: Command): void {
   controller.command("status").option("-w, --workspace <path>").option("--json").action(async opts => {
     process.stdout.write(JSON.stringify(await status(new Workspace(opts.workspace ?? process.cwd())), null, opts.json ? undefined : 2) + "\n");
   });
+}
+
+function parsePort(value: string): number {
+  if (!/^\d+$/.test(value)) throw new InvalidArgumentError("port must be an integer from 0 to 65535");
+  const port = Number(value);
+  if (!Number.isSafeInteger(port) || port > 65535) throw new InvalidArgumentError("port must be an integer from 0 to 65535");
+  return port;
 }

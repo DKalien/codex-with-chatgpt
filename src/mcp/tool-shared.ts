@@ -7,6 +7,7 @@ import type { ConnectionRuntimeUpgrade } from "../workflow/readiness-model.js";
 import type { CommandMailboxSubmit } from "../routing/mailbox.js";
 
 export interface McpContext {
+  profile?: "legacy" | "official" | "feedback";
   commandMailbox?: CommandMailboxSubmit;
   workspace: Workspace;
   logger: Logger;
