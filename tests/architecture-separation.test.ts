@@ -21,7 +21,8 @@ describe("task delivery / feedback return architecture boundary", () => {
     for (const file of files) {
       const source = fs.readFileSync(file, "utf8");
       const relative = path.relative(companionRoot, file).replaceAll(path.sep, "/");
-      const taskSymbolSource = source.replace("不调用 codex_desktop_send，不执行开发任务。", "");
+      // Legacy 和 workspace-bound 固定 bootstrap 都包含同一句禁止任务投递的提示。
+      const taskSymbolSource = source.replaceAll("不调用 codex_desktop_send，不执行开发任务。", "");
       expect(taskSymbolSource, relative).not.toMatch(/\b(?:codex_desktop_send|deliverCurrentCommand|sendDesktop)\b/);
       expect(source, relative).not.toMatch(/(?:from\s*|import\s*\()\s*["'][^"']*(?:\/(?:src\/)?(?:desktop|routing)\/|\/current-command(?:-transport)?(?:\.|\/|["']))[^"']*["']/i);
       expect(source, relative).not.toMatch(/["'`][^"'`]*(?:\/api\/(?:desktop|command|task|routing)|thread-follower-start-turn|thread\/start|turn\/start)[^"'`]*/i);

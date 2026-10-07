@@ -159,12 +159,22 @@ describe("Browser Companion action indicator", () => {
 
   it("service worker wires refresh to hydration, messages, startup, install, and tab removal", () => {
     const sw = fs.readFileSync(path.join(root, "service-worker.js"), "utf8");
+    const projectContext = fs.readFileSync(path.join(root, "project-context.js"), "utf8");
     expect(sw).toContain("createCompanionIndicatorApplier");
     expect(sw).toContain("void refreshActionIndicator();");
-    expect(sw).toMatch(/onMessage\.addListener[\s\S]*refreshActionIndicator/);
-    expect(sw).toMatch(/onRemoved\.addListener[\s\S]*refreshActionIndicator/);
-    expect(sw).toMatch(/onInstalled\.addListener[\s\S]*refreshActionIndicator/);
-    expect(sw).toMatch(/onStartup\.addListener[\s\S]*refreshActionIndicator/);
+    const afterMessageStart = sw.indexOf("async function afterMessage(type)");
+    const afterMessageEnd = sw.indexOf("\nreturn {", afterMessageStart);
+    expect(sw.slice(afterMessageStart, afterMessageEnd)).toMatch(/refreshActionIndicator\(\)/);
+    expect(sw.slice(afterMessageStart, afterMessageEnd)).toMatch(/syncWakeWatchdog\(\)/);
+    expect(projectContext).toMatch(/await context\.afterMessage\?\.\(message\.type\)/);
+    expect(sw).toMatch(/globalThis\.chrome\.runtime\.onMessage\.addListener\([\s\S]*projectRouter\.handle\(message, sender\)/);
+    expect(sw).toMatch(/async function handleTabRemoved\(tabId\)[\s\S]*await refreshActionIndicator\(\)/);
+    expect(sw).toMatch(/async function handleInstalled\(\)[\s\S]*await refreshActionIndicator\(\)/);
+    expect(sw).toMatch(/async function handleStartup\(\)[\s\S]*await refreshActionIndicator\(\)/);
+    expect(projectContext).toMatch(/dispatchToProjects\("handleTabRemoved", tabId\)/);
+    expect(sw).toMatch(/globalThis\.chrome\.tabs\?\.onRemoved\?\.addListener\([\s\S]*projectRouter\.handleTabRemoved\(tabId\)/);
+    expect(sw).toMatch(/globalThis\.chrome\.runtime\.onInstalled\?\.addListener\([\s\S]*projectRouter\.handleInstalled\(details\)/);
+    expect(sw).toMatch(/globalThis\.chrome\.runtime\.onStartup\?\.addListener\([\s\S]*projectRouter\.handleStartup\(\)/);
     expect(sw).toContain("chrome.permissions?.contains");
     expect(sw).not.toContain("chrome.permissions.request");
   });

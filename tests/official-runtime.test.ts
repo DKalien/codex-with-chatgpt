@@ -236,7 +236,7 @@ describe("official App Server controller", () => {
     } finally { controller.stop(); await running; }
   });
 
-  it("崩溃重启从 task 持久正文投影一次，不重复 execution record/output", async () => {
+  it("投影中断并确认关闭后重启从 task 持久正文投影一次，不重复 execution record/output", async () => {
     ready(); const targetId = addTarget("thread-1", "owner");
     const task = enqueueTask(workspace.id, taskInput("restart-project", targetId, "thread-1"), "owner");
     const fake = new FakeAppServer(), failed = new RemoteController(workspace, fake as any, { projectResult: () => { throw new Error("projection interrupted"); } });
@@ -251,7 +251,7 @@ describe("official App Server controller", () => {
     expect(saved.resultProjected).toBeUndefined();
     expect(readExecutionRecords(workspace.id, 100).filter(item => item.taskId === task.taskId)).toHaveLength(1);
     expect(readExecutionOutputMetadataStrict(workspace.id).filter(item => item.taskId === task.taskId)).toHaveLength(1);
-    updateRemote(workspace.id, state => { state!.controller!.pid = 99999999; return { state: state!, result: undefined }; });
+    expect(readRemote(workspace.id)!.controller).toBeUndefined();
     let attempts = 0;
     const restarted = new RemoteController(workspace, new FakeAppServer() as any, { projectResult: (_workspace, projected) => {
       attempts++; expect(projected.finalResponse?.text).toBe("durable final body");
@@ -314,7 +314,7 @@ describe("official App Server controller", () => {
       });
     } finally { controller.stop(); await running; }
 
-    updateRemote(workspace.id, state => { state!.controller!.pid = 99999999; return { state: state!, result: undefined }; });
+    expect(readRemote(workspace.id)!.controller).toBeUndefined();
     const restartedFake = new FakeAppServer(), restarted = new RemoteController(workspace, restartedFake as any), restartRun = restarted.run();
     try {
       await until(() => readRemote(workspace.id)!.controller?.appServer === "running");
@@ -348,7 +348,7 @@ describe("official App Server controller", () => {
       expect(entry.resultSha256).toBe(resultBusResultDigest(entry.result as any));
       controller.stop(); await running;
 
-      updateRemote(workspace.id, state => { state!.controller!.pid = 99999999; return { state: state!, result: undefined }; });
+      expect(readRemote(workspace.id)!.controller).toBeUndefined();
       const restartedFake = new FakeAppServer(), restarted = new RemoteController(workspace, restartedFake as any), restartRun = restarted.run();
       try {
         await until(() => readRemote(workspace.id)!.controller?.appServer === "running");

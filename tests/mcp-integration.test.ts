@@ -3,7 +3,7 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { StreamableHTTPClientTransport } from "./sdk-http-fixture.js";
 import { startBridge, type Bridge } from "../src/bridge/server.js";
 import { appendExecutionRecord } from "../src/execution/records.js";
 import { SUPPORTED_SCOPES } from "../src/auth/store.js";
@@ -482,10 +482,10 @@ describe("MCP tools over Streamable HTTP", () => {
 
   it("mutating feedback reconciliation entrypoints remain workspace-root aware and status stays read-only", () => {
     const source = fs.readFileSync(path.resolve(process.cwd(), "src/mcp/feedback.ts"), "utf8");
-    expect(source).toContain("reconcileFeedbackOutbox(workspace.id, undefined, workspace.root)");
+    expect(source).toContain("reconcileFeedbackOutbox(input.workspace.id, input.stateDir, input.workspace.root)");
     expect(source).not.toMatch(/reconcileFeedbackOutbox\(workspace\.id\)\s*[;)]/);
     const reconciledTools = source.split("server.registerTool(").slice(1)
-      .filter(tool => tool.includes("reconcileWorkspaceFeedback();"))
+      .filter(tool => tool.includes("claimNextForMcp({"))
       .map(tool => /^\s*"([^"]+)"/.exec(tool)?.[1]);
     expect(reconciledTools).toEqual([
       "feedback_claim_next",

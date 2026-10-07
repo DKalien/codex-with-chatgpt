@@ -1,5 +1,11 @@
 (() => {
   const el = id => document.getElementById(id);
+  const workspaceId = typeof location === "undefined" ? null : new URL(location.href).searchParams.get("workspaceId");
+  const send = message => workspaceId === null
+    ? chrome.runtime.sendMessage(message)
+    : /^[a-f0-9]{12}$/.test(workspaceId)
+      ? chrome.runtime.sendMessage({ ...message, workspaceId })
+      : Promise.resolve({ ok: false, reason: "workspace_selection_invalid" });
   let response = null;
   let filter = "all";
   let page = 0;
@@ -61,7 +67,7 @@
       const item = text("button", `核验并收敛 ${operation.commandId} 的本地操作`, "quiet"); item.type = "button";
       item.disabled = !permission.enabled || actionPending;
       item.onclick = async () => {
-        const result = await chrome.runtime.sendMessage({ type: "c2c.operations.action", phase: "reconcile", requestId: operation.requestId }).catch(() => null);
+        const result = await send({ type: "c2c.operations.action", phase: "reconcile", requestId: operation.requestId }).catch(() => null);
         el("operation-status").textContent = result?.status === "completed" ? "已证明本地操作的目标状态并收敛记录；未重新执行操作。" : `证据仍不足：${result?.reason ?? result?.status ?? "unknown"}；原记录保持待核验。`;
         await refresh();
       };
@@ -122,7 +128,7 @@
         el("execution-result").hidden = false;
         el("execution-result").textContent = "正在读取当前 verified route 可见的 canonical 结果…";
         try {
-          const reply = await chrome.runtime.sendMessage({ type: "c2c.operations.result.read", commandId: row.commandId, iteration: execution.iteration });
+          const reply = await send({ type: "c2c.operations.result.read", commandId: row.commandId, iteration: execution.iteration });
           if (!reply?.ok) {
             const reason = reply?.reason === "COMPANION_RESULT_HISTORICAL_REFUSED"
               ? "此结果冻结到其他 verified route，服务端拒绝显示历史摘要。"
@@ -186,7 +192,7 @@
     if (actionPending) return;
     actionPending = true; render();
     try {
-      const result = await chrome.runtime.sendMessage({ type: "c2c.operations.action", phase: "preview", request });
+      const result = await send({ type: "c2c.operations.action", phase: "preview", request });
       if (!result?.ok) throw new Error(result?.reason ?? "preview_failed");
       actionPreview = result;
       el("confirm-task").textContent = request.commandId;
@@ -203,7 +209,7 @@
     actionPending = true; el("confirm-action").disabled = true;
     const preview = actionPreview; actionPreview = null; el("confirm-dialog").close(); render();
     try {
-      const result = await chrome.runtime.sendMessage({ type: "c2c.operations.action", phase: "confirm", request: preview.request,
+      const result = await send({ type: "c2c.operations.action", phase: "confirm", request: preview.request,
         confirmationSha256: preview.confirmationSha256, confirmed: true });
       el("operation-status").textContent = result?.ok && result.status === "completed" ? "本地操作已完成。外部任务及消息状态请以详情中的证据为准。"
         : actionReasons[result?.reason] ?? `操作待核验：${result?.reason ?? result?.status ?? "unknown"}。请保留 requestId ${preview.request.requestId}。`;
@@ -212,7 +218,7 @@
   };
   el("check-operation").onclick = async () => {
     try {
-      const result = await chrome.runtime.sendMessage({ type: "c2c.operations.action", phase: "check", ...(selected ? { commandId: selected } : {}) });
+      const result = await send({ type: "c2c.operations.action", phase: "check", ...(selected ? { commandId: selected } : {}) });
       el("operation-status").textContent = result?.ok && result.status === "completed" ? "已核验上次本地操作完成。"
         : result?.status === "none" ? "没有待核验的本地操作。" : `上次操作：${result?.status ?? result?.reason ?? "unknown"}；未重新执行。`;
     } catch { el("operation-status").textContent = "无法核验上次操作；未重新执行。"; }
@@ -223,7 +229,7 @@
     pending = true; el("refresh").disabled = true; clearTimeout(timer);
     let deadline;
     try {
-      response = await Promise.race([chrome.runtime.sendMessage({ type: "c2c.operations.read" }),
+      response = await Promise.race([send({ type: "c2c.operations.read" }),
         new Promise(resolve => { deadline = setTimeout(() => resolve({ ok: false, reason: "query_timeout" }), 20_000); })]);
       failures = response?.ok ? 0 : Math.min(failures + 1, 2);
     } catch { response = { ok: false, reason: "extension_unavailable" }; failures = Math.min(failures + 1, 2); }

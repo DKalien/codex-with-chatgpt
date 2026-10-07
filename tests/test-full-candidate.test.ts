@@ -14,9 +14,27 @@ function tmp() { const dir = makeTmpDir("candidate-runner"); dirs.push(dir); ret
 afterEach(async () => { vi.restoreAllMocks(); vi.useRealTimers(); await cleanupStrict(...dirs.splice(0)); });
 const manifest = () => JSON.parse(fs.readFileSync("scripts/test-full-candidate-manifest.json", "utf8"));
 
+function inventoryFixture() {
+  const directory = tmp(), value = manifest();
+  for (const entry of value.files) {
+    write(directory, entry.file, entry.file);
+    entry.sha256 = hashFile(path.join(directory, entry.file));
+  }
+  for (const file of Object.keys(value.support)) {
+    write(directory, file, file);
+    value.support[file] = hashFile(path.join(directory, file));
+  }
+  expect(() => validateInventory(directory, value)).not.toThrow();
+  return { directory, value };
+}
+
 describe("experimental full partition guards", () => {
-  it("exhaustively classifies the current suite with an exclusive writer and OS serial fence", () => {
-    const groups = validateInventory(process.cwd(), manifest());
+  it("rejects the historical candidate until the changed suite receives an independent reaudit", () => {
+    const frozen = manifest();
+    const groups = Object.fromEntries(["packaging", "serial", "parallel"].map(group => [group,
+      frozen.files.filter((entry: { group: string }) => entry.group === group).map((entry: { file: string }) => entry.file).sort(),
+    ]));
+    expect(() => validateInventory(process.cwd(), frozen)).toThrow(/classification|reaudit/);
     expect(groups.packaging).toEqual(["tests/desktop-helper-packaging.test.ts"]);
     expect(groups.serial).toEqual(["bridge-parent-death", "daemon-parent-death", "daemon-spawn", "runtime", "web-control-cli", "windows-process"].map(name => `tests/${name}.test.ts`));
     expect(groups.parallel).toHaveLength(157);
@@ -31,20 +49,20 @@ describe("experimental full partition guards", () => {
     expect(pkg.scripts["test:full:candidate"]).toBe("node scripts/test-full-candidate.mjs");
   });
   it.each(["missing", "duplicate", "new"])("rejects %s classification", kind => {
-    const value = manifest();
+    const { directory, value } = inventoryFixture();
     if (kind === "missing") value.files.pop();
     if (kind === "duplicate") value.files.push(value.files[0]);
     if (kind === "new") value.files.push({ ...value.files[0], file: "tests/unclassified.test.ts" });
-    expect(() => validateInventory(process.cwd(), value)).toThrow("classification");
+    expect(() => validateInventory(directory, value)).toThrow("classification");
   });
   it("changed tests/shared helper scripts require explicit reaudit; a new writer cannot silently join parallel", () => {
     for (const kind of ["test", "support", "writer", "serial"]) {
-      const value = manifest();
+      const { directory, value } = inventoryFixture();
       if (kind === "test") value.files[0].sha256 = "0".repeat(64);
       if (kind === "support") value.support["tests/helpers.ts"] = "0".repeat(64);
       if (kind === "writer") value.files.find(entry => entry.group === "parallel").dist = "write";
       if (kind === "serial") value.files.find(entry => entry.file === "tests/runtime.test.ts").group = "parallel";
-      expect(() => validateInventory(process.cwd(), value)).toThrow();
+      expect(() => validateInventory(directory, value)).toThrow();
     }
   });
   it("counts actual files/cases; missing/duplicate/extra execution and skipped/error results fail", () => {

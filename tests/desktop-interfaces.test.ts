@@ -1,7 +1,7 @@
 import { requestHttp } from "./http-json.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { StreamableHTTPClientTransport } from "./sdk-http-fixture.js";
 import { Command } from "commander";
 import fs from "node:fs";
 import path from "node:path";

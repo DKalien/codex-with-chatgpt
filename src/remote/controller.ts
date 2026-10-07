@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { getRuntimeBuildId } from "../build-id.js";
 import { AppServerClient, AppServerRpcError } from "./app-server.js";
 import { withCommandOperation } from "../command-cleanup/fence.js";
 import { CommandCleanupError } from "../command-cleanup/schema.js";
@@ -139,7 +140,7 @@ export class RemoteController {
       if (state.workspaceRoot !== this.workspace.root) throw new RemoteError("UNKNOWN_WORKSPACE");
       if (state.controller && processAlive(state.controller.pid)) throw new RemoteError("WORKSPACE_BUSY", "Controller PID 仍存活，拒绝重复启动。");
       recoverRemote(state);
-      state.controller = { pid: process.pid, instanceId: this.instanceId, heartbeatAt: Date.now(), appServer: "starting" };
+      state.controller = { pid: process.pid, instanceId: this.instanceId, heartbeatAt: Date.now(), appServer: "starting", buildId: getRuntimeBuildId() };
       return { state, result: undefined };
     });
     this.client.on("notification", (event: Event) => {
@@ -174,9 +175,15 @@ export class RemoteController {
       let exited = false;
       try { await this.client.close(); exited = true; }
       finally {
-        this.mutate(state => { recoverRemote(state); state.controller!.appServer = exited ? "offline" : "unknown";
-          if (!exited) state.controller!.error = "CODEX_APP_SERVER_SHUTDOWN_UNCONFIRMED";
-          state.controller!.heartbeatAt = Date.now(); });
+        this.mutate(state => {
+          recoverRemote(state);
+          if (exited && !state.controller!.error) delete state.controller;
+          else {
+            state.controller!.appServer = exited ? "offline" : "unknown";
+            if (!exited) state.controller!.error = "CODEX_APP_SERVER_SHUTDOWN_UNCONFIRMED";
+            state.controller!.heartbeatAt = Date.now();
+          }
+        });
       }
     }
   }

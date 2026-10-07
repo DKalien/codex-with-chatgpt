@@ -1,6 +1,6 @@
 # 长期开发计划
 
-当前单机多 workspace Gateway、单插件整合的唯一现役路线见[统一 Gateway 计划](unified-gateway-plan.md)。本文其余部分保留各阶段历史记录；旧条目的“当前/NEXT”不覆盖该计划与其新鲜运行状态。
+当前单机多 workspace Gateway、单插件整合的现役源码范围与未完成验收见[统一 Gateway 计划](unified-gateway-plan.md)，工具与安全合同见[官方路线](official-route.md)。本文其余部分保留各阶段历史记录；旧条目的“当前/NEXT”、PID 与部署快照只代表标注时点，不证明当前运行状态。
 
 <a id="当前事实与开发阶段2026-10-04-2144asiashanghai"></a>
 

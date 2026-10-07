@@ -1,5 +1,17 @@
 # Security Model
 
+## 机器 Gateway 与逐项目授权（2026-10-07，源码合同）
+
+`gateway serve` 只绑定 loopback；它认证本机 Gateway 的 OAuth client，AuthStore endpoint identity 为 `machine-gateway`，本身不授予任何 workspace。没有 Authorization header 时，Gateway `/mcp` 仅放行 POST `initialize`、`notifications/initialized` 和 `tools/list` 作协议发现；其余请求必须带有效 bearer token。`gateway_list_workspaces` 还要求 `workspace.read`，且只列当前 client 的项目授权。
+
+除 `gateway_list_workspaces` 外，所有 Gateway 项目工具都要求显式 workspaceId。每次调用重新核验 registry 中的 clientId/workspaceId、Workspace canonical root 和对应 tool scope；MCP 不提供登记、扩大或撤销 grant 的工具。Registry 损坏、root retarget、撤销或身份错配都 fail closed，保留项目任务、防重放和结果历史。
+
+机器 OAuth 存储与旧 Bridge/单 workspace 官方 endpoint 分开；`gateway/server.lock` 防止多个运行实例覆盖认证缓存，遗留锁不自动删除。项目内 Remote task status/result/cancel 继续核验原 OAuth client。Feedback principal 由当前请求的 `openai/session` 与 clientId 推导，不接受工具参数；需要 active binding 的操作还要核验其 binding/epoch，接管必须提供 fresh `expectedEpoch`。旧 Connector 的 principal 不会自动转换成新 Gateway client。每个项目仍保留原 scope、Remote enable/official mode、target/task 所属检查、route attestation、Result Bus 与发送状态机；Gateway 不提供 Shell、provider 或审批旁路。
+
+Companion 的项目登记仅保存 workspaceId 与 Bridge origin，不扩大 Gateway allowlist。每项目 local/session/alarm 隔离，加载与 Pair 都核对 transport 的项目身份与 origin；只有确证旧 singleton 身份时复制迁移，未知或冲突停止并保留 attempt 历史。迁移先建立 TRUSTED_CONTEXTS；失败停止业务操作并尝试净化 transport credential，不声称无法清理的凭据已删除。Grant Bridge access 是唯一权限请求入口，Pair/Pair+Connect 缺已有权限时不获取 proof、不调用 /pair。生产回调固定发送原 workspace/tab/document；Popup 异步操作捕获项目身份，手动操作期间锁定所选项目，迟到状态读取不得覆盖新选择，切项目清空临时结果显示。存储失败不提交内存登记或选择。
+
+上述为源码边界，不表示机器部署或双项目真实网页验收已完成；阶段状态见[统一 Gateway 计划](unified-gateway-plan.md)。
+
 ## 消息收件箱与单条隔离（2026-10-05，源码开发）
 
 [双向消息收件箱](agent-mailbox.md) 在当前授权范围内保存排队正文和 token 的 hash 引用，原始 bearer 不落盘，正文不会进入公开 status、任务元数据或日志。入队事务校验正文 UTF-8 长度/hash、MCP 对话主体与 frozen target；投递提交点仍重新验证 OAuth、enable 和 owner。重启的 dispatching 不回到 queued；不存在已验证 steer 协议时不向 active turn 注入。
@@ -16,15 +28,19 @@ POST preview/confirm 只允许显式单个 commandId/eventId；摘要绑定请�
 响应丢失/存储中断不自动重试；相同 command 的 pending 不因新 requestId 绕过。显式 reconciliation 只在已有精确域证据证明请求效果时完成本地操作记录，不能把任务或网页发送标记成功。claimed/outcome_unknown 不得重新排队，accepted 未有可信终态不能直接清理；原历史行政处置/损坏锁修复仍使用本机专用协议。原 OAuth、Grant Bridge access、Pair、route fence、防重放与发送权限不变。
 
 
+## Bridge Supervisor Windows ACL 错误信息
+
+Windows owner-only 校验仍要求当前用户 owner SID、唯一 Allow FullControl DACL 与原目录/文件继承规则，原 8 秒 deadline 和 fail-closed 条件不变。错误只提供有界分类、耗时/exit 信息与白名单 signal；原始子进程 stderr 不回显，路径、SID、环境和 cause 不进入生产错误。测试失败的完整 fixture 与 ACL/SDDL 仅留在 ignored `.tooling`，不属于生产返回值；见[诊断流程](troubleshooting.md#bridge-supervisor-windows-acl-校验失败)。
+
 ## MCP Remote Control 授权边界
 
 第三阶段新增 `codex.control` / `codex.read`，不属于默认授权，也不复用 probe.write。
 写入需 OAuth scope 和本地 `remote enable` 同时成立。工作区根目录仅由本地 CLI 注册，
-MCP 只接受当前 Bridge 的 workspaceId 和 C2C 管理的 threadId，不能启用工作区或传任意路径。
+单 workspace MCP 只接受自身 workspaceId；Gateway 按本机 grant 解析显式 workspaceId，任务还须核验该项目的 official mode 与已登记 target/thread。MCP 不能启用工作区或传任意路径。
 用户目标交给 Codex 主代理；不提供通用 Shell、文件写入 RPC、provider 配置或 Worker 接口。
 Codex 继承本机安全配置，任务本身可能修改文件、调用工具；approval 请求不会自动批准。
 
-队列 JSON 用锁和原子替换保存，ID 永不淘汰；不确定的已开始任务阻塞工作区并要求本地核对。
+队列 JSON 用锁和原子替换保存，ID 永不淘汰；不确定的已开始任务要求本地核对，禁止原 thread 重跑，其他已核验 target 可继续排队。
 状态接口只返回限定元数据，最终回答走现有 execution_output sanitizer，审计不复制任务原文。
 Controller 是独立本机常驻进程，无浏览器依赖，不注册开机启动。
 Remote disable 拒绝新调用和消费，正在执行的 turn 需另用 controller stop 停止。
@@ -32,9 +48,10 @@ Remote disable 拒绝新调用和消费，正在执行的 turn 需另用 control
 
 ## Trust boundaries
 
-1. **Workspace root** is the smallest authorization boundary. One bridge serves
-   exactly one workspace; every token is bound to `workspace_id`; a token for
-   project A returns 403 on project B's bridge.
+1. **Workspace root** is the smallest project authorization boundary. A Bridge
+   and `remote serve` each serve one fixed workspace. Machine Gateway may route
+   several projects, but only through explicit per-client local grants and a
+   fresh canonical-root check on every project call.
 2. **Workspace content is untrusted.** README, comments, diffs may contain
    prompt injection. Every MCP tool description carries an explicit warning and
    tools never grant capabilities based on file content.
@@ -46,7 +63,7 @@ Remote disable 拒绝新调用和消费，正在执行的 turn 需另用 control
 
 | Threat | Mitigation |
 | --- | --- |
-| MCP URL leaks | URL alone is useless: every `/mcp` request requires a valid bearer token (401 without, 403 wrong workspace) |
+| MCP URL leaks | Bridge and `remote serve` require a valid bearer token on every `/mcp` request. Gateway permits only unauthenticated POST initialize/initialized/tools-list discovery; project listing and all operations require bearer authentication, scope, and (for project tools) an explicit client grant. |
 | Pairing code brute force | 8 chars from a 31-char CSPRNG alphabet (~40 bits), 5 attempts per session, per-IP rate limit (10/min), 5-minute TTL, one-time use, session destroyed on limit |
 | OAuth CSRF | `state` round-tripped verbatim; authorization requests are server-side records keyed by random ids |
 | Code interception | PKCE S256 mandatory (plain rejected); authorization codes are one-time, 5-minute TTL, bound to client + redirect URI |
@@ -71,16 +88,22 @@ separate `probe.write` scope; existing refresh tokens do not gain it. Production
 feedback uses `codex.feedback` (and probe uses `feedback.probe`); companion production
 Send additionally requires Browser route attestation VERIFIED after pairing — pairing
 alone never authorizes DOM Send.
-Access tokens: 1 hour. Refresh tokens: 30 days, rotated. All tokens bound to
-`workspace_id` and `client_id`.
+Access tokens: 1 hour. Refresh tokens: 30 days, rotated. Bridge and `remote serve`
+tokens bind `workspace_id` and `client_id`; Gateway tokens bind the machine identity
+`machine-gateway` and `client_id`. A Gateway token does not encode or grant a project:
+the local registry and explicit workspaceId are checked again for each project tool.
 
 ## Storage
 
 State lives under the OS-convention app dir
 (`~/Library/Application Support/codex-with-chatgpt` on macOS), directories 0700,
-files 0600. Named-hostname preference and tunnel metadata live there too
-(`tunnels/<workspaceId>.json`) — never in the project. Only SHA-256 hashes of
-tokens are persisted — a stolen state file does not yield usable bearer tokens.
+files 0600. Gateway's `gateway/workspaces.json`, `gateway/server.lock`, and
+`auth/gateway.json` are machine-level and separate from per-workspace Bridge and
+`auth/official-mcp/<workspaceId>.json` files. An existing Gateway owner lock is
+not automatically reclaimed. Named-hostname preference and tunnel metadata live
+there too (`tunnels/<workspaceId>.json`) — never in the project. Only SHA-256
+hashes of tokens are persisted — a stolen state file does not yield usable bearer
+tokens.
 
 **V1 limitation**: client registrations and token hashes are file-based rather
 than OS-keychain-based. Raw tokens are never written anywhere. Keychain

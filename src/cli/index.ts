@@ -22,6 +22,7 @@ import { registerTunnelCommands } from "./tunnel.js";
 import { registerExecutorCommands } from "./executor.js";
 import { registerCleanupCommands } from "./cleanup.js";
 import { registerSupervisorCommands } from "./supervisor.js";
+import { registerGatewayCommands } from "./gateway.js";
 
 const program = new Command();
 registerWebControlCommands(program);
@@ -56,6 +57,7 @@ registerSessionCommands(program);
 registerPreferencesCommands(program);
 registerRecordCommand(program);
 registerTunnelCommands(program);
+registerGatewayCommands(program);
 
 program.parseAsync(process.argv).catch((error: Error) => {
   cross(error.message);

@@ -1,7 +1,8 @@
 # Troubleshooting
 
-Use the installed stable launcher for the `c2c` commands below and specify `-w <workspace>`.
+Use the installed stable launcher for the `c2c` commands below and specify `-w <workspace>` for per-workspace commands. Machine `gateway` commands use the explicit registry or machine state directory instead.
 For read-only inspection, start with `c2c status -w <workspace> --json` or `c2c doctor -w <workspace> --no-fix --json`.
+For Unified Gateway, `gateway list --client-id <clientId> --json` reads local grants and `gateway supervisor status --json` / `validate --json` inspect its configuration and runtime. These checks do not start services or register Scheduled Tasks. Gateway OAuth authenticates the client, while every project call also needs the explicit workspace grant and canonical root match; `GATEWAY_UNKNOWN_WORKSPACE`, `GATEWAY_CLIENT_NOT_AUTHORIZED` and `GATEWAY_WORKSPACE_ID_MISMATCH` are distinct failures. A discovered tool or healthy Tunnel does not prove project authorization, route VERIFIED or successful task execution. Recheck exact identities before any separately authorized repair; do not remove owner locks or change commandId to bypass uncertainty. See [official route](official-route.md) and [Unified Gateway stages](unified-gateway-plan.md).
 When connection repair is intended:
 
 ```
@@ -26,6 +27,12 @@ are not started. Once a named workspace is provably healthy and idle, a local
 A concurrent `rollout_busy` response performs no state writes; it does not create a new pending record.
 Do not rebuild a compatible Connector or reauthorize OAuth merely because the Core build differs.
 Do not interrupt an active Review Bridge to clear pending status.
+
+### Bridge Supervisor Windows ACL 校验失败
+
+源码中的 owner-only ACL 校验保留原 8 秒子进程 deadline、owner SID、精确 DACL 与继承检查；失败继续返回 `SUPERVISOR_STORE_SECURITY`。错误只附带有限的 `classification`、有界单调时钟耗时、退出码和白名单 signal，不返回路径、SID、环境、原始 stdout/stderr 或 cause。`timeout` 表示子进程报告超时；`nonzero` 本身不能证明 ACL mismatch，仍需现场证据。诊断信息不授权重试、提权或放宽校验。
+
+`tests/supervisor-store.test.ts` 失败时先把 exact fixture 内容、原路径 ACL/SDDL 和测试侧子进程记录保存到 ignored `.tooling/supervisor-acl-diagnostics/<uuid>/`，再严格清理；ACL 快照采集失败则保留原 fixture。链接只记元数据，不跟随到其它目录。正常通过仍 strict teardown；单次 PASS 不替代原失败归因或正式门禁，也不代表已部署。
 
 ### named rollout 显示 `named_unhealthy`
 

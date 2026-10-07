@@ -13,6 +13,7 @@
   let lastWakeHeartbeatAt = 0;
   let nativeProductionInFlight = false;
   let nativeProductionOperationInFlight = false;
+  let feedbackBootstrapWorkspaceId = null;
 
   function parseRoute(href) {
     try {
@@ -57,7 +58,11 @@
     const safety = observeSafety();
     let feedbackBootstrapToolMissing = false;
     try {
-      feedbackBootstrapToolMissing = globalThis.__c2cFeedbackBootstrapToolMissingReply?.(document) === true;
+      feedbackBootstrapToolMissing = globalThis.__c2cFeedbackBootstrapToolMissingReply?.(
+        document,
+        undefined,
+        feedbackBootstrapWorkspaceId,
+      ) === true;
     } catch {
       feedbackBootstrapToolMissing = false;
     }
@@ -92,6 +97,15 @@
         resolve({ ok: false, reason: "runtime_throw" });
       }
     });
+  }
+
+  function workspaceForwarding(message) {
+    if (!Object.prototype.hasOwnProperty.call(message, "workspaceId")) {
+      return { ok: true, fields: {} };
+    }
+    return typeof message.workspaceId === "string" && /^[a-f0-9]{12}$/.test(message.workspaceId)
+      ? { ok: true, fields: { workspaceId: message.workspaceId } }
+      : { ok: false, reason: "workspace_id_invalid" };
   }
 
   function report() {
@@ -166,8 +180,11 @@
       // Identity still comes only from the forwarded MessageSender; generation is
       // freshness only and canonicalRoute is the R3o witness, which must match the
       // browser-authority tab URL or bind/connect fail closed.
+      const workspace = workspaceForwarding(message);
+      if (!workspace.ok) { sendResponse(workspace); return false; }
       void sendToWorker({
         type: "c2c.bind",
+        ...workspace.fields,
         generation,
         canonicalRoute: parseRoute(location.href)?.canonical ?? null,
       }).then((response) => {
@@ -179,8 +196,11 @@
       // Identity comes from MessageSender; safety, generation and canonicalRoute are
       // runtime evidence only (canonicalRoute is the R3o witness, never an authority).
       const observation = buildObserveMessage();
+      const workspace = workspaceForwarding(message);
+      if (!workspace.ok) { sendResponse(workspace); return false; }
       void sendToWorker({
         type: "c2c.connect.page",
+        ...workspace.fields,
         generation: observation.generation,
         canonicalRoute: observation.canonicalRoute,
         safety: observation.safety,
@@ -191,7 +211,9 @@
     }
     if (message.type === "c2c.owner-proof.request") {
       // Carry current route/safety so SW can atomically refresh before mint.
-      void sendToWorker({ ...buildObserveMessage(), type: "c2c.owner-proof.request" }).then((response) => {
+      const workspace = workspaceForwarding(message);
+      if (!workspace.ok) { sendResponse(workspace); return false; }
+      void sendToWorker({ ...buildObserveMessage(), ...workspace.fields, type: "c2c.owner-proof.request" }).then((response) => {
         sendResponse(response);
       });
       return true;
@@ -390,6 +412,7 @@
       const refuseBootstrap = (reason) => sendResponse({
         type: "c2c.feedback.bootstrap.result",
         mode: "feedback_bootstrap_send",
+        workspaceId: typeof message.workspaceId === "string" ? message.workspaceId : null,
         ok: false,
         reason,
         mutationAttempted: false,
@@ -407,6 +430,15 @@
       }
       const expectedRoute = typeof message.expectedRoute === "string" ? message.expectedRoute : "";
       const expectedGeneration = message.expectedGeneration;
+      const workspaceIdProvided = Object.prototype.hasOwnProperty.call(message, "workspaceId");
+      const workspaceId = typeof message.workspaceId === "string" && /^[a-f0-9]{12}$/.test(message.workspaceId)
+        ? message.workspaceId
+        : null;
+      if (workspaceIdProvided && !workspaceId) {
+        refuseBootstrap("bootstrap_workspace_invalid");
+        return false;
+      }
+      feedbackBootstrapWorkspaceId = workspaceId;
       if (typeof globalThis.__c2cRunFeedbackBootstrapSend !== "function") {
         refuseBootstrap("bootstrap_capability_missing");
         return false;
@@ -415,6 +447,7 @@
         let result;
         try {
           result = await globalThis.__c2cRunFeedbackBootstrapSend(document, {
+            ...(workspaceId ? { workspaceId } : {}),
             expectedRoute,
             expectedGeneration,
             locationHref: location.href,
@@ -433,6 +466,7 @@
         sendResponse({
           ok: result?.ok === true,
           mode: "feedback_bootstrap_send",
+          workspaceId,
           reason: result?.ok ? undefined : (result?.reason || "bootstrap_failed"),
           mutationAttempted: result?.mutationAttempted === true,
           wrote: result?.wrote === true,

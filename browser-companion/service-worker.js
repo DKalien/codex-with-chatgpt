@@ -51,6 +51,8 @@ import {
   pairAllowedWithJournal,
   applyStorageProtectionPolicy,
   wrapFetchResponse,
+  JOURNAL_STATES,
+  validateSendJournalShape,
 } from "./reservation-journal.js";
 import {
   mintOwnerProof,
@@ -163,6 +165,52 @@ import {
   createWakeWatchdogController,
 } from "./wake-watchdog.js";
 
+import {
+  createProjectChrome,
+  createProjectContextRouter,
+} from "./project-context.js";
+
+const LEGACY_LOCAL_KEYS = [
+  "c2c_companion_local_v1",
+  "c2c_companion_transport_v1",
+  "c2c_companion_journal_v1",
+  "c2c_companion_outcome_unknown_archive_v1",
+  AUTONOMY_STORAGE_KEY,
+  ROUTE_ATTEST_FENCE_KEY,
+  CONNECT_FLOW_KEY,
+  "c2c.panel.action.v1",
+];
+const LEGACY_SESSION_KEYS = [
+  "c2c_companion_owner_v1",
+  "c2c_companion_registry_v1",
+  "c2c_companion_evidence_v1",
+  SEND_PROBE_LATCH_KEY,
+  ROUTE_ATTEST_LATCH_KEY,
+  "c2c_companion_pair_intent_v1",
+];
+
+export function createWorkspaceContext(project, isSelected = () => false, withPageSendLock = null) {
+const chrome = createProjectChrome(globalThis.chrome, project.workspaceId, isSelected, withPageSendLock);
+
+function isOwnOperationsPanel(sender) {
+  if (sender?.id !== chrome.runtime.id || !Number.isSafeInteger(sender?.tab?.id)) return false;
+  const expected = new URL(chrome.runtime.getURL("operations/operations.html"));
+  const parsePanelUrl = value => {
+    try {
+      const url = new URL(value);
+      const ids = url.searchParams.getAll("workspaceId");
+      if (url.protocol !== expected.protocol || url.hostname !== expected.hostname || url.port !== expected.port
+        || url.pathname !== expected.pathname || url.hash) return null;
+      if (url.search === "" && project.legacy === true) return url.href;
+      if (url.searchParams.size !== 1 || ids.length !== 1 || ids[0] !== project.workspaceId) return null;
+      return url.href;
+    } catch { return null; }
+  };
+  const source = parsePanelUrl(sender.url);
+  const tab = parsePanelUrl(sender.tab.url);
+  return source != null && source === tab;
+}
+
 const LOCAL_KEY = "c2c_companion_local_v1";
 const TRANSPORT_KEY = "c2c_companion_transport_v1";
 const JOURNAL_KEY = "c2c_companion_journal_v1";
@@ -176,6 +224,7 @@ const isUuid = (value) => typeof value === "string" && UUID.test(value);
 let localState = { schemaVersion: 1, targetRoute: null, paired: false };
 let ownerState = emptyOwnerState();
 let transport = null;
+let transportIdentityBlocked = false;
 let journal = emptyJournal();
 let outcomeUnknownArchive = emptyOutcomeUnknownArchive();
 let outcomeUnknownArchiveValid = true;
@@ -278,8 +327,18 @@ async function hydrate() {
   if (!row) await chrome.storage.local.set({ [LOCAL_KEY]: localState });
 
   const t = stored[TRANSPORT_KEY];
-  const policy = applyStorageProtectionPolicy(storageProtected, t);
-  if (policy.mustDeleteStoredKey) {
+  const transportIdentityMatches = t == null || (
+    t && typeof t === "object" && !Array.isArray(t)
+    && t.workspaceId === project.workspaceId
+    && typeof t.bridgeOrigin === "string"
+    && (() => {
+      try { return parseBridgeOrigin(t.bridgeOrigin, { allowLoopbackHttp: true }) === project.bridgeOrigin; }
+      catch { return false; }
+    })()
+  );
+  transportIdentityBlocked = !transportIdentityMatches;
+  const policy = applyStorageProtectionPolicy(storageProtected, transportIdentityBlocked ? null : t);
+  if (policy.mustDeleteStoredKey && transportIdentityMatches) {
     await chrome.storage.local.remove(TRANSPORT_KEY);
   }
   transport = policy.transport;
@@ -1048,6 +1107,7 @@ async function unbindAll() {
 
 function requireProtectedTransport() {
   if (!storageProtected) return { ok: false, reason: "storage_unprotected" };
+  if (transportIdentityBlocked) return { ok: false, reason: "transport_identity_mismatch" };
   if (!transport) return { ok: false, reason: "transport_missing" };
   if (transport.authStale) return { ok: false, reason: "auth_stale" };
   return { ok: true };
@@ -1160,6 +1220,14 @@ async function handleMintOwnerProof(sender, message) {
 }
 
 async function handlePair(message) {
+  if (transportIdentityBlocked) return { ok: false, reason: "transport_identity_mismatch" };
+  let origin;
+  try {
+    origin = parseBridgeOrigin(message.bridgeOrigin, { allowLoopbackHttp: true });
+  } catch (e) {
+    return { ok: false, reason: e instanceof BridgeOriginError ? "bridge_origin_invalid" : "origin_error" };
+  }
+  if (origin !== project.bridgeOrigin) return { ok: false, reason: "project_origin_conflict" };
   if (!storageProtected) return { ok: false, reason: "storage_unprotected" };
   const authStale = transport?.authStale === true;
   if (!pairAllowedWithJournal(journal, authStale)) {
@@ -1180,12 +1248,6 @@ async function handlePair(message) {
   }
   ownerProof = markProofUsed(ownerProof);
 
-  let origin;
-  try {
-    origin = parseBridgeOrigin(message.bridgeOrigin, { allowLoopbackHttp: true });
-  } catch (e) {
-    return { ok: false, reason: e instanceof BridgeOriginError ? "bridge_origin_invalid" : "origin_error" };
-  }
   if (typeof message.intentId !== "string" || typeof message.secret !== "string" || !message.secret) {
     return { ok: false, reason: "pairing_input_invalid" };
   }
@@ -1268,7 +1330,7 @@ async function handlePair(message) {
   if (
     !areChatgptConversationRoutesEquivalent(body.routeCanonical, routeCanonical)
     || typeof body.credential !== "string"
-    || typeof body.workspaceId !== "string"
+    || body.workspaceId !== project.workspaceId
     || typeof body.companionId !== "string"
     || typeof body.bindingId !== "string"
     || typeof body.epoch !== "number"
@@ -1788,6 +1850,7 @@ async function dispatchFeedbackBootstrap(identity) {
   try {
     response = await chrome.tabs.sendMessage(owner.tabId, {
       type: "c2c.feedback.bootstrap.execute",
+      workspaceId: transport.workspaceId,
       expectedRoute: owner.canonicalRoute,
       expectedGeneration: owner.generation,
     }, { documentId: owner.documentId });
@@ -1800,6 +1863,7 @@ async function dispatchFeedbackBootstrap(identity) {
 
   const responseIdentityMatches = response?.type === "c2c.feedback.bootstrap.result"
     && response.mode === "feedback_bootstrap_send"
+    && response.workspaceId === transport.workspaceId
     && response.generation === owner.generation
     && areChatgptConversationRoutesEquivalent(response.canonicalRoute, owner.canonicalRoute)
     && ownerStillMatches(owner);
@@ -2336,6 +2400,7 @@ async function handleFetchState() {
   // A stale observation blocks writes, not a fresh read with the SAME credential.
   // Otherwise a transient rejection permanently disables its own recovery path.
   if (!storageProtected) return { ok: false, reason: "storage_unprotected" };
+  if (transportIdentityBlocked) return { ok: false, reason: "transport_identity_mismatch" };
   if (!transport?.credential) return { ok: false, reason: "transport_missing" };
   try {
     const res = await fetchCompanion("/state", { method: "GET" });
@@ -2987,7 +3052,8 @@ async function handleClearTransport() {
   transport = null;
   connectReason = null;
   await forceAutonomyOff("transport_clear", { clearRearmPreference: true });
-  await persistTransport();
+  const persisted = await persistTransport();
+  if (persisted) transportIdentityBlocked = false;
   // Durable route-attest fence is NOT cleared here. Transport clear must not
   // silently authorize the same challenge again; only re-pair with a new
   // companionId + challengeId may reset the fence.
@@ -3159,16 +3225,14 @@ async function handleMessage(message, sender, { transportMutationHeld = false, m
   if (!message || typeof message !== "object") return { ok: false, reason: "bad_message" };
 
   if (message.type === "c2c.operations.action") {
-    const ownPanel = typeof chrome.runtime.id === "string" && sender?.id === chrome.runtime.id
-      && sender?.url === chrome.runtime.getURL?.("operations/operations.html");
+    const ownPanel = isOwnOperationsPanel(sender);
     if (!ownPanel || sender?.tab?.url?.startsWith("https://")) return { ok: false, reason: "extension_panel_required" };
     if (Object.keys(message).some(key => !["type", "phase", "request", "requestId", "commandId", "confirmationSha256", "confirmed"].includes(key))) return { ok: false, reason: "bad_message" };
     return runTransportMutation(() => panelAction(message));
   }
 
   if (message.type === "c2c.operations.read") {
-    const ownPanel = typeof chrome.runtime.id === "string" && sender?.id === chrome.runtime.id
-      && sender?.url === chrome.runtime.getURL?.("operations/operations.html");
+    const ownPanel = isOwnOperationsPanel(sender);
     if (!isExtensionInternalSender(sender) && !ownPanel) return { ok: false, reason: "extension_sender_required" };
     if (Object.keys(message).length !== 1) return { ok: false, reason: "bad_message" };
     if (!operationsReadInFlight) operationsReadInFlight = readOperations().finally(() => { operationsReadInFlight = null; });
@@ -3176,8 +3240,7 @@ async function handleMessage(message, sender, { transportMutationHeld = false, m
   }
 
   if (message.type === "c2c.operations.result.read") {
-    const ownPanel = typeof chrome.runtime.id === "string" && sender?.id === chrome.runtime.id
-      && sender?.url === chrome.runtime.getURL?.("operations/operations.html");
+    const ownPanel = isOwnOperationsPanel(sender);
     if (!ownPanel || sender?.tab?.url?.startsWith("https://")) return { ok: false, reason: "extension_panel_required" };
     if (Object.keys(message).some(key => !["type", "commandId", "iteration"].includes(key))) return { ok: false, reason: "bad_message" };
     return readOperationResult(message);
@@ -5292,72 +5355,179 @@ async function handleRetireUnknown() {
   };
 }
 
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  handleMessage(message, sender)
-    .then((response) => {
-      if (message?.type !== "c2c.operations.read" && message?.type !== "c2c.status.read") {
-        void refreshActionIndicator();
-        void syncWakeWatchdog();
-      }
-      sendResponse(response);
-    })
+async function handleTabRemoved(tabId) {
+  await initPromise;
+  ownerState = invalidateOnTabRemoved(ownerState, tabId);
+  if (evidence?.tabId === tabId) evidence = null;
+  if (ownerProof?.tabId === tabId) ownerProof = null;
+  await persistSessionOwnership();
+  await syncWakeWatchdog();
+  await refreshActionIndicator();
+}
+
+async function handleInstalled() {
+  await initPromise;
+  const stored = await chrome.storage.local.get(LOCAL_KEY);
+  if (!stored[LOCAL_KEY]) {
+    localState = { schemaVersion: 1, targetRoute: null, paired: false };
+    await persistLocal();
+  }
+  await syncWakeWatchdog();
+  await refreshActionIndicator();
+}
+
+async function handleStartup() {
+  await initPromise;
+  ownerState = resetSessionOwnership(emptyOwnerState());
+  ownerState.targetRoute = localState.targetRoute;
+  evidence = null;
+  ownerProof = null;
+  await persistSessionOwnership();
+  await syncWakeWatchdog();
+  await refreshActionIndicator();
+}
+
+async function summary() {
+  await initPromise;
+  return {
+    workspaceId: project.workspaceId,
+    bridgeOrigin: project.bridgeOrigin,
+    paired: localState.paired === true,
+    connected: safeTransportSummary()?.connected === true,
+    routeCanonical: transport?.routeCanonical ?? null,
+    routeVerification: transport?.routeVerification === "VERIFIED" ? "VERIFIED" : "PENDING",
+    authStale: transport?.authStale === true,
+    journal: summarizeProductionJournal(journal).state,
+    routeAttestFence: routeAttestFence.state,
+  };
+}
+
+async function matchesOwner(sender, message) {
+  await initPromise;
+  const identity = resolveSenderDocumentIdentity(sender);
+  if (!identity.ok || !isOwner(ownerState, identity.tabId, identity.documentId)) return false;
+  const route = ownerState.owner?.canonicalRoute;
+  if (!areChatgptConversationRoutesEquivalent(route, sender?.url)) return false;
+  return typeof message?.canonicalRoute !== "string"
+    || areChatgptConversationRoutesEquivalent(route, message.canonicalRoute);
+}
+
+async function matchesDocument(sender) {
+  await initPromise;
+  const identity = resolveSenderDocumentIdentity(sender);
+  return identity.ok && isOwner(ownerState, identity.tabId, identity.documentId);
+}
+
+async function ownsTabRoute(tabId, route) {
+  await initPromise;
+  return (ownerState.owner?.tabId === tabId
+      && areChatgptConversationRoutesEquivalent(ownerState.owner?.canonicalRoute, route))
+    || (ownerState.targetRoute != null
+      && areChatgptConversationRoutesEquivalent(ownerState.targetRoute, route)
+      && ownerState.owner?.tabId === tabId);
+}
+
+async function ownerTabId() {
+  await initPromise;
+  return ownerState.owner?.tabId ?? null;
+}
+
+async function afterMessage(type) {
+  if (type !== "c2c.operations.read" && type !== "c2c.status.read") {
+    await Promise.all([refreshActionIndicator(), syncWakeWatchdog()]);
+  }
+}
+
+return {
+  initialize: () => initPromise,
+  handleAlarm: alarm => handleWakeWatchdogAlarm(alarm),
+  handleTabRemoved,
+  handleActiveOwnerRefresh: tabId => requestActiveOwnerRefresh(tabId),
+  handleInstalled,
+  handleStartup,
+  handleMessage,
+  summary,
+  matchesOwner,
+  matchesDocument,
+  ownsTabRoute,
+  ownerTabId,
+  afterMessage,
+};
+}
+
+function exactOperationsPanelWorkspaceId(sender, browser) {
+  if (sender?.id !== browser?.runtime?.id || !Number.isSafeInteger(sender?.tab?.id)) return null;
+  let expected;
+  try { expected = new URL(browser.runtime.getURL("operations/operations.html")); } catch { return null; }
+  const parse = value => {
+    try {
+      const url = new URL(value);
+      const ids = url.searchParams.getAll("workspaceId");
+      return url.protocol === expected.protocol && url.hostname === expected.hostname && url.port === expected.port
+        && url.pathname === expected.pathname && !url.hash
+        && url.searchParams.size === 1 && ids.length === 1 && /^[a-f0-9]{12}$/.test(ids[0])
+        ? ids[0]
+        : null;
+    } catch { return null; }
+  };
+  const sourceWorkspaceId = parse(sender.url);
+  return sourceWorkspaceId != null && sourceWorkspaceId === parse(sender.tab.url)
+    ? sourceWorkspaceId
+    : null;
+}
+
+const projectRouter = createProjectContextRouter({
+  browser: globalThis.chrome,
+  createContext: (project, isSelected, withPageSendLock) => createWorkspaceContext(project, isSelected, withPageSendLock),
+  localKeys: LEGACY_LOCAL_KEYS,
+  sessionKeys: LEGACY_SESSION_KEYS,
+  transportKey: "c2c_companion_transport_v1",
+  localIdentityKey: "c2c_companion_local_v1",
+  journalKey: "c2c_companion_journal_v1",
+  journalStates: JOURNAL_STATES,
+  isInternalSender: (sender, workspaceId) => isExtensionInternalSender(sender)
+    || (typeof workspaceId === "string"
+      && exactOperationsPanelWorkspaceId(sender, globalThis.chrome) === workspaceId),
+  validateLegacyJournal: ({ journal, transport }) => {
+    const shape = validateSendJournalShape(journal);
+    return shape.ok && (journal.state === "NONE"
+      || (areChatgptConversationRoutesEquivalent(journal.routeCanonical, transport.routeCanonical)
+        && journal.bindingId === transport.bindingId && journal.epoch === transport.epoch));
+  },
+  routesEquivalent: areChatgptConversationRoutesEquivalent,
+});
+
+const dispatchProjectLifecycle = operation => {
+  Promise.resolve(operation).catch(() => {});
+};
+
+// Register wake listeners before registry hydration so a cold MV3 worker cannot
+// miss an alarm while project contexts are being created.
+globalThis.chrome.alarms?.onAlarm?.addListener(alarm => {
+  dispatchProjectLifecycle(projectRouter.handleAlarm(alarm));
+});
+globalThis.chrome.tabs?.onRemoved?.addListener(tabId => {
+  dispatchProjectLifecycle(projectRouter.handleTabRemoved(tabId));
+});
+globalThis.chrome.tabs?.onActivated?.addListener(activeInfo => {
+  dispatchProjectLifecycle(projectRouter.handleActiveOwnerRefresh(activeInfo?.tabId));
+});
+globalThis.chrome.windows?.onFocusChanged?.addListener(windowId => {
+  if (windowId !== globalThis.chrome.windows.WINDOW_ID_NONE && windowId !== -1) {
+    dispatchProjectLifecycle(projectRouter.handleActiveOwnerRefresh());
+  }
+});
+globalThis.chrome.runtime.onInstalled?.addListener(details => {
+  dispatchProjectLifecycle(projectRouter.handleInstalled(details));
+});
+globalThis.chrome.runtime.onStartup?.addListener(() => {
+  dispatchProjectLifecycle(projectRouter.handleStartup());
+});
+dispatchProjectLifecycle(projectRouter.initialize());
+
+globalThis.chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  projectRouter.handle(message, sender)
+    .then(sendResponse)
     .catch(() => sendResponse({ ok: false, reason: "internal" }));
   return true;
-});
-
-chrome.tabs.onRemoved.addListener((tabId) => {
-  void (async () => {
-    await initPromise;
-    ownerState = invalidateOnTabRemoved(ownerState, tabId);
-    if (evidence?.tabId === tabId) evidence = null;
-    if (ownerProof?.tabId === tabId) ownerProof = null;
-    await persistSessionOwnership();
-    await syncWakeWatchdog();
-    await refreshActionIndicator();
-  })();
-});
-
-if (chrome.alarms?.onAlarm?.addListener) {
-  chrome.alarms.onAlarm.addListener((alarm) => {
-    void handleWakeWatchdogAlarm(alarm);
-  });
-}
-
-if (chrome.tabs?.onActivated?.addListener) {
-  chrome.tabs.onActivated.addListener(({ tabId }) => {
-    void requestActiveOwnerRefresh(tabId);
-  });
-}
-
-if (chrome.windows?.onFocusChanged?.addListener) {
-  chrome.windows.onFocusChanged.addListener((windowId) => {
-    if (windowId === chrome.windows.WINDOW_ID_NONE || windowId === -1) return;
-    void requestActiveOwnerRefresh();
-  });
-}
-
-chrome.runtime.onInstalled.addListener(() => {
-  void (async () => {
-    await initPromise;
-    const stored = await chrome.storage.local.get(LOCAL_KEY);
-    if (!stored[LOCAL_KEY]) {
-      localState = { schemaVersion: 1, targetRoute: null, paired: false };
-      await persistLocal();
-    }
-    await syncWakeWatchdog();
-    await refreshActionIndicator();
-  })();
-});
-
-chrome.runtime.onStartup.addListener(() => {
-  void (async () => {
-    await initPromise;
-    ownerState = resetSessionOwnership(emptyOwnerState());
-    ownerState.targetRoute = localState.targetRoute;
-    evidence = null;
-    ownerProof = null;
-    await persistSessionOwnership();
-    await syncWakeWatchdog();
-    await refreshActionIndicator();
-  })();
 });

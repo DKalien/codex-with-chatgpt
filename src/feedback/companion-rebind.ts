@@ -106,6 +106,7 @@ export function initiateCompanionRebind(input: {
           message: formatRouteAttestationMessage(
             routeAttestation.challengeId,
             routeAttestation.challengeDigest,
+            input.workspaceId,
           ),
         },
       },

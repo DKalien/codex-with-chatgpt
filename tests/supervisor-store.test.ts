@@ -3,6 +3,12 @@ import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { pathToFileURL } from "node:url";
+import * as childProcess from "node:child_process";
+
+vi.mock("node:child_process", async importOriginal => {
+  const original = await importOriginal<typeof import("node:child_process")>();
+  return { ...original, execFileSync: vi.fn(original.execFileSync) };
+});
 import {
   acquireSupervisorLease,
   hasSupervisorState,
@@ -20,12 +26,13 @@ import {
   type SupervisorStoreOptions,
 } from "../src/supervisor/store.js";
 import { Workspace } from "../src/workspace/manager.js";
-import { cleanupStrict } from "./strict-teardown.js";
 import { makeTmpDir } from "./helpers.js";
+import { finishSupervisorFixtures, observeSupervisorAclCall, type SupervisorAclCall } from "./supervisor-acl-support.js";
 import { validateSupervisorLaunch } from "../src/supervisor/run.js";
 import { runSupervisorLoop } from "../src/supervisor/lifecycle.js";
 
 const roots: string[] = [];
+const aclCalls: SupervisorAclCall[] = [];
 let stateDir: string;
 let workspaceRoot: string;
 let workspace: Workspace;
@@ -82,16 +89,20 @@ function seedLock(file: string, kind: "operation" | "supervisor", identity: { pi
   }), { mode: 0o600 });
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   stateDir = makeTmpDir("supervisor-state"); roots.push(stateDir);
   workspaceRoot = makeTmpDir("supervisor-workspace"); roots.push(workspaceRoot);
   workspace = new Workspace(workspaceRoot);
   options = optionsWithProbe();
+  aclCalls.length = 0;
+  const { execFileSync: execute } = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+  vi.mocked(childProcess.execFileSync).mockImplementation(observeSupervisorAclCall(aclCalls, execute));
 });
 
-afterEach(async () => {
+afterEach(async ({ task }) => {
   vi.restoreAllMocks();
-  await cleanupStrict(...roots.splice(0));
+  const evidence = await finishSupervisorFixtures(task.result?.state === "fail", task.name, roots.splice(0), aclCalls, task.result?.errors);
+  if (evidence) console.error(`supervisor failed fixture evidence: ${evidence}`);
 });
 
 describe("supervisor durable config", () => {

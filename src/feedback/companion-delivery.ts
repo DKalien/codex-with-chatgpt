@@ -174,7 +174,7 @@ export function companionPublicState(input: {
               challengeId: att.challengeId,
               challengeDigest: att.challengeDigest,
               expiresAt: att.expiresAt,
-              message: formatRouteAttestationMessage(att.challengeId, att.challengeDigest),
+              message: formatRouteAttestationMessage(att.challengeId, att.challengeDigest, input.workspaceId),
             },
           };
         })()),

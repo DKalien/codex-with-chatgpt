@@ -3,10 +3,10 @@ import { z } from "zod";
 import { latestExecutionRecord, readExecutionRecords } from "../execution/records.js";
 import { listExecutionOutputs, readExecutionOutput } from "../execution/output.js";
 import { executionOutputOutputSchema, executionSummaryOutputSchema, testStatusOutputSchema } from "./base-schemas.js";
-import { fail, okStructured, requireScope, UNTRUSTED_NOTE, type McpContext } from "./tool-shared.js";
+import { fail, mapError, okStructured, requireScope, resolveToolWorkspace, workspaceIdShape, UNTRUSTED_NOTE, type McpContext, type WorkspaceResolver } from "./tool-shared.js";
 
-export function registerExecutionTools(server: McpServer, ctx: McpContext): void {
-  const { workspace } = ctx;
+export function registerExecutionTools(server: McpServer, ctx: McpContext | WorkspaceResolver): void {
+  const workspaceSource = typeof ctx === "function" ? ctx : ctx.workspace;
   server.registerTool(
     "test_status",
     {
@@ -14,13 +14,16 @@ export function registerExecutionTools(server: McpServer, ctx: McpContext): void
       description:
         `Summary of the most recent test run reported by the Codex harness. This does NOT run ` +
         `tests; it reads the latest execution record. ${UNTRUSTED_NOTE}`,
-      inputSchema: {},
+      inputSchema: { ...workspaceIdShape(workspaceSource) },
       outputSchema: testStatusOutputSchema,
       annotations: { readOnlyHint: true },
     },
-    async (_args, extra) => {
+    async (args, extra) => {
       const denied = requireScope(extra.authInfo, "execution.read");
       if (denied) return denied;
+      let workspace;
+      try { workspace = resolveToolWorkspace(workspaceSource, args, extra.authInfo); }
+      catch (error) { return mapError(error); }
       const latest = latestExecutionRecord(workspace.id);
       if (!latest) {
         return okStructured({ available: false, message: "No execution records yet for this workspace." });
@@ -47,6 +50,7 @@ export function registerExecutionTools(server: McpServer, ctx: McpContext): void
         `tests and exit status. For Desktop Review, match the original delivery commandId exactly, then read that record's outputId; ` +
         `a missing record means this task has no execution receipt, never substitute historical test_status. ${UNTRUSTED_NOTE}`,
       inputSchema: {
+        ...workspaceIdShape(workspaceSource),
         limit: z.number().int().min(1).max(50).default(5),
       },
       outputSchema: executionSummaryOutputSchema,
@@ -55,6 +59,9 @@ export function registerExecutionTools(server: McpServer, ctx: McpContext): void
     async (args, extra) => {
       const denied = requireScope(extra.authInfo, "execution.read");
       if (denied) return denied;
+      let workspace;
+      try { workspace = resolveToolWorkspace(workspaceSource, args, extra.authInfo); }
+      catch (error) { return mapError(error); }
       return okStructured({ records: readExecutionRecords(workspace.id, args.limit) });
     },
   );
@@ -68,6 +75,7 @@ export function registerExecutionTools(server: McpServer, ctx: McpContext): void
         `run. Call with action=list first, then action=read and an id. Restricted items have no ` +
         `body. This does not run commands. ${UNTRUSTED_NOTE}`,
       inputSchema: {
+        ...workspaceIdShape(workspaceSource),
         action: z.enum(["list", "read"]).default("list"),
         id: z.number().int().positive().optional(),
         limit: z.number().int().min(1).max(50).default(20),
@@ -78,6 +86,9 @@ export function registerExecutionTools(server: McpServer, ctx: McpContext): void
     async (args, extra) => {
       const denied = requireScope(extra.authInfo, "execution.read");
       if (denied) return denied;
+      let workspace;
+      try { workspace = resolveToolWorkspace(workspaceSource, args, extra.authInfo); }
+      catch (error) { return mapError(error); }
       const action = args.action ?? "list";
       if (action === "list") {
         const items = listExecutionOutputs(workspace.id, args.limit).map((item) => ({

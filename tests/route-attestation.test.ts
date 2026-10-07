@@ -197,6 +197,14 @@ describe("route-attestation pure contract", () => {
     expect(header).toEqual({ challengeId: CHALLENGE, challengeDigest: DIGEST });
     expect(call).toEqual(header);
   });
+
+  it("Gateway attestation carries the same explicit workspace in headers and tool call", async () => {
+    const { formatRouteAttestationMessage } = await import("../src/feedback/store.js");
+    const msg = formatRouteAttestationMessage(CHALLENGE, DIGEST, "012345abcdef");
+    const expected = { workspaceId: "012345abcdef", challengeId: CHALLENGE, challengeDigest: DIGEST };
+    expect(extractRouteAttestHeaderArgs(msg)).toEqual(expected);
+    expect(extractRouteAttestToolCallArgs(msg)).toEqual(expected);
+  });
 });
 
 describe("route-attestation session latch fence", () => {

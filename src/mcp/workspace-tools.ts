@@ -28,13 +28,22 @@ import {
   workflowOutputSchema,
   workspaceInfoOutputSchema,
 } from "./base-schemas.js";
-import { mapError, okStructured, requireScope, UNTRUSTED_NOTE, type McpContext } from "./tool-shared.js";
+import {
+  mapError,
+  okStructured,
+  requireScope,
+  resolveToolWorkspace,
+  UNTRUSTED_NOTE,
+  workspaceIdShape,
+  type McpContext,
+  type WorkspaceSource,
+} from "./tool-shared.js";
 
 export { workflowOutputSchema } from "./base-schemas.js";
 
 async function buildWorkspaceInfoWorkflow(
   workspace: Workspace,
-  ctx: McpContext,
+  ctx: Pick<McpContext, "runtimeUpgrade">,
   extra: { authInfo?: AuthInfo; sessionId?: string; _meta?: unknown },
   requestDesktopCompatibility: DesktopCompatibility,
 ): Promise<WorkflowMcpProjection> {
@@ -86,8 +95,17 @@ async function buildWorkspaceInfoWorkflow(
 
 export { buildWorkspaceInfoWorkflow };
 
-export function registerWorkspaceTools(server: McpServer, ctx: McpContext, profile: "legacy" | "official" = "legacy"): void {
-  const { workspace } = ctx;
+type WorkspaceToolsContext = Pick<McpContext, "runtimeUpgrade"> & Partial<Pick<McpContext, "workspace" | "desktopCompatibility">>;
+
+export function registerWorkspaceTools(
+  server: McpServer,
+  ctx: WorkspaceToolsContext,
+  profile: "legacy" | "official" | "gateway" = "legacy",
+  source: WorkspaceSource = ctx.workspace!,
+): void {
+  if (!source) throw new Error("Workspace tools require a workspace or resolver.");
+  const workspaceInput = <T extends z.ZodRawShape>(shape: T = {} as T) => ({ ...workspaceIdShape(source), ...shape });
+  const scope = (authInfo: AuthInfo | undefined, required: string) => requireScope(authInfo, required, typeof source === "function");
   server.registerTool(
     "workspace_info",
     {
@@ -97,22 +115,23 @@ export function registerWorkspaceTools(server: McpServer, ctx: McpContext, profi
         `frameworks, git state, available scripts, and request-scoped bounded workflow readiness. ` +
         `Read-only: does not bind Desktop, create Remote threads, send Desktop tasks, or repair connections. ` +
         `Call this first. ${UNTRUSTED_NOTE}`,
-      inputSchema: {},
+      inputSchema: workspaceInput(),
       outputSchema: workspaceInfoOutputSchema,
       annotations: { readOnlyHint: true },
     },
     async (_args, extra) => {
-      const denied = requireScope(extra.authInfo, "workspace.read");
+      const denied = scope(extra.authInfo, "workspace.read");
       if (denied) return denied;
       try {
+        const workspace = resolveToolWorkspace(source, _args, extra.authInfo);
         const project = workspace.detectProject();
         const git = gitInfo(workspace.root);
-        const requestDesktopCompatibility = profile === "official"
+        const requestDesktopCompatibility = profile !== "legacy"
           ? { status: "unknown" as const }
           : ctx.desktopCompatibility?.(extra.authInfo) ?? { status: "unknown" as const };
         let workflow: WorkflowMcpProjection;
         try {
-          workflow = profile === "official"
+          workflow = profile !== "legacy"
             ? buildOfficialWorkspaceInfoWorkflow(workspace, extra.authInfo)
             : await buildWorkspaceInfoWorkflow(workspace, ctx, extra, requestDesktopCompatibility);
         } catch {
@@ -160,19 +179,20 @@ export function registerWorkspaceTools(server: McpServer, ctx: McpContext, profi
       description:
         `List files and directories under a workspace-relative path. High-noise directories ` +
         `(node_modules, .git, build output) are omitted. Supports pagination. ${UNTRUSTED_NOTE}`,
-      inputSchema: {
+      inputSchema: workspaceInput({
         path: z.string().default(".").describe("Workspace-relative path, e.g. 'src'"),
         depth: z.number().int().min(1).max(4).default(1).describe("Recursion depth (1-4)"),
         limit: z.number().int().min(1).max(1000).default(200),
         offset: z.number().int().min(0).default(0),
-      },
+      }),
       outputSchema: listDirectoryOutputSchema,
       annotations: { readOnlyHint: true },
     },
     async (args, extra) => {
-      const denied = requireScope(extra.authInfo, "workspace.read");
+      const denied = scope(extra.authInfo, "workspace.read");
       if (denied) return denied;
       try {
+        const workspace = resolveToolWorkspace(source, args, extra.authInfo);
         return okStructured(await workspace.listDirectory(args.path, args));
       } catch (error) {
         return mapError(error);
@@ -188,18 +208,19 @@ export function registerWorkspaceTools(server: McpServer, ctx: McpContext, profi
         `Read a text file from the workspace with line-range pagination. Defaults to the first ` +
         `400 lines; use start_line/end_line to page through large files. Sensitive files ` +
         `(.env, keys, credentials) are always denied. ${UNTRUSTED_NOTE}`,
-      inputSchema: {
+      inputSchema: workspaceInput({
         path: z.string().describe("Workspace-relative file path"),
         start_line: z.number().int().min(1).optional().describe("1-based first line to return"),
         end_line: z.number().int().min(1).optional().describe("1-based last line to return"),
-      },
+      }),
       outputSchema: readFileOutputSchema,
       annotations: { readOnlyHint: true },
     },
     async (args, extra) => {
-      const denied = requireScope(extra.authInfo, "workspace.read");
+      const denied = scope(extra.authInfo, "workspace.read");
       if (denied) return denied;
       try {
+        const workspace = resolveToolWorkspace(source, args, extra.authInfo);
         return okStructured(await workspace.readFile(args.path, { startLine: args.start_line, endLine: args.end_line }));
       } catch (error) {
         return mapError(error);
@@ -214,20 +235,21 @@ export function registerWorkspaceTools(server: McpServer, ctx: McpContext, profi
       description:
         `Search file contents across the workspace (ripgrep when available). Returns matching ` +
         `lines with file paths and line numbers. ${UNTRUSTED_NOTE}`,
-      inputSchema: {
+      inputSchema: workspaceInput({
         query: z.string().min(2).describe("Text to search for (literal by default)"),
         path: z.string().optional().describe("Restrict search to this workspace-relative path"),
         glob: z.string().optional().describe("Filename glob filter, e.g. '*.ts'"),
         limit: z.number().int().min(1).max(200).default(50),
         regex: z.boolean().default(false).describe("Treat query as a regular expression"),
-      },
+      }),
       outputSchema: searchWorkspaceOutputSchema,
       annotations: { readOnlyHint: true },
     },
     async (args, extra) => {
-      const denied = requireScope(extra.authInfo, "workspace.search");
+      const denied = scope(extra.authInfo, "workspace.search");
       if (denied) return denied;
       try {
+        const workspace = resolveToolWorkspace(source, args, extra.authInfo);
         return okStructured(await searchWorkspace(workspace, args));
       } catch (error) {
         return mapError(error);
@@ -240,14 +262,15 @@ export function registerWorkspaceTools(server: McpServer, ctx: McpContext, profi
     {
       title: "Git status",
       description: `Structured git status of the workspace: branch, staged/unstaged/untracked files. ${UNTRUSTED_NOTE}`,
-      inputSchema: {},
+      inputSchema: workspaceInput(),
       outputSchema: gitStatusOutputSchema,
       annotations: { readOnlyHint: true },
     },
     async (_args, extra) => {
-      const denied = requireScope(extra.authInfo, "git.read");
+      const denied = scope(extra.authInfo, "git.read");
       if (denied) return denied;
       try {
+        const workspace = resolveToolWorkspace(source, _args, extra.authInfo);
         return okStructured(gitStatus(workspace.root));
       } catch (error) {
         return mapError(error);
@@ -262,19 +285,20 @@ export function registerWorkspaceTools(server: McpServer, ctx: McpContext, profi
       description:
         `Git diff with byte-offset pagination. mode: 'unstaged' (default), 'staged', or 'head' ` +
         `(working tree vs HEAD). When hasMore is true, call again with offset=nextOffset. ${UNTRUSTED_NOTE}`,
-      inputSchema: {
+      inputSchema: workspaceInput({
         mode: z.enum(["unstaged", "staged", "head"]).default("unstaged"),
         path: z.string().optional().describe("Limit the diff to one workspace-relative path"),
         offset: z.number().int().min(0).default(0).describe("Byte offset for pagination"),
         max_bytes: z.number().int().min(1024).max(262144).default(65536),
-      },
+      }),
       outputSchema: gitDiffOutputSchema,
       annotations: { readOnlyHint: true },
     },
     async (args, extra) => {
-      const denied = requireScope(extra.authInfo, "git.read");
+      const denied = scope(extra.authInfo, "git.read");
       if (denied) return denied;
       try {
+        const workspace = resolveToolWorkspace(source, args, extra.authInfo);
         let relPath: string | undefined;
         if (args.path) {
           relPath = workspace.resolve(args.path).rel;

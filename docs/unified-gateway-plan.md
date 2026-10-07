@@ -2,21 +2,34 @@
 
 本文是“一个机器级 Gateway、一个 ChatGPT 插件，覆盖本机所有显式授权项目”的现役实施计划。下列各阶段完成前，计划目标都不得写成已交付。旧时间线仍保留在[开发计划](development-plan.md)；单 workspace 官方投递的当前合同见[官方路线](official-route.md)。
 
-## 当前状态（2026-10-06，Asia/Shanghai）
+## 当前状态（2026-10-07 当前 checkout）
 
-### 已验证的单 workspace 闭环
+### 当前源码能力
+
+- M1–M3 已有源码：`gateway register/list/revoke` 把规范 workspaceId/root 与获准 clientIds 写入机器 allowlist；`gateway serve` 使用独立 `machine-gateway` OAuth store 和单实例 owner lock。`gateway_list_workspaces` 只列出当前 client 的授权项目；workspace、Remote、execution、feedback、Web Sink 工具显式带 workspaceId，每次调用重新解析 grant 与 canonical root。Remote 工具仍要求该 workspace 处于 official delivery mode。
+- MCP Gateway 复用原工具 handler 与每项目业务状态，不增加 Gateway 任务/反馈队列。`/mcp` 与 `/oauth/token` 诊断日志只记录 method、固定 path 和 statusCode；不记录 query、body、headers。匿名访问只开放协议 discovery，工具调用仍要求 bearer OAuth 和原 scope。
+- M4 已有多 workspace Companion 源码：每项目 local/session/alarm 存储隔离，页面选择固定 workspaceId 与 canonical route，DOM mutation 按 tab 串行，操作面板请求带 workspaceId 并忽略旧项目迟到响应。测试覆盖双项目状态隔离；双项目真实 Send/observed 尚待现场验收。
+- M6 已有 Windows 前台 Gateway/Tunnel Supervisor 源码：configure/status/validate/set-key/run、DPAPI key 保存、exact process identity、launcher startup pin、受限 OAuth metadata preflight，以及 GC 对 Gateway/Controller release 引用的保护。尚无 Scheduled Task 注册或异常退出自动恢复。
+
+### 当前未交付与验证边界
+
+M4 双项目真实 Send/observed、M5 同一插件的双项目端到端验收及旧 feedback Connector 退役仍未完成。M6 的历史机器启动、正常停止/重启和 A 项目只读 smoke 证据不能证明当前的进程、listener、build 或浏览器状态；本段说明源码能力和待现场验收范围，旧 PASS 记录只适用于其标注的源码/build。
+
+## 历史现场与源码验证记录（每条只代表其标注时点）
+
+### 已验证的单 workspace 闭环（2026-10-06）
 
 08:31–08:34 的真实网页验收已通过：OAuth；普通 Chat 的 workspace_info/list_targets；创建唯一 target；连续两轮官方投递、按需读取结果并留在同一 thread；两条 Companion 结果自动到达 observed。用户 Reload 扩展后确认当前对话 connected/armed。此验收证明一个 workspace 的官方投递与 Companion 回流，不证明多 workspace 聚合、原生 Events 唤醒或持续在线。
 
 验收对应 workspace 2582910bf0d2，root 为 D:\python\codex-with-chatgpt，target b90a0577-2174-409f-8228-13fe8722ddef，thread 01a10e94-2366-7dc0-ae7b-0f948f24bef3。Gateway origin 为 https://c2c-official-2582910bf0d2.devworklink.com；旧反馈 origin 为 https://c2c-codex-with-chatgpt.devworklink.com。Companion route 为 https://chatgpt.com/c/6ac43e04-28c0-83ec-9651-0b32ba0617e4，Feedback epoch 14、Web Sink epoch 4。脱敏验收记录为 .tooling/official-route-deploy-20261005/gateway-companion-feedback-acceptance-20261006-verified.json（记录时间 08:34:27）。
 
-### 最新运行状态
+### 实施前运行快照（2026-10-06）
 
 09:01:03 的只读快照 .tooling/official-route-deploy-20261005/closeout-current-1791248463501.json 记录 Bridge 为 stopped，旧 durable runtime 记录仍包含 PID 19516/build c4b4c18d050137aaae1130b99257e3e13ded21eefbdf6359db2ee22798e28d97；该记录不代表进程仍运行。09:02 的 Win32_Process 只读取证中，早间记录的 Bridge 19516、Controller 24508、App Server 20172、Gateway 8572、PowerShell 24736、Cloudflare 6852、Tunnel 25488 均不在进程列表，端口 48766 无监听。原因未判定，本次未恢复。
 
-当前已安装 build 仍为 c4b4c18d050137aaae1130b99257e3e13ded21eefbdf6359db2ee22798e28d97；不要据此声称它当前正在运行。最新快照记录两条 Result Bus 结果为 observed、Remote queued/inflight/reconciliation 均为 0，maintenance/rollout/start locks 均为 0。471 项冻结文件 drift 为 0。Gateway、Controller 与 App Server 的当前身份需在下一会话重新只读取证。
+该历史快照的已安装 build 为 c4b4c18d050137aaae1130b99257e3e13ded21eefbdf6359db2ee22798e28d97；不代表当前安装或运行版本。当时两条 Result Bus 结果为 observed、Remote queued/inflight/reconciliation 均为 0，maintenance/rollout/start locks 均为 0，471 项冻结文件 drift 为 0。2026-10-07 部署后的状态见 M6 和文末的下一会话入口。
 
-源码正式串行全量为 164 files / 3435 tests PASS，typecheck、build PASS，build ID 与上列安装版本一致；这是已有源码验收，不是本轮文档验证。普通 Chat 原生 Events 尚未通过；既有 thread 选择与 Desktop writer 移交限制、重启恢复、Key rotation、长期运行入口和 machine supervisor live acceptance 未完成。旧反馈插件仍保留，尚未并入单一插件或停用。
+此前源码正式串行全量为 164 files / 3435 tests PASS，typecheck、build PASS；这是实施前验收，不是当前 checkout 的 Gateway 门禁。后续 M6 限定机器启动/正常重启、双 workspace 只读连接与单项目 smoke 仅见本页历史摘要。普通 Chat 原生 Events、开机自启、异常恢复、M4 双项目真实 Send/observed、M5 端到端验收和旧插件退役仍未完成。
 
 ## 目标与不可变边界
 
@@ -29,24 +42,51 @@
 - 保留认证、scope、审批、本机确认、workspace/root/client/target 精确匹配、防重放、route attestation VERIFIED 和 outcome_unknown 不重发等现有门禁。普通 Chat 原生 Events 不作为本计划的替代回流机制。
 - 不引入新数据库、新队列、新依赖或跨设备体系。机器级项目登记沿用现有 state directory 和安全 JSON 工具；项目执行/反馈状态仍落在原 workspace 权威存储。
 
-## 现有实现与最小落点
+## 实施前基线与最小落点
 
 - src/remote/server.ts 的独立 endpoint 只接收一个 workspaceRoot，构造一个 Workspace 和一个按 workspaceId 隔离的 AuthStore；其 official MCP profile 只注册 workspace 与 remote 工具。
 - src/mcp/server.ts 已将 official、feedback、legacy 三类 profile 分开。Bridge 在 official mode 仍通过 feedback profile 提供反馈工具；Companion 与 Web Sink 路由仍按单 workspace 绑定。
 - src/workspace/manager.ts 会 realpath workspace root 并从规范 root 派生 workspaceId，但没有机器级已授权项目 registry。src/config/endpoint.ts 是每 workspace 最近 Connector endpoint 记录，不是项目授权清单。
 - 可复用 src/remote/store.ts 与 src/remote/controller.ts、src/result-bus/、src/mcp/feedback.ts、src/mcp/web-sink-tools.ts、src/bridge/companion.ts 的现有权威和协议。只为 workspaceId 路由与组合工具做必要改造；不复制业务状态机。
 
+## 历史源码实施与验证（2026-10-06；仅对应当时 checkout）
+
+09:15 的只读核验：旧 Bridge/Controller/App Server/Gateway/Tunnel PID 均不存在，48766 无监听；稳定 launcher 显示 Bridge stopped、Controller/App Server/Tunnel offline，Remote queued/reconciliation 为 0。installed build 仍为 c4b4c18d050137aaae1130b99257e3e13ded21eefbdf6359db2ee22798e28d97，running build 为 null。没有恢复、启动或重绑真实服务。
+
+M1 增加机器级 `gateway/workspaces.json`，只保存规范 workspaceId/root 与 clientIds；`gateway register/list/revoke` 是本机显式授权入口，MCP 不提供登记或授权工具。每次项目调用重新读取清单并 realpath 核验；撤销对原 token 的后续调用立即生效，清单损坏拒绝且保留文件。短写锁、fsync 与原子 rename 沿用现有 JSON store 模式，遗留锁不自动回收。
+
+M2/M3 的源码通过 `gateway serve --port <port> --public-url <HTTPS origin>` 复用原 OAuth 与 stateless MCP HTTP 入口。机器 OAuth 独立保存在 `auth/gateway.json`，token 只认证 `machine-gateway` 调用方。`gateway_list_workspaces` 要求 workspace.read 且仅列该 client 的已授权项目；其余 workspace、Git、Remote、execution、feedback、Web Sink 工具显式带 workspaceId，进入原处理函数前解析项目。Remote 还核验 deliveryMode=official。每项目业务状态、Controller、结果与审批门禁保持原权威。`gateway/server.lock` 保证认证缓存只有一个运行 owner，异常退出后的锁需人工核对，不自动抢占。
+
+新 Gateway client 不继承旧 Connector 的 conversation fingerprint；反馈接管仍要求显式 takeover 与 fresh expectedEpoch。`feedback_companion_pair` 附加 workspaceId 供浏览器明确选择，secret 仍为一次性。路由认证消息同时携带精确 workspaceId、challengeId 与 digest，供同一插件确认对应项目。领取反馈在 reconcile/cutover 前核对 principal 与 binding/epoch；ACK 在 stale recovery 写盘前核对主体及 event/attempt，拒绝路径不推进历史。
+
+M4 源码复用单份 Companion 状态机，为每个显式 workspace 建立 local/session/alarm 命名空间。Popup 从完整 Pair 输出登记 workspaceId 与 Bridge origin，再明确选择项目；登记不授予 Gateway 项目权限，也不调用 Pair。操作面板 URL 固定 workspaceId；页面绑定按 tab/route 选择项目，生产发送回调固定原 workspace/tab/document，同 tab 的 DOM mutation 串行。后台唤醒监听在 registry 加载前同步注册，namespaced alarm 只进入对应项目，关闭 tab 的选择清理先等待 session 加载。旧 singleton 只有完整身份与 route 可核对时复制迁移，保留旧 journal、attempt 与 archive；未知或冲突状态停止迁移。
+
+Popup 的项目选择、列表和页面状态读取使用 revision 检查，迟到响应不能覆盖新项目或新页面；手动操作复用项目操作锁直到响应与显示更新完成，期间不能切换项目。切项目清空临时结果显示，保留持久历史；解绑后按钮保留最新 owner 状态。
+当前 Popup 的空白“请选择项目”项不解除既有 tab/route 的项目映射，刷新会恢复原选择；切项目须选择明确的已登记项目。解除 tab 映射不是该空白项已实现的操作。
+
+Grant Bridge access 单独请求权限；Pair 与 Pair+Connect 仅检查已有 permission，缺失时返回 bridge_permission_missing，不领取 owner proof 或调用 /pair。Pair secret 只保留在 popup 内存。Manifest 继续加载已构建的 classic content artifacts；ESM 模块只进入 service worker import graph。该次源码阶段没有 Reload 扩展或操作真实 ChatGPT 页面。
+
+当次正式串行全量 `pnpm test --maxWorkers=1 --testTimeout=90000` 分两次执行。第一次于 11:29–11:59 发现 `architecture-separation.test.ts` 的静态检查只移除一次“禁止任务投递”固定提示，而 legacy 与 workspace-bound bootstrap 都含该提示：171 个文件中 170 PASS、1 FAIL，3482 项中 3481 PASS、1 FAIL。将精确提示的移除改为 `replaceAll` 后，第二次于 13:15–13:43 完整通过：171/171 files、3482/3482 tests，exit 0。调用符号、import 和 endpoint 三层架构门仍保留；source map 告警不影响测试结果。
+
+第二次全量后的 `typecheck`、`build`、JavaScript syntax 和 `git diff --check` 均通过。run-2 使用 482 个源码/测试/配置输入，source digest 为 `24d38ebbcf301e8ae642362542246e5df37d3300a4df582cc0092e375f8b2ff5`，build ID 三重核验为 `af826f8d96120046bf6e1a8b9c029b8b7daae73bdddb7b6c741cb73e9bec4a5d`。全量无 Unhandled Error；仍记录 `dist/browser-companion/route.js.map` 缺失 source map 告警，未扩大修改打包脚本。
+
+run-2 前后机器快照归属到测试 runner 的新进程、监听和新增临时目录均为 0。独立证据保存在 checkout 的 ignored [.tooling/unified-gateway-20261006/run-2-evidence.json](../.tooling/unified-gateway-20261006/run-2-evidence.json)，第一轮失败证据仍保留在原始 `evidence.json`。13:48 的稳定 launcher 只读刷新仍为 Bridge stopped、Controller/App Server/Tunnel offline，queued/reconciliation=0，旧 PID missing、48766 无监听；installed build 未变，running build=null。
+
+截至该次记录，M1–M3 与 M4 的源码、定向测试和串行源码门禁已完成。M4 双项目真实 Send/observed、M5 同一插件真实双项目验收和旧插件退役尚未执行，不得从测试 fixture 推断 live 完成。
+
+实验性并行 candidate 的 manifest 与 164 files / 3435 tests 仍保留为旧冻结基线。当前新增与改动测试会被其 inventory/hash 门拒绝；未经独立 profiling 与资源隔离审计，不刷新该清单或把新文件加入 parallel。正式验收只使用串行全量。
+
 ## 阶段与依赖顺序
 
-顺序为 M0 → M1 → M2 → M3 → M4 → M5。每阶段先做针对性回归，再运行 typecheck/build/diff 检查；整合后的正式串行全量只在源码冻结后运行一次。所有 live 检查都核对当前身份和状态，不沿用旧 PID 或把 installed build 当作 running build。
+顺序为 M0 → M1 → M2 → M3 → M4 → M5；M6 是独立的机器级 supervisor 实施与部署验收阶段。每阶段先做针对性回归，再运行 typecheck/build/diff 检查；整合后的正式串行全量只在源码冻结后运行一次。所有 live 检查都核对当前身份和状态，不沿用旧 PID 或把 installed build 当作 running build。
 
-### M0：基线与合同锁定（文档完成）
+### M0：基线与合同锁定（历史阶段，已完成）
 
 本文件记录单 workspace 现状、多项目目标、退出门槛和未完成事项。M0 不表示 Gateway 多项目代码或部署已完成。
 
-退出条件：实现者能区分已通过的单 workspace live 闭环与尚未实现的多 workspace 路由；接受本文件全部安全边界。已完成。
+退出条件（M0 完成时）：实现者能区分已通过的单 workspace live 闭环与当时尚未实现的多 workspace 路由；接受本文件全部安全边界。已完成。
 
-### M1：显式项目登记与授权
+### M1：显式项目登记与授权（源码已实现）
 
 增加最小机器级 allowlist：显式 register/list/revoke 本机 workspace，复用 state directory、schema 校验、既有原子 JSON 写入模式与 Workspace realpath 校验。登记内容只保存规范 workspaceId/root 和必要授权主体；不递归发现目录。endpoint 记录不能代替授权。
 
@@ -54,7 +94,7 @@ OAuth 认证后仍按 clientId 与 workspaceId 检查本机授权；root 与 wor
 
 退出条件：测试覆盖两个已授权 workspace、未登记/撤销 workspace、不同 client、root 身份错配、路径别名/符号链接边界和损坏 registry；拒绝路径没有写入任务、反馈或项目状态。
 
-### M2：单 MCP Gateway 与多 workspace 官方工具
+### M2：单 MCP Gateway 与多 workspace 官方工具（源码已实现；双项目现场验收待完成）
 
 在现有 MCP 组合入口增加 Gateway profile。提供只列出当前 client 有权访问项目的只读清单；项目级 workspace/read、target、create-thread、submit、status、result 工具都显式接收 workspaceId，target/thread/task 参数按对应 workspace 解析。每次调用先核验 Gateway OAuth 身份、项目登记和 root，再进入已有每项目逻辑。
 
@@ -62,7 +102,7 @@ OAuth 认证后仍按 clientId 与 workspaceId 检查本机授权；root 与 wor
 
 退出条件：同一插件连接和 OAuth client 可对两个本机已授权 workspace 各自创建 target、投递、查询精确 task/result；跨 workspace targetId/taskId、未授权项目及错误 root 均被拒绝；两边任务、历史和结果状态不串线。
 
-### M3：整合旧插件的 feedback 管理
+### M3：整合旧插件的 feedback 管理（Gateway 工具源码已实现；双项目现场验收待完成）
 
 新 Gateway 插件暴露现有 feedback 管理与 Companion/Web Sink 状态能力，至少覆盖 bootstrap/status、enable/takeover、claim/ack、stop、pair、route confirm、revoke、Web Sink list/status。项目级调用显式带 workspaceId 和原有 conversation/client 证明；逐项保留原 scope 与 fresh-state 校验。
 
@@ -70,7 +110,7 @@ OAuth 认证后仍按 clientId 与 workspaceId 检查本机授权；root 与 wor
 
 退出条件：同一 Gateway 插件在两个 workspace 分别完成只读状态、明确接管/验证和受控回流管理；只读操作零状态写；授权不足或主体不匹配没有副作用；旧与新接口不会为同一 event/attempt 产生第二次发送。
 
-### M4：Companion 多项目连接与回流隔离
+### M4：Companion 多项目连接与回流隔离（源码已实现；双项目真实 Send/observed 待验收）
 
 让 Companion 明确显示并操作当前已授权 workspace 的连接/route 状态。复用每项目 Bridge endpoint 与现有 connection、route attestation、Web Sink 和 Result Bus；不得把多个项目压成一个当前 binding。每项目连接、事件、reservation、attempt、ACK 与错误日志均留在本 workspace，并保留此前 attempt。
 
@@ -78,21 +118,55 @@ production Send 仍要求该 workspace 当前 route attestation 为 VERIFIED。�
 
 退出条件：两个 workspace 分别完成普通 Chat 的连接、真实结果 Send 与 observed/ACK；每条结果能回到唯一原 workspace/event/attempt；一个项目断开、刷新或发生 unknown 不改动另一个项目，也不覆盖旧 attempt。
 
-### M5：双项目验收与旧插件逐个停用门
+### M5：双项目验收与旧插件逐个停用门（未完成）
 
 冻结源码后执行正式串行全量、typecheck、build 和 diff；确认 packaged artifacts、安装身份、当前运行身份和浏览器扩展版本分别可核验。随后通过同一个插件连接完成两个 workspace 的只读、官方投递、结果读取、反馈连接/验证和 Companion 回流验收。
 
-只有新插件覆盖旧插件所需功能，两个项目均通过端到端验收、没有未解决 attempt/授权不明或结果缺口，并有可用回退路径，才逐个停用并移除旧 feedback Connector。每次只停一个并现场检查。按本轮已有的旧插件退役授权执行，无需重复索取授权；保留旧连接的历史、凭据状态与恢复证据，不清理 workspace 状态。Bridge feedback 服务继续保留，直至另有兼容与状态迁移证据证明可以移除。
+只有新插件覆盖旧插件所需功能，两个项目均通过端到端验收、没有未解决 attempt/授权不明或结果缺口，并有可用回退路径，才逐个停用并移除旧 feedback Connector。每次只停一个并现场检查，按实际会话已有的明确用户授权执行；计划文本和历史记录本身不授予退役权限。保留旧连接的历史、凭据状态与恢复证据，不清理 workspace 状态。Bridge feedback 服务继续保留，直至另有兼容与状态迁移证据证明可以移除。
 
 退出条件：两个项目的权限隔离和端到端记录可独立审查；新旧接口不存在双重发送；旧 Connector 每次停用后其余项目正常。任一检查不清楚即停止停用并保留旧配置。
 
 ## 延后项与风险停止条件
 
+### M6：机器级 Gateway/Tunnel Supervisor（源码已实现；限定机器验收与 A 项目 smoke 仅为历史记录）
+
+本节描述当前源码机制，并保留 2026-10-07 的历史验收摘要；精确机器身份和运行证据留在本机，不复制为现役配置。历史摘要不是本轮新鲜观察，也不能替代当前 checkout 的门禁或当前运行态核验。Windows Scheduled Task、开机自启和异常退出自动恢复没有实现，仍属 pending。
+
+`gateway supervisor configure` 提供首次配置入口：保存 Gateway HTTPS origin、固定 loopback 端口、Cloudflare named tunnel 名称、Secure MCP Tunnel ID、stable launcher、两个 executable 路径和可选 proxy。配置与 `set-key`/启动共用 machine maintenance fence；存在 supervisor runtime/lock 时拒绝覆盖，损坏状态保留供核对。`status`/`validate` 只读检查配置和 runtime 文件，不证明公网可用或 OAuth 已授权。
+
+`gateway supervisor set-key` 只接受交互式终端中的隐藏输入，用 Windows 当前用户 DPAPI 加密保存到机器状态目录的 `gateway/tunnel-runtime-key.dpapi`，配置只保存 keyFile/reference。不接受 `--key`、管道明文输入或仓库中的 key 文件；缺配置时先提示 configure。后续 `run` 只在内存解密，并只向 Secure MCP Tunnel 子进程传入临时环境变量；不向 argv、runtime JSON 或日志输出明文。PowerShell helper 使用现有环境白名单，避免继承 PowerShell 7 的 PSModulePath 导致 Windows PowerShell 的加密模块无法加载。
+
+`gateway supervisor run` 是前台入口，直接在管理进程内启动 Gateway HTTP listener，再启动 Cloudflare origin 与 Secure MCP Tunnel 两个子进程。Secure Tunnel upstream 固定为 Gateway 公网 `/mcp`，复用精确 hostname 限制。Gateway 和所有子进程使用同一 `C2C_STATE_DIR`；Tunnel identity 是机器级，与 workspace Bridge identity 分开，停止任一项目不会隐式关闭其他项目共用的 Gateway。
+
+本机启动终端显示短期 OAuth 配对码；Tunnel key 与 OAuth 配对码用途不同，已有效的 OAuth 授权不会因为正常重启被撤销。Gateway 使用正常 `close()` 释放 server.lock；Ctrl+C、Gateway 关闭或任一 Tunnel 退出时按本轮 PID/creationTime/executable 核验并收敛所拥有的子进程。提前退出不会漏掉，停止超时后的 unknown/仍存活进程保留 runtime/lock，绝不报告清理成功。实机首轮发现 Windows PTY 的 Ctrl+C 会令父 launcher 先退出并中断异步清理；修复仅为 Windows 增加父进程 SIGINT/SIGTERM listener 并保持 `spawnSync` 清理，非 Windows 行为不变。以真实 `CTRL_C_EVENT` 回归 `tests/windows_launcher_sigint_test.py`，另有 5 项 launcher 测试、typecheck、build、diff 检查通过；没有重跑全量。异常退出遗留锁仍需核对，不自动抢占或重试。
+
+部署该版本后，一次配置的命令结构如下（参数来自已核验的机器 Tunnel 配置，不复制旧项目的 Tunnel 身份）：
+
+```powershell
+node "<稳定 launcher>" gateway supervisor configure --public-url "https://<Gateway origin>" --port "<已核验固定端口>" --tunnel-name "<Cloudflare named tunnel>" --tunnel-id "tunnel_<Secure MCP Tunnel ID>" --stable-launcher "<稳定 launcher>" --cloudflared "<cloudflared.exe 绝对路径>" --tunnel-client "<tunnel-client.exe 绝对路径>"
+node "<稳定 launcher>" gateway supervisor set-key
+node "<稳定 launcher>" gateway supervisor run
+```
+
+后续正常启动只执行 `run`，无需再次 `set-key`。需要轮换 key 时先正常停止，再执行 `set-key`。首次授权或授权失效时使用启动终端里的配对码；配对码过期可正常停止并重新运行以生成新码，保存的 Tunnel key 不变。
+
+stable launcher 在 maintenance lock 内读取 current 并写入每次启动独立的 `gateway/supervisor.<nonce>.launch.json`，再加载 release。Supervisor 验证路径、文件身份、nonce、build 与 launcher；在同一维护门禁内持久化 runtime 后才移除本轮 pin。GC 保留 Gateway runtime、子进程与所有 launch pin 引用的 build；未知或损坏引用停止回收。未完成 handoff 的 pin 保守保留，但不会阻挡下次启动；人工核对前不自动清理。配置原子写入留下的规范临时文件不作为 release 引用，runtime 临时文件仍 fail closed。
+
+### 历史验证摘要（2026-10-07）
+
+当时的隔离回归覆盖机器 Supervisor 配置、DPAPI key、正常启动/停止、launcher pin 与 GC 引用。正式串行回归曾通过 173 files / 3509 tests，但之后又有 Windows Ctrl+C、Web Sink strict output projection、请求诊断与 Supervisor preflight/GC 修复；该旧全量不得作为当前 checkout 的门禁。SDK HTTP 测试夹具使用 loopback `node:http` 与流式响应规避 Fetch 禁用端口，保留真实鉴权状态、SSE 与取消行为；生产 Fetch、OAuth 和 OS 配置没有因此改变。
+
+历史现场覆盖正常 Ctrl+C 清理、复用已保存 key 的正常重启和双 workspace 只读连接。一次 cold start 曾返回 readiness 503，正常重启后返回 200 仍带 startup probe timeout；不能宣布持续在线、异常恢复或其根因已解决。只读项目 smoke 后续完成 route attestation、同一 attempt 的 TURN_ENDED、observed 和结果回读，但仅覆盖一个明确授权项目；双项目真实 Send/observed、M5 端到端验收和旧 Connector 退役仍未完成。
+
+精确 PID/startTime、tunnel/client、workspace/session/task/binding/attempt、installed/running build、日志和截图身份保留在本机验收记录中；本页不把它们作为可复用配置或新会话的授权来源。源码的按请求鉴权、反馈 epoch、防重放与 GC fail closed 合同仍须分别验证。
+
 这些不是首轮 M1–M5 的阻塞任务，也不得在本轮声称已完成：
 
 - 既有 thread 选择以及 Desktop 与独立 App Server 的 writer 移交限制。
-- Controller/Gateway 重启恢复、Key rotation、Gateway 长期运行入口与恢复自动化。
-- machine supervisor live acceptance；Windows Task Scheduler 注册需单独授权。
+- Controller 重启恢复、Key rotation、Gateway 开机自启与异常退出自动恢复。
+- 启动 readiness 仍有异常提示：15:23 `/readyz` 为 HTTP 200，但带 2 秒 MCP startup probe timeout；此前 cold-start 503 保留为历史，原因仍未确认。
+- Controller 启动 launch-pin 窗口仍未解决；legacy remote runtime 缺少 buildId 与状态不明的 remote lock/temp 持续触发保守 GC block，不清理旧状态。
+- Windows Task Scheduler 注册需单独授权。
 - R5j 性能优化继续 deferred。
 - 普通 Chat 原生 Events 唤醒仍未通过，继续由 Companion 负责回流。
 
@@ -100,6 +174,4 @@ workspace/root/client/target 不一致、授权无法确认、存储损坏、进
 
 ## 下一新会话入口
 
-先只读刷新 Bridge、Gateway、Controller、App Server、Tunnel 的真实进程身份、端口、installed/running build、锁和 inflight。当前最后一次观察为 09:01–09:02：旧进程均 missing、48766 无监听、Bridge stopped，恢复未执行；早间 08:31–08:34 的成功闭环是历史验收。不要自动恢复、重启、使用 Key 或注册 Scheduled Task。
-
-状态核验后从 M1 开始：只实现本机显式 workspace allowlist 和 client 授权，再进入 M2。提交时以新 commit SHA 和当时 fresh runtime observation 更新交接；本文件不把提交前 HEAD 固定成最终版本。
+只在实际已授权范围内重新只读核验进程身份、端口、installed/running build、锁与 inflight；历史现场记录不代替本次检查，也不授权启动、重启、注册任务或修改绑定。先完成当前源码门禁，再按实际会话授权处理待完成的 M4/M5 验收。普通 Chat 原生 Events 与旧 Connector 退役不由一次 smoke 或旧全量推断完成。

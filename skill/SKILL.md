@@ -39,7 +39,15 @@ Normal 使用 `[C2C]`。状态不互相推进，同一 Agent 不并行执行两�
 endpoint 的 workspace。`TURN_ENDED` 是 App Server 生命周期事实，不是 Desktop receipt 或测试成功。
 不得为它写 `desktop_*` 回执。Desktop 持有 writer 时不得抢占、修改私有状态或自动换线程。
 本机 `deliveryMode=official` 后 Bridge 停用旧任务投递，只保留反馈相关功能；Remote disable 不回退旧入口。
-仅开发或读取文档不授权启用、部署、重启服务或更改现有绑定。普通 Chat 的自动回流仍使用 Companion。
+
+**统一 Gateway（显式部署后）:** 见 `docs/unified-gateway-plan.md`。先在实际连接中调用
+`gateway_list_workspaces`，核对当前 clientId 和显式授权项目，再选定 workspaceId。
+所有项目工具（包括 workspace_info、feedback_status、web_sink_list）都携带该 workspaceId；
+targetId/taskId 必须属于同一项目。OAuth 登录本身不授权任何本机项目，缺失授权由本机用户
+明确登记，网页工具不能自行登记、扫描目录或扩大范围。新 Gateway client 不继承旧反馈
+binding，接管仍要求实际对话证明和 fresh expectedEpoch；不在 outcome_unknown 后换插件重发。
+源码开发不授权部署、启动、迁移或停用旧 Connector；M4/M5 live 验收门保持独立。
+仅开发或读取文档不授权启用、部署、重启服务或更改现有绑定。普通 Chat 的自动回流仍使用 Companion；MCP Events、Work Events、普通 Chat 原生 Events 或 App Server `TURN_ENDED` 的源码/单次观察均不等于对应 Events 支持已验收。
 
 **Desktop Control（独立实验性 MVP）:** 默认关闭，只支持本机用户绑定、已在 Desktop 加载的
 已有会话。ChatGPT 只有在网页用户确认完整方案后，才可调用 `codex_desktop_send`；它只等待真实

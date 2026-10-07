@@ -24,7 +24,7 @@
     .ok { color: #81c995; }
     .bad { color: #f28b82; }
     .warn { color: #fdd663; }
-    input, textarea {
+    input, textarea, select {
       width: 100%;
       box-sizing: border-box;
       padding: 6px 8px;
@@ -61,6 +61,14 @@
 <body>
   <header><strong>C2C Companion</strong><div class="note">连接当前 ChatGPT 对话与 Codex，并自动接收执行结果。</div></header>
   <main>
+    <section class="card" aria-label="Gateway workspace">
+      <div class="section-title">项目 workspace</div>
+      <div class="row">
+        <div class="label">明确选择已登记项目</div>
+        <select id="workspace-select"><option value="">请选择项目</option></select>
+      </div>
+      <div class="note" id="workspace-status">未选择项目；页面状态与连接操作保持关闭。</div>
+    </section>
     <section class="card" aria-label="当前连接状态">
       <div class="section-title">当前状态</div>
       <div class="row"><div class="label">当前对话</div><div class="value" id="user-connection-status">检查中…</div></div>
@@ -70,7 +78,7 @@
     <section class="card" aria-label="消息与任务概览">
       <div class="section-title">消息与任务</div>
       <div id="operations-summary" class="note" style="white-space:pre-line">正在只读查询两端状态…</div>
-      <a href="../operations/operations.html" target="_blank" rel="noopener" style="color:#a8c7fa">打开任务面板 →</a>
+      <a id="operations-link" href="../operations/operations.html" target="_blank" rel="noopener" style="color:#a8c7fa">打开任务面板 →</a>
     </section>
     <button id="connect-chat" class="primary">连接当前对话</button>
     <label class="note" style="display:flex;gap:8px;align-items:flex-start;color:#fdd663;">
@@ -84,7 +92,9 @@
     <details id="first-use-settings">
       <summary>首次使用或连接有问题？</summary>
       <div class="note" id="first-use-hint">首次使用时，粘贴配对信息，然后点击一次完成连接。</div>
-      <div class="row"><div class="label">配对信息</div><textarea id="pair-json" rows="4" placeholder='{"intentId":"...","secret":"c2c_pair_..."}'></textarea></div>
+      <div class="row"><div class="label">配对信息</div><textarea id="pair-json" rows="4" placeholder='{"workspaceId":"012345abcdef","bridgeOrigin":"https://...","intentId":"...","secret":"c2c_pair_..."}'></textarea></div>
+      <button id="add-project" class="secondary">登记 JSON 中的项目</button>
+      <div class="note" id="add-project-hint">登记仅保存 workspaceId 与 Bridge 地址；仍需在上方明确选择项目。不会请求 Bridge 权限或配对。</div>
       <button id="pair-connect" class="primary">配对并连接当前对话</button>
       <div class="note" id="pair-connect-hint">配对密钥只在本次 popup 内存中使用，不会保存。</div>
       <details id="manual-repair">

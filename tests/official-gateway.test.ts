@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { StreamableHTTPClientTransport } from "./sdk-http-fixture.js";
 import { AuthStore } from "../src/auth/store.js";
 import { createMcpServer } from "../src/mcp/server.js";
 import { registerRemoteTools } from "../src/mcp/remote.js";

@@ -1,7 +1,8 @@
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import type { Workspace } from "../workspace/manager.js";
+import { GatewayRegistryError } from "../gateway/registry.js";
+import { resolveToolWorkspace, workspaceIdShape, type WorkspaceSource } from "./tool-shared.js";
 import { WEB_SINK_READ_SCOPE } from "../auth/store.js";
 import { WebSinkControlError } from "../web-sink-control/schema.js";
 import {
@@ -87,6 +88,7 @@ function authorizeNow(auth: AuthInfo): void {
 }
 
 function safeError(error: unknown, scope?: string): ToolResult {
+  if (error instanceof GatewayRegistryError) return fail(error.code, error.message);
   if (error instanceof WebSinkControlError) {
     return error.code === "INSUFFICIENT_SCOPE"
       ? fail(error.code, error.message, scope)
@@ -106,20 +108,21 @@ function result(action: () => unknown | Promise<unknown>, scope?: string): Promi
  * Generic Web Sink MCP read-only tools。
  * 不提供 MCP web_sink_bind / web_sink_switch（绑定必须来自 Companion 页面证明）。
  */
-export function registerWebSinkTools(server: McpServer, workspace: Workspace): void {
+export function registerWebSinkTools(server: McpServer, workspaceSource: WorkspaceSource): void {
   server.registerTool(
     "web_sink_list",
     {
       title: "列出 Web Sink Surface",
       description: "只读列出 production Web Sink surface；不会绑定或切换结果目的地。",
-      inputSchema: listInputSchema,
+      inputSchema: typeof workspaceSource === "function" ? z.object(workspaceIdShape(workspaceSource)).strict() : listInputSchema,
       outputSchema: listOutputSchema,
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
       _meta: { securitySchemes: [{ type: "oauth2", scopes: [WEB_SINK_READ_SCOPE] }] },
     },
-    (_input, extra) => result(() => {
+    (input, extra) => result(() => {
       const auth = requireAuth(extra.authInfo, WEB_SINK_READ_SCOPE);
       authorizeNow(auth);
+      resolveToolWorkspace(workspaceSource, input, auth);
       return { plugins: listWebSinkSurfaces() };
     }, WEB_SINK_READ_SCOPE),
   );
@@ -137,6 +140,7 @@ export function registerWebSinkTools(server: McpServer, workspace: Workspace): v
     (input, extra) => result(async () => {
       const auth = requireAuth(extra.authInfo, WEB_SINK_READ_SCOPE);
       authorizeNow(auth);
+      const workspace = resolveToolWorkspace(workspaceSource, input, auth);
       if (input.workspaceId !== workspace.id) {
         throw new WebSinkControlError("WEB_SINK_WORKSPACE_MISMATCH", "请求工作区不匹配。");
       }
@@ -154,11 +158,26 @@ export function registerWebSinkTools(server: McpServer, workspace: Workspace): v
       } catch {
         companionAvailable = false;
       }
-      return webSinkStatus(workspace.id, {
+      const status = await webSinkStatus(workspace.id, {
         companionRouteCanonical,
         companionVerified,
         companionAvailable,
       });
+      const binding = status.activeBinding;
+      return {
+        workspaceId: status.workspaceId,
+        activeBinding: binding ? {
+          bindingId: binding.bindingId,
+          pluginId: binding.pluginId,
+          surfaceId: binding.surfaceId,
+          workspaceId: binding.workspaceId,
+          canonicalUrl: binding.canonicalUrl,
+          epoch: binding.epoch,
+          boundAt: binding.boundAt,
+        } : null,
+        plugins: status.plugins,
+        availability: status.availability,
+      };
     }, WEB_SINK_READ_SCOPE),
   );
 }

@@ -27,10 +27,30 @@ export const FEEDBACK_BOOTSTRAP_MESSAGE = [
   "若 feedback_status 或 feedback_takeover 工具不可用，仅回复 C2C_FEEDBACK_BOOTSTRAP_TOOL_MISSING 并停止。",
 ].join("\n");
 
+const WORKSPACE_ID_PATTERN = /^[a-f0-9]{12}$/;
+
+/** Construct the only workspace-bound bootstrap message accepted by the runner. */
+export function createFeedbackBootstrapMessage(workspaceId) {
+  if (typeof workspaceId !== "string" || !WORKSPACE_ID_PATTERN.test(workspaceId)) return null;
+  return [
+    "[C2C_FEEDBACK_BOOTSTRAP]",
+    `WORKSPACE_ID: ${workspaceId}`,
+    "这是 C2C 当前对话连接自举，不是开发任务。",
+    `请在本对话调用 feedback_status(workspaceId=${workspaceId})。`,
+    `若 enabled=true 且 ownsBinding=false，使用返回 binding 的 exact epoch/widgetId 调 feedback_takeover(workspaceId=${workspaceId}, expectedEpoch=..., widgetId=...)。`,
+    "若 ownsBinding=true 不调用 takeover。",
+    "完成后停止；Browser Companion 会继续 route verification。",
+    "不调用 codex_desktop_send，不执行开发任务。",
+    "若 feedback_status 或 feedback_takeover 工具不可用，仅回复 C2C_FEEDBACK_BOOTSTRAP_TOOL_MISSING 并停止。",
+  ].join("\n");
+}
+
 export const FEEDBACK_BOOTSTRAP_EXECUTE_TYPE = "c2c.feedback.bootstrap.execute";
 
-export function isFeedbackBootstrapMessage(value) {
-  return value === FEEDBACK_BOOTSTRAP_MESSAGE;
+export function isFeedbackBootstrapMessage(value, workspaceId) {
+  if (workspaceId == null) return value === FEEDBACK_BOOTSTRAP_MESSAGE;
+  const expectedMessage = createFeedbackBootstrapMessage(workspaceId);
+  return typeof expectedMessage === "string" && value === expectedMessage;
 }
 
 function baselineHas(baseline, turn) {
@@ -62,11 +82,14 @@ function hasExactBody(turn, wanted, normalizeText) {
   });
 }
 
-export function findFeedbackBootstrapUserTurn({ turns, message, baseline, normalizeText } = {}) {
-  if (!isFeedbackBootstrapMessage(message)) return { ok: false, reason: "bootstrap_message_invalid" };
+export function findFeedbackBootstrapUserTurn({ turns, message, workspaceId, baseline, normalizeText } = {}) {
+  const expectedMessage = workspaceId == null ? FEEDBACK_BOOTSTRAP_MESSAGE : createFeedbackBootstrapMessage(workspaceId);
+  if (!expectedMessage || !isFeedbackBootstrapMessage(message, workspaceId)) {
+    return { ok: false, reason: "bootstrap_message_invalid" };
+  }
   if (!Array.isArray(turns)) return { ok: false, reason: "bootstrap_turns_missing" };
   const normalize = typeof normalizeText === "function" ? normalizeText : normalizeCanonicalDomText;
-  const wanted = normalize(FEEDBACK_BOOTSTRAP_MESSAGE);
+  const wanted = normalize(expectedMessage);
   const prior = Array.isArray(baseline) ? baseline : [];
   const matches = turns.filter((turn) => hasExactBody(turn, wanted, normalize) && !baselineHas(prior, turn));
   if (matches.length === 0) return { ok: false, reason: "bootstrap_not_observed" };
@@ -74,7 +97,9 @@ export function findFeedbackBootstrapUserTurn({ turns, message, baseline, normal
   return { ok: true, turn: matches[0] };
 }
 
-export function hasFeedbackBootstrapToolMissingReply(doc, normalizeText = normalizeCanonicalDomText) {
+export function hasFeedbackBootstrapToolMissingReply(doc, normalizeText = normalizeCanonicalDomText, workspaceId) {
+  const expectedMessage = workspaceId == null ? FEEDBACK_BOOTSTRAP_MESSAGE : createFeedbackBootstrapMessage(workspaceId);
+  if (!expectedMessage) return false;
   if (!doc || typeof doc.querySelectorAll !== "function") return false;
   let nodes;
   try {
@@ -94,7 +119,7 @@ export function hasFeedbackBootstrapToolMissingReply(doc, normalizeText = normal
       || "";
     const rawText = node?.innerText ?? node?.textContent ?? "";
     const text = typeof rawText === "string" ? normalizeText(rawText) : "";
-    if (role === "user" && text === normalizeText(FEEDBACK_BOOTSTRAP_MESSAGE)) {
+    if (role === "user" && text === normalizeText(expectedMessage)) {
       lastBootstrapIndex = roles.length;
     }
     roles.push(role);
@@ -110,6 +135,11 @@ function sleep(ms) {
 }
 
 export async function runFeedbackBootstrapSend(doc, opts = {}) {
+  const workspaceId = typeof opts.workspaceId === "string" ? opts.workspaceId : "";
+  const workspaceIdProvided = Object.hasOwn(opts, "workspaceId");
+  const message = workspaceIdProvided
+    ? createFeedbackBootstrapMessage(workspaceId)
+    : FEEDBACK_BOOTSTRAP_MESSAGE;
   const expectedRoute = typeof opts.expectedRoute === "string" ? opts.expectedRoute : "";
   const expectedGeneration = opts.expectedGeneration;
   const parseRoute = typeof opts.parseRoute === "function" ? opts.parseRoute : undefined;
@@ -139,7 +169,7 @@ export async function runFeedbackBootstrapSend(doc, opts = {}) {
     observed: false,
   };
 
-  if (!isFeedbackBootstrapMessage(FEEDBACK_BOOTSTRAP_MESSAGE)) {
+  if (!message || !isFeedbackBootstrapMessage(message, workspaceIdProvided ? workspaceId : undefined)) {
     return { ...base, ok: false, reason: "bootstrap_message_invalid" };
   }
   if (!expectedRoute || !Number.isFinite(expectedGeneration)) {
@@ -182,7 +212,7 @@ export async function runFeedbackBootstrapSend(doc, opts = {}) {
   }
   if (!Array.isArray(baseline)) return { ...base, ok: false, reason: "bootstrap_observer_invalid" };
 
-  const write = writeCanonicalMessage(doc, FEEDBACK_BOOTSTRAP_MESSAGE, {
+  const write = writeCanonicalMessage(doc, message, {
     routeValid: true,
     mutationGuard: () => routeOk() && generationOk(),
   });
@@ -195,7 +225,7 @@ export async function runFeedbackBootstrapSend(doc, opts = {}) {
       wrote: write.wrote === true,
     };
   }
-  const verify = verifyCanonicalComposer(doc, FEEDBACK_BOOTSTRAP_MESSAGE, { routeValid: true });
+  const verify = verifyCanonicalComposer(doc, message, { routeValid: true });
   if (!verify.ok) {
     return {
       ...base,
@@ -215,7 +245,7 @@ export async function runFeedbackBootstrapSend(doc, opts = {}) {
     const current = resolveChatGptComposer(doc).editor;
     if (!current) return { ...base, ok: false, reason: "composer_missing", mutationAttempted: true, wrote: true, verified: true };
     const read = readCanonicalComposerText(current);
-    if (!read.ok || normalizeText(read.text) !== normalizeText(FEEDBACK_BOOTSTRAP_MESSAGE)) {
+    if (!read.ok || normalizeText(read.text) !== normalizeText(message)) {
       return { ...base, ok: false, reason: read.ok ? "composer_text_mismatch" : read.reason, mutationAttempted: true, wrote: true, verified: true };
     }
     const nextAction = resolveChatGptAction(doc, current);
@@ -230,7 +260,7 @@ export async function runFeedbackBootstrapSend(doc, opts = {}) {
 
   let click;
   try {
-    click = await dispatchNativeSend(doc, FEEDBACK_BOOTSTRAP_MESSAGE, {
+    click = await dispatchNativeSend(doc, message, {
       routeValid: true,
       mutationGuard: () => routeOk() && generationOk(),
     });
@@ -257,7 +287,8 @@ export async function runFeedbackBootstrapSend(doc, opts = {}) {
     try {
       const found = findFeedbackBootstrapUserTurn({
         turns: snapshotUserTurns(doc),
-        message: FEEDBACK_BOOTSTRAP_MESSAGE,
+        message,
+        ...(workspaceIdProvided ? { workspaceId } : {}),
         baseline,
         normalizeText,
       });

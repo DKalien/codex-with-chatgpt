@@ -30,8 +30,8 @@ function createWakeRefreshHarness({
   const sw = fs.readFileSync(path.join(root, "service-worker.js"), "utf8");
   const refreshStart = sw.indexOf("async function requestActiveOwnerRefresh");
   const refreshEnd = sw.indexOf("\nfunction statusPayload", refreshStart);
-  const listenersStart = sw.indexOf("if (chrome.tabs?.onActivated?.addListener)");
-  const listenersEnd = sw.indexOf("chrome.runtime.onInstalled.addListener", listenersStart);
+  const listenersStart = sw.indexOf("globalThis.chrome.tabs?.onActivated?.addListener(", refreshEnd);
+  const listenersEnd = sw.indexOf("\nglobalThis.chrome.runtime.onInstalled?.addListener", listenersStart);
   if (refreshStart < 0 || refreshEnd < 0 || listenersStart < 0 || listenersEnd < 0) {
     throw new Error("wake refresh harness could not locate service-worker hooks");
   }
@@ -41,7 +41,7 @@ function createWakeRefreshHarness({
   let focusListener: ((windowId: number) => void) | undefined;
   let queryCount = 0;
   const sends: unknown[][] = [];
-  const context: Record<string, unknown> = {
+  const context: Record<string, any> = {
     initPromise: Promise.resolve(),
     ownerState: { owner: { tabId: ownerTabId, documentId: ownerDocumentId } },
     chrome: {
@@ -70,10 +70,14 @@ function createWakeRefreshHarness({
         },
       },
     },
+    projectRouter: {},
+    dispatchProjectLifecycle(operation: Promise<unknown>) {
+      Promise.resolve(operation).catch(() => {});
+    },
   };
 
   vm.runInNewContext(
-    `${sw.slice(refreshStart, refreshEnd)}\n${sw.slice(listenersStart, listenersEnd)}`,
+    `${sw.slice(refreshStart, refreshEnd)}\nprojectRouter.handleActiveOwnerRefresh = tabId => requestActiveOwnerRefresh(tabId);\n${sw.slice(listenersStart, listenersEnd)}`,
     context,
     { filename: "service-worker.wake-refresh.test.js" },
   );
@@ -170,14 +174,16 @@ describe("Browser Companion sleep/wake feedback recovery", () => {
     ]) {
       expect(handler).not.toContain(forbidden);
     }
-    expect(sw).toContain("chrome.alarms.onAlarm.addListener");
+    expect(sw).toContain("globalThis.chrome.alarms?.onAlarm?.addListener");
+    expect(sw).toContain("projectRouter.handleAlarm(alarm)");
   });
 
   it("restores real owner heartbeat after resume without resurrecting ownership", () => {
     const sw = fs.readFileSync(path.join(root, "service-worker.js"), "utf8");
     const cs = fs.readFileSync(path.join(root, "content-script.js"), "utf8");
-    expect(sw).toContain("chrome.tabs.onActivated.addListener");
-    expect(sw).toContain("chrome.windows.onFocusChanged.addListener");
+    expect(sw).toContain("globalThis.chrome.tabs?.onActivated?.addListener");
+    expect(sw).toContain("globalThis.chrome.windows?.onFocusChanged?.addListener");
+    expect(sw).toContain("projectRouter.handleActiveOwnerRefresh(activeInfo?.tabId)");
     expect(sw).toContain("requestActiveOwnerRefresh");
     expect(cs).toContain('message.type === "c2c.wake.refresh"');
     expect(cs).toContain("if (!document.hidden) wakeHeartbeat();");

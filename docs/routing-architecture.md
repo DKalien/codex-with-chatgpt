@@ -1,15 +1,15 @@
-# Routing Architecture（R1 foundation + R3 live-complete；R4c + R5a-R5c source-complete）
+# Routing Architecture
 
 Routing 是 C2C 的新语义身份层：以 `{workspaceId, platform, conversationId}` 标识
 workspace 内特定平台上的对话。Route 另有注册后不可变的 planner / executor role；
 Command / ExecutionResult 是可持久化、可重放、可审计的记录。R1 只建立模型与 durable
-store，不接任何生产调用方。
+store。当前生产接线与 R5 Result Bus 的覆盖范围见下；R1 阶段本身不代表现场运行状态。
 
 ## R0→R5 当前路线
 
 权威阶段定义与完整历史见[长期开发计划](development-plan.md)。当前状态：R0 基线、R1 Routing
 foundation、R2 Desktop behavioral adapter、R3 Browser Companion Web adapter / feedback return plane
-均已完成，R3 真实 live E2E 已通过；R4a canonical result envelope、R4b receipt → canonical RoutingResult → routing-owned Result Outbox、R4c route-pinned Browser return consumer 与 R4c2 canonical-only routed return 已完成源码实现。R5a endpoint contracts、R5b Active Executor Binding、R5c Active Web Sink Binding 已完成源码实现；R5d Result Bus 尚未开始。本文记录源码架构，不代表当前机器已安装或已 rollout。
+已有实现和相应历史验收；R4a canonical result envelope、R4b receipt → canonical RoutingResult → routing-owned Result Outbox、R4c route-pinned Browser return consumer 与 R4c2 canonical-only routed return 是已实现的历史路径。当前 R5a endpoint contracts、R5b Active Executor Binding、R5c Active Web Sink Binding 与 R5d Result Bus 均有源码接线，新 canonical 结果由 Result Bus 统一发送，历史 legacy 经 cutover ledger 精确分类并抑制重复发送。Unified Gateway 复用这些逐 workspace 权威，官方 App Server 终态使用独立来源，不伪造 Desktop receipt；当前合同见[官方路线](official-route.md)与[R5 endpoint 架构](r5-endpoint-architecture.md)。本文不证明当前安装、rollout、双项目现场验收或普通 Chat 原生 Events 支持。
 
 | 阶段 | Routing 相关目标 | 状态 |
 | --- | --- | --- |
@@ -18,7 +18,7 @@ foundation、R2 Desktop behavioral adapter、R3 Browser Companion Web adapter / 
 | R2 | Desktop 生产信任基于 live behavioral proof | done |
 | R3 | Web adapter、当前网址绑定与 feedback return plane | live E2E PASS |
 | R4 | canonical ExecutionResult + `Command.plannerRouteId` durable outbox；机器事实与 Codex 自己的 final summary 一并回流，不做第二次 AI rewrite | R4a-R4c source-complete / independent review PASS；Result Outbox 仍保持 planner-route pinned |
-| R5 | Bridge lifecycle 与会话执行状态解耦 | R5a-R5c source-complete；R5d Result Bus 及后续 lifecycle decoupling planned |
+| R5 | Bridge lifecycle 与会话执行状态解耦 | endpoint binding 与 Result Bus 已有源码；完整生命周期现场验收按[统一 Gateway 计划](unified-gateway-plan.md)核对 |
 
 ## 术语
 
@@ -57,7 +57,7 @@ workspace / platform / conversation 的错误路由、command 重放、重复 mu
 - **command 重放与伪造**：commandId 严格幂等——同 commandId + 完全相同
   routes/intent/payload 指纹才返回旧记录，任一字段不同即 `COMMAND_CONFLICT`；
   创建入口封死初始 `deliveryStatus`（一律 `pending`），`accepted/rejected/outcome_unknown`
-  只能由未来 transport 阶段的明确状态转换 API 写入。
+  只能由受控 transport 阶段的明确状态转换 API 写入。
 - **exact replay 不修改状态**：route / command / result 的 exact replay 返回原记录，
   不 bump revision、不更新 `updatedAt`、不重写主 state 文件；幂等是可观测性质，
   不是仅返回值相同。
@@ -71,7 +71,7 @@ workspace / platform / conversation 的错误路由、command 重放、重复 mu
   route attestation 已 VERIFIED 才投影 planner candidate，绝不因文件里有个 URL 就把它
   升级成可信 planner route。
 
-## 数据流（未来形态）
+## Routing 语义数据流
 
 ```text
 Planner route → Project → Command → Executor route → ExecutionResult → Planner route
@@ -266,8 +266,7 @@ R4b 把 R4a projector 验证出的 `ResultInput` 先交给 Routing store，持�
 
 - R5a-r5c 已在源码中建立并接线 generic endpoint contracts、Bridge-owned Active Executor Binding 与 Active Web Sink
   Binding；Codex Desktop 仍是唯一 production Executor，ChatGPT Web 仍是当前唯一 production Web Surface。
-- R5d Result Bus 尚未实现，Result Outbox 仍保持 planner-route pinned；后续 R5e dynamic endpoint switching 与 R5f Bridge
-  lifecycle independence 才会处理 `rollout.ts` 当前对 Desktop busy、`approval_pending` 和 post-turn-finalizer 的耦合。
+- R5d Result Bus 已接入新 canonical 结果；在 reserve/begin-send 冻结 Active Web Sink target，后续 ACK 精确核对原 attempt，不随面板当前连接重定向。历史 Result Outbox 保留 planner-route pinned 身份并经 cutover ledger 处理，legacy/control 保留兼容合同。生命周期和动态 endpoint 切换的当前边界见[R5 endpoint 架构](r5-endpoint-architecture.md)，不能由 Routing store 的存在推断现场验收完成。
 - H0 / Claude E1a 属于独立 executor extensibility 支线，不等同于 R5d/f，也未把 Claude 加入 production registry。
 
 ## R3k Task delivery 与 Feedback return plane

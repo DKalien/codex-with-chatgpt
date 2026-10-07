@@ -12,6 +12,8 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const sourcePopup = path.join(root, "browser-companion", "popup");
 const builtPopup = path.join(root, "dist", "browser-companion", "popup");
 const route = "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111";
+const workspaceId = "aaaaaaaaaaaa";
+const project = { workspaceId, bridgeOrigin: "https://bridge.example.test", legacy: true };
 
 function popupScripts(dir: string) {
   const html = fs.readFileSync(path.join(dir, "popup.html"), "utf8");
@@ -28,7 +30,6 @@ async function loadPopup(
     pairResult?: unknown;
     connectResult?: unknown;
     tabId?: number;
-    tabIds?: number[];
     pageUrl?: string;
     autonomyArmConfirmed?: boolean;
     productionSendConfirmed?: boolean;
@@ -36,8 +37,10 @@ async function loadPopup(
     status?: Record<string, unknown>;
     ownerProofResult?: unknown;
     statusResponse?: () => Promise<unknown>;
-    runtimeResponse?: () => Promise<unknown>;
+    runtimeResponse?: (message: unknown) => Promise<unknown>;
+    projectResponse?: (message: { type?: string; workspaceId?: string }) => Promise<unknown>;
     visibility?: "visible" | "hidden";
+    projects?: { workspaceId: string; bridgeOrigin: string; legacy?: boolean }[];
   } = {},
 ) {
   const html = fs.readFileSync(path.join(sourcePopup, "popup.html"), "utf8");
@@ -54,13 +57,19 @@ async function loadPopup(
     contains: [] as unknown[], request: [] as unknown[], ownerProof: 0,
     order: [] as string[],
     runtime: [] as unknown[], storage: [] as unknown[], page: [] as unknown[],
+    projects: [] as unknown[],
+    removed: [] as string[],
   };
+  const projects = options.projects ?? [{ ...project,
+    bridgeOrigin: new URL(options.savedBridgeOrigin ?? project.bridgeOrigin).origin }];
+  let selectedWorkspaceId = projects[0]?.workspaceId ?? null;
+  let activeTabId = options.tabId ?? 1;
+  let activePageUrl = options.pageUrl ?? route;
   const requestResult = requestGranted ?? permissionGranted;
   const chrome = {
     tabs: {
       query: async () => {
-        const id = options.tabIds?.shift() ?? options.tabId ?? 1;
-        return [{ id, url: options.pageUrl ?? route }];
+        return [{ id: activeTabId, url: activePageUrl }];
       },
       sendMessage: async (_tabId: number, message: { type: string }) => {
         if (message.type === "c2c.popup.ping") {
@@ -94,11 +103,20 @@ async function loadPopup(
     },
     runtime: {
       sendMessage: async (message: unknown) => {
+        const input = message as { type?: string; workspaceId?: string };
+        if (input.type?.startsWith("c2c.project.")) {
+          calls.projects.push(message);
+          if (input.type === "c2c.project.select") selectedWorkspaceId = input.workspaceId ?? null;
+          const response = await options.projectResponse?.(input);
+          if (response !== undefined) return response;
+          if (input.type === "c2c.project.list") return { ok: true, projects };
+          return { ok: true, workspaceId: selectedWorkspaceId };
+        }
         calls.runtime.push(message);
-        if (options.runtimeResponse) return options.runtimeResponse();
+        if (options.runtimeResponse) return options.runtimeResponse(message);
         if (typeof message === "object" && message && (message as { type?: string }).type === "c2c.pair") {
           calls.order.push("pair");
-          return options.pairResult ?? { ok: true };
+          return options.pairResult ?? { ok: true, transport: { workspaceId: input.workspaceId } };
         }
         if (
           typeof message === "object"
@@ -130,11 +148,11 @@ async function loadPopup(
       session: {
         get: async () => ({}),
         set: async (value: unknown) => { calls.storage.push(value); calls.order.push("save-intent"); },
-        remove: async () => undefined,
+        remove: async (key: string) => { calls.removed.push(key); },
       },
     },
     permissions: {
-      contains: async (query: unknown) => { calls.contains.push(query); return permissionGranted; },
+      contains: async (query: unknown) => { calls.contains.push(query); calls.order.push("contains"); return permissionGranted; },
       request: (query: unknown) => {
         // Synchronous push proves gesture-time invocation from the click handler.
         calls.request.push(query);
@@ -161,18 +179,18 @@ async function loadPopup(
     setTimeout,
     clearTimeout,
     testRefresh: null as null | (() => Promise<boolean>),
+    testRefreshProjects: null as null | (() => Promise<boolean>),
   };
   const source = fs.readFileSync(path.join(sourcePopup, "popup.js"), "utf8");
-  vm.runInNewContext(source.replace(/\}\)\(\);\s*$/, "globalThis.testRefresh = refresh; })();"), sandbox);
+  vm.runInNewContext(source.replace(/\}\)\(\);\s*$/, "globalThis.testRefresh = refresh; globalThis.testRefreshProjects = refreshProjectRegistry; })();"), sandbox);
   for (let i = 0; i < 10 && !elements.get("pair")?.onclick; i += 1) {
     await new Promise(resolve => setImmediate(resolve));
   }
-  const fireChange = (id: string) => {
-    for (const listener of listeners.get(id) ?? []) {
-      if (listener.type === "change") listener.handler();
-    }
-  };
+  const fireChange = (id: string) => Promise.all((listeners.get(id) ?? [])
+    .filter(listener => listener.type === "change").map(listener => listener.handler()));
   return { calls, elements, fireChange, refresh: () => sandbox.testRefresh!(),
+    refreshProjects: () => sandbox.testRefreshProjects!(),
+    setActiveTab: (id: number, url = route) => { activeTabId = id; activePageUrl = url; },
     setVisibility: (value: "visible" | "hidden") => { document.visibilityState = value; documentListeners.get("visibilitychange")?.(); },
     close: () => windowListeners.get("pagehide")?.(),
   };
@@ -220,7 +238,7 @@ describe("popup bounded status RPC", () => {
     await popup.elements.get("fetch-state")!.onclick!();
     expect(popup.elements.get("user-connection-status")!.textContent).toBe("当前对话已连接");
     expect(popup.calls.page).toEqual([]);
-    expect(popup.calls.runtime).toEqual([{ type: "c2c.fetch.state" }]);
+    expect(popup.calls.runtime).toEqual([{ type: "c2c.fetch.state", workspaceId }]);
   });
 
   it("keeps the durable stage diagnostic when Connect returns an error", async () => {
@@ -298,7 +316,7 @@ describe("popup bounded status RPC", () => {
     await popup.elements.get("fetch-state")!.onclick!();
     expect(popup.elements.get("bridge-state")!.textContent).toContain("1");
     expect(vi.getTimerCount()).toBe(0);
-    expect(popup.calls.runtime).toEqual([{ type: "c2c.fetch.state" }, { type: "c2c.fetch.state" }]);
+    expect(popup.calls.runtime).toEqual([{ type: "c2c.fetch.state", workspaceId }, { type: "c2c.fetch.state", workspaceId }]);
   });
 });
 
@@ -322,6 +340,210 @@ describe("popup classic packaging", () => {
 });
 
 describe("popup Bridge permission and Pair separation", () => {
+  it("unbind keeps the refreshed owner gate after releasing the project action", async () => {
+    let isOwner = true;
+    const popup = await loadPopup(true, true, {
+      statusResponse: async () => ({ isOwner, storageProtected: true }),
+      runtimeResponse: async message => {
+        if ((message as { type?: string }).type === "c2c.unbind") isOwner = false;
+        return { ok: true };
+      },
+    });
+    expect(popup.elements.get("pair")!.disabled).toBe(false);
+    await popup.elements.get("unbind")!.onclick!();
+    expect(popup.elements.get("pair")!.disabled).toBe(true);
+    expect(popup.elements.get("workspace-select")!.disabled).toBe(false);
+    expect(popup.calls.runtime).toEqual([{ type: "c2c.unbind", workspaceId }]);
+    expect(popup.calls.ownerProof).toBe(0);
+    expect(popup.calls.request).toEqual([]);
+  });
+
+  it.each(["fetch-state", "release", "recover", "write-probe", "production-send"])(
+    "%s holds its project until the reply settles and clears its result when switching", async id => {
+      const second = { workspaceId: "bbbbbbbbbbbb", bridgeOrigin: "https://second.example.test" };
+      let release!: (value: unknown) => void;
+      const delayed = new Promise(resolve => { release = resolve; });
+      let started!: () => void;
+      const requested = new Promise<void>(resolve => { started = resolve; });
+      const popup = await loadPopup(true, true, { projects: [project, second], productionSendConfirmed: true,
+        runtimeResponse: async () => { started(); return delayed; } });
+      const pending = popup.elements.get(id)!.onclick!();
+      await requested;
+      expect(popup.elements.get("workspace-select")!.disabled).toBe(true);
+      popup.elements.get("workspace-select")!.value = second.workspaceId;
+      await popup.fireChange("workspace-select");
+      expect(popup.elements.get("workspace-select")!.value).toBe(workspaceId);
+      expect(popup.calls.projects).not.toContainEqual(expect.objectContaining({ type: "c2c.project.select", workspaceId: second.workspaceId }));
+      release({ ok: true, attemptId: "a-only-result-987", status: { pendingReady: 987, reserved: 0, claimed: 0, outcomeUnknown: 0, inFlight: null } });
+      await pending;
+      expect(popup.calls.runtime).toHaveLength(1);
+      expect(popup.calls.runtime[0]).toMatchObject({ workspaceId });
+      expect(popup.elements.get("workspace-select")!.disabled).toBe(false);
+      popup.elements.get("connect-status")!.textContent = "old A connected";
+      popup.elements.get("bridge-permission-status")!.textContent = "old A granted";
+      popup.elements.get("workspace-select")!.value = second.workspaceId;
+      await popup.fireChange("workspace-select");
+      expect(popup.elements.get("workspace-select")!.value).toBe(second.workspaceId);
+      for (const resultId of ["bridge-state", "write-probe-result", "production-send-result", "connect-status", "bridge-permission-status"]) {
+        expect(popup.elements.get(resultId)!.textContent).toBe("—");
+      }
+      expect(popup.calls.request).toEqual([]);
+    },
+  );
+
+  it("an older project list cannot remove the newer selected project", async () => {
+    const second = { workspaceId: "bbbbbbbbbbbb", bridgeOrigin: "https://second.example.test" };
+    let release!: (value: unknown) => void;
+    const delayed = new Promise(resolve => { release = resolve; });
+    let started!: () => void;
+    const requested = new Promise<void>(resolve => { started = resolve; });
+    let hold = false;
+    const popup = await loadPopup(true, true, { projects: [project, second], projectResponse: async message => {
+      if (hold && message.type === "c2c.project.list") { hold = false; started(); return delayed; }
+    } });
+    hold = true;
+    const oldList = popup.refreshProjects();
+    await requested;
+    expect(await popup.refreshProjects()).toBe(true);
+    popup.elements.get("workspace-select")!.value = second.workspaceId;
+    await popup.fireChange("workspace-select");
+    release({ ok: true, projects: [project] });
+    expect(await oldList).toBe(false);
+    expect(popup.elements.get("workspace-select")!.value).toBe(second.workspaceId);
+    expect(popup.elements.get("workspace-status")!.textContent).toContain(second.workspaceId);
+    expect(popup.calls.runtime).toEqual([]);
+  });
+
+  it.each(["resolve", "status"])("a late A %s response cannot overwrite selected B or its requests", async stage => {
+    const second = { workspaceId: "bbbbbbbbbbbb", bridgeOrigin: "https://second.example.test" };
+    let release!: (value: unknown) => void;
+    const delayed = new Promise(resolve => { release = resolve; });
+    let started!: () => void;
+    const requested = new Promise<void>(resolve => { started = resolve; });
+    let hold = false;
+    let held = false;
+    let currentProject: typeof project | typeof second = project;
+    const statusFor = (row: typeof project | typeof second) => ({
+      targetRoute: route, isOwner: true, storageProtected: true, journal: { state: "NONE" },
+      transport: { workspaceId: row.workspaceId, bridgeOrigin: row.bridgeOrigin, connected: true,
+        routeCanonical: route, routeVerification: "VERIFIED", r5cConnected: true, productionEligible: true },
+    });
+    const popup = await loadPopup(true, true, {
+      projects: [project, second],
+      runtimeResponse: async () => ({ ok: true, status: { pendingReady: 0, reserved: 0, claimed: 0, outcomeUnknown: 0, inFlight: null } }),
+      projectResponse: async message => {
+        if (message.type === "c2c.project.select") currentProject = message.workspaceId === second.workspaceId ? second : project;
+        if (stage === "resolve" && message.type === "c2c.project.resolve" && hold && !held) {
+          held = true; started(); return delayed;
+        }
+      },
+      statusResponse: async () => {
+        if (stage === "status" && hold && !held) { held = true; started(); return delayed; }
+        return statusFor(currentProject);
+      },
+    });
+    hold = true;
+    const oldRefresh = popup.refresh();
+    await requested;
+    popup.elements.get("workspace-select")!.value = second.workspaceId;
+    await popup.fireChange("workspace-select");
+    const bStatus = popup.elements.get("transport-status")!.textContent;
+    expect(bStatus).toContain(second.bridgeOrigin);
+    release(stage === "resolve" ? { ok: true, workspaceId } : statusFor(project));
+    expect(await oldRefresh).toBe(false);
+    expect(popup.elements.get("workspace-select")!.value).toBe(second.workspaceId);
+    expect(popup.elements.get("transport-status")!.textContent).toBe(bStatus);
+    expect(popup.elements.get("bridge-origin")!.value).toBe(second.bridgeOrigin);
+    await popup.elements.get("fetch-state")!.onclick!();
+    expect(popup.calls.runtime).toContainEqual({ type: "c2c.fetch.state", workspaceId: second.workspaceId });
+    expect(popup.calls.request).toEqual([]);
+    expect(popup.calls.ownerProof).toBe(0);
+  });
+
+  it.each([true, false])("a late selection response (ok=%s) cannot reset a newer choice", async ok => {
+    const second = { workspaceId: "bbbbbbbbbbbb", bridgeOrigin: "https://second.example.test" };
+    let release!: (value: unknown) => void;
+    const delayed = new Promise(resolve => { release = resolve; });
+    let started!: () => void;
+    const requested = new Promise<void>(resolve => { started = resolve; });
+    const popup = await loadPopup(true, true, { projects: [project, second], projectResponse: async message => {
+      if (message.type === "c2c.project.select" && message.workspaceId === workspaceId) { started(); return delayed; }
+    } });
+    popup.elements.get("workspace-select")!.value = workspaceId;
+    const oldSelection = popup.fireChange("workspace-select");
+    await requested;
+    popup.elements.get("workspace-select")!.value = second.workspaceId;
+    await popup.fireChange("workspace-select");
+    const bStatus = popup.elements.get("workspace-status")!.textContent;
+    release({ ok, workspaceId, reason: "old_selection_failure" });
+    await oldSelection;
+    expect(popup.elements.get("workspace-select")!.value).toBe(second.workspaceId);
+    expect(popup.elements.get("workspace-status")!.textContent).toBe(bStatus);
+    expect(bStatus).toContain(second.workspaceId);
+    expect(popup.calls.runtime).toEqual([]);
+  });
+
+  it.each(["tab", "route"])("a resolve response for a changed active %s cannot render old page state", async field => {
+    let release!: (value: unknown) => void;
+    const delayed = new Promise(resolve => { release = resolve; });
+    let started!: () => void;
+    const requested = new Promise<void>(resolve => { started = resolve; });
+    let hold = false;
+    let statusReads = 0;
+    const popup = await loadPopup(true, true, {
+      projectResponse: async message => { if (hold && message.type === "c2c.project.resolve") { started(); return delayed; } },
+      statusResponse: async () => { statusReads += 1; return { isOwner: true, storageProtected: true }; },
+    });
+    const before = statusReads;
+    hold = true;
+    const oldRefresh = popup.refresh();
+    await requested;
+    popup.setActiveTab(field === "tab" ? 2 : 1, field === "route"
+      ? "https://chatgpt.com/c/22222222-2222-4222-8222-222222222222" : route);
+    release({ ok: true, workspaceId });
+    expect(await oldRefresh).toBe(false);
+    expect(statusReads).toBe(before);
+    expect(popup.calls.runtime).toEqual([]);
+    expect(popup.calls.page).toEqual([]);
+  });
+
+  it("a Pair JSON for another selected project cannot write its intent or request a proof", async () => {
+    const second = { workspaceId: "bbbbbbbbbbbb", bridgeOrigin: "https://second.example.test" };
+    const { calls, elements } = await loadPopup(true, true, { projects: [second, project] });
+    elements.get("pair-json")!.value = JSON.stringify({ ...project, legacy: undefined,
+      intentId: "intent-a", secret: "secret-a", expiresAt: "2026-10-06T03:00:00.000Z", bindingId: "binding-a", epoch: 2 });
+    await elements.get("apply-pair-json")!.onclick!();
+    expect(elements.get("pair-hint")!.textContent).toBe("workspace_selection_mismatch");
+    await elements.get("pair-connect")!.onclick!();
+    expect(calls.contains).toEqual([]);
+    expect(calls.request).toEqual([]);
+    expect(calls.ownerProof).toBe(0);
+    expect(calls.storage).toEqual([]);
+    expect(calls.runtime).toEqual([]);
+  });
+
+  it("a delayed Pair remains in its captured project and blocks selection until it settles", async () => {
+    let settlePair!: (value: unknown) => void;
+    const paired = new Promise(resolve => { settlePair = resolve; });
+    const { calls, elements, fireChange } = await loadPopup(true, true, {
+      projects: [project, { workspaceId: "bbbbbbbbbbbb", bridgeOrigin: "https://second.example.test" }],
+      runtimeResponse: async message => (message as { type: string }).type === "c2c.pair" ? paired : { ok: true },
+    });
+    elements.get("pair-json")!.value = JSON.stringify({ workspaceId, bridgeOrigin: project.bridgeOrigin, intentId: "intent-a", secret: "secret-a" });
+    const pending = elements.get("pair-connect")!.onclick!();
+    for (let tick = 0; tick < 5 && !calls.runtime.length; tick++) await new Promise(resolve => setImmediate(resolve));
+    expect(calls.runtime).toContainEqual(expect.objectContaining({ type: "c2c.pair", workspaceId }));
+    elements.get("workspace-select")!.value = "bbbbbbbbbbbb";
+    await fireChange("workspace-select");
+    expect(calls.projects).not.toContainEqual(expect.objectContaining({ type: "c2c.project.select", workspaceId: "bbbbbbbbbbbb" }));
+    settlePair({ ok: true, transport: { workspaceId } });
+    await pending;
+    expect(calls.removed).toEqual([`c2c_companion_project_v1:${workspaceId}:c2c_companion_pair_intent_v1`]);
+    expect(calls.page).toEqual([{ type: "c2c.connect.request", workspaceId, canonicalRoute: route }]);
+    expect(JSON.stringify(calls.storage)).not.toContain("secret-a");
+    expect(JSON.stringify(calls.storage)).not.toContain("bbbbbbbbbbbb");
+  });
+
   it("shows the saved auto-rearm preference and restores the pause prompt when cleared", async () => {
     const transport = { connected: true, routeCanonical: route, routeVerification: "VERIFIED", r5cConnected: true, productionEligible: true };
     const saved = await loadPopup(true, true, {
@@ -341,22 +563,22 @@ describe("popup Bridge permission and Pair separation", () => {
     expect(paused.elements.get("autonomy-disable")!.disabled).toBe(true);
   });
 
-  it("Connect uses one fixed content-script request and no popup identity or owner proof", async () => {
+  it("Connect checks permission and sends only the selected project and route witness", async () => {
     const { calls, elements } = await loadPopup(true);
     elements.get("bridge-origin")!.value = "https://bridge.example.test";
     await elements.get("connect-chat")!.onclick!();
-    expect(calls.request).toEqual([{ origins: ["https://bridge.example.test/*"] }]);
-    expect(calls.contains).toEqual([]);
-    expect(calls.page).toEqual([{ type: "c2c.connect.request" }]);
+    expect(calls.request).toEqual([]);
+    expect(calls.contains).toEqual([{ origins: ["https://bridge.example.test/*"] }]);
+    expect(calls.page).toEqual([{ type: "c2c.connect.request", workspaceId, canonicalRoute: route }]);
     expect(calls.ownerProof).toBe(0);
     expect(calls.runtime).toEqual([]);
-    expect(JSON.stringify(calls.page)).not.toMatch(/route|document|tab|credential|principal|secret/);
+    expect(JSON.stringify(calls.page)).not.toMatch(/document|tab|credential|principal|secret/);
   });
 
-  it("advanced Bind also sends a fixed zero-parameter request", async () => {
+  it("advanced Bind fixes the selected project without popup document or route authority", async () => {
     const { calls, elements } = await loadPopup(true);
     await elements.get("bind")!.onclick!();
-    expect(calls.page).toEqual([{ type: "c2c.bind.request" }]);
+    expect(calls.page).toEqual([{ type: "c2c.bind.request", workspaceId }]);
     expect(JSON.stringify(calls.page)).not.toMatch(/route|document|tab|generation|credential|principal|secret/);
   });
 
@@ -484,7 +706,7 @@ describe("popup Bridge permission and Pair separation", () => {
       connectResult: { ok: true, state: "WAITING_TAKEOVER" },
     });
     await elements.get("connect-chat")!.onclick!();
-    expect(calls.page).toEqual([{ type: "c2c.connect.request" }]);
+    expect(calls.page).toEqual([{ type: "c2c.connect.request", workspaceId, canonicalRoute: route }]);
     expect(elements.get("connect-status")!.textContent).toBe("正在等待当前 Chat 接管连接");
     expect(elements.get("user-connection-status")!.textContent).toBe("正在等待当前 Chat 接管连接");
     expect(elements.get("user-action-hint")!.textContent).toContain("完成反馈连接接管");
@@ -499,15 +721,15 @@ describe("popup Bridge permission and Pair separation", () => {
     expect(calls.page).toEqual([]);
   });
 
-  it("Connect reports denied Bridge permission before contacting the page", async () => {
+  it("Connect reports missing Bridge permission before contacting the page", async () => {
     const { calls, elements } = await loadPopup(false);
     elements.get("bridge-origin")!.value = "https://bridge.example.test";
     await elements.get("connect-chat")!.onclick!();
     expect(calls.page).toEqual([]);
-    expect(calls.request).toEqual([{ origins: ["https://bridge.example.test/*"] }]);
-    expect(calls.contains).toEqual([]);
-    expect(elements.get("connect-status")!.textContent).toContain("需要授权连接服务才能继续");
-    expect(elements.get("connect-diagnostic")?.textContent).toBe("bridge_permission_denied");
+    expect(calls.request).toEqual([]);
+    expect(calls.contains).toEqual([{ origins: ["https://bridge.example.test/*"] }]);
+    expect(elements.get("connect-status")!.textContent).toContain("授权连接服务");
+    expect(elements.get("connect-diagnostic")?.textContent).toBe("bridge_permission_missing");
   });
 
   it("cold_pair_required opens the one-click first-use section", async () => {
@@ -518,7 +740,7 @@ describe("popup Bridge permission and Pair separation", () => {
     expect(elements.get("pair-connect-hint")!.textContent).toContain("首次使用需要配对");
   });
 
-  it("one-click Pair + Connect requests permission before the ordered identity flow", async () => {
+  it("one-click Pair + Connect checks existing permission before the ordered identity flow", async () => {
     const { calls, elements } = await loadPopup(true, true, {
       connectResult: { ok: true, state: "CONNECTED" },
       status: { transport: { connected: true, routeCanonical: route, routeVerification: "VERIFIED", r5cConnected: true } },
@@ -526,10 +748,11 @@ describe("popup Bridge permission and Pair separation", () => {
     elements.get("bridge-origin")!.value = "https://bridge.example.test";
     elements.get("pair-json")!.value = JSON.stringify({ intentId: "intent-1", secret: "c2c_pair_secret" });
     const pending = elements.get("pair-connect")!.onclick!();
-    expect(calls.order).toEqual(["permission"]);
+    expect(calls.order).toEqual(["contains"]);
     await pending;
-    expect(calls.order).toEqual(["permission", "save-origin", "save-intent", "owner-proof", "pair", "connect"]);
-    expect(calls.page).toEqual([{ type: "c2c.connect.request" }]);
+    expect(calls.order).toEqual(["contains", "save-intent", "owner-proof", "pair", "connect"]);
+    expect(calls.request).toEqual([]);
+    expect(calls.page).toEqual([{ type: "c2c.connect.request", workspaceId, canonicalRoute: route }]);
     expect(JSON.stringify(calls.storage)).not.toContain("c2c_pair_secret");
     expect(elements.get("pair-json")!.value).toBe("");
     expect(elements.get("pair-secret")!.value).toBe("");
@@ -712,25 +935,28 @@ describe("popup Bridge permission and Pair separation", () => {
     expect(pending.elements.get("user-connection-status")!.textContent).toBe("还差一步完成连接");
   });
 
-  it("brand-new first-use pairing JSON bootstraps and canonicalizes bridge origin", async () => {
+  it("complete server pairing JSON retains metadata and canonicalizes the registered origin", async () => {
     const { calls, elements } = await loadPopup(true, true);
     elements.get("pair-json")!.value = JSON.stringify({
       intentId: "intent-1",
       secret: "c2c_pair_secret",
       bridgeOrigin: "https://bridge.example.test/",
+      workspaceId, bindingId: "binding-1", epoch: 1, expiresAt: "2026-10-06T03:00:00.000Z",
     });
     await elements.get("pair-connect")!.onclick!();
-    expect(calls.request).toEqual([{ origins: ["https://bridge.example.test/*"] }]);
-    expect(calls.order).toEqual(["permission", "save-origin", "save-intent", "owner-proof", "pair", "connect"]);
-    expect(calls.page).toEqual([{ type: "c2c.connect.request" }]);
+    expect(calls.request).toEqual([]);
+    expect(calls.contains).toEqual([{ origins: ["https://bridge.example.test/*"] }]);
+    expect(calls.order).toEqual(["contains", "save-intent", "owner-proof", "pair", "connect"]);
+    expect(calls.page).toEqual([{ type: "c2c.connect.request", workspaceId, canonicalRoute: route }]);
   });
 
-  it("legacy pairing JSON falls back to the saved bridge origin", async () => {
+  it("legacy pairing JSON falls back only to the explicitly selected single project", async () => {
     const { calls, elements } = await loadPopup(true, true, { savedBridgeOrigin: "https://bridge.example.test/" });
     elements.get("pair-json")!.value = JSON.stringify({ intentId: "intent-1", secret: "c2c_pair_secret" });
     await elements.get("pair-connect")!.onclick!();
-    expect(calls.request).toEqual([{ origins: ["https://bridge.example.test/*"] }]);
-    expect(calls.page).toEqual([{ type: "c2c.connect.request" }]);
+    expect(calls.request).toEqual([]);
+    expect(calls.contains).toEqual([{ origins: ["https://bridge.example.test/*"] }]);
+    expect(calls.page).toEqual([{ type: "c2c.connect.request", workspaceId, canonicalRoute: route }]);
   });
 
   it("unsafe pairing JSON origin stops before permission, owner proof, and pair", async () => {
@@ -748,14 +974,14 @@ describe("popup Bridge permission and Pair separation", () => {
     expect(elements.get("connect-diagnostic")!.textContent).toBe("bridge_origin_invalid");
   });
 
-  it("without pairing or saved origin keeps the first-use origin error", async () => {
-    const { calls, elements } = await loadPopup(true, true);
+  it("without a registered project rejects pairing before permission or page work", async () => {
+    const { calls, elements } = await loadPopup(true, true, { projects: [] });
     elements.get("pair-json")!.value = JSON.stringify({ intentId: "intent-1", secret: "c2c_pair_secret" });
     await elements.get("pair-connect")!.onclick!();
     expect(calls.order).toEqual([]);
     expect(calls.runtime).toEqual([]);
     expect(calls.page).toEqual([]);
-    expect(elements.get("connect-diagnostic")!.textContent).toBe("bridge_origin_invalid");
+    expect(elements.get("connect-diagnostic")!.textContent).toBe("workspace_id_required");
   });
 
   it("one-click Pair + Connect reports awaiting confirmation when route attestation is pending", async () => {
@@ -763,7 +989,7 @@ describe("popup Bridge permission and Pair separation", () => {
     elements.get("bridge-origin")!.value = "https://bridge.example.test";
     elements.get("pair-json")!.value = JSON.stringify({ intentId: "intent-1", secret: "c2c_pair_secret" });
     await elements.get("pair-connect")!.onclick!();
-    expect(calls.page).toEqual([{ type: "c2c.connect.request" }]);
+    expect(calls.page).toEqual([{ type: "c2c.connect.request", workspaceId, canonicalRoute: route }]);
     expect(elements.get("connect-status")!.textContent).toBe("已发送连接验证，请回到 ChatGPT 完成确认");
   });
 
@@ -772,7 +998,9 @@ describe("popup Bridge permission and Pair separation", () => {
     elements.get("bridge-origin")!.value = "https://bridge.example.test";
     elements.get("pair-json")!.value = JSON.stringify({ intentId: "intent-1", secret: "c2c_pair_secret" });
     await elements.get("pair-connect")!.onclick!();
-    expect(calls.order).toEqual(["permission"]);
+    expect(calls.order).toEqual(["contains"]);
+    expect(calls.request).toEqual([]);
+    expect(calls.storage).toEqual([]);
     expect(calls.ownerProof).toBe(0);
     expect(calls.runtime).toEqual([]);
     expect(calls.page).toEqual([]);
@@ -784,14 +1012,15 @@ describe("popup Bridge permission and Pair separation", () => {
     elements.get("bridge-origin")!.value = "https://bridge.example.test";
     elements.get("pair-json")!.value = JSON.stringify({ intentId: "intent-1", secret: "c2c_pair_secret" });
     await elements.get("pair-connect")!.onclick!();
-    expect(calls.order).toEqual(["permission", "save-origin", "save-intent", "owner-proof", "pair"]);
+    expect(calls.order).toEqual(["contains", "save-intent", "owner-proof", "pair"]);
     expect(calls.page).toEqual([]);
     expect(elements.get("pair-json")!.value).toBe("");
     expect(elements.get("pair-connect-hint")!.textContent).toContain("配对未成功");
   });
 
   it("one-click Pair rejects an active-tab change before pairing", async () => {
-    const { calls, elements } = await loadPopup(true, true, { tabIds: [1, 2] });
+    const { calls, elements, setActiveTab } = await loadPopup(true, true);
+    setActiveTab(2);
     elements.get("bridge-origin")!.value = "https://bridge.example.test";
     elements.get("pair-json")!.value = JSON.stringify({ intentId: "intent-1", secret: "c2c_pair_secret" });
     await elements.get("pair-connect")!.onclick!();
@@ -813,24 +1042,24 @@ describe("popup Bridge permission and Pair separation", () => {
     expect(html.indexOf('id="verify-route"')).toBeGreaterThan(manual);
   });
 
-  it("Connect requests permission synchronously before storage or page work", async () => {
+  it("Connect checks permission before storage or page work", async () => {
     const { calls, elements } = await loadPopup(true);
     elements.get("bridge-origin")!.value = "https://bridge.example.test";
     const pending = elements.get("connect-chat")!.onclick!();
-    expect(calls.request).toEqual([{ origins: ["https://bridge.example.test/*"] }]);
-    expect(calls.contains).toEqual([]);
+    expect(calls.request).toEqual([]);
+    expect(calls.contains).toEqual([{ origins: ["https://bridge.example.test/*"] }]);
     expect(calls.storage).toEqual([]);
     expect(calls.page).toEqual([]);
     await pending;
-    expect(calls.page).toEqual([{ type: "c2c.connect.request" }]);
+    expect(calls.page).toEqual([{ type: "c2c.connect.request", workspaceId, canonicalRoute: route }]);
   });
 
   it("rebind controls send fixed payload-free SW commands", async () => {
     const { calls, elements } = await loadPopup(true);
     await elements.get("rebind-start")!.onclick!();
     await elements.get("rebind-complete")!.onclick!();
-    expect(calls.runtime).toContainEqual({ type: "c2c.rebind.start", ownerProofId: "proof-1" });
-    expect(calls.runtime).toContainEqual({ type: "c2c.rebind.complete" });
+    expect(calls.runtime).toContainEqual({ type: "c2c.rebind.start", ownerProofId: "proof-1", workspaceId });
+    expect(calls.runtime).toContainEqual({ type: "c2c.rebind.complete", workspaceId });
     expect(JSON.stringify(calls.runtime)).not.toMatch(/credential|principal|secret|redemption/);
   });
 
@@ -863,7 +1092,7 @@ describe("popup Bridge permission and Pair separation", () => {
   });
 
   it("Grant requests only the exact validated Bridge origin (port retained)", async () => {
-    const { calls, elements } = await loadPopup(false, true);
+    const { calls, elements } = await loadPopup(false, true, { projects: [{ ...project, bridgeOrigin: "https://bridge.example.test:8443" }] });
     elements.get("bridge-origin")!.value = "https://bridge.example.test:8443";
     await elements.get("grant-bridge-access")!.onclick!();
     expect(calls.contains).toEqual([]);
@@ -874,7 +1103,7 @@ describe("popup Bridge permission and Pair separation", () => {
   });
 
   it("Grant invokes permissions.request synchronously before any async storage write", async () => {
-    const { calls, elements } = await loadPopup(false, true);
+    const { calls, elements } = await loadPopup(false, true, { projects: [{ ...project, bridgeOrigin: "https://bridge.example.test:8443" }] });
     elements.get("bridge-origin")!.value = "https://bridge.example.test:8443";
     const p = elements.get("grant-bridge-access")!.onclick!();
     // BEFORE awaiting p: request already invoked; storage not yet written.
@@ -883,7 +1112,7 @@ describe("popup Bridge permission and Pair separation", () => {
     expect(calls.contains).toHaveLength(0);
     await p;
     expect(calls.request).toEqual([{ origins: ["https://bridge.example.test:8443/*"] }]);
-    expect(calls.storage).toContainEqual({ "c2c_companion_bridge_origin_v1": "https://bridge.example.test:8443" });
+    expect(calls.storage).toEqual([]);
     expect(elements.get("bridge-origin")!.value).toBe("https://bridge.example.test:8443");
   });
 

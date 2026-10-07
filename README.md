@@ -41,7 +41,7 @@ Detailed docs below are in English · 详细中文文档见 **[README.zh-CN.md](
 默认关闭，新增 `codex.control` / `codex.read`；基础只读工具边界不变，feedback/Desktop 独立鉴权。
 操作步骤、持久化与恢复限制见 [Remote Control](docs/remote-control.md)。
 
-单机多 workspace 官方 Gateway 与旧 feedback 插件整合计划见 [统一 Gateway 计划](docs/unified-gateway-plan.md)；该聚合能力仍在开发规划中。
+当前源码已实现机器级 Unified Gateway、显式 workspace/client 授权路由与 feedback 工具整合；多项目 Companion、Gateway Supervisor 也已有源码实现。双项目真实 Send/observed、完整现场验收与旧插件退役仍待完成，Browser Companion 和旧 feedback Connector 继续保留。当前合同见 [官方路线](docs/official-route.md)，实施与验收边界见 [统一 Gateway 计划](docs/unified-gateway-plan.md)。
 
 ## Experimental Desktop Control · 实验性桌面控制
 
@@ -353,14 +353,18 @@ Credentials stay in the OS app state directory, not in the project.
   confirmed plain task text to one locally bound Desktop thread after the
   `codex.desktop.control` scope and local enable check pass. It is not a direct
   file or shell RPC; see [Desktop Control](docs/desktop-control.md).
-- **One workspace = one boundary**: every token is bound to a single workspace;
-  path containment uses canonical realpaths (symlink/`../`/absolute-path escapes
-  are all blocked and tested).
+- **One workspace = one boundary**: Bridge and single-workspace official tokens
+  remain workspace-bound. Gateway tokens identify a client; each project call
+  requires an explicit workspaceId, a local client grant and a canonical root
+  match. Path containment uses canonical realpaths (symlink/`../`/absolute-path
+  escapes are all blocked and tested).
 - **Sensitive files never leave**: `.env*`, keys, SSH, credentials are denied by
   default (`.env.example` allowed); `.c2cignore` adds your own rules.
 - **Knowing the URL grants nothing**: the public MCP endpoint requires OAuth 2.1
   (PKCE S256, dynamic client registration, rotating refresh tokens). Without a
-  token: 401. Wrong workspace: 403.
+  token, protected calls return 401. Gateway alone allows anonymous initialize,
+  initialized notification and tools/list discovery; tool execution still
+  requires OAuth, scope and the local project grant.
 - **The model never sees long-lived credentials**: the only secret that ever
   touches a browser is a one-time pairing code (5-minute TTL, 5 attempts,
   rate-limited, destroyed on use).
@@ -372,7 +376,7 @@ Full threat model: [docs/security.md](docs/security.md)
 ```bash
 pnpm install --frozen-lockfile
 pnpm run build      # -> dist/ and deterministic build ID; does not switch installed Core
-pnpm test --maxWorkers=1 --testTimeout=60000
+pnpm test --maxWorkers=1 --testTimeout=90000
 pnpm run typecheck
 git diff --check
 

@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createHash } from "node:crypto";
+import { PROJECT_REGISTRY_KEY, projectStorageKey } from "../browser-companion/project-context.js";
 
 const ROUTE_A = "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111";
 const ROUTE_B = "https://chatgpt.com/c/22222222-2222-4222-8222-222222222222";
-const WORKSPACE = "workspace-r5c-sink";
+const WORKSPACE = "b1c2d3e4f5a6";
 const COMPANION = "11111111-1111-4111-8111-111111111111";
 const BINDING = "22222222-2222-4222-8222-222222222222";
 const EPOCH = 3;
@@ -23,6 +24,7 @@ const RESERVATION_ID = "33333333-3333-4333-8333-333333333333";
 const ATTEMPT_ID = "44444444-4444-4444-8444-444444444444";
 const MESSAGE = "原始回流正文保留在本机 archive";
 const MESSAGE_HASH = createHash("sha256").update(MESSAGE, "utf8").digest("hex");
+const projectKey = (key: string) => projectStorageKey(WORKSPACE, key);
 
 function unknownJournal() {
   return {
@@ -80,14 +82,21 @@ function stateIsolatedAttempt() {
 
 function storageArea(initial: Record<string, unknown>) {
   const values = new Map(Object.entries(initial));
+  const migratedValues = new Map<string, unknown>();
   return {
     values,
+    migratedValues,
     async get(keys?: string | string[]) {
       if (keys == null) return Object.fromEntries(values);
       const list = Array.isArray(keys) ? keys : [keys];
       return Object.fromEntries(list.map(key => [key, values.get(key)]));
     },
     async set(row: Record<string, unknown>) {
+      if ((row[PROJECT_REGISTRY_KEY] as { legacyMigration?: string } | undefined)?.legacyMigration === "migrated") {
+        for (const [key, value] of Object.entries(row)) {
+          if (key.startsWith(`c2c_companion_project_v1:${WORKSPACE}:`)) migratedValues.set(key, value);
+        }
+      }
       for (const [key, value] of Object.entries(row)) values.set(key, value);
     },
     async remove(keys: string | string[]) {
@@ -163,6 +172,7 @@ async function loadWorker(opts: {
   connectFlow?: Record<string, unknown>;
   routeFence?: Record<string, unknown>;
   local?: Record<string, unknown>;
+  preMigrated?: boolean;
 } = {}) {
   const initial = initialState(opts.route ?? ROUTE_A, opts.routeVerification ?? "VERIFIED");
   if (opts.ownerRoute) {
@@ -173,6 +183,16 @@ async function loadWorker(opts: {
   if (opts.connectFlow) initial.local[CONNECT_KEY] = opts.connectFlow;
   if (opts.routeFence) initial.local[FENCE_KEY] = opts.routeFence;
   Object.assign(initial.local, opts.local);
+  const legacyMigrationExpected = !opts.preMigrated && !Object.hasOwn(initial.local, PROJECT_REGISTRY_KEY);
+  if (opts.preMigrated) {
+    for (const [key, value] of Object.entries(initial.local)) initial.local[projectKey(key)] = value;
+    for (const [key, value] of Object.entries(initial.session)) initial.session[projectKey(key)] = value;
+    initial.local[PROJECT_REGISTRY_KEY] = {
+      schemaVersion: 1,
+      projects: [{ workspaceId: WORKSPACE, bridgeOrigin: "https://bridge.example.test", legacy: true }],
+      legacyMigration: "migrated",
+    };
+  }
   const local = storageArea(initial.local);
   const session = storageArea(initial.session);
   let messageListener: ((message: unknown, sender: unknown, sendResponse: (response: unknown) => void) => unknown) | null = null;
@@ -217,9 +237,19 @@ async function loadWorker(opts: {
   vi.resetModules();
   await import("../browser-companion/service-worker.js");
   if (!messageListener) throw new Error("service worker did not register onMessage handler");
-  const send = (message: unknown, sender: unknown = {}) => new Promise<unknown>((resolve) => {
-    messageListener!(message, sender, resolve);
-  });
+  let legacyMigrationChecked = false;
+  const send = async (message: unknown, sender: unknown = {}) => {
+    const response = await new Promise<unknown>((resolve) => messageListener!(message, sender, resolve));
+    if (legacyMigrationExpected && !legacyMigrationChecked) {
+      expect(local.values.get(PROJECT_REGISTRY_KEY)).toMatchObject({ legacyMigration: "migrated" });
+      expect(local.migratedValues.get(projectKey(TRANSPORT_KEY))).toEqual(initial.local[TRANSPORT_KEY]);
+      expect(local.values.has(projectKey(TRANSPORT_KEY))).toBe(true);
+      expect(local.values.get(TRANSPORT_KEY)).toEqual(initial.local[TRANSPORT_KEY]);
+      expect(session.values.get(OWNER_KEY)).toEqual(initial.session[OWNER_KEY]);
+      legacyMigrationChecked = true;
+    }
+    return response;
+  };
   const ownerSender = {
     tab: { id: 7 },
     documentId: "document-r5c",
@@ -228,9 +258,18 @@ async function loadWorker(opts: {
   };
   const panelSender = {
     id: chrome.runtime.id,
-    url: chrome.runtime.getURL("operations/operations.html"),
+    url: `${chrome.runtime.getURL("operations/operations.html")}?workspaceId=${WORKSPACE}`,
+    tab: {
+      id: 9,
+      url: `${chrome.runtime.getURL("operations/operations.html")}?workspaceId=${WORKSPACE}`,
+    },
   };
-  return { initial, local, session, fetchMock, send, ownerSender, panelSender, tabsSendMessage };
+  const selectProject = (tabId: number, canonicalRoute: string) => send({
+    type: "c2c.project.select", workspaceId: WORKSPACE, tabId, canonicalRoute,
+  }, { id: chrome.runtime.id });
+  const selection = await selectProject(7, opts.route ?? ROUTE_A) as { ok: boolean; reason?: string };
+  if (!selection.ok) throw new Error(`workspace selection setup failed: ${JSON.stringify(selection)}`);
+  return { initial, local, session, fetchMock, send, selectProject, ownerSender, panelSender, tabsSendMessage };
 }
 
 function bindCalls(fetchMock: ReturnType<typeof vi.fn>) {
@@ -245,7 +284,8 @@ describe("B2 operations read-only RPC", () => {
     const worker = await loadWorker({ fetch: async () => { await new Promise<void>(resolve => { release = resolve; }); return { ok: true, status: 200, json: async () => body }; } });
     await worker.send({ type: "c2c.status.read", canonicalRoute: ROUTE_A }, worker.ownerSender);
     const before = JSON.stringify([Object.fromEntries(worker.local.values), Object.fromEntries(worker.session.values)]);
-    const a = worker.send({ type: "c2c.operations.read" }), b = worker.send({ type: "c2c.operations.read" });
+    const a = worker.send({ type: "c2c.operations.read", workspaceId: WORKSPACE }, worker.panelSender);
+    const b = worker.send({ type: "c2c.operations.read", workspaceId: WORKSPACE }, worker.panelSender);
     await vi.waitFor(() => expect(worker.fetchMock).toHaveBeenCalledTimes(1)); release();
     expect(await a).toMatchObject({ ok: true, snapshot: body }); expect(await b).toMatchObject({ ok: true });
     expect(worker.fetchMock.mock.calls[0][0]).toMatch(/\/operations$/);
@@ -262,17 +302,20 @@ describe("B2 operations read-only RPC", () => {
     const worker = await loadWorker({ fetch: async () => ({ ok: false, status: 401, json: async () => ({ error: "COMPANION_UNAUTHORIZED" }) }) });
     await worker.send({ type: "c2c.status.read", canonicalRoute: ROUTE_A }, worker.ownerSender);
     const before = JSON.stringify(Object.fromEntries(worker.local.values));
-    expect(await worker.send({ type: "c2c.operations.read" })).toMatchObject({ ok: false, reason: "COMPANION_UNAUTHORIZED" });
+    expect(await worker.send({ type: "c2c.operations.read", workspaceId: WORKSPACE }, worker.panelSender))
+      .toMatchObject({ ok: false, reason: "COMPANION_UNAUTHORIZED" });
     expect(JSON.stringify(Object.fromEntries(worker.local.values))).toBe(before); expect(worker.tabsSendMessage).not.toHaveBeenCalled();
   });
   it("read rejects mismatched response identity without synchronizing binding", async () => {
     const worker = await loadWorker({ fetch: async () => ({ ok: true, status: 200, json: async () => ({ ...body, epoch: EPOCH + 1 }) }) });
-    expect(await worker.send({ type: "c2c.operations.read" })).toMatchObject({ ok: false, reason: "identity_mismatch:epoch" });
-    expect(worker.local.values.get(TRANSPORT_KEY)).toMatchObject({ epoch: EPOCH });
+    expect(await worker.send({ type: "c2c.operations.read", workspaceId: WORKSPACE }, worker.panelSender))
+      .toMatchObject({ ok: false, reason: "identity_mismatch:epoch" });
+    expect(worker.local.values.get(projectKey(TRANSPORT_KEY))).toMatchObject({ epoch: EPOCH });
   });
   it("popup status observation never runs connect convergence or mutates owner on route mismatch", async () => {
     const worker = await loadWorker();
     await worker.send({ type: "c2c.status.read", canonicalRoute: ROUTE_A }, worker.ownerSender);
+    await worker.selectProject(7, ROUTE_B);
     const before = JSON.stringify([Object.fromEntries(worker.local.values), Object.fromEntries(worker.session.values)]);
     expect(await worker.send({ type: "c2c.status.read", canonicalRoute: ROUTE_B }, worker.ownerSender)).toMatchObject({ ok: true, isOwner: false });
     expect(worker.fetchMock).not.toHaveBeenCalled(); expect(worker.tabsSendMessage).not.toHaveBeenCalled();
@@ -312,7 +355,7 @@ describe("durable outcome-unknown isolation mailbox", () => {
 
     const recovered = await worker.send({ type: "c2c.recover" });
     expect(recovered).toMatchObject({ ok: true, isolated: true, observed: false, journal: { state: "NONE" } });
-    const archive = worker.local.values.get(ISOLATION_ARCHIVE_KEY) as any;
+    const archive = worker.local.values.get(projectKey(ISOLATION_ARCHIVE_KEY)) as any;
     expect(archive.entries[0]).toMatchObject({ status: "isolated", journal: { message: MESSAGE, messageSha256: MESSAGE_HASH } });
     const isolateRequest = requests.find(request => request.path.endsWith("/isolate-attempt"));
     expect(isolateRequest?.init.method).toBe("POST");
@@ -346,8 +389,8 @@ describe("durable outcome-unknown isolation mailbox", () => {
       },
     });
     expect(await first.send({ type: "c2c.recover" })).toMatchObject({ ok: false, reason: "network_unreachable" });
-    expect(first.local.values.get(JOURNAL_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN", message: MESSAGE });
-    expect(first.local.values.get(ISOLATION_ARCHIVE_KEY)).toMatchObject({ entries: [{ status: "pending", journal: { message: MESSAGE } }] });
+    expect(first.local.values.get(projectKey(JOURNAL_KEY))).toMatchObject({ state: "OUTCOME_UNKNOWN", message: MESSAGE });
+    expect(first.local.values.get(projectKey(ISOLATION_ARCHIVE_KEY))).toMatchObject({ entries: [{ status: "pending", journal: { message: MESSAGE } }] });
     expect(serverIsolated).toBe(true);
 
     const restarted = await loadWorker({
@@ -359,8 +402,8 @@ describe("durable outcome-unknown isolation mailbox", () => {
       },
     });
     expect(await restarted.send({ type: "c2c.recover" })).toMatchObject({ ok: true, isolated: true, observed: false });
-    expect(restarted.local.values.get(JOURNAL_KEY)).toMatchObject({ state: "NONE" });
-    expect(restarted.local.values.get(ISOLATION_ARCHIVE_KEY)).toMatchObject({ entries: [{ status: "isolated", journal: { message: MESSAGE } }] });
+    expect(restarted.local.values.get(projectKey(JOURNAL_KEY))).toMatchObject({ state: "NONE" });
+    expect(restarted.local.values.get(projectKey(ISOLATION_ARCHIVE_KEY))).toMatchObject({ entries: [{ status: "isolated", journal: { message: MESSAGE } }] });
     expect(restarted.fetchMock.mock.calls.some(call => String(call[0]).endsWith("/ack"))).toBe(false);
     expect(restarted.tabsSendMessage).not.toHaveBeenCalled();
   });
@@ -373,7 +416,7 @@ describe("durable outcome-unknown isolation mailbox", () => {
         ? json(200, apiState(unknownInFlight())) : json(200, isolateProof()),
     });
     expect(await stale.send({ type: "c2c.recover" })).toMatchObject({ ok: false, reason: "outcome_unknown" });
-    expect(stale.local.values.has(ISOLATION_ARCHIVE_KEY)).toBe(false);
+    expect(stale.local.values.has(projectKey(ISOLATION_ARCHIVE_KEY))).toBe(false);
     expect(stale.fetchMock.mock.calls.some(call => String(call[0]).endsWith("/isolate-attempt"))).toBe(false);
 
     const wrongTarget = await loadWorker({
@@ -387,8 +430,8 @@ describe("durable outcome-unknown isolation mailbox", () => {
       },
     });
     expect(await wrongTarget.send({ type: "c2c.recover" })).toMatchObject({ ok: false, reason: "isolation_response_invalid" });
-    expect(wrongTarget.local.values.get(JOURNAL_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN" });
-    expect(wrongTarget.local.values.get(ISOLATION_ARCHIVE_KEY)).toMatchObject({ entries: [{ status: "pending" }] });
+    expect(wrongTarget.local.values.get(projectKey(JOURNAL_KEY))).toMatchObject({ state: "OUTCOME_UNKNOWN" });
+    expect(wrongTarget.local.values.get(projectKey(ISOLATION_ARCHIVE_KEY))).toMatchObject({ entries: [{ status: "pending" }] });
     expect(wrongTarget.fetchMock.mock.calls.some(call => String(call[0]).endsWith("/ack"))).toBe(false);
 
     const storageFailure = await loadWorker({
@@ -398,11 +441,11 @@ describe("durable outcome-unknown isolation mailbox", () => {
     });
     const originalSet = storageFailure.local.set.bind(storageFailure.local);
     storageFailure.local.set = async row => {
-      if (Object.hasOwn(row, ISOLATION_ARCHIVE_KEY)) throw new Error("protected storage write failed");
+      if (Object.hasOwn(row, projectKey(ISOLATION_ARCHIVE_KEY))) throw new Error("protected storage write failed");
       await originalSet(row);
     };
     expect(await storageFailure.send({ type: "c2c.recover" })).toMatchObject({ ok: false, reason: "isolation_archive_persist_failed" });
-    expect(storageFailure.local.values.get(JOURNAL_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN" });
+    expect(storageFailure.local.values.get(projectKey(JOURNAL_KEY))).toMatchObject({ state: "OUTCOME_UNKNOWN" });
     expect(storageFailure.fetchMock.mock.calls.some(call => String(call[0]).endsWith("/isolate-attempt"))).toBe(false);
   });
 
@@ -415,8 +458,8 @@ describe("durable outcome-unknown isolation mailbox", () => {
     });
     expect(await worker.send({ type: "c2c.recover" })).toMatchObject({ ok: false, reason: "outcome_unknown" });
     expect(worker.tabsSendMessage).toHaveBeenCalledTimes(1);
-    expect(worker.local.values.get(JOURNAL_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN", message: MESSAGE });
-    expect(worker.local.values.has(ISOLATION_ARCHIVE_KEY)).toBe(false);
+    expect(worker.local.values.get(projectKey(JOURNAL_KEY))).toMatchObject({ state: "OUTCOME_UNKNOWN", message: MESSAGE });
+    expect(worker.local.values.has(projectKey(ISOLATION_ARCHIVE_KEY))).toBe(false);
     expect(worker.fetchMock.mock.calls.some(call => /\/(?:ack|isolate-attempt|operations\/terminal-gone)$/.test(String(call[0])))).toBe(false);
   });
 
@@ -458,7 +501,7 @@ describe("durable outcome-unknown isolation mailbox", () => {
     expect(await worker.send({ type: "c2c.recover" })).toMatchObject({
       ok: true, terminalGone: true, isolated: false, observed: false, journal: { state: "NONE" },
     });
-    expect(worker.local.values.get(ISOLATION_ARCHIVE_KEY)).toMatchObject({
+    expect(worker.local.values.get(projectKey(ISOLATION_ARCHIVE_KEY))).toMatchObject({
       entries: [{ status: "terminal_gone", journal: { message: MESSAGE, messageSha256: MESSAGE_HASH } }],
     });
     const request = requests.find(item => item.path.endsWith("/operations/terminal-gone"));
@@ -488,7 +531,7 @@ describe("durable outcome-unknown isolation mailbox", () => {
     expect(await worker.send({ type: "c2c.recover" })).toMatchObject({ ok: true, isolated: true, observed: false });
     expect(paths.indexOf("/api/companion/v1/operations/terminal-gone"))
       .toBeLessThan(paths.indexOf("/api/companion/v1/isolate-attempt"));
-    expect(worker.local.values.get(ISOLATION_ARCHIVE_KEY)).toMatchObject({ entries: [{ status: "isolated" }] });
+    expect(worker.local.values.get(projectKey(ISOLATION_ARCHIVE_KEY))).toMatchObject({ entries: [{ status: "isolated" }] });
     expect(worker.fetchMock.mock.calls.some(call => String(call[0]).endsWith("/ack"))).toBe(false);
   });
 
@@ -505,8 +548,8 @@ describe("durable outcome-unknown isolation mailbox", () => {
       },
     });
     expect(await first.send({ type: "c2c.recover" })).toMatchObject({ ok: false, reason: "network_unreachable" });
-    expect(first.local.values.get(JOURNAL_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN", message: MESSAGE });
-    expect(first.local.values.get(ISOLATION_ARCHIVE_KEY)).toMatchObject({ entries: [{ status: "pending", journal: { message: MESSAGE } }] });
+    expect(first.local.values.get(projectKey(JOURNAL_KEY))).toMatchObject({ state: "OUTCOME_UNKNOWN", message: MESSAGE });
+    expect(first.local.values.get(projectKey(ISOLATION_ARCHIVE_KEY))).toMatchObject({ entries: [{ status: "pending", journal: { message: MESSAGE } }] });
     expect(gone).toBe(true);
 
     const restarted = await loadWorker({
@@ -515,8 +558,8 @@ describe("durable outcome-unknown isolation mailbox", () => {
         ? json(200, apiState(null)) : json(200, terminalGoneProof()),
     });
     expect(await restarted.send({ type: "c2c.recover" })).toMatchObject({ ok: true, terminalGone: true, observed: false });
-    expect(restarted.local.values.get(JOURNAL_KEY)).toMatchObject({ state: "NONE" });
-    expect(restarted.local.values.get(ISOLATION_ARCHIVE_KEY)).toMatchObject({ entries: [{ status: "terminal_gone" }] });
+    expect(restarted.local.values.get(projectKey(JOURNAL_KEY))).toMatchObject({ state: "NONE" });
+    expect(restarted.local.values.get(projectKey(ISOLATION_ARCHIVE_KEY))).toMatchObject({ entries: [{ status: "terminal_gone" }] });
 
     const storageFailure = await loadWorker({
       local: { [JOURNAL_KEY]: unknownJournal() },
@@ -526,11 +569,11 @@ describe("durable outcome-unknown isolation mailbox", () => {
     });
     const originalSet = storageFailure.local.set.bind(storageFailure.local);
     storageFailure.local.set = async row => {
-      if (Object.hasOwn(row, ISOLATION_ARCHIVE_KEY)) throw new Error("protected storage write failed");
+      if (Object.hasOwn(row, projectKey(ISOLATION_ARCHIVE_KEY))) throw new Error("protected storage write failed");
       await originalSet(row);
     };
     expect(await storageFailure.send({ type: "c2c.recover" })).toMatchObject({ ok: false, reason: "isolation_archive_persist_failed" });
-    expect(storageFailure.local.values.get(JOURNAL_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN" });
+    expect(storageFailure.local.values.get(projectKey(JOURNAL_KEY))).toMatchObject({ state: "OUTCOME_UNKNOWN" });
     expect(storageFailure.fetchMock.mock.calls.some(call => String(call[0]).endsWith("/operations/terminal-gone"))).toBe(false);
   });
 });
@@ -549,14 +592,14 @@ describe("read-only execution result panel proxy", () => {
       const path = new URL(String(url)).pathname;
       return path.endsWith("/operations/result") ? json(200, result) : json(404, {});
     } });
-    const reply = await worker.send({ type: "c2c.operations.result.read", commandId: "mailbox_1", iteration: 2 }, worker.panelSender);
+    const reply = await worker.send({ type: "c2c.operations.result.read", workspaceId: WORKSPACE, commandId: "mailbox_1", iteration: 2 }, worker.panelSender);
     expect(reply).toEqual({ ok: true, result });
     const [url, init] = worker.fetchMock.mock.calls.find(call => String(call[0]).includes("/operations/result"))!;
     expect(String(url)).toMatch(/\/operations\/result\?commandId=mailbox_1&iteration=2$/);
     expect(init).toMatchObject({ method: "GET", cache: "no-store" });
     expect(init.headers.authorization).toBe("Bearer c2c_comp_test-credential");
     expect(worker.tabsSendMessage).not.toHaveBeenCalled();
-    expect(await worker.send({ type: "c2c.operations.result.read", commandId: "mailbox_1", iteration: 2, route: ROUTE_B }, worker.panelSender))
+    expect(await worker.send({ type: "c2c.operations.result.read", workspaceId: WORKSPACE, commandId: "mailbox_1", iteration: 2, route: ROUTE_B }, worker.panelSender))
       .toMatchObject({ ok: false, reason: "bad_message" });
     expect(await worker.send({ type: "c2c.operations.result.read", commandId: "mailbox_1", iteration: 2 }, worker.ownerSender))
       .toMatchObject({ ok: false, reason: "extension_panel_required" });
@@ -566,7 +609,7 @@ describe("read-only execution result panel proxy", () => {
     const worker = await loadWorker({ fetch: async url => new URL(String(url)).pathname.endsWith("/operations/result")
       ? json(409, { error: "COMPANION_RESULT_HISTORICAL_REFUSED", rawSummary: "must not reach UI" })
       : json(404, {}) });
-    expect(await worker.send({ type: "c2c.operations.result.read", commandId: "mailbox_1", iteration: 2 }, worker.panelSender))
+    expect(await worker.send({ type: "c2c.operations.result.read", workspaceId: WORKSPACE, commandId: "mailbox_1", iteration: 2 }, worker.panelSender))
       .toEqual({ ok: false, reason: "COMPANION_RESULT_HISTORICAL_REFUSED" });
   });
 });
@@ -590,42 +633,70 @@ describe("authenticated response belongs to its request transport", () => {
     const pending = new Promise(resolve => { finish = resolve; });
     const requested = new Promise<void>(resolve => { started = resolve; });
     let first = true;
+    let ackStateReads = 0;
+    let worker!: Awaited<ReturnType<typeof loadWorker>>;
+    let callbackAck: Promise<unknown> | undefined;
     const ackJournal = { state: "OBSERVED_PENDING_ACK", eventId: "a".repeat(32), reservationId: "reserved",
       attemptId: "attempt", routeCanonical: ROUTE_A, bindingId: BINDING, epoch: EPOCH,
       message: "fixture result", messageSha256: "b".repeat(64), createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
-    const worker = await loadWorker({
+    worker = await loadWorker({
       ...(endpoint === "ack" ? { local: { [JOURNAL]: ackJournal } } : {}),
+      ...(endpoint === "ack" ? { tabsSendMessage: async (tabId, message) => {
+        expect(message).toMatchObject({ type: "c2c.production.send.recover" });
+        callbackAck = worker.send({ type: "c2c.production.ack", workspaceId: WORKSPACE,
+          eventId: ackJournal.eventId, attemptId: ackJournal.attemptId }, {
+          id: "browser-companion-test-id", tab: { id: tabId }, documentId: "document-r5c", frameId: 0, url: ROUTE_A,
+        });
+        await requested;
+        return { ok: false, reason: "outcome_unknown", zeroWrite: true, zeroClick: true };
+      } } : {}),
       fetch: async url => {
         const pathname = String(url);
         if (pathname.endsWith(`/${endpoint}`) && first) { first = false; started(); return pending; }
         if (pathname.endsWith("/pair")) return json(200, pairBody);
+        if (pathname.endsWith("/state") && endpoint === "ack") {
+          ackStateReads += 1;
+          return ackStateReads === 1 ? json(200, stateBody) : json(401, { error: "COMPANION_UNAUTHORIZED" });
+        }
         // Current credential 401 permits repairing an active journal; replacement itself is real Pair.
         return json(401, { error: "COMPANION_UNAUTHORIZED" });
       },
     });
-    const oldResponse = worker.send(endpoint === "state" ? { type: "c2c.fetch.state" }
-      : endpoint === "reserve" ? { type: "c2c.reserve.page", ...page }
-        : { type: "c2c.production.ack", eventId: ackJournal.eventId, attemptId: ackJournal.attemptId }, worker.ownerSender);
-    await Promise.race([requested, oldResponse.then(response => { throw new Error(`request did not reach fetch: ${JSON.stringify(response)}`); })]);
-    if (endpoint !== "state") expect(await worker.send({ type: "c2c.fetch.state" })).toMatchObject({ authStale: true });
+    let oldResponse: Promise<unknown>;
+    if (endpoint === "ack") {
+      const recovery = worker.send({ type: "c2c.recover" }, worker.ownerSender);
+      await Promise.race([requested, recovery.then(response => { throw new Error(`ACK callback did not reach fetch: ${JSON.stringify(response)}`); })]);
+      await recovery;
+      expect(worker.tabsSendMessage).toHaveBeenCalledTimes(1);
+      oldResponse = callbackAck!;
+    } else {
+      oldResponse = worker.send(endpoint === "state" ? { type: "c2c.fetch.state" }
+        : { type: "c2c.reserve.page", ...page }, worker.ownerSender);
+      await Promise.race([requested, oldResponse.then(response => { throw new Error(`request did not reach fetch: ${JSON.stringify(response)}`); })]);
+    }
+    if (endpoint === "reserve" || endpoint === "ack") {
+      expect(await worker.send({ type: "c2c.fetch.state" })).toMatchObject({ authStale: true });
+    }
     const proof = await worker.send({ type: "c2c.owner-proof.request", ...page }, worker.ownerSender) as { proof: { id: string } };
     expect(await worker.send({ type: "c2c.pair", bridgeOrigin: "https://bridge.example.test",
+      workspaceId: WORKSPACE, tabId: 7, canonicalRoute: ROUTE_A,
       intentId: "fixture-intent", secret: "fixture-secret", ownerProofId: proof.proof.id })).toMatchObject({ ok: true });
     const before = JSON.stringify(Object.fromEntries(worker.local.values));
     finish(json(401, { error: "COMPANION_UNAUTHORIZED" }));
     expect(await oldResponse).toMatchObject({ ok: false, reason: "stale_transport_response" });
     expect(JSON.stringify(Object.fromEntries(worker.local.values))).toBe(before);
-    expect(worker.local.values.get(TRANSPORT_KEY)).toMatchObject({ authStale: false, credential: pairBody.credential });
-    expect(worker.tabsSendMessage).not.toHaveBeenCalled();
+    expect(worker.local.values.get(projectKey(TRANSPORT_KEY))).toMatchObject({ authStale: false, credential: pairBody.credential });
+    if (endpoint === "ack") expect(worker.tabsSendMessage.mock.calls[0]?.[1]).toMatchObject({ type: "c2c.production.send.recover" });
+    else expect(worker.tabsSendMessage).not.toHaveBeenCalled();
   });
 
   it("current 401 is durably stale and remains stale after SW hydration", async () => {
     const worker = await loadWorker({ fetch: async () => json(401, { error: "COMPANION_UNAUTHORIZED" }) });
     expect(await worker.send({ type: "c2c.fetch.state" })).toMatchObject({ authStale: true });
-    expect(worker.local.values.get(TRANSPORT_KEY)).toMatchObject({ authStale: true });
+    expect(worker.local.values.get(projectKey(TRANSPORT_KEY))).toMatchObject({ authStale: true });
     const restarted = await loadWorker({ local: Object.fromEntries(worker.local.values) });
     expect(await restarted.send({ type: "c2c.transport.status" })).toMatchObject({ transport: { authStale: true } });
-    expect(restarted.local.values.get(TRANSPORT_KEY)).toMatchObject({ authStale: true });
+    expect(restarted.local.values.get(projectKey(TRANSPORT_KEY))).toMatchObject({ authStale: true });
   });
 
   it("still-current rebindPending 401 keeps the established special semantics", async () => {
@@ -633,7 +704,7 @@ describe("authenticated response belongs to its request transport", () => {
     const worker = await loadWorker({ local: { [TRANSPORT_KEY]: { ...initial.transport, rebindPending: true } },
       fetch: async () => json(401, { error: "COMPANION_UNAUTHORIZED" }) });
     expect(await worker.send({ type: "c2c.fetch.state" })).toEqual({ ok: false, reason: "rebind_pending", authStale: false });
-    expect(worker.local.values.get(TRANSPORT_KEY)).toMatchObject({ authStale: false });
+    expect(worker.local.values.get(projectKey(TRANSPORT_KEY))).toMatchObject({ authStale: false });
   });
 
   it("revalidates the original stale credential after restart without pairing, sending or changing authority", async () => {
@@ -641,14 +712,14 @@ describe("authenticated response belongs to its request transport", () => {
     const durable = { [TRANSPORT_KEY]: { ...initial.transport, authStale: true },
       [JOURNAL]: { state: "OUTCOME_UNKNOWN", eventId: "existing" },
       [FENCE_KEY]: { state: "VERIFIED", companionId: COMPANION, challengeId: "unchanged" } };
-    const worker = await loadWorker({ local: durable, fetch: async () => json(200, stateBody) });
-    const beforeJournal = worker.local.values.get(JOURNAL);
-    const beforeFence = worker.local.values.get(FENCE_KEY);
+    const worker = await loadWorker({ preMigrated: true, local: durable, fetch: async () => json(200, stateBody) });
+    const beforeJournal = worker.local.values.get(projectKey(JOURNAL));
+    const beforeFence = worker.local.values.get(projectKey(FENCE_KEY));
     expect(await worker.send({ type: "c2c.fetch.state" })).toMatchObject({ ok: true });
     const { routeAttestationMessage: _pendingMessage, ...expectedTransport } = initial.transport;
-    expect(worker.local.values.get(TRANSPORT_KEY)).toEqual({ ...expectedTransport, authStale: false });
-    expect(worker.local.values.get(JOURNAL)).toEqual(beforeJournal);
-    expect(worker.local.values.get(FENCE_KEY)).toEqual(beforeFence);
+    expect(worker.local.values.get(projectKey(TRANSPORT_KEY))).toEqual({ ...expectedTransport, authStale: false });
+    expect(worker.local.values.get(projectKey(JOURNAL))).toEqual(beforeJournal);
+    expect(worker.local.values.get(projectKey(FENCE_KEY))).toEqual(beforeFence);
     expect(worker.fetchMock).toHaveBeenCalledTimes(1);
     expect(String(worker.fetchMock.mock.calls[0][0])).toMatch(/\/state$/);
     expect(worker.fetchMock.mock.calls[0][1]).toMatchObject({ method: "GET",
@@ -661,15 +732,15 @@ describe("authenticated response belongs to its request transport", () => {
     const worker = await loadWorker({ fetch: async () => rejected
       ? json(401, { error: "arbitrary-private-response" }) : json(200, stateBody) });
     await worker.send({ type: "c2c.fetch.state" });
-    expect(worker.local.values.get(TRANSPORT_KEY)).toMatchObject({ authStale: true, authStaleReason: "auth_revalidation_required" });
+    expect(worker.local.values.get(projectKey(TRANSPORT_KEY))).toMatchObject({ authStale: true, authStaleReason: "auth_revalidation_required" });
     expect(await worker.send({ type: "c2c.transport.status" })).toMatchObject({ transport: { authStale: true, productionEligible: false } });
     const requestsBeforeReserve = worker.fetchMock.mock.calls.length;
     expect(await worker.send({ type: "c2c.reserve.page", ...page }, worker.ownerSender)).toMatchObject({ ok: false, reason: "auth_stale" });
     expect(worker.fetchMock).toHaveBeenCalledTimes(requestsBeforeReserve);
     rejected = false;
     expect(await worker.send({ type: "c2c.fetch.state" })).toMatchObject({ ok: true });
-    expect(worker.local.values.get(TRANSPORT_KEY)).toMatchObject({ authStale: false });
-    expect(worker.local.values.get(TRANSPORT_KEY)).not.toHaveProperty("authStaleReason");
+    expect(worker.local.values.get(projectKey(TRANSPORT_KEY))).toMatchObject({ authStale: false });
+    expect(worker.local.values.get(projectKey(TRANSPORT_KEY))).not.toHaveProperty("authStaleReason");
   });
 
   it.each(["network", "500", "invalid", "identity", "401"])("stale credential recheck fails closed on %s", async failure => {
@@ -682,14 +753,14 @@ describe("authenticated response belongs to its request transport", () => {
         return json(401, { error: "COMPANION_UNAUTHORIZED" });
       } });
     expect(await worker.send({ type: "c2c.fetch.state" })).toMatchObject({ ok: false });
-    expect(worker.local.values.get(TRANSPORT_KEY)).toMatchObject({ authStale: true, credential: initialState().transport.credential });
+    expect(worker.local.values.get(projectKey(TRANSPORT_KEY))).toMatchObject({ authStale: true, credential: initialState().transport.credential });
     expect(worker.tabsSendMessage).not.toHaveBeenCalled();
   });
 
   it("invalid 200 state is not proof that an otherwise valid pair was revoked", async () => {
     const worker = await loadWorker({ fetch: async () => json(200, {}) });
     expect(await worker.send({ type: "c2c.fetch.state" })).toEqual({ ok: false, reason: "state_response_invalid" });
-    expect(worker.local.values.get(TRANSPORT_KEY)).toMatchObject({ authStale: false });
+    expect(worker.local.values.get(projectKey(TRANSPORT_KEY))).toMatchObject({ authStale: false });
   });
 
   it("a state response started before a newer auth failure cannot clear that failure", async () => {
@@ -707,7 +778,7 @@ describe("authenticated response belongs to its request transport", () => {
     expect(await worker.send({ type: "c2c.fetch.state" })).toMatchObject({ authStale: true });
     finish(json(200, stateBody));
     expect(await old).toEqual({ ok: false, reason: "stale_transport_response" });
-    expect(worker.local.values.get(TRANSPORT_KEY)).toMatchObject({ authStale: true });
+    expect(worker.local.values.get(projectKey(TRANSPORT_KEY))).toMatchObject({ authStale: true });
   });
 
   it("failed persistence cannot unblock mutations during auth recovery", async () => {
@@ -752,18 +823,18 @@ describe("R5c Browser explicit-connect Web Sink convergence", () => {
     const freshSender = { tab: { id: 7 }, documentId: "fresh-document", frameId: 0, url: ROUTE_A };
     await send({ type: "c2c.bind", canonicalRoute: ROUTE_A, generation: 2 }, freshSender);
     await send({ type: "c2c.heartbeat", canonicalRoute: ROUTE_A, generation: 2 }, freshSender);
-    const before = local.values.get(CONNECT_KEY) as { ownerWitness?: { documentId?: string } };
+    const before = local.values.get(projectKey(CONNECT_KEY)) as { ownerWitness?: { documentId?: string } };
     expect(before).toMatchObject({ state: "DONE", ownerWitness: { documentId: "old-document" } });
     const status = await send({ type: "c2c.transport.status" }) as { transport?: { r5cConnected?: boolean } };
     expect(status.transport?.r5cConnected).toBe(false);
-    expect(local.values.get(CONNECT_KEY)).toMatchObject({ state: "DONE" });
-    expect((local.values.get(CONNECT_KEY) as typeof before).ownerWitness?.documentId).toBe("old-document");
+    expect(local.values.get(projectKey(CONNECT_KEY))).toMatchObject({ state: "DONE" });
+    expect((local.values.get(projectKey(CONNECT_KEY)) as typeof before).ownerWitness?.documentId).toBe("old-document");
     expect(bindCalls(fetchMock)).toHaveLength(0);
 
     const result = await send({ type: "c2c.connect.page", canonicalRoute: ROUTE_A, generation: 2 }, freshSender) as { ok?: boolean; state?: string };
     expect(result, JSON.stringify(result)).toMatchObject({ ok: true, state: "CONNECTED" });
     expect(bindCalls(fetchMock)).toHaveLength(1);
-    expect((local.values.get(CONNECT_KEY) as typeof before).ownerWitness?.documentId).toBe("fresh-document");
+    expect((local.values.get(projectKey(CONNECT_KEY)) as typeof before).ownerWitness?.documentId).toBe("fresh-document");
     const after = await send({ type: "c2c.transport.status" }) as { transport?: { r5cConnected?: boolean } };
     expect(after.transport?.r5cConnected).toBe(true);
   });
@@ -786,7 +857,7 @@ describe("R5c Browser explicit-connect Web Sink convergence", () => {
       const result = await send({ type: "c2c.connect.page", canonicalRoute: ROUTE_A, generation: 1 }, ownerSender) as { ok?: boolean; reason?: string };
       expect(result).toMatchObject({ ok: false, reason: "connect_identity_conflict" });
       expect(bindCalls(fetchMock)).toHaveLength(0);
-      expect((local.values.get(CONNECT_KEY) as { ownerWitness?: { documentId?: string } }).ownerWitness?.documentId).toBe("old-document");
+      expect((local.values.get(projectKey(CONNECT_KEY)) as { ownerWitness?: { documentId?: string } }).ownerWitness?.documentId).toBe("old-document");
     }
   });
 
@@ -935,7 +1006,9 @@ describe("R5c Browser explicit-connect Web Sink convergence", () => {
   });
 
   it("stale owner/document after VERIFIED prevents bind success", async () => {
-    const { send, fetchMock } = await loadWorker({ ownerRoute: ROUTE_B, route: ROUTE_A });
+    const worker = await loadWorker({ ownerRoute: ROUTE_B, route: ROUTE_A });
+    const { send, fetchMock } = worker;
+    await worker.selectProject(9, ROUTE_B);
     const ownerSender = {
       tab: { id: 9 },
       documentId: "document-stale",
@@ -1024,7 +1097,7 @@ describe("R5c Browser explicit-connect Web Sink convergence", () => {
     expect(first.ok).toBe(false);
     expect(first.reason).toMatch(/web_sink_bind|web_sink_response/);
     expect(bindCount).toBe(1);
-    expect((local.values.get(CONNECT_KEY) as { state?: string }).state).not.toBe("DONE");
+    expect((local.values.get(projectKey(CONNECT_KEY)) as { state?: string }).state).not.toBe("DONE");
 
     failBind = false;
     const retry = await send({
@@ -1036,7 +1109,7 @@ describe("R5c Browser explicit-connect Web Sink convergence", () => {
     expect(retry.ok).toBe(true);
     expect(retry.state).toBe("CONNECTED");
     expect(bindCount).toBe(2);
-    expect((local.values.get(CONNECT_KEY) as { state?: string }).state).toBe("DONE");
+    expect((local.values.get(projectKey(CONNECT_KEY)) as { state?: string }).state).toBe("DONE");
   });
 
   it("same-route document replacement prevents old connect convergence", async () => {
@@ -1062,7 +1135,7 @@ describe("R5c Browser explicit-connect Web Sink convergence", () => {
     // Heartbeat from old document X must not bind as X's pending connect.
     await send({ type: "c2c.heartbeat", canonicalRoute: ROUTE_A, generation: 1, safety: { composer: "empty", generation: "idle", safe: true } }, ownerSender);
     expect(bindCalls(fetchMock).length).toBe(before);
-    expect((local.values.get(CONNECT_KEY) as { state?: string }).state).not.toBe("DONE");
+    expect((local.values.get(projectKey(CONNECT_KEY)) as { state?: string }).state).not.toBe("DONE");
     // silence unused
     expect(sessionOwner.documentId).toBe("document-replaced");
   });
@@ -1718,7 +1791,7 @@ describe("R5c acceptance evidence: real async and ownership", () => {
       url: ROUTE_A,
     });
     expect(bindCount).toBe(bindsAfterX);
-    expect((local.values.get(CONNECT_KEY) as { state?: string }).state).not.toBe("DONE");
+    expect((local.values.get(projectKey(CONNECT_KEY)) as { state?: string }).state).not.toBe("DONE");
 
     const yConnect = await send({
       type: "c2c.connect.page",
@@ -1733,7 +1806,7 @@ describe("R5c acceptance evidence: real async and ownership", () => {
     }) as { ok: boolean; webSink?: { bindingId?: string } };
     expect(yConnect.ok).toBe(true);
     expect(bindCount).toBe(bindsAfterX + 1);
-    const done = local.values.get(CONNECT_KEY) as {
+    const done = local.values.get(projectKey(CONNECT_KEY)) as {
       state?: string;
       ownerWitness?: { documentId?: string };
     };

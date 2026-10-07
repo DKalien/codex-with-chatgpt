@@ -5,9 +5,10 @@ import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { StreamableHTTPClientTransport } from "./sdk-http-fixture.js";
 import { makeTmpDir } from "./helpers.js";
 import { Workspace } from "../src/workspace/manager.js";
+import { getRuntimeBuildId } from "../src/build-id.js";
 import { getStateDir } from "../src/config/paths.js";
 import { startBridge } from "../src/bridge/server.js";
 import { enqueueTask, enqueueThread, publicTask, readRemote, remoteFile, setRemoteEnabled, updateRemote } from "../src/remote/store.js";
@@ -135,7 +136,8 @@ describe("Controller 状态机", () => {
     const fake = new Fake();
     fake.request = async () => { throw new Error("configuration unavailable"); };
     await expect(new RemoteController(workspace, fake as unknown as AppServerClient).run()).rejects.toThrow("Codex 无法加载本机配置");
-    expect(readRemote(workspace.id)!.controller).toMatchObject({ appServer: "offline", error: "CODEX_CONFIG_UNAVAILABLE" });
+    expect(readRemote(workspace.id)!.controller).toMatchObject({ appServer: "offline", error: "CODEX_CONFIG_UNAVAILABLE",
+      buildId: getRuntimeBuildId() });
   });
   it("另一个仍存活的 Controller 不可抢占，即使心跳过期", async () => {
     ready();
@@ -151,9 +153,11 @@ describe("Controller 状态机", () => {
     const controller = new RemoteController(workspace, fake as unknown as AppServerClient), running = controller.run();
     try {
       await until(() => readRemote(workspace.id)!.threads[0].status === "needs_reconciliation");
+      expect(readRemote(workspace.id)!.controller?.buildId).toBe(getRuntimeBuildId());
       expect(enqueueThread(workspace.id, { workspaceId: workspace.id, requestId: "req" }, "client").status).toBe("needs_reconciliation");
       expect(fake.calls.filter(c => c.method === "thread/start")).toHaveLength(1);
     } finally { controller.stop(); await running; }
+    expect(readRemote(workspace.id)!.controller).toBeUndefined();
   });
   it("恢复线程期间本地撤权不会再派发 turn", async () => {
     ready(); thread(); enqueueTask(workspace.id, input(), "client");

@@ -12,8 +12,7 @@
 正式权限是 `codex.control` / `codex.read`，write_probe 仍默认关闭。
 首次使用、启停、状态位置和崩溃恢复见 [Remote Control 操作说明](docs/remote-control.md)。
 
-单机多 workspace 官方 Gateway 与旧 feedback 插件整合仍在规划中，当前实施路线见
-[统一 Gateway 计划](docs/unified-gateway-plan.md)。
+当前源码已实现机器级 Unified Gateway、显式 workspace/client 授权路由与 feedback 工具整合；多项目 Companion、Gateway Supervisor 也已有源码实现。双项目真实 Send/observed、完整现场验收与旧插件退役仍待完成，Browser Companion 和旧 feedback Connector 继续保留。当前合同见 [官方路线](docs/official-route.md)，实施与验收边界见 [统一 Gateway 计划](docs/unified-gateway-plan.md)。
 
 ## 实验性 Desktop Control（默认关闭）
 
@@ -316,12 +315,15 @@ Ready.
 - **Desktop 投递单独受限**：`codex_desktop_send` 只有在取得
   `codex.desktop.control` 且本机明确启用绑定后，才能向一个已有 Desktop 会话发送已确认的
   任务正文；它不是直接写文件或执行 Shell 的 RPC。
-- **一个工作区 = 一道边界**：每个令牌绑定单一工作区；路径校验基于规范化
-  realpath（symlink、`../`、绝对路径逃逸全部被拦截并有测试覆盖）。
+- **一个工作区 = 一道边界**：Bridge 与单 workspace 官方令牌仍绑定单一工作区；Gateway
+  令牌只认证 client，每次项目调用还要求显式 workspaceId、本机 client 授权与规范 root
+  匹配。路径校验基于 realpath（symlink、`../`、绝对路径逃逸全部被拦截并有测试覆盖）。
 - **敏感文件永不外泄**：`.env*`、密钥、SSH、各类凭据默认拒绝
   （`.env.example` 放行）；`.c2cignore` 可追加自定义规则。
 - **知道 URL 不等于有权限**：公网 MCP 端点强制 OAuth 2.1（PKCE S256、动态
-  客户端注册、refresh token 轮换）。无令牌：401；令牌属于别的工作区：403。
+  客户端注册、refresh token 轮换）。无令牌的受保护调用返回 401；仅 Gateway 允许匿名
+  initialize、initialized notification 与 tools/list discovery，工具执行仍要求 OAuth、scope
+  与本机项目授权。
 - **模型永远接触不到长期凭据**：唯一会出现在浏览器里的秘密是一次性配对码
   （5 分钟有效、限 5 次尝试、限速、用后即毁）。
 
@@ -332,7 +334,7 @@ Ready.
 ```bash
 pnpm install --frozen-lockfile
 pnpm run build      # 产出 dist/ 与确定性 build ID，不切换已安装 Core
-pnpm test --maxWorkers=1 --testTimeout=60000
+pnpm test --maxWorkers=1 --testTimeout=90000
 pnpm run typecheck
 git diff --check
 

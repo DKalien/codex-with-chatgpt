@@ -479,14 +479,21 @@ describe("E1b2 recovery / authStale / storage policy (final closeout)", () => {
     expect(failIdx).toBeGreaterThan(refreshIdx);
   });
 
-  it("popup persists origin local + intent session; never stores secret", () => {
+  it("popup registers the explicit project, scopes intent to session, and never stores secret", () => {
     const popup = fs.readFileSync(
       path.join(projectRoot, "browser-companion", "popup", "popup.js"),
       "utf8",
     );
-    expect(popup).toMatch(/chrome\.storage\.local\.set/);
+    const projectContext = fs.readFileSync(
+      path.join(projectRoot, "browser-companion", "project-context.js"),
+      "utf8",
+    );
+    expect(popup).toMatch(/type:\s*"c2c\.project\.add"[\s\S]*project:\s*\{\s*workspaceId:\s*fields\.workspaceId,\s*bridgeOrigin:\s*permission\.origin/s);
+    expect(projectContext).toMatch(/const added = \{ workspaceId: project\.workspaceId, bridgeOrigin: origin \}/);
+    expect(projectContext).toMatch(/browser\.storage\.local\.set\(\{ \[PROJECT_REGISTRY_KEY\]: nextRegistry \}\)/);
+    expect(projectContext).not.toMatch(/\b(?:secret|credential)\s*:/i);
+    expect(popup).toMatch(/PROJECT_STORAGE_PREFIX/);
     expect(popup).toMatch(/chrome\.storage\.session\.set/);
-    expect(popup).toMatch(/LOCAL_ORIGIN_KEY/);
     expect(popup).toMatch(/SESSION_INTENT_KEY/);
     expect(popup).not.toMatch(/storage\.(local|session)\.set\(\{[^}]*secret/);
     expect(popup).toMatch(/clearPairingForm/);

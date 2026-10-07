@@ -6,6 +6,8 @@ import { readCurrentInstall } from "./install.js";
 import { activeFinalizerSchema, workerClaimSchema, readFinalizerRetirement } from "./post-turn-finalizer.js";
 import { Workspace } from "../workspace/manager.js";
 import { supervisorRuntimeSchema, supervisorLaunchSchema } from "../supervisor/schema.js";
+import { gatewaySupervisorLaunchSchema, gatewaySupervisorRuntimeSchema } from "../gateway/supervisor.js";
+import { remoteStateSchema } from "../remote/store.js";
 
 /** 与 scripts/core-release.cjs 的 BOOTSTRAP 固定清单一致；GC 只做结构校验，不重算内容摘要。 */
 export const RELEASE_BOOTSTRAP_KEYS = [
@@ -31,7 +33,7 @@ const WORKSPACE_ID = /^[a-f0-9]{12}$/;
  * 引用种类可扩展：本轮只注册 current / runtime / runtime-upgrade，
  * D2/B 可加入 install/rollout/finalizer 而不改 graph 消费方契约。
  */
-export type ReleaseReferenceKind = "current" | "runtime" | "runtime-upgrade" | "finalizer" | "supervisor-runtime" | "supervisor-launch";
+export type ReleaseReferenceKind = "current" | "runtime" | "runtime-upgrade" | "finalizer" | "supervisor-runtime" | "supervisor-launch" | "gateway-runtime" | "gateway-launch" | "remote-controller";
 
 export interface ReleaseReference {
   kind: ReleaseReferenceKind;
@@ -59,7 +61,9 @@ export type ReleaseReferenceIssueCode =
   | "finalizer_corrupt"
   | "supervisor_corrupt"
   | "supervisor_identity_mismatch"
-  | "supervisor_missing_build_id";
+  | "supervisor_missing_build_id"
+  | "remote_corrupt"
+  | "remote_missing_build_id";
 
 export type ReleaseIssueScope =
   | { kind: "global" }
@@ -302,6 +306,85 @@ function collectSupervisor(stateDir: string, graph: ReleaseReferenceGraph): void
   }
 }
 
+function collectGateway(stateDir: string, graph: ReleaseReferenceGraph): void {
+  const folder = path.join(stateDir, "gateway");
+  for (const name of listStateFiles(folder)) {
+    const source = `gateway:${name}`;
+    const runtime = name === "supervisor.runtime.json";
+    const launchMatch = /^supervisor\.([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.launch\.json$/.exec(name);
+    const launch = launchMatch !== null;
+    if (!runtime && !launch) {
+      const known = name === "supervisor.json" || name === "supervisor.lock" || name === "server.lock" ||
+        name === "workspaces.json" || name === "workspaces.json.lock" || name === "tunnel-runtime-key.dpapi" ||
+        /^(?:workspaces|supervisor)\.json\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.tmp$/i.test(name);
+      if (known) {
+        try { assertCanonicalNonReferenceFile(path.join(folder, name)); }
+        catch { graph.issues.push(issue("supervisor_corrupt", source, "known gateway config, lock, registry, or key entry is not a canonical regular file")); }
+      } else {
+        graph.issues.push(issue("supervisor_corrupt", source, "unknown gateway entry may contain an unrecognized release reference"));
+      }
+      continue;
+    }
+
+    try {
+      const value = readReleaseReferenceJson(path.join(folder, name));
+      if (runtime) {
+        const parsed = gatewaySupervisorRuntimeSchema.safeParse(value);
+        if (!parsed.success) throw new Error("runtime schema");
+        addReference(graph, { kind: "gateway-runtime", buildId: parsed.data.buildId, source: "gateway-runtime" });
+        for (const [index, child] of (parsed.data.children ?? []).entries()) {
+          addReference(graph, { kind: "gateway-runtime", buildId: child.buildId, source: `gateway-runtime:child:${index}` });
+        }
+        continue;
+      }
+
+      const parsed = gatewaySupervisorLaunchSchema.safeParse(value);
+      if (!parsed.success) throw new Error("launch schema");
+      if (parsed.data.nonce !== launchMatch![1]) {
+        graph.issues.push(issue("supervisor_identity_mismatch", source, "launch pin filename nonce does not match its contents"));
+        continue;
+      }
+      if (parsed.data.launcherPath !== path.join(stateDir, "bin", "c2c.js")) {
+        graph.issues.push(issue("supervisor_identity_mismatch", source, "launch pin stable launcher path does not match the machine bin"));
+        continue;
+      }
+      addReference(graph, { kind: "gateway-launch", buildId: parsed.data.buildId, source: `gateway-launch:${parsed.data.nonce}` });
+    } catch {
+      graph.issues.push(issue("supervisor_corrupt", source, "gateway runtime or launch pin is noncanonical, corrupt, or ambiguous"));
+    }
+  }
+}
+
+function collectRemote(stateDir: string, graph: ReleaseReferenceGraph): void {
+  const folder = path.join(stateDir, "remote-control");
+  for (const name of listStateFiles(folder)) {
+    const source = `remote-controller:${name}`;
+    if (!/^[a-f0-9]{12}\.json$/.test(name)) {
+      graph.issues.push(issue("remote_corrupt", source, "remote state filename is not canonical workspaceId.json"));
+      continue;
+    }
+    const workspaceId = name.slice(0, -5);
+    try {
+      const parsed = remoteStateSchema.safeParse(readReleaseReferenceJson(path.join(folder, name)));
+      if (!parsed.success) throw new Error("state schema");
+      const state = parsed.data;
+      if (state.workspaceId !== workspaceId || !exactWorkspace(state, workspaceId)) {
+        graph.issues.push(issue("remote_corrupt", source, "remote state filename/workspace identity does not match"));
+        continue;
+      }
+      if (!state.controller) continue;
+      if (!isRuntimeBuildId(state.controller.buildId)) {
+        graph.issues.push(issue("remote_missing_build_id", source, "Controller runtime lacks an exact release buildId"));
+        continue;
+      }
+      addReference(graph, { kind: "remote-controller", buildId: state.controller.buildId,
+        source: `remote-controller:${workspaceId}`, workspaceId });
+    } catch {
+      graph.issues.push(issue("remote_corrupt", source, "remote state is noncanonical, corrupt, or ambiguous"));
+    }
+  }
+}
+
 function collectPending(stateDir: string, graph: ReleaseReferenceGraph): void {
   const folder = path.join(stateDir, "runtime-upgrades");
   for (const name of listStateFiles(folder)) {
@@ -404,6 +487,8 @@ const REFERENCE_COLLECTORS: ReadonlyArray<{ kind: ReleaseReferenceKind; collect:
   { kind: "current", collect: collectCurrent },
   { kind: "runtime", collect: collectRuntime },
   { kind: "supervisor-runtime", collect: collectSupervisor },
+  { kind: "gateway-runtime", collect: collectGateway },
+  { kind: "remote-controller", collect: collectRemote },
   { kind: "runtime-upgrade", collect: collectPending },
   { kind: "finalizer", collect: collectFinalizers },
 ];

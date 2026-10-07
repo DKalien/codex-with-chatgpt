@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { StreamableHTTPClientTransport } from "./sdk-http-fixture.js";
 import { startBridge, type Bridge } from "../src/bridge/server.js";
 import {
   DESKTOP_READ_SCOPE,

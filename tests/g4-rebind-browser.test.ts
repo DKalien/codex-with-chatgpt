@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import vm from "node:vm";
+import { PROJECT_REGISTRY_KEY, projectStorageKey } from "../browser-companion/project-context.js";
 
 const ROUTE = "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111";
 const OLD_ROUTE = "https://chatgpt.com/c/77777777-7777-4777-8777-777777777777";
-const WORKSPACE = "workspace-g4-rebind";
+const WORKSPACE = "a1b2c3d4e5f6";
 const OLD_COMPANION = "11111111-1111-4111-8111-111111111111";
 const OLD_BINDING = "22222222-2222-4222-8222-222222222222";
 const NEW_COMPANION = "33333333-3333-4333-8333-333333333333";
@@ -20,6 +21,7 @@ const REGISTRY_KEY = "c2c_companion_registry_v1";
 const EVIDENCE_KEY = "c2c_companion_evidence_v1";
 const CONNECT_KEY = "c2c_companion_connect_flow_v1";
 const AUTONOMY_KEY = "c2c_companion_autonomy_v1";
+const projectKey = (key: string) => projectStorageKey(WORKSPACE, key);
 
 function storageArea(
   initial: Record<string, unknown>,
@@ -29,25 +31,33 @@ function storageArea(
   failConnectFlowSetAt: number[] = [],
 ) {
   const values = new Map(Object.entries(initial));
+  const migratedValues = new Map<string, unknown>();
   let connectFlowSetCount = 0;
   return {
     values,
+    migratedValues,
     async get(keys?: string | string[]) {
       if (keys == null) return Object.fromEntries(values);
       const list = Array.isArray(keys) ? keys : [keys];
       return Object.fromEntries(list.map(key => [key, values.get(key)]));
     },
     async set(row: Record<string, unknown>) {
-      if (failAutonomyPersist && Object.hasOwn(row, AUTONOMY_KEY)) {
+      const legacyMigrationWrite = (row[PROJECT_REGISTRY_KEY] as { legacyMigration?: string } | undefined)?.legacyMigration === "migrated";
+      if ((row[PROJECT_REGISTRY_KEY] as { legacyMigration?: string } | undefined)?.legacyMigration === "migrated") {
+        for (const [key, value] of Object.entries(row)) {
+          if (key.startsWith(`c2c_companion_project_v1:${WORKSPACE}:`)) migratedValues.set(key, value);
+        }
+      }
+      if (!legacyMigrationWrite && failAutonomyPersist && Object.hasOwn(row, projectKey(AUTONOMY_KEY))) {
         throw new Error("autonomy storage unavailable");
       }
-      if (failArmedAutonomyPersist && (row[AUTONOMY_KEY] as { mode?: string } | undefined)?.mode === "armed") {
+      if (!legacyMigrationWrite && failArmedAutonomyPersist && (row[projectKey(AUTONOMY_KEY)] as { mode?: string } | undefined)?.mode === "armed") {
         throw new Error("armed autonomy storage unavailable");
       }
       // Fails only the Nth (1-based) set whose row carries the connect flow,
       // so the initial begin persist can succeed while a later rollback/harden
       // commit is injected to fail.
-      if (failConnectFlowSetAt.length > 0 && Object.hasOwn(row, CONNECT_KEY)) {
+      if (!legacyMigrationWrite && failConnectFlowSetAt.length > 0 && Object.hasOwn(row, projectKey(CONNECT_KEY))) {
         connectFlowSetCount += 1;
         if (failConnectFlowSetAt.includes(connectFlowSetCount)) {
           throw new Error("connect flow storage unavailable");
@@ -57,7 +67,7 @@ function storageArea(
     },
     async remove(keys: string | string[]) {
       const list = Array.isArray(keys) ? keys : [keys];
-      if (failRouteFenceClear && list.includes(FENCE_KEY)) {
+      if (failRouteFenceClear && list.includes(projectKey(FENCE_KEY))) {
         throw new Error("route attest fence clear unavailable");
       }
       for (const key of list) values.delete(key);
@@ -125,7 +135,9 @@ challengeId=${CHALLENGE}`,
 
 async function loadWorker(body: Record<string, unknown>, opts: {
   oldRoute?: string;
+  selectedRoute?: string;
   noTransport?: boolean;
+  preMigrated?: boolean;
   transport?: Record<string, unknown>;
   connectFlow?: Record<string, unknown>;
   routeFence?: Record<string, unknown>;
@@ -142,6 +154,12 @@ async function loadWorker(body: Record<string, unknown>, opts: {
     initial.transport.routeCanonical = opts.oldRoute;
     initial.local[LOCAL_KEY] = { schemaVersion: 1, targetRoute: opts.oldRoute, paired: true };
   }
+  if (opts.ownerRoute) {
+    const currentOwner = initial.session[OWNER_KEY] as Record<string, unknown>;
+    const owner = { ...currentOwner, canonicalRoute: opts.ownerRoute };
+    initial.session[OWNER_KEY] = owner;
+    initial.session[REGISTRY_KEY] = [owner];
+  }
   if (opts.noTransport) {
     delete initial.local[TRANSPORT_KEY];
   }
@@ -152,6 +170,16 @@ async function loadWorker(body: Record<string, unknown>, opts: {
   if (opts.connectFlow) initial.local[CONNECT_KEY] = opts.connectFlow;
   if (opts.routeFence) initial.local[FENCE_KEY] = opts.routeFence;
   if (opts.autonomyPolicy) initial.local[AUTONOMY_KEY] = opts.autonomyPolicy;
+  const legacyMigrationExpected = !opts.noTransport && !opts.preMigrated && !Object.hasOwn(initial.local, PROJECT_REGISTRY_KEY);
+  if (opts.noTransport || opts.preMigrated) {
+    for (const [key, value] of Object.entries(initial.local)) initial.local[projectKey(key)] = value;
+    for (const [key, value] of Object.entries(initial.session)) initial.session[projectKey(key)] = value;
+    initial.local[PROJECT_REGISTRY_KEY] = {
+      schemaVersion: 1,
+      projects: [{ workspaceId: WORKSPACE, bridgeOrigin: "https://bridge.example.test", legacy: true }],
+      legacyMigration: "migrated",
+    };
+  }
   const local = storageArea(
     initial.local,
     opts.failAutonomyPersist === true,
@@ -219,14 +247,27 @@ async function loadWorker(body: Record<string, unknown>, opts: {
   const send = (message: unknown, sender: unknown = {}) => new Promise<unknown>((resolve) => {
     messageListener!(message, sender, resolve);
   });
-  const ownerSender = { tab: { id: 7 }, documentId: "document-g4-rebind", frameId: 0, url: ROUTE };
-  const proof = await send({ type: "c2c.owner-proof.request", href: ROUTE, canonicalRoute: ROUTE, generation: 1 }, ownerSender) as {
+  const selectProject = (tabId: number, canonicalRoute: string) => send({
+    type: "c2c.project.select", workspaceId: WORKSPACE, tabId, canonicalRoute,
+  }, { id: chrome.runtime.id });
+  const ownerRoute = opts.ownerRoute ?? ROUTE;
+  const selection = await selectProject(7, opts.selectedRoute ?? ownerRoute) as { ok: boolean; reason?: string };
+  if (!selection.ok) throw new Error(`workspace selection setup failed: ${JSON.stringify(selection)}`);
+  const ownerSender = { tab: { id: 7 }, documentId: "document-g4-rebind", frameId: 0, url: ownerRoute };
+  const proof = await send({ type: "c2c.owner-proof.request", href: ownerRoute, canonicalRoute: ownerRoute, generation: 1 }, ownerSender) as {
     ok: boolean;
     proof?: { id: string };
   };
   if (!proof.ok || !proof.proof) throw new Error(`owner proof setup failed: ${JSON.stringify(proof)}`);
+  if (legacyMigrationExpected) {
+    expect(local.values.get(PROJECT_REGISTRY_KEY)).toMatchObject({ legacyMigration: "migrated" });
+    expect(local.migratedValues.get(projectKey(TRANSPORT_KEY))).toEqual(initial.local[TRANSPORT_KEY]);
+    expect(local.values.has(projectKey(TRANSPORT_KEY))).toBe(true);
+    expect(local.values.get(TRANSPORT_KEY)).toEqual(initial.local[TRANSPORT_KEY]);
+    expect(session.values.get(OWNER_KEY)).toEqual(initial.session[OWNER_KEY]);
+  }
   const nonSinkCalls = () => fetchMock.mock.calls.filter(([url]) => !String(url).includes("/web-sink/bind-current"));
-  return { initial, local, session, fetchMock, tabsSendMessage, send, proofId: proof.proof.id, nonSinkCalls };
+  return { initial, local, session, fetchMock, tabsSendMessage, send, selectProject, proofId: proof.proof.id, nonSinkCalls };
 }
 
 afterEach(() => {
@@ -324,7 +365,7 @@ describe("G4c one-click connect orchestration", () => {
       ok: boolean; state?: string;
     };
     expect(connected).toMatchObject({ ok: true, state: "AWAITING_CONFIRMATION" });
-    expect(worker.local.values.get(AUTONOMY_KEY)).toMatchObject({
+    expect(worker.local.values.get(projectKey(AUTONOMY_KEY))).toMatchObject({
       mode: "off",
       rearmOnConnect: true,
       bindingId: null,
@@ -344,13 +385,14 @@ describe("G4c one-click connect orchestration", () => {
     await worker.send({ type: "c2c.heartbeat", generation: 1, safety, canonicalRoute: ROUTE }, sender);
     expect(urls.filter(url => url.includes("/rebind/complete"))).toHaveLength(1);
     expect(worker.tabsSendMessage).toHaveBeenCalledTimes(1);
-    expect(worker.local.values.get(TRANSPORT_KEY)).toMatchObject({
+    expect(worker.local.values.get(projectKey(TRANSPORT_KEY))).toMatchObject({
       credential: "c2c_comp_fresh-companion-credential",
       routeVerification: "VERIFIED",
       rebindPending: false,
     });
-    expect(worker.local.values.get(CONNECT_KEY)).toMatchObject({ state: "DONE", challengeId: CHALLENGE });
-    expect(worker.local.values.get(AUTONOMY_KEY)).toMatchObject(failRearmPersistence
+    expect(worker.local.values.get(TRANSPORT_KEY)).toEqual(worker.initial.transport);
+    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toMatchObject({ state: "DONE", challengeId: CHALLENGE });
+    expect(worker.local.values.get(projectKey(AUTONOMY_KEY))).toMatchObject(failRearmPersistence
       ? { mode: "off", rearmOnConnect: true, bindingId: null, epoch: null, routeCanonical: null }
       : {
           mode: "armed",
@@ -361,7 +403,7 @@ describe("G4c one-click connect orchestration", () => {
           lastProductionAttemptAt: 123456,
         });
     if (!failRearmPersistence) {
-      expect((worker.local.values.get(AUTONOMY_KEY) as { armedAt: number }).armedAt).toBeGreaterThan(100);
+      expect((worker.local.values.get(projectKey(AUTONOMY_KEY)) as { armedAt: number }).armedAt).toBeGreaterThan(100);
     }
     const status = await worker.send({
       type: "c2c.status.page", href: ROUTE, canonicalRoute: ROUTE, generation: 1, safety,
@@ -384,6 +426,7 @@ describe("G4c one-click connect orchestration", () => {
       tabsSendMessage: async (_tabId, message) => ({
         type: "c2c.feedback.bootstrap.result",
         mode: "feedback_bootstrap_send",
+        workspaceId: WORKSPACE,
         ok: true,
         mutationAttempted: true,
         clickAttempted: true,
@@ -409,15 +452,16 @@ describe("G4c one-click connect orchestration", () => {
 
     expect(result).toMatchObject({ ok: true, state: "WAITING_TAKEOVER" });
     expect(result.reason).not.toBe("cold_pair_required");
-    expect(worker.session.values.get(OWNER_KEY)).toMatchObject({
+    expect(worker.session.values.get(projectKey(OWNER_KEY))).toMatchObject({
       tabId: 7, documentId: "document-g4-rebind", canonicalRoute: ROUTE, generation: 1,
     });
-    expect(worker.session.values.get(OWNER_KEY)).not.toHaveProperty("frameId");
-    expect(worker.local.values.get(LOCAL_KEY)).toMatchObject({ targetRoute: ROUTE });
-    expect(worker.local.values.get(CONNECT_KEY)).toMatchObject({ state: "WAITING_TAKEOVER", challengeId: null });
+    expect(worker.session.values.get(projectKey(OWNER_KEY))).not.toHaveProperty("frameId");
+    expect(worker.local.values.get(projectKey(LOCAL_KEY))).toMatchObject({ targetRoute: ROUTE });
+    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toMatchObject({ state: "WAITING_TAKEOVER", challengeId: null });
     expect(worker.tabsSendMessage).toHaveBeenCalledTimes(1);
     expect(worker.tabsSendMessage.mock.calls[0][1]).toEqual({
       type: "c2c.feedback.bootstrap.execute",
+      workspaceId: WORKSPACE,
       expectedRoute: ROUTE,
       expectedGeneration: 1,
     });
@@ -429,6 +473,7 @@ describe("G4c one-click connect orchestration", () => {
     const sender = {
       tab: { id: 17 }, documentId: "actual-document", frameId: 0, url: ROUTE,
     };
+    await worker.selectProject(17, ROUTE);
     await worker.send({
       type: "c2c.bind",
       generation: 8,
@@ -440,11 +485,11 @@ describe("G4c one-click connect orchestration", () => {
       frameId: 2,
       lastSeen: -1,
     }, sender);
-    expect(worker.session.values.get(OWNER_KEY)).toMatchObject({
+    expect(worker.session.values.get(projectKey(OWNER_KEY))).toMatchObject({
       tabId: 17, documentId: "actual-document", canonicalRoute: ROUTE, generation: 8,
     });
-    expect(worker.session.values.get(OWNER_KEY)).not.toHaveProperty("frameId");
-    expect(worker.local.values.get(LOCAL_KEY)).toMatchObject({ targetRoute: ROUTE });
+    expect(worker.session.values.get(projectKey(OWNER_KEY))).not.toHaveProperty("frameId");
+    expect(worker.local.values.get(projectKey(LOCAL_KEY))).toMatchObject({ targetRoute: ROUTE });
   });
 
   it("proven no-mutation bootstrap failure stays retryable only on a later explicit Connect", async () => {
@@ -477,6 +522,7 @@ describe("G4c one-click connect orchestration", () => {
         return {
           type: "c2c.feedback.bootstrap.result",
           mode: "feedback_bootstrap_send",
+          workspaceId: WORKSPACE,
           ok: true,
           mutationAttempted: true,
           clickAttempted: true,
@@ -498,7 +544,7 @@ describe("G4c one-click connect orchestration", () => {
     const failed = await worker.send(message, sender) as Record<string, unknown>;
     expect(failed).toMatchObject({ ok: false, reason: "bootstrap_capability_missing", retryAllowed: true });
     expect(worker.tabsSendMessage).toHaveBeenCalledTimes(1);
-    expect(worker.local.values.get(CONNECT_KEY)).toMatchObject({ state: "NONE" });
+    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toMatchObject({ state: "NONE" });
     expect(await worker.send({ type: "c2c.status.read", canonicalRoute: ROUTE }, sender))
       .toMatchObject({ connectReason: "bootstrap_capability_missing", connectState: "NONE" });
 
@@ -517,6 +563,7 @@ describe("G4c one-click connect orchestration", () => {
         : Promise.reject(new Error(`unexpected URL ${String(url)}`)),
       tabsSendMessage: async () => ({
         type: "c2c.feedback.bootstrap.result", mode: "feedback_bootstrap_send", ok: true,
+        workspaceId: WORKSPACE,
         mutationAttempted: true, clickAttempted: true, clicked: true, observed: true,
         canonicalRoute: ROUTE, generation: 1,
       }),
@@ -530,7 +577,7 @@ describe("G4c one-click connect orchestration", () => {
     await worker.send({ type: "c2c.heartbeat", generation: 1, safety, canonicalRoute: ROUTE }, sender);
     expect(worker.tabsSendMessage).toHaveBeenCalledTimes(1);
     expect(worker.fetchMock.mock.calls.filter(([url]) => String(url).includes("/rebind/init"))).toHaveLength(3);
-    expect(worker.local.values.get(CONNECT_KEY)).toMatchObject({ state: "WAITING_TAKEOVER" });
+    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toMatchObject({ state: "WAITING_TAKEOVER" });
     const status = await worker.send({ type: "c2c.status.page", href: ROUTE, canonicalRoute: ROUTE, generation: 1 }, sender) as Record<string, unknown>;
     expect(status.connectReason).toBe("bootstrap_tool_missing");
   });
@@ -548,6 +595,7 @@ describe("G4c one-click connect orchestration", () => {
       },
       tabsSendMessage: async () => ({
         type: "c2c.feedback.bootstrap.result", mode: "feedback_bootstrap_send", ok: true,
+        workspaceId: WORKSPACE,
         mutationAttempted: true, clickAttempted: true, clicked: true, observed: true,
         canonicalRoute: ROUTE, generation: 1,
       }),
@@ -556,7 +604,7 @@ describe("G4c one-click connect orchestration", () => {
     const safety = { composer: "empty", generation: "idle", safe: true };
     await worker.send({ type: "c2c.connect.page", generation: 1, safety, canonicalRoute: ROUTE }, sender);
     await worker.send({ type: "c2c.heartbeat", generation: 1, safety, canonicalRoute: ROUTE }, sender);
-    expect(worker.local.values.get(CONNECT_KEY)).toMatchObject({ state: "WAITING_TAKEOVER" });
+    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toMatchObject({ state: "WAITING_TAKEOVER" });
     expect(worker.tabsSendMessage).toHaveBeenCalledTimes(1);
     expect(rebindCalls).toBe(2);
   });
@@ -593,8 +641,9 @@ describe("G4c one-click connect orchestration", () => {
         throw new Error(`unexpected URL ${value}`);
       },
       tabsSendMessage: async (_tabId, message) => message.type === "c2c.feedback.bootstrap.execute"
-        ? {
+          ? {
             type: "c2c.feedback.bootstrap.result", mode: "feedback_bootstrap_send", ok: true,
+            workspaceId: WORKSPACE,
             mutationAttempted: true, clickAttempted: true, clicked: true, observed: true,
             canonicalRoute: ROUTE, generation: 1,
           }
@@ -610,16 +659,16 @@ describe("G4c one-click connect orchestration", () => {
     await worker.send({ type: "c2c.heartbeat", generation: 1, safety, canonicalRoute: ROUTE }, sender);
     expect(worker.tabsSendMessage.mock.calls.filter(([, message]) => message.type === "c2c.route.attest.execute")).toHaveLength(1);
     await worker.send({ type: "c2c.heartbeat", generation: 1, safety, canonicalRoute: ROUTE }, sender);
-    expect(worker.local.values.get(CONNECT_KEY)).toMatchObject({ state: "DONE", bootstrapAutoResume: false });
-    expect(worker.local.values.get(TRANSPORT_KEY)).toMatchObject({ routeVerification: "VERIFIED", rebindPending: false });
-    expect(worker.local.values.get(AUTONOMY_KEY)).toMatchObject(rearmOnConnect
+    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toMatchObject({ state: "DONE", bootstrapAutoResume: false });
+    expect(worker.local.values.get(projectKey(TRANSPORT_KEY))).toMatchObject({ routeVerification: "VERIFIED", rebindPending: false });
+    expect(worker.local.values.get(projectKey(AUTONOMY_KEY))).toMatchObject(rearmOnConnect
       ? {
           mode: "armed", bindingId: NEW_BINDING, epoch: OLD_EPOCH + 1,
           routeCanonical: ROUTE, rearmOnConnect: true,
         }
       : { mode: "off", rearmOnConnect: false });
     if (rearmOnConnect) {
-      expect((worker.local.values.get(AUTONOMY_KEY) as { armedAt: number }).armedAt).toBeGreaterThan(100);
+      expect((worker.local.values.get(projectKey(AUTONOMY_KEY)) as { armedAt: number }).armedAt).toBeGreaterThan(100);
     }
     expect(urls.filter(url => url.includes("/rebind/complete"))).toHaveLength(1);
     if (!rearmOnConnect) expect((await worker.send({ type: "c2c.autonomy.arm" }, {})).ok).toBe(true);
@@ -646,7 +695,7 @@ describe("G4c one-click connect orchestration", () => {
     expect(result).toMatchObject({ ok: false, reason: "COMPANION_REBIND_NOT_SUCCESSOR", state: "TAKEOVER_DISPATCH" });
     expect(worker.fetchMock).toHaveBeenCalledTimes(1);
     expect(String(worker.fetchMock.mock.calls[0][0])).toContain("/rebind/init");
-    expect(worker.local.values.get(CONNECT_KEY)).toMatchObject({ state: "TAKEOVER_DISPATCH" });
+    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toMatchObject({ state: "TAKEOVER_DISPATCH" });
     expect(worker.tabsSendMessage).not.toHaveBeenCalled();
   });
 
@@ -666,6 +715,7 @@ describe("G4c one-click connect orchestration", () => {
     async (stage) => {
       const urls: string[] = [];
       const worker = await loadWorker(responseBody(), {
+        ...(stage === "durable_successor" ? { preMigrated: true } : {}),
         oldRoute: OLD_ROUTE,
         connectFlow: { ...unknownBootstrap, state: stage.startsWith("old_verified") || stage === "durable_successor" ? "OUTCOME_UNKNOWN" : stage },
         ...(stage.startsWith("old_verified") ? { routeFence: {
@@ -699,8 +749,8 @@ describe("G4c one-click connect orchestration", () => {
       const result = await worker.send(connectPage, connectSender);
       expect(result).toMatchObject({ ok: true });
       await worker.send({ ...connectPage, type: "c2c.heartbeat" }, connectSender);
-      expect(worker.local.values.get(CONNECT_KEY)).toMatchObject({ state: "DONE", bindingId: NEW_BINDING });
-      expect(worker.local.values.get(TRANSPORT_KEY)).toMatchObject({ routeVerification: "VERIFIED", rebindPending: false });
+      expect(worker.local.values.get(projectKey(CONNECT_KEY))).toMatchObject({ state: "DONE", bindingId: NEW_BINDING });
+      expect(worker.local.values.get(projectKey(TRANSPORT_KEY))).toMatchObject({ routeVerification: "VERIFIED", rebindPending: false });
       expect(worker.tabsSendMessage).toHaveBeenCalledTimes(1);
       expect(urls.filter(url => url.includes("/rebind/init"))).toHaveLength(stage === "durable_successor" ? 0 : 1);
       expect(urls.filter(url => url.includes("/rebind/complete"))).toHaveLength(1);
@@ -712,7 +762,7 @@ describe("G4c one-click connect orchestration", () => {
     await worker.send({ ...connectPage, type: "c2c.heartbeat" }, connectSender);
     expect(worker.tabsSendMessage).not.toHaveBeenCalled();
     expect(worker.fetchMock.mock.calls.some(([url]) => String(url).includes("/rebind/"))).toBe(false);
-    expect(worker.local.values.get(CONNECT_KEY)).toMatchObject(unknownBootstrap);
+    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toMatchObject(unknownBootstrap);
   });
 
   it.each(["wrong_target", "wrong_binding", "attestation_unknown", "corrupt", "uncertain_rebind", "uncertain_attestation"])(
@@ -748,10 +798,10 @@ describe("G4c one-click connect orchestration", () => {
         },
       });
       expect(await worker.send(connectPage, connectSender)).toMatchObject({ ok: false });
-      expect(worker.local.values.get(CONNECT_KEY)).toMatchObject(unknownBootstrap);
+      expect(worker.local.values.get(projectKey(CONNECT_KEY))).toMatchObject(unknownBootstrap);
       expect(worker.tabsSendMessage).not.toHaveBeenCalled();
       if (failure !== "flow_persist") {
-        expect(worker.local.values.get(FENCE_KEY)).toMatchObject({ state: "PAIRING_TRANSITION" });
+        expect(worker.local.values.get(projectKey(FENCE_KEY))).toMatchObject({ state: "PAIRING_TRANSITION" });
         const calls = worker.fetchMock.mock.calls.length;
         expect(await worker.send(connectPage, connectSender)).toMatchObject({ ok: false });
         expect(worker.fetchMock).toHaveBeenCalledTimes(calls);
@@ -771,7 +821,7 @@ describe("G4c one-click connect orchestration", () => {
         rearmOnConnect: true,
       },
     });
-    expect(worker.local.values.get(AUTONOMY_KEY)).toMatchObject({
+    expect(worker.local.values.get(projectKey(AUTONOMY_KEY))).toMatchObject({
       mode: "off",
       bindingId: null,
       epoch: null,
@@ -805,7 +855,7 @@ describe("G4c one-click connect orchestration", () => {
       safety: { composer: "empty", generation: "idle", safe: true },
     }, sender);
     expect(result).toMatchObject({ ok: true, state: "CONNECTED", autonomy: "off" });
-    expect(worker.local.values.get(AUTONOMY_KEY)).toMatchObject({ mode: "off", rearmOnConnect: false });
+    expect(worker.local.values.get(projectKey(AUTONOMY_KEY))).toMatchObject({ mode: "off", rearmOnConnect: false });
     expect(worker.tabsSendMessage).not.toHaveBeenCalled();
   });
 
@@ -827,7 +877,7 @@ describe("G4c one-click connect orchestration", () => {
       },
     });
     expect(await worker.send({ type: "c2c.autonomy.disable" }, {})).toMatchObject({ ok: true, mode: "off" });
-    expect(worker.local.values.get(AUTONOMY_KEY)).toMatchObject({ mode: "off", rearmOnConnect: false });
+    expect(worker.local.values.get(projectKey(AUTONOMY_KEY))).toMatchObject({ mode: "off", rearmOnConnect: false });
     const sender = { tab: { id: 7 }, documentId: "document-g4-rebind", frameId: 0, url: ROUTE };
     const result = await worker.send({
       type: "c2c.connect.page",
@@ -836,7 +886,7 @@ describe("G4c one-click connect orchestration", () => {
       safety: { composer: "empty", generation: "idle", safe: true },
     }, sender);
     expect(result).toMatchObject({ ok: true, state: "CONNECTED", autonomy: "off" });
-    expect(worker.local.values.get(AUTONOMY_KEY)).toMatchObject({ mode: "off", rearmOnConnect: false });
+    expect(worker.local.values.get(projectKey(AUTONOMY_KEY))).toMatchObject({ mode: "off", rearmOnConnect: false });
   });
 
   it("explicit unbind clears the auto-rearm preference", async () => {
@@ -853,7 +903,7 @@ describe("G4c one-click connect orchestration", () => {
 
     await worker.send({ type: "c2c.unbind" });
 
-    expect(worker.local.values.get(AUTONOMY_KEY)).toMatchObject({ mode: "off", rearmOnConnect: false });
+    expect(worker.local.values.get(projectKey(AUTONOMY_KEY))).toMatchObject({ mode: "off", rearmOnConnect: false });
   });
 
   it("explicit transport clear clears the auto-rearm preference", async () => {
@@ -869,7 +919,7 @@ describe("G4c one-click connect orchestration", () => {
     });
 
     expect(await worker.send({ type: "c2c.transport.clear" })).toMatchObject({ ok: true });
-    expect(worker.local.values.get(AUTONOMY_KEY)).toMatchObject({ mode: "off", rearmOnConnect: false });
+    expect(worker.local.values.get(projectKey(AUTONOMY_KEY))).toMatchObject({ mode: "off", rearmOnConnect: false });
   });
 
   it("holds the mutation gate across route attestation RPC and persistence", async () => {
@@ -894,13 +944,19 @@ describe("G4c one-click connect orchestration", () => {
     }, sender);
     await vi.waitFor(() => expect(worker.tabsSendMessage).toHaveBeenCalledTimes(1));
 
-    expect(await worker.send({
+    let pairResolved = false;
+    const pair = worker.send({
       type: "c2c.pair",
+      workspaceId: WORKSPACE,
+      tabId: 7,
+      canonicalRoute: ROUTE,
       bridgeOrigin: "https://bridge.example.test",
       intentId: "intent",
       secret: "secret",
       ownerProofId: "unused",
-    })).toMatchObject({ reason: "transport_mutation_in_flight" });
+    }).then(result => { pairResolved = true; return result; });
+    await Promise.resolve();
+    expect(pairResolved).toBe(false);
     expect(await worker.send({ type: "c2c.transport.clear" })).toMatchObject({
       reason: "transport_mutation_in_flight",
     });
@@ -912,6 +968,8 @@ describe("G4c one-click connect orchestration", () => {
       clickAttempted: true,
     });
     expect(await connect).toMatchObject({ ok: true, state: "AWAITING_CONFIRMATION" });
+    expect(await pair).toMatchObject({ ok: false });
+    expect(worker.fetchMock.mock.calls.some(([url]) => String(url).includes("/pair"))).toBe(false);
   });
 
   it("fails closed when Connect cannot durably persist Autonomy OFF", async () => {
@@ -936,7 +994,7 @@ describe("G4c one-click connect orchestration", () => {
     }, sender);
     expect(result).toMatchObject({ ok: false, reason: "autonomy_persist_failed", autonomy: "off" });
     expect(worker.tabsSendMessage).not.toHaveBeenCalled();
-    expect(worker.local.values.get(CONNECT_KEY)).toBeUndefined();
+    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toBeUndefined();
   });
 
   it("rolls back a proven pre-dispatch attestation failure for a later explicit Connect", async () => {
@@ -963,7 +1021,7 @@ describe("G4c one-click connect orchestration", () => {
       safety: { composer: "filled", generation: "idle", safe: false },
     }, sender) as Record<string, unknown>;
     expect(unsafe).toMatchObject({ ok: false, state: "NONE", retryAllowed: true });
-    expect(worker.local.values.get(CONNECT_KEY)).toMatchObject({ state: "NONE" });
+    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toMatchObject({ state: "NONE" });
     expect(worker.tabsSendMessage).not.toHaveBeenCalled();
 
     await worker.send({
@@ -1047,7 +1105,7 @@ describe("G4c one-click connect orchestration", () => {
         safety: { composer: "empty", generation: "idle", safe: true },
       };
       await worker.send(heartbeat, sender);
-      expect(worker.local.values.get(CONNECT_KEY)).toMatchObject({ state: "ATTEST_REQUESTED" });
+      expect(worker.local.values.get(projectKey(CONNECT_KEY))).toMatchObject({ state: "ATTEST_REQUESTED" });
       expect(urls.filter(item => item.includes("/rebind/complete"))).toHaveLength(1);
       await worker.send(heartbeat, sender);
       expect(urls.filter(item => item.includes("/rebind/complete"))).toHaveLength(1);
@@ -1077,7 +1135,7 @@ describe("G4c one-click connect orchestration", () => {
     }, sender);
     if (!result || result.ok !== true) throw new Error("R=" + JSON.stringify(result));
     expect(result).toMatchObject({ ok: true, state: "CONNECTED", routeVerification: "VERIFIED" });
-    expect(worker.local.values.get(AUTONOMY_KEY)).toMatchObject({
+    expect(worker.local.values.get(projectKey(AUTONOMY_KEY))).toMatchObject({
       mode: "armed",
       bindingId: OLD_BINDING,
       epoch: OLD_EPOCH,
@@ -1092,6 +1150,9 @@ describe("G4c one-click connect orchestration", () => {
     const slug = "https://chatgpt.com/g/g-p-6aa296e634348191b441d56fdab23b7b-codex-with-chatgpt/c/6aae79f7-d174-83ec-a704-2e3e4c662b47";
     const bare = "https://chatgpt.com/g/g-p-6aa296e634348191b441d56fdab23b7b/c/6aae79f7-d174-83ec-a704-2e3e4c662b47";
     const worker = await loadWorker(responseBody({ routeCanonical: slug }), {
+      preMigrated: true,
+      selectedRoute: bare,
+      ownerRoute: bare,
       oldRoute: slug,
       transport: { routeCanonical: slug, routeVerification: "VERIFIED" },
       fetch: async (url) => String(url).endsWith("/state")
@@ -1107,7 +1168,7 @@ describe("G4c one-click connect orchestration", () => {
     expect(result).toMatchObject({ ok: true, state: "CONNECTED", routeVerification: "VERIFIED" });
     expect(worker.fetchMock.mock.calls.some(([url]) => String(url).includes("/rebind/init"))).toBe(false);
     expect(worker.tabsSendMessage).not.toHaveBeenCalled();
-    expect(worker.local.values.get(TRANSPORT_KEY)).toMatchObject({ routeCanonical: slug, bindingId: OLD_BINDING, epoch: OLD_EPOCH });
+    expect(worker.local.values.get(projectKey(TRANSPORT_KEY))).toMatchObject({ routeCanonical: slug, bindingId: OLD_BINDING, epoch: OLD_EPOCH });
   });
 
   it("returns bounded cold_pair_required with no transport and rejects popup authority", async () => {
@@ -1161,8 +1222,8 @@ describe("G4c one-click connect orchestration", () => {
     await worker.send({ type: "c2c.heartbeat", generation: 1, safety, canonicalRoute: ROUTE }, sender);
     await worker.send({ type: "c2c.heartbeat", generation: 1, safety, canonicalRoute: ROUTE }, sender);
     expect(urls.filter(url => url.includes("/rebind/complete"))).toHaveLength(1);
-    expect(worker.local.values.get(CONNECT_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN" });
-    expect(worker.local.values.get(TRANSPORT_KEY)).toMatchObject({ credential: "old-companion-credential" });
+    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toMatchObject({ state: "OUTCOME_UNKNOWN" });
+    expect(worker.local.values.get(projectKey(TRANSPORT_KEY))).toMatchObject({ credential: "old-companion-credential" });
   });
 
   it("identity-mismatched complete 2xx becomes OUTCOME_UNKNOWN without credential switch", async () => {
@@ -1198,8 +1259,8 @@ describe("G4c one-click connect orchestration", () => {
     await worker.send({ type: "c2c.heartbeat", generation: 1, safety, canonicalRoute: ROUTE }, sender);
     await worker.send({ type: "c2c.heartbeat", generation: 1, safety, canonicalRoute: ROUTE }, sender);
     expect(urls.filter(url => url.includes("/rebind/complete"))).toHaveLength(1);
-    expect(worker.local.values.get(CONNECT_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN" });
-    expect(worker.local.values.get(TRANSPORT_KEY)).toMatchObject({ credential: "old-companion-credential" });
+    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toMatchObject({ state: "OUTCOME_UNKNOWN" });
+    expect(worker.local.values.get(projectKey(TRANSPORT_KEY))).toMatchObject({ credential: "old-companion-credential" });
   });
 
   it.each(["ATTEST_REQUESTED", "COMPLETE_REQUESTED", "OUTCOME_UNKNOWN"])(
@@ -1243,7 +1304,7 @@ describe("G4c one-click connect orchestration", () => {
       await worker.send({ type: "c2c.heartbeat", generation: 1, safety, canonicalRoute: ROUTE }, sender);
       expect(worker.fetchMock).not.toHaveBeenCalled();
       expect(worker.tabsSendMessage).not.toHaveBeenCalled();
-      expect(worker.local.values.get(CONNECT_KEY)).toMatchObject({ state });
+      expect(worker.local.values.get(projectKey(CONNECT_KEY))).toMatchObject({ state });
     },
   );
 
@@ -1298,8 +1359,8 @@ describe("G4c one-click connect orchestration", () => {
     expect(urls[0]).toMatch(/\/state$/);
     expect(urls[0]).not.toContain("/rebind/complete");
     expect(worker.tabsSendMessage).not.toHaveBeenCalled();
-    expect(worker.local.values.get(TRANSPORT_KEY)).toMatchObject({ routeVerification: "VERIFIED" });
-    expect(worker.local.values.get(CONNECT_KEY)).toMatchObject({ state: "DONE" });
+    expect(worker.local.values.get(projectKey(TRANSPORT_KEY))).toMatchObject({ routeVerification: "VERIFIED" });
+    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toMatchObject({ state: "DONE" });
   });
 });
 
@@ -1320,13 +1381,13 @@ describe("G4 Browser rebind init response identity gate", () => {
       routeCanonical: ROUTE,
       rebindPending: true,
     });
-    expect(worker.local.values.get(TRANSPORT_KEY)).toMatchObject({
+    expect(worker.local.values.get(projectKey(TRANSPORT_KEY))).toMatchObject({
       workspaceId: WORKSPACE,
       companionId: NEW_COMPANION,
       bindingId: NEW_BINDING,
       epoch: OLD_EPOCH + 1,
     });
-    expect(worker.local.values.get(FENCE_KEY)).toMatchObject({
+    expect(worker.local.values.get(projectKey(FENCE_KEY))).toMatchObject({
       state: "NONE",
       companionId: NEW_COMPANION,
       challengeId: CHALLENGE,
@@ -1361,8 +1422,8 @@ describe("G4 Browser rebind init response identity gate", () => {
       routeAttestFence: "PAIRING_TRANSITION",
       retryAllowed: false,
     });
-    expect(worker.local.values.get(TRANSPORT_KEY)).toEqual(worker.initial.transport);
-    expect(worker.local.values.get(FENCE_KEY)).toMatchObject({ state: "PAIRING_TRANSITION" });
+    expect(worker.local.values.get(projectKey(TRANSPORT_KEY))).toEqual(worker.initial.transport);
+    expect(worker.local.values.get(projectKey(FENCE_KEY))).toMatchObject({ state: "PAIRING_TRANSITION" });
     expect(worker.nonSinkCalls()).toHaveLength(1);
     expect(worker.tabsSendMessage).not.toHaveBeenCalled();
     const status = await worker.send({ type: "c2c.transport.status" }) as {
@@ -1391,6 +1452,9 @@ describe("G4 Browser rebind init response identity gate", () => {
 
     const pair = await worker.send({
       type: "c2c.pair",
+      workspaceId: WORKSPACE,
+      tabId: 7,
+      canonicalRoute: ROUTE,
       bridgeOrigin: "https://bridge.example.test",
       intentId: "intent",
       secret: "secret",
@@ -1433,12 +1497,12 @@ describe("G4 R3o trusted route authority integration (live-like SPA topology)", 
     ) as { ok: boolean; isOwner?: boolean; canonicalRoute?: string | null };
 
     expect(result).toMatchObject({ ok: true, isOwner: true, canonicalRoute: ROUTE });
-    expect(worker.session.values.get(OWNER_KEY)).toMatchObject({
+    expect(worker.session.values.get(projectKey(OWNER_KEY))).toMatchObject({
       tabId: 7,
       documentId: "document-g4-new-doc",
       canonicalRoute: ROUTE,
     });
-    expect(worker.local.values.get(LOCAL_KEY)).toMatchObject({ targetRoute: ROUTE, paired: true });
+    expect(worker.local.values.get(projectKey(LOCAL_KEY))).toMatchObject({ targetRoute: ROUTE, paired: true });
   });
 
   it("connect identity stage resolves the current tab route and starts the rebind flow", async () => {
@@ -1475,12 +1539,12 @@ describe("G4 R3o trusted route authority integration (live-like SPA topology)", 
       "route_witness_invalid",
       "route_witness_mismatch",
     ]).not.toContain(result.reason);
-    expect(worker.session.values.get(OWNER_KEY)).toMatchObject({
+    expect(worker.session.values.get(projectKey(OWNER_KEY))).toMatchObject({
       tabId: 7,
       documentId: "document-g4-rebind",
       canonicalRoute: ROUTE,
     });
-    expect(worker.local.values.get(TRANSPORT_KEY)).toMatchObject({
+    expect(worker.local.values.get(projectKey(TRANSPORT_KEY))).toMatchObject({
       companionId: NEW_COMPANION,
       bindingId: NEW_BINDING,
       epoch: OLD_EPOCH + 1,
@@ -1510,12 +1574,12 @@ describe("G4 R3o trusted route authority integration (live-like SPA topology)", 
 
     // Owner-exact heartbeat builds runtime evidence for the new document.
     await worker.send({ type: "c2c.heartbeat", generation: 2, canonicalRoute: ROUTE, safety }, newDocSender);
-    expect(worker.session.values.get(OWNER_KEY)).toMatchObject({
+    expect(worker.session.values.get(projectKey(OWNER_KEY))).toMatchObject({
       tabId: 7,
       documentId: "document-g4-new-doc",
       canonicalRoute: ROUTE,
     });
-    expect(worker.session.values.get(EVIDENCE_KEY)).toMatchObject({
+    expect(worker.session.values.get(projectKey(EVIDENCE_KEY))).toMatchObject({
       tabId: 7,
       documentId: "document-g4-new-doc",
       canonicalRoute: ROUTE,
@@ -1528,9 +1592,10 @@ describe("G4 R3o trusted route authority integration (live-like SPA topology)", 
     ) as { ok: boolean };
     expect(proof.ok).toBe(true);
 
-    const ownerBefore = worker.session.values.get(OWNER_KEY);
-    const evidenceBefore = worker.session.values.get(EVIDENCE_KEY);
-    const registryBefore = worker.session.values.get(REGISTRY_KEY);
+    const ownerBefore = worker.session.values.get(projectKey(OWNER_KEY));
+    const evidenceBefore = worker.session.values.get(projectKey(EVIDENCE_KEY));
+    const registryBefore = worker.session.values.get(projectKey(REGISTRY_KEY));
+    const localBefore = Object.fromEntries(worker.local.values);
     const stale = await worker.send({
       type: "c2c.heartbeat",
       generation: 1,
@@ -1547,18 +1612,13 @@ describe("G4 R3o trusted route authority integration (live-like SPA topology)", 
       };
     };
 
-    expect(stale.ownership).toMatchObject({ hasOwner: true, isOwner: false });
-    expect(stale.ownership?.owner).toMatchObject({
-      tabId: 7,
-      documentId: "document-g4-new-doc",
-      canonicalRoute: ROUTE,
-    });
-    // A mismatched observation never leaks its witness route as canonical.
-    expect(stale.canonicalRoute).toBeNull();
-    expect(stale.evidence).toMatchObject({ documentId: "document-g4-new-doc" });
-    expect(worker.session.values.get(OWNER_KEY)).toEqual(ownerBefore);
-    expect(worker.session.values.get(EVIDENCE_KEY)).toEqual(evidenceBefore);
-    expect(worker.session.values.get(REGISTRY_KEY)).toEqual(registryBefore);
+    expect(stale).toEqual({ ok: false, reason: "workspace_selection_required" });
+    // The selected project route is authoritative; a stale sender route cannot
+    // reach or mutate the workspace context.
+    expect(Object.fromEntries(worker.local.values)).toEqual(localBefore);
+    expect(worker.session.values.get(projectKey(OWNER_KEY))).toEqual(ownerBefore);
+    expect(worker.session.values.get(projectKey(EVIDENCE_KEY))).toEqual(evidenceBefore);
+    expect(worker.session.values.get(projectKey(REGISTRY_KEY))).toEqual(registryBefore);
   });
 });
 
@@ -1575,6 +1635,7 @@ describe("G4 R3p recoverable written-unsent bootstrap + abandon connect unknown"
     return {
       type: "c2c.feedback.bootstrap.result",
       mode: "feedback_bootstrap_send",
+      workspaceId: WORKSPACE,
       ok: false,
       reason: "bootstrap_send_not_ready",
       mutationAttempted: true,
@@ -1634,13 +1695,13 @@ describe("G4 R3p recoverable written-unsent bootstrap + abandon connect unknown"
       retryAllowed: true,
       composerDirty: true,
     });
-    expect(worker.local.values.get(CONNECT_KEY)).toMatchObject({ state: "NONE" });
+    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toMatchObject({ state: "NONE" });
     expect(worker.tabsSendMessage).toHaveBeenCalledTimes(1);
     // Zero collateral mutation: owner, evidence, transport and journal survive.
-    expect(worker.session.values.get(OWNER_KEY)).toMatchObject({
+    expect(worker.session.values.get(projectKey(OWNER_KEY))).toMatchObject({
       tabId: 7, documentId: "document-g4-rebind", canonicalRoute: ROUTE,
     });
-    expect(worker.local.values.get(TRANSPORT_KEY)).toEqual(worker.initial.transport);
+    expect(worker.local.values.get(projectKey(TRANSPORT_KEY))).toEqual(worker.initial.transport);
   });
 
   it("a written-unsent reason outside the allowlist maps to bootstrap_written_unsent with responseReason", async () => {
@@ -1664,7 +1725,7 @@ describe("G4 R3p recoverable written-unsent bootstrap + abandon connect unknown"
       retryAllowed: true,
       composerDirty: true,
     });
-    expect(worker.local.values.get(CONNECT_KEY)).toMatchObject({ state: "NONE" });
+    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toMatchObject({ state: "NONE" });
   });
 
   it("a click-attempted bootstrap failure still hardens into OUTCOME_UNKNOWN", async () => {
@@ -1690,7 +1751,7 @@ describe("G4 R3p recoverable written-unsent bootstrap + abandon connect unknown"
       state: "OUTCOME_UNKNOWN",
       retryAllowed: false,
     });
-    const savedFlow = worker.local.values.get(CONNECT_KEY) as Record<string, unknown>;
+    const savedFlow = worker.local.values.get(projectKey(CONNECT_KEY)) as Record<string, unknown>;
     expect(savedFlow).toMatchObject({ state: "OUTCOME_UNKNOWN", failureReason: "bootstrap_click_outcome_unknown" });
     const restarted = await loadWorker(responseBody(), { oldRoute: OLD_ROUTE, connectFlow: savedFlow });
     for (let read = 0; read < 2; read += 1) {
@@ -1726,7 +1787,7 @@ describe("G4 R3p recoverable written-unsent bootstrap + abandon connect unknown"
     });
     expect(result.composerDirty).toBeUndefined();
     expect(result.responseReason).toBeUndefined();
-    expect(worker.local.values.get(CONNECT_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN" });
+    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toMatchObject({ state: "OUTCOME_UNKNOWN" });
   });
 
   it.each([
@@ -1750,7 +1811,7 @@ describe("G4 R3p recoverable written-unsent bootstrap + abandon connect unknown"
       retryAllowed: false,
     });
     expect(result.composerDirty).toBeUndefined();
-    expect(worker.local.values.get(CONNECT_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN" });
+    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toMatchObject({ state: "OUTCOME_UNKNOWN" });
   });
 
   it("an explicit false/false response stays on the retryable proven-no-mutation path", async () => {
@@ -1779,7 +1840,7 @@ describe("G4 R3p recoverable written-unsent bootstrap + abandon connect unknown"
     });
     expect(result.composerDirty).toBeUndefined();
     expect(result.responseReason).toBeUndefined();
-    expect(worker.local.values.get(CONNECT_KEY)).toMatchObject({ state: "NONE" });
+    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toMatchObject({ state: "NONE" });
   });
 
   it("written-unsent is recoverable: a later explicit Connect completes the takeover", async () => {
@@ -1813,12 +1874,12 @@ describe("G4 R3p recoverable written-unsent bootstrap + abandon connect unknown"
 
     const first = await worker.send(message, sender) as Record<string, unknown>;
     expect(first).toMatchObject({ ok: false, reason: "bootstrap_send_not_ready", state: "NONE", retryAllowed: true });
-    expect(worker.local.values.get(CONNECT_KEY)).toMatchObject({ state: "NONE" });
+    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toMatchObject({ state: "NONE" });
 
     const second = await worker.send(message, sender) as Record<string, unknown>;
     expect(second).toMatchObject({ ok: true, state: "WAITING_TAKEOVER" });
     expect(worker.tabsSendMessage).toHaveBeenCalledTimes(2);
-    expect(worker.local.values.get(CONNECT_KEY)).toMatchObject({ state: "WAITING_TAKEOVER" });
+    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toMatchObject({ state: "WAITING_TAKEOVER" });
   });
 
   it("abandon connect unknown clears only the connect fence with zero mutations (popup sender + exact-owner proof)", async () => {
@@ -1841,7 +1902,7 @@ describe("G4 R3p recoverable written-unsent bootstrap + abandon connect unknown"
       zeroClick: true,
       zeroBridgeMutation: true,
     });
-    expect(worker.local.values.get(CONNECT_KEY)).toEqual({
+    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toEqual({
       state: "NONE",
       workspaceId: null,
       bindingId: null,
@@ -1855,7 +1916,7 @@ describe("G4 R3p recoverable written-unsent bootstrap + abandon connect unknown"
     const localAfter = Object.fromEntries(worker.local.values);
     expect(Object.keys(localAfter).sort()).toEqual(Object.keys(localBefore).sort());
     for (const [key, value] of Object.entries(localBefore)) {
-      if (key === CONNECT_KEY) continue;
+      if (key === projectKey(CONNECT_KEY)) continue;
       expect(localAfter[key]).toEqual(value);
     }
     expect(Object.fromEntries(worker.session.values)).toEqual(sessionBefore);
@@ -1899,7 +1960,7 @@ describe("G4 R3p recoverable written-unsent bootstrap + abandon connect unknown"
       reason: "transport_mutation_in_flight",
       retryAllowed: true,
     });
-    expect(worker.local.values.get(CONNECT_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN" });
+    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toMatchObject({ state: "OUTCOME_UNKNOWN" });
 
     // A proof minted through the exact owner while the gate is still held.
     const minted = await worker.send(
@@ -1912,7 +1973,7 @@ describe("G4 R3p recoverable written-unsent bootstrap + abandon connect unknown"
     // Rebind finishes (409: barrier restored, fence untouched, gate released).
     releaseInit(jsonResponse(409, { error: "COMPANION_REBIND_NOT_SUCCESSOR" }));
     expect(await rebind).toMatchObject({ ok: false, reason: "COMPANION_REBIND_NOT_SUCCESSOR" });
-    expect(worker.local.values.get(CONNECT_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN" });
+    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toMatchObject({ state: "OUTCOME_UNKNOWN" });
 
     // The gate-held abandon consumed nothing: the fresh proof still clears the fence.
     const result = await worker.send(
@@ -1928,7 +1989,7 @@ describe("G4 R3p recoverable written-unsent bootstrap + abandon connect unknown"
       zeroClick: true,
       zeroBridgeMutation: true,
     });
-    expect(worker.local.values.get(CONNECT_KEY)).toEqual({
+    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toEqual({
       state: "NONE",
       workspaceId: null,
       bindingId: null,
@@ -1949,7 +2010,7 @@ describe("G4 R3p recoverable written-unsent bootstrap + abandon connect unknown"
       {},
     ) as Record<string, unknown>;
     expect(result).toMatchObject({ ok: false, reason: "owner_proof_mismatch", state: "OUTCOME_UNKNOWN" });
-    expect(worker.local.values.get(CONNECT_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN" });
+    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toMatchObject({ state: "OUTCOME_UNKNOWN" });
   });
 
   it("a popup from a non-owner Chat cannot mint a proof nor clear the fence", async () => {
@@ -1957,6 +2018,7 @@ describe("G4 R3p recoverable written-unsent bootstrap + abandon connect unknown"
     // Popup opened from ANOTHER Chat relays the proof request through that
     // foreign document: the SW refuses to mint (not the exact owner) and the
     // stale cross-document observation invalidates any outstanding proof.
+    await worker.selectProject(8, ROUTE);
     const foreignProof = await worker.send(
       { type: "c2c.owner-proof.request", href: ROUTE, canonicalRoute: ROUTE, generation: 1 },
       { tab: { id: 8 }, documentId: "document-foreign-chat", frameId: 0, url: ROUTE },
@@ -1968,7 +2030,7 @@ describe("G4 R3p recoverable written-unsent bootstrap + abandon connect unknown"
       {},
     ) as Record<string, unknown>;
     expect(result).toMatchObject({ ok: false, reason: "owner_proof_missing", state: "OUTCOME_UNKNOWN" });
-    expect(worker.local.values.get(CONNECT_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN" });
+    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toMatchObject({ state: "OUTCOME_UNKNOWN" });
   });
 
   it("abandon rejects a used (replayed) proof and keeps the fence durable", async () => {
@@ -1993,7 +2055,7 @@ describe("G4 R3p recoverable written-unsent bootstrap + abandon connect unknown"
       {},
     ) as Record<string, unknown>;
     expect(result).toMatchObject({ ok: false, reason: "owner_proof_used", state: "OUTCOME_UNKNOWN" });
-    expect(worker.local.values.get(CONNECT_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN" });
+    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toMatchObject({ state: "OUTCOME_UNKNOWN" });
   });
 
   it("abandon rejects an expired proof and keeps the fence durable", async () => {
@@ -2009,7 +2071,7 @@ describe("G4 R3p recoverable written-unsent bootstrap + abandon connect unknown"
     } finally {
       vi.useRealTimers();
     }
-    expect(worker.local.values.get(CONNECT_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN" });
+    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toMatchObject({ state: "OUTCOME_UNKNOWN" });
   });
 
   it("abandon rejects a proof whose document no longer matches the exact owner", async () => {
@@ -2027,19 +2089,19 @@ describe("G4 R3p recoverable written-unsent bootstrap + abandon connect unknown"
       {},
     ) as Record<string, unknown>;
     expect(result).toMatchObject({ ok: false, reason: "owner_proof_document_mismatch", state: "OUTCOME_UNKNOWN" });
-    expect(worker.local.values.get(CONNECT_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN" });
+    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toMatchObject({ state: "OUTCOME_UNKNOWN" });
   });
 
   it("abandon rejects content-script senders without touching the fence", async () => {
     const worker = await loadWorker(responseBody(), { connectFlow: outcomeUnknownFlow() });
-    const flowBefore = worker.local.values.get(CONNECT_KEY);
+    const flowBefore = worker.local.values.get(projectKey(CONNECT_KEY));
 
     const result = await worker.send(
       { type: "c2c.connect.abandon.unknown" },
       { tab: { id: 7 }, documentId: "document-g4-rebind", frameId: 0, url: ROUTE },
     ) as Record<string, unknown>;
     expect(result).toMatchObject({ ok: false, reason: "popup_sender_required" });
-    expect(worker.local.values.get(CONNECT_KEY)).toEqual(flowBefore);
+    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toEqual(flowBefore);
   });
 
   it("abandon rejects when the connect fence is not OUTCOME_UNKNOWN", async () => {
@@ -2049,7 +2111,7 @@ describe("G4 R3p recoverable written-unsent bootstrap + abandon connect unknown"
       {},
     ) as Record<string, unknown>;
     expect(result).toMatchObject({ ok: false, reason: "connect_not_outcome_unknown", state: "NONE" });
-    expect(worker.local.values.get(CONNECT_KEY)).toBeUndefined();
+    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toBeUndefined();
   });
 
   it("abandon rejects a route-mismatched unknown fence and keeps it durable", async () => {
@@ -2058,14 +2120,14 @@ describe("G4 R3p recoverable written-unsent bootstrap + abandon connect unknown"
     const worker = await loadWorker(responseBody(), {
       connectFlow: outcomeUnknownFlow({ routeCanonical: OLD_ROUTE }),
     });
-    const flowBefore = worker.local.values.get(CONNECT_KEY);
+    const flowBefore = worker.local.values.get(projectKey(CONNECT_KEY));
 
     const result = await worker.send(
       { type: "c2c.connect.abandon.unknown" },
       {},
     ) as Record<string, unknown>;
     expect(result).toMatchObject({ ok: false, reason: "connect_identity_mismatch", state: "OUTCOME_UNKNOWN" });
-    expect(worker.local.values.get(CONNECT_KEY)).toEqual(flowBefore);
+    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toEqual(flowBefore);
   });
 });
 
@@ -2225,10 +2287,10 @@ describe("G4 R3q route-attest written-unsent recovery + abandon route-attest unk
       clickAttempted: false,
     });
     // Durable fence removed (not NONE-with-identity) and session latch absent.
-    expect(worker.local.values.get(FENCE_KEY)).toBeUndefined();
-    expect(worker.session.values.get(LATCH_KEY)).toBeUndefined();
+    expect(worker.local.values.get(projectKey(FENCE_KEY))).toBeUndefined();
+    expect(worker.session.values.get(projectKey(LATCH_KEY))).toBeUndefined();
     // The direct handler never touches the managed connect flow.
-    expect(worker.local.values.get(CONNECT_KEY)).toBeUndefined();
+    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toBeUndefined();
   });
 
   it("written-unsent route-attest via Connect rolls the managed connect flow back to NONE", async () => {
@@ -2248,12 +2310,12 @@ describe("G4 R3q route-attest written-unsent recovery + abandon route-attest unk
       composerDirty: true,
       writtenUnsent: true,
     });
-    expect(worker.local.values.get(CONNECT_KEY)).toEqual(emptyConnectFlowShape());
-    expect(worker.local.values.get(FENCE_KEY)).toBeUndefined();
+    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toEqual(emptyConnectFlowShape());
+    expect(worker.local.values.get(projectKey(FENCE_KEY))).toBeUndefined();
     expect(worker.tabsSendMessage).toHaveBeenCalledTimes(1);
     // Zero collateral mutation: epoch transport survives byte-identical.
-    expect(worker.local.values.get(TRANSPORT_KEY)).toEqual(worker.initial.transport);
-    expect(worker.session.values.get(OWNER_KEY)).toMatchObject({
+    expect(worker.local.values.get(projectKey(TRANSPORT_KEY))).toEqual(worker.initial.transport);
+    expect(worker.session.values.get(projectKey(OWNER_KEY))).toMatchObject({
       tabId: 7, documentId: "document-g4-rebind", canonicalRoute: ROUTE,
     });
   });
@@ -2275,7 +2337,7 @@ describe("G4 R3q route-attest written-unsent recovery + abandon route-attest unk
       fenceState: "OUTCOME_UNKNOWN",
       retryAllowed: false,
     });
-    expect(worker.local.values.get(FENCE_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN" });
+    expect(worker.local.values.get(projectKey(FENCE_KEY))).toMatchObject({ state: "OUTCOME_UNKNOWN" });
   });
 
   it.each([
@@ -2300,7 +2362,7 @@ describe("G4 R3q route-attest written-unsent recovery + abandon route-attest unk
     });
     expect(result.composerDirty).toBeUndefined();
     expect(result.writtenUnsent).toBeUndefined();
-    expect(worker.local.values.get(FENCE_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN" });
+    expect(worker.local.values.get(projectKey(FENCE_KEY))).toMatchObject({ state: "OUTCOME_UNKNOWN" });
   });
 
   it("an observed route-attest failure (inconsistent) stays OUTCOME_UNKNOWN", async () => {
@@ -2319,7 +2381,7 @@ describe("G4 R3q route-attest written-unsent recovery + abandon route-attest unk
       retryAllowed: false,
     });
     expect(result.writtenUnsent).toBeUndefined();
-    expect(worker.local.values.get(FENCE_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN" });
+    expect(worker.local.values.get(projectKey(FENCE_KEY))).toMatchObject({ state: "OUTCOME_UNKNOWN" });
   });
 
   // review-fix FIX_3: written-unsent requires response.ok === false. A
@@ -2339,7 +2401,7 @@ describe("G4 R3q route-attest written-unsent recovery + abandon route-attest unk
     });
     expect(result.writtenUnsent).toBeUndefined();
     expect(result.composerDirty).toBeUndefined();
-    expect(worker.local.values.get(FENCE_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN" });
+    expect(worker.local.values.get(projectKey(FENCE_KEY))).toMatchObject({ state: "OUTCOME_UNKNOWN" });
   });
 
   it("written-unsent persist failure hardens both stores instead of drifting recoverable", async () => {
@@ -2357,8 +2419,8 @@ describe("G4 R3q route-attest written-unsent recovery + abandon route-attest unk
       clickAttempted: false,
     });
     // Fail-closed durable end state — never a silent NONE.
-    expect(worker.local.values.get(FENCE_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN" });
-    expect(worker.session.values.get(LATCH_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN" });
+    expect(worker.local.values.get(projectKey(FENCE_KEY))).toMatchObject({ state: "OUTCOME_UNKNOWN" });
+    expect(worker.session.values.get(projectKey(LATCH_KEY))).toMatchObject({ state: "OUTCOME_UNKNOWN" });
   });
 
   it("written-unsent route-attest is recoverable: a later explicit Connect completes the attestation", async () => {
@@ -2389,12 +2451,12 @@ describe("G4 R3q route-attest written-unsent recovery + abandon route-attest unk
     expect(first).toMatchObject({
       ok: false, reason: "route_attest_send_not_ready", state: "NONE", retryAllowed: true,
     });
-    expect(worker.local.values.get(CONNECT_KEY)).toEqual(emptyConnectFlowShape());
+    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toEqual(emptyConnectFlowShape());
 
     const second = await worker.send(message, OWNER_SENDER) as Record<string, unknown>;
     expect(second).toMatchObject({ ok: true, state: "AWAITING_CONFIRMATION" });
-    expect(worker.local.values.get(CONNECT_KEY)).toMatchObject({ state: "ATTEST_REQUESTED" });
-    expect(worker.local.values.get(FENCE_KEY)).toMatchObject({ state: "OBSERVED_PENDING_CONFIRM" });
+    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toMatchObject({ state: "ATTEST_REQUESTED" });
+    expect(worker.local.values.get(projectKey(FENCE_KEY))).toMatchObject({ state: "OBSERVED_PENDING_CONFIRM" });
     expect(worker.tabsSendMessage).toHaveBeenCalledTimes(2);
   });
 
@@ -2422,7 +2484,7 @@ describe("G4 R3q route-attest written-unsent recovery + abandon route-attest unk
     });
     // Never a null-identity OUTCOME_UNKNOWN: the durable flow carries the
     // current epoch transport / challenge identity.
-    expect(worker.local.values.get(CONNECT_KEY)).toEqual({
+    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toEqual({
       state: "OUTCOME_UNKNOWN",
       workspaceId: WORKSPACE,
       bindingId: OLD_BINDING,
@@ -2440,7 +2502,7 @@ describe("G4 R3q route-attest written-unsent recovery + abandon route-attest unk
       updatedAt: expect.any(Number),
     });
     // Hardened in the SAME commit, with identity — abandon stays possible.
-    expect(worker.local.values.get(FENCE_KEY)).toMatchObject({
+    expect(worker.local.values.get(projectKey(FENCE_KEY))).toMatchObject({
       state: "OUTCOME_UNKNOWN",
       companionId: OLD_COMPANION,
       challengeId: CHALLENGE,
@@ -2465,8 +2527,8 @@ describe("G4 R3q route-attest written-unsent recovery + abandon route-attest unk
       zeroClick: true,
       zeroBridgeMutation: true,
     });
-    expect(worker.local.values.get(FENCE_KEY)).toBeUndefined();
-    expect(worker.local.values.get(CONNECT_KEY)).toEqual(emptyConnectFlowShape());
+    expect(worker.local.values.get(projectKey(FENCE_KEY))).toBeUndefined();
+    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toEqual(emptyConnectFlowShape());
   });
 
   // review-fix FIX_2, sustained fault injection: even when BOTH the rollback
@@ -2492,7 +2554,7 @@ describe("G4 R3q route-attest written-unsent recovery + abandon route-attest unk
       retryAllowed: false,
     });
     // Durable tail: the pre-attest pair the begin persist left behind.
-    expect(worker.local.values.get(CONNECT_KEY)).toEqual({
+    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toEqual({
       state: "ATTEST_REQUESTED",
       workspaceId: WORKSPACE,
       bindingId: OLD_BINDING,
@@ -2509,7 +2571,7 @@ describe("G4 R3q route-attest written-unsent recovery + abandon route-attest unk
       bootstrapAutoResume: false,
       updatedAt: expect.any(Number),
     });
-    expect(worker.local.values.get(FENCE_KEY)).toMatchObject({
+    expect(worker.local.values.get(projectKey(FENCE_KEY))).toMatchObject({
       state: "ROUTE_ATTEST_DISPATCH",
       companionId: OLD_COMPANION,
       challengeId: CHALLENGE,
@@ -2526,8 +2588,8 @@ describe("G4 R3q route-attest written-unsent recovery + abandon route-attest unk
       {},
     ) as Record<string, unknown>;
     expect(abandoned).toMatchObject({ ok: true, abandoned: true, state: "NONE", zeroBridgeMutation: true });
-    expect(worker.local.values.get(FENCE_KEY)).toBeUndefined();
-    expect(worker.local.values.get(CONNECT_KEY)).toEqual(emptyConnectFlowShape());
+    expect(worker.local.values.get(projectKey(FENCE_KEY))).toBeUndefined();
+    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toEqual(emptyConnectFlowShape());
   });
 
   it("abandon route-attest unknown clears only latch/fence/connectFlow with zero mutations (popup sender + exact-owner proof)", async () => {
@@ -2555,18 +2617,18 @@ describe("G4 R3q route-attest written-unsent recovery + abandon route-attest unk
       zeroBridgeMutation: true,
     });
     // Durable attest fence removed (key gone, not NONE-with-identity).
-    expect(worker.local.values.get(FENCE_KEY)).toBeUndefined();
-    expect(worker.session.values.get(LATCH_KEY)).toBeUndefined();
-    expect(worker.local.values.get(CONNECT_KEY)).toEqual(emptyConnectFlowShape());
+    expect(worker.local.values.get(projectKey(FENCE_KEY))).toBeUndefined();
+    expect(worker.session.values.get(projectKey(LATCH_KEY))).toBeUndefined();
+    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toEqual(emptyConnectFlowShape());
     // Byte-level proof: every other durable key is untouched. Clearing a
     // pristine-NONE attest fence REMOVES the storage key, so the after-key set
     // is exactly the before-set minus the fence.
     const localAfter = Object.fromEntries(worker.local.values);
     expect(Object.keys(localAfter).sort()).toEqual(
-      Object.keys(localBefore).filter(key => key !== FENCE_KEY).sort(),
+      Object.keys(localBefore).filter(key => key !== projectKey(FENCE_KEY)).sort(),
     );
     for (const [key, value] of Object.entries(localBefore)) {
-      if (key === FENCE_KEY || key === CONNECT_KEY) continue;
+      if (key === projectKey(FENCE_KEY) || key === projectKey(CONNECT_KEY)) continue;
       expect(localAfter[key]).toEqual(value);
     }
     expect(Object.fromEntries(worker.session.values)).toEqual(sessionBefore);
@@ -2600,8 +2662,8 @@ describe("G4 R3q route-attest written-unsent recovery + abandon route-attest unk
       reason: "connect_identity_mismatch",
       fenceState: "OUTCOME_UNKNOWN",
     });
-    expect(worker.local.values.get(CONNECT_KEY)).toEqual(foreignFlow);
-    expect(worker.local.values.get(FENCE_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN" });
+    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toEqual(foreignFlow);
+    expect(worker.local.values.get(projectKey(FENCE_KEY))).toMatchObject({ state: "OUTCOME_UNKNOWN" });
 
     // The proof was not consumed by the rejected attempt.
     const second = await worker.send(
@@ -2609,7 +2671,7 @@ describe("G4 R3q route-attest written-unsent recovery + abandon route-attest unk
       {},
     ) as Record<string, unknown>;
     expect(second).toMatchObject({ ok: false, reason: "connect_identity_mismatch" });
-    expect(worker.local.values.get(CONNECT_KEY)).toEqual(foreignFlow);
+    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toEqual(foreignFlow);
   });
 
   // review-fix FIX_1: identity alone is not enough — a still-live managed flow
@@ -2632,8 +2694,8 @@ describe("G4 R3q route-attest written-unsent recovery + abandon route-attest unk
       reason: "connect_identity_mismatch",
       fenceState: "OUTCOME_UNKNOWN",
     });
-    expect(worker.local.values.get(CONNECT_KEY)).toEqual(liveFlow);
-    expect(worker.local.values.get(FENCE_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN" });
+    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toEqual(liveFlow);
+    expect(worker.local.values.get(projectKey(FENCE_KEY))).toMatchObject({ state: "OUTCOME_UNKNOWN" });
   });
 
   // review-fix FIX_1: the direct/manual route-attest scenario has no managed
@@ -2657,8 +2719,8 @@ describe("G4 R3q route-attest written-unsent recovery + abandon route-attest unk
       zeroClick: true,
       zeroBridgeMutation: true,
     });
-    expect(worker.local.values.get(FENCE_KEY)).toBeUndefined();
-    expect(worker.local.values.get(CONNECT_KEY)).toBeUndefined();
+    expect(worker.local.values.get(projectKey(FENCE_KEY))).toBeUndefined();
+    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toBeUndefined();
   });
 
   it("abandon route-attest rejects a transport without a pending rebind and keeps the fence", async () => {
@@ -2666,7 +2728,7 @@ describe("G4 R3q route-attest written-unsent recovery + abandon route-attest unk
       transport: routeAttestTransport({ rebindPending: false }),
       routeFence: routeAttestUnknownFence(),
     });
-    const fenceBefore = worker.local.values.get(FENCE_KEY);
+    const fenceBefore = worker.local.values.get(projectKey(FENCE_KEY));
 
     const result = await worker.send(
       { type: "c2c.route-attest.abandon.unknown", ownerProofId: worker.proofId },
@@ -2677,7 +2739,7 @@ describe("G4 R3q route-attest written-unsent recovery + abandon route-attest unk
       reason: "route_attest_not_rebind_pending",
       fenceState: "OUTCOME_UNKNOWN",
     });
-    expect(worker.local.values.get(FENCE_KEY)).toEqual(fenceBefore);
+    expect(worker.local.values.get(projectKey(FENCE_KEY))).toEqual(fenceBefore);
   });
 
   it("abandon route-attest rejects when the attest fence is not OUTCOME_UNKNOWN", async () => {
@@ -2691,7 +2753,7 @@ describe("G4 R3q route-attest written-unsent recovery + abandon route-attest unk
       reason: "route_attest_not_outcome_unknown",
       fenceState: "NONE",
     });
-    expect(worker.local.values.get(FENCE_KEY)).toBeUndefined();
+    expect(worker.local.values.get(projectKey(FENCE_KEY))).toBeUndefined();
   });
 
   it.each([
@@ -2707,7 +2769,7 @@ describe("G4 R3q route-attest written-unsent recovery + abandon route-attest unk
       transport: routeAttestTransport(),
       routeFence: routeAttestUnknownFence(fenceOverride),
     });
-    const fenceBefore = worker.local.values.get(FENCE_KEY);
+    const fenceBefore = worker.local.values.get(projectKey(FENCE_KEY));
 
     const result = await worker.send(
       { type: "c2c.route-attest.abandon.unknown", ownerProofId: worker.proofId },
@@ -2718,7 +2780,7 @@ describe("G4 R3q route-attest written-unsent recovery + abandon route-attest unk
       reason: "route_attest_identity_mismatch",
       fenceState: "OUTCOME_UNKNOWN",
     });
-    expect(worker.local.values.get(FENCE_KEY)).toEqual(fenceBefore);
+    expect(worker.local.values.get(projectKey(FENCE_KEY))).toEqual(fenceBefore);
   });
 
   it("abandon route-attest without relaying the fresh proof fails closed and keeps the fence", async () => {
@@ -2731,7 +2793,7 @@ describe("G4 R3q route-attest written-unsent recovery + abandon route-attest unk
       {},
     ) as Record<string, unknown>;
     expect(result).toMatchObject({ ok: false, reason: "owner_proof_mismatch", fenceState: "OUTCOME_UNKNOWN" });
-    expect(worker.local.values.get(FENCE_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN" });
+    expect(worker.local.values.get(projectKey(FENCE_KEY))).toMatchObject({ state: "OUTCOME_UNKNOWN" });
   });
 
   it("a popup from a non-owner Chat cannot mint a proof nor clear the attest fence", async () => {
@@ -2739,6 +2801,7 @@ describe("G4 R3q route-attest written-unsent recovery + abandon route-attest unk
       transport: routeAttestTransport(),
       routeFence: routeAttestUnknownFence(),
     });
+    await worker.selectProject(8, ROUTE);
     const foreignProof = await worker.send(
       { type: "c2c.owner-proof.request", href: ROUTE, canonicalRoute: ROUTE, generation: 1 },
       { tab: { id: 8 }, documentId: "document-foreign-chat", frameId: 0, url: ROUTE },
@@ -2750,7 +2813,7 @@ describe("G4 R3q route-attest written-unsent recovery + abandon route-attest unk
       {},
     ) as Record<string, unknown>;
     expect(result).toMatchObject({ ok: false, reason: "owner_proof_missing", fenceState: "OUTCOME_UNKNOWN" });
-    expect(worker.local.values.get(FENCE_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN" });
+    expect(worker.local.values.get(projectKey(FENCE_KEY))).toMatchObject({ state: "OUTCOME_UNKNOWN" });
   });
 
   it("abandon route-attest rejects a replayed (used) proof and keeps the fence durable", async () => {
@@ -2774,7 +2837,7 @@ describe("G4 R3q route-attest written-unsent recovery + abandon route-attest unk
       {},
     ) as Record<string, unknown>;
     expect(result).toMatchObject({ ok: false, reason: "owner_proof_used", fenceState: "OUTCOME_UNKNOWN" });
-    expect(worker.local.values.get(FENCE_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN" });
+    expect(worker.local.values.get(projectKey(FENCE_KEY))).toMatchObject({ state: "OUTCOME_UNKNOWN" });
   });
 
   it("abandon route-attest rejects an expired proof and keeps the fence durable", async () => {
@@ -2793,7 +2856,7 @@ describe("G4 R3q route-attest written-unsent recovery + abandon route-attest unk
     } finally {
       vi.useRealTimers();
     }
-    expect(worker.local.values.get(FENCE_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN" });
+    expect(worker.local.values.get(projectKey(FENCE_KEY))).toMatchObject({ state: "OUTCOME_UNKNOWN" });
   });
 
   it("abandon route-attest rejects a proof whose document no longer matches the exact owner", async () => {
@@ -2818,7 +2881,7 @@ describe("G4 R3q route-attest written-unsent recovery + abandon route-attest unk
       reason: "owner_proof_document_mismatch",
       fenceState: "OUTCOME_UNKNOWN",
     });
-    expect(worker.local.values.get(FENCE_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN" });
+    expect(worker.local.values.get(projectKey(FENCE_KEY))).toMatchObject({ state: "OUTCOME_UNKNOWN" });
   });
 
   it("abandon route-attest rejects content-script senders without touching the fence", async () => {
@@ -2826,14 +2889,14 @@ describe("G4 R3q route-attest written-unsent recovery + abandon route-attest unk
       transport: routeAttestTransport(),
       routeFence: routeAttestUnknownFence(),
     });
-    const fenceBefore = worker.local.values.get(FENCE_KEY);
+    const fenceBefore = worker.local.values.get(projectKey(FENCE_KEY));
 
     const result = await worker.send(
       { type: "c2c.route-attest.abandon.unknown", ownerProofId: worker.proofId },
       OWNER_SENDER,
     ) as Record<string, unknown>;
     expect(result).toMatchObject({ ok: false, reason: "popup_sender_required" });
-    expect(worker.local.values.get(FENCE_KEY)).toEqual(fenceBefore);
+    expect(worker.local.values.get(projectKey(FENCE_KEY))).toEqual(fenceBefore);
   });
 
   it("abandon route-attest is serialized behind an in-flight transport mutation (no proof burn, no fence write)", async () => {
@@ -2868,7 +2931,7 @@ describe("G4 R3q route-attest written-unsent recovery + abandon route-attest unk
     });
     // The gate-held abandon wrote nothing: the fence still shows the barrier
     // the rebind itself persisted before its pending fetch.
-    expect(worker.local.values.get(FENCE_KEY)).toMatchObject({ state: "PAIRING_TRANSITION" });
+    expect(worker.local.values.get(projectKey(FENCE_KEY))).toMatchObject({ state: "PAIRING_TRANSITION" });
 
     // A proof minted through the exact owner while the gate is still held.
     const minted = await worker.send(
@@ -2881,7 +2944,7 @@ describe("G4 R3q route-attest written-unsent recovery + abandon route-attest unk
     // Rebind finishes (409: barrier restored, fence untouched, gate released).
     releaseInit(jsonResponse(409, { error: "COMPANION_REBIND_NOT_SUCCESSOR" }));
     expect(await rebind).toMatchObject({ ok: false, reason: "COMPANION_REBIND_NOT_SUCCESSOR" });
-    expect(worker.local.values.get(FENCE_KEY)).toMatchObject({ state: "OUTCOME_UNKNOWN" });
+    expect(worker.local.values.get(projectKey(FENCE_KEY))).toMatchObject({ state: "OUTCOME_UNKNOWN" });
 
     // The gate-held abandon consumed nothing: the fresh proof clears the fence.
     const result = await worker.send(
@@ -2897,6 +2960,6 @@ describe("G4 R3q route-attest written-unsent recovery + abandon route-attest unk
       zeroClick: true,
       zeroBridgeMutation: true,
     });
-    expect(worker.local.values.get(FENCE_KEY)).toBeUndefined();
+    expect(worker.local.values.get(projectKey(FENCE_KEY))).toBeUndefined();
   });
 });

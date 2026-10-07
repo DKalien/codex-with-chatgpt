@@ -31,6 +31,9 @@ export const taskInput = z.object(taskFields).strict();
 const status = z.enum(["queued", "starting", "running", "completed", "failed", "cancelled", "awaiting_approval", "needs_reconciliation"]);
 const targetSchema = z.object({ targetId: targetIdSchema, hostId: z.literal("local"), workspaceId: remoteId, workspaceRoot: z.string(),
   threadId: remoteId, createdAt: z.string(), source: z.enum(["created", "selected"]), clientId: z.string() }).strict();
+export const remoteControllerSchema = z.object({ pid: z.number().int(), instanceId: z.string(), heartbeatAt: z.number(),
+  appServer: z.enum(["starting", "running", "offline", "unknown"]), buildId: z.string().regex(/^[a-f0-9]{64}$/).nullable().optional(),
+  error: z.string().optional(), stopRequested: z.boolean().optional() }).strict();
 const threadSchema = createInput.extend({ clientId: z.string(), status, source: z.enum(["created", "selected"]).optional(),
   targetId: targetIdSchema.optional(), threadId: remoteId.optional(), createdAt: z.string(), updatedAt: z.string(), error: z.string().optional() });
 const taskSchema = z.object({ workspaceId: remoteId, targetId: targetIdSchema.optional(), threadId: remoteId, commandId: remoteId,
@@ -39,13 +42,13 @@ const taskSchema = z.object({ workspaceId: remoteId, targetId: targetIdSchema.op
   turnId: remoteId.optional(), error: z.string().optional(), summary: z.string().optional(), recorded: z.boolean().optional(),
   finalResponse: z.object({ text: z.string().max(64 * 1024), truncated: z.boolean(), restrictedReason: z.string().max(128).optional() }).strict().optional(),
   outputId: z.number().int().positive().optional(), outputAvailable: z.boolean().optional(), resultProjected: z.boolean().optional() }).strict();
-const stateSchema = z.object({ version: z.literal(1), workspaceId: remoteId, workspaceRoot: z.string(), enabled: z.boolean(),
+export const remoteStateSchema = z.object({ version: z.literal(1), workspaceId: remoteId, workspaceRoot: z.string(), enabled: z.boolean(),
   deliveryMode: z.literal("official").optional(), targets: z.array(targetSchema).max(10000).optional(),
   threads: z.array(threadSchema).max(10000), tasks: z.array(taskSchema).max(10000),
-  controller: z.object({ pid: z.number().int(), instanceId: z.string(), heartbeatAt: z.number(), appServer: z.enum(["starting", "running", "offline", "unknown"]), error: z.string().optional(), stopRequested: z.boolean().optional() }).optional(),
+  controller: remoteControllerSchema.optional(),
   audit: z.array(z.object({ timestamp: z.string(), clientId: z.string(), action: z.string(), id: z.string(), result: z.string(), threadId: z.string().optional() })).max(40000),
 }).strict();
-export type RemoteState = z.infer<typeof stateSchema>;
+export type RemoteState = z.infer<typeof remoteStateSchema>;
 export type RemoteTask = z.infer<typeof taskSchema>;
 export type RemoteThread = z.infer<typeof threadSchema>;
 export type RemoteTarget = z.infer<typeof targetSchema>;
@@ -57,7 +60,7 @@ export function remoteFile(workspaceId: string, stateDir = getStateDir()): strin
 }
 export function readRemote(workspaceId: string, stateDir = getStateDir()): RemoteState | null {
   try {
-    const state = stateSchema.parse(JSON.parse(fs.readFileSync(remoteFile(workspaceId, stateDir), "utf8")));
+    const state = remoteStateSchema.parse(JSON.parse(fs.readFileSync(remoteFile(workspaceId, stateDir), "utf8")));
     if (state.workspaceId !== workspaceId) throw new Error("workspace mismatch");
     return state;
   } catch (error) {
@@ -80,7 +83,7 @@ export function updateRemote<T>(workspaceId: string, change: (state: RemoteState
     fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, createdAt: Date.now() }));
     fs.fsyncSync(lock);
     const next = change(readRemote(workspaceId, stateDir));
-    const valid = stateSchema.parse(next.state);
+    const valid = remoteStateSchema.parse(next.state);
     const fd = fs.openSync(temporary, "wx", 0o600);
     try { fs.writeFileSync(fd, JSON.stringify(valid)); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
     fs.renameSync(temporary, file);

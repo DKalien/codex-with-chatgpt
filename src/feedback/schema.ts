@@ -291,15 +291,16 @@ export function routeChallengeDigest(input: {
 /** Fixed attestation body; no credential/principal/secret; browser cannot free-write.
  * Tool-call instruction carries the actual challengeId/challengeDigest values — never placeholders.
  */
-export function formatRouteAttestationMessage(challengeId: string, challengeDigest: string): string {
+export function formatRouteAttestationMessage(challengeId: string, challengeDigest: string, workspaceId?: string): string {
   return [
     "[C2C_ROUTE_ATTEST]",
+    ...(workspaceId ? [`workspaceId=${workspaceId}`] : []),
     `challengeId=${challengeId}`,
     `challengeDigest=${challengeDigest}`,
     "",
     "这是 C2C delivery-route verification，不是新开发任务。",
-    "请在本对话调用 MCP 工具（参数必须与上方两行完全一致）：",
-    `feedback_companion_route_confirm(challengeId=${challengeId}, challengeDigest=${challengeDigest})`,
+    "请在本对话调用 MCP 工具（参数必须与上方身份行完全一致）：",
+    `feedback_companion_route_confirm(${workspaceId ? `workspaceId=${workspaceId}, ` : ""}challengeId=${challengeId}, challengeDigest=${challengeDigest})`,
   ].join("\n");
 }
 

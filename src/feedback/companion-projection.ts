@@ -15,7 +15,6 @@ import {
   isActiveCompanion,
   isActiveRebindIntent,
 } from "./companion-common.js";
-import { formatRouteAttestationMessage } from "./schema.js";
 
 /** Trusted：读 companion 元数据（无 secret）。 */
 export function companionStatusForPrincipal(input: {

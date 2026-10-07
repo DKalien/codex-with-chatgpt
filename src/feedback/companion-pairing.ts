@@ -170,6 +170,7 @@ export function exchangePairingIntent(input: {
           message: formatRouteAttestationMessage(
             routeAttestation.challengeId,
             routeAttestation.challengeDigest,
+            input.workspaceId,
           ),
         },
       },

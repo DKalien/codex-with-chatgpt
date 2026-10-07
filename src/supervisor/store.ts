@@ -175,9 +175,13 @@ foreach ($item in @((ConvertFrom-Json -InputObject $env:C2C_SUPERVISOR_ACL_TARGE
 function verifyWindowsAcls(targets: Array<{ path: string; mode: "set-directory" | "verify-directory" | "verify-file" }>): void {
   const systemRoot = process.env.SystemRoot ?? process.env.WINDIR ?? "C:\\Windows";
   const powershell = path.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  const startedAt = performance.now();
+  let output: string;
   try {
-    const output = execFileSync(powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", ACL_SCRIPT], {
+    output = execFileSync(powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", ACL_SCRIPT], {
       encoding: "utf8", windowsHide: true, timeout: 8000, maxBuffer: 16 * 1024,
+      // 显式 pipe 防止 execFileSync 在抛错前将原始 PowerShell stderr 写到父进程。
+      stdio: "pipe",
       env: {
         SystemRoot: systemRoot,
         WINDIR: process.env.WINDIR ?? systemRoot,
@@ -188,11 +192,49 @@ function verifyWindowsAcls(targets: Array<{ path: string; mode: "set-directory" 
         C2C_SUPERVISOR_ACL_TARGETS: JSON.stringify(targets),
       },
     });
-    if (!/^OK:S-\d(?:-\d+)+\s*$/i.test(output)) fail("SUPERVISOR_STORE_SECURITY", "supervisor owner-only Windows ACL verification failed");
   } catch (error) {
-    if (error instanceof SupervisorStoreError) throw error;
-    fail("SUPERVISOR_STORE_SECURITY", "supervisor owner-only Windows ACL could not be established or verified");
+    failWindowsAcl(classifyWindowsAclFailure(error), startedAt, error);
   }
+  if (!/^OK:S-\d(?:-\d+)+\s*$/i.test(output)) failWindowsAcl("invalid_output", startedAt);
+}
+
+type WindowsAclFailure = "timeout" | "nonzero" | "spawn_failure" | "interrupted" | "execution_failure" | "invalid_output";
+type WindowsAclSignal = "SIGBREAK" | "SIGINT" | "SIGTERM";
+const WINDOWS_ACL_SPAWN_CODES = new Set(["EACCES", "EAGAIN", "EMFILE", "ENFILE", "ENOENT", "ENOMEM", "ENOBUFS", "ENOEXEC", "ENOTDIR", "EPERM"]);
+const WINDOWS_ACL_SIGNALS: readonly WindowsAclSignal[] = ["SIGBREAK", "SIGINT", "SIGTERM"];
+
+function classifyWindowsAclFailure(error: unknown): WindowsAclFailure {
+  const detail = error && typeof error === "object" ? error as Record<string, unknown> : {};
+  const code = typeof detail.code === "string" ? detail.code : "";
+  const status = typeof detail.status === "number" && Number.isInteger(detail.status) ? detail.status : undefined;
+  const signal = typeof detail.signal === "string" ? detail.signal : "";
+  if (code === "ETIMEDOUT") return "timeout";
+  if (code === "EINTR" || WINDOWS_ACL_SIGNALS.includes(signal as WindowsAclSignal)) return "interrupted";
+  if (status !== undefined && status !== 0) return "nonzero";
+  if (WINDOWS_ACL_SPAWN_CODES.has(code)) return "spawn_failure";
+  return "execution_failure";
+}
+
+function failWindowsAcl(classification: WindowsAclFailure, startedAt: number, error?: unknown): never {
+  const elapsed = performance.now() - startedAt;
+  const durationMs = Number.isFinite(elapsed) ? Math.max(0, Math.min(60_000, Math.trunc(elapsed))) : 0;
+  const detail = error && typeof error === "object" ? error as Record<string, unknown> : {};
+  const status = typeof detail.status === "number" && Number.isInteger(detail.status) ? detail.status : undefined;
+  const signal = typeof detail.signal === "string" && WINDOWS_ACL_SIGNALS.includes(detail.signal as WindowsAclSignal)
+    ? detail.signal as WindowsAclSignal : undefined;
+  const fields = {
+    classification,
+    durationMs,
+    ...(status === undefined ? {} : { exitCode: Math.max(-0x80000000, Math.min(0xffffffff, status)) }),
+    ...(signal === undefined ? {} : { signal }),
+  };
+  const details = Object.entries(fields).map(([key, value]) => `${key}=${value}`).join(", ");
+  const prefix = classification === "invalid_output"
+    ? "supervisor owner-only Windows ACL verification failed"
+    : "supervisor owner-only Windows ACL could not be established or verified";
+  const failure = new SupervisorStoreError("SUPERVISOR_STORE_SECURITY", `${prefix} (${details})`);
+  Object.assign(failure, fields);
+  throw failure;
 }
 
 function verifyWindowsAcl(target: string, mode: "set-directory" | "verify-directory" | "verify-file"): void {

@@ -28,18 +28,20 @@ export function claimNext(input: {
 }): { event: FeedbackEvent; attemptId: string } {
   requireConversationPrincipal(input.principal);
   const stateDir = input.stateDir ?? getStateDir();
-  return withRecoveredFeedbackState(input.workspaceId, stateDir, recovered => {
-    const binding = requireActiveBinding(recovered, input.principal);
+  return withRecoveredFeedbackState(input.workspaceId, stateDir, previous => {
+    const binding = requireActiveBinding(previous, input.principal);
     if (binding.bindingId !== input.bindingId || binding.epoch !== input.epoch) {
       throw new FeedbackError("FEEDBACK_EPOCH_STALE", "旧绑定不能领取事件");
     }
+    return binding;
+  }, (recovered, binding) => {
     const ready = recovered.events
       .filter((e) => e.status === "ready"
         && !("plannerRouteId" in e)
         && !(input.excludeEventIds?.has(e.eventId) ?? false)
-        && e.targetBindingId === input.bindingId
-        && e.targetEpoch === input.epoch
-        && e.targetPrincipalFingerprint === input.principal.fingerprint)
+        && e.targetBindingId === binding.bindingId
+        && e.targetEpoch === binding.epoch
+        && e.targetPrincipalFingerprint === binding.principalFingerprint)
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
     if (ready.length === 0) {
       throw new FeedbackError("FEEDBACK_NO_READY_EVENT", "没有可领取的 ready 事件");
@@ -122,17 +124,20 @@ function applyAckObserved(
   };
 }
 
-function withRecoveredFeedbackState<T>(
+function withRecoveredFeedbackState<T, V>(
   workspaceId: string,
   stateDir: string,
-  fn: (state: FeedbackState) => T,
+  prevalidate: (state: FeedbackState) => V,
+  fn: (state: FeedbackState, validated: V) => T,
 ): T {
   return withFeedbackCommandSnapshotLock(workspaceId, stateDir, previous => {
+    // Reject stale callers before recovery can persist outcome_unknown transitions.
+    const validated = prevalidate(previous);
     const recovered = recoverStaleInMemory(previous, Date.now());
     if (recovered !== previous) {
       writeState(workspaceId, stateDir, recovered);
     }
-    return fn(recovered);
+    return fn(recovered, validated);
   });
 }
 
@@ -147,11 +152,20 @@ export function ackObserved(input: {
 }): FeedbackEvent {
   requireConversationPrincipal(input.principal);
   const stateDir = input.stateDir ?? getStateDir();
-  return withRecoveredFeedbackState(input.workspaceId, stateDir, (recovered) => {
-    const binding = requireActiveBinding(recovered, input.principal);
+  return withRecoveredFeedbackState(input.workspaceId, stateDir, previous => {
+    const binding = requireActiveBinding(previous, input.principal);
     if (binding.bindingId !== input.bindingId || binding.epoch !== input.epoch) {
       throw new FeedbackError("FEEDBACK_EPOCH_STALE", "旧绑定不能确认事件");
     }
+    applyAckObserved(previous, {
+      bindingId: binding.bindingId,
+      epoch: binding.epoch,
+      principalFingerprint: input.principal.fingerprint,
+      eventId: input.eventId,
+      attemptId: input.attemptId,
+    });
+    return binding;
+  }, (recovered, binding) => {
     const acked = applyAckObserved(recovered, {
       bindingId: binding.bindingId,
       epoch: binding.epoch,
@@ -178,7 +192,9 @@ export function ackObservedForCompanion(input: {
   stateDir?: string;
 }): FeedbackEvent {
   const stateDir = input.stateDir ?? getStateDir();
-  return withRecoveredFeedbackState(input.workspaceId, stateDir, (recovered) => {
+  return withRecoveredFeedbackState(input.workspaceId, stateDir, previous => {
+    applyAckObserved(previous, input);
+  }, (recovered) => {
     const acked = applyAckObserved(recovered, input);
     if (acked.state !== recovered) {
       writeState(input.workspaceId, stateDir, acked.state);
@@ -222,8 +238,8 @@ export function reserveNext(input: {
   excludeEventIds?: ReadonlySet<string>;
 }): { event: FeedbackEvent; reservationId: string } {
   const stateDir = input.stateDir ?? getStateDir();
-  return withRecoveredFeedbackState(input.workspaceId, stateDir, recovered => {
-    requireActiveCompanionBinding(recovered, input);
+  return withRecoveredFeedbackState(input.workspaceId, stateDir,
+    previous => requireActiveCompanionBinding(previous, input), (recovered, binding) => {
     // Companion delivery 严格 single-flight：未解决 reserved/claimed/outcome_unknown 不得越过继续消费 ready。
     if (recovered.events.some((e) => INFLIGHT_FENCE_STATUSES.has(e.status))) {
       throw new FeedbackError(
@@ -238,9 +254,9 @@ export function reserveNext(input: {
       .filter((e) => e.status === "ready"
         && !("plannerRouteId" in e)
         && !(input.excludeEventIds?.has(e.eventId) ?? false)
-        && e.targetBindingId === input.bindingId
-        && e.targetEpoch === input.epoch
-        && e.targetPrincipalFingerprint === input.principalFingerprint)
+        && e.targetBindingId === binding.bindingId
+        && e.targetEpoch === binding.epoch
+        && e.targetPrincipalFingerprint === binding.principalFingerprint)
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
     if (ready.length === 0) {
       throw new FeedbackError("FEEDBACK_NO_READY_EVENT", "没有可预占的 ready 事件");
@@ -283,8 +299,8 @@ export function releaseReservation(input: {
   stateDir?: string;
 }): FeedbackEvent {
   const stateDir = input.stateDir ?? getStateDir();
-  return withRecoveredFeedbackState(input.workspaceId, stateDir, recovered => {
-    requireActiveCompanionBinding(recovered, input);
+  return withRecoveredFeedbackState(input.workspaceId, stateDir,
+    previous => requireActiveCompanionBinding(previous, input), (recovered, binding) => {
     const event = recovered.events.find((e) => e.eventId === input.eventId);
     if (!event) throw new FeedbackError("FEEDBACK_EVENT_NOT_FOUND", "feedback 事件不存在");
     if (event.status === "ready") {
@@ -298,9 +314,9 @@ export function releaseReservation(input: {
     }
     if (
       event.reservedBy !== input.companionId
-      || event.targetBindingId !== recovered.binding!.bindingId
-      || event.targetEpoch !== recovered.binding!.epoch
-      || event.targetPrincipalFingerprint !== input.principalFingerprint
+      || event.targetBindingId !== binding.bindingId
+      || event.targetEpoch !== binding.epoch
+      || event.targetPrincipalFingerprint !== binding.principalFingerprint
     ) {
       throw new FeedbackError("FEEDBACK_RESERVATION_MISMATCH", "reservation 目标绑定不匹配");
     }
@@ -336,8 +352,8 @@ export function beginSend(input: {
   stateDir?: string;
 }): { event: FeedbackEvent; attemptId: string } {
   const stateDir = input.stateDir ?? getStateDir();
-  return withRecoveredFeedbackState(input.workspaceId, stateDir, recovered => {
-    const binding = requireActiveCompanionBinding(recovered, input);
+  return withRecoveredFeedbackState(input.workspaceId, stateDir,
+    previous => requireActiveCompanionBinding(previous, input), (recovered, binding) => {
     const event = recovered.events.find((e) => e.eventId === input.eventId);
     if (!event) throw new FeedbackError("FEEDBACK_EVENT_NOT_FOUND", "feedback 事件不存在");
     // claimed 幂等也必须绑定 reservedBy：其它 companion 不得继承本 attempt。
@@ -399,8 +415,8 @@ export function retireOutcomeUnknown(input: {
   stateDir?: string;
 }): FeedbackEvent {
   const stateDir = input.stateDir ?? getStateDir();
-  return withRecoveredFeedbackState(input.workspaceId, stateDir, recovered => {
-    const binding = requireActiveCompanionBinding(recovered, input);
+  return withRecoveredFeedbackState(input.workspaceId, stateDir,
+    previous => requireActiveCompanionBinding(previous, input), (recovered, binding) => {
     const event = recovered.events.find((e) => e.eventId === input.eventId);
     if (!event) throw new FeedbackError("FEEDBACK_EVENT_NOT_FOUND", "feedback 事件不存在");
     if (

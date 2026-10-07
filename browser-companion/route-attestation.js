@@ -485,10 +485,10 @@ export { ROUTE_ATTEST_DESCENDANT_LIMIT, routeAttTurnBodyMatch };
 export function extractRouteAttestToolCallArgs(message) {
   if (typeof message !== "string") return null;
   const m = message.match(
-    /feedback_companion_route_confirm\(challengeId=([0-9a-fA-F-]{36}), challengeDigest=([0-9a-f]{64})\)/,
+    /feedback_companion_route_confirm\((?:workspaceId=([0-9a-f]{12}), )?challengeId=([0-9a-fA-F-]{36}), challengeDigest=([0-9a-f]{64})\)/,
   );
   if (!m) return null;
-  return { challengeId: m[1].toLowerCase(), challengeDigest: m[2].toLowerCase() };
+  return { ...(m[1] ? { workspaceId: m[1] } : {}), challengeId: m[2].toLowerCase(), challengeDigest: m[3].toLowerCase() };
 }
 
 /** Header lines challengeId/challengeDigest from server-owned body. */
@@ -497,8 +497,10 @@ export function extractRouteAttestHeaderArgs(message) {
   const lines = message.split("\n").map((l) => l.replace(/\r$/, ""));
   const idLine = lines.find((l) => /^challengeId=[0-9a-fA-F-]{36}$/.test(l));
   const digestLine = lines.find((l) => /^challengeDigest=[0-9a-f]{64}$/.test(l));
+  const workspaceLine = lines.find((l) => /^workspaceId=[0-9a-f]{12}$/.test(l));
   if (!idLine || !digestLine) return null;
   return {
+    ...(workspaceLine ? { workspaceId: workspaceLine.slice("workspaceId=".length) } : {}),
     challengeId: idLine.slice("challengeId=".length).toLowerCase(),
     challengeDigest: digestLine.slice("challengeDigest=".length).toLowerCase(),
   };

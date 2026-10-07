@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { StreamableHTTPClientTransport } from "./sdk-http-fixture.js";
 import { startBridge, type Bridge } from "../src/bridge/server.js";
 import { AuthStore, filterScopes, SUPPORTED_SCOPES } from "../src/auth/store.js";
 import { cleanup, makeTmpDir, write } from "./helpers.js";

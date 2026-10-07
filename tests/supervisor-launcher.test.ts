@@ -60,4 +60,47 @@ describe("stable launcher supervisor release pin", () => {
     const result = f.run(); expect(result.status, result.stderr).toBe(0);
     expect(fs.readdirSync(f.folder).filter(name => name.endsWith(".launch.json"))).toEqual([]);
   });
+
+  it("gateway supervisor run creates nonce pins and lets retries proceed after unhanded failures", () => {
+    const f = fixture();
+    const folder = path.join(f.stateDir, "gateway");
+    fs.mkdirSync(folder, { recursive: true });
+    fs.writeFileSync(path.join(folder, "supervisor.json"), JSON.stringify({ scope: "machine", stableLauncher: f.launcher }));
+    fs.writeFileSync(f.child, `const fs=require('node:fs'),path=require('node:path'),assert=require('node:assert/strict'),crypto=require('node:crypto');
+const gatewayPin=process.env.C2C_GATEWAY_SUPERVISOR_LAUNCH_PIN;
+const gatewayIdentity=JSON.parse(process.env.C2C_GATEWAY_SUPERVISOR_LAUNCH_IDENTITY),gatewayStat=fs.statSync(gatewayPin);
+for(const key of ['dev','ino','size','mtimeMs','ctimeMs']) assert.equal(gatewayIdentity[key],gatewayStat[key]);
+assert.equal(gatewayIdentity.sha256,crypto.createHash('sha256').update(fs.readFileSync(gatewayPin)).digest('hex'));
+const gatewayInfo=JSON.parse(fs.readFileSync(gatewayPin,'utf8'));
+assert.match(path.basename(gatewayPin),/^supervisor\.[0-9a-f-]{36}\.launch\.json$/);
+assert.equal(path.basename(gatewayPin),'supervisor.'+gatewayInfo.nonce+'.launch.json');
+assert.equal(gatewayInfo.scope,'machine'); assert.equal(gatewayInfo.buildId,'${f.buildId}'); assert.equal(gatewayInfo.launcherPath,'${f.launcher.replace(/\\/g, "\\\\")}');
+assert.equal(process.env.C2C_STATE_DIR,'${f.stateDir.replace(/\\/g, "\\\\")}');
+fs.writeFileSync(path.join(path.dirname(gatewayPin),'observed-gateway.txt'),JSON.stringify(gatewayInfo));
+if(!process.env.KEEP_GATEWAY_PIN) fs.unlinkSync(gatewayPin);
+if(process.env.FAIL_GATEWAY_RUN) process.exitCode=7;`);
+    const run = (extra: NodeJS.ProcessEnv = {}) => spawnSync(process.execPath,
+      [f.launcher, "gateway", "supervisor", "run", "--state-dir", f.stateDir],
+      { encoding: "utf8", windowsHide: true, timeout: 10000, env: { ...process.env, ...extra } });
+    const result = run();
+    expect(result.status, result.stderr).toBe(0);
+    const observed = JSON.parse(fs.readFileSync(path.join(folder, "observed-gateway.txt"), "utf8"));
+    expect(observed).toMatchObject({ scope: "machine", buildId: f.buildId, launcherPath: f.launcher });
+    const listPins = () => fs.readdirSync(folder).filter(name => /^supervisor\.[0-9a-f-]{36}\.launch\.json$/.test(name));
+    expect(listPins()).toEqual([]);
+    expect(fs.existsSync(path.join(f.stateDir, "maintenance.lock"))).toBe(false);
+
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const failed = run({ KEEP_GATEWAY_PIN: "1", FAIL_GATEWAY_RUN: "1" });
+      expect(failed.status, failed.stderr).toBe(7);
+      const pins = listPins();
+      expect(pins).toHaveLength(attempt + 1);
+      expect(new Set(pins).size).toBe(pins.length);
+      for (const name of pins) {
+        const launch = JSON.parse(fs.readFileSync(path.join(folder, name), "utf8"));
+        expect(name).toBe(`supervisor.${launch.nonce}.launch.json`);
+      }
+    }
+  });
+
 });

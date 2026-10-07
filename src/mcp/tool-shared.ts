@@ -1,10 +1,35 @@
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
+import { z } from "zod";
+import { GatewayRegistryError } from "../gateway/registry.js";
 import { Workspace, WorkspaceError } from "../workspace/manager.js";
 import type { Logger } from "../logger/index.js";
 import type { DesktopCompatibility } from "../auth/store.js";
 import type { ConnectionRuntimeUpgrade } from "../workflow/readiness-model.js";
 
 import type { CommandMailboxSubmit } from "../routing/mailbox.js";
+
+export type WorkspaceResolver = (workspaceId: string, clientId: string) => Workspace;
+export type WorkspaceSource = Workspace | WorkspaceResolver;
+
+export function workspaceIdShape(source: WorkspaceSource): Record<string, z.ZodTypeAny> {
+  return typeof source === "function" ? { workspaceId: z.string().regex(/^[a-f0-9]{12}$/) } : {};
+}
+
+export function resolveToolWorkspace(
+  source: WorkspaceSource,
+  input: unknown,
+  authInfo: AuthInfo | undefined,
+): Workspace {
+  if (typeof source !== "function") return source;
+  const workspaceId = input && typeof input === "object" ? (input as { workspaceId?: unknown }).workspaceId : undefined;
+  if (typeof workspaceId !== "string" || !/^[a-f0-9]{12}$/.test(workspaceId)) {
+    throw new GatewayRegistryError("GATEWAY_INVALID_WORKSPACE_ID", "Gateway 工具必须提供有效的 workspaceId。");
+  }
+  if (!authInfo?.clientId) {
+    throw new GatewayRegistryError("GATEWAY_AUTH_REQUIRED", "Gateway 工具要求经过认证的 OAuth 客户端。");
+  }
+  return source(workspaceId, authInfo.clientId);
+}
 
 export interface McpContext {
   profile?: "legacy" | "official" | "feedback";
@@ -48,12 +73,13 @@ export function fail(code: string, message: string): ToolResult {
 
 export function mapError(error: unknown): ToolResult {
   if (error instanceof WorkspaceError) return fail(error.code, error.message);
+  if (error instanceof GatewayRegistryError) return fail(error.code, error.message);
   return fail("INTERNAL_ERROR", error instanceof Error ? error.message : String(error));
 }
 
-export function requireScope(authInfo: AuthInfo | undefined, scope: string): ToolResult | null {
+export function requireScope(authInfo: AuthInfo | undefined, scope: string, requireAuth = false): ToolResult | null {
   // authInfo is absent only for trusted in-process clients (tests / local stdio).
-  if (!authInfo) return null;
+  if (!authInfo) return requireAuth ? fail("AUTH_REQUIRED", "This operation requires an authenticated OAuth client.") : null;
   if (!authInfo.scopes.includes(scope)) {
     return fail("INSUFFICIENT_SCOPE", `This operation requires the '${scope}' scope.`);
   }

@@ -1,5 +1,13 @@
 # Architecture
 
+## 单机统一 Gateway 源码状态（2026-10-07 当前 checkout）
+
+源码中的 `gateway register/list/revoke` 维护机器级 workspace/client allowlist；`gateway serve` 以独立的 `machine-gateway` OAuth store 暴露 MCP。项目工具显式接收 workspaceId，每次调用重新核验 client grant 与 canonical root，再复用原 Workspace、Remote、execution、feedback、Web Sink handler。各 workspace 的 Controller、Bridge、Result Bus 和业务存储仍各自独立；固定单 workspace `remote serve` 保留兼容。Gateway 不复制任务队列或结果权威。
+
+Gateway MCP 的匿名访问仅用于协议 discovery；工具调用仍要求 bearer OAuth 与原 scope。服务端 `/mcp`、`/oauth/token` 诊断日志只记录 method、固定 path 和 statusCode，不记录 query、body 或 headers。Browser Companion 源码已按 workspace 隔离存储、alarm、页面选择和发送上下文，操作面板请求固定 workspaceId；双项目真实 Send/observed 仍未完成。
+
+机器级 `gateway supervisor` 源码提供 Windows 前台 configure/status/validate/set-key/run、DPAPI key 保存、进程身份核验、启动 pin 与 GC release 引用保护；没有 Scheduled Task 注册或异常退出自动恢复。此前的部署与 live 验收时间线见[统一 Gateway 计划](unified-gateway-plan.md)；该源码说明和历史记录均不证明当前安装、进程或浏览器运行状态。
+
 ## 官方路线源码改造（2026-10-05，当前分支）
 
 当前分支按[官方投递与 Companion 回流](official-route.md)分离执行与回流：独立受 OAuth 保护的 MCP 复用安全文件/Git 读取，通过明确 targetId 向既有 Remote Controller 和官方 App Server 投递；Bridge 在显式 official 模式只保留回流相关入口。官方 turn 结果带独立来源进入 Result Bus，不伪造 Desktop receipt 或测试通过。旧部署、旧消息链及历史记录保留兼容；源码改造阶段本身未迁移机器状态，之后的显式部署见下方快照。
@@ -12,7 +20,7 @@
 
 2026-10-06 08:31，用户 Connect 后确认当前对话已连接且自动回流开启；两条 Result Bus 均经真实 Browser Send+ACK 进入 observed，Companion 回流通过。普通 Chat 原生 Events 仍未通过。本轮输入 Key 启动独立 Gateway/隧道，Bridge、Controller、App Server 未重启，业务源码未改，也未额外 install/full/build；细节见[开发计划](development-plan.md)。
 
-08:31–08:34 是单 workspace 历史 live 验收。09:01–09:02 新鲜观察显示旧 Bridge/Gateway/Controller/App Server/Tunnel 进程均 missing、48766 无监听且 Bridge stopped；installed build 与旧 durable runtime 记录不能证明当前运行版本。恢复未执行。多 workspace Gateway 仍是后续计划，见[统一 Gateway 计划](unified-gateway-plan.md)。
+08:31–08:34 是单 workspace 历史 live 验收。09:01–09:02 当时的观察显示旧 Bridge/Gateway/Controller/App Server/Tunnel 进程均 missing、48766 无监听且 Bridge stopped；installed build 与旧 durable runtime 记录不能证明当前运行版本。恢复未执行。该历史时点尚未实施多 workspace Gateway；当前源码状态见本页开头，后续待执行的 live 门见[统一 Gateway 计划](unified-gateway-plan.md)。
 
 ## 官方路线之前的双向消息模型基线（2026-10-05，历史源码与后端部署）
 
@@ -24,7 +32,7 @@
 
 最新源码、运行与部署快照见[开发计划当前事实](development-plan.md#当前事实与开发阶段2026-10-04-2144asiashanghai)；下文保留 2026-10-04 的历史实现与部署边界说明。
 
-本节下方“网页命令 → Desktop”图和对应文字描述的是兼容的 legacy profile；当前 official profile 通过独立 Remote Controller 与 App Server 投递，Bridge official mode 保留 feedback。单机多 workspace 聚合尚未实现，后续路线见[统一 Gateway 计划](unified-gateway-plan.md)。
+本节下方“网页命令 → Desktop”图和对应文字描述的是兼容的 legacy profile；当前 official profile 通过独立 Remote Controller 与 App Server 投递，Bridge official mode 保留 feedback。机器级 Gateway 的多 workspace 源码能力见本页开头；M4/M5 多项目现场验收与旧 feedback Connector 退役仍待完成，见[统一 Gateway 计划](unified-gateway-plan.md)。
 
 B1 进程退出证据、B2 查询/连接与维护分离、B4 canonical 主链、B5 受控任务面板已实现；B3 已评估并决定不迁移 SQLite。固定 registry、Executor/Web Sink 合同、领域存储与安全启动协议继续复用。Supervisor foundation 已随 Core 安装，实际 Scheduled Task/config/runtime 仍 absent/null，独立自动恢复尚未启用。
 
@@ -57,7 +65,7 @@ Normal C2C 的 Computer Use 小消息流程仍是独立支持模式；不把它�
 - **Read-only by default**: the 9 base tools remain read-only. Desktop Control is a separately
   authorized plain-text delivery path to one existing Desktop thread; it is not a workspace
   write, shell or arbitrary RPC tool.
-- **Workspace is the security boundary**: one bridge = one workspace = one token audience.
+- **Workspace is the project security boundary**: each Bridge remains bound to one workspace and its token audience; the machine Gateway authenticates its own OAuth client and checks the explicit grant and canonical root on every project call.
 
 ## Components (src/)
 
@@ -65,6 +73,7 @@ Normal C2C 的 Computer Use 小消息流程仍是独立支持模式；不把它�
 | --- | --- |
 | `bridge/` | Express app assembly, loopback-only listener, port fallback, runtime state, admin API |
 | `mcp/` | McpServer with workspace/git/search/session/pairing/feedback/workflow tools (base read-only set + separately guarded Desktop/Remote/feedback schemas); stateless Streamable HTTP transport (fresh server per request, JSON responses) |
+| `gateway/` | Machine workspace/client allowlist and Windows foreground Gateway/Tunnel supervisor; routes each call to an independently authorized workspace |
 | `desktop/` | Local Desktop binding, behaviorally attested IPC delivery, replay-safe state and delivery status |
 | `executor/` | Executor Core 的有限适配器契约、固定注册表及当前 Codex Desktop adapter |
 | `endpoints/` | R5 generic executor/web-sink contracts, identity snapshots and fixed plugin registry |

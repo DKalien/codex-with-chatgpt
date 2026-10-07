@@ -8,6 +8,7 @@ export interface BearerAuthDeps {
   workspaceId: string;
   getBaseUrl: (req: Request) => string;
   logger: Logger;
+  allowAnonymousDiscovery?: boolean;
 }
 
 /**
@@ -22,6 +23,14 @@ export function bearerAuth(deps: BearerAuthDeps) {
       `resource_metadata="${deps.getBaseUrl(req)}/.well-known/oauth-protected-resource/mcp"`;
 
     const header = req.headers.authorization;
+    const anonymousMethod = req.body && typeof req.body === "object" && !Array.isArray(req.body)
+      ? (req.body as { method?: unknown }).method
+      : undefined;
+    if (deps.allowAnonymousDiscovery === true && !header && req.method === "POST" &&
+        (anonymousMethod === "initialize" || anonymousMethod === "notifications/initialized" || anonymousMethod === "tools/list")) {
+      next();
+      return;
+    }
     if (!header || !header.toLowerCase().startsWith("bearer ")) {
       res
         .status(401)

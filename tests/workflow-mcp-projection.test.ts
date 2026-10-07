@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { StreamableHTTPClientTransport } from "./sdk-http-fixture.js";
 import { startBridge, type Bridge } from "../src/bridge/server.js";
 import { mergeSession, projectChatOwnerFingerprint, writeSession } from "../src/session/state.js";
 import { desktopFile } from "../src/desktop/store.js";

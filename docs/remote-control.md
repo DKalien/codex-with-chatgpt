@@ -1,17 +1,17 @@
 # MCP Remote Control
 
-当前分支新增独立官方入口与明确 target，完整职责和部署边界见[官方投递与 Companion 回流](official-route.md)。`remote enable --official` 选择新模式后，独立 `remote serve` 承担任务及项目读取，Bridge 保留回流；下文的 Bridge 投递与旧工具清单只适用于 legacy 模式。源码实现不代表机器已经切换。
+当前源码支持独立单 workspace 官方入口与机器级 Unified Gateway，完整职责见[官方投递与 Companion 回流](official-route.md)。`remote enable --official` 选择官方模式后，可由独立 `remote serve` 或显式授权的 `gateway serve` 承担任务及项目读取；每 workspace 的 Controller、任务与结果存储仍是原权威，Bridge 与 Companion 保留回流。Gateway 不注册任意路径、不提供远程 enable，也不建立第二份业务队列。下文的 Bridge 投递、首次测试步骤与旧工具清单只适用于 legacy 模式；Gateway 的本机授权和部署边界见[统一 Gateway 计划](unified-gateway-plan.md)。源码实现不代表机器已经切换。
 
 | 模式 | 控制路径 | 在线条件 |
 | --- | --- | --- |
 | Normal C2C | Codex → ChatGPT Planner / Reviewer | 当前本地 Agent 和网页流程 |
 | DOM Web Control | ChatGPT COMMAND → 内置浏览器 → 当前 Codex | 对应 Agent turn 正在监听 |
-| MCP Remote Control | 任意设备 ChatGPT → HTTPS MCP → durable queue → Controller → Codex app-server | 本机 Bridge、Tunnel、Controller 正在运行 |
+| MCP Remote Control | 任意设备 ChatGPT → HTTPS MCP → 每 workspace durable queue → Controller → Codex app-server | legacy 需 Bridge/Tunnel；official 需官方 endpoint/Tunnel；均需已授权 workspace 的 Controller |
 | Desktop Control | ChatGPT → HTTPS MCP → 本机绑定 → Desktop 内部 IPC → 已有 Desktop thread | 本机 Bridge、Desktop 已加载且空闲、绑定和 enable 正在生效 |
 
 Remote Control 不依赖 Codex Desktop 窗口、当前 conversation、in-app browser 或 DOM listener。
-电脑需保持运行并联网。没有 ChatGPT 主动推送、远程 Shell、任意路径注册、自动审批或开机启动。
-当前开发环境中的 ChatGPT Pro 账户已经实测支持 MCP write actions；不同账户/套餐/rollout 可能不同。
+电脑需保持运行并联网。没有普通 Chat 原生 Events 唤醒、远程 Shell、任意路径注册或自动审批。机器级 Gateway Supervisor 已有源码实现，但其本机配置、key 保存、Scheduled Task 注册均需独立授权，不自动启用每 workspace 的 Remote；现场验收边界见统一 Gateway 计划。
+此前开发账户实测过 MCP write actions；这是历史账户证据，不证明当前账户、Work、普通 Chat 原生 Events 或所有套餐/rollout 已支持。
 write_probe 仍默认关闭，正式功能不依赖 C2C_ENABLE_WRITE_PROBE。
 
 ## 第一次跨设备测试
@@ -65,17 +65,18 @@ tests:null、changedFiles:[] 表示 Controller 未自动采集测试与文件列
 
 kind 仅 TASK/ANALYZE/TEST/REVIEW；ID 仅 1–128 位字母数字、下划线、连字符，单段任务文本最多 8192 字符。
 不接受 cwd、shellCommand、argv、rawRpc、model、model_provider、base_url、api_key。
-每 endpoint 只接受其自身 workspaceId；目标必须来自本工作区创建记录，或经过本机显式选择、官方 API 核验的已有线程。只读状态不返回完整输入、transcript 或配置；官方 profile 的 `codex_task_result` 单独返回脱敏的最终正文。
+Bridge 与单 workspace 官方 endpoint 只接受自身 workspaceId；Gateway 每次按显式 workspaceId、当前 OAuth client 的本机 grant 与规范 root 解析项目，Remote 调用还要求该项目为 official 模式。target/task/thread 只从对应 workspace 的权威存储解析，官方与 Gateway profile 同时核验 OAuth client 的访问归属；目标必须来自本工作区创建记录，或经过本机显式选择、官方 API 核验的已有线程。只读状态不返回完整输入、transcript 或配置；官方与 Gateway profile 的 `codex_task_result` 单独返回脱敏的最终正文。
 写工具标注 readOnlyHint:false、destructiveHint:true、idempotentHint:true、openWorldHint:true。
 幂等标注依赖持久 ID 去重；底层 thread/start、turn/start 不能盲目重试。
-权限由 _meta.securitySchemes 声明，服务端独立检查，缺权返回 INSUFFICIENT_SCOPE 和 OAuth challenge。
-OAuth codex.control **且** 本地 enabled 才能派发，网页不能启用工作区。Remote 关闭时不注册其
+权限由 _meta.securitySchemes 声明；Gateway 的 tools/list 同时暴露顶层 securitySchemes 镜像。Gateway 仅匿名开放 initialize、notifications/initialized、tools/list discovery，工具执行仍独立核验 OAuth、scope 与项目 grant，缺权返回错误和相应 OAuth challenge。
+OAuth codex.control **且** 本地 enabled 才能派发，网页不能启用工作区。legacy Remote 关闭时不注册其
 4 个工具；原 9 个只读工具与两个独立鉴权的 Desktop schema 仍可发现。
 
 ## 状态与恢复
 
 `%LOCALAPPDATA%\codex-with-chatgpt\remote-control\<workspaceId>.json` 保存 enabled、规范化 root、
 线程请求、任务队列、Controller 心跳及审计元数据；遵循 C2C_STATE_DIR 覆盖。
+Controller 新记录还保存运行 release 的 buildId，供 GC 保留引用；兼容读取缺少 buildId 的旧记录，但引用不明会阻止回收。正常 stop 只在专属 app-server 确认退出且无 Controller 错误时移除 Controller 记录，shutdown 不明或已有错误保留诊断与引用，不清空任务历史。
 目标登记保存精确 workspace/root/thread，任务提交时冻结 targetId，审计不复制 prompt 或 token。旧已创建线程仅在明确提交事务中按原 workspace/client/thread 兼容登记，查询不迁移状态。目录/文件用现有 0700/0600 模式，Windows 另依赖用户目录 ACL。
 修改使用 .lock 短锁、临时文件 fsync + rename。损坏或遗留锁停止操作；先核对锁内 PID，保留 JSON 后人工恢复锁。
 不能删除 JSON 清空历史。相同 requestId/commandId 和参数返回原记录，不同参数或 client 冲突拒绝。

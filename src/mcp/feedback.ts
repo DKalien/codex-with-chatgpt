@@ -3,6 +3,8 @@ import { CommandCleanupError } from "../command-cleanup/schema.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import { Workspace } from "../workspace/manager.js";
+import { GatewayRegistryError } from "../gateway/registry.js";
+import { resolveToolWorkspace, workspaceIdShape, type WorkspaceSource } from "./tool-shared.js";
 import {
   resolveConversationPrincipal,
   requireConversationPrincipal,
@@ -32,11 +34,23 @@ import { withConnectionMutation } from "../bridge/connection.js";
 import { findLiveBridge } from "../bridge/runtime.js";
 import { withDeliveryArbiter, assertNoResultBusInFlight } from "../bridge/delivery-arbiter.js";
 import { reconcileResultBusCutover } from "../bridge/result-bus-delivery.js";
+import { requireActiveBinding } from "../feedback/receiver.js";
+
+function assertMcpClaimBinding(input: {
+  workspace: Workspace; principal: ConversationPrincipal; bindingId: string; epoch: number; stateDir?: string;
+}): void {
+  requireConversationPrincipal(input.principal);
+  const state = readFeedbackStatusState(input.workspace.id, input.stateDir);
+  const binding = requireActiveBinding(state, input.principal);
+  if (binding.bindingId !== input.bindingId || binding.epoch !== input.epoch) {
+    throw new FeedbackError("FEEDBACK_EPOCH_STALE", "旧绑定不能领取事件");
+  }
+}
 
 /**
  * MCP feedback_claim_next 的生产获取路径（FIX A/FIX 5）：
- * arbiter 锁内先 reconcile cutover（建立/发现 pre-R4c & R4c 归属），
- * 经 neutral read fence 拒绝 Bus in-flight，再以 validated 排除集领取。
+ * arbiter 锁内先核验 in-flight 与 exact principal/binding，再 reconcile 投影与 cutover，
+ * 建立/发现 pre-R4c & R4c 归属，以 validated 排除集领取；接管不能穿插此窗口。
  */
 export function claimNextForMcp(input: {
   workspace: Workspace;
@@ -47,6 +61,8 @@ export function claimNextForMcp(input: {
 }): { attemptId: string; event: unknown } {
   return withDeliveryArbiter({ workspaceId: input.workspace.id, workspaceRoot: input.workspace.root, stateDir: input.stateDir }, identity => {
     assertNoResultBusInFlight({ workspaceId: input.workspace.id, workspaceRoot: input.workspace.root, stateDir: input.stateDir });
+    assertMcpClaimBinding(input);
+    reconcileFeedbackOutbox(input.workspace.id, input.stateDir, input.workspace.root);
     const cutover = reconcileResultBusCutover({ identity, stateDir: input.stateDir });
     return claimNext({
       workspaceId: input.workspace.id,
@@ -88,6 +104,7 @@ function fail(code: string, message: string, scope?: string): ToolResult {
 }
 
 function mapError(error: unknown): ToolResult {
+  if (error instanceof GatewayRegistryError) return fail(error.code, error.message);
   if (error instanceof CommandCleanupError) {
     return fail(error.code, `legacy_feedback_enrichment: ${error.code}${error.commandId ? ` commandId=${error.commandId}` : ""}`);
   }
@@ -188,16 +205,14 @@ function modelVisibleMeta(extra?: Record<string, unknown>): Record<string, unkno
  * Production feedback tools（E1a：无 card UI / 无 emit / 无 model_confirm）。
  * 查询与连接不触发历史维护；领取属于显式投递写入。
  */
-export function registerFeedbackTools(server: McpServer, workspace: Workspace): void {
-  // MCP 与 Bridge 统一走带 workspace root 的 reconcile 路径。
-  const reconcileWorkspaceFeedback = () => reconcileFeedbackOutbox(workspace.id, undefined, workspace.root);
+export function registerFeedbackTools(server: McpServer, workspaceSource: WorkspaceSource): void {
 
   server.registerTool(
     "feedback_bootstrap_status",
     {
       title: "Feedback bootstrap readiness",
       description: "一次读取当前 Chat 的 bounded feedback bootstrap 状态；不返回 principal、credential、secret 或 hash。",
-      inputSchema: {},
+      inputSchema: { ...workspaceIdShape(workspaceSource) },
       outputSchema: {
         workspaceId: z.string(),
         state: z.enum([
@@ -219,10 +234,11 @@ export function registerFeedbackTools(server: McpServer, workspace: Workspace): 
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
       _meta: modelVisibleMeta(),
     },
-    async (_args, extra: Extra) => {
+    async (args, extra: Extra) => {
       const denied = requireScope(extra.authInfo, CODEX_FEEDBACK_SCOPE);
       if (denied) return denied;
       try {
+        const workspace = resolveToolWorkspace(workspaceSource, args, extra.authInfo);
         const principal = principalFromExtra(extra);
         return ok(companionBootstrapReadiness({ workspaceId: workspace.id, principal }));
       } catch (error) {
@@ -237,7 +253,7 @@ export function registerFeedbackTools(server: McpServer, workspace: Workspace): 
       title: "Production feedback status",
       description:
         "只读已持久化的 production feedback receiver/outbox；不初始化、不 reconcile、不清理历史。过期投递由显式生命周期操作重新核验。",
-      inputSchema: {},
+      inputSchema: { ...workspaceIdShape(workspaceSource) },
       outputSchema: {
         workspaceId: z.string(),
         enabled: z.boolean(),
@@ -250,10 +266,11 @@ export function registerFeedbackTools(server: McpServer, workspace: Workspace): 
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
       _meta: modelVisibleMeta(),
     },
-    async (_args, extra: Extra) => {
+    async (args, extra: Extra) => {
       const denied = requireScope(extra.authInfo, CODEX_FEEDBACK_SCOPE);
       if (denied) return denied;
       try {
+        const workspace = resolveToolWorkspace(workspaceSource, args, extra.authInfo);
         const principal = principalFromExtra(extra);
         return ok({
           ...feedbackStatusSummary(readFeedbackStatusState(workspace.id), principal.fingerprint),
@@ -270,7 +287,7 @@ export function registerFeedbackTools(server: McpServer, workspace: Workspace): 
     {
       title: "Enable production feedback receiver",
       description: "为当前对话主体启用 production receiver。无绑定创建；同主体幂等；异主体需 takeover。",
-      inputSchema: { widgetId: z.string().min(1).max(128) },
+      inputSchema: { ...workspaceIdShape(workspaceSource), widgetId: z.string().min(1).max(128) },
       outputSchema: {
         workspaceId: z.string(),
         binding: z.object({
@@ -287,6 +304,7 @@ export function registerFeedbackTools(server: McpServer, workspace: Workspace): 
       const denied = requireScope(extra.authInfo, CODEX_FEEDBACK_SCOPE);
       if (denied) return denied;
       try {
+        const workspace = resolveToolWorkspace(workspaceSource, args, extra.authInfo);
         const principal = principalFromExtra(extra);
         const state = withConnectionMutation({ workspaceId: workspace.id, workspaceRoot: workspace.root, initialize: true }, () => enableReceiver({
           workspaceId: workspace.id,
@@ -314,6 +332,7 @@ export function registerFeedbackTools(server: McpServer, workspace: Workspace): 
       title: "Take over production feedback receiver",
       description: "明确接管；必须带 status 的 expectedEpoch。存在 claimed/outcome_unknown 时拒绝。",
       inputSchema: {
+        ...workspaceIdShape(workspaceSource),
         widgetId: z.string().min(1).max(128),
         expectedEpoch: z.number().int().nonnegative(),
       },
@@ -329,6 +348,7 @@ export function registerFeedbackTools(server: McpServer, workspace: Workspace): 
       const denied = requireScope(extra.authInfo, CODEX_FEEDBACK_SCOPE);
       if (denied) return denied;
       try {
+        const workspace = resolveToolWorkspace(workspaceSource, args, extra.authInfo);
         const principal = principalFromExtra(extra);
         const result = withConnectionMutation({ workspaceId: workspace.id, workspaceRoot: workspace.root }, () => takeoverReceiver({
           workspaceId: workspace.id,
@@ -353,6 +373,7 @@ export function registerFeedbackTools(server: McpServer, workspace: Workspace): 
       title: "Claim next ready feedback event",
       description: "先 reconcile 再领取最早 ready 事件；持久化 attempt 后返回。",
       inputSchema: {
+        ...workspaceIdShape(workspaceSource),
         bindingId: z.string().uuid(),
         epoch: z.number().int().nonnegative(),
       },
@@ -367,8 +388,8 @@ export function registerFeedbackTools(server: McpServer, workspace: Workspace): 
       const denied = requireScope(extra.authInfo, CODEX_FEEDBACK_SCOPE);
       if (denied) return denied;
       try {
+        const workspace = resolveToolWorkspace(workspaceSource, args, extra.authInfo);
         const principal = principalFromExtra(extra);
-        reconcileWorkspaceFeedback();
         // R5d3 review-fix：全局单飞 pre-mutation 检查——Bus in-flight 时拒绝 claim，
         // Feedback state 保持不变；cutover-owned legacy 事件不可领取。
         const claimed = claimNextForMcp({
@@ -390,6 +411,7 @@ export function registerFeedbackTools(server: McpServer, workspace: Workspace): 
       title: "Ack feedback event observed",
       description: "精确匹配 workspace/binding/epoch/principal/eventId/attemptId；exact claimed/outcome_unknown → observed；observed same-attempt idempotent。调用者必须已拥有正观察证据，工具不判断 UI 是否显示消息。",
       inputSchema: {
+        ...workspaceIdShape(workspaceSource),
         bindingId: z.string().uuid(),
         epoch: z.number().int().nonnegative(),
         eventId: z.string().regex(/^[a-f0-9]{32}$/),
@@ -403,6 +425,7 @@ export function registerFeedbackTools(server: McpServer, workspace: Workspace): 
       const denied = requireScope(extra.authInfo, CODEX_FEEDBACK_SCOPE);
       if (denied) return denied;
       try {
+        const workspace = resolveToolWorkspace(workspaceSource, args, extra.authInfo);
         const principal = principalFromExtra(extra);
         // FIX 6：legacy canonical ACK 终态化与 disposition 写入经 arbiter 串行，
         // 关闭与新 Bus reservation 的 terminalization TOCTOU 窗口。
@@ -430,15 +453,16 @@ export function registerFeedbackTools(server: McpServer, workspace: Workspace): 
     {
       title: "Stop production feedback receiver",
       description: "supersede 当前绑定；不删除 queued/history；不自动 unmount。",
-      inputSchema: {},
+      inputSchema: { ...workspaceIdShape(workspaceSource) },
       outputSchema: { stopped: z.boolean(), workspaceId: z.string() },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
       _meta: modelVisibleMeta(),
     },
-    async (_args, extra: Extra) => {
+    async (args, extra: Extra) => {
       const denied = requireScope(extra.authInfo, CODEX_FEEDBACK_SCOPE);
       if (denied) return denied;
       try {
+        const workspace = resolveToolWorkspace(workspaceSource, args, extra.authInfo);
         const principal = principalFromExtra(extra);
         stopReceiver({ workspaceId: workspace.id, principal });
         return ok({ stopped: true, workspaceId: workspace.id });
@@ -454,8 +478,9 @@ export function registerFeedbackTools(server: McpServer, workspace: Workspace): 
       title: "Create one-time companion pairing intent",
       description:
         "为当前 active binding 创建短时 one-time pairing intent。返回的 secret 只出现一次，需安全转交 browser companion；浏览器不得使用 MCP principal/admin token。",
-      inputSchema: {},
+      inputSchema: { ...workspaceIdShape(workspaceSource) },
       outputSchema: {
+        workspaceId: z.string(),
         intentId: z.string(),
         secret: z.string(),
         expiresAt: z.string(),
@@ -466,17 +491,19 @@ export function registerFeedbackTools(server: McpServer, workspace: Workspace): 
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
       _meta: modelVisibleMeta(),
     },
-    async (_args, extra: Extra) => {
+    async (args, extra: Extra) => {
       const denied = requireScope(extra.authInfo, CODEX_FEEDBACK_SCOPE);
       if (denied) return denied;
       try {
+        const workspace = resolveToolWorkspace(workspaceSource, args, extra.authInfo);
         const principal = principalFromExtra(extra);
         const bridgeOrigin = await companionBridgeOrigin(workspace.id);
+        resolveToolWorkspace(workspaceSource, args, extra.authInfo);
         const intent = withConnectionMutation({ workspaceId: workspace.id, workspaceRoot: workspace.root, kind: "companion" }, () => createPairingIntent({
           workspaceId: workspace.id,
           principal,
         }));
-        return ok({ ...intent, bridgeOrigin });
+        return ok({ ...intent, workspaceId: workspace.id, bridgeOrigin });
       } catch (error) {
         return mapError(error);
       }
@@ -492,6 +519,7 @@ export function registerFeedbackTools(server: McpServer, workspace: Workspace): 
         "不接受 principal 参数；错误 principal 拒绝且不消费 challenge。" +
         "这是 C2C delivery-route verification，不是新开发任务。",
       inputSchema: {
+        ...workspaceIdShape(workspaceSource),
         challengeId: z.string().uuid(),
         challengeDigest: z.string().regex(/^[a-f0-9]{64}$/),
       },
@@ -509,6 +537,7 @@ export function registerFeedbackTools(server: McpServer, workspace: Workspace): 
       if (denied) return denied;
       try {
         // Principal must come from official openai/session only — never a tool arg.
+        const workspace = resolveToolWorkspace(workspaceSource, args, extra.authInfo);
         const principal = principalFromExtra(extra);
         const result = confirmRouteAttestation({
           workspaceId: workspace.id,
@@ -533,7 +562,7 @@ export function registerFeedbackTools(server: McpServer, workspace: Workspace): 
     {
       title: "Companion pairing status",
       description: "读取当前 binding 的 companion 元数据；不返回 secret 或 credential hash。",
-      inputSchema: {},
+      inputSchema: { ...workspaceIdShape(workspaceSource) },
       outputSchema: {
         workspaceId: z.string(),
         ownsBinding: z.boolean(),
@@ -543,10 +572,11 @@ export function registerFeedbackTools(server: McpServer, workspace: Workspace): 
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
       _meta: modelVisibleMeta(),
     },
-    async (_args, extra: Extra) => {
+    async (args, extra: Extra) => {
       const denied = requireScope(extra.authInfo, CODEX_FEEDBACK_SCOPE);
       if (denied) return denied;
       try {
+        const workspace = resolveToolWorkspace(workspaceSource, args, extra.authInfo);
         const principal = principalFromExtra(extra);
         return ok(companionStatusForPrincipal({
           workspaceId: workspace.id,
@@ -563,15 +593,16 @@ export function registerFeedbackTools(server: McpServer, workspace: Workspace): 
     {
       title: "Revoke companion pairing",
       description: "撤销当前 companion 与未消费 pairing intent；不自动 stop receiver binding。",
-      inputSchema: {},
+      inputSchema: { ...workspaceIdShape(workspaceSource) },
       outputSchema: { revoked: z.boolean() },
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
       _meta: modelVisibleMeta(),
     },
-    async (_args, extra: Extra) => {
+    async (args, extra: Extra) => {
       const denied = requireScope(extra.authInfo, CODEX_FEEDBACK_SCOPE);
       if (denied) return denied;
       try {
+        const workspace = resolveToolWorkspace(workspaceSource, args, extra.authInfo);
         const principal = principalFromExtra(extra);
         return ok(revokeCompanion({ workspaceId: workspace.id, principal }));
       } catch (error) {

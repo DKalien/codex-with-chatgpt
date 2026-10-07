@@ -19,6 +19,7 @@ async function main() {
   const stateDir = path.dirname(bin);
   const args = process.argv.slice(2);
   let launchPin = null;
+  let gatewayLaunchPin = null;
   let metadata;
   if (args[0] === "supervisor" && args[1] === "run") {
     // Pin BEFORE loading any release code. GC/install share this maintenance fence.
@@ -72,12 +73,75 @@ async function main() {
       launchPin = { file, identity: JSON.stringify({ dev, ino, size, mtimeMs, ctimeMs,
         sha256: createHash("sha256").update(raw).digest("hex") }) };
     } finally { if (!maintenance.release()) throw new Error("MAINTENANCE_RELEASE_FAILED"); }
+  } else if (args[0] === "gateway" && args[1] === "supervisor" && args[2] === "run") {
+    if (args.length > 3 && (args.length !== 5 || args[3] !== "--state-dir" || path.resolve(args[4]) !== stateDir))
+      throw new Error("GATEWAY_SUPERVISOR_LAUNCH_ARGUMENTS_INVALID");
+    if (launcher !== path.join(stateDir, "bin", "c2c.js")) throw new Error("GATEWAY_SUPERVISOR_LAUNCH_PATH_INVALID");
+    const folder = path.join(stateDir, "gateway");
+    for (let current = folder; current !== path.parse(current).root; current = path.dirname(current)) {
+      const stat = fs.lstatSync(current);
+      if (!stat.isDirectory() || stat.isSymbolicLink() || fs.realpathSync(current) !== current)
+        throw new Error("GATEWAY_SUPERVISOR_LAUNCH_PATH_INVALID");
+    }
+    const configFile = path.join(folder, "supervisor.json");
+    const configStat = fs.lstatSync(configFile);
+    if (!configStat.isFile() || configStat.isSymbolicLink() || configStat.nlink !== 1 || configStat.size > 64 * 1024 || fs.realpathSync(configFile) !== configFile)
+      throw new Error("GATEWAY_SUPERVISOR_LAUNCH_CONFIG_INVALID");
+    const config = JSON.parse(fs.readFileSync(configFile, "utf8"));
+    if (config.scope !== "machine" || config.stableLauncher !== launcher)
+      throw new Error("GATEWAY_SUPERVISOR_LAUNCH_CONFIG_INVALID");
+    const maintenance = release.tryAcquireMaintenanceLock(stateDir, "gateway-supervisor-launch");
+    if (!maintenance.ok) throw new Error("MAINTENANCE_BUSY");
+    try {
+      const currentConfigStat = fs.lstatSync(configFile);
+      if (!currentConfigStat.isFile() || currentConfigStat.isSymbolicLink() || currentConfigStat.nlink !== 1 || currentConfigStat.size > 64 * 1024 ||
+          fs.realpathSync(configFile) !== configFile) throw new Error("GATEWAY_SUPERVISOR_LAUNCH_CONFIG_INVALID");
+      const currentConfig = JSON.parse(fs.readFileSync(configFile, "utf8"));
+      if (currentConfig.scope !== "machine" || currentConfig.stableLauncher !== launcher)
+        throw new Error("GATEWAY_SUPERVISOR_LAUNCH_CONFIG_INVALID");
+      metadata = release.readCurrent(stateDir, "fast");
+      if (!metadata) throw new Error("current.json 缺失");
+      const nonce = randomUUID();
+      const file = path.join(folder, `supervisor.${nonce}.launch.json`);
+      const raw = JSON.stringify({ version: 1, scope: "machine", buildId: metadata.runtimeBuildId,
+        nonce, launcherPath: launcher, createdAt: new Date().toISOString() });
+      const fd = fs.openSync(file, "wx", 0o600);
+      let created;
+      try {
+        fs.writeFileSync(fd, raw); fs.fsyncSync(fd);
+        created = fs.fstatSync(fd);
+      } finally { fs.closeSync(fd); }
+      const stat = fs.lstatSync(file);
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.dev !== created.dev || stat.ino !== created.ino ||
+          fs.realpathSync(file) !== file || fs.readFileSync(file, "utf8") !== raw)
+        throw new Error("GATEWAY_SUPERVISOR_LAUNCH_PIN_CHANGED");
+      const { dev, ino, size, mtimeMs, ctimeMs } = stat;
+      gatewayLaunchPin = { file, identity: JSON.stringify({ dev, ino, size, mtimeMs, ctimeMs,
+        sha256: createHash("sha256").update(raw).digest("hex") }) };
+    } finally { if (!maintenance.release()) throw new Error("MAINTENANCE_RELEASE_FAILED"); }
   } else metadata = release.readCurrent(stateDir, "fast");
   if (!metadata) throw new Error("current.json 缺失");
   const entry = path.join(metadata.releaseRoot, "bin", "c2c.js");
-  const result = spawnSync(process.execPath, [entry, ...args], { stdio: "inherit", windowsHide: true,
-    ...(launchPin ? { env: { ...process.env, C2C_SUPERVISOR_LAUNCH_PIN: launchPin.file,
-      C2C_SUPERVISOR_LAUNCH_IDENTITY: launchPin.identity } } : {}) });
+  // Windows broadcasts console Ctrl+C to the launcher and child; keep this parent alive for async child cleanup.
+  const holdSignal = () => {};
+  const holdWindowsSignals = process.platform === "win32";
+  if (holdWindowsSignals) {
+    process.on("SIGINT", holdSignal);
+    process.on("SIGTERM", holdSignal);
+  }
+  let result;
+  try {
+    result = spawnSync(process.execPath, [entry, ...args], { stdio: "inherit", windowsHide: true,
+      ...(launchPin ? { env: { ...process.env, C2C_SUPERVISOR_LAUNCH_PIN: launchPin.file,
+        C2C_SUPERVISOR_LAUNCH_IDENTITY: launchPin.identity } } : gatewayLaunchPin ? { env: { ...process.env,
+        C2C_STATE_DIR: stateDir, C2C_GATEWAY_SUPERVISOR_LAUNCH_PIN: gatewayLaunchPin.file,
+        C2C_GATEWAY_SUPERVISOR_LAUNCH_IDENTITY: gatewayLaunchPin.identity } } : {}) });
+  } finally {
+    if (holdWindowsSignals) {
+      process.off("SIGINT", holdSignal);
+      process.off("SIGTERM", holdSignal);
+    }
+  }
   // The release supervisor consumes its exact startup pin only after durable
   // runtime handoff. Exit alone proves no handoff; retain pre-handoff evidence.
   if (result.error) throw result.error;

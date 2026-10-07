@@ -6,10 +6,27 @@
 (function () {
   "use strict";
 
-  const LOCAL_ORIGIN_KEY = "c2c_companion_bridge_origin_v1";
   const SESSION_INTENT_KEY = "c2c_companion_pair_intent_v1";
+  const PROJECT_STORAGE_PREFIX = "c2c_companion_project_v1:";
+  const WORKSPACE_ID_PATTERN = /^[a-f0-9]{12}$/;
+  const PROJECT_MESSAGES = new Set([
+    "c2c.project.list", "c2c.project.add", "c2c.project.select", "c2c.project.resolve",
+  ]);
+
+  let projects = [];
+  let selectedWorkspaceId = null;
+  let selectedProject = null;
+  let projectActionBusy = false;
+  let projectActionButtonDisabled = null;
+  let selectionRevision = 0;
+  let projectRegistryRevision = 0;
 
   const els = {
+    workspaceSelect: document.getElementById("workspace-select"),
+    workspaceStatus: document.getElementById("workspace-status"),
+    addProject: document.getElementById("add-project"),
+    addProjectHint: document.getElementById("add-project-hint"),
+    operationsLink: document.getElementById("operations-link"),
     pageRoute: document.getElementById("page-route"),
     ownerStatus: document.getElementById("owner-status"),
     domSafety: document.getElementById("dom-safety"),
@@ -232,10 +249,19 @@
     } finally { clearTimeout(timer); }
   }
   const tabMessage = (tabId, message) => boundedRpc(message.type, () => chrome.tabs.sendMessage(tabId, message));
-  async function runtimeMessage(message) {
-    try { return await boundedRpc(message.type, () => chrome.runtime.sendMessage(message)); }
+  async function runtimeMessage(message, workspaceId = selectedWorkspaceId) {
+    const revision = selectionRevision;
+    let payload = message;
+    if (!PROJECT_MESSAGES.has(message?.type)) {
+      const explicitWorkspaceId = message?.workspaceId ?? workspaceId;
+      if (typeof explicitWorkspaceId !== "string" || !WORKSPACE_ID_PATTERN.test(explicitWorkspaceId)) {
+        return { ok: false, reason: "workspace_selection_required" };
+      }
+      payload = { ...message, workspaceId: explicitWorkspaceId };
+    }
+    try { return await boundedRpc(message.type, () => chrome.runtime.sendMessage(payload)); }
     catch (error) {
-      showStatusTimeout(error);
+      if (revision === selectionRevision) showStatusTimeout(error);
       return { ok: false, reason: String(error?.message).startsWith("popup_timeout:")
         ? `popup_timeout:${message.type}` : "popup_status_unavailable" };
     }
@@ -249,10 +275,16 @@
   }
   let refreshInFlight = null;
   async function refresh() {
-    if (refreshInFlight) return refreshInFlight;
-    refreshInFlight = refreshStatus().catch(error => { showStatusTimeout(error); return false; });
-    try { return await refreshInFlight; }
-    finally { refreshInFlight = null; }
+    const revision = selectionRevision;
+    if (refreshInFlight?.revision === revision) return refreshInFlight.promise;
+    const operation = { revision, promise: null };
+    operation.promise = refreshStatus(revision).catch(error => {
+      if (revision === selectionRevision) showStatusTimeout(error);
+      return false;
+    });
+    refreshInFlight = operation;
+    try { return await operation.promise; }
+    finally { if (refreshInFlight === operation) refreshInFlight = null; }
   }
 
   // The popup can remain open while route confirmation completes in ChatGPT.
@@ -282,46 +314,232 @@
     return tabMessage(tabId, { type: "c2c.status.request" });
   }
 
-  async function loadPairingPrefs() {
+  async function isCurrentPopupContext(revision, tab, parsed, workspaceId) {
+    const currentSelection = () => revision === selectionRevision
+      && (workspaceId === undefined || workspaceId === selectedWorkspaceId);
+    if (!currentSelection()) return false;
+    const current = await activeTab();
+    if (!currentSelection() || current?.id !== tab?.id) return false;
+    if (!parsed) return current?.url === tab?.url;
     try {
-      const local = await boundedRpc("origin_preferences", () => chrome.storage.local.get(LOCAL_ORIGIN_KEY));
-      if (typeof local[LOCAL_ORIGIN_KEY] === "string" && local[LOCAL_ORIGIN_KEY]) {
-        els.bridgeOrigin.value = local[LOCAL_ORIGIN_KEY];
+      return parseChatgptConversationRoute(current?.url ?? "", {
+        allowQueryOrHash: false,
+        conversationIdPolicy: "uuid",
+      })?.canonical === parsed.canonical;
+    } catch { return false; }
+  }
+
+  function setSelectedWorkspace(workspaceId) {
+    const previousWorkspaceId = selectedWorkspaceId;
+    selectedWorkspaceId = typeof workspaceId === "string" && WORKSPACE_ID_PATTERN.test(workspaceId)
+      ? workspaceId
+      : null;
+    selectedProject = projects.find(project => project.workspaceId === selectedWorkspaceId) ?? null;
+    if (previousWorkspaceId !== selectedWorkspaceId) {
+      if (els.pairSecret) els.pairSecret.value = "";
+      if (els.intentId) els.intentId.value = "";
+      for (const result of [els.bridgeState, els.shadowEvidence, els.shadowControls, els.shadowContainers,
+        els.writeProbeResult, els.sendProbeResult, els.productionSendResult, els.pairHint, els.pairConnectHint,
+        els.connectStatus, els.bridgePermissionStatus]) {
+        if (result) setText(result, "—", "");
       }
-    } catch { /* ignore */ }
+    }
+    if (els.workspaceSelect) {
+      els.workspaceSelect.value = selectedWorkspaceId ?? "";
+      els.workspaceSelect.disabled = projectActionBusy;
+    }
+    if (els.workspaceStatus) {
+      setText(els.workspaceStatus, selectedProject
+        ? `已选择 ${selectedProject.workspaceId} · ${selectedProject.bridgeOrigin}`
+        : "未选择项目；页面状态与连接操作保持关闭。", selectedProject ? "ok" : "warn");
+    }
+    if (els.operationsLink) {
+      const base = typeof chrome.runtime?.getURL === "function"
+        ? chrome.runtime.getURL("operations/operations.html")
+        : "../operations/operations.html";
+      els.operationsLink.href = selectedProject
+        ? `${base}?workspaceId=${encodeURIComponent(selectedProject.workspaceId)}`
+        : base;
+      els.operationsLink.setAttribute?.("aria-disabled", selectedProject ? "false" : "true");
+    }
+    if (previousWorkspaceId !== selectedWorkspaceId && typeof CustomEvent === "function") {
+      document.dispatchEvent?.(new CustomEvent("c2c-project-selection", {
+        detail: { workspaceId: selectedWorkspaceId },
+      }));
+    }
+  }
+
+  async function withProjectAction(workspaceId, project, work) {
+    if (projectActionBusy) return { ok: false, reason: "workspace_operation_busy" };
+    if (!workspaceId || selectedWorkspaceId !== workspaceId
+      || !project || project.workspaceId !== workspaceId) {
+      return { ok: false, reason: "workspace_selection_mismatch" };
+    }
+    const selectorWasDisabled = els.workspaceSelect?.disabled === true;
+    const buttons = [els.connectChat, els.pairConnect, els.pair];
+    projectActionButtonDisabled = buttons.map(button => button?.disabled === true);
+    selectionRevision += 1;
+    projectActionBusy = true;
+    if (els.workspaceSelect) els.workspaceSelect.disabled = true;
+    for (const button of buttons) {
+      if (button) button.disabled = true;
+    }
+    try { return await work(); }
+    finally {
+      projectActionBusy = false;
+      if (els.workspaceSelect) els.workspaceSelect.disabled = selectorWasDisabled;
+      buttons.forEach((button, index) => {
+        if (button) button.disabled = projectActionButtonDisabled[index];
+      });
+      projectActionButtonDisabled = null;
+    }
+  }
+
+  async function refreshProjectRegistry() {
+    const revision = ++projectRegistryRevision;
+    const result = await runtimeMessage({ type: "c2c.project.list" });
+    if (revision !== projectRegistryRevision) return false;
+    if (!result?.ok || !Array.isArray(result.projects)) {
+      if (els.workspaceStatus) setText(els.workspaceStatus, result?.reason || "项目列表不可用", "bad");
+      return false;
+    }
+    projects = result.projects.filter(project => WORKSPACE_ID_PATTERN.test(project?.workspaceId ?? "")
+      && typeof project?.bridgeOrigin === "string");
+    if (els.workspaceSelect) {
+      if (typeof Option === "function" && typeof els.workspaceSelect.replaceChildren === "function") {
+        els.workspaceSelect.replaceChildren(new Option("请选择项目", ""));
+        for (const project of projects) {
+          const option = new Option(`${project.workspaceId} · ${project.status?.connected ? "已连接" : project.bridgeOrigin}`, project.workspaceId);
+          els.workspaceSelect.add(option);
+        }
+      }
+    }
+    if (!projects.some(project => project.workspaceId === selectedWorkspaceId)) setSelectedWorkspace(null);
+    return true;
+  }
+
+  async function selectWorkspaceForActiveTab(workspaceId, revision) {
+    if (!workspaceId) {
+      setSelectedWorkspace(null);
+      await loadPairingPrefs(null);
+      return { ok: true, workspaceId: null };
+    }
+    if (!projects.some(project => project.workspaceId === workspaceId)) return { ok: false, reason: "workspace_not_registered" };
+    const tab = await activeTab();
+    if (revision !== selectionRevision) return { ok: false, stale: true, reason: "workspace_selection_changed" };
+    let parsed = null;
     try {
-      const session = await boundedRpc("pairing_preferences", () => chrome.storage.session.get(SESSION_INTENT_KEY));
-      if (typeof session[SESSION_INTENT_KEY] === "string" && session[SESSION_INTENT_KEY]) {
-        els.intentId.value = session[SESSION_INTENT_KEY];
-      }
+      parsed = parseChatgptConversationRoute(tab?.url ?? "", {
+        allowQueryOrHash: false,
+        conversationIdPolicy: "uuid",
+      });
+    } catch { parsed = null; }
+    if (!tab?.id || !parsed) return { ok: false, reason: "workspace_selection_invalid" };
+    const result = await runtimeMessage({
+      type: "c2c.project.select",
+      workspaceId,
+      tabId: tab.id,
+      canonicalRoute: parsed.canonical,
+    });
+    if (!await isCurrentPopupContext(revision, tab, parsed)) {
+      return { ok: false, stale: true, reason: "workspace_selection_changed" };
+    }
+    if (!result?.ok) return result ?? { ok: false, reason: "workspace_selection_failed" };
+    setSelectedWorkspace(workspaceId);
+    await loadPairingPrefs(selectedProject);
+    return result;
+  }
+
+  async function resolveWorkspaceForTab(tab, parsed, revision) {
+    if (projectActionBusy) return selectedProject;
+    if (!tab?.id || !parsed) {
+      setSelectedWorkspace(null);
+      return null;
+    }
+    const result = await runtimeMessage({
+      type: "c2c.project.resolve",
+      tabId: tab.id,
+      canonicalRoute: parsed.canonical,
+    });
+    if (projectActionBusy || !await isCurrentPopupContext(revision, tab, parsed)) return false;
+    const workspaceId = result?.ok && projects.some(project => project.workspaceId === result.workspaceId)
+      ? result.workspaceId
+      : null;
+    const changed = workspaceId !== selectedWorkspaceId;
+    setSelectedWorkspace(workspaceId);
+    if (changed) await loadPairingPrefs(selectedProject);
+    return selectedProject;
+  }
+
+  async function registerProjectFromPairJson() {
+    const fields = extractPairingFields(els.pairJson?.value);
+    if (!fields?.workspaceId || !fields.bridgeOrigin) {
+      setText(els.addProjectHint, "JSON 必须包含服务端返回的 workspaceId 与 bridgeOrigin。", "bad");
+      return;
+    }
+    let permission;
+    try { permission = bridgePermission(fields.bridgeOrigin); }
+    catch {
+      setText(els.addProjectHint, "bridge_origin_invalid", "bad");
+      return;
+    }
+    const result = await runtimeMessage({
+      type: "c2c.project.add",
+      project: { workspaceId: fields.workspaceId, bridgeOrigin: permission.origin },
+    });
+    if (!result?.ok) {
+      setText(els.addProjectHint, result?.reason || "项目登记失败", "bad");
+      return;
+    }
+    await refreshProjectRegistry();
+    setText(els.addProjectHint,
+      `已登记 ${fields.workspaceId}。请在上方明确选择该项目后再 Pair；此操作未请求权限，也未调用 Pair。`, "ok");
+  }
+
+  function scopedSessionKey(workspaceId) {
+    return `${PROJECT_STORAGE_PREFIX}${workspaceId}:${SESSION_INTENT_KEY}`;
+  }
+
+  async function loadPairingPrefs(project = selectedProject) {
+    if (!project) {
+      if (els.bridgeOrigin) els.bridgeOrigin.value = "";
+      return;
+    }
+    const workspaceId = project.workspaceId;
+    if (selectedWorkspaceId !== workspaceId) return;
+    els.bridgeOrigin.value = project.bridgeOrigin;
+    try {
+      const key = scopedSessionKey(workspaceId);
+      const session = await boundedRpc("pairing_preferences", () => chrome.storage.session.get(key));
+      if (selectedWorkspaceId !== workspaceId) return;
+      els.intentId.value = typeof session[key] === "string" && session[key] ? session[key] : "";
     } catch { /* ignore */ }
   }
 
   async function saveBridgeOrigin(origin) {
     const value = (origin ?? "").trim();
-    if (!value) return;
-    try {
-      await chrome.storage.local.set({ [LOCAL_ORIGIN_KEY]: value });
-    } catch { /* ignore */ }
+    return Boolean(selectedProject && selectedProject.bridgeOrigin === value);
   }
 
-  async function saveIntentSession(intentId) {
+  async function saveIntentSession(intentId, workspaceId = selectedWorkspaceId) {
+    if (typeof workspaceId !== "string" || !WORKSPACE_ID_PATTERN.test(workspaceId)) return;
+    const key = scopedSessionKey(workspaceId);
     try {
       if (intentId) {
-        await chrome.storage.session.set({ [SESSION_INTENT_KEY]: intentId });
+        await chrome.storage.session.set({ [key]: intentId });
       } else {
-        await chrome.storage.session.remove(SESSION_INTENT_KEY);
+        await chrome.storage.session.remove(key);
       }
     } catch { /* ignore */ }
   }
 
   /** Destroy secret from DOM + clear session intentId. Never touch secret storage. */
-  async function clearPairingForm({ includeIntent = true } = {}) {
+  async function clearPairingForm({ includeIntent = true, workspaceId = selectedWorkspaceId } = {}) {
     els.pairSecret.value = "";
     els.pairJson.value = "";
     if (includeIntent) {
       els.intentId.value = "";
-      await saveIntentSession(null);
+      await saveIntentSession(null, workspaceId);
     }
   }
 
@@ -341,12 +559,17 @@
       return null;
     }
     if (!obj || typeof obj !== "object") return null;
+    const workspaceId = typeof obj.workspaceId === "string" ? obj.workspaceId.trim() : undefined;
     const intentId = typeof obj.intentId === "string" ? obj.intentId.trim() : "";
     const secret = typeof obj.secret === "string" ? obj.secret : "";
     const hasBridgeOrigin = Object.prototype.hasOwnProperty.call(obj, "bridgeOrigin");
     if (hasBridgeOrigin && typeof obj.bridgeOrigin !== "string") return null;
+    if (workspaceId !== undefined && !WORKSPACE_ID_PATTERN.test(workspaceId)) return null;
+    if (Object.keys(obj).some(key => ![
+      "workspaceId", "bridgeOrigin", "intentId", "secret", "expiresAt", "bindingId", "epoch",
+    ].includes(key))) return null;
     if (!intentId || !secret) return null;
-    return { intentId, secret, bridgeOrigin: hasBridgeOrigin ? obj.bridgeOrigin.trim() : undefined };
+    return { workspaceId, intentId, secret, bridgeOrigin: hasBridgeOrigin ? obj.bridgeOrigin.trim() : undefined };
   }
 
   function bridgePermission(origin) {
@@ -359,9 +582,29 @@
     return { origin: url.origin, pattern: `${url.origin}/*` };
   }
 
-  async function refreshStatus() {
+  function projectForPairingFields(fields) {
+    if (!fields) return { ok: false, reason: "pairing_input_invalid" };
+    const workspaceId = fields.workspaceId ?? (projects.length === 1 ? selectedWorkspaceId : null);
+    if (!workspaceId || !WORKSPACE_ID_PATTERN.test(workspaceId)) {
+      return { ok: false, reason: "workspace_id_required" };
+    }
+    const project = projects.find(row => row.workspaceId === workspaceId);
+    if (!project) return { ok: false, reason: "workspace_not_registered" };
+    if (selectedWorkspaceId !== workspaceId) return { ok: false, reason: "workspace_selection_mismatch" };
+    let permission;
+    try {
+      permission = bridgePermission(fields.bridgeOrigin ?? project.bridgeOrigin);
+    } catch {
+      return { ok: false, reason: "bridge_origin_invalid" };
+    }
+    if (permission.origin !== project.bridgeOrigin) return { ok: false, reason: "project_origin_conflict" };
+    return { ok: true, project, permission };
+  }
+
+  async function refreshStatus(revision) {
     let statusError = null;
     const tab = await activeTab();
+    if (revision !== selectionRevision) return false;
     const href = tab?.url ?? "";
     let parsed = null;
     try {
@@ -378,6 +621,9 @@
       parsed ? "ok" : "bad",
     );
 
+    if (await resolveWorkspaceForTab(tab, parsed, revision) === false || revision !== selectionRevision) return false;
+    const refreshWorkspaceId = selectedWorkspaceId;
+
     let safety = null;
     let status = null;
     if (tab?.id != null && parsed) {
@@ -388,6 +634,9 @@
         status = await pageStatus(tab.id);
       } catch (error) { statusError = error; }
     }
+
+    if (!await isCurrentPopupContext(revision, tab, parsed, refreshWorkspaceId)
+      || (status?.transport?.workspaceId != null && status.transport.workspaceId !== refreshWorkspaceId)) return false;
 
     if (safety?.safety) {
       const s = safety.safety;
@@ -445,10 +694,13 @@
       && safety?.safety?.composer === "empty"
       && safety?.safety?.generation === "idle";
 
-    els.bind.disabled = !parsed || !tab?.id;
-    if (els.connectChat) els.connectChat.disabled = !parsed || !tab?.id;
-    if (els.pairConnect) els.pairConnect.disabled = !parsed || !tab?.id;
-    els.pair.disabled = !isOwner;
+    const hasWorkspace = Boolean(selectedProject);
+    const connectDisabled = !parsed || !tab?.id || !hasWorkspace;
+    if (projectActionBusy) projectActionButtonDisabled = [connectDisabled, connectDisabled, !isOwner];
+    els.bind.disabled = !parsed || !tab?.id || !hasWorkspace;
+    if (els.connectChat) els.connectChat.disabled = projectActionBusy || connectDisabled;
+    if (els.pairConnect) els.pairConnect.disabled = projectActionBusy || connectDisabled;
+    els.pair.disabled = projectActionBusy || !isOwner;
     if (els.rebindStart) {
       els.rebindStart.disabled = !isOwner || !transport?.bridgeOrigin || transport?.rebindPending === true;
     }
@@ -512,7 +764,7 @@
         : connectionText === "当前对话需要完成连接"
           ? "请再次点击“连接当前对话”完成 Web Sink 收敛。"
         : (status?.connectReason === "bootstrap_tool_missing"
-          ? "请在当前 Chat 启用 feedback_status 与 feedback_takeover 工具；不会自动重发自举消息。"
+          ? `请在当前 Chat 调用 feedback_status(workspaceId=${transport?.workspaceId ?? selectedWorkspaceId})；需要接管时调用 feedback_takeover(workspaceId=${transport?.workspaceId ?? selectedWorkspaceId}, expectedEpoch=..., widgetId=...)；不会自动重发自举消息。`
           : transport?.rebindPending
           ? "请回到 ChatGPT 完成确认。"
           : status?.connectState === "WAITING_TAKEOVER"
@@ -641,81 +893,102 @@
     if (els.connectChat) {
       els.connectChat.onclick = async () => {
         if (!tab?.id || !parsed) return;
-        const origin = els.bridgeOrigin.value.trim();
-        if (origin) {
+        const workspaceId = selectedWorkspaceId;
+        const project = selectedProject && { ...selectedProject };
+        if (!project || !workspaceId || project.workspaceId !== workspaceId) {
+          setText(els.connectStatus, "请先选择 workspace 项目。", "warn");
+          return;
+        }
+        await withProjectAction(workspaceId, project, async () => {
           let permission;
-          try {
-            permission = bridgePermission(origin);
-          } catch {
+          try { permission = bridgePermission(project.bridgeOrigin); }
+          catch {
             setText(els.connectStatus, friendlyConnectReason("bridge_origin_invalid"), "bad");
             setText(els.connectDiagnostic, "bridge_origin_invalid", "bad");
             return;
           }
-          // Keep the permission request inside the click user gesture. Do not await
-          // contains or perform any page/storage work before requesting it.
           let granted = false;
-          try {
-            granted = await chrome.permissions.request({ origins: [permission.pattern] });
-          } catch {
-            granted = false;
-          }
+          try { granted = await chrome.permissions.contains({ origins: [permission.pattern] }); }
+          catch { granted = false; }
           if (!granted) {
-            setText(els.connectStatus, "需要授权连接服务才能继续", "bad");
-            setText(els.connectDiagnostic, "bridge_permission_denied", "bad");
+            setText(els.connectStatus, friendlyConnectReason("bridge_permission_missing"), "warn");
+            setText(els.connectDiagnostic, "bridge_permission_missing", "warn");
+            setText(els.bridgePermissionStatus, "请展开设置，单独点击“授权连接服务”。", "warn");
             return;
           }
-          await saveBridgeOrigin(permission.origin);
-          els.bridgeOrigin.value = permission.origin;
-        }
-        const tabNow = await activeTab();
-        if (!tabNow?.id || tabNow.id !== tab.id) {
-          setText(els.connectStatus, friendlyConnectReason("tab_changed"), "bad");
-          setText(els.connectDiagnostic, "tab_changed", "bad");
-          return;
-        }
-        let res;
-        try {
-          // Fixed command only. Content script forwards real MessageSender identity.
-          res = await tabMessage(tabNow.id, { type: "c2c.connect.request" });
-        } catch {
-          res = { ok: false, reason: "content_script_unavailable" };
-        }
-        const converged = await refresh();
-        const reason = res?.ok ? "" : (res?.reason || "connect_failed");
-        const connected = res?.ok && res.state === "CONNECTED" && converged;
-        const text = res?.ok
-          ? (res.state === "CONNECTED"
-              ? (connected ? "当前对话已连接" : "当前对话尚未完成连接，请再次点击“连接当前对话”。")
-              : res.state === "WAITING_TAKEOVER"
-                ? "正在等待当前 Chat 接管连接"
-              : "已发送连接验证，请回到 ChatGPT 完成确认")
-          : friendlyConnectReason(reason);
-        const outcome = reason || (res.state === "CONNECTED" && !connected ? "连接尚未收敛" : "ok");
-        setText(els.connectDiagnostic, `${outcome}\n${els.connectDiagnostic.textContent}`, res?.ok ? (connected ? "ok" : "warn") : "bad");
-        setText(els.connectStatus, text, connected ? "ok" : res?.ok ? "warn" : "bad");
-        if (reason === "cold_pair_required") {
-          openFirstUse({ focusPairing: true });
-          setText(els.pairConnectHint, friendlyConnectReason(reason), "warn");
-        }
+          const tabNow = await activeTab();
+          let currentRoute = null;
+          try {
+            currentRoute = parseChatgptConversationRoute(tabNow?.url ?? "", {
+              allowQueryOrHash: false,
+              conversationIdPolicy: "uuid",
+            });
+          } catch { currentRoute = null; }
+          if (!tabNow?.id || tabNow.id !== tab.id || currentRoute?.canonical !== parsed.canonical) {
+            setText(els.connectStatus, friendlyConnectReason("tab_changed"), "bad");
+            setText(els.connectDiagnostic, "tab_changed", "bad");
+            return;
+          }
+          let res;
+          try {
+            // The selected workspace and canonical route are captured at click time.
+            res = await tabMessage(tabNow.id, {
+              type: "c2c.connect.request", workspaceId, canonicalRoute: parsed.canonical,
+            });
+          } catch {
+            res = { ok: false, reason: "content_script_unavailable" };
+          }
+          const converged = await refresh();
+          const reason = res?.ok ? "" : (res?.reason || "connect_failed");
+          const connected = res?.ok && res.state === "CONNECTED" && converged;
+          const text = res?.ok
+            ? (res.state === "CONNECTED"
+                ? (connected ? "当前对话已连接" : "当前对话尚未完成连接，请再次点击“连接当前对话”。")
+                : res.state === "WAITING_TAKEOVER"
+                  ? "正在等待当前 Chat 接管连接"
+                : "已发送连接验证，请回到 ChatGPT 完成确认")
+            : friendlyConnectReason(reason);
+          const outcome = reason || (res.state === "CONNECTED" && !connected ? "连接尚未收敛" : "ok");
+          setText(els.connectDiagnostic, `${outcome}\n${els.connectDiagnostic.textContent}`, res?.ok ? (connected ? "ok" : "warn") : "bad");
+          setText(els.connectStatus, text, connected ? "ok" : res?.ok ? "warn" : "bad");
+          if (reason === "cold_pair_required") {
+            openFirstUse({ focusPairing: true });
+            setText(els.pairConnectHint, friendlyConnectReason(reason), "warn");
+          }
+        });
       };
     }
 
     els.bind.onclick = async () => {
       if (!tab?.id || !parsed) return;
-      let bindReason = "";
-      let bindOk = false;
-      try {
-        const res = await tabMessage(tab.id, { type: "c2c.bind.request" });
-        bindOk = res?.ok === true;
-        if (!bindOk) bindReason = res?.reason || "bind_failed";
-      } catch {
-        bindOk = false;
-        bindReason = "content_script_unavailable";
-      }
-      await refresh();
-      if (!bindOk) {
-        setText(els.ownerStatus, `bind 失败: ${bindReason}`, "bad");
-      }
+      const workspaceId = selectedWorkspaceId;
+      const project = selectedProject && { ...selectedProject };
+      await withProjectAction(workspaceId, project, async () => {
+        let bindReason = "";
+        let bindOk = false;
+        try {
+          const tabNow = await activeTab();
+          let currentRoute = null;
+          try {
+            currentRoute = parseChatgptConversationRoute(tabNow?.url ?? "", {
+              allowQueryOrHash: false,
+              conversationIdPolicy: "uuid",
+            });
+          } catch { currentRoute = null; }
+          if (!tabNow?.id || tabNow.id !== tab.id || currentRoute?.canonical !== parsed.canonical) {
+            bindReason = "tab_changed";
+          } else {
+            const res = await tabMessage(tabNow.id, { type: "c2c.bind.request", workspaceId });
+            bindOk = res?.ok === true;
+            if (!bindOk) bindReason = res?.reason || "bind_failed";
+          }
+        } catch {
+          bindOk = false;
+          bindReason = "content_script_unavailable";
+        }
+        await refresh();
+        if (!bindOk) setText(els.ownerStatus, `bind 失败: ${bindReason}`, "bad");
+      });
     };
 
     els.unbind.onclick = async () => {
@@ -730,12 +1003,22 @@
         els.pairHint.className = "note bad";
         return;
       }
-      els.intentId.value = fields.intentId;
-      els.pairSecret.value = fields.secret;
-      await saveIntentSession(fields.intentId);
-      els.pairJson.value = "";
-      els.pairHint.textContent = "已提取 intentId / secret（secret 仅内存）。立即 Pair。";
-      els.pairHint.className = "note ok";
+      const resolved = projectForPairingFields(fields);
+      if (!resolved.ok) {
+        els.pairHint.textContent = resolved.reason;
+        els.pairHint.className = "note bad";
+        return;
+      }
+      const workspaceId = resolved.project.workspaceId;
+      await withProjectAction(workspaceId, resolved.project, async () => {
+        els.intentId.value = fields.intentId;
+        els.pairSecret.value = fields.secret;
+        await saveIntentSession(fields.intentId, workspaceId);
+        if (selectedWorkspaceId !== workspaceId) return;
+        els.pairJson.value = "";
+        els.pairHint.textContent = "已提取 intentId / secret（secret 仅内存）。立即 Pair。";
+        els.pairHint.className = "note ok";
+      });
     };
 
     if (els.pairConnect) {
@@ -745,110 +1028,124 @@
           setText(els.pairConnectHint, "无法读取配对信息，请粘贴完整 pairing JSON。", "bad");
           return;
         }
-        const originText = fields.bridgeOrigin ?? els.bridgeOrigin?.value?.trim() ?? "";
-        let permission;
-        try {
-          permission = bridgePermission(originText);
-        } catch {
-          setText(els.pairConnectHint, "首次使用需要先在连接修复中设置有效的连接服务地址。", "bad");
-          setText(els.connectDiagnostic, "bridge_origin_invalid", "bad");
+        const resolved = projectForPairingFields(fields);
+        if (!resolved.ok) {
+          setText(els.pairConnectHint, `配对项目无效（${resolved.reason}）。`, "bad");
+          setText(els.connectDiagnostic, resolved.reason, "bad");
           return;
         }
+        const workspaceId = resolved.project.workspaceId;
+        const project = { ...resolved.project };
+        const permission = resolved.permission;
+        await withProjectAction(workspaceId, project, async () => {
+          // Pair only consumes a separately granted permission. This check must
+          // precede owner proof, intent writes, and the /pair request.
+          let granted = false;
+          try { granted = await chrome.permissions.contains({ origins: [permission.pattern] }); }
+          catch { granted = false; }
+          if (!granted) {
+            setText(els.pairConnectHint, "bridge_permission_missing：请单独点击“授权连接服务”。配对信息仍保留在本次 popup 内存中。", "warn");
+            setText(els.connectDiagnostic, "bridge_permission_missing", "warn");
+            setText(els.bridgePermissionStatus, "请展开设置，单独点击“授权连接服务”。", "warn");
+            return;
+          }
+          await saveIntentSession(fields.intentId, workspaceId);
+          const tabNow = await activeTab();
+          let currentRoute = null;
+          try {
+            currentRoute = parseChatgptConversationRoute(tabNow?.url ?? "", {
+              allowQueryOrHash: false,
+              conversationIdPolicy: "uuid",
+            });
+          } catch { currentRoute = null; }
+          if (!tabNow?.id || tabNow.id !== tab?.id || currentRoute?.canonical !== parsed.canonical) {
+            setText(els.pairConnectHint, "当前页面已变化，请重新打开扩展后再试。", "bad");
+            setText(els.connectDiagnostic, "tab_changed", "bad");
+            return;
+          }
 
-        // This call must happen synchronously in the click gesture, before any
-        // storage, tab, or runtime work. Pairing secret remains popup memory.
-        let granted = false;
-        try {
-          granted = await chrome.permissions.request({ origins: [permission.pattern] });
-        } catch {
-          granted = false;
-        }
-        if (!granted) {
-          setText(els.pairConnectHint, "需要授权连接服务才能继续。配对信息仍保留在本次 popup 内存中。", "bad");
-          setText(els.connectDiagnostic, "bridge_permission_denied", "bad");
-          return;
-        }
+          let proof;
+          try {
+            proof = await tabMessage(tabNow.id, {
+              type: "c2c.owner-proof.request", workspaceId, canonicalRoute: parsed.canonical,
+            });
+          } catch { proof = null; }
+          if (!proof?.ok || !proof.proof?.id) {
+            setText(els.pairConnectHint, "当前页面无法完成安全校验，请刷新 ChatGPT 页面后再试。", "bad");
+            setText(els.connectDiagnostic, proof?.reason || "owner_proof_missing", "bad");
+            return;
+          }
 
-        await saveBridgeOrigin(permission.origin);
-        await saveIntentSession(fields.intentId);
-        if (els.bridgeOrigin) els.bridgeOrigin.value = permission.origin;
-        const tabNow = await activeTab();
-        if (!tabNow?.id || tabNow.id !== tab?.id) {
-          setText(els.pairConnectHint, "当前页面已变化，请重新打开扩展后再试。", "bad");
-          setText(els.connectDiagnostic, "tab_changed", "bad");
-          return;
-        }
+          let pairAttempted = false;
+          let pairResult;
+          try {
+            pairAttempted = true;
+            pairResult = await runtimeMessage({
+              type: "c2c.pair",
+              workspaceId,
+              tabId: tabNow.id,
+              canonicalRoute: parsed.canonical,
+              bridgeOrigin: project.bridgeOrigin,
+              intentId: fields.intentId,
+              secret: fields.secret,
+              ownerProofId: proof.proof.id,
+            }, workspaceId);
+          } catch (error) {
+            pairResult = { ok: false, reason: error?.message || "pair_runtime_error" };
+          } finally {
+            if (pairAttempted) await clearPairingForm({ includeIntent: true, workspaceId });
+          }
 
-        let proof;
-        try {
-          proof = await tabMessage(tabNow.id, { type: "c2c.owner-proof.request" });
-        } catch {
-          proof = null;
-        }
-        if (!proof?.ok || !proof.proof?.id) {
-          setText(els.pairConnectHint, "当前页面无法完成安全校验，请刷新 ChatGPT 页面后再试。", "bad");
-          setText(els.connectDiagnostic, proof?.reason || "owner_proof_missing", "bad");
-          return;
-        }
+          if (!pairResult?.ok || pairResult.transport?.workspaceId !== workspaceId) {
+            const reason = pairResult?.ok
+              ? "pair_workspace_mismatch"
+              : pairResult?.reason || (typeof pairResult?.status === "number" ? `http_${pairResult.status}` : "pair_failed");
+            setText(els.pairConnectHint, `配对未成功（${reason}），请重新粘贴配对信息。`, "bad");
+            setText(els.connectDiagnostic, reason, "bad");
+            await refresh();
+            return;
+          }
 
-        let pairAttempted = false;
-        let pairResult;
-        try {
-          pairAttempted = true;
-          pairResult = await runtimeMessage({
-            type: "c2c.pair",
-            bridgeOrigin: permission.origin,
-            intentId: fields.intentId,
-            secret: fields.secret,
-            ownerProofId: proof.proof.id,
-          });
-        } catch (error) {
-          pairResult = { ok: false, reason: error?.message || "pair_runtime_error" };
-        } finally {
-          if (pairAttempted) await clearPairingForm({ includeIntent: true });
-        }
-
-        if (!pairResult?.ok) {
-          const reason = pairResult?.reason || (typeof pairResult?.status === "number" ? `http_${pairResult.status}` : "pair_failed");
-          setText(els.pairConnectHint, `配对未成功（${reason}），请重新粘贴配对信息。`, "bad");
-          setText(els.connectDiagnostic, reason, "bad");
-          await refresh();
-          return;
-        }
-
-        let connectResult;
-        try {
-          connectResult = await tabMessage(tabNow.id, { type: "c2c.connect.request" });
-        } catch {
-          connectResult = { ok: false, reason: "content_script_unavailable" };
-        }
-        const converged = await refresh();
-        const connectReason = connectResult?.ok ? "" : (connectResult?.reason || "connect_failed");
-        if (connectResult?.ok) {
-          const connected = connectResult.state === "CONNECTED" && converged;
-          setText(els.pairConnectHint, connected
-            ? "当前对话已连接。"
-            : connectResult.state === "CONNECTED"
-              ? "当前对话尚未完成连接，请再次点击“连接当前对话”。"
-              : "已发送连接验证，请回到 ChatGPT 完成确认。", connected ? "ok" : "warn");
-          setText(els.connectStatus, connected
-            ? "当前对话已连接"
-            : connectResult.state === "CONNECTED"
-              ? "当前对话尚未完成连接，请再次点击“连接当前对话”。"
-              : "已发送连接验证，请回到 ChatGPT 完成确认", connected ? "ok" : "warn");
-          if (els.firstUseSettings) els.firstUseSettings.open = false;
-        } else {
-          setText(els.pairConnectHint, friendlyConnectReason(connectReason), "bad");
-          setText(els.connectDiagnostic, connectReason, "bad");
-        }
+          let connectResult;
+          try {
+            connectResult = await tabMessage(tabNow.id, {
+              type: "c2c.connect.request", workspaceId, canonicalRoute: parsed.canonical,
+            });
+          } catch { connectResult = { ok: false, reason: "content_script_unavailable" }; }
+          const converged = await refresh();
+          const connectReason = connectResult?.ok ? "" : (connectResult?.reason || "connect_failed");
+          if (connectResult?.ok) {
+            const connected = connectResult.state === "CONNECTED" && converged;
+            setText(els.pairConnectHint, connected
+              ? "当前对话已连接。"
+              : connectResult.state === "CONNECTED"
+                ? "当前对话尚未完成连接，请再次点击“连接当前对话”。"
+                : "已发送连接验证，请回到 ChatGPT 完成确认。", connected ? "ok" : "warn");
+            setText(els.connectStatus, connected
+              ? "当前对话已连接"
+              : connectResult.state === "CONNECTED"
+                ? "当前对话尚未完成连接，请再次点击“连接当前对话”。"
+                : "已发送连接验证，请回到 ChatGPT 完成确认", connected ? "ok" : "warn");
+            if (els.firstUseSettings) els.firstUseSettings.open = false;
+          } else {
+            setText(els.pairConnectHint, friendlyConnectReason(connectReason), "bad");
+            setText(els.connectDiagnostic, connectReason, "bad");
+          }
+        });
       };
     }
 
     els.grantBridgeAccess.onclick = async () => {
+      const workspaceId = selectedWorkspaceId;
+      const project = selectedProject && { ...selectedProject };
+      if (!workspaceId || !project) {
+        setText(els.bridgePermissionStatus, "请先选择已登记项目。", "warn");
+        return;
+      }
+      await withProjectAction(workspaceId, project, async () => {
       let permission;
-      try {
-        permission = bridgePermission(els.bridgeOrigin.value);
-      } catch {
+      try { permission = bridgePermission(project.bridgeOrigin); }
+      catch {
         setText(els.bridgePermissionStatus, "bridge_origin_invalid", "bad");
         return;
       }
@@ -867,46 +1164,76 @@
 
       if (granted) {
         await saveBridgeOrigin(permission.origin);
-        els.bridgeOrigin.value = permission.origin;
-        setText(els.bridgePermissionStatus, "Bridge access granted", "ok");
+        if (selectedWorkspaceId === workspaceId) {
+          els.bridgeOrigin.value = permission.origin;
+          setText(els.bridgePermissionStatus, "Bridge access granted", "ok");
+        }
       } else {
         setText(els.bridgePermissionStatus, "Bridge access denied", "bad");
       }
+      });
     };
 
     els.pair.onclick = async () => {
-      const origin = els.bridgeOrigin.value.trim();
+      const workspaceId = selectedWorkspaceId;
+      const project = selectedProject && { ...selectedProject };
       const intentId = els.intentId.value.trim();
       const secret = els.pairSecret.value;
-      if (!origin || !intentId || !secret) {
+      if (!workspaceId || !project || project.workspaceId !== workspaceId) {
+        setText(els.transportStatus, "workspace_selection_required", "bad");
+        return;
+      }
+      const rawPairJson = els.pairJson?.value?.trim() ?? "";
+      if (rawPairJson) {
+        const fields = extractPairingFields(rawPairJson);
+        const resolved = fields && projectForPairingFields(fields);
+        if (!resolved?.ok || resolved.project.workspaceId !== workspaceId) {
+          setText(els.transportStatus, resolved?.reason || "workspace_selection_mismatch", "bad");
+          return;
+        }
+      }
+      if (!intentId || !secret) {
         setText(els.transportStatus, "缺少 origin / intentId / secret", "bad");
         return;
       }
       if (!tab?.id) return;
-      try {
+      await withProjectAction(workspaceId, project, async () => {
+       let pairAttempted = false;
+       try {
         let permission;
         try {
-          permission = bridgePermission(origin);
+          permission = bridgePermission(project.bridgeOrigin);
         } catch {
           setText(els.transportStatus, "bridge_origin_invalid", "bad");
           return;
         }
-        await saveBridgeOrigin(permission.origin);
-        await saveIntentSession(intentId);
-        els.bridgeOrigin.value = permission.origin;
+        if (els.bridgeOrigin.value.trim() !== permission.origin) {
+          setText(els.transportStatus, "project_origin_conflict", "bad");
+          return;
+        }
         const granted = await chrome.permissions.contains({ origins: [permission.pattern] });
         if (!granted) {
           setText(els.transportStatus, "bridge_permission_missing", "bad");
           return;
         }
+        await saveIntentSession(intentId, workspaceId);
         const tabNow = await activeTab();
-        if (!tabNow?.id || tabNow.id !== tab.id) {
+        let currentRoute = null;
+        try {
+          currentRoute = parseChatgptConversationRoute(tabNow?.url ?? "", {
+            allowQueryOrHash: false,
+            conversationIdPolicy: "uuid",
+          });
+        } catch { currentRoute = null; }
+        if (!tabNow?.id || tabNow.id !== tab.id || currentRoute?.canonical !== parsed?.canonical) {
           setText(els.transportStatus, "tab 已变化；请重开 popup", "bad");
           return;
         }
         let proof;
         try {
-          proof = await tabMessage(tabNow.id, { type: "c2c.owner-proof.request" });
+          proof = await tabMessage(tabNow.id, {
+            type: "c2c.owner-proof.request", workspaceId, canonicalRoute: parsed.canonical,
+          });
         } catch {
           proof = null;
         }
@@ -914,18 +1241,24 @@
           setText(els.transportStatus, `owner proof 失败: ${proof?.reason || "no_content"}`, "bad");
           return;
         }
+        pairAttempted = true;
         const res = await runtimeMessage({
           type: "c2c.pair",
-          bridgeOrigin: permission.origin,
+          workspaceId,
+          tabId: tabNow.id,
+          canonicalRoute: parsed.canonical,
+          bridgeOrigin: project.bridgeOrigin,
           intentId,
           secret,
           ownerProofId: proof.proof.id,
-        });
+        }, workspaceId);
         // refresh() rewrites transport-status; apply pair result AFTER it so HTTP reason is kept.
         await refresh();
-        const failReason = res?.reason
+        const failReason = res?.ok && res.transport?.workspaceId !== workspaceId
+          ? "pair_workspace_mismatch"
+          : res?.reason
           || (typeof res?.status === "number" ? `http_${res.status}` : "unknown");
-        if (res?.ok) {
+        if (res?.ok && failReason !== "pair_workspace_mismatch") {
           setText(els.transportStatus, "paired — Route verification: PENDING", "bad");
           els.pairHint.textContent =
             "Pairing 成功。Route verification=PENDING。请在本 conversation 点击 Verify this conversation route；Production eligible=no。secret 已清空。";
@@ -939,8 +1272,9 @@
         await refresh().catch(() => undefined);
         setText(els.transportStatus, `pair 异常: ${e?.message || "runtime"}`, "bad");
       } finally {
-        await clearPairingForm({ includeIntent: true });
+        if (pairAttempted) await clearPairingForm({ includeIntent: true, workspaceId });
       }
+      });
     };
 
     if (els.verifyRoute) {
@@ -1468,19 +1802,51 @@
       await runtimeMessage({ type: "c2c.transport.clear" });
       await refresh();
     };
+    for (const button of [els.unbind, els.verifyRoute, els.rebindStart, els.rebindComplete, els.fetchState,
+      els.reserve, els.release, els.recover, els.autonomyShadow, els.autonomyArm, els.autonomyDisable,
+      els.retireUnknown, els.connectAbandon, els.routeAttestAbandon, els.shadowInspect, els.writeProbe,
+      els.sendProbe, els.sendProbeReset, els.productionSend, els.clearTransport]) {
+      if (typeof button?.onclick !== "function") continue;
+      const action = button.onclick;
+      button.onclick = (...args) => withProjectAction(selectedWorkspaceId,
+        selectedProject && { ...selectedProject }, () => action(...args));
+    }
     if (statusError) { showStatusTimeout(statusError); return false; }
     return isOwner && routeMatchesTransport && transport?.routeVerification === "VERIFIED"
       && transport?.r5cConnected === true;
   }
 
   (async () => {
-    await loadPairingPrefs();
+    if (els.workspaceSelect?.addEventListener) {
+      els.workspaceSelect.addEventListener("change", async () => {
+        if (projectActionBusy) {
+          els.workspaceSelect.value = selectedWorkspaceId ?? "";
+          return;
+        }
+        const revision = ++selectionRevision;
+        const previous = selectedWorkspaceId;
+        const result = await selectWorkspaceForActiveTab(els.workspaceSelect.value, revision);
+        if (revision !== selectionRevision || result?.stale) return;
+        if (!result?.ok) {
+          if (els.workspaceSelect) els.workspaceSelect.value = previous ?? "";
+          setText(els.workspaceStatus, result?.reason || "项目选择失败", "bad");
+          return;
+        }
+        await refresh();
+      });
+    }
+    if (els.addProject?.addEventListener) {
+      els.addProject.addEventListener("click", () => { void registerProjectFromPairJson(); });
+    }
+    await refreshProjectRegistry();
     // Popup may be destroyed on blur (e.g. copying JSON) — save on input, not change.
     els.bridgeOrigin.addEventListener("input", () => {
-      void saveBridgeOrigin(els.bridgeOrigin.value);
+      if (selectedProject && els.bridgeOrigin.value !== selectedProject.bridgeOrigin) {
+        setText(els.bridgePermissionStatus, "Bridge 地址由已登记 workspace 固定；请更换项目 JSON。", "warn");
+      }
     });
     els.intentId.addEventListener("input", () => {
-      void saveIntentSession(els.intentId.value.trim() || null);
+      void saveIntentSession(els.intentId.value.trim() || null, selectedWorkspaceId);
     });
     // Secret input: never write to storage.
     await refresh();
