@@ -887,7 +887,8 @@ describe("G3 route attestation browser contract (source)", () => {
     expect(js).toMatch(/还差一步完成连接/);
     expect(js).toMatch(/请完成当前对话验证/);
     expect(js).toMatch(/首次使用需要授权连接服务/);
-    expect(js).toMatch(/连接遇到问题，请展开连接设置查看详情/);
+    expect(js).toMatch(/连接未完成/);
+    expect(js).toMatch(/请在本机确认连接/);
     expect(js).toMatch(/connectDiagnostic/);
     expect(js).not.toMatch(/setText\(els\.connectStatus, reason/);
   });

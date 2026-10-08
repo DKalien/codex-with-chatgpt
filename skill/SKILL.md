@@ -46,12 +46,18 @@ endpoint 的 workspace。`TURN_ENDED` 是 App Server 生命周期事实，不是
 targetId/taskId 必须属于同一项目。OAuth 登录本身不授权任何本机项目，缺失授权由本机用户
 明确登记，网页工具不能自行登记、扫描目录或扩大范围。新 Gateway client 不继承旧反馈
 binding，接管仍要求实际对话证明和 fresh expectedEpoch；不在 outcome_unknown 后换插件重发。
+需要当前 Desktop 会话执行时，先调用 `codex_desktop_status` 核对本机绑定，再使用返回的
+bindingId 和同一 workspaceId 调用 `codex_desktop_send`。Gateway 直接通过现有安全 sender 投递，
+要求 idle 并遵守现有 busy 门禁，不持久排队、不自动转投或重发；仅可信完成 receipt 的短暂
+busy-tail 由既有 sender 有界等待。Desktop 工具独立于后台 Remote enabled/official；
+`codex_submit_task` 始终是后台 Remote，不得用它替代 Desktop 或自行创建新 target 绕过失败。
 源码开发不授权部署、启动、迁移或停用旧 Connector；M4/M5 live 验收门保持独立。
 仅开发或读取文档不授权启用、部署、重启服务或更改现有绑定。普通 Chat 的自动回流仍使用 Companion；MCP Events、Work Events、普通 Chat 原生 Events 或 App Server `TURN_ENDED` 的源码/单次观察均不等于对应 Events 支持已验收。
 
 **Desktop Control（独立实验性 MVP）:** 默认关闭，只支持本机用户绑定、已在 Desktop 加载的
-已有会话。ChatGPT 只有在网页用户确认完整方案后，才可调用 `codex_desktop_send`；它只等待真实
-Bridge 持久接收回执，收到 `deliveryStatus=queued` 后本轮即可结束；后台在目标空闲后投递，`accepted` 才表示真实接收，二者均不表示执行完成。不要自动新建
+已有会话。ChatGPT 只有在网页用户确认完整方案后，才可调用 `codex_desktop_send`。Bridge 入口
+持久接收并返回 `deliveryStatus=queued`，后台在目标空闲后投递；Gateway 入口直接发送，不排队。
+`accepted` 才表示真实接收，queued/accepted 均不表示执行完成。不要自动新建
 会话、steer、interrupt、轮询或通知；本机绑定、授权和恢复规则见 `docs/desktop-control.md`。
 
 **Golden rules**
@@ -882,6 +888,12 @@ Desktop Control 是发送到本机 Desktop 已有会话的独立 MCP 路径，�
 由本机用户明确绑定的 thread；不自动新建会话，不做 steer、interrupt、实时进度、推送通知或
 网页持续轮询。
 
+### 日常 UX：连接网页回流
+
+已有配对的 Browser Companion 在具体 ChatGPT 对话中点击“连接当前对话”，新建或切换回流目标时由本机确认窗显示工作区与完整目标 URL。用户本人确认后，系统轮换 Companion 凭据并收敛 Web Sink；不需要用户输入 binding、epoch 或让 ChatGPT 执行验证指令。该本机确认仅授权结果回流，不授权执行任务，也不变更 Desktop 目标或 Gateway OAuth scopes。
+
+空白首页尚无具体 conversation URL 时，先建立对话。首次未配对仍走配对与明确的 Bridge 访问授权；旧 Bridge 不支持本机确认时应升级兼容运行时，不能静默发送旧式验证消息。既有未知发送与旧流程按原安全恢复规则处理；不能清除 journal 或伪造已连接。构建/安装不等于当前 Bridge 已升级，也不等于扩展已重载或真实网页流程已通过。
+
 ### 日常 UX：绑定当前 Desktop 会话
 
 用户在当前 Desktop 会话中说“把这个会话绑定并启用给 ChatGPT”（或同义表达），或
@@ -968,6 +980,8 @@ Desktop 行为；不能声称 Desktop Control 能抵御已经获授权客户端�
 或平台策略拦截、拒绝或要求审批。send 的风险标注保持
 `readOnlyHint:false`、`destructiveHint:true`、`openWorldHint:true`、`idempotentHint:true`；
 `idempotent` 仅表示同一 `commandId` 防止重复尝试，不是网络 exactly-once。
+
+先调用 `codex_desktop_status` 核对当前本机绑定和可用性；失败时停止，不自动改用后台 Remote。Gateway 的直接 send 不返回排队接收凭据，遵守既有 idle/busy 门禁且不自动重试。
 
 Bridge 返回 `deliveryStatus=queued` 表示完整任务已持久接收；网页本轮可以结束。目标 busy 时排队，不猜测 steer/插播协议。只有真实 `threadId`/`turnId` 接受凭据才表示 `accepted`；二者都不是 `completed` 或测试通过。后台提交点重新验证 OAuth、enable、frozen target、owner 与审批，不能借入队绕过权限。无 owner、离线或身份不明时不发送，保留本条明确状态；不要持续轮询等待完成。
 

@@ -81,6 +81,9 @@ export function verifyCompanionCredential(input: {
   // Authentication is read-only; lifecycle mutations perform their own recovery.
   const state = raw;
   const companion = rawCompanion;
+  if (companion.routeAttestation?.proofKind === "local_user") {
+    throw new CompanionError("COMPANION_ROUTE_UNVERIFIED", "本机 route 授权不提供 Feedback principal 证明");
+  }
   if (!state.binding || state.binding.status !== "active") {
     throw new FeedbackError("FEEDBACK_NOT_ENABLED", "production feedback 未启用");
   }

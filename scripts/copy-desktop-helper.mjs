@@ -21,3 +21,8 @@ for (const relativePath of HELPER_FILES) {
   fs.mkdirSync(new URL(".", target), { recursive: true });
   fs.copyFileSync(new URL(relativePath, source), target);
 }
+
+// 本机 route 授权使用独立 UI helper，不扩 Desktop IPC 协议。
+const routeTarget = new URL("../dist/feedback/local-route-confirm.py", import.meta.url);
+fs.mkdirSync(new URL(".", routeTarget), { recursive: true });
+fs.copyFileSync(new URL("../src/feedback/local-route-confirm.py", import.meta.url), routeTarget);

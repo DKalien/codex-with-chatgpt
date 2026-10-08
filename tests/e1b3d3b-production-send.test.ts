@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import fs from "node:fs";
+import { sanitizeRecoveryDiagnostic } from "../browser-companion/autonomy.js";
 import path from "node:path";
 import vm from "node:vm";
 import { fileURLToPath } from "node:url";
@@ -3305,6 +3306,45 @@ describe("E1b3d3b2 marker representation diagnostic", () => {
     expect(dump).not.toContain("ATTEMPT_ID");
   });
 
+  it.each([0, 3, 8, 15, -1, 16, 1.5, "secret", { message: MESSAGE }])(
+    "rich reader reason code %j is allowlisted through recovery, autonomy and popup", async code => {
+      const input = {
+        richBodyReasonCode: code, richBodyWrapperScannedCount: 64,
+        richBodyNodeScannedCount: 128, richBodyCount: 1,
+        richBodyRebuildSucceeded: false, richBodyExact: false,
+        richBodyRebuiltLength: 123, richBodyRebuiltLineCount: 4,
+        richBodyLengthDelta: -2, richBodyFirstMismatchIndex: 12,
+        raw: MESSAGE, html: "<p>secret</p>", selector: "private-selector", credential: "secret",
+      };
+      const expected = { ...input } as Record<string, unknown>;
+      for (const key of ["raw", "html", "selector", "credential"]) delete expected[key];
+      if (!Number.isInteger(code) || Number(code) < 0 || Number(code) > 15) delete expected.richBodyReasonCode;
+      expect(sanitizeMarkerRepresentation(input)).toEqual(expected);
+      expect(sanitizeObservationDiagnostic({ representation: input })?.representation).toEqual(expected);
+      expect(sanitizeRecoveryDiagnostic({ representation: input })?.representation).toEqual(expected);
+      const spy = makeSpies({
+        journal: markOutcomeUnknown(claimedJournal(), {}),
+        inFlight: { status: "outcome_unknown", eventId: EVENT_ID, reservationId: RES_ID, attemptId: ATTEMPT, message: MESSAGE, messageSha256: MESSAGE_SHA },
+        findCanonicalUserTurn: () => ({ ok: false, reason: "not_observed", diagnostic: { representation: input } }),
+      });
+      const result = await recoverProductionSend(spy);
+      expect(result.diagnostic?.representation).toEqual(expected);
+      expect(spy.calls).toMatchObject({ write: 0, click: 0, beginSend: 0, ack: 0 });
+      expect(spy.journal.state).toBe("OUTCOME_UNKNOWN");
+      const popup = fs.readFileSync(path.join(companionRoot, "popup", "popup.js"), "utf8");
+      const start = popup.indexOf("  function formatRecoverResult(");
+      const end = popup.indexOf("  /** Last known Arm gates", start);
+      const scope: Record<string, any> = {};
+      vm.runInNewContext(popup.slice(start, end), scope);
+      const formatted = scope.formatRecoverResult({ diagnostic: { representation: input } });
+      const json = formatted.split("\n").find((line: string) => line.startsWith("diagnostic="));
+      expect(JSON.parse(json.slice("diagnostic=".length)).representation).toEqual(expected);
+      expect(formatted).not.toContain("secret");
+      expect(formatted).not.toContain("ATTEMPT_ID");
+      expect(formatted).not.toContain("private-selector");
+    },
+  );
+
   it("G. production recovery zero-mutation contracts unchanged", () => {
     const sw = fs.readFileSync(path.join(companionRoot, "service-worker.js"), "utf8");
     const tickStart = sw.indexOf("async function maybeRunAutonomyTick");
@@ -3709,6 +3749,142 @@ describe("command29 rich USER paragraph observation", () => {
   const find = (f: ReturnType<typeof fixture>, expected = message) =>
     findCanonicalUserTurn(f.doc, { message: expected, attemptId: ATTEMPT });
 
+
+  // 脱敏复刻：预格式正文直接含文本和 12 个 CODE，折叠 UI 是正文外的兄弟节点。
+  const codeValues = Array.from({ length: 12 }, (_, i) => `item ${i + 1} → ready`);
+  const plainPrefix = MESSAGE + Array.from({ length: 7 }, (_, i) => `FIELD_${i}: synthetic\n`).join("") + 'RAW_SUMMARY_JSON: "';
+  const plainSuffix = '  preserve  spaces \\n literal"\n```text\nuntouched  fence\n```\nINSTRUCTION: observe only';
+  const plainMessage = plainPrefix + codeValues.map(value => '`' + value + '`').join(", ") + plainSuffix;
+  function plainFixture() {
+    const codes = codeValues.map(value => element("CODE", [text(value)]));
+    const nodes = [text(plainPrefix)];
+    codes.forEach((code, i) => { if (i) nodes.push(text(", ")); nodes.push(code); });
+    nodes.push(text(plainSuffix));
+    const body = element("DIV", nodes, "text-size-chat whitespace-pre-wrap");
+    body.style.whiteSpace = "pre-wrap";
+    const clip = element("DIV", [element("DIV", [body])], "overflow-hidden");
+    clip.attrs["data-search-result-target"] = "";
+    clip.style.maxHeight = "494px";
+    const spacer = element("SPAN", [text("…")], "block");
+    spacer.attrs["aria-hidden"] = "true";
+    const button = element("BUTTON", [element("SPAN", [text("显示更多")]), element("svg")]);
+    button.attrs["data-markdown-copy"] = "exclude";
+    button.attrs["data-thread-find-skip"] = "true";
+    const bubble = element("DIV", [clip, spacer, button]);
+    bubble.attrs["data-user-message-bubble"] = "true";
+    bubble.rendered = body.innerText + "\n…\n显示更多";
+    return { body, bubble, codes, doc: { querySelectorAll: () => [bubble] } as never };
+  }
+  const findPlain = (f: ReturnType<typeof plainFixture>, expected = plainMessage) =>
+    findCanonicalUserTurn(f.doc, { message: expected, attemptId: ATTEMPT });
+
+  it("pre-wrap direct text and 12 CODE restore only backticks, excluding collapse controls", () => {
+    const f = plainFixture();
+    expect(plainMessage.split("\n")).toHaveLength(16);
+    expect(f.body.innerText).toBe(f.body.textContent);
+    expect(f.body.innerText.length).toBe(plainMessage.length - 24);
+    expect(f.bubble.innerText).not.toBe(plainMessage);
+    expect(hasExactVisibleBodyDescendant(f.bubble, plainMessage, ATTEMPT)).toBe(false);
+    const result = findPlain(f);
+    expect(result.ok).toBe(true);
+    expect(result.diagnostic?.representation).toMatchObject({ richBodyReasonCode: 0, richBodyCount: 1,
+      richBodyRebuildSucceeded: true, richBodyExact: true, richBodyLengthDelta: 0, richBodyFirstMismatchIndex: -1 });
+    const classic: Record<string, any> = { normalizeCanonicalDomText };
+    vm.runInNewContext(fs.readFileSync(path.join(distCompanion, "turn-observer-global.js"), "utf8"), classic);
+    expect(classic.findCanonicalUserTurn(f.doc, { message: plainMessage, attemptId: ATTEMPT })).toEqual(result);
+  });
+
+  it.each(["body_hidden", "body_transform", "body_inline", "collapse", "unknown_style", "wrong_class", "body_visible_mismatch",
+    "code_hidden", "code_opacity", "code_transform", "code_block", "code_empty", "code_backtick", "code_newline", "code_nested", "code_visible_mismatch",
+    "body_span", "body_comment", "changed_text", "marker_missing", "assistant"])("plain %s fails closed", kind => {
+    const f = plainFixture();
+    if (kind === "body_hidden") f.body.style.visibility = "hidden";
+    if (kind === "body_transform") f.body.style.textTransform = "uppercase";
+    if (kind === "body_inline") f.body.style.display = "inline";
+    if (kind === "collapse") f.body.style.whiteSpace = "normal";
+    if (kind === "unknown_style") delete f.body.style.whiteSpace;
+    if (kind === "wrong_class") f.body.classList.contains = () => false;
+    if (kind === "body_visible_mismatch") f.body.rendered = f.body.textContent + " ";
+    if (kind === "code_hidden") f.codes[0].style.visibility = "hidden";
+    if (kind === "code_opacity") f.codes[0].style.opacity = "0";
+    if (kind === "code_transform") f.codes[0].style.textTransform = "uppercase";
+    if (kind === "code_block") f.codes[0].style.display = "block";
+    if (kind === "code_empty") f.codes[0].childNodes = [];
+    if (kind === "code_backtick") f.codes[0].childNodes = [text("a`b")];
+    if (kind === "code_newline") f.codes[0].childNodes = [text("a\nb")];
+    if (kind === "code_nested") f.codes[0].childNodes = [element("SPAN", [text(codeValues[0])])];
+    if (kind === "code_visible_mismatch") f.codes[0].rendered = "changed";
+    if (kind === "body_span") f.body.childNodes.push(element("SPAN", [text("extra")]));
+    if (kind === "body_comment") f.body.childNodes.push({ nodeType: 8, textContent: "", childNodes: [] });
+    if (kind === "changed_text") f.body.childNodes[0].nodeValue += "changed";
+    if (kind === "marker_missing") f.bubble.rendered = "no marker";
+    if (kind === "assistant") { f.bubble.attrs["data-user-message-bubble"] = null; f.bubble.attrs["data-message-author-role"] = "assistant"; }
+    expect(findPlain(f).ok).toBe(false);
+  });
+
+  it("plain exactness preserves spaces, literal slash-n, fence text and exact attempt", () => {
+    const f = plainFixture();
+    for (const expected of [plainMessage + " ", plainMessage.replace("preserve  spaces", "preserve spaces"),
+      plainMessage.replace("\\n literal", "\n literal"), plainMessage.replace("```text", "`text"),
+      plainMessage.replace(ATTEMPT, RES_ID)]) expect(findPlain(f, expected).ok).toBe(false);
+  });
+
+  it("counts separate plain or mixed bodies, but not a pre-wrap wrapper around rich DIV", () => {
+    for (const extra of [plainFixture().body, fixture().rich]) {
+      const f = plainFixture();
+      f.bubble.childNodes.push(extra);
+      const result = findPlain(f);
+      expect(result.ok).toBe(false);
+      expect(result.diagnostic?.representation).toMatchObject({ richBodyReasonCode: 5, richBodyCount: 2 });
+    }
+    const f = fixture();
+    f.rich.parentElement.classList.contains = (name: string) => name === "whitespace-pre-wrap";
+    expect(find(f).ok).toBe(true);
+  });
+
+  it("plain body preserves both bounded budgets, baseline exclusion and turn ambiguity", () => {
+    const f = plainFixture();
+    const count = (node: any): number => 1 + node.childNodes.reduce((sum: number, child: any) => sum + count(child), 0);
+    f.body.childNodes.push(...Array.from({ length: 128 - count(f.body) }, () => text("")));
+    expect(findPlain(f).diagnostic?.representation).toMatchObject({ richBodyReasonCode: 0, richBodyNodeScannedCount: 128 });
+    f.body.childNodes.push(text(""));
+    expect(findPlain(f).ok).toBe(false);
+    expect(findPlain(f).diagnostic?.representation?.richBodyReasonCode).toBe(8);
+    const wrappers = plainFixture();
+    const base = findPlain(wrappers).diagnostic!.representation!.richBodyWrapperScannedCount;
+    wrappers.bubble.childNodes.push(...Array.from({ length: 64 - base }, () => element("DIV")));
+    expect(findPlain(wrappers).ok).toBe(true);
+    wrappers.bubble.childNodes.push(element("DIV"));
+    expect(findPlain(wrappers).diagnostic?.representation?.richBodyReasonCode).toBe(3);
+    const a = plainFixture(), b = plainFixture();
+    expect(findCanonicalUserTurn(a.doc, { message: plainMessage, attemptId: ATTEMPT, baseline: snapshotUserTurns(a.doc) }).ok).toBe(false);
+    expect(findCanonicalUserTurn({ querySelectorAll: () => [a.bubble, b.bubble] } as never,
+      { message: plainMessage, attemptId: ATTEMPT }).reason).toBe("ambiguous");
+  });
+
+  it("plain late-positive ACK binds the original attempt without write/click/reserve/begin-send", async () => {
+    const f = plainFixture();
+    const journal = markClaimed(markSendIntent(reservedJournal(), {}), {
+      eventId: EVENT_ID, reservationId: RES_ID, attemptId: ATTEMPT, message: plainMessage, messageSha256: MESSAGE_SHA,
+    });
+    let reserveCount = 0;
+    const proofs: any[] = [];
+    const spy = makeSpies({ journal: markOutcomeUnknown(journal, {}), doc: f.doc, findCanonicalUserTurn,
+      reserve: async () => { reserveCount++; },
+      ackObserved: async (proof: unknown) => { proofs.push(proof); return { eventId: EVENT_ID, status: "observed" }; },
+      inFlight: { status: "outcome_unknown", eventId: EVENT_ID, reservationId: RES_ID, attemptId: ATTEMPT,
+        message: plainMessage, messageSha256: MESSAGE_SHA },
+    });
+    const result = await recoverProductionSend(spy);
+    expect(result.action).toBe("late_positive_observed_then_acked");
+    expect(proofs).toHaveLength(1);
+    expect(proofs[0]).toMatchObject({ eventId: EVENT_ID, reservationId: RES_ID, attemptId: ATTEMPT, routeCanonical: ROUTE, bindingId: "b", epoch: 1 });
+    expect(spy.calls).toMatchObject({ write: 0, click: 0, beginSend: 0 });
+    expect(reserveCount).toBe(0);
+    expect(spy.journal.state).toBe("NONE");
+    expect(result).toMatchObject({ ok: true, zeroWrite: true, zeroClick: true });
+  });
+
   it("reconstructs real BRs and inline link text despite the favicon LF and outer controls", () => {
     const f = fixture();
     expect(f.paragraph.innerText.length - message.length).toBe(1);
@@ -3735,6 +3911,65 @@ describe("command29 rich USER paragraph observation", () => {
       if (kind === "link_label") f.label.childNodes[0].childNodes[0].nodeValue = "example.test";
       if (kind === "hidden_link_text") f.link.rendered = "";
       expect(find(f).ok).toBe(false);
+    },
+  );
+
+  it("rich reader diagnostic preserves exact success and reports mismatch position only", () => {
+    const f = fixture();
+    const success = find(f);
+    expect(success.ok).toBe(true);
+    const rep = success.diagnostic?.representation;
+    expect(rep).toMatchObject({ richBodyReasonCode: 0, richBodyCount: 1,
+      richBodyRebuildSucceeded: true, richBodyExact: true,
+      richBodyRebuiltLength: message.length, richBodyLengthDelta: 0, richBodyFirstMismatchIndex: -1 });
+    const expected = message.replace("Preserve  spaces", "Preserve spaces");
+    const mismatch = find(f, expected);
+    expect(mismatch.ok).toBe(false);
+    expect(mismatch.diagnostic?.representation).toMatchObject({ richBodyReasonCode: 0,
+      richBodyRebuildSucceeded: true, richBodyExact: false, richBodyLengthDelta: 1,
+      richBodyFirstMismatchIndex: expected.indexOf("Preserve spaces") + "Preserve ".length });
+    const classic: Record<string, any> = { normalizeCanonicalDomText };
+    vm.runInNewContext(fs.readFileSync(path.join(distCompanion, "turn-observer-global.js"), "utf8"), classic);
+    expect(classic.findCanonicalUserTurn(f.doc, { message, attemptId: ATTEMPT }).diagnostic.representation).toEqual(rep);
+  });
+
+  it("128 body nodes and 64 wrappers stay exact; the next node reports its separate limit", () => {
+    const f = fixture();
+    const count = (node: any): number => 1 + node.childNodes.reduce((sum: number, child: any) => sum + count(child), 0);
+    f.paragraph.childNodes.push(...Array.from({ length: 128 - count(f.paragraph) }, () => text("")));
+    expect(find(f).ok).toBe(true);
+    expect(find(f).diagnostic?.representation).toMatchObject({ richBodyReasonCode: 0, richBodyNodeScannedCount: 128 });
+    f.paragraph.childNodes.push(text(""));
+    expect(find(f).ok).toBe(false);
+    expect(find(f).diagnostic?.representation).toMatchObject({ richBodyReasonCode: 8, richBodyNodeScannedCount: 128, richBodyRebuildSucceeded: false });
+    const wrappers = fixture();
+    const base = find(wrappers).diagnostic!.representation!.richBodyWrapperScannedCount;
+    wrappers.bubble.childNodes.push(...Array.from({ length: 64 - base }, () => element("DIV")));
+    expect(find(wrappers).ok).toBe(true);
+    expect(find(wrappers).diagnostic?.representation).toMatchObject({ richBodyReasonCode: 0, richBodyWrapperScannedCount: 64 });
+    wrappers.bubble.childNodes.push(element("DIV"));
+    const over = find(wrappers);
+    expect(over.ok).toBe(false);
+    expect(over.diagnostic?.representation).toMatchObject({ richBodyReasonCode: 3, richBodyRebuildSucceeded: false });
+    expect(over.diagnostic?.representation?.richBodyWrapperScannedCount).toBeLessThanOrEqual(64);
+  });
+
+  it.each(["bodyshape", "hidden", "transform", "tag", "inline", "link", "node", "style_fault"])(
+    "%s has a fixed reader refusal code without raw error text", kind => {
+      const f = fixture();
+      const codes: Record<string, number> = { bodyshape: 6, hidden: 7, transform: 10, tag: 13, inline: 14, link: 11, node: 9, style_fault: 15 };
+      if (kind === "bodyshape") f.rich.childNodes.push(element("P"));
+      if (kind === "hidden") f.rich.style.visibility = "hidden";
+      if (kind === "transform") f.paragraph.style.textTransform = "uppercase";
+      if (kind === "tag") f.paragraph.childNodes[0].tagName = "EM";
+      if (kind === "inline") f.paragraph.childNodes[0].rendered = "different";
+      if (kind === "link") f.link.rendered = "";
+      if (kind === "node") f.paragraph.childNodes.push({ nodeType: 8, textContent: "", innerText: "", childNodes: [] });
+      if (kind === "style_fault") f.bubble.ownerDocument.defaultView.getComputedStyle = () => { throw Error("credential secret"); };
+      const result = find(f);
+      expect(result.ok).toBe(false);
+      expect(result.diagnostic?.representation).toMatchObject({ richBodyReasonCode: codes[kind], richBodyRebuildSucceeded: false, richBodyExact: false });
+      expect(JSON.stringify(result.diagnostic?.representation)).not.toMatch(/credential|secret|ATTEMPT_ID|example\.test/);
     },
   );
 

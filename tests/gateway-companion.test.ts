@@ -7,6 +7,8 @@ import {
   projectStorageKey,
 } from "../browser-companion/project-context.js";
 
+import { createCompanionIndicatorApplier, deriveCompanionIndicator } from "../browser-companion/action-indicator.js";
+
 const EXTENSION_ID = "gateway-companion-test-id";
 const WORKSPACE_A = "111111aaaaaa";
 const WORKSPACE_B = "222222bbbbbb";
@@ -80,6 +82,52 @@ function deferred<T>() {
 function popupSender() { return { id: EXTENSION_ID }; }
 
 describe("Gateway Companion project contexts", () => {
+  it("does not cache action updates skipped by an unselected project", async () => {
+    let selected = false;
+    const action = { setBadgeText: vi.fn(async (_value: { text: string }) => undefined), setTitle: vi.fn(async () => undefined) };
+    const scoped = createProjectChrome({ action }, WORKSPACE_A, () => selected);
+    const apply = createCompanionIndicatorApplier(() => scoped.action);
+    const unknown = deriveCompanionIndicator({ journal: { state: "OUTCOME_UNKNOWN" } });
+    expect(await apply(unknown)).toBe(false);
+    expect(action.setBadgeText).not.toHaveBeenCalled();
+    expect(action.setTitle).not.toHaveBeenCalled();
+    selected = true;
+    expect(await apply(unknown)).toBe(true);
+    expect(await apply(unknown)).toBe(false);
+    expect(action.setBadgeText).toHaveBeenCalledTimes(1);
+    expect(action.setTitle).toHaveBeenCalledTimes(1);
+  });
+
+  it("reapplies cached A → B → A indicators on project switches while deduplicating the selected project", async () => {
+    const action = { setBadgeText: vi.fn(async (_value: { text: string }) => undefined), setTitle: vi.fn(async () => undefined) };
+    const browser = { ...browserWithStorage(), action };
+    const refreshes = new Map<string, () => Promise<boolean>>();
+    const router = createProjectContextRouter({ browser, createContext(project, isSelected) {
+      const scoped = createProjectChrome(browser, project.workspaceId, isSelected);
+      const apply = createCompanionIndicatorApplier(() => scoped.action);
+      const indicator = deriveCompanionIndicator({ hydrated: true, storageProtected: true, bridgePermissionGranted: true,
+        transport: { connected: true, bridgeOrigin: project.bridgeOrigin, routeVerification: "VERIFIED",
+          connectionReadiness: { ready: true, reason: null } },
+        owner: { available: true }, autonomy: { mode: "armed", identityExact: true },
+        journal: { state: project.workspaceId === WORKSPACE_A ? "OUTCOME_UNKNOWN" : "NONE" } });
+      const refresh = () => apply(indicator);
+      refreshes.set(project.workspaceId, refresh);
+      return { ownsTabRoute: async () => false,
+        refreshSelectedIndicator: async () => { apply.invalidate(); await refresh(); } };
+    } });
+    for (const [workspaceId, bridgeOrigin] of [[WORKSPACE_A, ORIGIN_A], [WORKSPACE_B, ORIGIN_B]]) {
+      expect(await router.handle({ type: "c2c.project.add", project: { workspaceId, bridgeOrigin } }, popupSender()))
+        .toMatchObject({ ok: true });
+    }
+    for (const workspaceId of [WORKSPACE_A, WORKSPACE_B, WORKSPACE_A, WORKSPACE_A]) {
+      expect(await router.handle({ type: "c2c.project.select", workspaceId, tabId: 7, canonicalRoute: ROUTE_A }, popupSender()))
+        .toMatchObject({ ok: true });
+      expect(await refreshes.get(workspaceId)!()).toBe(false);
+    }
+    expect(action.setBadgeText.mock.calls.map(([value]) => value.text)).toEqual(["C×", "C", "C×"]);
+    expect(action.setTitle).toHaveBeenCalledTimes(3);
+  });
+
   it("keeps two contexts isolated through concurrent page RPCs and A-only unknown/revoke/refresh", async () => {
     const local = storageArea();
     const session = storageArea();

@@ -9,7 +9,7 @@
   const resultLabels = { ok: "已完成", failed: "执行失败", blocked: "执行受阻" };
   const feedbackLabels = { cancelled: "网页回流已取消", queued: "已排队 · 等待网页可接收", ready: "已准备 · 等待网页接收", reserved: "已预约网页回流", claimed: "网页发送中 · 待确认",
     observed: "回流已确认", outcome_unknown: "发送结果待核实", retired_unknown: "已行政结束等待" };
-  const activityLabels = { idle: "空闲", busy: "忙碌 · 可排队", approval_required: "等待本机处理", unknown: "无法确认" };
+  const activityLabels = { idle: "空闲", busy: "忙碌", approval_required: "等待本机处理", unknown: "无法确认" };
   const issueLabels = { cleanup_pending: "清理事务待收敛", empty_lifecycle_lock: "空生命周期锁，需人工核验", lifecycle_lock_present: "存在生命周期锁，所有者待核验",
     repair_fence_present: "存在修复隔离标记", lifecycle_state_unreadable: "生命周期证据不可读", delivery_identity_conflict: "投递身份冲突" };
   const administrativeLabels = { abandoned: "已行政结束等待", retired: "已行政退役", resolved_unknown: "已接受结果不明并结束等待" };
@@ -44,7 +44,16 @@
         : executions.length ? executions.map(result => `第 ${result.iteration} 次 · ${resultLabels[result.status] ?? "未知"}`).join("；") : "执行未确认",
       feedbackLabel: feedback.length ? [...new Set(feedback.map(event => event.label))].join("；") : "尚无回流证据" };
   }
-  function derive(response, now = Date.now()) {
+  function canHide(command) {
+    if (command.issues?.length || command.pendingPanelOperation) return false;
+    if (command.appServerTurn) return ["completed", "failed", "cancelled"].includes(command.appServerTurn.status);
+    if (command.delivery?.status === "pending" || command.delivery?.queueStatus) return false;
+    return ["abandoned", "retired", "resolved_unknown"].includes(command.administrative)
+      || command.delivery?.status === "cancelled"
+      || command.delivery?.status === "accepted" && command.executions?.length > 0
+        && command.executions.every(result => ["ok", "failed", "blocked"].includes(result.status));
+  }
+  function derive(response, now = Date.now(), hiddenIds = []) {
     const snapshot = response?.snapshot;
     const serviceFresh = response?.ok === true && fresh(snapshot?.observedAt, now);
     const executorFresh = serviceFresh && fresh(snapshot?.executor?.observedAt, now);
@@ -56,17 +65,27 @@
           : !web.verified ? "对话待验证"
             : web.generation === "streaming" || web.generation === "generating" ? "正在生成"
               : web.composer === "nonempty" ? "输入框有未发送内容"
-                : web.composer === "empty" && web.generation === "idle" && web.safe === true ? "可接收结果" : "暂不可接收";
+                : web.composer === "empty" && web.generation === "idle" && web.safe === true
+                  ? web.connectionReadiness?.ready !== true ? "当前对话需要完成连接"
+                    : response?.journal?.state === "OUTCOME_UNKNOWN" ? "回流待核验" : "可接收结果" : "暂不可接收";
     }
+    const allRows = response?.ok === true ? (snapshot?.commands ?? []).map(command => ({ ...row(command, response.journal),
+      pendingPanelOperation: (snapshot?.panelAuthorization?.pending ?? []).some(operation => operation.commandId === command.commandId),
+    })) : [];
+    const hidden = new Set(hiddenIds);
     return {
       serviceFresh, bridge: serviceFresh ? "连接正常" : response?.ok ? "状态已过期" : "无法连接",
       codex: executorFresh ? activityLabels[snapshot?.executor?.state] ?? "无法确认" : "无法确认",
       web: webLabel, autonomy: response?.autonomy === "armed" ? "已开启" : "已暂停",
       observedAt: snapshot?.observedAt ?? null, reason: response?.reason ?? snapshot?.executor?.reason ?? null,
       workspaceId: snapshot?.workspaceId ?? null, route: snapshot?.routeCanonical ?? null,
-      rows: response?.ok === true ? (snapshot?.commands ?? []).map(command => row(command, response.journal)) : [],
+      rows: allRows.filter(command => !hidden.has(command.commandId) || !canHide(command)),
+      hiddenCount: allRows.filter(command => hidden.has(command.commandId) && canHide(command)).length,
+      pendingFeedback: allRows.flatMap(command => command.feedback
+        .filter(event => event.isolated === true || !["observed", "cancelled"].includes(event.status))
+        .map(event => ({ ...event, commandId: command.commandId }))),
       truncated: snapshot?.truncated === true,
     };
   }
-  globalThis.C2COperations = Object.freeze({ derive, fresh, FRESH_MS, resultLabels });
+  globalThis.C2COperations = Object.freeze({ derive, canHide, fresh, FRESH_MS, resultLabels });
 })();

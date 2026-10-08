@@ -68,7 +68,7 @@ export function registerRemoteTools(
     return { ok: thread.status === "completed", accepted: true, ...publicThread(thread) };
   }, "codex.control"));
   server.registerTool("codex_submit_task", {
-    description: "向明确登记且当前 OAuth 客户端有权访问的本机 Codex target 提交任务；优先传 targetId，threadId 仅作唯一 target 的兼容选择。commandId 全生命周期幂等。执行由本机 Codex 决定，可能修改文件或请求审批。", inputSchema: taskInput.extend({ workspaceId: workspaceIdSchema }),
+    description: "仅向后台 Remote 的已登记 Codex target 提交任务，不会投递到当前 Desktop 会话。Desktop 任务应先调用 codex_desktop_status，再调用 codex_desktop_send；不要用本工具替代。当前 OAuth 客户端必须有权访问；优先传 targetId，threadId 仅作唯一 target 的兼容选择。commandId 全生命周期幂等。执行由本机 Codex 决定，可能修改文件或请求审批。", inputSchema: taskInput.extend({ workspaceId: workspaceIdSchema }),
     ...metadata("codex.control", true),
   }, (input, extra) => result(() => {
     const { workspace } = guard(input.workspaceId, extra.authInfo, "codex.control");

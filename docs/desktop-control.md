@@ -1,10 +1,18 @@
 # 实验性 Desktop Control（MVP）
 
 Desktop Control 是默认关闭的 MCP 写入能力。它只把 ChatGPT 已确认的完整计划
-持久排队到本机已经绑定、已经在 Desktop 中加载的会话；busy 时等待，空闲后通过原安全入口投递。它不会创建新的会话或直接 steer active turn。
+投递到本机已经绑定、已经在 Desktop 中加载的会话。Bridge 入口持久排队，空闲后通过原安全入口投递；Gateway 入口直接复用同一 sender，遵守 idle/busy 门禁，不排队。它不会创建新的会话或直接 steer active turn。
 本功能依赖 Desktop 的版本绑定内部 IPC，不能当作公开稳定 API。
 
-## 用户流程
+## Gateway 直接投递
+
+先调用 `gateway_list_workspaces` 核对当前 client 的项目授权，再调用带明确 workspaceId 的 `codex_desktop_status` 核对本机绑定与可用性；用户确认完整计划后，以返回的 bindingId 调用 `codex_desktop_send`。Gateway 使用独立的 Desktop read/control scopes，入口及发送提交前实时验证原 OAuth bearer、registry grant 与 canonical root。目标 busy 时遵守现有 sender 门禁：只有可信完成 receipt 的短暂 busy-tail 可有界等待，其余 busy 拒绝；不创建后台队列，不自动换目标或重发。
+
+Desktop 工具独立于 Remote enabled/official；`codex_submit_task` 始终提交后台 Remote target，不会代替 Desktop。绑定、enable、本机确认、runtime fence、owner、审批、防重放与 outcome_unknown 规则全部保留。此处描述源码行为，不证明已安装或通过真实网页验收。
+
+Companion 任务面板在 Remote 未启用且 Desktop 已启用绑定时，只读核验该 Desktop exact target 与保存的 runtime fence，显示空闲、忙碌、等待本机处理或无法确认；查询期间绑定、启用版本或投递模式变化则保守显示无法确认，连接可用不等于空闲，面板不承诺 Gateway 消息可排队。
+
+## Bridge 用户流程
 
 ```text
 ChatGPT 讨论并确认完整方案
@@ -23,9 +31,9 @@ ChatGPT 讨论并确认完整方案
 
 ## Bridge 收件箱与回流隔离（2026-10-05）
 
-当前源码合同见 [双向消息收件箱](agent-mailbox.md)。MCP 入口先返回 queued；下文 prepare/30秒 busy-tail 属于复用的底层 sender，不是 MCP 请求持久等待或新的全局队列。`codex_desktop_status` 的 commandQueue 只返回排队状态/原因，不把它伪装成真实 delivery。dispatching 重启中断封为 outcome_unknown，绝不原请求重发；某条历史坏锁不阻断其他独立 Command。
+Bridge 的当前源码合同见 [双向消息收件箱](agent-mailbox.md)。MCP 入口先返回 queued；下文 prepare/30秒 busy-tail 属于复用的底层 sender，不是 MCP 请求持久等待或新的全局队列。`codex_desktop_status` 的 commandQueue 只返回排队状态/原因，不把它伪装成真实 delivery。dispatching 重启中断封为 outcome_unknown，绝不原请求重发；某条历史坏锁不阻断其他独立 Command。
 
-canonical Result Bus 可逐条隔离未知浏览器 attempt，保留 evidence 且不伪 ACK；网页生成或草稿非空时等待，不覆盖输入框。当前源码仍未部署，机器现场验收另行进行。rollout、binding/enable、OAuth、本机确认和 trusted receipt 的安全规则保持。
+canonical Result Bus 可逐条隔离未知浏览器 attempt，保留 evidence 且不伪 ACK；网页生成或草稿非空时等待，不覆盖输入框。该机制的历史部署与新变更的验收状态分别见 [Gateway 当前状态](unified-gateway-plan.md#当前状态2026-10-08-当前-checkout)，源码说明不证明当前机器已升级。rollout、binding/enable、OAuth、本机确认和 trusted receipt 的安全规则保持。
 
 ## 自动验收记录
 

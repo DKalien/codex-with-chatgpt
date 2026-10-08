@@ -1,3 +1,5 @@
+import { requestLocalRoute, finishLocalRouteConfirmation, commitLocalRoute, localRouteStatus } from "./companion-local-route.js";
+import { confirmLocalRoute } from "../feedback/local-route-confirm.js";
 import { authenticateOperations } from "./companion-operation-auth.js";
 import { previewPanelAction, confirmPanelAction, reconcilePanelAction } from "./companion-actions.js";
 import express, { type Request, type Response, type Router } from "express";
@@ -24,7 +26,7 @@ import { bindCurrentWebSinkFromDurableCompanion, verifyCompanionCredentialForWeb
 import { WebSinkControlError } from "../web-sink-control/schema.js";
 import { webSinkStatus, readActiveWebSinkBinding } from "../web-sink-control/service.js";
 import { readFeedbackState } from "../feedback/store.js";
-import { isRouteAttestationVerified } from "../feedback/schema.js";
+import { isWebSinkRouteVerified } from "../feedback/schema.js";
 import { routingCommandIdSchema } from "../routing/schema.js";
 import { withConnectionMutation } from "./connection.js";
 import { readCompanionOperations } from "./companion-operations.js";
@@ -147,7 +149,8 @@ function sendError(res: Response, error: unknown): void {
     return;
   }
   if (error instanceof CompanionError || error instanceof FeedbackError) {
-    const status = error.code === "COMPANION_REPAIR_BLOCKED"
+    const status = error.code.startsWith("LOCAL_ROUTE_")
+      || error.code === "COMPANION_REPAIR_BLOCKED"
       || error.code === "COMPANION_ROUTE_UNVERIFIED"
       || error.code === "COMPANION_REBIND_NOT_CONFIRMED"
       || error.code === "COMPANION_REBIND_NOT_SUCCESSOR"
@@ -225,6 +228,43 @@ export function createCompanionRouter(opts: CompanionRouterOptions): Router {
 
   const connection = <T>(action: () => T): T => opts.workspaceRoot
     ? withConnectionMutation({ ...opts, workspaceRoot: opts.workspaceRoot, kind: "companion" }, action) : action();
+
+  const localRouteBody = z.object({ requestId: z.string().uuid(), routeCanonical: z.string().min(1).max(512) }).strict();
+  const localInput = (req: Request, requestId: string) => {
+    const credential = bearerCredential(req);
+    if (!credential) throw new CompanionError("COMPANION_UNAUTHORIZED", "缺少 companion credential");
+    if (!opts.workspaceRoot) throw new CompanionError("COMPANION_WORKSPACE_MISMATCH", "workspace root 不可用");
+    return { ...opts, workspaceRoot: opts.workspaceRoot, credential, requestId };
+  };
+  router.post("/route/local/request", (req, res) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      const body = localRouteBody.parse(req.body);
+      const input = { ...localInput(req, body.requestId), routeCanonical: body.routeCanonical };
+      const result = requestLocalRoute(input);
+      res.status(result.created ? 202 : 200).json(result.response);
+      if (result.created) {
+        void confirmLocalRoute({ workspaceId: opts.workspaceId, workspaceRoot: input.workspaceRoot,
+          routeCanonical: result.response.routeCanonical }).then(confirmed => {
+          finishLocalRouteConfirmation(input, confirmed);
+        }).catch(() => { /* 撤权、漂移、进程错误保留单次 pending，最终到期；绝不重弹或自动提交。 */ });
+      }
+    } catch (error) { sendError(res, error); }
+  });
+  router.get("/route/local/status", (req, res) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      const query = z.object({ requestId: z.string().uuid() }).strict().parse(req.query);
+      res.json(localRouteStatus(localInput(req, query.requestId)));
+    } catch (error) { sendError(res, error); }
+  });
+  router.post("/route/local/commit", (req, res) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      const body = localRouteBody.parse(req.body);
+      res.json(commitLocalRoute({ ...localInput(req, body.requestId), routeCanonical: body.routeCanonical }));
+    } catch (error) { sendError(res, error); }
+  });
 
   router.post("/pair", (req, res) => {
     try {
@@ -624,7 +664,7 @@ export function createCompanionRouter(opts: CompanionRouterOptions): Router {
         if (companion && !companion.supersededAt) {
           companionAvailable = true;
           companionRouteCanonical = companion.routeCanonical;
-          companionVerified = isRouteAttestationVerified(companion);
+          companionVerified = isWebSinkRouteVerified(companion);
         }
       } catch {
         companionAvailable = false;

@@ -521,7 +521,7 @@ describe("E1b2 recovery / authStale / storage policy (final closeout)", () => {
     expect(stateBody).toMatch(/res\.ok/);
     expect(stateBody).not.toMatch(/status\s*===\s*200/);
     const reserveIdx = sw.indexOf("async function handleReservePage");
-    const reserveBody = sw.slice(reserveIdx, reserveIdx + 1800);
+    const reserveBody = sw.slice(reserveIdx, sw.indexOf("\nasync function handleRelease", reserveIdx));
     expect(reserveBody).toMatch(/if \(!res\.ok\)/);
     expect(reserveBody).not.toMatch(/status\s*===\s*200/);
     const releaseIdx = sw.indexOf("async function handleRelease");

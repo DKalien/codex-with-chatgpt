@@ -53,6 +53,14 @@ export interface ExecutorSessionInfo extends ExecutorTarget {
   readonly runtimeFence?: DesktopRuntimeFence;
 }
 
+/** 连接可用不代表空闲；缺少审批或运行状态时保守返回 unknown。 */
+export function projectDesktopActivity(session: ExecutorSessionInfo): ExecutorSessionProjection["activity"] {
+  return session.requestsCount === undefined ? "unknown"
+    : session.requestsCount > 0 ? "approval_required"
+      : session.runtimeStatus === "idle" ? "idle"
+        : session.runtimeStatus === "active" || session.runtimeStatus === "inProgress" ? "busy" : "unknown";
+}
+
 export interface ExecutorExecutionInfo extends ExecutorTarget {
   readonly activeTurnId: string;
 }
@@ -297,10 +305,7 @@ export class CodexDesktopExecutorPlugin implements ExecutorPlugin {
       sessionId: session.threadId,
       instanceId: session.hostId,
       locator: { executorProjectId: session.projectId },
-      activity: session.requestsCount === undefined ? "unknown"
-        : session.requestsCount > 0 ? "approval_required"
-          : session.runtimeStatus === "idle" ? "idle"
-            : session.runtimeStatus === "active" || session.runtimeStatus === "inProgress" ? "busy" : "unknown",
+      activity: projectDesktopActivity(session),
     };
   }
 

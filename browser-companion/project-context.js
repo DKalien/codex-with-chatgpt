@@ -131,7 +131,7 @@ function selectedAction(action, isSelected) {
       const value = Reflect.get(target, property, target);
       if (typeof value !== "function") return value;
       if (["setBadgeText", "setTitle", "setBadgeBackgroundColor"].includes(property)) {
-        return (...args) => isSelected() ? value.apply(target, args) : undefined;
+        return (...args) => isSelected() ? value.apply(target, args) : false;
       }
       return value.bind(target);
     },
@@ -536,7 +536,9 @@ export function createProjectContextRouter({
             return { ok: false, reason: "workspace_operation_busy" };
           }
           selections.set(tabId, { workspaceId: currentProject.workspaceId, canonicalRoute });
+          const selectionChanged = selectedWorkspaceId !== currentProject.workspaceId;
           selectedWorkspaceId = currentProject.workspaceId;
+          if (selectionChanged) await contextFor(currentProject).refreshSelectedIndicator?.();
           return { ok: true, workspaceId: currentProject.workspaceId, tabId, canonicalRoute };
         });
       } finally { selectionBusyTabs.delete(tabId); }

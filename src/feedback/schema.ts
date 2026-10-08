@@ -155,6 +155,7 @@ export const pairingIntentSchema = z.object({
 }).strict();
 
 export const routeAttestationSchema = z.object({
+  proofKind: z.enum(["mcp_principal", "local_user"]).optional(),
   status: z.enum(["pending", "verified"]),
   challengeId: z.string().regex(UUID),
   challengeDigest: z.string().regex(HEX64),
@@ -225,6 +226,15 @@ export const feedbackStateSchema = z.object({
   events: z.array(feedbackEventSchema).max(10000),
   panelGrant: panelGrantSchema.optional(),
   panelOperations: z.array(panelOperationSchema).max(100).optional(),
+  localRouteRequests: z.array(z.object({
+    requestId: z.string().uuid(), routeCanonical: z.string().min(1).max(512),
+    workspaceRoot: z.string().min(1), previousCompanionId: z.string().uuid(),
+    previousCredentialHash: z.string().regex(HEX64), bindingSha256: z.string().regex(HEX64), authoritySha256: z.string().regex(HEX64),
+    sinkRevision: z.number().int().nonnegative(), companionId: z.string().uuid(), challengeId: z.string().uuid(),
+    createdAt: z.string().datetime(), expiresAt: z.string().datetime(),
+    status: z.enum(["PENDING", "CONFIRMED", "CANCELLED", "COMMITTED"]),
+    confirmedAt: z.string().datetime().optional(),
+  }).strict()).max(100).optional(),
   // Active command cleanup only; removed before its journal is finalized.
   cleanupAdjustments: z.array(z.object({
     cleanupId: z.string().uuid(),
@@ -311,6 +321,11 @@ export function formatRouteAttestationMessage(challengeId: string, challengeDige
 export function isRouteAttestationVerified(
   companion: CompanionRecord | null | undefined,
 ): boolean {
+  return companion?.routeAttestation?.proofKind !== "local_user" && isWebSinkRouteVerified(companion);
+}
+
+/** 本机授权只证明 Web Sink URL，不能用作 Feedback principal 证明。 */
+export function isWebSinkRouteVerified(companion: CompanionRecord | null | undefined): boolean {
   if (!companion || companion.supersededAt) return false;
   const att = companion.routeAttestation;
   if (!att) return false;

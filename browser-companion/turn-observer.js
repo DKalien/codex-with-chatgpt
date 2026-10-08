@@ -161,6 +161,13 @@ export const MARKER_REPRESENTATION_NUMERIC_KEYS = [
   "exactInnerTextDescendantCount",
   "exactTextContentDescendantCount",
   "attemptMarkerDescendantCount",
+  "richBodyWrapperScannedCount",
+  "richBodyCount",
+  "richBodyNodeScannedCount",
+  "richBodyRebuiltLength",
+  "richBodyRebuiltLineCount",
+  "richBodyLengthDelta",
+  "richBodyFirstMismatchIndex",
 ];
 
 export const MARKER_REPRESENTATION_BOOLEAN_KEYS = [
@@ -168,6 +175,8 @@ export const MARKER_REPRESENTATION_BOOLEAN_KEYS = [
   "markerTextContentExact",
   "markerInnerTextAttemptExact",
   "markerTextContentAttemptExact",
+  "richBodyRebuildSucceeded",
+  "richBodyExact",
 ];
 
 function commonPrefixLength(a, b) {
@@ -293,7 +302,27 @@ export function buildMarkerRepresentationDiagnostic(input = {}) {
     }
   }
 
+  const richStats = {};
+  let richBody = null;
+  try {
+    richBody = readRichTextUserBody(node, richStats);
+  } catch {
+    // 诊断读取故障不影响既有匹配结果。
+    richStats.richBodyReasonCode = 15;
+  }
+  if (richBody !== null) {
+    Object.assign(richStats, {
+      richBodyRebuildSucceeded: true,
+      richBodyExact: want.length > 0 && richBody === want,
+      richBodyRebuiltLength: richBody.length,
+      richBodyRebuiltLineCount: lineCount(richBody),
+      richBodyLengthDelta: richBody.length - want.length,
+      richBodyFirstMismatchIndex: richBody === want ? -1 : commonPrefixLength(richBody, want),
+    });
+  }
+
   return {
+    ...richStats,
     markerCandidateIndex,
     markerCandidateNormalizedLength: normalized.length,
     markerInnerTextLength: innerNorm.length,
@@ -328,6 +357,8 @@ export function sanitizeMarkerRepresentation(rep) {
   for (const key of MARKER_REPRESENTATION_BOOLEAN_KEYS) {
     if (typeof rep[key] === "boolean") out[key] = rep[key];
   }
+  const code = rep.richBodyReasonCode;
+  if (Number.isInteger(code) && code >= 0 && code <= 15) out.richBodyReasonCode = code;
   return Object.keys(out).length ? out : null;
 }
 
@@ -471,16 +502,30 @@ export function hasExactVisibleBodyDescendant(node, want, attemptId) {
 }
 
 /**
- * Observed ChatGPT user Markdown shape: one P, inline text/SPAN/A and BR.
+ * Observed ChatGPT user shapes: rich P with text/SPAN/A/BR, or pre-wrap DIV
+ * with direct text/CODE. Only the latter restores single inline backticks.
  * A link's empty block favicon can add a layout newline to P.innerText; outer
  * collapse controls add more text. Reconstruct ONLY this explicit body shape,
  * preserving every text character and BR. No whitespace folding, href-derived
  * text, hidden-text fallback or general Markdown interpretation.
  */
-function readRichTextUserBody(bubble) {
-  if (bubble?.getAttribute?.("data-user-message-bubble") !== "true") return null;
+function readRichTextUserBody(bubble, stats = null) {
+  // 只记录固定数字原因码；异常消息和 DOM 内容不进入诊断，码表见 troubleshooting。
+  if (stats) Object.assign(stats, {
+    richBodyWrapperScannedCount: 0, richBodyCount: 0, richBodyNodeScannedCount: 0,
+    richBodyReasonCode: 15, richBodyRebuildSucceeded: false, richBodyExact: false,
+  });
+  const reject = (code) => {
+    if (stats) stats.richBodyReasonCode = code;
+    return null;
+  };
+  const fail = (code) => {
+    reject(code);
+    throw Error("rich_body_rejected");
+  };
+  if (bubble?.getAttribute?.("data-user-message-bubble") !== "true") return reject(1);
   const view = bubble.ownerDocument?.defaultView;
-  if (typeof view?.getComputedStyle !== "function") return null;
+  if (typeof view?.getComputedStyle !== "function") return reject(2);
   const visible = (element) => {
     const style = view.getComputedStyle(element);
     return style.display !== "none" && style.visibility === "visible"
@@ -492,57 +537,81 @@ function readRichTextUserBody(bubble) {
     const pending = [bubble], bodies = [];
     let searched = 0;
     while (pending.length) {
-      if (++searched > 64) return null;
+      if (++searched > 64) return reject(3);
+      if (stats) stats.richBodyWrapperScannedCount = searched;
       const element = pending.pop();
-      if (element.classList?.contains("rich-text-user-turn")) {
+      const children = element.children;
+      if (!children) return reject(4);
+      const plainBody = element.tagName === "DIV"
+        && element.classList?.contains("whitespace-pre-wrap")
+        && children.length <= 128
+        && Array.from(children).every(child => child.tagName === "CODE");
+      if (element.classList?.contains("rich-text-user-turn") || plainBody) {
         bodies.push(element);
+        if (stats) stats.richBodyCount = bodies.length;
         continue;
       }
-      const children = element.children;
-      if (!children || searched + pending.length + children.length > 64) return null;
+      if (searched + pending.length + children.length > 64) return reject(3);
       for (const child of children) pending.push(child);
     }
-    if (bodies.length !== 1) return null;
+    if (bodies.length !== 1) return reject(5);
     const body = bodies[0];
-    if (body.tagName !== "DIV" || body.childNodes.length !== 1
-      || body.firstChild?.tagName !== "P") return null;
+    const plainBody = !body.classList.contains("rich-text-user-turn");
+    if (body.tagName !== "DIV" || (!plainBody && (body.childNodes.length !== 1
+      || body.firstChild?.tagName !== "P"))) return reject(6);
     for (let parent = body; parent; parent = parent.parentElement) {
-      if (!visible(parent)) return null;
+      if (!visible(parent)) return reject(7);
       if (parent === bubble) break;
     }
     // Separate, bounded grammar walk: real incident body has 65 nodes, including
     // text nodes and the empty favicon. Unknown/oversized trees fail closed.
     let remaining = 128;
     const read = (node, inLink = false) => {
-      if (--remaining < 0) throw Error("rich_body_limit");
+      if (--remaining < 0) fail(8);
+      if (stats) stats.richBodyNodeScannedCount = 128 - remaining;
       if (node.nodeType === 3) return node.nodeValue;
-      if (node.nodeType !== 1) throw Error("rich_body_node");
+      if (node.nodeType !== 1) fail(9);
       const tag = node.tagName.toUpperCase();
       // A link's decorative subtree is allowed only when it has no text.
       if (inLink && rawTextContentOf(node) === "" && ["SPAN", "SVG", "PATH", "IMG"].includes(tag)) {
         for (const child of node.childNodes) read(child, true);
         return "";
       }
-      if (!visible(node)) throw Error("rich_body_hidden");
+      if (!visible(node)) fail(7);
       const style = view.getComputedStyle(node);
       const display = style.display;
-      if (style.textTransform !== "none") throw Error("rich_body_transform");
-      if (node.childNodes.length > remaining) throw Error("rich_body_limit");
+      if (style.textTransform !== "none") fail(10);
+      if (node.childNodes.length > remaining) fail(8);
+      if (plainBody) {
+        if (node === body) {
+          if (display !== "block" || style.whiteSpace !== "pre-wrap") fail(13);
+          if (rawInnerTextOf(node) !== rawTextContentOf(node)) fail(14);
+          return Array.from(node.childNodes, child => read(child)).join("");
+        }
+        if (tag !== "CODE" || display !== "inline") fail(13);
+        const text = rawInnerTextOf(node);
+        if (!text || text.includes("`") || LINE_BREAKS.test(text)
+          || text !== rawTextContentOf(node)) fail(14);
+        if (Array.from(node.childNodes).some(child => child.nodeType !== 3)) fail(9);
+        return "`" + Array.from(node.childNodes, child => read(child)).join("") + "`";
+      }
       if (tag === "BR" && !inLink && node.childNodes.length === 0 && display === "inline") return "\n";
       if (tag === "A" && !inLink && display === "inline"
         && /(?:^|\s)ExternalMarkdownLink-\S+/.test(node.className)) {
         const text = rawInnerTextOf(node);
-        if (!text || text !== rawTextContentOf(node) || LINE_BREAKS.test(text)) throw Error("rich_body_link");
+        if (!text || text !== rawTextContentOf(node) || LINE_BREAKS.test(text)) fail(11);
         const rebuilt = Array.from(node.childNodes, child => read(child, true)).join("");
-        if (rebuilt !== text) throw Error("rich_body_link_text");
+        if (rebuilt !== text) fail(12);
         return text;
       }
       if (!((tag === "P" && node === body.firstChild && display === "block")
-        || (tag === "SPAN" && display === "inline"))) throw Error("rich_body_shape");
-      if (tag === "SPAN" && rawInnerTextOf(node) !== rawTextContentOf(node)) throw Error("rich_body_inline_text");
+        || (tag === "SPAN" && display === "inline"))) fail(13);
+      if (tag === "SPAN" && rawInnerTextOf(node) !== rawTextContentOf(node)) fail(14);
       return Array.from(node.childNodes, child => read(child, inLink)).join("");
     };
-    return normalizeCanonicalDomText(read(body.firstChild));
+    const rebuilt = normalizeCanonicalDomText(read(plainBody ? body : body.firstChild));
+    if (stats) stats.richBodyReasonCode = 0;
+    return rebuilt;
   } catch {
     return null;
   }
@@ -553,7 +622,7 @@ function readRichTextUserBody(bubble) {
  * 1) Parent exact fast path: turn.text === want + exact ATTEMPT.
  * 2) Else bounded fallback: parent visible text must have exact ATTEMPT marker,
  *    and some descendant innerText is canonical-exact (byte/canonical equality only).
- * 3) Known modern rich USER paragraph may reconstruct text + explicit BRs;
+ * 3) Known modern USER body may reconstruct BRs or inline CODE backticks;
  *    the whole reconstructed body and ATTEMPT marker must still match exactly.
  * Ambiguity is counted per USER TURN, never per descendant.
  */

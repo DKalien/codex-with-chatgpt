@@ -191,7 +191,7 @@ describe("Browser Companion sleep/wake feedback recovery", () => {
     expect(cs).toContain('window.addEventListener("focus", wakeHeartbeat)');
     expect(cs).toContain('type: "c2c.heartbeat"');
     expect(sw).toContain("resetSessionOwnership(emptyOwnerState())");
-    expect(sw).not.toContain("ownerState.owner =");
+    expect(sw).not.toMatch(/\bownerState\.owner\s*=(?!=)/);
   });
 
   it("targets the exact owner document on activation", async () => {

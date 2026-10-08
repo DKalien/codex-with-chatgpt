@@ -59,7 +59,7 @@ describe("R5c architecture fence", () => {
     expect(adapter).toMatch(/bindCurrentWebSinkFromDurableCompanion/);
     expect(adapter).toMatch(/bindCurrentWebSinkFromVerifiedCompanionRoute/);
     expect(adapter).toMatch(/verifyCompanionCredentialForWebSink/);
-    expect(adapter).toMatch(/isRouteAttestationVerified/);
+    expect(adapter).toMatch(/isWebSinkRouteVerified/);
     expect(adapter).not.toMatch(/principalFingerprint/);
     const service = read("src/web-sink-control/service.ts");
     expect(service).not.toMatch(/from ["'].*feedback|from ["'].*companion/i);

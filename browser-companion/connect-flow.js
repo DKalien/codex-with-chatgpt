@@ -121,7 +121,7 @@ export function parseConnectFlow(value) {
 export function connectFlowIdentity(transport) {
   const challengeId = typeof transport?.routeAttestationMessage === "string"
     ? /challengeId=([0-9a-fA-F-]{36})/.exec(transport.routeAttestationMessage)?.[1] ?? null
-    : null;
+    : UUID.test(transport?.challengeId) ? transport.challengeId : null;
   const base = {
     workspaceId: transport?.workspaceId,
     bindingId: transport?.bindingId,
@@ -317,4 +317,36 @@ export function refreshExplicitConnectOwnerWitness(current, owner, now = Date.no
       updatedAt: now,
     },
   };
+}
+
+/** authenticated VERIFIED 的旧版本可没有 challenge，但其余 identity 必须精确。 */
+export function verifiedConnectFlowMatchesTransport(flow, transport) {
+  if (transport?.routeVerification !== "VERIFIED") return false;
+  const identity = connectFlowIdentity(transport);
+  return Boolean(identity && connectFlowMatches(flow, identity.challengeId === null
+    ? { ...identity, challengeId: flow.challengeId }
+    : identity));
+}
+
+/** 当前对话连接的只读派生；输入仅来自 SW 内部权威，不持久化。 */
+export function deriveConnectionReadiness({ transport, storageProtected, transportIdentityBlocked, transportMutationInFlight, routeAttestFence, connectFlow, connectReason, owner, webSink } = {}) {
+  const unavailable = reason => ({ ready: false, reason });
+  if (storageProtected !== true) return unavailable("storage_unprotected");
+  if (transportIdentityBlocked === true) return unavailable("transport_identity_mismatch");
+  if (!transport?.credential || !transport.bridgeOrigin) return unavailable("transport_missing");
+  if (transport.authStale === true) return unavailable("auth_stale");
+  if (transportMutationInFlight === true) return unavailable("transport_mutation_in_flight");
+  if (!["NONE", "VERIFIED"].includes(routeAttestFence?.state ?? routeAttestFence ?? "NONE")) return unavailable("route_fence_active");
+  if (transport.rebindPending === true) return unavailable("rebind_pending");
+  if (transport.routeVerification !== "VERIFIED") return unavailable("route_unverified");
+  if (connectFlow?.state !== "DONE" || connectReason
+    || !verifiedConnectFlowMatchesTransport(connectFlow, transport)) return unavailable("connect_not_ready");
+  if (!validOwnerWitness(owner) || !connectFlowOwnerWitnessMatches(connectFlow, owner)
+    || !areChatgptConversationRoutesEquivalent(owner.canonicalRoute, transport.routeCanonical)) return unavailable("owner_witness_changed");
+  const binding = webSink?.binding;
+  if (webSink?.synced !== true || webSink.available !== true
+    || binding?.workspaceId !== transport.workspaceId
+    || binding.pluginId !== "browser-companion" || binding.surfaceId !== "chatgpt-web"
+    || !areChatgptConversationRoutesEquivalent(binding.canonicalUrl, transport.routeCanonical)) return unavailable("web_sink_not_ready");
+  return { ready: true, reason: null };
 }

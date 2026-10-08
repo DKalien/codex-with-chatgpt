@@ -17,6 +17,7 @@ function healthy(overrides: Record<string, unknown> = {}) {
     bridgePermissionGranted: true,
     transport: {
       connected: true,
+      connectionReadiness: { ready: true, reason: null },
       bridgeOrigin: "https://bridge.example.test",
       routeCanonical: ROUTE,
       routeVerification: "VERIFIED",
@@ -73,6 +74,18 @@ describe("Browser Companion action indicator", () => {
     expect(result.severity).toBe("error");
     expect(result.badgeText).toBe("C×");
     expect(result.reason).toBe(reason);
+  });
+
+  it.each([undefined, { ready: false, reason: "web_sink_not_ready" }])("missing or incomplete readiness cannot show C", connectionReadiness => {
+    expect(deriveCompanionIndicator(healthy({ transport: { ...healthy().transport, connectionReadiness } })))
+      .toMatchObject({ severity: "warning", reason: "connect_not_ready" });
+  });
+
+  it("journal unknown keeps C× with a feedback-specific tooltip", () => {
+    expect(deriveCompanionIndicator(healthy({ journal: { state: "OUTCOME_UNKNOWN" } })))
+      .toMatchObject({ badgeText: "C×", reason: "journal_outcome_unknown", title: "C2C：回流待核验，请勿重复发送" });
+    expect(deriveCompanionIndicator(healthy({ routeAttestFence: { state: "OUTCOME_UNKNOWN" } })).title)
+      .toBe("C2C：连接需要处理");
   });
 
   it("error precedence wins over warning", () => {
@@ -161,6 +174,7 @@ describe("Browser Companion action indicator", () => {
     const sw = fs.readFileSync(path.join(root, "service-worker.js"), "utf8");
     const projectContext = fs.readFileSync(path.join(root, "project-context.js"), "utf8");
     expect(sw).toContain("createCompanionIndicatorApplier");
+    expect(sw).toMatch(/refreshSelectedIndicator: async \(\) => \{\s*await initPromise;\s*applyActionIndicator\.invalidate\(\);\s*await refreshActionIndicator\(\);/);
     expect(sw).toContain("void refreshActionIndicator();");
     const afterMessageStart = sw.indexOf("async function afterMessage(type)");
     const afterMessageEnd = sw.indexOf("\nreturn {", afterMessageStart);

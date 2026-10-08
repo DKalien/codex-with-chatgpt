@@ -207,7 +207,7 @@ describe("popup bounded status RPC", () => {
       reads += 1;
       return { isOwner: true, storageProtected: true, connectState: connected ? "DONE" : "ATTEST_REQUESTED",
         transport: { connected: true, routeCanonical: route, routeVerification: connected ? "VERIFIED" : "PENDING",
-          r5cConnected: connected, productionEligible: connected }, autonomy: { mode: connected ? "armed" : "off" } };
+          r5cConnected: connected, connectionReadiness: { ready: connected, reason: connected ? null : "connect_not_ready" }, productionEligible: connected }, autonomy: { mode: connected ? "armed" : "off" } };
     } });
     connected = true;
     await vi.advanceTimersByTimeAsync(2000);
@@ -232,7 +232,7 @@ describe("popup bounded status RPC", () => {
     let connected = false;
     const popup = await loadPopup(true, true, { runtimeResponse: async () => ({ ok: true, status: { pendingReady: 0, reserved: 0, claimed: 0, outcomeUnknown: 0, inFlight: null } }), statusResponse: async () => ({
       isOwner: true, storageProtected: true, connectState: connected ? "DONE" : "ATTEST_REQUESTED",
-      transport: { connected: true, routeCanonical: route, routeVerification: connected ? "VERIFIED" : "PENDING", r5cConnected: connected },
+      transport: { connected: true, routeCanonical: route, routeVerification: connected ? "VERIFIED" : "PENDING", r5cConnected: connected, connectionReadiness: { ready: connected, reason: connected ? null : "connect_not_ready" } },
     }) });
     connected = true;
     await popup.elements.get("fetch-state")!.onclick!();
@@ -287,7 +287,7 @@ describe("popup bounded status RPC", () => {
     let hung = true;
     const popup = await loadPopup(true, true, { statusResponse: () => hung ? delayed : Promise.resolve({
       targetRoute: route, isOwner: true, storageProtected: true, journal: { state: "NONE" },
-      transport: { connected: true, routeCanonical: route, routeVerification: "VERIFIED", r5cConnected: true, productionEligible: true },
+      transport: { connected: true, routeCanonical: route, routeVerification: "VERIFIED", r5cConnected: true, connectionReadiness: { ready: true, reason: null }, productionEligible: true },
     }) });
     await vi.advanceTimersByTimeAsync(10_000);
     expect(popup.elements.get("user-connection-status")!.textContent).toBe("连接服务响应超时");
@@ -426,7 +426,7 @@ describe("popup Bridge permission and Pair separation", () => {
     const statusFor = (row: typeof project | typeof second) => ({
       targetRoute: route, isOwner: true, storageProtected: true, journal: { state: "NONE" },
       transport: { workspaceId: row.workspaceId, bridgeOrigin: row.bridgeOrigin, connected: true,
-        routeCanonical: route, routeVerification: "VERIFIED", r5cConnected: true, productionEligible: true },
+        routeCanonical: route, routeVerification: "VERIFIED", r5cConnected: true, connectionReadiness: { ready: true, reason: null }, productionEligible: true },
     });
     const popup = await loadPopup(true, true, {
       projects: [project, second],
@@ -545,7 +545,7 @@ describe("popup Bridge permission and Pair separation", () => {
   });
 
   it("shows the saved auto-rearm preference and restores the pause prompt when cleared", async () => {
-    const transport = { connected: true, routeCanonical: route, routeVerification: "VERIFIED", r5cConnected: true, productionEligible: true };
+    const transport = { connected: true, routeCanonical: route, routeVerification: "VERIFIED", r5cConnected: true, connectionReadiness: { ready: true, reason: null }, productionEligible: true };
     const saved = await loadPopup(true, true, {
       status: { transport, autonomy: { mode: "off", rearmOnConnect: true } },
     });
@@ -561,6 +561,105 @@ describe("popup Bridge permission and Pair separation", () => {
     expect(paused.elements.get("user-action-hint")!.textContent)
       .not.toContain("连接后将自动恢复自动回流");
     expect(paused.elements.get("autonomy-disable")!.disabled).toBe(true);
+  });
+
+  it("keeps missing permission ahead of a leftover verification stage", async () => {
+    const popup = await loadPopup(false, false, {
+      status: { connectState: "ATTEST_REQUESTED", connectReason: "bridge_permission_missing" },
+    });
+    expect(popup.elements.get("user-connection-status")!.textContent).toBe("需要授权连接服务");
+    expect(popup.elements.get("user-action-hint")!.textContent).toContain("授权连接服务");
+    expect(popup.elements.get("user-action-hint")!.textContent).not.toContain("正在核验");
+    expect(popup.calls.page).toEqual([]);
+  });
+
+  it("never claims paused for an armed status even with blocked delivery or an older Connect reply", async () => {
+    const popup = await loadPopup(true, true, {
+      status: { connectState: "DONE", transport: { connected: true, routeCanonical: route,
+        routeVerification: "VERIFIED", r5cConnected: true, connectionReadiness: { ready: true, reason: null } }, autonomy: { mode: "armed" },
+        deliveryRecovery: { blocked: true, journalState: "CLAIMED" } },
+      connectResult: { ok: true, state: "CONNECTED", autonomy: "off", deliveryRecovery: { blocked: true } },
+    });
+    expect(popup.elements.get("user-autonomy-status")!.textContent).toContain("已开启");
+    expect(popup.elements.get("user-action-hint")!.textContent).not.toContain("已暂停");
+    await popup.elements.get("connect-chat")!.onclick!();
+    expect(popup.elements.get("user-autonomy-status")!.textContent).toContain("已开启");
+    expect(popup.elements.get("user-action-hint")!.textContent).not.toContain("已暂停");
+    expect(popup.calls.runtime).toEqual([]);
+  });
+
+  it("shows armed unknown feedback as awaiting verification even when recovery is not blocked", async () => {
+    const popup = await loadPopup(true, true, {
+      status: { connectState: "DONE", transport: { connected: true, routeCanonical: route,
+        routeVerification: "VERIFIED", r5cConnected: true, connectionReadiness: { ready: true, reason: null } }, autonomy: { mode: "armed" },
+        journal: { state: "OUTCOME_UNKNOWN" }, deliveryRecovery: { blocked: false, journalState: "OUTCOME_UNKNOWN" } },
+    });
+    expect(popup.elements.get("user-connection-status")!.textContent).toBe("当前对话已连接");
+    expect(popup.elements.get("user-autonomy-status")!.textContent).toBe("已开启 · 回流待核验");
+    expect(popup.elements.get("user-action-hint")!.textContent).toContain("当前回流记录仍待核验");
+    expect(popup.elements.get("user-action-hint")!.textContent).not.toMatch(/已暂停|执行结果会自动回到当前对话/);
+    expect(popup.calls.page).toEqual([]);
+    expect(popup.calls.runtime).toEqual([]);
+  });
+
+  it("separates a restored connection from blocked old feedback with one explicit Connect", async () => {
+    const deliveryRecovery = { blocked: true, journalState: "OUTCOME_UNKNOWN", reason: "delivery_journal_requires_recovery", action: "observe_only", recovered: false };
+    const { calls, elements } = await loadPopup(true, true, {
+      status: { connectState: "DONE", transport: { connected: true, routeCanonical: route,
+        routeVerification: "VERIFIED", r5cConnected: true, connectionReadiness: { ready: true, reason: null } }, autonomy: { mode: "off", rearmOnConnect: true }, deliveryRecovery },
+      connectResult: { ok: true, state: "CONNECTED", deliveryRecovery },
+    });
+    expect(elements.get("user-connection-status")!.textContent).toBe("当前对话已连接");
+    expect(elements.get("user-autonomy-status")!.textContent).toContain("已暂停");
+    expect(elements.get("user-action-hint")!.textContent).toContain("旧回流尚待核验");
+    expect(elements.get("user-action-hint")!.textContent).not.toContain("连接后将自动恢复");
+    expect(elements.get("connect-diagnostic")!.textContent).toContain("delivery_journal_requires_recovery");
+    expect(calls.page).toEqual([]);
+    await elements.get("connect-chat")!.onclick!();
+    expect(elements.get("connect-status")!.textContent).toBe("当前对话已连接");
+    expect(elements.get("user-action-hint")!.textContent).toContain("不会重发");
+    expect(calls.page).toEqual([{ type: "c2c.connect.request", workspaceId, canonicalRoute: route }]);
+    expect(calls.runtime).toEqual([]);
+  });
+
+  it.each([
+    { transport: { authStale: true }, label: "连接需要修复" },
+    { connectState: "OUTCOME_UNKNOWN", label: "连接发送结果待确认" },
+    { routeAttestFence: "OUTCOME_UNKNOWN", label: "连接验证消息待核验" },
+  ])("keeps connection fences ahead of connected + delivery recovery ($label)", async gate => {
+    const { label, transport, ...status } = gate;
+    const popup = await loadPopup(true, true, {
+      status: { ...status, transport: { connected: true, routeCanonical: route, routeVerification: "VERIFIED", r5cConnected: true, connectionReadiness: { ready: true, reason: null }, ...transport },
+        deliveryRecovery: { blocked: true }, autonomy: { mode: "off", rearmOnConnect: true } },
+      connectResult: { ok: true, state: "CONNECTED", deliveryRecovery: { blocked: true } },
+    });
+    expect(popup.elements.get("user-connection-status")!.textContent).toContain(label);
+    expect(popup.elements.get("user-action-hint")!.textContent).not.toContain("连接后将自动恢复");
+    await popup.elements.get("connect-chat")!.onclick!();
+    expect(popup.elements.get("connect-status")!.textContent).not.toBe("当前对话已连接");
+  });
+
+  it("shows the current connection stage while awaiting a reply, without claiming a verification message was sent", async () => {
+    let resolve!: (value: unknown) => void;
+    const reply = new Promise(done => { resolve = done; });
+    const popup = await loadPopup(true, true, { connectResult: reply });
+    const pending = popup.elements.get("connect-chat")!.onclick!();
+    await vi.waitFor(() => expect(popup.calls.page).toHaveLength(1));
+    expect(popup.elements.get("connect-status")!.textContent).toContain("正在连接当前对话");
+    resolve({ ok: true, state: "ATTEST_REQUESTED" });
+    await pending;
+    expect(popup.elements.get("connect-status")!.textContent).toBe("正在核验当前对话");
+    expect(popup.elements.get("connect-status")!.textContent).not.toContain("已发送");
+    expect(popup.calls.runtime).toEqual([]);
+  });
+
+  it("keeps an explicit Connect failure reason visible", async () => {
+    const popup = await loadPopup(true, true, { connectResult: { ok: false, reason: "owner_proof_rejected" } });
+    await popup.elements.get("connect-chat")!.onclick!();
+    expect(popup.elements.get("connect-status")!.textContent).toContain("owner_proof_rejected");
+    expect(popup.elements.get("connect-diagnostic")!.textContent).toContain("owner_proof_rejected");
+    expect(popup.calls.page).toHaveLength(1);
+    expect(popup.calls.runtime).toEqual([]);
   });
 
   it("Connect checks permission and sends only the selected project and route witness", async () => {
@@ -718,6 +817,8 @@ describe("popup Bridge permission and Pair separation", () => {
     });
     expect(elements.get("user-connection-status")!.textContent).toBe("当前对话缺少反馈连接工具");
     expect(elements.get("user-action-hint")!.textContent).toContain("不会自动重发自举消息");
+    expect(elements.get("user-action-hint")!.textContent).toContain("C2C Unified Gateway");
+    expect(elements.get("user-action-hint")!.textContent).not.toMatch(/feedback_status|feedback_takeover|expectedEpoch|workspaceId|widgetId/);
     expect(calls.page).toEqual([]);
   });
 
@@ -743,7 +844,7 @@ describe("popup Bridge permission and Pair separation", () => {
   it("one-click Pair + Connect checks existing permission before the ordered identity flow", async () => {
     const { calls, elements } = await loadPopup(true, true, {
       connectResult: { ok: true, state: "CONNECTED" },
-      status: { transport: { connected: true, routeCanonical: route, routeVerification: "VERIFIED", r5cConnected: true } },
+      status: { transport: { connected: true, routeCanonical: route, routeVerification: "VERIFIED", r5cConnected: true, connectionReadiness: { ready: true, reason: null } } },
     });
     elements.get("bridge-origin")!.value = "https://bridge.example.test";
     elements.get("pair-json")!.value = JSON.stringify({ intentId: "intent-1", secret: "c2c_pair_secret" });
@@ -763,7 +864,7 @@ describe("popup Bridge permission and Pair separation", () => {
     for (const button of ["connect-chat", "pair-connect"]) {
       const { elements } = await loadPopup(true, true, {
         connectResult: { ok: true, state: "CONNECTED" },
-        status: { transport: { connected: true, routeCanonical: route, routeVerification: "VERIFIED", r5cConnected: false } },
+        status: { transport: { connected: true, routeCanonical: route, routeVerification: "VERIFIED", r5cConnected: false, connectionReadiness: { ready: false, reason: "connect_not_ready" } } },
       });
       elements.get("bridge-origin")!.value = "https://bridge.example.test";
       if (button === "pair-connect") {
@@ -783,7 +884,7 @@ describe("popup Bridge permission and Pair separation", () => {
         transport: {
           connected: true,
           routeCanonical: route,
-          routeVerification: "VERIFIED", r5cConnected: true,
+          routeVerification: "VERIFIED", r5cConnected: true, connectionReadiness: { ready: true, reason: null },
           rebindPending: false,
           authStale: false,
           bridgeOrigin: "https://bridge.example.test",
@@ -803,7 +904,7 @@ describe("popup Bridge permission and Pair separation", () => {
         ownership: { hasOwner: true },
         transport: {
           connected: true,
-          routeVerification: "VERIFIED", r5cConnected: true,
+          routeVerification: "VERIFIED", r5cConnected: false, connectionReadiness: { ready: false, reason: "owner_witness_changed" },
           rebindPending: false,
           authStale: false,
           bridgeOrigin: "https://bridge.example.test",
@@ -815,7 +916,7 @@ describe("popup Bridge permission and Pair separation", () => {
     expect(elements.get("user-connection-status")!.textContent).toBe("当前页面需要重新连接");
     expect(elements.get("user-connection-status")!.className).toContain("warn");
     expect(elements.get("user-action-hint")!.textContent).toContain("连接当前对话");
-    expect(elements.get("user-action-hint")!.textContent).not.toMatch(/Pair|Verify/);
+    expect(elements.get("user-action-hint")!.textContent).not.toMatch(/Pair|Verify|页面刷新后|Web Sink/);
   });
 
   it("keeps hard auth repair ahead of the owner-missing warning", async () => {
@@ -824,7 +925,7 @@ describe("popup Bridge permission and Pair separation", () => {
         isOwner: false,
         transport: {
           connected: false,
-          routeVerification: "VERIFIED", r5cConnected: true,
+          routeVerification: "VERIFIED", r5cConnected: true, connectionReadiness: { ready: true, reason: null },
           rebindPending: false,
           authStale: true,
           bridgeOrigin: "https://bridge.example.test",
@@ -855,7 +956,7 @@ describe("popup Bridge permission and Pair separation", () => {
         transport: {
           connected: true,
           routeCanonical: oldRoute,
-          routeVerification: "VERIFIED", r5cConnected: true,
+          routeVerification: "VERIFIED", r5cConnected: false, connectionReadiness: { ready: false, reason: "owner_witness_changed" },
           productionEligible: true,
           rebindPending: false,
           authStale: false,
@@ -887,7 +988,7 @@ describe("popup Bridge permission and Pair separation", () => {
         transport: {
           connected: true,
           routeCanonical: route,
-          routeVerification: "VERIFIED", r5cConnected: true,
+          routeVerification: "VERIFIED", r5cConnected: true, connectionReadiness: { ready: true, reason: null },
           productionEligible: true,
           rebindPending: false,
           authStale: false,
@@ -906,7 +1007,7 @@ describe("popup Bridge permission and Pair separation", () => {
         isOwner: false,
         transport: {
           connected: true,
-          routeVerification: "VERIFIED", r5cConnected: true,
+          routeVerification: "VERIFIED", r5cConnected: true, connectionReadiness: { ready: true, reason: null },
           rebindPending: true,
           authStale: false,
           bridgeOrigin: "https://bridge.example.test",
@@ -991,6 +1092,14 @@ describe("popup Bridge permission and Pair separation", () => {
     await elements.get("pair-connect")!.onclick!();
     expect(calls.page).toEqual([{ type: "c2c.connect.request", workspaceId, canonicalRoute: route }]);
     expect(elements.get("connect-status")!.textContent).toBe("已发送连接验证，请回到 ChatGPT 完成确认");
+  });
+
+  it("pair-and-connect reports the returned verification stage without claiming Send", async () => {
+    const { elements } = await loadPopup(true, true, { connectResult: { ok: true, state: "ATTEST_REQUESTED" } });
+    elements.get("pair-json")!.value = JSON.stringify({ workspaceId, bridgeOrigin: project.bridgeOrigin, intentId: "intent-a", secret: "secret-a" });
+    await elements.get("pair-connect")!.onclick!();
+    expect(elements.get("connect-status")!.textContent).toBe("正在核验当前对话");
+    expect(elements.get("pair-connect-hint")!.textContent).toBe("正在核验当前对话");
   });
 
   it("one-click Pair denial stops before owner proof/pair/connect and keeps input", async () => {
@@ -1161,7 +1270,7 @@ describe("popup Bridge permission and Pair separation", () => {
         transport: {
           connected: true,
           routeVerification: "VERIFIED",
-          r5cConnected: false,
+          r5cConnected: false, connectionReadiness: { ready: false, reason: "connect_not_ready" },
           webSinkConverged: false,
           routeCanonical: route,
           authStale: false,
@@ -1177,4 +1286,32 @@ describe("popup Bridge permission and Pair separation", () => {
     expect(calls.ownerProof).toBeGreaterThanOrEqual(0);
   });
 
+});
+
+
+describe("本机确认连接提示", () => {
+  it.each([ ["PENDING", "请在本机确认连接"], ["COMMIT_REQUESTED", "正在核验本机确认结果"],
+    ["CANCELLED", "已取消本机确认"], ["EXPIRED", "本机确认已过期"], ["UPGRADE_REQUIRED", "请升级连接服务"] ])("%s阶段重开popup显示真实状态", async (state, label) => {
+    const { elements, calls } = await loadPopup(true, true, { status: { connectState: "NONE", localRoute: { state } } });
+    expect(elements.get("user-connection-status")!.textContent).toContain(label);
+    expect(calls.page).toEqual([]); expect(calls.order).not.toContain("pair");
+  });
+  it("无对话地址时要求先创建对话，不显示可以连接", async () => {
+    const { elements, calls } = await loadPopup(true, true, { pageUrl: "https://chatgpt.com/" });
+    expect(elements.get("user-connection-status")!.textContent).toContain("先创建");
+    expect(elements.get("connect-chat")!.disabled).toBe(true); expect(calls.page).toEqual([]);
+  });
+});
+
+describe("popup 统一连接派生", () => {
+  it.each([undefined, { ready: false, reason: "owner_witness_changed" }])("旧别名不能替代缺失或不 ready 的当前页面结果", async connectionReadiness => {
+    const { elements, close } = await loadPopup(true, true, { status: {
+      isOwner: true, connectState: "DONE", transport: { connected: true, routeCanonical: route,
+        routeVerification: "VERIFIED", r5cConnected: true, webSinkConverged: true, connectionReadiness },
+    } });
+    await new Promise(resolve => setImmediate(resolve));
+    expect(elements.get("user-connection-status")!.textContent).toBe("当前对话需要完成连接");
+    expect(elements.get("reserve")!.disabled).toBe(true);
+    close();
+  });
 });

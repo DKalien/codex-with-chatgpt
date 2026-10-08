@@ -27,8 +27,9 @@ import { appendResult, createCommand, registerRoute, transitionCommandDelivery, 
 import type { CommandMailbox } from "../src/routing/schema.js";
 import { enqueueResultBusEntry } from "../src/result-bus/store.js";
 import { cleanupJournalFile, withCommandOperation } from "../src/command-cleanup/fence.js";
-import { CodexDesktopExecutorPlugin, type ExecutorAdapter } from "../src/executor/index.js";
-import { updateDesktop } from "../src/desktop/store.js";
+import { codexDesktopAdapter } from "../src/executor/index.js";
+import { readDesktop, updateDesktop } from "../src/desktop/store.js";
+import { setRemoteEnabled, updateRemote } from "../src/remote/store.js";
 import { takeoverReceiver } from "../src/feedback/receiver.js";
 import { isolateStateDir, makeTmpDir } from "./helpers.js";
 import { cleanupStrict } from "./strict-teardown.js";
@@ -211,6 +212,101 @@ describe("B2 read-only status boundary", () => {
   });
 });
 
+describe("Companion Desktop activity", () => {
+  const fence = { desktopPid: 1, desktopExe: "desktop.exe", desktopCreation: "1",
+    appServerPid: 2, appServerExe: "server.exe", appServerCreation: "2" };
+  function desktop() {
+    const binding = { bindingId: randomUUID(), threadId: randomUUID(), hostId: "local" as const,
+      projectId: "test", title: "private title", boundAt: new Date().toISOString() };
+    updateDesktop(workspace.id, () => ({ state: { version: 1, workspaceId: workspace.id, workspaceRoot: root,
+      enabled: true, binding, runtimeFence: fence, deliveries: [] }, result: null }), stateDir);
+    setRemoteEnabled(workspace, false, { deliveryMode: "official" });
+    return { threadId: binding.threadId, hostId: binding.hostId, projectId: binding.projectId, workspaceRoot: root };
+  }
+  it.each([
+    ["idle", 0, "idle"], ["active", 0, "busy"], ["inProgress", 0, "busy"],
+    ["idle", 1, "approval_required"], ["idle", undefined, "unknown"], [undefined, 0, "unknown"],
+  ])("disabled official mode projects exact Desktop %s / %s as %s without writes", async (runtimeStatus, requestsCount, activity) => {
+    const input = pair(), target = desktop(); seed("history", principal().fingerprint, true);
+    const probe = vi.spyOn(codexDesktopAdapter, "inspect").mockResolvedValue({ ...target, title: "private title", runtimeStatus, requestsCount });
+    const generic = vi.fn(inspect), before = snapshot(stateDir);
+    const result = await readCompanionOperations(input, generic);
+    expect(result.executor).toMatchObject({ source: "codex_desktop", state: activity, sessionId: target.threadId });
+    expect(probe).toHaveBeenCalledExactlyOnceWith(target, fence);
+    expect(generic).not.toHaveBeenCalled();
+    expect(result.commands.map(command => command.commandId)).toEqual(["history"]);
+    for (const secret of [root, "private title", "desktop.exe", input.credential]) expect(JSON.stringify(result)).not.toContain(secret);
+    expect(snapshot(stateDir)).toEqual(before);
+  });
+  it.each(["disabled", "retarget", "revision", "fence", "remote_enabled", "remote_mode"])("%s during IPC invalidates the observation", async change => {
+    const input = pair(), target = desktop();
+    vi.spyOn(codexDesktopAdapter, "inspect").mockImplementation(async () => {
+      if (change.startsWith("remote_")) updateRemote(workspace.id, state => {
+        if (change === "remote_enabled") state!.enabled = true;
+        else delete state!.deliveryMode;
+        return { state: state!, result: null };
+      }, stateDir);
+      else updateDesktop(workspace.id, state => {
+        if (change === "disabled") state!.enabled = false;
+        if (change === "retarget") state!.binding!.threadId = randomUUID();
+        if (change === "fence") state!.runtimeFence!.desktopPid++;
+        return { state: state!, result: null };
+      }, stateDir);
+      return { ...target, title: "test", requestsCount: 0, runtimeStatus: "idle" };
+    });
+    expect((await readCompanionOperations(input, inspect)).executor).toMatchObject({
+      state: "unknown", reason: "binding_changed", observedAt: null, sessionId: null });
+  });
+  it.each(["missing_fence", "wrong_target", "inspect_failed"])("%s never falls back to a generic target", async failure => {
+    const input = pair(), target = desktop();
+    if (failure === "missing_fence") updateDesktop(workspace.id, state => ({ state: { ...state!, runtimeFence: null }, result: null }), stateDir);
+    const probe = vi.spyOn(codexDesktopAdapter, "inspect").mockImplementation(async () => {
+      if (failure === "inspect_failed") throw new Error("offline");
+      return { ...target, threadId: randomUUID(), title: "test", requestsCount: 0, runtimeStatus: "idle" };
+    });
+    const generic = vi.fn(inspect), before = snapshot(stateDir);
+    expect((await readCompanionOperations(input, generic)).executor).toMatchObject({ state: "unknown", reason: "inspect_failed" });
+    expect(generic).not.toHaveBeenCalled();
+    if (failure === "missing_fence") expect(probe).not.toHaveBeenCalled();
+    expect(snapshot(stateDir)).toEqual(before);
+  });
+  it("enabling Desktop during a generic inspection discards the old target observation", async () => {
+    const input = pair(); desktop();
+    updateDesktop(workspace.id, state => ({ state: { ...state!, enabled: false }, result: null }), stateDir);
+    updateRemote(workspace.id, state => { delete state!.deliveryMode; return { state: state!, result: null }; }, stateDir);
+    const probe = vi.spyOn(codexDesktopAdapter, "inspect");
+    expect((await readCompanionOperations(input, async () => {
+      updateDesktop(workspace.id, state => ({ state: { ...state!, enabled: true }, result: null }), stateDir);
+      return { workspaceId: workspace.id, activeBinding: null, plugins: [], availability: { available: true }, activity: "idle" };
+    })).executor).toMatchObject({ state: "unknown", reason: "binding_changed", observedAt: null });
+    expect(probe).not.toHaveBeenCalled();
+  });
+  it("enabled unhealthy official Remote stays unknown and disabled Desktop is not inspected", async () => {
+    const input = pair(); desktop();
+    const probe = vi.spyOn(codexDesktopAdapter, "inspect"), generic = vi.fn(inspect);
+    setRemoteEnabled(workspace, true);
+    expect((await readCompanionOperations(input, generic)).executor).toMatchObject({ source: "codex_app_server", state: "unknown", reason: "CONTROLLER_OFFLINE" });
+    setRemoteEnabled(workspace, false);
+    updateDesktop(workspace.id, state => ({ state: { ...state!, enabled: false }, result: null }), stateDir);
+    expect((await readCompanionOperations(input, generic)).executor).toMatchObject({ state: "unknown", reason: "REMOTE_CONTROL_DISABLED" });
+    expect(probe).not.toHaveBeenCalled(); expect(generic).not.toHaveBeenCalled();
+  });
+  it("rejects a foreign workspace before IPC and revocation after IPC", async () => {
+    const input = pair(), target = desktop();
+    updateDesktop(workspace.id, state => ({ state: { ...state!, workspaceRoot: "foreign" }, result: null }), stateDir);
+    const probe = vi.spyOn(codexDesktopAdapter, "inspect").mockImplementation(async () => {
+      revokeCompanion({ workspaceId: workspace.id, principal: principal(), stateDir });
+      return { ...target, title: "test", requestsCount: 0, runtimeStatus: "idle" };
+    });
+    await expect(readCompanionOperations(input, inspect)).rejects.toThrow("workspace 身份不一致");
+    expect(probe).not.toHaveBeenCalled();
+    updateDesktop(workspace.id, state => ({ state: { ...state!, workspaceRoot: root }, result: null }), stateDir);
+    await expect(readCompanionOperations(input, inspect)).rejects.toThrow();
+    expect(probe).toHaveBeenCalledTimes(1);
+    expect(readDesktop(workspace.id, stateDir)!.binding!.threadId).toBe(target.threadId);
+  });
+});
+
 describe("Companion read-only presentation", () => {
   function model() {
     const context = vm.createContext({});
@@ -219,9 +315,25 @@ describe("Companion read-only presentation", () => {
   }
   const now = Date.parse("2026-10-04T12:00:00.000Z");
   function response(overrides = {}) { return { ok: true, autonomy: "off", snapshot: { observedAt: new Date(now).toISOString(), executor: { state: "busy", observedAt: new Date(now).toISOString() }, commands: [] },
-    web: { observedAt: now, ownerAvailable: true, routeMatches: true, verified: true, composer: "empty", generation: "idle", safe: true }, ...overrides }; }
+    web: { connectionReadiness: { ready: true, reason: null }, observedAt: now, ownerAvailable: true, routeMatches: true, verified: true, composer: "empty", generation: "idle", safe: true }, ...overrides }; }
   it("Codex busy and webpage available are independent; pause is not offline", () => {
-    expect(model().derive(response(), now)).toMatchObject({ codex: "忙碌 · 可排队", web: "可接收结果", autonomy: "已暂停" });
+    expect(model().derive(response(), now)).toMatchObject({ codex: "忙碌", web: "可接收结果", autonomy: "已暂停" });
+  });
+  it("unknown journal changes only an otherwise-ready webpage to awaiting feedback verification", () => {
+    const view = model();
+    const data = response({ autonomy: "armed", journal: { state: "OUTCOME_UNKNOWN" } });
+    expect(view.derive(data, now)).toMatchObject({ web: "回流待核验", autonomy: "已开启" });
+    expect(view.derive(response({ autonomy: "armed", journal: { state: "NONE" } }), now))
+      .toMatchObject({ web: "可接收结果", autonomy: "已开启" });
+    expect(view.derive(data, now + 46_000).web).toBe("无法确认");
+    for (const [web, label] of [
+      [{ ownerAvailable: false }, "当前页面无 owner"], [{ routeMatches: false }, "页面与绑定不一致"],
+      [{ verified: false }, "对话待验证"], [{ generation: "generating" }, "正在生成"],
+      [{ composer: "nonempty" }, "输入框有未发送内容"], [{ safe: false }, "暂不可接收"],
+      [{ observedAt: now - 46_000 }, "无法确认"],
+    ] as const) {
+      expect(view.derive({ ...data, web: { ...data.web, ...web } }, now).web).toBe(label);
+    }
   });
   it.each(["generating", "nonempty", "mismatch"])("web %s cannot appear ready", condition => {
     const data = response();
@@ -229,6 +341,11 @@ describe("Companion read-only presentation", () => {
     if (condition === "nonempty") data.web.composer = condition;
     if (condition === "mismatch") data.web.routeMatches = false;
     expect(model().derive(data, now).web).not.toBe("可接收结果");
+  });
+  it.each([undefined, { ready: false, reason: "web_sink_not_ready" }])("missing or incomplete readiness cannot receive", connectionReadiness => {
+    const data = response();
+    expect(model().derive({ ...data, web: { ...data.web, connectionReadiness } }, now).web)
+      .toBe("当前对话需要完成连接");
   });
   it("stale or unreachable service makes both endpoints unknown", () => {
     expect(model().derive(response(), now + 46_000)).toMatchObject({ codex: "无法确认", web: "无法确认", serviceFresh: false });

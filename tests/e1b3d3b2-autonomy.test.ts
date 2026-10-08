@@ -74,6 +74,7 @@ function baseState(overrides = {}) {
     inFlight: null,
     pendingReady: 1,
     routeVerified: true,
+    connectionReadiness: { ready: true, reason: null },
     now: Date.now(),
     ...overrides,
   };
@@ -199,6 +200,7 @@ describe("E1b3d3b2 autonomy policy", () => {
       sendProbeLatch: "NONE",
       productionSendInFlight: false,
       routeVerified: true,
+      connectionReadiness: { ready: true, reason: null },
       now: Date.now(),
     });
     expect(gates.ok).toBe(true);
@@ -824,6 +826,17 @@ describe("E1b3d3b2 autonomous recovery diagnostic", () => {
     const distPopup = path.join(projectRoot, "dist", "browser-companion", "popup", "popup.js");
     if (fs.existsSync(distPopup)) {
       expect(fs.readFileSync(distPopup, "utf8")).toMatch(/recoveryDiagnostic=/);
+    }
+  });
+});
+
+describe("统一连接派生只阻止新的自动预约", () => {
+  it.each([undefined, { ready: false, reason: "owner_witness_changed" }])("缺失或不 ready 时零新增投递，已有 journal 恢复保持可用", connectionReadiness => {
+    expect(planAutonomyTick(baseState({ connectionReadiness })))
+      .toMatchObject({ decision: "gate_failed", reason: "connect_not_ready" });
+    for (const state of ["RESERVED", "OBSERVED_PENDING_ACK", "OUTCOME_UNKNOWN"]) {
+      expect(planAutonomyTick(baseState({ connectionReadiness, journal: { state } })))
+        .toMatchObject({ decision: "recovering", journalState: state });
     }
   });
 });

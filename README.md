@@ -41,7 +41,9 @@ Detailed docs below are in English · 详细中文文档见 **[README.zh-CN.md](
 默认关闭，新增 `codex.control` / `codex.read`；基础只读工具边界不变，feedback/Desktop 独立鉴权。
 操作步骤、持久化与恢复限制见 [Remote Control](docs/remote-control.md)。
 
-当前源码已实现机器级 Unified Gateway、显式 workspace/client 授权路由与 feedback 工具整合；多项目 Companion、Gateway Supervisor 也已有源码实现。双项目真实 Send/observed、完整现场验收与旧插件退役仍待完成，Browser Companion 和旧 feedback Connector 继续保留。当前合同见 [官方路线](docs/official-route.md)，实施与验收边界见 [统一 Gateway 计划](docs/unified-gateway-plan.md)。
+当前源码已实现机器级 Unified Gateway、显式 workspace/client 授权路由，以及 Remote、Desktop、feedback 与 Web Sink 工具整合。多项目 Companion 和 Gateway Supervisor 也已有源码实现；双项目真实 Send/observed、完整现场验收与旧插件退役仍待完成。当前合同见 [官方路线](docs/official-route.md)，源码、部署与验收状态统一见 [Gateway 计划](docs/unified-gateway-plan.md)。
+
+已配对浏览器在具体 ChatGPT 对话中点击“连接当前对话”，新建或切换回流目标时由用户在本机确认工作区与完整 URL；该确认只授权结果回流。连接状态与自动回流、未知发送分别判断；“清空历史显示”只隐藏本地终态列表，保留待发送、隔离与防重放证据。操作和恢复见 [日常连接](docs/troubleshooting.md#日常连接与本机确认)。
 
 ## Experimental Desktop Control · 实验性桌面控制
 
@@ -89,9 +91,11 @@ the matching owner/project/workspace, and a verified version. Explicit
 `desktop bind` plus `desktop enable` remains an advanced fallback; there is no
 MCP bind tool.
 
-The send action waits only for a real delivery acceptance and returns
-`deliveryStatus=accepted` with the actual thread/turn IDs. It does not mean
-the task is completed or tested. If delivery is uncertain (`outcome_unknown`), do not resend,
+先调用 `codex_desktop_status` 核对本机绑定，再用同一 workspaceId/bindingId 发送。
+Bridge 入口返回 `deliveryStatus=queued`，空闲后再投递；Gateway 入口直接复用现有安全
+sender，遵守 idle/busy 门禁且不排队，真实接收后返回 `deliveryStatus=accepted` 和 thread/turn ID。
+Desktop 授权独立于后台 Remote；`codex_submit_task` 始终是后台 Remote 工具。
+queued/accepted 均不代表执行完成或测试通过。 If delivery is uncertain (`outcome_unknown`), do not resend,
 change `commandId` or rebind; the whole workspace stays blocked, including a
 new binding. A local user must check the Desktop session and then use the
 documented `reconcile-unknown` or two-step `resolve-unknown` workflow as appropriate;

@@ -6,7 +6,8 @@ import { readPanelAuthorization } from "../feedback/panel.js";
 import { readFeedbackState } from "../feedback/state-store.js";
 import { readRouting } from "../routing/store.js";
 import { canCancelMailbox } from "../routing/schema.js";
-import { readDesktop } from "../desktop/store.js";
+import { readDesktop, requireDesktopRuntimeFence } from "../desktop/store.js";
+import { getExecutor, projectDesktopActivity } from "../executor/index.js";
 import { listResultBusEntries } from "../result-bus/store.js";
 import { resultBusCompanionDeliveryId } from "./result-bus-delivery.js";
 import { areChatgptConversationRoutesEquivalent } from "../chatgpt/route.js";
@@ -65,9 +66,23 @@ export async function readCompanionOperations(input: {
   const identity = { id: input.workspaceId, root: input.workspaceRoot };
   const remote = readRemote(identity.id, stateDir);
   if (remote && remote.workspaceRoot !== identity.root) throw new CompanionError("COMPANION_WORKSPACE_MISMATCH", "official workspace 身份不一致。");
-  const officialMode = remote?.deliveryMode === "official";
+  const desktopSnapshot = readDesktop(identity.id, stateDir);
+  if (desktopSnapshot && desktopSnapshot.workspaceRoot !== identity.root) {
+    throw new CompanionError("COMPANION_WORKSPACE_MISMATCH", "workspace 身份不一致。");
+  }
+  const desktopBinding = !remote?.enabled && desktopSnapshot?.enabled ? desktopSnapshot.binding : null;
+  const officialMode = remote?.deliveryMode === "official" && !desktopBinding;
   let endpoint: ExecutorStatusProjection;
-  try { endpoint = officialMode
+  try {
+    if (desktopBinding) {
+      const target = { threadId: desktopBinding.threadId, hostId: desktopBinding.hostId,
+        projectId: desktopBinding.projectId, workspaceRoot: identity.root };
+      const session = await getExecutor().inspect(target, requireDesktopRuntimeFence(identity.id, identity.root, stateDir));
+      if (session.threadId !== target.threadId || session.hostId !== target.hostId
+        || session.projectId !== target.projectId || session.workspaceRoot !== target.workspaceRoot) throw new Error("Desktop target changed");
+      endpoint = { workspaceId: identity.id, activeBinding: null, plugins: [],
+        availability: { available: true }, activity: projectDesktopActivity(session) };
+    } else endpoint = officialMode
     ? { workspaceId: identity.id, activeBinding: null, plugins: [], availability: { available: false, reasonCode: "official_mode", message: "Official App Server" } }
     : await inspect(identity.id, identity.root); }
   catch { endpoint = { workspaceId: identity.id, activeBinding: null, plugins: [],
@@ -76,12 +91,17 @@ export async function readCompanionOperations(input: {
   if (JSON.stringify(authenticate(input)) !== JSON.stringify({ auth, ctx })) {
     throw new CompanionError("COMPANION_EPOCH_STALE", "查询期间连接身份改变；请刷新。");
   }
-  const bindingStable = officialMode || JSON.stringify(readActiveExecutorBinding(identity.id, identity.root)) === JSON.stringify(endpoint.activeBinding);
   const routing = readRouting(identity, input.stateDir);
   const desktop = readDesktop(identity.id, input.stateDir);
   if (desktop && desktop.workspaceRoot !== identity.root) {
     throw new CompanionError("COMPANION_WORKSPACE_MISMATCH", "workspace 身份不一致。");
   }
+  const latestRemote = readRemote(identity.id, stateDir);
+  if (latestRemote && latestRemote.workspaceRoot !== identity.root) throw new CompanionError("COMPANION_WORKSPACE_MISMATCH", "official workspace 身份不一致。");
+  const modeStable = remote?.enabled === latestRemote?.enabled && remote?.deliveryMode === latestRemote?.deliveryMode;
+  const bindingStable = modeStable && JSON.stringify(desktopSnapshot) === JSON.stringify(desktop)
+    && (!!desktopBinding || officialMode
+      || JSON.stringify(readActiveExecutorBinding(identity.id, identity.root)) === JSON.stringify(endpoint.activeBinding));
   const feedback = readFeedbackState(identity.id, input.stateDir);
   const pendingPanelCommandIds = new Set((feedback.panelOperations ?? [])
     .filter(operation => operation.status === "pending").map(operation => operation.commandId));
@@ -180,7 +200,8 @@ export async function readCompanionOperations(input: {
     : { state: bindingStable && endpoint.availability.available ? endpoint.activity ?? "unknown" : "unknown",
       reason: !bindingStable ? "binding_changed" : endpoint.availability.available ? null : endpoint.availability.reasonCode,
       observedAt: bindingStable && endpoint.availability.available ? new Date().toISOString() : null,
-      sessionId: endpoint.activeBinding?.sessionId ?? null },
+      ...(desktopBinding ? { source: "codex_desktop" } : {}),
+      sessionId: desktopBinding ? (bindingStable ? desktopBinding.threadId : null) : endpoint.activeBinding?.sessionId ?? null },
     scope: "workspace_metadata", commands: rows, total: rows.length,
   };
 }

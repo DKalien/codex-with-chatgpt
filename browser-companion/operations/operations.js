@@ -7,6 +7,9 @@
       ? chrome.runtime.sendMessage({ ...message, workspaceId })
       : Promise.resolve({ ok: false, reason: "workspace_selection_invalid" });
   let response = null;
+  let hiddenIds = [];
+  let historyPending = false;
+  let historyError = "";
   let filter = "all";
   let page = 0;
   let selected = null;
@@ -23,7 +26,12 @@
     return node;
   };
   function render() {
-    const view = C2COperations.derive(response);
+    const view = C2COperations.derive(response, Date.now(), hiddenIds);
+    el("clear-history").disabled = pending || historyPending || !view.serviceFresh || !workspaceId || view.workspaceId !== workspaceId || !view.rows.some(C2COperations.canHide);
+    el("restore-history").disabled = pending || historyPending || !workspaceId || view.workspaceId !== workspaceId || !hiddenIds.length;
+    el("history-status").textContent = historyError || `已隐藏 ${view.hiddenCount} 条历史；新任务及重新活动的任务仍显示。`;
+    el("feedback-status").textContent = `自动回流${view.autonomy}；${view.pendingFeedback.length} 条排队、待确认或隔离回流（含已隐藏任务）。清空历史显示不取消发送。${response?.journal?.state && response.journal.state !== "NONE" ? `当前发送日志：${response.journal.state}；仍需核验。` : ""}`;
+    el("feedback-pending").replaceChildren(...view.pendingFeedback.map(event => text("li", `${event.commandId} · ${event.label} · event ${event.eventId} · attempt ${event.attemptId ?? "尚未开始"}`)));
     document.body.classList.toggle("stale", !view.serviceFresh);
     for (const key of ["codex", "web", "bridge", "autonomy"]) el(key).textContent = view[key];
     el("checked-at").textContent = `最近观察：${time(view.observedAt)}`;
@@ -103,7 +111,7 @@
     }
     el("empty").hidden = rows.length > 0;
     el("empty").textContent = response?.ok !== true ? "未取得任务数据。请检查连接后刷新。"
-      : filter === "all" ? "没有仍可核验的任务记录。已清理的任务不会恢复。" : "当前筛选下没有记录。";
+      : filter === "all" ? "当前没有可见任务；可恢复已隐藏历史。物理清理的记录不会恢复。" : "当前筛选下没有记录。";
     const row = view.rows.find(item => item.commandId === selected);
     el("detail").hidden = !row;
     if (!row) return;
@@ -225,12 +233,19 @@
     await refresh();
   };
   async function refresh() {
-    if (pending || document.hidden) return;
+    if (pending || historyPending || document.hidden) return;
     pending = true; el("refresh").disabled = true; clearTimeout(timer);
     let deadline;
     try {
       response = await Promise.race([send({ type: "c2c.operations.read" }),
         new Promise(resolve => { deadline = setTimeout(() => resolve({ ok: false, reason: "query_timeout" }), 20_000); })]);
+      if (response?.ok && response.snapshot?.workspaceId !== workspaceId) response = { ok: false, reason: "workspace_selection_mismatch" };
+      hiddenIds = [];
+      historyError = response?.reason === "workspace_selection_mismatch" ? "项目不一致；未读取或修改历史显示设置，请从当前项目重新打开面板。" : "";
+      if (response?.ok && response.snapshot?.workspaceId) {
+        try { hiddenIds = await C2CHistory.read(workspaceId); }
+        catch { historyError = "无法读取历史显示设置；已显示全部任务，未修改存储。"; }
+      }
       failures = response?.ok ? 0 : Math.min(failures + 1, 2);
     } catch { response = { ok: false, reason: "extension_unavailable" }; failures = Math.min(failures + 1, 2); }
     finally {
@@ -238,6 +253,20 @@
       if (!document.hidden) timer = setTimeout(refresh, Math.min(30_000 * 2 ** failures, 120_000));
     }
   }
+  async function changeHistory(restore) {
+    const view = C2COperations.derive(response, Date.now(), hiddenIds);
+    if (pending || historyPending || !workspaceId || view.workspaceId !== workspaceId || !view.serviceFresh) return;
+    // 与 refresh 串行，项目切换及迟到读取不会覆盖本次明确选择。
+    const ids = restore ? [] : [...new Set([...hiddenIds, ...view.rows.filter(C2COperations.canHide).map(row => row.commandId)])];
+    historyPending = true; render();
+    try {
+      await C2CHistory.write(workspaceId, ids);
+      hiddenIds = ids; selected = null; page = 0; historyError = "";
+    } catch { historyError = "历史显示设置保存失败；未改变当前显示，请稍后重试。"; }
+    finally { historyPending = false; render(); clearTimeout(timer); if (!document.hidden) timer = setTimeout(refresh, 30_000); }
+  }
+  el("clear-history").onclick = () => changeHistory(false);
+  el("restore-history").onclick = () => changeHistory(true);
   el("refresh").onclick = refresh;
   el("search").oninput = () => { page = 0; render(); };
   el("previous").onclick = () => { page = Math.max(0, page - 1); render(); };

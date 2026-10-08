@@ -12,12 +12,14 @@
 正式权限是 `codex.control` / `codex.read`，write_probe 仍默认关闭。
 首次使用、启停、状态位置和崩溃恢复见 [Remote Control 操作说明](docs/remote-control.md)。
 
-当前源码已实现机器级 Unified Gateway、显式 workspace/client 授权路由与 feedback 工具整合；多项目 Companion、Gateway Supervisor 也已有源码实现。双项目真实 Send/observed、完整现场验收与旧插件退役仍待完成，Browser Companion 和旧 feedback Connector 继续保留。当前合同见 [官方路线](docs/official-route.md)，实施与验收边界见 [统一 Gateway 计划](docs/unified-gateway-plan.md)。
+当前源码已实现机器级 Unified Gateway、显式 workspace/client 授权路由，以及 Remote、Desktop、feedback 与 Web Sink 工具整合。多项目 Companion 和 Gateway Supervisor 也已有源码实现；双项目真实 Send/observed、完整现场验收与旧插件退役仍待完成。当前合同见 [官方路线](docs/official-route.md)，源码、部署与验收状态统一见 [Gateway 计划](docs/unified-gateway-plan.md)。
+
+已配对浏览器在具体 ChatGPT 对话中点击“连接当前对话”，新建或切换回流目标时由用户在本机确认工作区与完整 URL；该确认只授权结果回流。连接状态与自动回流、未知发送分别判断；“清空历史显示”只隐藏本地终态列表，保留待发送、隔离与防重放证据。操作和恢复见 [日常连接](docs/troubleshooting.md#日常连接与本机确认)。
 
 ## 实验性 Desktop Control（默认关闭）
 
-Desktop Control 只在本机用户明确绑定并启用一个已经在 Desktop 中加载、当前空闲的已有
-会话后可用。ChatGPT 讨论并确认完整方案后，通过 `codex_desktop_send` 投递到该会话，
+Desktop Control 只在本机用户明确绑定并启用一个已经在 Desktop 中加载的已有会话后可用；
+身份核验可以接受 active，会话实际投递仍要求 idle。ChatGPT 讨论并确认完整方案后，通过 `codex_desktop_send` 投递到该会话，
 使用独立的 `codex.desktop.control`；`codex_desktop_status` 使用独立的
 `codex.desktop.read`。第一版不自动新建会话，不做 steer、interrupt、实时进度、推送通知
 或网页持续轮询。
@@ -50,8 +52,11 @@ node "<stable launcher>" desktop bind-current [-w <workspace>] [--json]
 待审批、owner/project/workspace 匹配和已验证版本。传统显式 `desktop bind` + `desktop enable`
 仍保留为高级 fallback；不新增 MCP bind 工具。
 
-工具只等待真实的投递接受回执，返回 `deliveryStatus=accepted` 和真实 thread/turn ID；
-这不代表任务已完成或测试已通过。回执不明（`outcome_unknown`）时不要重发、不要更换 `commandId` 或重新绑定，
+先调用 `codex_desktop_status` 核对本机绑定，再使用同一 workspaceId/bindingId 发送。
+Bridge 入口返回 `deliveryStatus=queued`，空闲后再投递；Gateway 入口直接复用现有安全 sender，
+遵守 idle/busy 门禁且不排队，真实接收后返回 `deliveryStatus=accepted` 和真实 thread/turn ID。
+Desktop 授权独立于后台 Remote；`codex_submit_task` 始终是后台 Remote 工具。
+queued/accepted 均不代表任务已完成或测试已通过。回执不明（`outcome_unknown`）时不要重发、不要更换 `commandId` 或重新绑定，
 整个 workspace（包括新绑定）会暂停后续投递；本机用户核对 Desktop 后，可按证据使用
 `reconcile-unknown` 恢复唯一真实 delivery，或使用两阶段 `resolve-unknown` 仅停止等待。
 行政 resolution 不代表已投递、已接受、已完成或成功，详见 [Desktop Control](docs/desktop-control.md)。
@@ -186,9 +191,8 @@ DONE 只结束当前任务，仍可等待下一次网页用户的明确委派。
 有效期、格式和防重放。此流程依赖可信的本地 Agent，网页文本或其自称的授权不是身份凭证。
 网页只能提出任务级自然语言，不能直接获得 Shell、文件写入、子代理 API 或额外权限。
 原 **基础只读 MCP 工具与默认 OAuth scopes 保持只读边界**；Desktop/Remote/feedback/探针仍独立鉴权。
-Production companion Send 还需 Browser **route attestation VERIFIED**（仅有 pairing 不够）。新 Chat 一键 takeover/reconnect
-仍未验收：最近一次真实 smoke 被 `generation_unknown` 阻断，R3i 只补只读诊断能力，没有放宽该门槛；因此目前不能承诺该流程已在已安装版本可用。
-后续验收通过后，已开启自动回流的用户换到新的 ChatGPT 对话只需点击扩展中的“连接当前对话”；新 route 验证为 `VERIFIED` 后才会自动恢复，显式暂停或清除本地目标不会恢复。独立的实验性
+Production companion Send 还需 Browser **route attestation VERIFIED**（仅有 pairing 不够）。
+2026-09-25 的 R3 smoke 曾被 `generation_unknown` 阻断，当时 R3i 仅增加只读诊断，没有放宽门槛；这是历史失败观测，不能作为当前运行状态。该 Web Control 使用场景的 live 验收仍待完成，本轮 Companion 本机确认与连接状态收敛不证明 Web Control 已通过。Companion 的当前操作与独立验收边界见 [日常连接](docs/troubleshooting.md#日常连接与本机确认) 和 [Gateway 当前状态](docs/unified-gateway-plan.md#当前状态2026-10-08-当前-checkout)。独立的实验性
 `write_probe` 默认关闭，边界和验证步骤见
 [实验性 MCP 写入探针](docs/experimental-write-probe.md)。
 Normal checkpoint 与 webControl 独立；既有 OAuth/Connector/Tunnel 不迁移、不重配。

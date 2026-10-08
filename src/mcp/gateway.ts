@@ -1,4 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
+import { registerDesktopTools } from "./desktop.js";
 import { z } from "zod";
 import { GatewayRegistry } from "../gateway/registry.js";
 import { PRODUCT_NAME, VERSION } from "../version.js";
@@ -12,7 +14,7 @@ import { exposeTopLevelToolSecuritySchemes } from "./security-schemes.js";
 
 const gatewaySecuritySchemes = (scope: string) => [{ type: "oauth2" as const, scopes: [scope] }];
 
-export function registerGatewayTools(server: McpServer, registry: GatewayRegistry): void {
+export function registerGatewayTools(server: McpServer, registry: GatewayRegistry, desktopAuthorize?: (auth: AuthInfo, scope: string) => void): void {
   const resolveWorkspace: WorkspaceResolver = (workspaceId, clientId) => registry.resolve(workspaceId, clientId);
 
   server.registerTool("gateway_list_workspaces", {
@@ -42,17 +44,18 @@ export function registerGatewayTools(server: McpServer, registry: GatewayRegistr
 
   registerWorkspaceTools(server, {}, "gateway", resolveWorkspace);
   registerRemoteTools(server, resolveWorkspace, "gateway");
+  registerDesktopTools(server, resolveWorkspace, desktopAuthorize);
   registerExecutionTools(server, resolveWorkspace);
   registerFeedbackTools(server, resolveWorkspace);
   registerWebSinkTools(server, resolveWorkspace);
 }
 
-export function createGatewayMcpServer(registry: GatewayRegistry): McpServer {
+export function createGatewayMcpServer(registry: GatewayRegistry, desktopAuthorize?: (auth: AuthInfo, scope: string) => void): McpServer {
   const server = new McpServer(
     { name: PRODUCT_NAME, version: VERSION },
     { capabilities: { tools: {}, resources: {} }, instructions: UNTRUSTED_NOTE },
   );
-  registerGatewayTools(server, registry);
+  registerGatewayTools(server, registry, desktopAuthorize);
   exposeTopLevelToolSecuritySchemes(server, {
     workspace_info: gatewaySecuritySchemes("workspace.read"),
     list_directory: gatewaySecuritySchemes("workspace.read"),

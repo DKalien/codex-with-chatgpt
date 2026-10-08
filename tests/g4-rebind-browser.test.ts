@@ -1,6 +1,4 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import fs from "node:fs";
-import vm from "node:vm";
 import { PROJECT_REGISTRY_KEY, projectStorageKey } from "../browser-companion/project-context.js";
 
 const ROUTE = "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111";
@@ -20,8 +18,18 @@ const OWNER_KEY = "c2c_companion_owner_v1";
 const REGISTRY_KEY = "c2c_companion_registry_v1";
 const EVIDENCE_KEY = "c2c_companion_evidence_v1";
 const CONNECT_KEY = "c2c_companion_connect_flow_v1";
+const LOCAL_ROUTE_KEY = "c2c_companion_local_route_request_v1";
 const AUTONOMY_KEY = "c2c_companion_autonomy_v1";
 const projectKey = (key: string) => projectStorageKey(WORKSPACE, key);
+
+// 升级前已落盘的 managed 流程；新 Connect 不再创建 bootstrap。
+function persistedTakeover(overrides: Record<string, unknown> = {}) {
+  return {
+    state: "WAITING_TAKEOVER", workspaceId: WORKSPACE, bindingId: OLD_BINDING,
+    epoch: OLD_EPOCH, companionId: OLD_COMPANION, routeCanonical: ROUTE,
+    challengeId: null, updatedAt: 1, ...overrides,
+  };
+}
 
 function storageArea(
   initial: Record<string, unknown>,
@@ -136,6 +144,8 @@ challengeId=${CHALLENGE}`,
 async function loadWorker(body: Record<string, unknown>, opts: {
   oldRoute?: string;
   selectedRoute?: string;
+  ownerRoute?: string;
+  permissionGranted?: boolean;
   noTransport?: boolean;
   preMigrated?: boolean;
   transport?: Record<string, unknown>;
@@ -236,7 +246,7 @@ async function loadWorker(body: Record<string, unknown>, opts: {
       onRemoved: { addListener() {} },
       sendMessage: tabsSendMessage,
     },
-    permissions: { contains: async () => true },
+    permissions: { contains: async () => opts.permissionGranted !== false },
   };
   vi.stubGlobal("chrome", chrome);
   vi.stubGlobal("fetch", fetchMock);
@@ -323,6 +333,7 @@ describe("G4c one-click connect orchestration", () => {
     const urls: string[] = [];
     const worker = await loadWorker(responseBody(), {
       oldRoute: OLD_ROUTE,
+      connectFlow: persistedTakeover({ state: "TAKEOVER_DISPATCH" }),
       failArmedAutonomyPersist: failRearmPersistence,
       autonomyPolicy: {
         mode: "armed",
@@ -416,25 +427,13 @@ describe("G4c one-click connect orchestration", () => {
     }
   });
 
-  it("A. NOT_SUCCESSOR binds the new page and sends one fixed bootstrap instead of cold-pairing", async () => {
+  it("fresh Connect binds the real sender and reports an old Bridge without DOM send", async () => {
     const worker = await loadWorker(responseBody(), {
       oldRoute: OLD_ROUTE,
       transport: { routeVerification: "VERIFIED" },
-      fetch: async (url) => String(url).includes("/rebind/init")
-        ? jsonResponse(409, { error: "COMPANION_REBIND_NOT_SUCCESSOR" })
+      fetch: async (url) => String(url).includes("/route/local/request")
+        ? jsonResponse(404, { error: "not_found" })
         : Promise.reject(new Error(`unexpected URL ${String(url)}`)),
-      tabsSendMessage: async (_tabId, message) => ({
-        type: "c2c.feedback.bootstrap.result",
-        mode: "feedback_bootstrap_send",
-        workspaceId: WORKSPACE,
-        ok: true,
-        mutationAttempted: true,
-        clickAttempted: true,
-        clicked: true,
-        observed: true,
-        canonicalRoute: ROUTE,
-        generation: 1,
-      }),
     });
     const sender = { tab: { id: 7 }, documentId: "document-g4-rebind", frameId: 0, url: ROUTE };
     const result = await worker.send({
@@ -450,22 +449,22 @@ describe("G4c one-click connect orchestration", () => {
       lastSeen: -1,
     }, sender) as Record<string, any>;
 
-    expect(result).toMatchObject({ ok: true, state: "WAITING_TAKEOVER" });
+    expect(result).toMatchObject({ ok: false, reason: "local_route_upgrade_required" });
     expect(result.reason).not.toBe("cold_pair_required");
     expect(worker.session.values.get(projectKey(OWNER_KEY))).toMatchObject({
       tabId: 7, documentId: "document-g4-rebind", canonicalRoute: ROUTE, generation: 1,
     });
     expect(worker.session.values.get(projectKey(OWNER_KEY))).not.toHaveProperty("frameId");
     expect(worker.local.values.get(projectKey(LOCAL_KEY))).toMatchObject({ targetRoute: ROUTE });
-    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toMatchObject({ state: "WAITING_TAKEOVER", challengeId: null });
-    expect(worker.tabsSendMessage).toHaveBeenCalledTimes(1);
-    expect(worker.tabsSendMessage.mock.calls[0][1]).toEqual({
-      type: "c2c.feedback.bootstrap.execute",
-      workspaceId: WORKSPACE,
-      expectedRoute: ROUTE,
-      expectedGeneration: 1,
+    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toBeUndefined();
+    expect(worker.local.values.get(projectKey(TRANSPORT_KEY))).toEqual(worker.initial.transport);
+    expect(worker.tabsSendMessage).not.toHaveBeenCalled();
+    expect(worker.fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = worker.fetchMock.mock.calls[0];
+    expect(String(url)).toContain("/route/local/request");
+    expect(JSON.parse(String((init as { body: string }).body))).toEqual({
+      requestId: expect.any(String), routeCanonical: ROUTE,
     });
-    expect(worker.fetchMock.mock.calls.filter(([url]) => String(url).includes("/rebind/init"))).toHaveLength(1);
   });
 
   it("explicit Bind derives the same identity from MessageSender and ignores caller identity fields", async () => {
@@ -492,81 +491,25 @@ describe("G4c one-click connect orchestration", () => {
     expect(worker.local.values.get(projectKey(LOCAL_KEY))).toMatchObject({ targetRoute: ROUTE });
   });
 
-  it("proven no-mutation bootstrap failure stays retryable only on a later explicit Connect", async () => {
-    // Exercise the actual content-script reply, not a hand-built success envelope.
-    let contentListener: (message: unknown, sender: unknown, reply: (value: unknown) => void) => boolean;
-    const content = {
-      chrome: { runtime: {
-        id: "test-extension", lastError: null,
-        sendMessage: (_message: unknown, reply: (value: unknown) => void) => reply({ ok: true }),
-        onMessage: { addListener: (listener: typeof contentListener) => { contentListener = listener; } },
-      } },
-      document: { hidden: false, addEventListener() {} },
-      window: { addEventListener() {} },
-      location: { href: ROUTE }, setInterval() {},
-      parseChatgptConversationRoute: () => ({ canonical: ROUTE }),
-    };
-    vm.runInNewContext(fs.readFileSync("browser-companion/content-script.js", "utf8"), content);
-    let dispatches = 0;
-    const worker = await loadWorker(responseBody(), {
-      oldRoute: OLD_ROUTE,
-      transport: { routeVerification: "VERIFIED" },
-      fetch: async (url) => String(url).includes("/rebind/init")
-        ? jsonResponse(409, { error: "COMPANION_REBIND_NOT_SUCCESSOR" })
-        : Promise.reject(new Error(`unexpected URL ${String(url)}`)),
-      tabsSendMessage: async (_tabId, message) => {
-        dispatches += 1;
-        if (dispatches === 1) {
-          return new Promise(resolve => contentListener(message, { id: "test-extension" }, resolve));
-        }
-        return {
-          type: "c2c.feedback.bootstrap.result",
-          mode: "feedback_bootstrap_send",
-          workspaceId: WORKSPACE,
-          ok: true,
-          mutationAttempted: true,
-          clickAttempted: true,
-          clicked: true,
-          observed: true,
-          canonicalRoute: ROUTE,
-          generation: 1,
-        };
-      },
-    });
-    const sender = { tab: { id: 7 }, documentId: "document-g4-rebind", frameId: 0, url: ROUTE };
-    const message = {
-      type: "c2c.connect.page",
-      generation: 1,
-      canonicalRoute: ROUTE,
+  it("fresh Connect without Bridge permission never requests native confirmation or DOM send", async () => {
+    const worker = await loadWorker(responseBody(), { oldRoute: OLD_ROUTE, permissionGranted: false });
+    const result = await worker.send({
+      type: "c2c.connect.page", generation: 1, canonicalRoute: ROUTE,
       safety: { composer: "empty", generation: "idle", safe: true },
-    };
-
-    const failed = await worker.send(message, sender) as Record<string, unknown>;
-    expect(failed).toMatchObject({ ok: false, reason: "bootstrap_capability_missing", retryAllowed: true });
-    expect(worker.tabsSendMessage).toHaveBeenCalledTimes(1);
-    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toMatchObject({ state: "NONE" });
-    expect(await worker.send({ type: "c2c.status.read", canonicalRoute: ROUTE }, sender))
-      .toMatchObject({ connectReason: "bootstrap_capability_missing", connectState: "NONE" });
-
-    const retried = await worker.send(message, sender) as Record<string, unknown>;
-    expect(retried).toMatchObject({ ok: true, state: "WAITING_TAKEOVER" });
-    expect(worker.tabsSendMessage).toHaveBeenCalledTimes(2);
-    expect(await worker.send({ type: "c2c.status.read", canonicalRoute: ROUTE }, sender))
-      .toMatchObject({ connectReason: null, connectState: "WAITING_TAKEOVER" });
+    }, { tab: { id: 7 }, documentId: "document-g4-rebind", frameId: 0, url: ROUTE });
+    expect(result).toMatchObject({ ok: false, reason: "bridge_permission_missing" });
+    expect(worker.fetchMock).not.toHaveBeenCalled();
+    expect(worker.tabsSendMessage).not.toHaveBeenCalled();
+    expect(worker.local.values.get(projectKey(LOCAL_ROUTE_KEY))).toBeUndefined();
   });
 
   it("C. repeated exact-owner heartbeat waits for takeover without resending bootstrap", async () => {
     const worker = await loadWorker(responseBody(), {
       oldRoute: OLD_ROUTE,
+      connectFlow: persistedTakeover(),
       fetch: async (url) => String(url).includes("/rebind/init")
         ? jsonResponse(409, { error: "COMPANION_REBIND_NOT_SUCCESSOR" })
         : Promise.reject(new Error(`unexpected URL ${String(url)}`)),
-      tabsSendMessage: async () => ({
-        type: "c2c.feedback.bootstrap.result", mode: "feedback_bootstrap_send", ok: true,
-        workspaceId: WORKSPACE,
-        mutationAttempted: true, clickAttempted: true, clicked: true, observed: true,
-        canonicalRoute: ROUTE, generation: 1,
-      }),
     });
     const sender = { tab: { id: 7 }, documentId: "document-g4-rebind", frameId: 0, url: ROUTE };
     const safety = { composer: "empty", generation: "idle", safe: true };
@@ -575,8 +518,8 @@ describe("G4c one-click connect orchestration", () => {
       type: "c2c.heartbeat", generation: 1, safety, canonicalRoute: ROUTE, feedbackBootstrapToolMissing: true,
     }, sender);
     await worker.send({ type: "c2c.heartbeat", generation: 1, safety, canonicalRoute: ROUTE }, sender);
-    expect(worker.tabsSendMessage).toHaveBeenCalledTimes(1);
-    expect(worker.fetchMock.mock.calls.filter(([url]) => String(url).includes("/rebind/init"))).toHaveLength(3);
+    expect(worker.tabsSendMessage).not.toHaveBeenCalled();
+    expect(worker.fetchMock.mock.calls.filter(([url]) => String(url).includes("/rebind/init"))).toHaveLength(2);
     expect(worker.local.values.get(projectKey(CONNECT_KEY))).toMatchObject({ state: "WAITING_TAKEOVER" });
     const status = await worker.send({ type: "c2c.status.page", href: ROUTE, canonicalRoute: ROUTE, generation: 1 }, sender) as Record<string, unknown>;
     expect(status.connectReason).toBe("bootstrap_tool_missing");
@@ -586,27 +529,20 @@ describe("G4c one-click connect orchestration", () => {
     let rebindCalls = 0;
     const worker = await loadWorker(responseBody(), {
       oldRoute: OLD_ROUTE,
+      connectFlow: persistedTakeover(),
       fetch: async (url) => {
         if (!String(url).includes("/rebind/init")) throw new Error(`unexpected URL ${String(url)}`);
         rebindCalls += 1;
-        return rebindCalls === 1
-          ? jsonResponse(409, { error: "COMPANION_REBIND_NOT_SUCCESSOR" })
-          : jsonResponse(409, { error: "COMPANION_REPAIR_BLOCKED" });
+        return jsonResponse(409, { error: "COMPANION_REPAIR_BLOCKED" });
       },
-      tabsSendMessage: async () => ({
-        type: "c2c.feedback.bootstrap.result", mode: "feedback_bootstrap_send", ok: true,
-        workspaceId: WORKSPACE,
-        mutationAttempted: true, clickAttempted: true, clicked: true, observed: true,
-        canonicalRoute: ROUTE, generation: 1,
-      }),
     });
     const sender = { tab: { id: 7 }, documentId: "document-g4-rebind", frameId: 0, url: ROUTE };
     const safety = { composer: "empty", generation: "idle", safe: true };
     await worker.send({ type: "c2c.connect.page", generation: 1, safety, canonicalRoute: ROUTE }, sender);
     await worker.send({ type: "c2c.heartbeat", generation: 1, safety, canonicalRoute: ROUTE }, sender);
     expect(worker.local.values.get(projectKey(CONNECT_KEY))).toMatchObject({ state: "WAITING_TAKEOVER" });
-    expect(worker.tabsSendMessage).toHaveBeenCalledTimes(1);
-    expect(rebindCalls).toBe(2);
+    expect(worker.tabsSendMessage).not.toHaveBeenCalled();
+    expect(rebindCalls).toBe(1);
   });
 
   it.each([true, false])(
@@ -616,6 +552,7 @@ describe("G4c one-click connect orchestration", () => {
     const urls: string[] = [];
     const worker = await loadWorker(responseBody(), {
       oldRoute: OLD_ROUTE,
+      connectFlow: persistedTakeover(),
       autonomyPolicy: rearmOnConnect
         ? {
             mode: "armed", bindingId: OLD_BINDING, epoch: OLD_EPOCH,
@@ -653,7 +590,7 @@ describe("G4c one-click connect orchestration", () => {
     const safety = { composer: "empty", generation: "idle", safe: true };
     await worker.send({ type: "c2c.connect.page", generation: 1, safety, canonicalRoute: ROUTE }, sender);
     await worker.send({ type: "c2c.heartbeat", generation: 1, safety, canonicalRoute: ROUTE }, sender);
-    expect(worker.tabsSendMessage.mock.calls.filter(([, message]) => message.type === "c2c.feedback.bootstrap.execute")).toHaveLength(1);
+    expect(worker.tabsSendMessage.mock.calls.filter(([, message]) => message.type === "c2c.feedback.bootstrap.execute")).toHaveLength(0);
 
     takeoverDone = true;
     await worker.send({ type: "c2c.heartbeat", generation: 1, safety, canonicalRoute: ROUTE }, sender);
@@ -927,6 +864,7 @@ describe("G4c one-click connect orchestration", () => {
     const pendingAttestation = new Promise(resolve => { releaseAttestation = resolve; });
     const worker = await loadWorker(responseBody(), {
       oldRoute: OLD_ROUTE,
+      connectFlow: persistedTakeover({ state: "TAKEOVER_DISPATCH" }),
       tabsSendMessage: async () => pendingAttestation,
       fetch: async (url) => {
         const value = String(url);
@@ -997,10 +935,11 @@ describe("G4c one-click connect orchestration", () => {
     expect(worker.local.values.get(projectKey(CONNECT_KEY))).toBeUndefined();
   });
 
-  it("rolls back a proven pre-dispatch attestation failure for a later explicit Connect", async () => {
+  it("persisted takeover keeps a proven pre-dispatch attestation pending for a safe owner heartbeat", async () => {
     const worker = await loadWorker(responseBody(), {
       oldRoute: OLD_ROUTE,
-      tabsSendMessage: async () => ({ ok: true }),
+      connectFlow: persistedTakeover({ state: "TAKEOVER_DISPATCH" }),
+      tabsSendMessage: async () => ({ ok: true, observed: true, mutationAttempted: true, clickAttempted: true }),
       fetch: async (url) => String(url).includes("/rebind/init")
         ? {
             ok: true,
@@ -1020,17 +959,19 @@ describe("G4c one-click connect orchestration", () => {
       canonicalRoute: ROUTE,
       safety: { composer: "filled", generation: "idle", safe: false },
     }, sender) as Record<string, unknown>;
-    expect(unsafe).toMatchObject({ ok: false, state: "NONE", retryAllowed: true });
-    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toMatchObject({ state: "NONE" });
+    expect(unsafe).toMatchObject({ ok: true, state: "AWAITING_CONFIRMATION" });
+    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toMatchObject({ state: "ATTEST_REQUESTED", bootstrapAutoResume: true });
     expect(worker.tabsSendMessage).not.toHaveBeenCalled();
 
     await worker.send({
-      type: "c2c.connect.page",
+      type: "c2c.heartbeat",
       generation: 1,
       canonicalRoute: ROUTE,
       safety: { composer: "empty", generation: "idle", safe: true },
     }, sender);
     expect(worker.tabsSendMessage).toHaveBeenCalledTimes(1);
+    expect(worker.local.values.get(projectKey(FENCE_KEY))).toMatchObject({ state: "OBSERVED_PENDING_CONFIRM" });
+    expect(worker.fetchMock.mock.calls.some(([url]) => String(url).includes("/route/local/request"))).toBe(false);
   });
 
   it.each(["COMPANION_REPAIR_BLOCKED", "COMPANION_REBIND_NOT_CONFIRMED"])(
@@ -1195,6 +1136,7 @@ describe("G4c one-click connect orchestration", () => {
     const urls: string[] = [];
     const worker = await loadWorker(responseBody(), {
       oldRoute: OLD_ROUTE,
+      connectFlow: persistedTakeover({ state: "TAKEOVER_DISPATCH" }),
       tabsSendMessage: async () => ({
         ok: true, observed: true, mutationAttempted: true, clickAttempted: true,
       }),
@@ -1230,6 +1172,7 @@ describe("G4c one-click connect orchestration", () => {
     const urls: string[] = [];
     const worker = await loadWorker(responseBody(), {
       oldRoute: OLD_ROUTE,
+      connectFlow: persistedTakeover({ state: "TAKEOVER_DISPATCH" }),
       tabsSendMessage: async () => ({
         ok: true, observed: true, mutationAttempted: true, clickAttempted: true,
       }),
@@ -1505,10 +1448,10 @@ describe("G4 R3o trusted route authority integration (live-like SPA topology)", 
     expect(worker.local.values.get(projectKey(LOCAL_KEY))).toMatchObject({ targetRoute: ROUTE, paired: true });
   });
 
-  it("connect identity stage resolves the current tab route and starts the rebind flow", async () => {
+  it("connect identity stage resolves the current tab route and requests local confirmation", async () => {
     // Same live-like topology: transport is still paired on OLD_ROUTE while the
     // tab is on ROUTE and MessageSender.url is stale. R3o resolves the connect
-    // identity from tab.url + witness and proceeds with rebind init (previously
+    // identity from tab.url + witness and requests local confirmation (previously
     // the stale sender.url fed the identity stage and failed the flow).
     const urls: string[] = [];
     const worker = await loadWorker(responseBody(), {
@@ -1516,7 +1459,7 @@ describe("G4 R3o trusted route authority integration (live-like SPA topology)", 
       fetch: async (url) => {
         const value = String(url);
         urls.push(value);
-        if (value.includes("/rebind/init")) return jsonResponse(200, responseBody());
+        if (value.includes("/route/local/request")) return jsonResponse(404, { error: "not_found" });
         throw new Error(`unexpected URL ${value}`);
       },
       tabsSendMessage: async (_tabId, message) => message.type === "c2c.route.attest.execute"
@@ -1531,8 +1474,7 @@ describe("G4 R3o trusted route authority integration (live-like SPA topology)", 
       canonicalRoute: ROUTE,
     }, sender) as { ok: boolean; state?: string; reason?: string };
 
-    expect(result.ok).toBe(true);
-    expect(result.state).toBe("AWAITING_CONFIRMATION");
+    expect(result).toMatchObject({ ok: false, reason: "local_route_upgrade_required" });
     expect([
       "invalid_route",
       "route_witness_required",
@@ -1544,14 +1486,11 @@ describe("G4 R3o trusted route authority integration (live-like SPA topology)", 
       documentId: "document-g4-rebind",
       canonicalRoute: ROUTE,
     });
-    expect(worker.local.values.get(projectKey(TRANSPORT_KEY))).toMatchObject({
-      companionId: NEW_COMPANION,
-      bindingId: NEW_BINDING,
-      epoch: OLD_EPOCH + 1,
-      routeCanonical: ROUTE,
-      rebindPending: true,
-    });
-    expect(urls.filter((url) => url.includes("/rebind/init"))).toHaveLength(1);
+    expect(worker.local.values.get(projectKey(TRANSPORT_KEY))).toEqual(worker.initial.transport);
+    expect(worker.local.values.get(projectKey(LOCAL_ROUTE_KEY))).toMatchObject({ routeCanonical: ROUTE });
+    expect(urls).toHaveLength(1);
+    expect(urls[0]).toContain("/route/local/request");
+    expect(worker.tabsSendMessage).not.toHaveBeenCalled();
   });
 
   it("drops a same-tab stale old-document heartbeat and preserves the new owner, evidence and proof", async () => {
@@ -1622,30 +1561,12 @@ describe("G4 R3o trusted route authority integration (live-like SPA topology)", 
   });
 });
 
-describe("G4 R3p recoverable written-unsent bootstrap + abandon connect unknown", () => {
+describe("G4 local Connect compatibility + legacy abandon connect unknown", () => {
   function jsonResponse(status: number, body: Record<string, unknown>) {
     return {
       ok: status >= 200 && status < 300,
       status,
       async json() { return body; },
-    };
-  }
-
-  function bootstrapResult(overrides: Record<string, unknown> = {}) {
-    return {
-      type: "c2c.feedback.bootstrap.result",
-      mode: "feedback_bootstrap_send",
-      workspaceId: WORKSPACE,
-      ok: false,
-      reason: "bootstrap_send_not_ready",
-      mutationAttempted: true,
-      wrote: true,
-      verified: true,
-      clickAttempted: false,
-      observed: false,
-      canonicalRoute: ROUTE,
-      generation: 1,
-      ...overrides,
     };
   }
 
@@ -1663,223 +1584,53 @@ describe("G4 R3p recoverable written-unsent bootstrap + abandon connect unknown"
     };
   }
 
-  function notSuccessorWorker(tabsResponse: Record<string, unknown>) {
-    return loadWorker(responseBody(), {
-      oldRoute: OLD_ROUTE,
-      transport: { routeVerification: "VERIFIED" },
-
-      fetch: async (url) => String(url).includes("/rebind/init")
-        ? jsonResponse(409, { error: "COMPANION_REBIND_NOT_SUCCESSOR" })
-        : Promise.reject(new Error(`unexpected URL ${String(url)}`)),
-      tabsSendMessage: async () => tabsResponse,
-    });
-  }
-
-  it("written-unsent bootstrap failure rolls the connect fence back and stays retryable", async () => {
-    // Proven composer write that never reached the irreversible click boundary:
-    // the fence must roll back to NONE (recoverable), never OUTCOME_UNKNOWN.
-    const worker = await notSuccessorWorker(bootstrapResult());
-    const sender = { tab: { id: 7 }, documentId: "document-g4-rebind", frameId: 0, url: ROUTE };
-    const result = await worker.send({
-      type: "c2c.connect.page",
-      generation: 1,
-      canonicalRoute: ROUTE,
-      safety: { composer: "empty", generation: "idle", safe: true },
-    }, sender) as Record<string, unknown>;
-
-    expect(result).toMatchObject({
-      ok: false,
-      reason: "bootstrap_send_not_ready",
-      responseReason: "bootstrap_send_not_ready",
-      state: "NONE",
-      retryAllowed: true,
-      composerDirty: true,
-    });
-    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toMatchObject({ state: "NONE" });
-    expect(worker.tabsSendMessage).toHaveBeenCalledTimes(1);
-    // Zero collateral mutation: owner, evidence, transport and journal survive.
-    expect(worker.session.values.get(projectKey(OWNER_KEY))).toMatchObject({
-      tabId: 7, documentId: "document-g4-rebind", canonicalRoute: ROUTE,
-    });
-    expect(worker.local.values.get(projectKey(TRANSPORT_KEY))).toEqual(worker.initial.transport);
-  });
-
-  it("a written-unsent reason outside the allowlist maps to bootstrap_written_unsent with responseReason", async () => {
-    const worker = await notSuccessorWorker(bootstrapResult({
-      reason: "composer_text_mismatch",
-      verified: false,
-    }));
-    const sender = { tab: { id: 7 }, documentId: "document-g4-rebind", frameId: 0, url: ROUTE };
-    const result = await worker.send({
-      type: "c2c.connect.page",
-      generation: 1,
-      canonicalRoute: ROUTE,
-      safety: { composer: "empty", generation: "idle", safe: true },
-    }, sender) as Record<string, unknown>;
-
-    expect(result).toMatchObject({
-      ok: false,
-      reason: "bootstrap_written_unsent",
-      responseReason: "composer_text_mismatch",
-      state: "NONE",
-      retryAllowed: true,
-      composerDirty: true,
-    });
-    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toMatchObject({ state: "NONE" });
-  });
-
-  it("a click-attempted bootstrap failure still hardens into OUTCOME_UNKNOWN", async () => {
-    // Control: once the irreversible click boundary was crossed, a failed
-    // dispatch must keep the existing fail-closed OUTCOME_UNKNOWN semantics.
-    const worker = await notSuccessorWorker(bootstrapResult({
-      ok: false,
-      reason: "bootstrap_click_outcome_unknown",
-      clickAttempted: true,
-      clicked: true,
-    }));
-    const sender = { tab: { id: 7 }, documentId: "document-g4-rebind", frameId: 0, url: ROUTE };
-    const result = await worker.send({
-      type: "c2c.connect.page",
-      generation: 1,
-      canonicalRoute: ROUTE,
-      safety: { composer: "empty", generation: "idle", safe: true },
-    }, sender) as Record<string, unknown>;
-
-    expect(result).toMatchObject({
-      ok: false,
-      reason: "bootstrap_click_outcome_unknown",
-      state: "OUTCOME_UNKNOWN",
-      retryAllowed: false,
-    });
-    const savedFlow = worker.local.values.get(projectKey(CONNECT_KEY)) as Record<string, unknown>;
-    expect(savedFlow).toMatchObject({ state: "OUTCOME_UNKNOWN", failureReason: "bootstrap_click_outcome_unknown" });
-    const restarted = await loadWorker(responseBody(), { oldRoute: OLD_ROUTE, connectFlow: savedFlow });
-    for (let read = 0; read < 2; read += 1) {
-      expect(await restarted.send({ type: "c2c.status.read", canonicalRoute: ROUTE }, sender))
-        .toMatchObject({ connectState: "OUTCOME_UNKNOWN", connectReason: "bootstrap_click_outcome_unknown" });
-    }
-    expect(restarted.tabsSendMessage).not.toHaveBeenCalled();
-  });
-
-  it("a response without mutationAttempted but wrote=true fails closed (never proven no-mutation)", async () => {
-    // Review-fix round 2: a positive wrote === true already disproves "no
-    // mutation". provenNoMutation now also requires wrote !== true, so a
-    // missing mutationAttempted alongside wrote=true can claim neither the
-    // recoverable written-unsent branch nor the retryable no-mutation branch —
-    // it fails closed into OUTCOME_UNKNOWN.
-    const worker = await notSuccessorWorker(bootstrapResult({
-      mutationAttempted: undefined,
-      wrote: true,
-    }));
-    const sender = { tab: { id: 7 }, documentId: "document-g4-rebind", frameId: 0, url: ROUTE };
-    const result = await worker.send({
-      type: "c2c.connect.page",
-      generation: 1,
-      canonicalRoute: ROUTE,
-      safety: { composer: "empty", generation: "idle", safe: true },
-    }, sender) as Record<string, unknown>;
-
-    expect(result).toMatchObject({
-      ok: false,
-      reason: "bootstrap_send_not_ready",
-      state: "OUTCOME_UNKNOWN",
-      retryAllowed: false,
-    });
-    expect(result.composerDirty).toBeUndefined();
-    expect(result.responseReason).toBeUndefined();
-    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toMatchObject({ state: "OUTCOME_UNKNOWN" });
-  });
-
   it.each([
-    ["wrote missing", { wrote: undefined }],
-    ["wrote malformed truthy string", { wrote: "yes" }],
-  ])("a bootstrap response with %s is not classified written-unsent", async (_label, override) => {
-    // Without positive wrote === true the branch is unreachable: fail closed
-    // into OUTCOME_UNKNOWN exactly as before the recoverable branch existed.
-    const worker = await notSuccessorWorker(bootstrapResult(override));
-    const sender = { tab: { id: 7 }, documentId: "document-g4-rebind", frameId: 0, url: ROUTE };
-    const result = await worker.send({
-      type: "c2c.connect.page",
-      generation: 1,
-      canonicalRoute: ROUTE,
-      safety: { composer: "empty", generation: "idle", safe: true },
-    }, sender) as Record<string, unknown>;
-
-    expect(result).toMatchObject({
-      ok: false,
-      state: "OUTCOME_UNKNOWN",
-      retryAllowed: false,
-    });
-    expect(result.composerDirty).toBeUndefined();
-    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toMatchObject({ state: "OUTCOME_UNKNOWN" });
-  });
-
-  it("an explicit false/false response stays on the retryable proven-no-mutation path", async () => {
-    // Review-fix round 2 companion: only EXPLICIT false on every mutation axis
-    // is provably no-mutation. After the wrote !== true tightening this stays
-    // recoverable: fence rolls back to NONE, composer not dirty, retry allowed.
-    const worker = await notSuccessorWorker(bootstrapResult({
-      mutationAttempted: false,
-      wrote: false,
-      clickAttempted: false,
-      observed: false,
-    }));
-    const sender = { tab: { id: 7 }, documentId: "document-g4-rebind", frameId: 0, url: ROUTE };
-    const result = await worker.send({
-      type: "c2c.connect.page",
-      generation: 1,
-      canonicalRoute: ROUTE,
-      safety: { composer: "empty", generation: "idle", safe: true },
-    }, sender) as Record<string, unknown>;
-
-    expect(result).toMatchObject({
-      ok: false,
-      reason: "bootstrap_send_not_ready",
-      state: "NONE",
-      retryAllowed: true,
-    });
-    expect(result.composerDirty).toBeUndefined();
-    expect(result.responseReason).toBeUndefined();
-    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toMatchObject({ state: "NONE" });
-  });
-
-  it("written-unsent is recoverable: a later explicit Connect completes the takeover", async () => {
-    let dispatches = 0;
+    ["NONE cross-route", 404], ["NONE cross-route", 405],
+    ["DONE cross-route", 404], ["DONE cross-route", 405],
+    ["NONE pending route", 404], ["NONE pending route", 405],
+    ["DONE pending route", 404], ["DONE pending route", 405],
+  ])("fresh %s requires Bridge upgrade on HTTP %s without legacy fallback", async (stage, status) => {
+    const oldRoute = String(stage).includes("cross-route") ? OLD_ROUTE : ROUTE;
+    const flow = String(stage).startsWith("DONE") ? persistedTakeover({
+      state: "DONE", routeCanonical: oldRoute, challengeId: CHALLENGE,
+    }) : undefined;
     const worker = await loadWorker(responseBody(), {
-      oldRoute: OLD_ROUTE,
-      transport: { routeVerification: "VERIFIED" },
-      fetch: async (url) => String(url).includes("/rebind/init")
-        ? jsonResponse(409, { error: "COMPANION_REBIND_NOT_SUCCESSOR" })
-        : Promise.reject(new Error(`unexpected URL ${String(url)}`)),
-      tabsSendMessage: async () => {
-        dispatches += 1;
-        return dispatches === 1
-          ? bootstrapResult()
-          : bootstrapResult({
-              ok: true,
-              mutationAttempted: true,
-              clickAttempted: true,
-              clicked: true,
-              observed: true,
-            });
+      oldRoute, connectFlow: flow,
+      transport: { routeVerification: oldRoute === OLD_ROUTE ? "VERIFIED" : "PENDING" },
+      fetch: async (url) => {
+        expect(String(url)).toContain("/route/local/request");
+        return jsonResponse(Number(status), { error: "not_found" });
       },
     });
     const sender = { tab: { id: 7 }, documentId: "document-g4-rebind", frameId: 0, url: ROUTE };
-    const message = {
-      type: "c2c.connect.page",
-      generation: 1,
-      canonicalRoute: ROUTE,
-      safety: { composer: "empty", generation: "idle", safe: true },
-    };
+    expect(await worker.send({
+      type: "c2c.connect.page", generation: 1, canonicalRoute: ROUTE,
+      safety: { composer: "filled", generation: "idle", safe: false },
+    }, sender)).toMatchObject({ ok: false, reason: "local_route_upgrade_required" });
+    expect(worker.local.values.get(projectKey(LOCAL_ROUTE_KEY))).toMatchObject({
+      stage: "UPGRADE_REQUIRED", routeCanonical: ROUTE,
+    });
+    expect(worker.local.values.get(projectKey(TRANSPORT_KEY))).toEqual(worker.initial.transport);
+    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toEqual(flow);
+    await worker.send({ type: "c2c.heartbeat", generation: 1, canonicalRoute: ROUTE }, sender);
+    expect(worker.fetchMock).toHaveBeenCalledTimes(1);
+    expect(worker.tabsSendMessage).not.toHaveBeenCalled();
+  });
 
-    const first = await worker.send(message, sender) as Record<string, unknown>;
-    expect(first).toMatchObject({ ok: false, reason: "bootstrap_send_not_ready", state: "NONE", retryAllowed: true });
-    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toMatchObject({ state: "NONE" });
-
-    const second = await worker.send(message, sender) as Record<string, unknown>;
-    expect(second).toMatchObject({ ok: true, state: "WAITING_TAKEOVER" });
-    expect(worker.tabsSendMessage).toHaveBeenCalledTimes(2);
-    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toMatchObject({ state: "WAITING_TAKEOVER" });
+  it("legacy unknown bootstrap failure reason survives restart without a DOM resend", async () => {
+    const flow = outcomeUnknownFlow({
+      bindingId: OLD_BINDING, companionId: OLD_COMPANION, epoch: OLD_EPOCH,
+      failureReason: "bootstrap_click_outcome_unknown",
+    });
+    const worker = await loadWorker(responseBody(), { oldRoute: OLD_ROUTE, connectFlow: flow });
+    const sender = { tab: { id: 7 }, documentId: "document-g4-rebind", frameId: 0, url: ROUTE };
+    for (let read = 0; read < 2; read += 1) {
+      expect(await worker.send({ type: "c2c.status.read", canonicalRoute: ROUTE }, sender))
+        .toMatchObject({ connectState: "OUTCOME_UNKNOWN", connectReason: "bootstrap_click_outcome_unknown" });
+    }
+    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toEqual(flow);
+    expect(worker.fetchMock).not.toHaveBeenCalled();
+    expect(worker.tabsSendMessage).not.toHaveBeenCalled();
   });
 
   it("abandon connect unknown clears only the connect fence with zero mutations (popup sender + exact-owner proof)", async () => {
@@ -2294,7 +2045,9 @@ describe("G4 R3q route-attest written-unsent recovery + abandon route-attest unk
   });
 
   it("written-unsent route-attest via Connect rolls the managed connect flow back to NONE", async () => {
-    const worker = await attestWorker(routeAttestResult());
+    const worker = await attestWorker(routeAttestResult(), { connectFlow: persistedTakeover({
+      bindingId: NEW_BINDING, companionId: NEW_COMPANION, epoch: OLD_EPOCH - 1,
+    }) });
     const result = await worker.send({
       type: "c2c.connect.page",
       generation: 1,
@@ -2423,7 +2176,7 @@ describe("G4 R3q route-attest written-unsent recovery + abandon route-attest unk
     expect(worker.session.values.get(projectKey(LATCH_KEY))).toMatchObject({ state: "OUTCOME_UNKNOWN" });
   });
 
-  it("written-unsent route-attest is recoverable: a later explicit Connect completes the attestation", async () => {
+  it("legacy written-unsent rollback uses local confirmation on the next explicit Connect", async () => {
     const worker = await attestWorker((dispatches) => dispatches === 1
       ? routeAttestResult()
       : {
@@ -2433,7 +2186,11 @@ describe("G4 R3q route-attest written-unsent recovery + abandon route-attest unk
         clickAttempted: true,
         clicked: true,
       }, {
+      connectFlow: persistedTakeover({
+        bindingId: NEW_BINDING, companionId: NEW_COMPANION, epoch: OLD_EPOCH - 1,
+      }),
       fetch: async (url) => {
+        if (String(url).includes("/route/local/request")) return jsonResponse(404, { error: "not_found" });
         if (String(url).includes("/state")) {
           return jsonResponse(409, { error: "COMPANION_REPAIR_BLOCKED" });
         }
@@ -2454,10 +2211,10 @@ describe("G4 R3q route-attest written-unsent recovery + abandon route-attest unk
     expect(worker.local.values.get(projectKey(CONNECT_KEY))).toEqual(emptyConnectFlowShape());
 
     const second = await worker.send(message, OWNER_SENDER) as Record<string, unknown>;
-    expect(second).toMatchObject({ ok: true, state: "AWAITING_CONFIRMATION" });
-    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toMatchObject({ state: "ATTEST_REQUESTED" });
-    expect(worker.local.values.get(projectKey(FENCE_KEY))).toMatchObject({ state: "OBSERVED_PENDING_CONFIRM" });
-    expect(worker.tabsSendMessage).toHaveBeenCalledTimes(2);
+    expect(second).toMatchObject({ ok: false, reason: "local_route_upgrade_required" });
+    expect(worker.local.values.get(projectKey(CONNECT_KEY))).toEqual(emptyConnectFlowShape());
+    expect(worker.local.values.get(projectKey(FENCE_KEY))).toBeUndefined();
+    expect(worker.tabsSendMessage).toHaveBeenCalledTimes(1);
   });
 
   // review-fix FIX_2, fault injection: the route-attest fence/latch rollback
@@ -2468,7 +2225,9 @@ describe("G4 R3q route-attest written-unsent recovery + abandon route-attest unk
   // no abandon path could ever clear. The hardened tail must remain fully
   // recoverable through the route-attest abandon.
   it("written-unsent rollback commit failure hardens fence+flow together with the exact managed identity", async () => {
-    const worker = await attestWorker(routeAttestResult(), { failConnectFlowSetAt: [2] });
+    const worker = await attestWorker(routeAttestResult(), { connectFlow: persistedTakeover({
+      bindingId: NEW_BINDING, companionId: NEW_COMPANION, epoch: OLD_EPOCH - 1,
+    }), failConnectFlowSetAt: [2] });
     const result = await worker.send({
       type: "c2c.connect.page",
       generation: 1,
@@ -2498,7 +2257,7 @@ describe("G4 R3q route-attest written-unsent recovery + abandon route-attest unk
         generation: expect.any(Number),
         canonicalRoute: ROUTE,
       },
-      bootstrapAutoResume: false,
+      bootstrapAutoResume: true,
       updatedAt: expect.any(Number),
     });
     // Hardened in the SAME commit, with identity — abandon stays possible.
@@ -2539,7 +2298,9 @@ describe("G4 R3q route-attest written-unsent recovery + abandon route-attest unk
   // OUTCOME_UNKNOWN. Memory stays fail-closed hardened with the same
   // identity; the manual abandon still recovers the whole scene.
   it("written-unsent rollback with sustained connect-flow storage failure stays identity-consistent and manually recoverable", async () => {
-    const worker = await attestWorker(routeAttestResult(), { failConnectFlowSetAt: [2, 3] });
+    const worker = await attestWorker(routeAttestResult(), { connectFlow: persistedTakeover({
+      bindingId: NEW_BINDING, companionId: NEW_COMPANION, epoch: OLD_EPOCH - 1,
+    }), failConnectFlowSetAt: [2, 3] });
     const result = await worker.send({
       type: "c2c.connect.page",
       generation: 1,
@@ -2568,7 +2329,7 @@ describe("G4 R3q route-attest written-unsent recovery + abandon route-attest unk
         generation: expect.any(Number),
         canonicalRoute: ROUTE,
       },
-      bootstrapAutoResume: false,
+      bootstrapAutoResume: true,
       updatedAt: expect.any(Number),
     });
     expect(worker.local.values.get(projectKey(FENCE_KEY))).toMatchObject({

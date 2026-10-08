@@ -707,6 +707,10 @@ export function resultBusCompanionReserve(input: {
         delivery: busDeliveryDto(reserved.entry),
       };
     }
+    // 本机 URL 证明仅接收 canonical Bus；空队列不回退到 legacy principal 通道。
+    if (sinkAuth.routeProofKind === "local_user") {
+      throw new CompanionError("FEEDBACK_NO_READY_EVENT", "当前没有可投递的事件");
+    }
     // Bus 空（或全部被抑制）→ priority 3：legacy 非 canonical/control。
     if (prepared?.legacyFeedbackDegraded) {
       // Full reconciliation is mandatory before making any legacy/control event reservable.

@@ -6,11 +6,21 @@
 
 除 `gateway_list_workspaces` 外，所有 Gateway 项目工具都要求显式 workspaceId。每次调用重新核验 registry 中的 clientId/workspaceId、Workspace canonical root 和对应 tool scope；MCP 不提供登记、扩大或撤销 grant 的工具。Registry 损坏、root retarget、撤销或身份错配都 fail closed，保留项目任务、防重放和结果历史。
 
+Gateway Desktop status/send 分别要求 `codex.desktop.read` / `codex.desktop.control`。入口重新核验 Gateway AuthStore 的原 bearer 有效期、撤销状态、machine-gateway 身份、clientId 与对应 scope；send 在原 Desktop durable commit 前再次核验原 bearer 和 registry 的 exact workspace/client/canonical root，拒绝使用请求入口快照跨越撤权。目标仍只来自本机确认绑定；enabled、bindingId、MCP conversation principal、userConfirmed、运行时身份、owner、审批、防重放和 outcome_unknown 门禁不变。Desktop 与后台 Remote 的 enable 独立；不会因 Remote disable 自动改投 Desktop，也不会把 codex_submit_task 重定向。
+
 机器 OAuth 存储与旧 Bridge/单 workspace 官方 endpoint 分开；`gateway/server.lock` 防止多个运行实例覆盖认证缓存，遗留锁不自动删除。项目内 Remote task status/result/cancel 继续核验原 OAuth client。Feedback principal 由当前请求的 `openai/session` 与 clientId 推导，不接受工具参数；需要 active binding 的操作还要核验其 binding/epoch，接管必须提供 fresh `expectedEpoch`。旧 Connector 的 principal 不会自动转换成新 Gateway client。每个项目仍保留原 scope、Remote enable/official mode、target/task 所属检查、route attestation、Result Bus 与发送状态机；Gateway 不提供 Shell、provider 或审批旁路。
 
 Companion 的项目登记仅保存 workspaceId 与 Bridge origin，不扩大 Gateway allowlist。每项目 local/session/alarm 隔离，加载与 Pair 都核对 transport 的项目身份与 origin；只有确证旧 singleton 身份时复制迁移，未知或冲突停止并保留 attempt 历史。迁移先建立 TRUSTED_CONTEXTS；失败停止业务操作并尝试净化 transport credential，不声称无法清理的凭据已删除。Grant Bridge access 是唯一权限请求入口，Pair/Pair+Connect 缺已有权限时不获取 proof、不调用 /pair。生产回调固定发送原 workspace/tab/document；Popup 异步操作捕获项目身份，手动操作期间锁定所选项目，迟到状态读取不得覆盖新选择，切项目清空临时结果显示。存储失败不提交内存登记或选择。
 
 上述为源码边界，不表示机器部署或双项目真实网页验收已完成；阶段状态见[统一 Gateway 计划](unified-gateway-plan.md)。
+
+## Companion 本机确认回流地址
+
+已配对浏览器可显式请求本机确认当前 ChatGPT 对话。Bridge 的 `/route/local/request` 固定 workspace 与完整规范化 URL，快速返回短时 requestId，并在本机显示确认窗；网页不能代替用户点击。`/route/local/commit` 只消费已确认、未过期且原 Companion、receiver 与 Active Web Sink 均未变化的申请。浏览器在提交前后核验真实 owner document；取消、身份变化、在途发送或未知结果不能通过重发或清空状态解决。
+
+该授权标记为 `local_user`，仅证明用户允许此 URL 接收 canonical Result Bus 回流；它不是 MCP `openai/session` principal，不能用于旧 Feedback receiver、route confirm 或面板写授权。旧 `mcp_principal` 证明保持兼容，缺少证明仍不可发送。成功时轮换唯一 Companion 的 credential、companionId 与 challengeId，随后通过既有 Active Web Sink 入口收敛；不增加第二份主绑定，不修改 Desktop/Gateway 执行权限。
+
+申请与提交各发送一次，先保存本地阶段；网络返回丢失只读查询原 requestId。旧凭据只在原申请有效期、原认证凭据和精确后继身份均匹配时恢复新凭据，服务端不持久化明文 credential。本机确认后，浏览器在提交前将尚未生效的候选凭据存入受保护的临时申请；提交返回丢失并跨越有效期时，只以候选凭据读取服务端精确后继身份。候选凭据未生效不能授权发送，成功收敛后移除临时副本；popup 状态不暴露它。连接不会迁移旧 attempt 的冻结目标、ACK 或清除 `outcome_unknown`；自动回流仍尊重用户保存的开关。
 
 ## 消息收件箱与单条隔离（2026-10-05，源码开发）
 
@@ -77,7 +87,7 @@ Remote disable 拒绝新调用和消费，正在执行的 turn 需另用 control
 | Log credential leakage | Logger redacts token prefixes, bearer headers, token-like parameters, and pairing-code-shaped strings before writing |
 | Execution output leak | Codex may nominate logs or Remote turn final responses; a local sanitizer redacts tokens, pairing-code-shaped strings and home paths, truncates size, and refuses private-key blocks entirely. Restricted items are listed without a body. Read-only tools cannot run commands; Remote Control and Desktop Control are separate, explicitly authorized paths. |
 | Checkpoint / resume dump | Session checkpoints store short protocol fields only (capped). Resume uses the existing chat or HANDOFF — no new protocol state, no log paste, no re-pairing. |
-| Companion pair ≠ Send authority | Pairing registers credential+route only. Production reserve/begin-send require authenticated `/state` route VERIFIED via `feedback_companion_route_confirm`. Browser durable fence + pair barrier survive restart; non-NONE fence blocks resend until re-pair writes matching NONE. Wrong-principal confirm does not consume the challenge. |
+| Companion pair ≠ Send authority | Pairing registers credential+route only. Production reserve/begin-send require authenticated `/state` route VERIFIED: legacy Feedback requires MCP principal proof; canonical Web Sink also accepts explicit local-user route confirmation. Browser durable fence + pair barrier survive restart; a new local confirmation rotates companion/challenge identity, never clears an unknown attempt. Wrong-principal confirm does not consume the challenge. |
 
 ## Token & scope design
 

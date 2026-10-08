@@ -2,18 +2,22 @@
 
 本文是“一个机器级 Gateway、一个 ChatGPT 插件，覆盖本机所有显式授权项目”的现役实施计划。下列各阶段完成前，计划目标都不得写成已交付。旧时间线仍保留在[开发计划](development-plan.md)；单 workspace 官方投递的当前合同见[官方路线](official-route.md)。
 
-## 当前状态（2026-10-07 当前 checkout）
+## 当前状态（2026-10-08 当前 checkout）
 
 ### 当前源码能力
 
-- M1–M3 已有源码：`gateway register/list/revoke` 把规范 workspaceId/root 与获准 clientIds 写入机器 allowlist；`gateway serve` 使用独立 `machine-gateway` OAuth store 和单实例 owner lock。`gateway_list_workspaces` 只列出当前 client 的授权项目；workspace、Remote、execution、feedback、Web Sink 工具显式带 workspaceId，每次调用重新解析 grant 与 canonical root。Remote 工具仍要求该 workspace 处于 official delivery mode。
+- M1–M3 已有源码：`gateway register/list/revoke` 把规范 workspaceId/root 与获准 clientIds 写入机器 allowlist；`gateway serve` 使用独立 `machine-gateway` OAuth store 和单实例 owner lock。`gateway_list_workspaces` 只列出当前 client 的授权项目；workspace、Remote、Desktop、execution、feedback、Web Sink 工具显式带 workspaceId，每次调用重新解析 grant 与 canonical root。Remote 工具仍要求该 workspace 处于 official delivery mode。
 - MCP Gateway 复用原工具 handler 与每项目业务状态，不增加 Gateway 任务/反馈队列。`/mcp` 与 `/oauth/token` 诊断日志只记录 method、固定 path 和 statusCode；不记录 query、body、headers。匿名访问只开放协议 discovery，工具调用仍要求 bearer OAuth 和原 scope。
 - M4 已有多 workspace Companion 源码：每项目 local/session/alarm 存储隔离，页面选择固定 workspaceId 与 canonical route，DOM mutation 按 tab 串行，操作面板请求带 workspaceId 并忽略旧项目迟到响应。测试覆盖双项目状态隔离；双项目真实 Send/observed 尚待现场验收。
+- Gateway Desktop 复用本机绑定与原 sender：先 status 再 send，直接投递并保留 idle/busy 门禁；Bridge mailbox 才持久排队。Desktop read/control 与 Remote enable 独立，`codex_submit_task` 始终是后台 Remote 工具，失败不自动转投。详见 [Desktop 合同](desktop-control.md#gateway-直接投递)。
+- Companion 已配对页面的新回流目标由本机确认完整 URL，`local_user` 不替代 MCP principal。popup、toolbar、面板与新增 reserve 统一使用 SW 的 `connectionReadiness`；同 tab 刷新只在原身份稳定且 fresh 服务端核验通过时恢复。隐藏终态历史保留 unknown/发送与防重放证据，正文观察仍须唯一精确 ATTEMPT 和全文相等。机制见 [架构](architecture.md#companion-当前连接与恢复)，操作与诊断见 [排障](troubleshooting.md#日常连接与本机确认)。
 - M6 已有 Windows 前台 Gateway/Tunnel Supervisor 源码：configure/status/validate/set-key/run、DPAPI key 保存、exact process identity、launcher startup pin、受限 OAuth metadata preflight，以及 GC 对 Gateway/Controller release 引用的保护。尚无 Scheduled Task 注册或异常退出自动恢复。
 
 ### 当前未交付与验证边界
 
-M4 双项目真实 Send/observed、M5 同一插件的双项目端到端验收及旧 feedback Connector 退役仍未完成。M6 的历史机器启动、正常停止/重启和 A 项目只读 smoke 证据不能证明当前的进程、listener、build 或浏览器状态；本段说明源码能力和待现场验收范围，旧 PASS 记录只适用于其标注的源码/build。
+本轮唯一一次正式串行全量（2026-10-08 20:48:08–21:22:52，Asia/Shanghai）为 **180 files：177 PASS / 3 FAIL；3762 tests：3759 PASS / 3 FAIL；Duration 2078.78s，exit 1**，未出现 unhandled banner。`supervisor-store` 在未修改的源码/测试中遇原 8 秒 ACL 调用超时（8133ms）；保存的 ACL 快照合格，但变慢根因未明，未放宽门限。另两项静态测试分别因固定 1800 字符截取遗漏既有 `if (!res.ok)`、字符串判断把 `===` 当赋值而失败；仅修两行测试后一次定向 **2 files / 42 tests PASS、exit 0**，生产源码未变。未再跑正式全量，不能把原全量改写为通过。此前相关回归 **15 files / 889 tests**、typecheck/build 与本次 Python 协议 **89+20+4=113 项**通过，均不替代失败的正式全量；Vite `route-esm.js → route.js.map` 的 ENOENT 警告仍保留。证据在 ignored `.tooling/neat-closeout-20261008/`。
+
+20:46:41 的稳定 launcher 只读样本为 `running=false`、`runtimeUpgrade.state=stopped`、`runtimeBuildId=null`、`upgradePending=false`；安装 build 为 `f6a69f50b1700fe62886d6742b33f2fe2fa460a065879aa19006ce297178cab5`，checkout build 为 `deab83645b14d099130f0bd7a381b9e085c32b332638a0eba4c4796555f2276d`，二者不同。该样本不证明后续运行状态；本轮未部署或 Reload，最新网页连接简化尚未通过用户 Reload 后的 live 验收。M4 双项目真实 Send/observed、M5 同一插件的双项目端到端验收及旧 feedback Connector 退役仍未完成。M6 的历史机器启动、正常停止/重启和 A 项目只读 smoke 证据只适用于标注时点与 build。
 
 ## 历史现场与源码验证记录（每条只代表其标注时点）
 

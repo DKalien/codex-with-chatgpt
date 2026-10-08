@@ -16,6 +16,7 @@ import { Workspace } from "../workspace/manager.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { GatewayRegistry, GatewayRegistryError } from "../gateway/registry.js";
 import { createGatewayMcpServer } from "../mcp/gateway.js";
+import { DesktopError } from "../desktop/store.js";
 
 export interface OfficialRemoteServerOptions extends GatewayServerOptions {
   workspaceRoot: string;
@@ -115,7 +116,13 @@ export async function startGatewayServer(opts: GatewayServerOptions): Promise<Ga
     const endpoint = await startEndpoint({ ...opts, identity: GATEWAY_AUTH_ID, name: "本机 Gateway（仅显式授权项目）",
       authStoreFile: opts.authStoreFile ?? path.join(getStateDir(), "auth", "gateway.json"),
       allowAnonymousDiscovery: true,
-      makeServer: () => createGatewayMcpServer(registry),
+      makeServer: (authStore) => createGatewayMcpServer(registry, (auth, scope) => {
+        const verdict = authStore.verifyAccessToken(auth.token);
+        if (!verdict.ok || verdict.record.workspaceId !== GATEWAY_AUTH_ID ||
+            verdict.record.clientId !== auth.clientId || !verdict.record.scopes.includes(scope)) {
+          throw new DesktopError("UNAUTHORIZED", "Gateway OAuth 授权已失效或权限不足，请重新授权后再操作。");
+        }
+      }),
     });
     let closing: Promise<void> | undefined;
     return { ...endpoint, close: () => closing ??= endpoint.close().finally(release) };
@@ -123,7 +130,7 @@ export async function startGatewayServer(opts: GatewayServerOptions): Promise<Ga
 }
 
 async function startEndpoint(opts: GatewayServerOptions & {
-  identity: string; name: string; authStoreFile: string; makeServer: () => McpServer;
+  identity: string; name: string; authStoreFile: string; makeServer: (authStore: AuthStore) => McpServer;
   allowAnonymousDiscovery?: boolean;
 }): Promise<GatewayServer> {
   if (!Number.isInteger(opts.port) || opts.port < 0 || opts.port > 65535) throw new RemoteError("INVALID_PORT");
@@ -154,7 +161,7 @@ async function startEndpoint(opts: GatewayServerOptions & {
     logger: nullLogger,
   }));
 
-  const handleMcp = createMcpHttpHandler(opts.makeServer, nullLogger);
+  const handleMcp = createMcpHttpHandler(() => opts.makeServer(authStore), nullLogger);
   app.all("/mcp", express.json({ limit: "8mb" }), bearerAuth({
     store: authStore,
     workspaceId: opts.identity,

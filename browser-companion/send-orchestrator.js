@@ -60,6 +60,13 @@ const MARKER_REPRESENTATION_NUMERIC_KEYS = [
   "exactInnerTextDescendantCount",
   "exactTextContentDescendantCount",
   "attemptMarkerDescendantCount",
+  "richBodyWrapperScannedCount",
+  "richBodyCount",
+  "richBodyNodeScannedCount",
+  "richBodyRebuiltLength",
+  "richBodyRebuiltLineCount",
+  "richBodyLengthDelta",
+  "richBodyFirstMismatchIndex",
 ];
 
 const MARKER_REPRESENTATION_BOOLEAN_KEYS = [
@@ -67,6 +74,8 @@ const MARKER_REPRESENTATION_BOOLEAN_KEYS = [
   "markerTextContentExact",
   "markerInnerTextAttemptExact",
   "markerTextContentAttemptExact",
+  "richBodyRebuildSucceeded",
+  "richBodyExact",
 ];
 
 function sanitizeMarkerRepresentationLocal(rep) {
@@ -78,6 +87,8 @@ function sanitizeMarkerRepresentationLocal(rep) {
   for (const key of MARKER_REPRESENTATION_BOOLEAN_KEYS) {
     if (typeof rep[key] === "boolean") out[key] = rep[key];
   }
+  const code = rep.richBodyReasonCode;
+  if (Number.isInteger(code) && code >= 0 && code <= 15) out.richBodyReasonCode = code;
   return Object.keys(out).length ? out : null;
 }
 

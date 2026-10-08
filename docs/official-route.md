@@ -5,7 +5,7 @@
 单 workspace 路线的现役扩展计划见[统一 Gateway 计划](unified-gateway-plan.md)。Gateway 源码实现不等于机器已安装、正在运行或双项目 live 验收完成；这些阶段须分别核对。本源码路线没有验收 MCP Events、Work Events 或普通 Chat 原生 Events 自动唤醒，也不据此宣布 Browser Companion 回流路径退役。
 
 机器级 `gateway serve` 由本机 `gateway register --workspace <root> --client-id <OAuth clientId>` 显式登记项目；`gateway_list_workspaces` 只列当前 client 获准的项目。每个项目工具都显式带 `workspaceId`，包括 `workspace_info`、`feedback_status` 和 `web_sink_list`。旧 `remote serve`、单 workspace OAuth 与现有 feedback Connector 保留兼容；Gateway 源码不会自动迁移或停用旧 Connector。
-Gateway 当前只组合 workspace/Git、Remote、execution、feedback 和 Web Sink 工具；不注册 legacy Desktop/generic Executor 投递、write_probe 或 feedback probe。旧工具在其兼容入口保留原独立授权，不因 Gateway 登录自动开放。
+Gateway 组合 workspace/Git、Remote、Desktop、execution、feedback 和 Web Sink 工具。Desktop 先读取 `codex_desktop_status` 的本机绑定，再以同一 workspaceId/bindingId 调用 `codex_desktop_send`；直接复用原安全 sender，遵守 idle/busy 门禁，不排队、不自动转投或重发。Desktop 与后台 Remote 的启用独立，`codex_submit_task` 始终提交 Remote target，不能自动替代失败的 Desktop 请求。完整合同见 [Desktop 直接投递](desktop-control.md#gateway-直接投递)。Gateway 不注册 generic Executor 投递、write_probe 或 feedback probe，旧兼容入口仍保留原独立授权。
 
 ## 职责
 
@@ -34,7 +34,7 @@ flowchart LR
 
 固定单 workspace endpoint 先查 `workspace_info` 和 `codex_list_targets`；机器 Gateway 先查 `gateway_list_workspaces`，后续两工具都显式传对应 workspaceId。核对项目后再创建或选择明确 target。后续 `codex_submit_task` 传 workspaceId/targetId；结果按对应 workspaceId/taskId 读取。旧 threadId 参数只兼容已经登记、授权的线程，不接受任意路径，不按最近会话或当前目录猜目标。
 
-项目文件按 endpoint 的固定 workspace 或 Gateway 调用的已授权 workspaceId 读取。文件查看不需要猜某个 thread，也不要求 Desktop 空闲。网页回流目标与执行目标独立：结果先排入各项目的 Result Bus，预约该项目当前 Active Web Sink，在 begin-send 冻结精确页面；已经开始的发送不会因为切换页面或项目而重发。
+项目文件按 endpoint 的固定 workspace 或 Gateway 调用的已授权 workspaceId 读取。文件查看不需要猜某个 thread，也不要求 Desktop 空闲。网页回流目标与执行目标独立：结果先排入各项目的 Result Bus，预约该项目当前 Active Web Sink，在 begin-send 冻结精确页面；已经开始的发送不会因为切换页面或项目而重发。已配对浏览器新建或切换回流目标时使用本机确认的完整 URL；`local_user` 仅授权 canonical 回流，旧 Feedback principal 权限仍单独核验，详见 [安全边界](security.md#companion-本机确认回流地址)。
 
 Gateway grant 是对共享 workspace 的授权，不是 OAuth client 之间的文件隔离。Remote task status、result 与 cancel 核验原 client；Feedback/Web Sink 则按当前 workspace 的有效 conversation binding 管理结果，因此可承接该项目此前由其他网页派发的结果。这个回流权限须单独建立并验证；另一 client 的 MCP token 本身不授予 Companion 权限。发送开始后不能把原 attempt 改投新页面。
 

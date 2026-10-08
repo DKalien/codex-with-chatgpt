@@ -94,8 +94,9 @@
     el.className = "value" + (cls ? " " + cls : "");
   }
 
-  function friendlyConnectState(transport, isOwner, connectReason, connectState, routeMatches, r5cConnected) {
+  function friendlyConnectState(transport, isOwner, connectReason, connectState, routeMatches, readiness, routeAttestFence, localRoute) {
     if (transport?.authStale) return ["连接需要修复", "bad"];
+    if (routeAttestFence === "OUTCOME_UNKNOWN") return ["连接验证消息待核验，请勿重复发送", "bad"];
     if (connectReason === "bootstrap_tool_missing") {
       return ["当前对话缺少反馈连接工具", "bad"];
     }
@@ -107,9 +108,14 @@
     if (connectReason === "bridge_permission_missing") {
       return ["需要授权连接服务", "warn"];
     }
+    const localHint = localRouteHint(localRoute?.state);
+    if (localHint) return [localHint, "warn"];
+    if (connectReason === "local_route_upgrade_required") return ["请升级连接服务后重试", "warn"];
+    if (connectProgress(connectState)) return [connectProgress(connectState), "warn"];
     if (transport?.rebindPending) {
       return ["正在等待 ChatGPT 完成确认", "warn"];
     }
+    if (readiness?.ready === true) return ["当前对话已连接", "ok"];
     if (transport?.connected && transport?.routeVerification !== "VERIFIED") {
       return ["还差一步完成连接", "warn"];
     }
@@ -117,17 +123,49 @@
       if (!(isOwner === true && routeMatches === true)) {
         return ["当前页面需要重新连接", "warn"];
       }
-      // R5c: full connected requires Web Sink convergence, not only legacy VERIFIED.
-      if (r5cConnected !== true) {
-        return ["当前对话需要完成连接", "warn"];
-      }
-      return ["当前对话已连接", "ok"];
+      return ["当前对话需要完成连接", "warn"];
     }
     return ["可以连接当前对话", "warn"];
   }
 
+  function localRouteHint(state) {
+    return ({ REQUESTED: "请在本机确认连接", PENDING: "请在本机确认连接",
+      COMMIT_REQUESTED: "正在核验本机确认结果", COMMITTED: "正在完成当前对话连接",
+      CANCELLED: "已取消本机确认", EXPIRED: "本机确认已过期，请再次连接",
+      UPGRADE_REQUIRED: "请升级连接服务后重试", NOT_FOUND: "连接请求未建立，请再次连接", CHANGED: "连接状态已变化，请再次连接",
+      RECOVERY_EXPIRED: "本机确认结果已超出恢复期限，请重新配对", INVALID: "连接请求记录需要检查" })[state] ?? null;
+  }
+
+  function connectProgress(state) {
+    return ({
+      LOCAL_CONFIRM_PENDING: "请在本机确认连接，可关闭此弹窗等待",
+      LOCAL_CONFIRM_CANCELLED: "已取消本机确认",
+      LOCAL_CONFIRM_EXPIRED: "本机确认已过期，请再次连接",
+      ATTEST_REQUESTED: "正在核验当前对话",
+      ROUTE_ATTEST_DISPATCH: "正在发送连接验证，请等待页面确认",
+      COMPLETE_REQUESTED: "正在完成当前对话连接",
+      AWAITING_CONFIRMATION: "已发送连接验证，请回到 ChatGPT 完成确认",
+    })[state] ?? null;
+  }
+
+  const deliveryRecoveryHint = armed => armed
+    ? "自动回流已开启，当前回流记录仍待核验；请等待状态更新，不要重复发送。"
+    : "旧回流尚待核验，自动回流已暂停。点击“连接当前对话”只核验原消息，不会重发。";
+
   function friendlyConnectReason(reason) {
     switch (reason) {
+      case "local_route_repair_required":
+        return "本机确认结果无法安全恢复，请重新配对；不会重复提交旧请求。";
+      case "local_route_request_ended":
+        return "旧本机确认已结束，请再次点击连接当前对话。";
+      case "local_route_upgrade_required":
+        return "请升级连接服务后重试，本次不会向对话发送验证消息。";
+      case "local_route_owner_changed":
+        return "当前页面已变化，本机确认已停止提交；请回到发起连接的页面。";
+      case "local_route_pending":
+        return "已有本机确认请求，请先在本机完成确认。";
+      case "local_route_fence_blocked":
+        return "旧连接结果尚待核验，请先处理原连接记录。";
       case "bridge_origin_invalid":
         return "连接地址需要检查，请展开连接设置查看详情。";
       case "bridge_permission_missing":
@@ -139,15 +177,20 @@
       case "cold_pair_required":
         return "首次使用需要配对，请粘贴配对信息并点击一次完成连接。";
       case "bootstrap_tool_missing":
-        return "当前对话缺少反馈连接工具，请检查 ChatGPT 工具连接后再继续。";
+        return "请在当前 ChatGPT 对话选用 C2C Unified Gateway，并完成页面上的连接确认；不会自动重发自举消息。";
       case "bootstrap_sender_invalid":
         return "连接消息来源校验未通过，未发送；重新打开扩展后可再次连接。";
       case "bootstrap_capability_missing":
         return "固定连接组件尚未加载，未发送；刷新 ChatGPT 页面后可再次连接。";
       case "COMPANION_REBIND_NOT_SUCCESSOR":
         return "服务端尚未确认接管，请等待当前 Chat 完成工具调用；不会重发连接消息。";
+      case "connect_outcome_unknown":
+      case "bootstrap_outcome_unknown":
+        return "连接消息结果待核验；请先核对当前对话，不要重复发送。";
+      case "delivery_journal_requires_recovery":
+        return "旧回流尚待核验，请先核对当前对话；不会重发。";
       default:
-        return "连接遇到问题，请展开连接设置查看详情。";
+        return `连接未完成（${reason || "原因未明"}），请查看高级诊断中的失败原因。`;
     }
   }
 
@@ -185,6 +228,50 @@
           ? d.candidateLengths.slice(0, 5)
           : undefined,
       };
+      if (d.representation && typeof d.representation === "object") {
+        const rep = {}, input = d.representation;
+        for (const key of [
+          "markerCandidateIndex",
+          "markerCandidateNormalizedLength",
+          "markerInnerTextLength",
+          "markerTextContentLength",
+          "targetLineCount",
+          "markerInnerTextLineCount",
+          "markerTextContentLineCount",
+          "innerLengthDelta",
+          "textContentLengthDelta",
+          "innerCommonPrefixLength",
+          "innerCommonSuffixLength",
+          "textCommonPrefixLength",
+          "textCommonSuffixLength",
+          "descendantScannedCount",
+          "exactInnerTextDescendantCount",
+          "exactTextContentDescendantCount",
+          "attemptMarkerDescendantCount",
+          "richBodyWrapperScannedCount",
+          "richBodyCount",
+          "richBodyNodeScannedCount",
+          "richBodyRebuiltLength",
+          "richBodyRebuiltLineCount",
+          "richBodyLengthDelta",
+          "richBodyFirstMismatchIndex",
+        ]) {
+          if (Number.isFinite(input[key])) rep[key] = input[key];
+        }
+        for (const key of [
+          "markerInnerTextExact",
+          "markerTextContentExact",
+          "markerInnerTextAttemptExact",
+          "markerTextContentAttemptExact",
+          "richBodyRebuildSucceeded",
+          "richBodyExact",
+        ]) {
+          if (typeof input[key] === "boolean") rep[key] = input[key];
+        }
+        const code = input.richBodyReasonCode;
+        if (Number.isInteger(code) && code >= 0 && code <= 15) rep.richBodyReasonCode = code;
+        if (Object.keys(rep).length) safe.representation = rep;
+      }
       for (const key of Object.keys(safe)) {
         if (safe[key] === undefined) delete safe[key];
       }
@@ -709,7 +796,7 @@
     }
     els.applyPairJson.disabled = false;
     els.fetchState.disabled = !storageProtected || !transport?.bridgeOrigin;
-    els.reserve.disabled = !hasTransport || !isOwner;
+    els.reserve.disabled = transport?.connectionReadiness?.ready !== true || !hasTransport || !isOwner;
     els.release.disabled = !hasTransport;
     els.recover.disabled = !hasTransport;
 
@@ -743,41 +830,58 @@
     const autonomyMode = autonomy.mode ?? "off";
     const armed = autonomyMode === "armed";
     const rearmOnConnect = autonomy.rearmOnConnect === true;
-    const [connectionText, connectionClass] = friendlyConnectState(
+    const deliveryBlocked = status?.deliveryRecovery?.blocked === true || journalState === "OUTCOME_UNKNOWN";
+    const [connectionText, connectionClass] = !parsed ? ["请先创建 ChatGPT 对话", "warn"] : friendlyConnectState(
       transport,
       isOwner,
       status?.connectReason,
       status?.connectState,
       routeMatchesTransport,
-      transport?.r5cConnected === true || status?.webSinkConverged === true,
+      transport?.connectionReadiness,
+      status?.routeAttestFence,
+      status?.localRoute,
     );
     const ownerNeedsReconnect = connectionText === "当前页面需要重新连接";
     setText(els.userConnectionStatus, connectionText, connectionClass);
     if (connectionText === "当前对话已连接") setText(els.connectStatus, connectionText, "ok");
-    setText(els.userAutonomyStatus, armed ? "已开启" : "未开启", armed ? "ok" : "warn");
-    const actionHint = transport?.takeoverRecovery
-      ? "点击“连接当前对话”核验接管并继续页面验证；不会重发之前的连接消息。"
+    setText(els.userAutonomyStatus, deliveryBlocked ? armed ? "已开启 · 回流待核验" : "已暂停 · 旧回流待核验" : armed ? "已开启" : "未开启", armed && !deliveryBlocked ? "ok" : "warn");
+    const actionHint = !parsed ? "请先在 ChatGPT 创建对话，出现对话地址后再连接。" : transport?.authStale
+      ? "正在用原配对复核连接，暂不发送；无需清除目标或重新配对。"
+      : status?.routeAttestFence === "OUTCOME_UNKNOWN"
+        ? "连接验证消息的发送结果尚不明确，请先核对当前对话；不会重发。"
+      : transport?.takeoverRecovery
+        ? "点击“连接当前对话”核验接管并继续页面验证；不会重发之前的连接消息。"
+      : status?.connectState === "OUTCOME_UNKNOWN" || status?.connectState === "TAKEOVER_DISPATCH"
+        ? "连接消息结果尚待核验，请先核对当前对话；不会重复发送。"
+      : status?.connectReason === "bootstrap_tool_missing"
+        ? friendlyConnectReason("bootstrap_tool_missing")
+      : status?.connectReason === "bridge_permission_missing"
+        ? friendlyConnectReason("bridge_permission_missing")
+      : localRouteHint(status?.localRoute?.state)
+        ? localRouteHint(status.localRoute.state)
+      : status?.connectReason === "local_route_upgrade_required"
+        ? friendlyConnectReason(status.connectReason)
       : ownerNeedsReconnect
-      ? "页面刷新后需要重新确认当前页面，请点击“连接当前对话”。"
+        ? "当前页面尚未接续连接，请点击“连接当前对话”。"
       : connectionText === "当前对话已连接"
-      ? (armed ? "执行结果会自动回到当前对话。" : "如需自动回流，请勾选确认后开启。")
-        : connectionText === "当前对话需要完成连接"
-          ? "请再次点击“连接当前对话”完成 Web Sink 收敛。"
-        : (status?.connectReason === "bootstrap_tool_missing"
-          ? `请在当前 Chat 调用 feedback_status(workspaceId=${transport?.workspaceId ?? selectedWorkspaceId})；需要接管时调用 feedback_takeover(workspaceId=${transport?.workspaceId ?? selectedWorkspaceId}, expectedEpoch=..., widgetId=...)；不会自动重发自举消息。`
-          : transport?.rebindPending
-          ? "请回到 ChatGPT 完成确认。"
-          : status?.connectState === "WAITING_TAKEOVER"
-            ? "正在等待当前 Chat 完成反馈连接接管；完成后会自动继续验证。"
-          : transport?.authStale
-            ? "正在用原配对复核连接，暂不发送；无需清除目标或重新配对。"
-          : transport?.connected
-            ? "请完成当前对话验证；如未自动出现验证消息，可展开连接设置。"
-            : "点击“连接当前对话”开始使用。遇到问题可展开连接设置。");
+        ? deliveryBlocked ? deliveryRecoveryHint(armed) : armed ? "执行结果会自动回到当前对话。" : "如需自动回流，请勾选确认后开启。"
+      : connectionText === "当前对话需要完成连接"
+        ? "请点击“连接当前对话”完成当前页面连接。"
+      : transport?.rebindPending
+        ? "请回到 ChatGPT 完成确认。"
+      : status?.connectState === "WAITING_TAKEOVER"
+        ? "正在等待当前 Chat 完成反馈连接接管；完成后会自动继续验证。"
+      : connectProgress(status?.connectState)
+        ? connectProgress(status.connectState)
+      : transport?.connected
+        ? "请完成当前对话验证；日常恢复请点击“连接当前对话”。"
+        : "点击“连接当前对话”开始使用。首次连接请完成页面确认。";
     setText(
       els.userActionHint,
-      rearmOnConnect && !armed ? `${actionHint} 连接后将自动恢复自动回流。` : actionHint,
-      connectionClass,
+      rearmOnConnect && !armed && !deliveryBlocked && !transport?.authStale
+        && status?.routeAttestFence !== "OUTCOME_UNKNOWN" && !["OUTCOME_UNKNOWN", "TAKEOVER_DISPATCH"].includes(status?.connectState)
+        ? `${actionHint} 连接后将自动恢复自动回流。` : actionHint,
+      deliveryBlocked ? "warn" : connectionClass,
     );
     if (els.connectDiagnostic) {
       els.connectDiagnostic.textContent = [
@@ -787,6 +891,7 @@
         `bindingEpoch=${transport?.epoch ?? "-"}`,
         `routeAttestFence=${status?.routeAttestFence ?? "NONE"}`,
         `reason=${status?.connectReason ?? "-"}`,
+        `deliveryRecovery=${status?.deliveryRecovery ? JSON.stringify(status.deliveryRecovery) : "-"}`,
       ].join("\n");
     }
     if (els.autonomyStatus) {
@@ -799,8 +904,8 @@
         `route=${transport?.routeCanonical ?? "-"}`,
         `Stored binding verification: ${transport?.routeVerification === "VERIFIED" ? "VERIFIED" : "PENDING"}`,
         `Current page matches binding: ${routeMatchesTransport && isOwner ? "yes" : "no"}`,
-        `Current page connected: ${routeMatchesTransport && isOwner && transport?.r5cConnected === true ? "yes" : "no"}`,
-        `Production eligible on current page: ${routeMatchesTransport && isOwner && transport?.productionEligible === true && transport?.r5cConnected === true ? "yes" : "no"}`,
+        `Current page connected: ${transport?.connectionReadiness?.ready === true ? "yes" : "no"}`,
+        `Production eligible on current page: ${transport?.productionEligible === true && transport?.connectionReadiness?.ready === true ? "yes" : "no"}`,
         `identityExact=${autonomy.identityExact === true}`,
         `tickInFlight=${autonomy.tickInFlight === true}`,
         `lastDecision=${autonomy.lastDecision ?? "-"}`,
@@ -836,7 +941,7 @@
       || transport?.productionEligible === true
     );
     if (els.reserve) {
-      els.reserve.disabled = !hasTransport || !isOwner || armed || !routeVerified;
+      els.reserve.disabled = transport?.connectionReadiness?.ready !== true || !hasTransport || !isOwner || armed || !routeVerified;
     }
     if (els.autonomyShadow) {
       els.autonomyShadow.disabled = !hasTransport || !isOwner || !storageProtected || armed;
@@ -900,6 +1005,7 @@
           return;
         }
         await withProjectAction(workspaceId, project, async () => {
+          setText(els.connectStatus, "正在检查连接服务权限…", "warn");
           let permission;
           try { permission = bridgePermission(project.bridgeOrigin); }
           catch {
@@ -916,6 +1022,7 @@
             setText(els.bridgePermissionStatus, "请展开设置，单独点击“授权连接服务”。", "warn");
             return;
           }
+          setText(els.connectStatus, "正在核对当前对话…", "warn");
           const tabNow = await activeTab();
           let currentRoute = null;
           try {
@@ -931,6 +1038,7 @@
           }
           let res;
           try {
+            setText(els.connectStatus, "正在连接当前对话并核验已有连接…", "warn");
             // The selected workspace and canonical route are captured at click time.
             res = await tabMessage(tabNow.id, {
               type: "c2c.connect.request", workspaceId, canonicalRoute: parsed.canonical,
@@ -946,7 +1054,7 @@
                 ? (connected ? "当前对话已连接" : "当前对话尚未完成连接，请再次点击“连接当前对话”。")
                 : res.state === "WAITING_TAKEOVER"
                   ? "正在等待当前 Chat 接管连接"
-                : "已发送连接验证，请回到 ChatGPT 完成确认")
+                : connectProgress(res.state) ?? "连接正在处理，请等待当前页面状态更新")
             : friendlyConnectReason(reason);
           const outcome = reason || (res.state === "CONNECTED" && !connected ? "连接尚未收敛" : "ok");
           setText(els.connectDiagnostic, `${outcome}\n${els.connectDiagnostic.textContent}`, res?.ok ? (connected ? "ok" : "warn") : "bad");
@@ -1108,6 +1216,7 @@
 
           let connectResult;
           try {
+            setText(els.pairConnectHint, "配对已完成，正在连接当前对话…", "warn");
             connectResult = await tabMessage(tabNow.id, {
               type: "c2c.connect.request", workspaceId, canonicalRoute: parsed.canonical,
             });
@@ -1120,12 +1229,14 @@
               ? "当前对话已连接。"
               : connectResult.state === "CONNECTED"
                 ? "当前对话尚未完成连接，请再次点击“连接当前对话”。"
-                : "已发送连接验证，请回到 ChatGPT 完成确认。", connected ? "ok" : "warn");
+                : connectResult.state === "WAITING_TAKEOVER" ? "正在等待当前 Chat 接管连接"
+                  : connectProgress(connectResult.state) ?? "连接正在处理，请等待当前页面状态更新", connected ? "ok" : "warn");
             setText(els.connectStatus, connected
               ? "当前对话已连接"
               : connectResult.state === "CONNECTED"
                 ? "当前对话尚未完成连接，请再次点击“连接当前对话”。"
-                : "已发送连接验证，请回到 ChatGPT 完成确认", connected ? "ok" : "warn");
+                : connectResult.state === "WAITING_TAKEOVER" ? "正在等待当前 Chat 接管连接"
+                  : connectProgress(connectResult.state) ?? "连接正在处理，请等待当前页面状态更新", connected ? "ok" : "warn");
             if (els.firstUseSettings) els.firstUseSettings.open = false;
           } else {
             setText(els.pairConnectHint, friendlyConnectReason(connectReason), "bad");
@@ -1812,8 +1923,7 @@
         selectedProject && { ...selectedProject }, () => action(...args));
     }
     if (statusError) { showStatusTimeout(statusError); return false; }
-    return isOwner && routeMatchesTransport && transport?.routeVerification === "VERIFIED"
-      && transport?.r5cConnected === true;
+    return connectionText === "当前对话已连接";
   }
 
   (async () => {

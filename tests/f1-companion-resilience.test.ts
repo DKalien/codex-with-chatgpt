@@ -109,6 +109,7 @@ function baseState(overrides: Record<string, unknown> = {}) {
     inFlight: null,
     pendingReady: 1,
     routeVerified: true,
+    connectionReadiness: { ready: true, reason: null },
     now: Date.now(),
     ...overrides,
   };
@@ -727,19 +728,20 @@ describe("F1b 7. SPA route / conversation drift", () => {
 describe("F1b 8. Bridge temporary offline", () => {
   it("SW recover fetch failure must not clear durable journal", () => {
     const sw = swSource();
-    const wrapper = sw.indexOf("async function handleRecover()");
-    const recovery = sw.indexOf("async function handleRecoverOnce()", wrapper);
+    const wrapper = sw.indexOf("async function handleRecover(");
+    const recovery = sw.indexOf("async function handleRecoverOnce(", wrapper);
     expect(wrapper).toBeGreaterThan(-1);
     expect(recovery).toBeGreaterThan(wrapper);
     const wrapperBody = sw.slice(wrapper, recovery);
-    expect(wrapperBody).toMatch(/if \(productionRecoveryInFlight \|\| productionSendInFlight\)/);
-    expect(wrapperBody).toMatch(/try \{ return await handleRecoverOnce\(\); \}/);
-    expect(wrapperBody).toMatch(/finally \{ productionRecoveryInFlight = false; \}/);
+    expect(wrapperBody).toMatch(/if \(productionRecoveryInFlight \|\| productionSendInFlight \|\| \(connectInFlight && !observeOnly\)\)/);
+    expect(wrapperBody).toMatch(/try \{ return await handleRecoverOnce\(\{ observeOnly, isCurrent \}\); \}/);
+    expect(wrapperBody).toMatch(/finally \{ productionRecoveryInFlight = false; connectRecoveryCurrent = null; \}/);
     const earlyReturn = sw.indexOf("if (journal.state === \"RESERVED\")", recovery);
     expect(earlyReturn).toBeGreaterThan(recovery);
     const body = sw.slice(recovery, earlyReturn);
     expect(body).toMatch(/const stateRes = await handleFetchState\(\);/);
     expect(body).toMatch(/if \(!stateRes\.ok\) return stateRes;/);
+    expect(body.slice(0, body.indexOf("if (!stateRes.ok) return stateRes;"))).not.toMatch(/journal\s*=|persistJournal\(/);
     expect(body).toMatch(/const inFlight = stateRes\.status\.inFlight;/);
   });
 

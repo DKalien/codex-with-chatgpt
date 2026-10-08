@@ -10,7 +10,7 @@ import {
   webSinkStatus,
 } from "../web-sink-control/service.js";
 import { readFeedbackState } from "../feedback/store.js";
-import { isRouteAttestationVerified } from "../feedback/schema.js";
+import { isWebSinkRouteVerified } from "../feedback/schema.js";
 
 export { WEB_SINK_READ_SCOPE };
 
@@ -153,7 +153,7 @@ export function registerWebSinkTools(server: McpServer, workspaceSource: Workspa
         if (companion && !companion.supersededAt) {
           companionAvailable = true;
           companionRouteCanonical = companion.routeCanonical;
-          companionVerified = isRouteAttestationVerified(companion);
+          companionVerified = isWebSinkRouteVerified(companion);
         }
       } catch {
         companionAvailable = false;

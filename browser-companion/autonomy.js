@@ -246,12 +246,21 @@ export function sanitizeRecoveryDiagnostic(diagnostic) {
     "exactInnerTextDescendantCount",
     "exactTextContentDescendantCount",
     "attemptMarkerDescendantCount",
+    "richBodyWrapperScannedCount",
+    "richBodyCount",
+    "richBodyNodeScannedCount",
+    "richBodyRebuiltLength",
+    "richBodyRebuiltLineCount",
+    "richBodyLengthDelta",
+    "richBodyFirstMismatchIndex",
   ];
   const repBool = [
     "markerInnerTextExact",
     "markerTextContentExact",
     "markerInnerTextAttemptExact",
     "markerTextContentAttemptExact",
+    "richBodyRebuildSucceeded",
+    "richBodyExact",
   ];
   const out = {};
   if (Number.isFinite(diagnostic.candidateCount)) out.candidateCount = diagnostic.candidateCount;
@@ -285,6 +294,8 @@ export function sanitizeRecoveryDiagnostic(diagnostic) {
     for (const key of repBool) {
       if (typeof diagnostic.representation[key] === "boolean") rep[key] = diagnostic.representation[key];
     }
+    const code = diagnostic.representation.richBodyReasonCode;
+    if (Number.isInteger(code) && code >= 0 && code <= 15) rep.richBodyReasonCode = code;
     if (Object.keys(rep).length) out.representation = rep;
   }
   return Object.keys(out).length ? out : null;
@@ -454,6 +465,7 @@ export function evaluateAutonomyGates(input) {
     sendProbeLatch,
     productionSendInFlight,
     routeVerified,
+    connectionReadiness,
     now = Date.now(),
     maxEvidenceAgeMs = 12_000,
   } = input || {};
@@ -496,6 +508,7 @@ export function evaluateAutonomyGates(input) {
     // Active journal is allowed — tick will recover, not reserve.
     return { ok: true, recovering: true };
   }
+  if (connectionReadiness?.ready !== true) return failGate("connect_not_ready");
   return { ok: true, recovering: false };
 }
 
@@ -513,6 +526,7 @@ export function planAutonomyTick(state) {
     sendProbeLatch,
     productionSendInFlight,
     routeVerified,
+    connectionReadiness,
     autonomyTickInFlight = false,
     inFlight = null,
     pendingReady = 0,
@@ -602,6 +616,7 @@ export function planAutonomyTick(state) {
     sendProbeLatch,
     productionSendInFlight,
     routeVerified,
+    connectionReadiness,
     now,
   });
   if (!gates.ok) {

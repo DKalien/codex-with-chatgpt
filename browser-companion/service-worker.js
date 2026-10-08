@@ -153,6 +153,8 @@ import {
   finishConnectFlow,
   connectFlowOwnerWitnessMatches,
   refreshExplicitConnectOwnerWitness,
+  verifiedConnectFlowMatchesTransport,
+  deriveConnectionReadiness,
 } from "./connect-flow.js";
 import {
   deriveCompanionIndicator,
@@ -172,6 +174,7 @@ import {
 
 const LEGACY_LOCAL_KEYS = [
   "c2c_companion_local_v1",
+  "c2c_companion_local_route_request_v1",
   "c2c_companion_transport_v1",
   "c2c_companion_journal_v1",
   "c2c_companion_outcome_unknown_archive_v1",
@@ -188,6 +191,9 @@ const LEGACY_SESSION_KEYS = [
   ROUTE_ATTEST_LATCH_KEY,
   "c2c_companion_pair_intent_v1",
 ];
+
+// 浏览器消息抵达即记录文档变化，先于project的同tab串行锁，防止await使用旧文档。
+const pageArrivals = new Map();
 
 export function createWorkspaceContext(project, isSelected = () => false, withPageSendLock = null) {
 const chrome = createProjectChrome(globalThis.chrome, project.workspaceId, isSelected, withPageSendLock);
@@ -212,6 +218,7 @@ function isOwnOperationsPanel(sender) {
 }
 
 const LOCAL_KEY = "c2c_companion_local_v1";
+const LOCAL_ROUTE_KEY = "c2c_companion_local_route_request_v1";
 const TRANSPORT_KEY = "c2c_companion_transport_v1";
 const JOURNAL_KEY = "c2c_companion_journal_v1";
 const OUTCOME_UNKNOWN_ARCHIVE_KEY = "c2c_companion_outcome_unknown_archive_v1";
@@ -249,11 +256,15 @@ let connectFlow = emptyConnectFlow();
 /** Bridge-authoritative Web Sink projection cache (read-only sync). */
 let activeWebSinkProjection = { binding: null, available: false, synced: false };
 let connectInFlight = false;
+let localRouteRequest = null;
+let lastLocalRoutePollAt = 0;
 let transportMutationInFlight = false;
 /** E1b3d3b concurrent production send gate (memory only; durable truth is journal). */
 let productionSendInFlight = false;
 /** Serializes manual and autonomous recovery so native production cannot overlap its proof. */
 let productionRecoveryInFlight = false;
+/** 仅显式 Connect 的观察恢复；不能用于续发或接管旧目标。 */
+let connectRecoveryCurrent = null;
 /** Short-lived SW transition proofs. Bound to current journal identity. Never from CS. */
 let productionClaimProof = null;
 let productionAckProof = null;
@@ -315,6 +326,7 @@ async function hydrate() {
     AUTONOMY_STORAGE_KEY,
     ROUTE_ATTEST_FENCE_KEY,
     CONNECT_FLOW_KEY,
+    LOCAL_ROUTE_KEY,
   ]);
   const row = stored[LOCAL_KEY];
   localState = row && typeof row === "object"
@@ -392,6 +404,7 @@ async function hydrate() {
   routeAttestFence = reconciled.fence;
   routeAttestLatch = reconciled.sessionLatch;
   connectFlow = parseConnectFlow(stored[CONNECT_FLOW_KEY]);
+  localRouteRequest = parseLocalRouteRequest(stored[LOCAL_ROUTE_KEY]);
   hydrated = true;
   void refreshActionIndicator();
 }
@@ -551,6 +564,11 @@ async function commitAutonomyPolicy(proposed) {
   const previous = autonomyPolicy;
   try {
     await chrome.storage.local.set({ [AUTONOMY_STORAGE_KEY]: proposed });
+    if (autonomyPolicy !== previous) {
+      // 用户在持久化期间关闭回流时，以更新后的偏好为准。
+      await persistAutonomyPolicy();
+      return { ok: false, reason: "autonomy_policy_changed", policy: autonomyPolicy };
+    }
   } catch (error) {
     return {
       ok: false,
@@ -637,18 +655,21 @@ async function persistSessionOwnership() {
   });
 }
 
-function verifiedConnectFlowMatchesTransport(flow) {
-  if (transport?.routeVerification !== "VERIFIED") return false;
-  const identity = connectFlowIdentity(transport);
-  return Boolean(identity && connectFlowMatches(flow, identity.challengeId === null
-    ? { ...identity, challengeId: flow.challengeId }
-    : identity));
+function connectionReadiness(tabId = ownerState.owner?.tabId, documentId = ownerState.owner?.documentId) {
+  return deriveConnectionReadiness({
+    transport, storageProtected, transportIdentityBlocked, transportMutationInFlight, routeAttestFence, connectFlow, connectReason,
+    owner: documentId != null && isOwner(ownerState, tabId, documentId) ? ownerState.owner : null,
+    webSink: activeWebSinkProjection,
+  });
 }
 
-function safeTransportSummary() {
+function safeTransportSummary(readiness = connectionReadiness()) {
   if (!transport) {
     return {
       connected: false,
+      connectionReadiness: readiness,
+      webSinkConverged: readiness.ready,
+      r5cConnected: readiness.ready,
       authStale: false,
       storageProtected,
       bridgeOrigin: null,
@@ -660,10 +681,6 @@ function safeTransportSummary() {
       pairedAt: null,
     };
   }
-  const r5cFlowCurrent = Boolean(
-    connectFlow.state === "DONE"
-    && verifiedConnectFlowMatchesTransport(connectFlow),
-  );
   return {
     connected: !transport.authStale && storageProtected,
     authStale: transport.authStale === true,
@@ -680,22 +697,9 @@ function safeTransportSummary() {
     rebindPending: transport.rebindPending === true,
     connectState: connectFlow.state,
     takeoverRecovery: currentTakeoverRecoveryStage(),
-    webSinkConverged: Boolean(
-      activeWebSinkProjection.synced
-      && activeWebSinkProjection.available
-      && activeWebSinkProjection.binding
-      && activeWebSinkProjection.binding.canonicalUrl === transport.routeCanonical
-      && transport.routeVerification === "VERIFIED"
-      && r5cFlowCurrent,
-    ),
-    r5cConnected: Boolean(
-      activeWebSinkProjection.synced
-      && activeWebSinkProjection.available
-      && activeWebSinkProjection.binding
-      && activeWebSinkProjection.binding.canonicalUrl === transport.routeCanonical
-      && transport.routeVerification === "VERIFIED"
-      && r5cFlowCurrent,
-    ),
+    connectionReadiness: readiness,
+    webSinkConverged: readiness.ready,
+    r5cConnected: readiness.ready,
     pairedAt: transport.pairedAt,
   };
 }
@@ -836,7 +840,20 @@ async function requestActiveOwnerRefresh(expectedTabId = null) {
   }
 }
 
+function deliveryRecoverySummary(result = null) {
+  const blocked = journal.state !== "NONE" && parseAutonomyPolicy(autonomyPolicy).mode === "off";
+  return {
+    blocked,
+    journalState: journal.state,
+    reason: blocked ? result?.reason || "delivery_journal_requires_recovery" : null,
+    action: result?.action ?? null,
+    recovered: result?.recovered === true,
+  };
+}
+
 function statusPayload(tabId, documentId, extra = {}) {
+  const readiness = connectionReadiness(tabId, documentId);
+  const summary = safeTransportSummary(readiness);
   return {
     ok: true,
     targetRoute: localState.targetRoute,
@@ -847,8 +864,10 @@ function statusPayload(tabId, documentId, extra = {}) {
     ownership: documentId != null
       ? ownerStatus(ownerState, tabId, documentId)
       : ownerStatus(ownerState, -1, ""),
-    transport: safeTransportSummary(),
+    transport: summary,
     journal: summarizeProductionJournal(journal),
+    deliveryRecovery: deliveryRecoverySummary(),
+    localRoute: localRouteSummary(),
     sendProbeLatch: sendProbeLatch.state,
     routeAttestLatch: routeAttestLatch.state,
     routeAttestFence: routeAttestFence.state,
@@ -873,7 +892,7 @@ function statusPayload(tabId, documentId, extra = {}) {
       identityExact: policyIdentityExact(autonomyPolicy, transport),
       ownerAvailable: documentId != null && isOwner(ownerState, tabId, documentId),
       storageProtected,
-      transport: safeTransportSummary(),
+      transport: summary,
       journalState: journal?.state,
       productionSendInFlight,
       autonomyTickInFlight,
@@ -962,6 +981,7 @@ async function convergeExplicitVerifiedConnect(expectedOwner) {
       body: JSON.stringify({ routeCanonical: transport.routeCanonical }),
     });
     if (!isCurrentTransportResponse(res)) return { ok: false, reason: "stale_transport_response" };
+    if (expectedOwner && !ownerStillMatches(expectedOwner)) return { ok: false, reason: "web_sink_owner_mismatch" };
     if (!res.ok || !res.body || typeof res.body !== "object") {
       return { ok: false, reason: "web_sink_bind_failed", status: res.status };
     }
@@ -1021,14 +1041,14 @@ async function syncActiveWebSinkFromBridge() {
     const res = await fetchCompanion("/web-sink/status", { method: "GET" });
     if (!isCurrentTransportResponse(res)) return { ok: false, reason: "stale_transport_response" };
     if (!res.ok || !res.body || typeof res.body !== "object") {
-      activeWebSinkProjection = { binding: null, available: false, synced: false };
+      activeWebSinkProjection = { binding: null, available: false, synced: false, checkedAt: Date.now() };
       return { ok: false, reason: "web_sink_status_unavailable" };
     }
     const b = res.body.activeBinding;
     const available = res.body.availability?.available === true;
     if (!b || typeof b !== "object") {
       // Successful authoritative read with no binding: still a successful sync.
-      activeWebSinkProjection = { binding: null, available: false, synced: true };
+      activeWebSinkProjection = { binding: null, available: false, synced: true, checkedAt: Date.now() };
       return { ok: true, binding: null, available: false };
     }
     const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -1047,7 +1067,7 @@ async function syncActiveWebSinkFromBridge() {
       || typeof b.boundAt !== "string"
       || !ISO_INSTANT.test(b.boundAt)
     ) {
-      activeWebSinkProjection = { binding: null, available: false, synced: false };
+      activeWebSinkProjection = { binding: null, available: false, synced: false, checkedAt: Date.now() };
       return { ok: false, reason: "web_sink_response_invalid" };
     }
     // Bridge is authority: assign the whole projection atomically.
@@ -1064,10 +1084,11 @@ async function syncActiveWebSinkFromBridge() {
       },
       available,
       synced: true,
+      checkedAt: Date.now(),
     };
     return { ok: true, binding: activeWebSinkProjection.binding, available };
   } catch {
-    activeWebSinkProjection = { binding: null, available: false, synced: false };
+    activeWebSinkProjection = { binding: null, available: false, synced: false, checkedAt: Date.now() };
     return { ok: false, reason: "web_sink_status_error" };
   }
 }
@@ -1220,6 +1241,7 @@ async function handleMintOwnerProof(sender, message) {
 }
 
 async function handlePair(message) {
+  if (localRouteActive()) return { ok: false, reason: "local_route_pending" };
   if (transportIdentityBlocked) return { ok: false, reason: "transport_identity_mismatch" };
   let origin;
   try {
@@ -1433,6 +1455,7 @@ async function handlePair(message) {
 }
 
 async function handleRebindStart(message) {
+  if (localRouteActive()) return { ok: false, reason: "local_route_pending" };
   if (!storageProtected) return { ok: false, reason: "storage_unprotected" };
   if (!transport?.bridgeOrigin || !transport?.credential) {
     return { ok: false, reason: "transport_missing" };
@@ -2196,26 +2219,405 @@ async function recoverConnectTakeover() {
   return dispatchConnectRouteAttestation();
 }
 
+async function restoreSameTabOwnerReadOnly(sender, message, previousOwner) {
+  const identity = resolveCurrentDocumentBindingIdentity(sender, message?.canonicalRoute ?? null);
+  const currentOwner = ownerState.owner;
+  if (!identity.ok || identity.identity.tabId !== previousOwner.tabId
+    || (currentOwner && (identity.identity.documentId !== previousOwner.documentId
+      || currentOwner.generation !== (Number.isFinite(message?.generation) ? Number(message.generation) : 1)
+      || !isOwner(ownerState, identity.identity.tabId, identity.identity.documentId)))) return;
+  const transportSnapshot = () => JSON.stringify({ ...localTransportIdentity(), credential: transport?.credential });
+  const before = transportSnapshot();
+  const beforeFlow = connectFlow;
+  const documents = () => JSON.stringify(ownerState.registry.filter(doc => doc.tabId === identity.identity.tabId));
+  const beforeDocuments = documents();
+  const arrival = pageArrivals.get(identity.identity.tabId);
+  const valid = () => !!arrival && arrival.documentId === identity.identity.documentId
+    && arrival.generation === (Number.isFinite(message?.generation) ? Number(message.generation) : 1)
+    && areChatgptConversationRoutesEquivalent(arrival.url, identity.identity.canonicalRoute)
+    && ownerState.owner === currentOwner && journal.state === "NONE" && connectFlow === beforeFlow
+    && transportSnapshot() === before && documents() === beforeDocuments && pageArrivals.get(identity.identity.tabId) === arrival && !localRouteActive();
+  if (!valid() || !await localRoutePermission()) return;
+  const state = await handleFetchState();
+  if (!valid() || !state.ok || state.status.routeVerification !== "VERIFIED") return;
+  const active = await syncActiveWebSinkFromBridge();
+  if (!valid() || !active.ok || !active.available || active.binding?.canonicalUrl !== transport.routeCanonical) return;
+  const bound = bindCurrentDocument(ownerState, identity.identity, { generation: message.generation });
+  if (!bound.ok) return;
+  const refreshed = refreshExplicitConnectOwnerWitness(connectFlow, bound.state.owner);
+  if (!refreshed.ok) return;
+  // 同tab重载或同document等价URL变化只读复核原授权；跨tab和新对话不能继承。
+  await chrome.storage.local.set({ [CONNECT_FLOW_KEY]: refreshed.flow });
+  if (!valid()) {
+    await chrome.storage.local.set({ [CONNECT_FLOW_KEY]: connectFlow });
+    return;
+  }
+  ownerState = bound.state; connectFlow = refreshed.flow; connectReason = null;
+  await persistSessionOwnership();
+}
+
+// 本机确认候选凭据只暂存在受保护请求记录，生效后立即移入主 transport。
+function localTransportIdentity(value = transport) {
+  if (!value) return null;
+  return Object.fromEntries(["bridgeOrigin", "workspaceId", "companionId", "bindingId", "epoch", "routeCanonical", "pairedAt"]
+    .map(key => [key, value[key]]));
+}
+
+function parseLocalRouteRequest(value) {
+  if (value == null) return null;
+  if (!value || value.schemaVersion !== 1 || !isUuid(value.requestId)
+    || value.workspaceId !== project.workspaceId || typeof value.routeCanonical !== "string"
+    || !areChatgptConversationRoutesEquivalent(value.routeCanonical, value.routeCanonical)
+    || !["REQUESTED", "PENDING", "COMMIT_REQUESTED", "COMMITTED", "DONE", "CANCELLED", "EXPIRED", "NOT_FOUND", "UPGRADE_REQUIRED", "RECOVERY_EXPIRED", "CHANGED"].includes(value.stage)
+    || !value.originalIdentity || value.originalIdentity.workspaceId !== project.workspaceId
+    || value.originalIdentity.bridgeOrigin !== project.bridgeOrigin
+    || !isUuid(value.originalIdentity.companionId) || !isUuid(value.originalIdentity.bindingId)
+    || !Number.isSafeInteger(value.originalIdentity.epoch)
+    || !Number.isSafeInteger(value.ownerWitness?.tabId) || value.ownerWitness.tabId < 0
+    || typeof value.ownerWitness?.documentId !== "string" || !value.ownerWitness.documentId
+    || !Number.isSafeInteger(value.ownerWitness.generation) || value.ownerWitness.generation < 1
+    || value.ownerWitness.canonicalRoute !== value.routeCanonical) return { stage: "INVALID" };
+  return value;
+}
+
+function localRouteActive() {
+  return !!localRouteRequest && !["DONE", "CANCELLED", "EXPIRED", "NOT_FOUND", "UPGRADE_REQUIRED", "RECOVERY_EXPIRED", "CHANGED"].includes(localRouteRequest.stage);
+}
+
+function localRouteSummary() {
+  if (!localRouteRequest) return null;
+  return { state: localRouteRequest.stage, requestId: localRouteRequest.requestId ?? null,
+    routeCanonical: localRouteRequest.routeCanonical ?? null, expiresAt: localRouteRequest.expiresAt ?? null };
+}
+
+async function saveLocalRouteRequest(next) {
+  await chrome.storage.local.set({ [LOCAL_ROUTE_KEY]: next });
+  localRouteRequest = next;
+}
+
+function localRouteCurrent(request) {
+  const expected = request?.stage === "COMMITTED" ? request.successorIdentity : request?.originalIdentity;
+  const arrival = pageArrivals.get(request?.ownerWitness?.tabId);
+  return request === localRouteRequest && storageProtected && !transportIdentityBlocked
+    && expected && JSON.stringify(localTransportIdentity()) === JSON.stringify(expected)
+    && journal.state === "NONE" && ownerStillMatches(request.ownerWitness)
+    && (!arrival || (arrival.documentId === request.ownerWitness.documentId && arrival.generation === request.ownerWitness.generation
+      && areChatgptConversationRoutesEquivalent(arrival.url, request.routeCanonical)))
+    && !["OUTCOME_UNKNOWN", "TAKEOVER_DISPATCH", "WAITING_TAKEOVER"].includes(connectFlow.state)
+    && ["NONE", "VERIFIED"].includes(routeAttestFence.state);
+}
+
+async function localRoutePermission() {
+  try {
+    return await chrome.permissions?.contains?.({ origins: [`${project.bridgeOrigin}/*`] }) === true;
+  } catch { return false; }
+}
+
+async function startLocalRouteRequest(owner) {
+  if (journal.state !== "NONE") return { ok: false, reason: "journal_active" };
+  if (!["NONE", "DONE"].includes(connectFlow.state)
+    || !["NONE", "VERIFIED"].includes(routeAttestFence.state)) {
+    return { ok: false, reason: "local_route_fence_blocked", retryAllowed: false };
+  }
+  const request = { schemaVersion: 1, requestId: crypto.randomUUID(), workspaceId: project.workspaceId,
+    routeCanonical: owner.canonicalRoute, originalIdentity: localTransportIdentity(),
+    ownerWitness: { tabId: owner.tabId, documentId: owner.documentId, generation: owner.generation, canonicalRoute: owner.canonicalRoute },
+    stage: "REQUESTED", expiresAt: null, updatedAt: Date.now() };
+  await saveLocalRouteRequest(request);
+  if (!localRouteCurrent(request) || !await localRoutePermission() || !localRouteCurrent(request)) return { ok: false, reason: "local_route_owner_changed" };
+  // 持久化 REQUESTED 后仅一次 POST；任何未知结果都只 GET/status。
+  let response;
+  try {
+    response = await fetchCompanion("/route/local/request", { method: "POST", body: JSON.stringify({
+      requestId: request.requestId, routeCanonical: request.routeCanonical,
+    }) });
+  } catch { return { ok: true, state: "LOCAL_CONFIRM_PENDING", localRoute: localRouteSummary() }; }
+  return applyLocalRouteResponse(request, response);
+}
+
+async function resumeLocalRouteExplicit(owner) {
+  const request = localRouteRequest;
+  const committed = request?.stage === "COMMITTED";
+  const unknownCommit = request?.stage === "COMMIT_REQUESTED";
+  const expected = committed ? request.successorIdentity : request?.originalIdentity;
+  const arrival = pageArrivals.get(owner.tabId);
+  const beforeFlow = connectFlow;
+  const exact = () => !!arrival && arrival.documentId === owner.documentId && arrival.generation === owner.generation
+    && areChatgptConversationRoutesEquivalent(arrival.url, owner.canonicalRoute)
+    && request === localRouteRequest && ownerStillMatches(owner) && journal.state === "NONE"
+    && pageArrivals.get(owner.tabId) === arrival && connectFlow === beforeFlow
+    && JSON.stringify(localTransportIdentity()) === JSON.stringify(expected)
+    && ["NONE", "DONE"].includes(connectFlow.state) && ["NONE", "VERIFIED"].includes(routeAttestFence.state);
+  // 仅显式同目标Connect重建见证；未知commit先只读查证，绝不再次POST。
+  if ((committed || unknownCommit) && expected && owner.canonicalRoute === request.routeCanonical && exact()) {
+    if (!await localRoutePermission() || !exact()) return { ok: false, reason: "local_route_owner_changed" };
+    let response;
+    if (committed) {
+      const state = await handleFetchState();
+      if (!state.ok || !exact() || state.status.routeVerification !== "VERIFIED") return { ok: false, reason: "local_route_owner_changed" };
+    } else {
+      try { response = await fetchCompanion(`/route/local/status?requestId=${encodeURIComponent(request.requestId)}`, { method: "GET", cache: "no-store" }); }
+      catch { return { ok: false, reason: "local_route_result_unverified" }; }
+      if (!exact() || !isCurrentTransportResponse(response)) return { ok: false, reason: "local_route_owner_changed" };
+      const body = response.body;
+      const knownResult = response.ok && body?.requestId === request.requestId && body.workspaceId === request.workspaceId
+        && body.routeCanonical === request.routeCanonical && ["COMMITTED", "EXPIRED"].includes(body.state);
+      const ended = !response.ok && ["LOCAL_ROUTE_EXPIRED", "LOCAL_ROUTE_CHANGED"].includes(body?.error);
+      if (!knownResult && !ended) return observeLocalRouteTerminal(request);
+    }
+    const witness = { tabId: owner.tabId, documentId: owner.documentId, generation: owner.generation, canonicalRoute: owner.canonicalRoute };
+    const refreshed = committed ? refreshExplicitConnectOwnerWitness(connectFlow, witness) : { ok: true, flow: connectFlow };
+    if (!refreshed.ok) return { ok: false, reason: "owner_witness_required" };
+    const next = { ...request, ownerWitness: witness, updatedAt: Date.now() };
+    await chrome.storage.local.set({ [LOCAL_ROUTE_KEY]: next, [CONNECT_FLOW_KEY]: refreshed.flow });
+    if (!exact()) {
+      await chrome.storage.local.set({ [LOCAL_ROUTE_KEY]: localRouteRequest, [CONNECT_FLOW_KEY]: connectFlow });
+      return { ok: false, reason: "local_route_owner_changed" };
+    }
+    localRouteRequest = next; connectFlow = refreshed.flow;
+    if (response) return applyLocalRouteResponse(next, response);
+  }
+  return progressLocalRouteRequest();
+}
+
+async function progressLocalRouteRequest() {
+  const request = localRouteRequest;
+  if (!localRouteCurrent(request)) return observeLocalRouteTerminal(request);
+  if (!await localRoutePermission() || !localRouteCurrent(request)) return { ok: false, reason: "bridge_permission_missing" };
+  if (request.stage === "COMMITTED") return finishLocalRouteConnection(request);
+  let response;
+  try { response = await fetchCompanion(`/route/local/status?requestId=${encodeURIComponent(request.requestId)}`, { method: "GET", cache: "no-store" }); }
+  catch { return { ok: true, state: "LOCAL_CONFIRM_PENDING", localRoute: localRouteSummary() }; }
+  return applyLocalRouteResponse(request, response);
+}
+
+async function observeLocalRouteTerminal(request) {
+  // owner 丢失只可查询终态；不能提交或应用配对，也不以本机时钟推断未提交。
+  const exact = () => request === localRouteRequest && request?.originalIdentity
+    && JSON.stringify(localTransportIdentity()) === JSON.stringify(request.originalIdentity) && journal.state === "NONE";
+  if (!exact() || !await localRoutePermission() || !exact()) return { ok: false, reason: "local_route_owner_changed" };
+  let response;
+  try { response = await fetchCompanion(`/route/local/status?requestId=${encodeURIComponent(request.requestId)}`, { method: "GET", cache: "no-store" }); }
+  catch { return { ok: false, reason: "local_route_owner_changed" }; }
+  if (!exact() || !isCurrentTransportResponse(response)) return { ok: false, reason: "local_route_owner_changed" };
+  const body = response.body;
+  const terminal = response.ok && body?.requestId === request.requestId && body.workspaceId === request.workspaceId
+    && body.routeCanonical === request.routeCanonical && ["CANCELLED", "EXPIRED"].includes(body.state)
+    ? body.state : body?.error === "LOCAL_ROUTE_EXPIRED" ? "EXPIRED" : body?.error === "LOCAL_ROUTE_UNKNOWN" ? "NOT_FOUND" : body?.error === "LOCAL_ROUTE_CHANGED" ? "CHANGED" : null;
+  if (terminal || (response.status === 401 && request.stage === "COMMIT_REQUESTED")) {
+    const stage = request.stage === "COMMIT_REQUESTED" ? "RECOVERY_EXPIRED" : terminal;
+    await saveLocalRouteRequest({ ...request, stage, updatedAt: Date.now() });
+    return { ok: false, reason: stage === "RECOVERY_EXPIRED" ? "local_route_repair_required" : "local_route_request_ended", localRoute: localRouteSummary() };
+  }
+  return { ok: false, reason: "local_route_owner_changed", localRoute: localRouteSummary() };
+}
+
+async function applyLocalRouteResponse(request, response) {
+  if (!localRouteCurrent(request) || !isCurrentTransportResponse(response)) return { ok: false, reason: "local_route_owner_changed" };
+  if (!response.ok) {
+    if (response.status === 401) {
+      if (request.stage === "COMMIT_REQUESTED") {
+        await saveLocalRouteRequest({ ...request, stage: "RECOVERY_EXPIRED", updatedAt: Date.now() });
+        return { ok: false, reason: "local_route_repair_required", localRoute: localRouteSummary() };
+      }
+      return markAuthStale(response.body?.error || "COMPANION_UNAUTHORIZED", response);
+    }
+    let stage = response.status === 404 || response.status === 405 ? "UPGRADE_REQUIRED"
+      : response.body?.error === "LOCAL_ROUTE_UNKNOWN" ? "NOT_FOUND"
+      : response.body?.error === "LOCAL_ROUTE_EXPIRED" ? "EXPIRED"
+      : response.body?.error === "LOCAL_ROUTE_CHANGED" ? "CHANGED" : null;
+    if (["EXPIRED", "CHANGED"].includes(stage) && request.stage === "COMMIT_REQUESTED" && request.stagedPairing) return recoverStagedLocalRoute(request);
+    if (stage && request.stage === "COMMIT_REQUESTED") stage = "RECOVERY_EXPIRED";
+    if (stage) await saveLocalRouteRequest({ ...request, stage, updatedAt: Date.now() });
+    if (stage === "RECOVERY_EXPIRED") return { ok: false, reason: "local_route_repair_required", localRoute: localRouteSummary() };
+    return { ok: false, reason: stage === "UPGRADE_REQUIRED" ? "local_route_upgrade_required" : response.body?.error || "local_route_unavailable",
+      localRoute: localRouteSummary() };
+  }
+  const body = response.body;
+  if (!body || body.requestId !== request.requestId || body.workspaceId !== request.workspaceId
+    || body.routeCanonical !== request.routeCanonical || typeof body.expiresAt !== "string" || !Number.isFinite(Date.parse(body.expiresAt))
+    || !["PENDING", "CONFIRMED", "CANCELLED", "EXPIRED", "COMMITTED"].includes(body.state)) {
+    return { ok: false, reason: "local_route_response_invalid" };
+  }
+  if (body.state === "COMMITTED") return adoptLocalRoutePairing(request, body);
+  if (body.state === "EXPIRED" && request.stage === "COMMIT_REQUESTED" && request.stagedPairing) {
+    return recoverStagedLocalRoute(request);
+  }
+  if (["CANCELLED", "EXPIRED"].includes(body.state)) {
+    const stage = request.stage === "COMMIT_REQUESTED" ? "RECOVERY_EXPIRED" : body.state;
+    await saveLocalRouteRequest({ ...request, stage, expiresAt: body.expiresAt, updatedAt: Date.now() });
+    if (stage === "RECOVERY_EXPIRED") return { ok: false, reason: "local_route_repair_required", localRoute: localRouteSummary() };
+    return { ok: true, state: `LOCAL_CONFIRM_${body.state}`, localRoute: localRouteSummary() };
+  }
+  if (body.state === "CONFIRMED" && request.stage !== "COMMIT_REQUESTED") {
+    if (!validLocalPairing(request, body.candidatePairing)) return { ok: false, reason: "local_route_candidate_invalid" };
+    const committing = { ...request, stage: "COMMIT_REQUESTED", stagedPairing: body.candidatePairing,
+      expiresAt: body.expiresAt, updatedAt: Date.now() };
+    await saveLocalRouteRequest(committing);
+    if (!localRouteCurrent(committing) || !await localRoutePermission() || !localRouteCurrent(committing)) {
+      return { ok: false, reason: "local_route_owner_changed" };
+    }
+    let committed;
+    try { committed = await fetchCompanion("/route/local/commit", { method: "POST", body: JSON.stringify({
+      requestId: committing.requestId, routeCanonical: committing.routeCanonical,
+    }) }); }
+    catch { return { ok: true, state: "LOCAL_CONFIRM_PENDING", localRoute: localRouteSummary() }; }
+    return applyLocalRouteResponse(committing, committed);
+  }
+  if (request.stage !== "COMMIT_REQUESTED") await saveLocalRouteRequest({ ...request, stage: "PENDING", expiresAt: body.expiresAt, updatedAt: Date.now() });
+  return { ok: true, state: "LOCAL_CONFIRM_PENDING", localRoute: localRouteSummary() };
+}
+
+function validLocalPairing(request, pairing) {
+  return !!pairing && pairing.workspaceId === project.workspaceId
+    && pairing.routeCanonical === request.routeCanonical && pairing.routeVerification === "VERIFIED"
+    && isUuid(pairing.companionId) && isUuid(pairing.bindingId) && isUuid(pairing.challengeId)
+    && pairing.companionId !== transport?.companionId && pairing.bindingId === transport?.bindingId
+    && pairing.challengeId !== connectFlowIdentity(transport)?.challengeId
+    && pairing.epoch === transport?.epoch && typeof pairing.credential === "string" && pairing.credential.length > 0
+    && pairing.credential.length <= 4096 && pairing.credential !== transport?.credential;
+}
+
+async function recoverStagedLocalRoute(request) {
+  if (!localRouteCurrent(request) || !validLocalPairing(request, request.stagedPairing)
+    || !await localRoutePermission() || !localRouteCurrent(request)) return { ok: false, reason: "local_route_repair_required" };
+  let response, body;
+  try {
+    response = await fetch(companionApiUrl(project.bridgeOrigin, "/state"), { method: "GET", cache: "no-store",
+      headers: { authorization: `Bearer ${request.stagedPairing.credential}` }, signal: AbortSignal.timeout(15_000) });
+    body = await response.json();
+  } catch { return { ok: false, reason: "local_route_result_unverified" }; }
+  if (!localRouteCurrent(request)) return { ok: false, reason: "local_route_owner_changed" };
+  if (!response.ok || !validateStateIdentity(request.stagedPairing, body).ok || body.routeVerification !== "VERIFIED") {
+    if (response.status === 401) {
+      // candidate未启用且原credential仍认证原identity，才可证明过期请求未切换主transport。
+      const original = await handleFetchState();
+      if (original.ok && localRouteCurrent(request)) {
+        const ended = { ...request, stage: "EXPIRED", updatedAt: Date.now() };
+        delete ended.stagedPairing;
+        await saveLocalRouteRequest(ended);
+        return { ok: false, reason: "local_route_request_ended", localRoute: localRouteSummary() };
+      }
+    }
+    return { ok: false, reason: "local_route_result_unverified" };
+  }
+  return adoptLocalRoutePairing(request, { pairing: request.stagedPairing, expiresAt: request.expiresAt });
+}
+
+async function adoptLocalRoutePairing(request, body) {
+  const pairing = body.pairing;
+  if (!localRouteCurrent(request) || !validLocalPairing(request, pairing)
+    || (request.stagedPairing && ["credential", "companionId", "bindingId", "epoch", "challengeId", "routeCanonical", "workspaceId"]
+      .some(key => request.stagedPairing[key] !== pairing[key]))) return { ok: false, reason: "local_route_pairing_invalid" };
+  const nextTransport = { schemaVersion: 1, bridgeOrigin: project.bridgeOrigin, workspaceId: project.workspaceId,
+    companionId: pairing.companionId, bindingId: pairing.bindingId, epoch: pairing.epoch,
+    routeCanonical: pairing.routeCanonical, pairedAt: new Date().toISOString(), credential: pairing.credential,
+    authStale: false, rebindPending: false, routeVerification: "VERIFIED", challengeId: pairing.challengeId,
+    routeAttestationMessage: null, routeAttestationExpiresAt: null };
+  const resolved = resolvePairFenceAfterSuccess({ prevFence: routeAttestFence, companionId: pairing.companionId,
+    challengeId: pairing.challengeId, routeCanonical: pairing.routeCanonical, now: Date.now() });
+  if (!resolved.ok) return { ok: false, reason: "local_route_fence_blocked" };
+  const nextFence = { ...resolved.fence, state: "VERIFIED" };
+  const nextFlow = { ...connectFlowIdentity(nextTransport), state: "DONE", ownerWitness: request.ownerWitness,
+    bootstrapAutoResume: false, updatedAt: Date.now() };
+  const nextRequest = { ...request, stage: "COMMITTED", successorIdentity: localTransportIdentity(nextTransport), expiresAt: body.expiresAt, updatedAt: Date.now() };
+  delete nextRequest.stagedPairing;
+  const nextLocal = { ...localState, paired: true, targetRoute: request.routeCanonical };
+  if (!localRouteCurrent(request)) return { ok: false, reason: "local_route_owner_changed" };
+  // 配对和请求收据一次落盘；失败仍用原 credential 只读查询已提交结果。
+  await chrome.storage.local.set({ [TRANSPORT_KEY]: nextTransport, [LOCAL_KEY]: nextLocal,
+    [CONNECT_FLOW_KEY]: nextFlow, [ROUTE_ATTEST_FENCE_KEY]: nextFence, [LOCAL_ROUTE_KEY]: nextRequest });
+  transport = nextTransport; localState = nextLocal; connectFlow = nextFlow;
+  routeAttestFence = nextFence; routeAttestLatch = emptyRouteAttestLatch(); localRouteRequest = nextRequest;
+  activeWebSinkProjection = { binding: null, available: false, synced: false };
+  if (!localRouteCurrent(nextRequest)) return { ok: false, reason: "local_route_owner_changed" };
+  return finishLocalRouteConnection(nextRequest);
+}
+
+async function finishLocalRouteConnection(request) {
+  if (!localRouteCurrent(request)) return { ok: false, reason: "local_route_owner_changed" };
+  const state = await handleFetchState();
+  if (!state.ok) return state;
+  if (!localRouteCurrent(request) || state.status.routeVerification !== "VERIFIED") return { ok: false, reason: "local_route_owner_changed" };
+  const sink = await convergeExplicitVerifiedConnect(request.ownerWitness);
+  if (!sink.ok) return sink;
+  if (!localRouteCurrent(request)) return { ok: false, reason: "local_route_owner_changed" };
+  await saveLocalRouteRequest({ ...request, stage: "DONE", updatedAt: Date.now() });
+  if (!ownerStillMatches(request.ownerWitness) || journal.state !== "NONE"
+    || JSON.stringify(localTransportIdentity()) !== JSON.stringify(request.successorIdentity)) return { ok: false, reason: "local_route_owner_changed" };
+  const autonomy = await rearmAutonomyAfterVerifiedConnect();
+  if (!ownerStillMatches(request.ownerWitness)) {
+    await forceAutonomyOff("local_route_owner_changed");
+    return { ok: false, reason: "local_route_owner_changed" };
+  }
+  connectReason = null;
+  return { ok: true, state: "CONNECTED", r5cConnected: true, routeVerification: "VERIFIED", webSink: sink.binding,
+    autonomy: autonomy.mode, deliveryRecovery: deliveryRecoverySummary(), localRoute: localRouteSummary() };
+}
+
 async function handleConnectPage(sender, message) {
   if (connectInFlight) return { ok: false, reason: "connect_in_flight", retryAllowed: false };
+  if (productionSendInFlight || productionRecoveryInFlight || autonomyTickInFlight) {
+    return { ok: false, reason: "production_recovery_busy", retryAllowed: true };
+  }
   connectInFlight = true;
   try {
     if (!storageProtected) return { ok: false, reason: "storage_unprotected" };
-    if (!pairAllowedWithJournal(journal, transport?.authStale === true)) {
+    const currentDocument = resolveCurrentDocumentBindingIdentity(sender, message?.canonicalRoute ?? null);
+    if (!currentDocument.ok) return { ok: false, reason: currentDocument.reason };
+    const identity = currentDocument.identity;
+    const canonicalRoute = identity.canonicalRoute;
+    const journalAtConnect = exactJournalSnapshot(journal);
+    const hasDelivery = journal.state !== "NONE";
+    const originalTransport = transport ? { ...transport } : null;
+    const sameTransport = () => !!transport && !!originalTransport
+      && ["bridgeOrigin", "workspaceId", "companionId", "bindingId", "epoch", "routeCanonical", "credential", "pairedAt"]
+        .every(key => transport[key] === originalTransport[key]);
+    // 旧消息只允许恢复原 VERIFIED 对话，不放宽 Pair/Rebind/未知连接 fence。
+    if (hasDelivery && (!sameTransport() || transport.rebindPending === true
+      || transport.routeVerification !== "VERIFIED"
+      || !areChatgptConversationRoutesEquivalent(transport.routeCanonical, canonicalRoute)
+      || journal.bindingId !== transport.bindingId || journal.epoch !== transport.epoch
+      || !areChatgptConversationRoutesEquivalent(journal.routeCanonical, canonicalRoute)
+      || !["NONE", "DONE"].includes(connectFlow.state)
+      || !["NONE", "VERIFIED"].includes(routeAttestFence.state)
+      || (connectFlow.state === "DONE" && !verifiedConnectFlowMatchesTransport(connectFlow, transport)))) {
       return { ok: false, reason: "journal_active" };
+    }
+    const checkPermission = async () => {
+      if (!transport?.bridgeOrigin || !transport?.credential) return { ok: false, reason: "cold_pair_required" };
+      try {
+        const origin = parseBridgeOrigin(transport.bridgeOrigin, { allowLoopbackHttp: true });
+        if (await chrome.permissions?.contains?.({ origins: [`${origin}/*`] }) === true) return { ok: true };
+      } catch {}
+      return { ok: false, reason: "bridge_permission_missing" };
+    };
+
+    let verifiedState = null;
+    if (hasDelivery) {
+      const permission = await checkPermission();
+      if (!permission.ok) return permission;
+      verifiedState = await handleFetchState();
+      if (!verifiedState.ok) return verifiedState;
+      if (!sameTransport() || exactJournalSnapshot(journal) !== journalAtConnect) {
+        return { ok: false, reason: "connect_identity_changed", retryAllowed: false };
+      }
+      if (verifiedState.status.routeVerification !== "VERIFIED") {
+        return { ok: false, reason: "route_not_verified", retryAllowed: false };
+      }
     }
     const autonomyOff = await forceAutonomyOff("connect");
     if (!autonomyOff.ok) {
       return { ok: false, reason: "autonomy_persist_failed", autonomy: "off", retryAllowed: true };
     }
-    const currentDocument = resolveCurrentDocumentBindingIdentity(sender, message?.canonicalRoute ?? null);
-    if (!currentDocument.ok) return { ok: false, reason: currentDocument.reason };
-    const identity = currentDocument.identity;
-    const canonicalRoute = identity.canonicalRoute;
     const generation = Number.isFinite(message?.generation) ? Number(message.generation) : 1;
     const bound = bindCurrentDocument(ownerState, identity, { generation });
     if (!bound.ok) return { ok: false, reason: bound.reason };
     ownerState = bound.state;
+    const explicitOwner = { ...ownerState.owner };
+    const connectCurrent = () => sameTransport() && ownerStillMatches(explicitOwner)
+      && transport?.authStale !== true && transport?.routeVerification === "VERIFIED";
+    const connectUnchanged = () => connectCurrent() && exactJournalSnapshot(journal) === journalAtConnect;
     localState = { ...localState, targetRoute: canonicalRoute, paired: true };
     evidence = message?.safety && typeof message.safety === "object"
       ? {
@@ -2230,18 +2632,18 @@ async function handleConnectPage(sender, message) {
       : null;
     await persistLocal();
     await persistSessionOwnership();
-    if (!transport?.bridgeOrigin || !transport?.credential) {
-      return { ok: false, reason: "cold_pair_required" };
+    if (!hasDelivery) {
+      const permission = await checkPermission();
+      if (!permission.ok) return permission;
     }
-    let permission;
-    try {
-      const origin = parseBridgeOrigin(transport.bridgeOrigin, { allowLoopbackHttp: true });
-      permission = await chrome.permissions?.contains?.({ origins: [`${origin}/*`] });
-    } catch {
-      permission = false;
-    }
-    if (permission !== true) return { ok: false, reason: "bridge_permission_missing" };
 
+    if (localRouteRequest?.stage === "RECOVERY_EXPIRED") return { ok: false, reason: "local_route_repair_required" };
+    if (localRouteActive()) return resumeLocalRouteExplicit(explicitOwner);
+    const freshLocalFlow = ["NONE", "DONE"].includes(connectFlow.state);
+    if (freshLocalFlow && (transport.rebindPending === true || transport.routeVerification !== "VERIFIED"
+      || !areChatgptConversationRoutesEquivalent(transport.routeCanonical, canonicalRoute))) {
+      return startLocalRouteRequest(explicitOwner);
+    }
     if (connectFlow.state === "TAKEOVER_DISPATCH" || connectFlow.state === "OUTCOME_UNKNOWN") {
       return await recoverConnectTakeover();
     }
@@ -2265,7 +2667,11 @@ async function handleConnectPage(sender, message) {
 
     let currentPairPending = false;
     if (!transport.rebindPending && areChatgptConversationRoutesEquivalent(transport.routeCanonical, canonicalRoute)) {
-      const current = await handleFetchState();
+      const current = verifiedState ?? await handleFetchState();
+      if (!sameTransport() || !ownerStillMatches(explicitOwner)
+        || exactJournalSnapshot(journal) !== journalAtConnect) {
+        return { ok: false, reason: "connect_identity_changed", retryAllowed: false };
+      }
       if (current?.ok && current.status?.routeVerification === "VERIFIED") {
         if (!ownerState.owner) {
           return { ok: false, reason: "not_exact_owner", retryAllowed: false };
@@ -2278,7 +2684,7 @@ async function handleConnectPage(sender, message) {
         };
         // Explicit Connect only: rebase stale owner witness for this exact transport.
         if (connectFlow.state === "DONE"
-          && !verifiedConnectFlowMatchesTransport(connectFlow)) {
+          && !verifiedConnectFlowMatchesTransport(connectFlow, transport)) {
           return { ok: false, reason: "connect_identity_conflict", retryAllowed: false };
         }
         if (["ATTEST_REQUESTED", "COMPLETE_REQUESTED", "DONE"].includes(connectFlow.state)) {
@@ -2323,7 +2729,20 @@ async function handleConnectPage(sender, message) {
         if (!witness || !connectFlowOwnerWitnessMatches(connectFlow, currentOwner)) {
           return { ok: false, reason: "owner_witness_required", retryAllowed: true };
         }
-        const sink = await convergeExplicitVerifiedConnect(witness);
+        let previousSink = null;
+        if (hasDelivery) {
+          const active = await syncActiveWebSinkFromBridge();
+          if (!connectUnchanged()) return { ok: false, reason: "connect_identity_changed", retryAllowed: false };
+          if (!active.ok || !active.available || !active.binding
+            || active.binding.canonicalUrl !== transport.routeCanonical) {
+            return { ok: false, reason: "delivery_web_sink_mismatch", retryAllowed: false };
+          }
+          previousSink = active.binding;
+        }
+        if (!connectUnchanged()) return { ok: false, reason: "connect_identity_changed", retryAllowed: false };
+        // 有旧记录时只复用现役目标；GET/POST 间目标变化不能造成新绑定。
+        const sink = previousSink ? { ok: true, binding: previousSink } : await convergeExplicitVerifiedConnect(witness);
+        if (!connectUnchanged()) return { ok: false, reason: "connect_identity_changed", retryAllowed: false };
         if (!sink.ok) {
           return { ok: false, reason: sink.reason || "web_sink_bind_failed", retryAllowed: true };
         }
@@ -2346,7 +2765,20 @@ async function handleConnectPage(sender, message) {
           await persistConnectFlow().catch(() => false);
           return { ok: false, reason: "connect_done_persist_failed", retryAllowed: true };
         }
-        const autonomy = await rearmAutonomyAfterVerifiedConnect();
+        if (!connectUnchanged()) return { ok: false, reason: "connect_identity_changed", retryAllowed: false };
+        const recovery = hasDelivery
+          ? await handleRecover({ observeOnly: true, isCurrent: connectCurrent })
+          : null;
+        if (!connectCurrent()) return { ok: false, reason: "connect_identity_changed", retryAllowed: false };
+        if (recovery?.status === 403) return { ok: false, reason: recovery.reason || "http_403" };
+        const deliveryRecovery = deliveryRecoverySummary(recovery);
+        const autonomy = deliveryRecovery.blocked
+          ? { ok: true, mode: "off" }
+          : await rearmAutonomyAfterVerifiedConnect();
+        if (!connectCurrent()) {
+          await forceAutonomyOff("connect_identity_changed");
+          return { ok: false, reason: "connect_identity_changed", retryAllowed: false };
+        }
         return {
           ok: true,
           state: "CONNECTED",
@@ -2355,6 +2787,7 @@ async function handleConnectPage(sender, message) {
           autonomyReason: autonomy.ok ? undefined : autonomy.reason,
           webSink: sink.binding,
           r5cConnected: true,
+          deliveryRecovery,
         };
       }
       currentPairPending = current?.ok === true
@@ -2364,6 +2797,8 @@ async function handleConnectPage(sender, message) {
       }
     }
 
+    if (hasDelivery) return { ok: false, reason: "journal_active", retryAllowed: false };
+    if (freshLocalFlow) return startLocalRouteRequest(explicitOwner);
     if (!transport.rebindPending && !currentPairPending) {
       ownerProof = mintOwnerProof({
         tabId: identity.tabId,
@@ -2418,7 +2853,7 @@ async function handleFetchState() {
       return { ok: false, reason: "COMPANION_REPAIR_BLOCKED", status: 409 };
     }
     if (!res.ok) {
-      return { ok: false, reason: res.body?.error || `http_${res.status}` };
+      return { ok: false, reason: res.body?.error || `http_${res.status}`, ...(res.status === 403 ? { status: 403 } : {}) };
     }
     assertNoForbiddenFields(res.body);
     if (!res.body || typeof res.body !== "object" || Array.isArray(res.body)
@@ -2501,6 +2936,7 @@ async function handleFetchState() {
 
 /** Reserve only from page MessageSender (content → SW) after atomic route refresh. */
 async function handleReservePage(sender, message) {
+  if (connectInFlight || productionRecoveryInFlight) return { ok: false, reason: "production_recovery_busy" };
   const gate = requireProtectedTransport();
   if (!gate.ok) return gate;
   const refresh = await refreshPageObservation(sender, message);
@@ -2508,6 +2944,8 @@ async function handleReservePage(sender, message) {
   if (!refresh.isOwnerExact || !refresh.documentId) {
     return { ok: false, reason: "not_exact_owner" };
   }
+  const readiness = connectionReadiness(refresh.tabId, refresh.documentId);
+  if (!readiness.ready) return { ok: false, reason: readiness.reason };
   const eligibility = evaluateReserveEligibility({
     transportValid: true,
     authStale: false,
@@ -2521,13 +2959,27 @@ async function handleReservePage(sender, message) {
   });
   if (!eligibility.ok) return { ok: false, reason: eligibility.reason };
 
+  const requestIdentity = JSON.stringify({ ...localTransportIdentity(), credential: transport.credential });
+  const requestOwner = { ...ownerState.owner };
+  const requestAuthRevision = authFailureRevision;
   const routeCanonical = eligibility.routeCanonical;
   journal = markReserveRequested(journal, {
     routeCanonical,
     bindingId: transport.bindingId,
     epoch: transport.epoch,
   });
+  const requestedJournal = journal;
   await persistJournal();
+  // 落盘等待不能把旧预约继承到新身份；尚未发出请求时只撤回本次 journal。
+  if (journal !== requestedJournal || productionRecoveryInFlight
+    || requestIdentity !== JSON.stringify({ ...localTransportIdentity(), credential: transport?.credential })
+    || requestAuthRevision !== authFailureRevision || !ownerStillMatches(requestOwner)
+    || !connectionReadiness(refresh.tabId, refresh.documentId).ready) {
+    if (journal === requestedJournal) journal = clearJournal();
+    // 较早的异步写可能覆盖已完成的 recovery；重新持久化当前 journal。
+    await persistJournal();
+    return { ok: false, reason: "connection_changed", journalState: journal.state };
+  }
 
   let res;
   try {
@@ -2656,6 +3108,8 @@ async function clearIsolatedUnknownFromState(serverAttempt) {
     try { await persistOutcomeUnknownArchive(marked.archive); }
     catch { return unknownIsolationResult("isolation_archive_persist_failed", { serverIsolated: true }); }
   }
+  if (connectRecoveryCurrent && !connectRecoveryCurrent()) return unknownIsolationResult("recovery_identity_changed");
+  if (exactJournalSnapshot(journal) !== snapshot) return unknownIsolationResult("journal_identity_changed");
   const previous = journal;
   journal = clearJournal();
   try { await persistJournal(); }
@@ -2705,6 +3159,7 @@ async function requestUnknownTerminalGone(journalAtStart) {
     return unknownIsolationResult("route_not_verified");
   }
 
+  if (connectRecoveryCurrent && !connectRecoveryCurrent()) return unknownIsolationResult("recovery_identity_changed");
   let response;
   try {
     response = await fetchCompanion("/operations/terminal-gone", {
@@ -2747,6 +3202,7 @@ async function requestUnknownTerminalGone(journalAtStart) {
   if (journal.state !== "OUTCOME_UNKNOWN" || exactJournalSnapshot(journal) !== snapshot) {
     return unknownIsolationResult("journal_identity_changed", { serverTerminalGone: true, archiveStatus: "terminal_gone" });
   }
+  if (connectRecoveryCurrent && !connectRecoveryCurrent()) return unknownIsolationResult("recovery_identity_changed");
   const previous = journal;
   journal = clearJournal();
   try { await persistJournal(); }
@@ -2792,6 +3248,7 @@ async function requestUnknownIsolation(journalAtStart) {
     return unknownIsolationResult("route_not_verified");
   }
 
+  if (connectRecoveryCurrent && !connectRecoveryCurrent()) return unknownIsolationResult("recovery_identity_changed");
   let response;
   try {
     response = await fetchCompanion("/isolate-attempt", {
@@ -2834,6 +3291,8 @@ async function requestUnknownIsolation(journalAtStart) {
   try { await persistOutcomeUnknownArchive(marked.archive); }
   catch { return unknownIsolationResult("isolation_archive_persist_failed", { serverIsolated: true, archiveStatus: "pending" }); }
 
+  if (connectRecoveryCurrent && !connectRecoveryCurrent()) return unknownIsolationResult("recovery_identity_changed");
+  if (exactJournalSnapshot(journal) !== exactJournalSnapshot(journalAtStart)) return unknownIsolationResult("journal_identity_changed");
   const previous = journal;
   journal = clearJournal();
   try { await persistJournal(); }
@@ -2858,18 +3317,29 @@ async function requestUnknownIsolation(journalAtStart) {
   };
 }
 
-async function handleRecover() {
-  if (productionRecoveryInFlight || productionSendInFlight) {
+async function handleRecover({ observeOnly = false, isCurrent = () => true } = {}) {
+  if (productionRecoveryInFlight || productionSendInFlight || (connectInFlight && !observeOnly)) {
     return unknownIsolationResult("production_recovery_busy", { retryAllowed: true });
   }
   productionRecoveryInFlight = true;
-  try { return await handleRecoverOnce(); }
-  finally { productionRecoveryInFlight = false; }
+  connectRecoveryCurrent = observeOnly ? isCurrent : null;
+  try { return await handleRecoverOnce({ observeOnly, isCurrent }); }
+  finally { productionRecoveryInFlight = false; connectRecoveryCurrent = null; }
 }
 
-async function handleRecoverOnce() {
+async function handleRecoverOnce({ observeOnly = false, isCurrent = () => true } = {}) {
+  // Connect 只观察已跨过发送边界的记录，绝不清理或续发 pre-send 阶段。
+  if (observeOnly && journal.state === "NONE") return { ok: true, recovered: false };
+  if (observeOnly && !["OUTCOME_UNKNOWN", "OBSERVED_PENDING_ACK"].includes(journal.state)) {
+    return unknownIsolationResult("delivery_recovery_requires_manual_action");
+  }
+  const beforeState = exactJournalSnapshot(journal);
   const stateRes = await handleFetchState();
   if (!stateRes.ok) return stateRes;
+  if (observeOnly && (!isCurrent() || exactJournalSnapshot(journal) !== beforeState
+    || !["OUTCOME_UNKNOWN", "OBSERVED_PENDING_ACK"].includes(journal.state))) {
+    return unknownIsolationResult("recovery_identity_changed");
+  }
   const inFlight = stateRes.status.inFlight;
 
   // Isolation proof takes precedence over legacy !inFlight -> /ack closeout.
@@ -3000,6 +3470,7 @@ async function handleRecoverOnce() {
     if (journal.state !== "OUTCOME_UNKNOWN" && !inFlight && journal.terminalWitness) {
       const previous = journal;
       const snapshot = exactJournalSnapshot(previous);
+      if (observeOnly && !isCurrent()) return unknownIsolationResult("recovery_identity_changed");
       let terminal;
       try {
         terminal = await fetchCompanion("/ack", { method: "POST", body: JSON.stringify({
@@ -3009,6 +3480,7 @@ async function handleRecoverOnce() {
       } catch { return { ok: false, reason: "network_unreachable", zeroWrite: true, zeroClick: true }; }
       if (!isCurrentTransportResponse(terminal)) return { ok: false, reason: "stale_transport_response" };
       if (terminal.status === 401) return markAuthStale(terminal.body?.error || "COMPANION_UNAUTHORIZED", terminal);
+      if (observeOnly && !isCurrent()) return unknownIsolationResult("recovery_identity_changed");
       if (exactJournalSnapshot(journal) !== snapshot) return { ok: false, reason: "journal_identity_changed", zeroWrite: true, zeroClick: true };
       if (terminal.ok && evaluateTerminalGoneCloseout({ journal, inFlight, serverTerminal: terminal.body }).ok) {
         journal = clearJournal();
@@ -3019,6 +3491,7 @@ async function handleRecoverOnce() {
       }
     }
     const recovery = await recoverProductionSendSide(inFlight);
+    if (observeOnly && !isCurrent()) return unknownIsolationResult("recovery_identity_changed");
     if (journal.state === "OUTCOME_UNKNOWN" && recovery?.reason === "outcome_unknown") {
       const proof = {
         journal,
@@ -3046,6 +3519,7 @@ async function handleRecoverOnce() {
 }
 
 async function handleClearTransport() {
+  if (localRouteActive()) return { ok: false, reason: "local_route_pending" };
   if (journalBlocksTransportMutation(journal)) {
     return { ok: false, reason: "journal_active", journalState: journal.state };
   }
@@ -3074,6 +3548,7 @@ async function readOperations() {
       routeMatches: !!evidence && !!transport && areChatgptConversationRoutesEquivalent(evidence.canonicalRoute, transport.routeCanonical),
       composer: evidence?.composer ?? "unknown", generation: evidence?.generation ?? "unknown", safe: evidence?.safe === true,
       verified: transport?.routeVerification === "VERIFIED",
+      connectionReadiness: connectionReadiness(),
     },
     journal: { state: journal.state, eventId: journal.eventId ?? null, attemptId: journal.attemptId ?? null },
     isolationArchive: outcomeUnknownArchiveValid
@@ -3264,6 +3739,8 @@ async function handleMessage(message, sender, { transportMutationHeld = false, m
       storageProtected,
       transport: safeTransportSummary(),
       journal: summarizeProductionJournal(journal),
+      deliveryRecovery: deliveryRecoverySummary(),
+    localRoute: localRouteSummary(),
       sendProbeLatch: sendProbeLatch.state,
       routeAttestLatch: routeAttestLatch.state,
       routeAttestFence: routeAttestFence.state,
@@ -3537,6 +4014,7 @@ async function handleMessage(message, sender, { transportMutationHeld = false, m
   if (message.type === "c2c.connect.page") {
     return runTransportMutation(async () => {
       const result = await handleConnectPage(sender, message);
+      if (!result?.ok) activeWebSinkProjection = { binding: null, available: false, synced: false };
       connectReason = !result?.ok && typeof result?.reason === "string"
         && /^[a-zA-Z][a-zA-Z0-9_]{0,95}$/.test(result.reason) ? result.reason : null;
       return result;
@@ -3571,7 +4049,7 @@ async function handleMessage(message, sender, { transportMutationHeld = false, m
     if (!identity.ok) return { ok: false, reason: identity.reason };
     const exact = canonical != null && isOwner(ownerState, tabId, documentId)
       && areChatgptConversationRoutesEquivalent(canonical, ownerState.owner?.canonicalRoute);
-    return statusPayload(tabId, documentId, { isOwner: exact, canonicalRoute: canonical });
+    return statusPayload(tabId, exact ? documentId : null, { isOwner: exact, canonicalRoute: canonical });
   }
 
   if (
@@ -3585,6 +4063,15 @@ async function handleMessage(message, sender, { transportMutationHeld = false, m
     if (message.type === "c2c.status.page") {
       await syncActiveWebSinkFromBridge().catch(() => undefined);
     }
+    const previousOwner = ownerState.owner;
+    const reloadCandidate = message.type === "c2c.heartbeat" && !localRouteActive()
+      && journal.state === "NONE" && connectFlow.state === "DONE" && verifiedConnectFlowMatchesTransport(connectFlow, transport)
+      && ["NONE", "VERIFIED"].includes(routeAttestFence.state)
+      && previousOwner?.tabId === tabId
+      && (previousOwner.documentId !== documentId || connectFlow.ownerWitness?.generation !== generation)
+      && connectFlow.ownerWitness?.tabId === tabId && connectFlow.ownerWitness.documentId === previousOwner.documentId
+      && areChatgptConversationRoutesEquivalent(connectFlow.ownerWitness.canonicalRoute, transport?.routeCanonical)
+      && canonical != null && areChatgptConversationRoutesEquivalent(canonical, transport?.routeCanonical);
     const applied = applyObservationRouteVerdict(ownerState, {
       tabId: tabId ?? -1,
       documentId,
@@ -3629,6 +4116,29 @@ async function handleMessage(message, sender, { transportMutationHeld = false, m
         ownerProof = null;
       }
       await persistSessionOwnership();
+    }
+    if (reloadCandidate && (!ownerState.owner || isOwner(ownerState, tabId, documentId)) && !productionSendInFlight && !productionRecoveryInFlight && !autonomyTickInFlight) {
+      await runTransportMutation(async () => {
+        connectInFlight = true;
+        try { await restoreSameTabOwnerReadOnly(sender, message, previousOwner); }
+        finally { connectInFlight = false; }
+      });
+      return statusPayload(tabId ?? -1, documentId, { canonicalRoute: canonical });
+    }
+    if (message.type === "c2c.heartbeat" && localRouteActive()) {
+      if (localRouteCurrent(localRouteRequest) && canonical === localRouteRequest.routeCanonical
+        && tabId === localRouteRequest.ownerWitness.tabId && documentId === localRouteRequest.ownerWitness.documentId
+        && generation === localRouteRequest.ownerWitness.generation && Date.now() - lastLocalRoutePollAt >= 2_000
+        && !productionSendInFlight && !productionRecoveryInFlight && !autonomyTickInFlight) {
+        lastLocalRoutePollAt = Date.now();
+        const result = await runTransportMutation(async () => {
+          connectInFlight = true;
+          try { return await progressLocalRouteRequest(); }
+          finally { connectInFlight = false; }
+        });
+        connectReason = result?.ok ? null : result?.reason || "local_route_unavailable";
+      }
+      return statusPayload(tabId ?? -1, documentId, { canonicalRoute: canonical });
     }
     // dropped (R3o): stale/non-owner observation failed the authority/witness
     // check — zero mutation; diagnostics below still run with canonical=null.
@@ -3877,6 +4387,7 @@ async function handleMessage(message, sender, { transportMutationHeld = false, m
         journal: summarizeProductionJournal(journal),
       };
     }
+    if (connectInFlight) return { ok: false, reason: "connect_in_flight" };
     if (!storageProtected) return { ok: false, reason: "storage_unprotected" };
     if (!transport || transport.authStale) return { ok: false, reason: "transport_invalid" };
     if (!ownerState.owner) return { ok: false, reason: "not_exact_owner" };
@@ -4314,6 +4825,11 @@ async function handleProductionJournalPersist(sender, message) {
   if (!proposed || typeof proposed !== "object" || !expectedPrevious || typeof expectedPrevious !== "object") {
     return { ok: false, reason: "production_persist_payload_invalid" };
   }
+  if (connectInFlight && (!connectRecoveryCurrent || !connectRecoveryCurrent()
+    || !["OUTCOME_UNKNOWN", "OBSERVED_PENDING_ACK"].includes(journal.state)
+    || !["OUTCOME_UNKNOWN", "OBSERVED_PENDING_ACK", "NONE"].includes(proposed.state))) {
+    return { ok: false, reason: "production_recovery_busy" };
+  }
   const check = validateProductionJournalCommit(journal, proposed, expectedPrevious, {
     claimProof: productionClaimProof,
     ackProof: productionAckProof,
@@ -4371,6 +4887,7 @@ async function handleProductionJournalPersist(sender, message) {
  */
 async function handleProductionBeginSend(sender, message) {
   await initPromise;
+  if (connectInFlight) return { ok: false, reason: "production_recovery_busy" };
   const ownerCheck = requireExactOwnerSender(sender);
   if (!ownerCheck.ok) return ownerCheck;
   const gate = requireProtectedTransport();
@@ -4471,6 +4988,7 @@ async function handleProductionBeginSend(sender, message) {
  */
 async function handleProductionAck(sender, message) {
   await initPromise;
+  if (connectInFlight && (!connectRecoveryCurrent || !connectRecoveryCurrent())) return { ok: false, reason: "recovery_identity_changed" };
   const ownerCheck = requireExactOwnerSender(sender);
   if (!ownerCheck.ok) return ownerCheck;
   const gate = requireProtectedTransport();
@@ -4508,6 +5026,7 @@ async function handleProductionAck(sender, message) {
     };
   }
   if (!isCurrentTransportResponse(res)) return { ok: false, reason: "stale_transport_response" };
+  if (connectRecoveryCurrent && !connectRecoveryCurrent()) return { ok: false, reason: "recovery_identity_changed" };
   if (res.status === 401) {
     return markAuthStale(res.body?.error || "COMPANION_UNAUTHORIZED", res);
   }
@@ -4553,7 +5072,7 @@ async function handleProductionAck(sender, message) {
  * Journal-first recovery. One event max per tick. Never auto-retire.
  */
 async function maybeRunAutonomyTick(ctx = {}) {
-  if (autonomyTickInFlight) return;
+  if (autonomyTickInFlight || connectInFlight || productionRecoveryInFlight) return;
   if (parseAutonomyPolicy(autonomyPolicy).mode === "off") return;
   autonomyTickInFlight = true;
   try {
@@ -4608,6 +5127,11 @@ async function maybeRunAutonomyTick(ctx = {}) {
       pendingReady = Number(stateRes.status.pendingReady) || 0;
       routeVerified = stateRes.status.routeVerification === "VERIFIED"
         || stateRes.status.productionEligible === true;
+      // SW 重建或投影失败时复用只读同步；正常 tick 不增加请求，失败每 2 秒可重查。
+      if (connectionReadiness().reason === "web_sink_not_ready"
+        && Date.now() - (activeWebSinkProjection.checkedAt ?? 0) >= 2_000) {
+        await syncActiveWebSinkFromBridge();
+      }
     }
 
     // Bounded diagnostic snapshot of evidence the planner will use.
@@ -4632,6 +5156,7 @@ async function maybeRunAutonomyTick(ctx = {}) {
       journal,
       sendProbeLatch,
       routeVerified,
+      connectionReadiness: connectionReadiness(),
       productionSendInFlight,
       autonomyTickInFlight: false,
       inFlight,
@@ -4785,7 +5310,7 @@ async function maybeRunAutonomyTick(ctx = {}) {
  */
 async function handleProductionSend() {
   await initPromise;
-  if (productionSendInFlight) {
+  if (productionSendInFlight || productionRecoveryInFlight || connectInFlight) {
     return {
       ok: false,
       reason: "production_send_in_flight",
@@ -5197,6 +5722,15 @@ async function handleAbandonRouteAttestUnknown(sender, message) {
  * Local clear only after exact server retirement success.
  */
 async function handleRetireUnknown() {
+  if (connectInFlight || productionRecoveryInFlight || productionSendInFlight) {
+    return { ok: false, reason: "production_recovery_busy" };
+  }
+  productionRecoveryInFlight = true;
+  try { return await handleRetireUnknownOnce(); }
+  finally { productionRecoveryInFlight = false; }
+}
+
+async function handleRetireUnknownOnce() {
   await initPromise;
   const gate = requireProtectedTransport();
   if (!gate.ok) return gate;
@@ -5440,6 +5974,11 @@ async function afterMessage(type) {
 
 return {
   initialize: () => initPromise,
+  refreshSelectedIndicator: async () => {
+    await initPromise;
+    applyActionIndicator.invalidate();
+    await refreshActionIndicator();
+  },
   handleAlarm: alarm => handleWakeWatchdogAlarm(alarm),
   handleTabRemoved,
   handleActiveOwnerRefresh: tabId => requestActiveOwnerRefresh(tabId),
@@ -5507,6 +6046,7 @@ globalThis.chrome.alarms?.onAlarm?.addListener(alarm => {
   dispatchProjectLifecycle(projectRouter.handleAlarm(alarm));
 });
 globalThis.chrome.tabs?.onRemoved?.addListener(tabId => {
+  pageArrivals.delete(tabId);
   dispatchProjectLifecycle(projectRouter.handleTabRemoved(tabId));
 });
 globalThis.chrome.tabs?.onActivated?.addListener(activeInfo => {
@@ -5521,11 +6061,19 @@ globalThis.chrome.runtime.onInstalled?.addListener(details => {
   dispatchProjectLifecycle(projectRouter.handleInstalled(details));
 });
 globalThis.chrome.runtime.onStartup?.addListener(() => {
+  pageArrivals.clear();
   dispatchProjectLifecycle(projectRouter.handleStartup());
 });
 dispatchProjectLifecycle(projectRouter.initialize());
 
 globalThis.chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (Number.isSafeInteger(sender?.tab?.id) && sender.frameId === 0 && typeof sender.documentId === "string"
+    && ["c2c.bind", "c2c.connect.page", "c2c.observe", "c2c.heartbeat", "c2c.status.page", "c2c.owner-proof.request"].includes(message?.type)) {
+    const route = resolveObservationRouteVerdict(sender, message?.canonicalRoute ?? null);
+    const next = { documentId: sender.documentId, url: route.verdict === "match" ? route.canonicalRoute : null,
+      generation: Number.isFinite(message.generation) ? message.generation : 1 };
+    if (JSON.stringify(pageArrivals.get(sender.tab.id)) !== JSON.stringify(next)) pageArrivals.set(sender.tab.id, next);
+  }
   projectRouter.handle(message, sender)
     .then(sendResponse)
     .catch(() => sendResponse({ ok: false, reason: "internal" }));

@@ -1,7 +1,7 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import { getStateDir } from "../config/paths.js";
 import { readFeedbackState, type FeedbackState } from "../feedback/store.js";
-import { isRouteAttestationVerified, type CompanionRecord } from "../feedback/schema.js";
+import { isWebSinkRouteVerified, type CompanionRecord } from "../feedback/schema.js";
 import { WebSinkControlError } from "./schema.js";
 import {
   bindCurrentWebSink,
@@ -24,6 +24,7 @@ export interface WebSinkCompanionAuthContext {
   readonly workspaceId: string;
   readonly companionId: string;
   readonly routeCanonical: string;
+  readonly routeProofKind: "mcp_principal" | "local_user";
   /** 传输层兼容元数据：来自 Companion record，不与 active Feedback receiver 校验。 */
   readonly bindingId: string;
   readonly epoch: number;
@@ -60,7 +61,7 @@ export function verifyCompanionCredentialForWebSink(input: {
   if (!hashEqual(companion.credentialHash, sha256Hex(input.credential))) {
     throw new WebSinkControlError("WEB_SINK_COMPANION_UNAUTHORIZED", "companion credential 无效或已撤销。");
   }
-  if (!isRouteAttestationVerified(companion)) {
+  if (!isWebSinkRouteVerified(companion)) {
     throw new WebSinkControlError("WEB_SINK_ROUTE_UNVERIFIED", "companion route 尚未 verified。");
   }
   const attestation = companion.routeAttestation;
@@ -71,6 +72,7 @@ export function verifyCompanionCredentialForWebSink(input: {
     workspaceId: state!.workspaceId,
     companionId: companion.companionId,
     routeCanonical: companion.routeCanonical,
+    routeProofKind: attestation.proofKind ?? "mcp_principal",
     bindingId: companion.bindingId,
     epoch: companion.epoch,
   };
@@ -118,7 +120,7 @@ export function bindCurrentWebSinkFromVerifiedCompanionRoute(input: {
     throw new WebSinkControlError("WEB_SINK_WORKSPACE_MISMATCH", "companion state workspace 不匹配。");
   }
   const companion = state.companion;
-  if (!isRouteAttestationVerified(companion)) {
+  if (!isWebSinkRouteVerified(companion)) {
     throw new WebSinkControlError("WEB_SINK_ROUTE_UNVERIFIED", "Browser Companion route 尚未 verified；拒绝绑定 Web Sink。");
   }
   const routeCanonical = companion.routeCanonical;

@@ -22,7 +22,8 @@ function result(severity, reason) {
   return {
     severity,
     badgeText,
-    title: severity === "normal" ? NORMAL_TEXT : severity === "error" ? ERROR_TEXT : WARNING_TEXT,
+    title: reason === "journal_outcome_unknown" ? "C2C：回流待核验，请勿重复发送"
+      : severity === "normal" ? NORMAL_TEXT : severity === "error" ? ERROR_TEXT : WARNING_TEXT,
     reason,
   };
 }
@@ -91,12 +92,13 @@ export function deriveCompanionIndicator(input = {}) {
     return result("warning", "autonomy_cooldown");
   }
   if (transport.connected !== true) return result("warning", "transport_not_ready");
+  if (transport.connectionReadiness?.ready !== true) return result("warning", "connect_not_ready");
   return result("normal", "ready");
 }
 
 export function createCompanionIndicatorApplier(getAction) {
   let lastKey = null;
-  return async (indicator) => {
+  const apply = async (indicator) => {
     const action = typeof getAction === "function" ? getAction() : getAction;
     if (!action || typeof action.setBadgeText !== "function" || typeof action.setTitle !== "function") {
       return false;
@@ -105,16 +107,18 @@ export function createCompanionIndicatorApplier(getAction) {
     if (key === lastKey) return false;
     let ok = true;
     try {
-      await action.setBadgeText({ text: indicator.badgeText });
+      if (await action.setBadgeText({ text: indicator.badgeText }) === false) ok = false;
     } catch {
       ok = false;
     }
     try {
-      await action.setTitle({ title: indicator.title });
+      if (await action.setTitle({ title: indicator.title }) === false) ok = false;
     } catch {
       ok = false;
     }
     if (ok) lastKey = key;
     return ok;
   };
+  apply.invalidate = () => { lastKey = null; };
+  return apply;
 }

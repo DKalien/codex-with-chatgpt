@@ -2,7 +2,8 @@ import type { CommandMailboxSubmit } from "../routing/mailbox.js";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import type { Workspace } from "../workspace/manager.js";
+import { GatewayRegistryError } from "../gateway/registry.js";
+import { resolveToolWorkspace, type WorkspaceSource } from "./tool-shared.js";
 import { DesktopError, desktopIntent, sendInput, statusInput } from "../desktop/store.js";
 import { desktopStatus } from "../desktop/service.js";
 import { DESKTOP_CONTROL_SCOPE, DESKTOP_READ_SCOPE } from "../auth/store.js";
@@ -77,6 +78,7 @@ function fail(code: string, message: string, scope?: string): ToolResult {
 }
 
 function safeError(error: unknown): ToolResult {
+  if (error instanceof GatewayRegistryError) return fail(error.code, error.message);
   if (error instanceof DesktopError) return fail(error.code, error.message);
   if (error instanceof RoutingError) return fail(error.code, error.message);
   return fail("DESKTOP_ERROR", "Desktop Control 操作失败；请先读取状态。若投递结果不明，请勿重发，先在 Desktop 人工核对。" );
@@ -124,15 +126,27 @@ function result(action: () => unknown | Promise<unknown>, scope?: string): Promi
 /** 无论是否绑定都注册 Desktop 工具；处理器内部严格校验状态和授权。 */
 export function registerDesktopTools(
   server: McpServer,
-  workspace: Workspace,
-  desktopAuthorize?: (auth: AuthInfo) => void,
+  source: WorkspaceSource,
+  desktopAuthorize?: (auth: AuthInfo, scope: string) => void,
   mailbox?: CommandMailboxSubmit,
 ): void {
+  function authorizeWorkspace(input: { workspaceId: string }, auth: AuthInfo, scope: string) {
+    authorizeNow(auth);
+    if (typeof source === "function" && !desktopAuthorize) {
+      throw new DesktopError("UNAUTHORIZED", "Gateway Desktop 缺少实时 OAuth 校验；拒绝操作。");
+    }
+    if (typeof source === "function" || scope === DESKTOP_CONTROL_SCOPE) desktopAuthorize?.(auth, scope);
+    const workspace = resolveToolWorkspace(source, input, auth);
+    if (input.workspaceId !== workspace.id) throw new DesktopError("DESKTOP_WRONG_WORKSPACE", "请求工作区不匹配。");
+    return workspace;
+  }
   server.registerTool(
     "codex_desktop_send",
     {
       title: "发送任务到 Desktop",
-      description: "向已绑定且已授权的 Desktop 会话提交完整开发计划（development_plan）或修订（revision）。Bridge 持久排队并返回 queued，Codex 空闲后通过现有安全入口投递；queued/accepted 都不是执行完成。只有用户在当前对话明确确认后，才设置 userConfirmed:true；它是意图信号，不能替代 OAuth、本机 enable、bindingId 或 Desktop 审批。同 commandId 防重复尝试；不明结果不自动重发，其他独立消息仍可排队。",
+      description: "先调用 codex_desktop_status 核对本机绑定的 Desktop 目标，再提交完整开发计划（development_plan）或修订（revision）。" +
+        (mailbox ? "Bridge 持久排队并返回 queued，Codex 空闲后通过现有安全入口投递；queued/accepted 都不是执行完成。" : "直接通过现有安全入口投递，遵守 Desktop busy 门禁；不排队、不自动转投或重发，accepted 不是执行完成。") +
+        "目标只来自本机绑定，独立于后台 Remote 的启用状态；codex_submit_task 始终是后台 Remote 工具。只有用户在当前对话明确确认后，才设置 userConfirmed:true；它不能替代 OAuth、本机 enable、bindingId 或 Desktop 审批。同 commandId 防重复尝试；不明结果须人工核对。",
       inputSchema: sendInput,
       outputSchema: {
         commandId: z.string(), bindingId: z.string().uuid(), threadId: z.string().uuid(),
@@ -146,20 +160,19 @@ export function registerDesktopTools(
     },
     (input, extra) => result(async () => {
       const auth = requireAuth(extra.authInfo, DESKTOP_CONTROL_SCOPE);
-      authorizeNow(auth);
-      if (input.workspaceId !== workspace.id) {
-        throw new DesktopError("DESKTOP_WRONG_WORKSPACE", "请求工作区不匹配。" );
-      }
+      const workspace = authorizeWorkspace(input, auth, DESKTOP_CONTROL_SCOPE);
       const plannerFingerprint = requestPlannerFingerprint(extra);
-      if (mailbox) { desktopAuthorize?.(auth); return mailbox("desktop", input, plannerFingerprint, auth); }
+      if (mailbox) return mailbox("desktop", input, plannerFingerprint, auth);
       const delivered = await deliverCurrentCommand(workspace, plannerFingerprint, {
         commandId: input.commandId,
         intent: input.intent,
         payload: input.message,
         userConfirmed: input.userConfirmed,
       }, auth.clientId, () => {
-        authorizeNow(auth);
-        desktopAuthorize?.(auth);
+        const current = authorizeWorkspace(input, auth, DESKTOP_CONTROL_SCOPE);
+        if (current.id !== workspace.id || current.root !== workspace.root) {
+          throw new DesktopError("DESKTOP_WRONG_WORKSPACE", "发送前工作区身份已变化；拒绝投递。");
+        }
       }, input.bindingId);
       if (!delivered.delivery) {
         throw new RoutingError("ROUTING_DESKTOP_DELIVERY_MISSING", "Desktop adapter 未返回公开 delivery；拒绝返回不完整结果。" );
@@ -172,7 +185,7 @@ export function registerDesktopTools(
     "codex_desktop_status",
     {
       title: "查看 Desktop 投递状态",
-      description: "读取当前 Desktop 绑定、可用性和可选 commandId 的投递状态；不会发送消息、恢复任务或切换目标。",
+      description: "Desktop 任务先调用本工具：读取指定 workspace 的本机绑定目标、可用性和可选 commandId 投递状态，再按返回的 bindingId 调用 codex_desktop_send。绑定只能在本机确认；不会发送消息、恢复任务或切换目标。",
       inputSchema: statusInput,
       outputSchema: statusOutputSchema,
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
@@ -180,8 +193,7 @@ export function registerDesktopTools(
     },
     (input, extra) => result(async () => {
       const auth = requireAuth(extra.authInfo, DESKTOP_READ_SCOPE);
-      authorizeNow(auth);
-      if (input.workspaceId !== workspace.id) throw new DesktopError("DESKTOP_WRONG_WORKSPACE", "请求工作区不匹配。" );
+      const workspace = authorizeWorkspace(input, auth, DESKTOP_READ_SCOPE);
       return desktopStatus(workspace, input.commandId);
     }, DESKTOP_READ_SCOPE)
   );

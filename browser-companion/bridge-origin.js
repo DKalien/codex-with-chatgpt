@@ -22,6 +22,9 @@ const FEEDBACK_ENDPOINTS = new Set([
   "/rebind/complete",
   "/rebind/status",
   "/state",
+  "/route/local/request",
+  "/route/local/status",
+  "/route/local/commit",
   "/operations",
   "/operations/result",
   "/operations/terminal-gone",
@@ -50,6 +53,11 @@ function feedbackEndpointPath(path) {
 
   if (pathname.includes("%") || !FEEDBACK_ENDPOINTS.has(endpoint)) {
     throw new BridgeOriginError("仅允许 Browser Companion feedback API endpoint");
+  }
+  if (endpoint === "/route/local/status") {
+    const match = /^\?requestId=([0-9a-fA-F-]{36})$/.exec(query);
+    if (!match || !UUID.test(match[1])) throw new BridgeOriginError("route/local/status query 无效");
+    return `${COMPANION_API_PREFIX}${endpoint}${query}`;
   }
   if (endpoint === "/operations/result") {
     const match = /^\?commandId=([A-Za-z0-9_-]{1,128})&iteration=([1-9][0-9]*)$/.exec(query);

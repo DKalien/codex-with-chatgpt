@@ -137,7 +137,7 @@ describe("Browser Companion mailbox presentation", () => {
       },
       web: { observedAt: new Date(now).toISOString(), verified: true, ownerAvailable: true, routeMatches: true, composer: "empty", generation: "idle", safe: true },
     }, now);
-    expect(view.codex).toBe("忙碌 · 可排队");
+    expect(view.codex).toBe("忙碌");
     expect(view.rows.find((row: any) => row.commandId === "queued_1").deliveryLabel).toBe("已排队 · 等待 Codex 处理");
     expect(view.rows.find((row: any) => row.commandId === "blocked_1")).toMatchObject({
       needsAttention: true, deliveryLabel: "派发受阻 · CODEX_BUSY",
