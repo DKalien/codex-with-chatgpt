@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { getStateDir } from "../config/paths.js";
+import { type DurableLockProvider, runDurableStoreTransaction } from "../core/durable-store.js";
 import {
   EXECUTOR_DISPATCH_MAX_ENTRIES,
   ExecutorDispatchError,
@@ -389,6 +390,8 @@ function attachDispatchLockOwnershipLoss(
  * Durable update（仿 executor-control/store 模式）：bounded wx lock + metadata fsync
  * + runtime parse + revision 校验 + noWrite byte-equality + tmp wx 0o600 + fsync + rename。
  * change 回调在锁内重读状态；可返回 noWrite 表示幂等无写。
+ * 写纪律模板统一由 src/core/durable-store.ts 保证：wx 锁、tmp wx 0o600、
+ * fsyncSync、initialized marker（.initialized）先于 rename、原子 rename、失败清 tmp、锁清理。
  *
  * 锁 ownership（R5e）：事务锁带随机 nonce；release 前重新验证 nonce，绝不删除
  * 替代锁；成功事务后 ownership lost / cleanup 失败一律抛
@@ -410,17 +413,37 @@ export function updateExecutorDispatchDetailed<T>(
   assertExecutorDispatchArtifactPath(path.dirname(file), stateDir, "directory");
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   assertExecutorDispatchArtifactPath(path.dirname(file), stateDir, "directory");
-  const lock = acquireExecutorDispatchLedgerLock(`${file}.lock`);
+  // 锁协议适配引擎 DurableLockProvider：acquire 原样走 generation 仲裁；
+  // release 调原 lock.release() 并把 bounded outcome 记入外层闭包变量。
+  let heldLock: ExecutorDispatchLedgerLock | null = null;
+  let releaseOutcome: ExecutorDispatchLockReleaseOutcome = { ownershipLost: false };
+  const lockProvider: DurableLockProvider = {
+    acquire(lockPath: string) {
+      const held = acquireExecutorDispatchLedgerLock(lockPath);
+      heldLock = held;
+      return {
+        release(): void {
+          releaseOutcome = held.release();
+        },
+      };
+    },
+  };
   let action: { ok: true; value: ExecutorDispatchUpdateResult<T> } | { ok: false; error: unknown };
   try {
     action = {
       ok: true,
-      value: runDispatchUpdate(workspaceId, workspaceRoot, stateDir, change, () => lock.verifyOwnership()),
+      value: runDispatchUpdate(
+        workspaceId,
+        workspaceRoot,
+        stateDir,
+        change,
+        () => heldLock!.verifyOwnership(),
+        lockProvider,
+      ),
     };
   } catch (error) {
     action = { ok: false, error };
   }
-  const releaseOutcome = lock.release();
   if (!action.ok) {
     if (releaseOutcome.ownershipLost) {
       attachDispatchLockOwnershipLoss(action.error, releaseOutcome);
@@ -443,76 +466,85 @@ function runDispatchUpdate<T>(
   change: (state: ExecutorDispatchState | null) =>
     | { state: ExecutorDispatchState; result: T; noWrite?: boolean },
   verifyCommitOwnership: () => void,
+  lock: DurableLockProvider,
 ): ExecutorDispatchUpdateResult<T> {
   const file = executorDispatchFile(workspaceId, stateDir);
   const marker = executorDispatchInitializedFile(workspaceId, stateDir);
-  assertExecutorDispatchArtifactPath(path.dirname(file), stateDir, "directory");
-  const previous = readExecutorDispatchState(workspaceId, stateDir);
-  if (previous && previous.workspaceRoot !== workspaceRoot) {
-    throw new ExecutorDispatchError(
-      "EXECUTOR_DISPATCH_WORKSPACE_MISMATCH",
-      "executor dispatch ledger workspaceRoot 不匹配。",
-    );
-  }
-  const next = change(previous);
-  // 每次写入前 runtime parse + workspace identity 校验。
-  const validated = parseExecutorDispatchState(next.state);
-  if (validated.workspaceId !== workspaceId || validated.workspaceRoot !== workspaceRoot) {
-    throw corrupt();
-  }
-  if (next.noWrite) {
-    if (!previous) {
-      throw new ExecutorDispatchError(
+  // tmp 名惰性派生并记忆：保持原实现"marker 落盘后才生成"的顺序，
+  // beforeTmp/beforeRename 钩子与引擎 tmp 写入共用同一路径。
+  let tmpPath: string | null = null;
+  const tmpNameFor = (target: string): string => {
+    if (tmpPath === null) {
+      tmpPath = `${target}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    }
+    return tmpPath;
+  };
+  const outcome = runDurableStoreTransaction<ExecutorDispatchState, T>({
+    file,
+    marker,
+    markerContent: `${workspaceId}\n`,
+    lockPath: `${file}.lock`,
+    lock,
+    tmpName: tmpNameFor,
+    serialize: (state) => `${JSON.stringify(state, null, 2)}\n`,
+    noWrite: {
+      mode: "require-previous",
+      onMissingPrevious: () => new ExecutorDispatchError(
         "EXECUTOR_DISPATCH_STATE_CORRUPT",
         "noWrite 要求已存在 durable state；拒绝无状态成功。",
-      );
-    }
-    if (JSON.stringify(validated) !== JSON.stringify(previous)) {
-      throw new ExecutorDispatchError("EXECUTOR_DISPATCH_STATE_CORRUPT", "noWrite 状态与 previous 不一致。");
-    }
-    return { result: next.result, noWrite: true, state: validated };
-  }
-  if (previous && validated.revision !== previous.revision + 1) {
-    throw corrupt();
-  }
-  if (!previous && validated.revision !== 1) {
-    throw corrupt();
-  }
-  if (!fs.existsSync(marker)) {
-    assertExecutorDispatchArtifactPath(path.dirname(marker), stateDir, "directory");
-    assertExecutorDispatchArtifactPath(marker, stateDir, "file");
-    const markerFd = fs.openSync(marker, "wx");
-    try {
-      fs.writeFileSync(markerFd, `${workspaceId}\n`);
-      fs.fsyncSync(markerFd);
-    } finally {
-      fs.closeSync(markerFd);
-    }
-  }
-  const tmp = `${file}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  try {
-    assertExecutorDispatchArtifactPath(path.dirname(tmp), stateDir, "directory");
-    assertExecutorDispatchArtifactPath(tmp, stateDir, "file");
-    const fd = fs.openSync(tmp, "wx", 0o600);
-    try {
-      fs.writeFileSync(fd, `${JSON.stringify(validated, null, 2)}\n`);
-      fs.fsyncSync(fd);
-    } finally {
-      fs.closeSync(fd);
-    }
-    // 提交点 ownership recheck：durable rename 前最后确认锁归属；
-    // 被并发 stale reclaimer 掠走即拒绝提交（tmp 由下方 catch 清理）。
-    verifyCommitOwnership();
-    assertExecutorDispatchArtifactPath(path.dirname(file), stateDir, "directory");
-    assertExecutorDispatchArtifactPath(tmp, stateDir, "file");
-    assertExecutorDispatchArtifactPath(marker, stateDir, "file");
-    assertExecutorDispatchArtifactPath(file, stateDir, "file");
-    fs.renameSync(tmp, file);
-  } catch (error) {
-    try { fs.unlinkSync(tmp); } catch { /* keep primary error */ }
-    throw error;
-  }
-  return { result: next.result, noWrite: false, state: validated };
+      ),
+      onChanged: () => new ExecutorDispatchError(
+        "EXECUTOR_DISPATCH_STATE_CORRUPT",
+        "noWrite 状态与 previous 不一致。",
+      ),
+    },
+    afterRead: (previous) => {
+      // 读阶段路径硬化断言 + workspaceRoot 身份校验。
+      assertExecutorDispatchArtifactPath(path.dirname(file), stateDir, "directory");
+      if (previous && previous.workspaceRoot !== workspaceRoot) {
+        throw new ExecutorDispatchError(
+          "EXECUTOR_DISPATCH_WORKSPACE_MISMATCH",
+          "executor dispatch ledger workspaceRoot 不匹配。",
+        );
+      }
+    },
+    sequence: "identity-first",
+    // 每次写入前 runtime parse + workspace identity 校验。
+    parseAndCheckIdentity: (state) => {
+      const validated = parseExecutorDispatchState(state);
+      if (validated.workspaceId !== workspaceId || validated.workspaceRoot !== workspaceRoot) {
+        throw corrupt();
+      }
+      return validated;
+    },
+    verifyRevision: (validated, previous) => {
+      if (previous && validated.revision !== previous.revision + 1) {
+        throw corrupt();
+      }
+      if (!previous && validated.revision !== 1) {
+        throw corrupt();
+      }
+    },
+    beforeMarker: () => {
+      assertExecutorDispatchArtifactPath(path.dirname(marker), stateDir, "directory");
+      assertExecutorDispatchArtifactPath(marker, stateDir, "file");
+    },
+    beforeTmp: () => {
+      const tmp = tmpNameFor(file);
+      assertExecutorDispatchArtifactPath(path.dirname(tmp), stateDir, "directory");
+      assertExecutorDispatchArtifactPath(tmp, stateDir, "file");
+    },
+    beforeRename: () => {
+      assertExecutorDispatchArtifactPath(path.dirname(file), stateDir, "directory");
+      assertExecutorDispatchArtifactPath(tmpNameFor(file), stateDir, "file");
+      assertExecutorDispatchArtifactPath(marker, stateDir, "file");
+      assertExecutorDispatchArtifactPath(file, stateDir, "file");
+      // 提交点 ownership recheck：durable rename 前最后确认锁归属；
+      // 被并发 stale reclaimer 掠走即拒绝提交（tmp 由引擎 catch 清理）。
+      verifyCommitOwnership();
+    },
+  }, change, () => readExecutorDispatchState(workspaceId, stateDir));
+  return { result: outcome.result, noWrite: outcome.noWrite, state: outcome.state as ExecutorDispatchState };
 }
 
 /** append/replace 共用的 entries 容量门禁（store 层 fail closed）。 */

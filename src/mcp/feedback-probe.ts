@@ -20,6 +20,7 @@ import {
   type TrustedPrincipal,
 } from "../feedback/probe-store.js";
 import { renderProbeHtml } from "../feedback/probe-ui.js";
+import { requireScopeReauth as requireScope, wwwAuthenticateChallenge } from "./tool-shared.js";
 
 /**
  * MCP Apps / ChatGPT 宿主约定：
@@ -73,13 +74,7 @@ function fail(code: string, message: string, scope?: string): ToolResult {
   return {
     isError: true,
     content: [{ type: "text", text: JSON.stringify({ error: code, message }) }],
-    ...(scope ? {
-      _meta: {
-        "mcp/www_authenticate": [
-          `Bearer error="insufficient_scope", error_description="Reauthorize this connector with ${scope}", scope="${scope}"`,
-        ],
-      },
-    } : {}),
+    ...(scope ? wwwAuthenticateChallenge(scope, "reauth") : {}),
   };
 }
 
@@ -88,14 +83,6 @@ function mapError(error: unknown): ToolResult {
     return fail(error.code, error.message);
   }
   return fail("PROBE_INTERNAL", error instanceof Error ? error.message : String(error));
-}
-
-function requireScope(authInfo: AuthInfo | undefined, scope: string): ToolResult | null {
-  if (!authInfo) return null;
-  if (!authInfo.scopes.includes(scope)) {
-    return fail("INSUFFICIENT_SCOPE", `This operation requires the '${scope}' scope.`, scope);
-  }
-  return null;
 }
 
 type Extra = {

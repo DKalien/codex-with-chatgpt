@@ -8,7 +8,7 @@ import {
   routingWorkspaceIdSchema,
 } from "./schema.js";
 
-const HEX64 = /^[a-f0-9]{64}$/;
+import { HEX64 } from "../core/hex.js";
 const SAFE_CODE = /^[A-Z][A-Z0-9_]{0,63}$/;
 
 export const resultOutboxEntryId = (workspaceId: string, commandId: string, iteration: number): string =>

@@ -2,13 +2,17 @@ import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
-import { ensureDir, getStateDir } from "../config/paths.js";
+import { getStateDir } from "../config/paths.js";
+import { runDurableStoreTransaction, simpleWxLock } from "../core/durable-store.js";
 
 export class DesktopError extends Error {
   constructor(public code: string, message: string) { super(message); }
 }
 export const desktopId = z.string().regex(/^[A-Za-z0-9_-]{1,128}$/);
-export const MAX_MESSAGE_BYTES = 64 * 1024;
+import { EXECUTOR_MESSAGE_MAX_BYTES } from "../executor-control/schema.js";
+
+/** 与 production Desktop send 相同的正文上限（UTF-8 bytes）；数值单一来源。 */
+export const MAX_MESSAGE_BYTES = EXECUTOR_MESSAGE_MAX_BYTES;
 export const desktopIntent = z.enum(["development_plan", "revision"]);
 export const sendInput = z.object({
   workspaceId: desktopId, bindingId: z.string().uuid(), commandId: desktopId,
@@ -84,32 +88,35 @@ export function requireDesktopRuntimeFence(workspaceId: string, workspaceRoot: s
 }
 
 // ponytail: 每工作区短文件锁和最多一万条永久 ID；容量达到上限后人工迁移，绝不淘汰防重放历史。
+// 写纪律模板统一由 src/core/durable-store.ts 保证：wx 锁、tmp wx 0600、
+// fsyncSync、initialized marker 先于 rename、原子 rename、失败清 tmp、锁清理。
 export function updateDesktop<T>(workspaceId: string, change: (state: DesktopState | null) => { state: DesktopState; result: T }, stateDir = getStateDir()): T {
   const file = desktopFile(workspaceId, stateDir);
-  ensureDir(path.dirname(file));
-  let lock: number;
-  try { lock = fs.openSync(`${file}.lock`, "wx", 0o600); }
-  catch { throw new DesktopError("DESKTOP_STORE_BUSY", "Desktop 状态写锁繁忙；遗留锁须人工核对进程和历史后恢复，不要删除投递记录。"); }
-  const temporary = `${file}.${randomUUID()}.tmp`;
-  try {
-    fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, createdAt: Date.now() })); fs.fsyncSync(lock);
-    const previous = readDesktop(workspaceId, stateDir);
-    const revision = (previous?.revision ?? 0) + 1;
-    const next = change(previous);
-    const valid = stateSchema.parse({ ...next.state, revision });
-    if (valid.workspaceId !== workspaceId) throw corrupt();
-    if (!fs.existsSync(`${file}.initialized`)) {
-      const marker = fs.openSync(`${file}.initialized`, "wx", 0o600);
-      try { fs.writeFileSync(marker, "1\n"); fs.fsyncSync(marker); } finally { fs.closeSync(marker); }
-    }
-    const fd = fs.openSync(temporary, "wx", 0o600);
-    try { fs.writeFileSync(fd, JSON.stringify(valid)); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
-    fs.renameSync(temporary, file);
-    return next.result;
-  } finally {
-    try { fs.rmSync(temporary, { force: true }); }
-    finally { fs.closeSync(lock); fs.unlinkSync(`${file}.lock`); }
-  }
+  return runDurableStoreTransaction<DesktopState, T>({
+    file,
+    marker: `${file}.initialized`,
+    markerContent: "1\n",
+    markerOpenMode: 0o600,
+    lockPath: `${file}.lock`,
+    lock: simpleWxLock({
+      payload: () => JSON.stringify({ pid: process.pid, createdAt: Date.now() }),
+      openMode: 0o600,
+      busyError: () => new DesktopError("DESKTOP_STORE_BUSY", "Desktop 状态写锁繁忙；遗留锁须人工核对进程和历史后恢复，不要删除投递记录。"),
+      cleanup: "propagate",
+    }),
+    tmpName: (target) => `${target}.${randomUUID()}.tmp`,
+    serialize: (state) => JSON.stringify(state),
+    noWrite: { mode: "disabled" },
+    sequence: "assign-first",
+    // assign-first：store 派生 revision 覆盖（schema revision 可省略，按 ?? 0 递增），
+    // 裸 zod parse（ZodError 原样外溢）后仅校验 workspaceId。
+    assignParseAndCheckIdentity: (state, previous) => {
+      const revision = (previous?.revision ?? 0) + 1;
+      const valid = stateSchema.parse({ ...(state as DesktopState), revision });
+      if (valid.workspaceId !== workspaceId) throw corrupt();
+      return valid;
+    },
+  }, change, () => readDesktop(workspaceId, stateDir)).result;
 }
 
 export function publicDelivery(record: DesktopDelivery) {

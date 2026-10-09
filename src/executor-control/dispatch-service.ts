@@ -23,6 +23,7 @@ import {
   updateExecutorDispatchDetailed,
 } from "./dispatch-store.js";
 import { withEndpointSwitchLock } from "../endpoint-switch/lock.js";
+import { HEX64 } from "../core/hex.js";
 import { assertCommandWritable, withCommandOperation } from "../command-cleanup/fence.js";
 
 /**
@@ -110,7 +111,7 @@ function assertBoundedCommandId(commandId: string): void {
 }
 
 function assertHex64(value: string, code: string, message: string): void {
-  if (!/^[a-f0-9]{64}$/.test(value)) {
+  if (!HEX64.test(value)) {
     throw new ExecutorDispatchError(code, message);
   }
 }

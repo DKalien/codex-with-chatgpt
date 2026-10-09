@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { z } from "zod";
@@ -22,6 +22,7 @@ import { withEvidenceLock } from "./recovery-evidence.js";
 import { withCommandOperationAsync } from "../command-cleanup/fence.js";
 import { readAbandonedCommandIds } from "./abandonment.js";
 import { unresolvedOutcomeUnknownCommandIds } from "./outcome-resolution.js";
+import { readEvidenceState, writeEvidenceState, type EvidenceReadMessages } from "../core/evidence-store.js";
 
 const uuid = z.string().uuid();
 const canonicalTimestamp = z.string().refine(value => {
@@ -155,75 +156,43 @@ function markerFile(workspaceId: string, stateDir = getStateDir()): string {
   return `${legacyRetirementFile(workspaceId, stateDir)}.initialized`;
 }
 
-function hasTemporaryEvidence(workspaceId: string, stateDir = getStateDir()): boolean {
-  const file = legacyRetirementFile(workspaceId, stateDir);
-  try {
-    return fs.readdirSync(path.dirname(file)).some(name =>
-      name.startsWith(`${path.basename(file)}.`) && name.endsWith(".tmp"));
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
-    return corrupt("LEGACY_RETIREMENT_STORE_CORRUPT", "遗留 retirement 目录无法读取；拒绝继续。");
-  }
+type RetirementState = { version: 1; workspaceId: string; entries: LegacyRetirementEvidence[] };
+
+const storeMessages: EvidenceReadMessages = {
+  directoryUnreadable: "遗留 retirement 目录无法读取；拒绝继续。",
+  temporaryFiles: "遗留 retirement 证据含未完成临时文件；拒绝继续。",
+  missingMainFile: "遗留 retirement 主文件缺失；拒绝重置证据。",
+  missingMarker: "遗留 retirement 初始化标记缺失；拒绝读取证据。",
+  bodyCorrupt: "遗留 retirement 证据损坏；保留文件并人工核对。",
+  schemaMismatch: "遗留 retirement 证据 schema 或 workspaceId 不一致；拒绝继续。",
+};
+
+function readState(workspaceId: string, stateDir = getStateDir()): RetirementState {
+  return readEvidenceState<RetirementState>({
+    file: legacyRetirementFile(workspaceId, stateDir),
+    marker: markerFile(workspaceId, stateDir),
+    workspaceId,
+    schema: retirementStateSchema,
+    emptyState: () => ({ version: 1, workspaceId, entries: [] }),
+    corrupt: message => corrupt("LEGACY_RETIREMENT_STORE_CORRUPT", message),
+    messages: storeMessages,
+  });
 }
 
-function readState(workspaceId: string, stateDir = getStateDir()): { version: 1; workspaceId: string; entries: LegacyRetirementEvidence[] } {
-  const file = legacyRetirementFile(workspaceId, stateDir);
-  if (hasTemporaryEvidence(workspaceId, stateDir)) {
-    return corrupt("LEGACY_RETIREMENT_STORE_CORRUPT", "遗留 retirement 证据含未完成临时文件；拒绝继续。");
-  }
-  const exists = fs.existsSync(file);
-  const marker = fs.existsSync(markerFile(workspaceId, stateDir));
-  if (!exists) {
-    if (marker) return corrupt("LEGACY_RETIREMENT_STORE_CORRUPT", "遗留 retirement 主文件缺失；拒绝重置证据。");
-    return { version: 1, workspaceId, entries: [] };
-  }
-  if (!marker) return corrupt("LEGACY_RETIREMENT_STORE_CORRUPT", "遗留 retirement 初始化标记缺失；拒绝读取证据。");
-  let parsed: unknown;
-  try { parsed = JSON.parse(fs.readFileSync(file, "utf8")); }
-  catch { return corrupt("LEGACY_RETIREMENT_STORE_CORRUPT", "遗留 retirement 证据损坏；保留文件并人工核对。"); }
-  const state = retirementStateSchema.safeParse(parsed);
-  if (!state.success || state.data.workspaceId !== workspaceId) {
-    return corrupt("LEGACY_RETIREMENT_STORE_CORRUPT", "遗留 retirement 证据 schema 或 workspaceId 不一致；拒绝继续。");
-  }
-  return state.data;
-}
-
-function writeState(
-  workspaceId: string,
-  state: { version: 1; workspaceId: string; entries: LegacyRetirementEvidence[] },
-  stateDir = getStateDir(),
-): void {
-  const file = legacyRetirementFile(workspaceId, stateDir);
-  const marker = markerFile(workspaceId, stateDir);
-  const temporary = `${file}.${randomUUID()}.tmp`;
-  const parsed = retirementStateSchema.parse(state);
-  let fd: number | undefined;
-  let prepared = false;
-  try {
-    ensureDir(path.dirname(file));
-    fd = fs.openSync(temporary, "wx", 0o600);
-    fs.writeFileSync(fd, JSON.stringify(parsed));
-    fs.fsyncSync(fd);
-    prepared = true;
-  } catch {
-    throw new LegacyRetirementError("LEGACY_RETIREMENT_STORE_WRITE", "遗留 retirement 证据无法写入；保留原文件并人工核对。");
-  } finally {
-    if (fd !== undefined) fs.closeSync(fd);
-    if (!prepared) fs.rmSync(temporary, { force: true });
-  }
-  try {
-    fs.renameSync(temporary, file);
-    try { fs.chmodSync(file, 0o600); } catch { /* best effort on Windows */ }
-    if (!fs.existsSync(marker)) {
-      const markerFd = fs.openSync(marker, "wx", 0o600);
-      try { fs.writeFileSync(markerFd, "1\n"); fs.fsyncSync(markerFd); }
-      finally { fs.closeSync(markerFd); }
-    }
-  } catch {
-    throw new LegacyRetirementError("LEGACY_RETIREMENT_STORE_WRITE", "遗留 retirement 证据提交失败；保留原文件并人工核对。");
-  } finally {
-    fs.rmSync(temporary, { force: true });
-  }
+function writeState(workspaceId: string, state: RetirementState, stateDir = getStateDir()): void {
+  writeEvidenceState<RetirementState>({
+    file: legacyRetirementFile(workspaceId, stateDir),
+    marker: markerFile(workspaceId, stateDir),
+    schema: retirementStateSchema,
+    wrapParseErrors: false,
+    ensureDir,
+    openTmpInsideTry: true,
+    cleanupTmpOnPrepareFailure: true,
+    onWriteError: phase => {
+      throw new LegacyRetirementError("LEGACY_RETIREMENT_STORE_WRITE",
+        phase === "prepare" ? "遗留 retirement 证据无法写入；保留原文件并人工核对。" : "遗留 retirement 证据提交失败；保留原文件并人工核对。");
+    },
+  }, state);
 }
 
 /** 只读读取；缺少初始化文件时返回空数组，不创建目录或锁。 */

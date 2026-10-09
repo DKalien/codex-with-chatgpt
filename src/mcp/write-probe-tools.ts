@@ -1,7 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { isWriteProbeEnabled, probeNonceSchema, writeProbe, WRITE_PROBE_LOCATION, WRITE_PROBE_SCOPE } from "./write-probe.js";
-import { fail, okStructured, type McpContext } from "./tool-shared.js";
+import { fail, okStructured, scopeSatisfied, type McpContext } from "./tool-shared.js";
 
 export function registerWriteProbeTools(server: McpServer, ctx: McpContext): void {
   if (!isWriteProbeEnabled()) return;
@@ -21,11 +21,13 @@ export function registerWriteProbeTools(server: McpServer, ctx: McpContext): voi
       _meta: { securitySchemes: [{ type: "oauth2", scopes: [WRITE_PROBE_SCOPE] }] },
     },
     async ({ nonce }, extra) => {
-      if (!extra.authInfo?.scopes.includes(WRITE_PROBE_SCOPE)) {
-        return {
-          ...fail("INSUFFICIENT_SCOPE", "需要 probe.write 授权。请重新授权当前 Connector；旧 read token 不会自动升级。"),
-          _meta: { "mcp/www_authenticate": ['Bearer error="insufficient_scope", error_description="Reauthorize this connector with probe.write", scope="probe.write"'] },
-        };
+      if (!extra.authInfo || !scopeSatisfied(extra.authInfo, WRITE_PROBE_SCOPE)) {
+        return fail(
+          "INSUFFICIENT_SCOPE",
+          "需要 probe.write 授权。请重新授权当前 Connector；旧 read token 不会自动升级。",
+          "reauth",
+          WRITE_PROBE_SCOPE,
+        );
       }
       try {
         return okStructured(writeProbe(workspace.id, nonce));

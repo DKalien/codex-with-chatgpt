@@ -1,24 +1,13 @@
-import { createHash, timingSafeEqual } from "node:crypto";
 import { getStateDir } from "../config/paths.js";
 import { readFeedbackState, type FeedbackState } from "../feedback/store.js";
 import { isWebSinkRouteVerified, type CompanionRecord } from "../feedback/schema.js";
+import { hashEqual, sha256Hex } from "../feedback/companion-common.js";
 import { WebSinkControlError } from "./schema.js";
 import {
   bindCurrentWebSink,
   type ActiveWebSinkBindingResult,
 } from "./service.js";
 import { projectChatgptRouteToWebSinkCandidate } from "./chatgpt-surface.js";
-
-function sha256Hex(material: string): string {
-  return createHash("sha256").update(material, "utf8").digest("hex");
-}
-
-function hashEqual(a: string, b: string): boolean {
-  const ba = Buffer.from(a, "utf8");
-  const bb = Buffer.from(b, "utf8");
-  if (ba.length !== bb.length) return false;
-  return timingSafeEqual(ba, bb);
-}
 
 export interface WebSinkCompanionAuthContext {
   readonly workspaceId: string;

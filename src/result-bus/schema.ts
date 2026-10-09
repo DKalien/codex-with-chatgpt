@@ -16,7 +16,7 @@ import {
   webSinkSendTargetSnapshotSchema,
 } from "../endpoints/schema.js";
 
-const HEX64 = /^[a-f0-9]{64}$/;
+import { HEX64 } from "../core/hex.js";
 /** bounded 诊断/原因码：与 Routing reconciliation reasonCode 同字符集。 */
 const REASON_CODE = /^[A-Z][A-Z0-9_]{0,63}$/;
 

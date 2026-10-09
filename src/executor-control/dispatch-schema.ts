@@ -19,7 +19,7 @@ export const EXECUTOR_DISPATCH_MAX_ENTRIES = 10000;
 
 /** bounded commandId：与 routing 层正交，本模块自有校验（≤128 safe chars）。 */
 export const EXECUTOR_DISPATCH_COMMAND_ID = /^[A-Za-z0-9_.:-]{1,128}$/;
-const HEX64 = /^[a-f0-9]{64}$/;
+import { HEX64 } from "../core/hex.js";
 const BOUNDED_CODE = /^[A-Za-z0-9_.:-]{1,128}$/;
 
 export class ExecutorDispatchError extends Error {

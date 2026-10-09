@@ -1,5 +1,5 @@
-import { createHash, randomUUID } from "node:crypto";
-import fs from "node:fs";
+import { createHash } from "node:crypto";
+import { MAX_MESSAGE_BYTES } from "./store.js";
 import path from "node:path";
 import { z } from "zod";
 import { ensureDir, getStateDir } from "../config/paths.js";
@@ -23,6 +23,7 @@ import { withEvidenceLock } from "./recovery-evidence.js";
 import { withCommandOperationAsync, assertCommandOperationOwned } from "../command-cleanup/fence.js";
 import { readLegacyRetirements, type LegacyRetirementEvidence } from "./legacy-retirement.js";
 import { unresolvedOutcomeUnknownCommandIds } from "./outcome-resolution.js";
+import { readEvidenceState, writeEvidenceState, type EvidenceReadMessages } from "../core/evidence-store.js";
 
 const uuid = z.string().uuid();
 const sha256 = z.string().regex(/^[a-f0-9]{64}$/);
@@ -42,7 +43,7 @@ const deliverySummarySchema = z.object({
   bindingId: uuid,
   intent: z.union([z.literal("development_plan"), z.literal("revision"), z.null()]),
   messageSha256: sha256,
-  messageBytes: z.number().int().positive().max(64 * 1024),
+  messageBytes: z.number().int().positive().max(MAX_MESSAGE_BYTES),
   threadId: uuid,
   turnId: uuid,
   deliveryStatus: z.literal("accepted"),
@@ -217,71 +218,42 @@ function markerFile(workspaceId: string, stateDir = getStateDir()): string {
   return `${abandonmentFile(workspaceId, stateDir)}.initialized`;
 }
 
-function hasTemporaryEvidence(workspaceId: string, stateDir = getStateDir()): boolean {
-  const file = abandonmentFile(workspaceId, stateDir);
-  try {
-    return fs.readdirSync(path.dirname(file)).some(name =>
-      name.startsWith(`${path.basename(file)}.`) && name.endsWith(".tmp"));
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
-    return corrupt("DESKTOP_ABANDONMENT_STORE_CORRUPT", "abandonment 目录无法读取；拒绝继续。");
-  }
-}
+const storeMessages: EvidenceReadMessages = {
+  directoryUnreadable: "abandonment 目录无法读取；拒绝继续。",
+  temporaryFiles: "abandonment 证据含未完成临时文件；拒绝继续。",
+  missingMainFile: "abandonment 主文件缺失；拒绝重置证据。",
+  missingMarker: "abandonment 初始化标记缺失；拒绝读取证据。",
+  bodyCorrupt: "abandonment 证据损坏；保留文件并人工核对。",
+  schemaMismatch: "abandonment 证据 schema 或 workspaceId 不一致；拒绝继续。",
+};
 
 function readState(workspaceId: string, stateDir = getStateDir()): AbandonmentState {
-  const file = abandonmentFile(workspaceId, stateDir);
-  if (hasTemporaryEvidence(workspaceId, stateDir)) {
-    return corrupt("DESKTOP_ABANDONMENT_STORE_CORRUPT", "abandonment 证据含未完成临时文件；拒绝继续。");
-  }
-  const exists = fs.existsSync(file);
-  const marker = fs.existsSync(markerFile(workspaceId, stateDir));
-  if (!exists) {
-    if (marker) return corrupt("DESKTOP_ABANDONMENT_STORE_CORRUPT", "abandonment 主文件缺失；拒绝重置证据。");
-    return { version: 1, workspaceId, batches: [] };
-  }
-  if (!marker) return corrupt("DESKTOP_ABANDONMENT_STORE_CORRUPT", "abandonment 初始化标记缺失；拒绝读取证据。");
-  let parsed: unknown;
-  try { parsed = JSON.parse(fs.readFileSync(file, "utf8")); }
-  catch { return corrupt("DESKTOP_ABANDONMENT_STORE_CORRUPT", "abandonment 证据损坏；保留文件并人工核对。"); }
-  const state = abandonmentStateSchema.safeParse(parsed);
-  if (!state.success || state.data.workspaceId !== workspaceId) {
-    return corrupt("DESKTOP_ABANDONMENT_STORE_CORRUPT", "abandonment 证据 schema 或 workspaceId 不一致；拒绝继续。");
-  }
-  return state.data;
+  return readEvidenceState<AbandonmentState>({
+    file: abandonmentFile(workspaceId, stateDir),
+    marker: markerFile(workspaceId, stateDir),
+    workspaceId,
+    schema: abandonmentStateSchema,
+    emptyState: () => ({ version: 1, workspaceId, batches: [] }),
+    corrupt: message => corrupt("DESKTOP_ABANDONMENT_STORE_CORRUPT", message),
+    messages: storeMessages,
+  });
 }
 
 function writeState(workspaceId: string, state: AbandonmentState, stateDir = getStateDir()): void {
-  const file = abandonmentFile(workspaceId, stateDir);
-  const marker = markerFile(workspaceId, stateDir);
-  const temporary = `${file}.${randomUUID()}.tmp`;
-  let fd: number | undefined;
-  let prepared = false;
-  try {
-    const parsed = abandonmentStateSchema.parse(state);
-    ensureDir(path.dirname(file));
-    fd = fs.openSync(temporary, "wx", 0o600);
-    fs.writeFileSync(fd, JSON.stringify(parsed), "utf8");
-    fs.fsyncSync(fd);
-    prepared = true;
-  } catch {
-    throw new AbandonmentError("DESKTOP_ABANDONMENT_STORE_WRITE", "abandonment 证据无法写入；保留原文件并人工核对。");
-  } finally {
-    if (fd !== undefined) fs.closeSync(fd);
-    if (!prepared) fs.rmSync(temporary, { force: true });
-  }
-  try {
-    fs.renameSync(temporary, file);
-    try { fs.chmodSync(file, 0o600); } catch { /* best effort on Windows */ }
-    if (!fs.existsSync(marker)) {
-      const markerFd = fs.openSync(marker, "wx", 0o600);
-      try { fs.writeFileSync(markerFd, "1\n", "utf8"); fs.fsyncSync(markerFd); }
-      finally { fs.closeSync(markerFd); }
-    }
-  } catch {
-    throw new AbandonmentError("DESKTOP_ABANDONMENT_STORE_WRITE", "abandonment 证据提交失败；保留原文件并人工核对。");
-  } finally {
-    fs.rmSync(temporary, { force: true });
-  }
+  writeEvidenceState<AbandonmentState>({
+    file: abandonmentFile(workspaceId, stateDir),
+    marker: markerFile(workspaceId, stateDir),
+    schema: abandonmentStateSchema,
+    wrapParseErrors: true,
+    ensureDir,
+    openTmpInsideTry: true,
+    cleanupTmpOnPrepareFailure: true,
+    writeEncoding: "utf8",
+    onWriteError: phase => {
+      throw new AbandonmentError("DESKTOP_ABANDONMENT_STORE_WRITE",
+        phase === "prepare" ? "abandonment 证据无法写入；保留原文件并人工核对。" : "abandonment 证据提交失败；保留原文件并人工核对。");
+    },
+  }, state);
 }
 
 function deliverySummary(delivery: DesktopDelivery): AbandonmentDeliverySummary {

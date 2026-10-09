@@ -561,6 +561,21 @@ function companionRouteMismatch(): CompanionError {
   return new CompanionError("ROUTE_MISMATCH", "delivery route 与 companion 绑定不一致");
 }
 
+/** FIX B：请求 route 必须与冻结 sendTarget 一致；frozen attempt 不随 Active Sink 迁移。
+ * required=false：sendTarget 存在才比对（reserve/begin-send）；
+ * required=true：sendTarget 必须存在且比对一致（ack/retire）。 */
+function assertFrozenSendTargetMatches(
+  sendTarget: ResultBusEntry["sendTarget"],
+  routeCanonical: string,
+  message: string,
+  required: boolean,
+): void {
+  const mismatch = sendTarget ? !routesMatch(routeCanonical, sendTarget.canonicalUrl) : required;
+  if (mismatch) {
+    throw new ResultBusDeliveryError("RESULT_BUS_FROZEN_TARGET_MISMATCH", message);
+  }
+}
+
 type WebSinkAuth = WebSinkCompanionAuthContext | { error: unknown };
 
 function tryWebSinkAuth(input: { workspaceId: string; credential: string; stateDir?: string }): WebSinkAuth {
@@ -706,12 +721,8 @@ export function resultBusCompanionReserve(input: {
           "预约不属于当前已认证的 Active Web Sink；保持预约不变，拒绝返回旧预约信息。",
         );
       }
-      if (reserved.entry.sendTarget && !routesMatch(input.routeCanonical, reserved.entry.sendTarget.canonicalUrl)) {
-        throw new ResultBusDeliveryError(
-          "RESULT_BUS_FROZEN_TARGET_MISMATCH",
-          "reserve route 与冻结 sendTarget 不一致；拒绝暴露其他 route 的 in-flight 结果。",
-        );
-      }
+      assertFrozenSendTargetMatches(reserved.entry.sendTarget, input.routeCanonical,
+        "reserve route 与冻结 sendTarget 不一致；拒绝暴露其他 route 的 in-flight 结果。", false);
       return {
         reservationId: reserved.entry.reservation!.reservationId,
         delivery: busDeliveryDto(reserved.entry),
@@ -808,12 +819,8 @@ export function resultBusCompanionBeginSend(input: {
       // FIX B：credential verified route 必须与请求 route 一致（独立于 Active Sink 证据）。
       if (!routesMatch(input.routeCanonical, sinkAuth.routeCanonical)) throw companionRouteMismatch();
       // claimed 重放仍属于原 sendTarget；切换 Sink 不授予新 route 读取或发送旧载荷的权限。
-      if (source.entry.sendTarget && !routesMatch(input.routeCanonical, source.entry.sendTarget.canonicalUrl)) {
-        throw new ResultBusDeliveryError(
-          "RESULT_BUS_FROZEN_TARGET_MISMATCH",
-          "begin-send route 与冻结 sendTarget 不一致；frozen attempt 不随 Active Sink 迁移。",
-        );
-      }
+      assertFrozenSendTargetMatches(source.entry.sendTarget, input.routeCanonical,
+        "begin-send route 与冻结 sendTarget 不一致；frozen attempt 不随 Active Sink 迁移。", false);
       // reserved target boundary：若 reservation stamp 仍与当前 Active Sink 一致，
       // 请求 route 必须等于当前 Sink；Sink 已切换时交由 core stale-requeue 安全边界处理。
       const active = readActiveWebSinkBinding(input.workspaceId);
@@ -898,12 +905,8 @@ export function resultBusCompanionAck(input: {
       // FIX B：credential verified route 必须与请求 route 一致，且等于冻结 sendTarget。
       if (!routesMatch(input.routeCanonical, sinkAuth.routeCanonical)) throw companionRouteMismatch();
       // claimed/outcome_unknown/observed：请求 route 必须等于冻结 sendTarget canonicalUrl。
-      if (!source.entry.sendTarget || !routesMatch(input.routeCanonical, source.entry.sendTarget.canonicalUrl)) {
-        throw new ResultBusDeliveryError(
-          "RESULT_BUS_FROZEN_TARGET_MISMATCH",
-          "ack route 与冻结 sendTarget 不一致；frozen attempt 不随 Active Sink 迁移。",
-        );
-      }
+      assertFrozenSendTargetMatches(source.entry.sendTarget, input.routeCanonical,
+        "ack route 与冻结 sendTarget 不一致；frozen attempt 不随 Active Sink 迁移。", true);
       const acked = ackResultBusObserved(identity, {
         busEntryId: source.entry.busEntryId,
         attemptId: input.attemptId,
@@ -1049,12 +1052,8 @@ export function resultBusCompanionRetire(input: {
       const sinkAuth = verifyCompanionCredentialForWebSink({ workspaceId: input.workspaceId, credential: input.credential, stateDir });
       // FIX B：credential verified route 必须与请求 route 一致，且等于冻结 sendTarget。
       if (!routesMatch(input.routeCanonical, sinkAuth.routeCanonical)) throw companionRouteMismatch();
-      if (!source.entry.sendTarget || !routesMatch(input.routeCanonical, source.entry.sendTarget.canonicalUrl)) {
-        throw new ResultBusDeliveryError(
-          "RESULT_BUS_FROZEN_TARGET_MISMATCH",
-          "retire route 与冻结 sendTarget 不一致；frozen attempt 不随 Active Sink 迁移。",
-        );
-      }
+      assertFrozenSendTargetMatches(source.entry.sendTarget, input.routeCanonical,
+        "retire route 与冻结 sendTarget 不一致；frozen attempt 不随 Active Sink 迁移。", true);
       if (!source.entry.reservation || source.entry.reservation.reservationId !== input.reservationId) {
         throw new ResultBusDeliveryError(
           "RESULT_BUS_RESERVATION_MISMATCH",

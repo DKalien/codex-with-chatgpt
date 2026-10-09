@@ -1,4 +1,5 @@
-import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { safeEqual } from "../auth/store.js";
 import {
   normalizeChatgptConversationRoute,
   ChatGptRouteError,
@@ -33,12 +34,8 @@ export function sha256Hex(material: string): string {
   return createHash("sha256").update(material, "utf8").digest("hex");
 }
 
-export function hashEqual(a: string, b: string): boolean {
-  const ba = Buffer.from(a, "utf8");
-  const bb = Buffer.from(b, "utf8");
-  if (ba.length !== bb.length) return false;
-  return timingSafeEqual(ba, bb);
-}
+/** 常量时间比较；canonical 实现为 auth/store 的 safeEqual，保留既有导出名。 */
+export const hashEqual = safeEqual;
 
 export function mintPairingSecret(): { secret: string; secretHash: string } {
   const secret = `c2c_pair_${randomBytes(24).toString("base64url")}`;

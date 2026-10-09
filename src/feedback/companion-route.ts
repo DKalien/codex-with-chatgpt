@@ -18,6 +18,24 @@ import {
   type CompanionAuthContext,
 } from "./companion-common.js";
 
+/** challengeDigest 双查之一：存档 digest 与提交 digest 常量时间比对。 */
+function assertStoredChallengeDigest(att: { challengeDigest: string }, inputChallengeDigest: string): void {
+  if (!hashEqual(att.challengeDigest, inputChallengeDigest)) {
+    throw new CompanionError("ROUTE_ATTESTATION_INVALID", "challengeDigest 不匹配");
+  }
+}
+
+/** challengeDigest 双查之二：按绑定事实重算 digest 并比对（防存档篡改）。 */
+function assertRecomputedChallengeDigest(
+  facts: Parameters<typeof routeChallengeDigest>[0],
+  inputChallengeDigest: string,
+  mismatchMessage: string,
+): void {
+  if (!hashEqual(routeChallengeDigest(facts), inputChallengeDigest)) {
+    throw new CompanionError("ROUTE_ATTESTATION_INVALID", mismatchMessage);
+  }
+}
+
 /**
  * Trusted MCP confirm: origin conversation principal proves routeCanonical.
  * Wrong principal rejects WITHOUT consuming the challenge.
@@ -49,9 +67,7 @@ export function confirmRouteAttestation(input: {
     const rebind = state.rebindIntent;
     if (rebind?.routeAttestation.challengeId === input.challengeId) {
       const att = rebind.routeAttestation;
-      if (!hashEqual(att.challengeDigest, input.challengeDigest)) {
-        throw new CompanionError("ROUTE_ATTESTATION_INVALID", "challengeDigest 不匹配");
-      }
+      assertStoredChallengeDigest(att, input.challengeDigest);
       if (rebind.consumedAt || rebind.confirmedAt || att.status === "verified" || att.consumedAt) {
         throw new CompanionError("ROUTE_ATTESTATION_INVALID", "challenge 已消费");
       }
@@ -64,17 +80,14 @@ export function confirmRouteAttestation(input: {
         || att.routeCanonical !== rebind.routeCanonical) {
         throw new CompanionError("ROUTE_ATTESTATION_INVALID", "rebind challenge 与当前 binding 不一致");
       }
-      const expectedDigest = routeChallengeDigest({
+      assertRecomputedChallengeDigest({
         workspaceId: state.workspaceId,
         bindingId: rebind.bindingId,
         epoch: rebind.epoch,
         companionId: rebind.companionId,
         routeCanonical: rebind.routeCanonical,
         challengeId: att.challengeId,
-      });
-      if (!hashEqual(expectedDigest, input.challengeDigest)) {
-        throw new CompanionError("ROUTE_ATTESTATION_INVALID", "challengeDigest 与 rebind 事实不匹配");
-      }
+      }, input.challengeDigest, "challengeDigest 与 rebind 事实不匹配");
       const routeVerifiedAt = new Date(nowMs).toISOString();
       const verifiedAtt: RouteAttestation = {
         ...att,
@@ -117,9 +130,7 @@ export function confirmRouteAttestation(input: {
     if (att.challengeId !== input.challengeId) {
       throw new CompanionError("ROUTE_ATTESTATION_INVALID", "challengeId 不匹配");
     }
-    if (!hashEqual(att.challengeDigest, input.challengeDigest)) {
-      throw new CompanionError("ROUTE_ATTESTATION_INVALID", "challengeDigest 不匹配");
-    }
+    assertStoredChallengeDigest(att, input.challengeDigest);
     if (att.consumedAt) {
       throw new CompanionError("ROUTE_ATTESTATION_INVALID", "challenge 已消费");
     }
@@ -132,17 +143,14 @@ export function confirmRouteAttestation(input: {
     if (att.routeCanonical !== companion.routeCanonical) {
       throw new CompanionError("ROUTE_ATTESTATION_INVALID", "challenge route 与 companion 不一致");
     }
-    const expectedDigest = routeChallengeDigest({
+    assertRecomputedChallengeDigest({
       workspaceId: state.workspaceId,
       bindingId: companion.bindingId,
       epoch: companion.epoch,
       companionId: companion.companionId,
       routeCanonical: companion.routeCanonical,
       challengeId: att.challengeId,
-    });
-    if (!hashEqual(expectedDigest, input.challengeDigest)) {
-      throw new CompanionError("ROUTE_ATTESTATION_INVALID", "challengeDigest 与绑定事实不匹配");
-    }
+    }, input.challengeDigest, "challengeDigest 与绑定事实不匹配");
     const routeVerifiedAt = new Date(nowMs).toISOString();
     const verifiedAtt = {
       ...att,

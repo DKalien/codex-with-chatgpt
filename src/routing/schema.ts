@@ -1,4 +1,5 @@
 import path from "node:path";
+import { EXECUTOR_MESSAGE_MAX_BYTES } from "../executor-control/schema.js";
 import { createHash } from "node:crypto";
 import { z } from "zod";
 
@@ -33,7 +34,7 @@ export type RoutingRole = z.infer<typeof routingRoleSchema>;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 /** 持久化层 UUID：仅 canonical lowercase；人工改成非 canonical → fail closed。 */
 const CANONICAL_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-const HEX64 = /^[a-f0-9]{64}$/;
+import { HEX64 } from "../core/hex.js";
 /** 与 desktop store 的 desktopId 同字符集：workspace 内稳定短 ID。 */
 const ROUTING_ID = /^[A-Za-z0-9_-]{1,128}$/;
 /** chatgpt_web：沿用现有 ChatGPT legacy conversation 字符集（src/chatgpt/route.ts）。 */
@@ -129,7 +130,7 @@ export type CommandDeliveryStatus = z.infer<typeof commandDeliveryStatusSchema>;
 export const commandMailboxSchema = z.object({
   kind: z.enum(["desktop", "executor"]),
   state: z.enum(["queued", "dispatching", "blocked"]),
-  message: z.string().min(1).max(65536),
+  message: z.string().min(1).max(EXECUTOR_MESSAGE_MAX_BYTES),
   clientId: z.string().min(1).max(256),
   tokenHash: z.string().regex(HEX64),
   bindingId: routingUuidSchema,

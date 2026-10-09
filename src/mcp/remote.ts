@@ -18,7 +18,7 @@ import {
   RemoteError,
   taskInput,
 } from "../remote/store.js";
-import { resolveToolWorkspace, type WorkspaceSource } from "./tool-shared.js";
+import { resolveToolWorkspace, scopeSatisfied, wwwAuthenticateChallenge, type WorkspaceSource } from "./tool-shared.js";
 
 export function registerRemoteTools(
   server: McpServer,
@@ -38,7 +38,7 @@ export function registerRemoteTools(
   function guard(requestedWorkspaceId: string, auth: AuthInfo | undefined, scope: string) {
     const workspace = resolveToolWorkspace(source, { workspaceId: requestedWorkspaceId }, auth);
     if (profile === "legacy" && fixedWorkspace && isOfficialRemoteMode(fixedWorkspace.id)) throw new RemoteError("OFFICIAL_MODE_ACTIVE");
-    if (!auth?.scopes.includes(scope)) throw new RemoteError("INSUFFICIENT_SCOPE", scope);
+    if (!auth || !scopeSatisfied(auth, scope)) throw new RemoteError("INSUFFICIENT_SCOPE", scope);
     if (requestedWorkspaceId !== workspace.id) throw new RemoteError("UNKNOWN_WORKSPACE");
     const state = authorized(readRemote(workspace.id));
     if (state.workspaceRoot !== workspace.root) throw new RemoteError("UNKNOWN_WORKSPACE");
@@ -52,7 +52,7 @@ export function registerRemoteTools(
     } catch (error) {
       const code = error instanceof RemoteError || error instanceof GatewayRegistryError ? error.code : "REMOTE_STATE_ERROR";
       return { isError: true, content: [{ type: "text" as const, text: JSON.stringify({ error: code }) }],
-        ...(code === "INSUFFICIENT_SCOPE" ? { _meta: { "mcp/www_authenticate": [`Bearer error="insufficient_scope", scope="${scope}"`] } } : {}) };
+        ...(code === "INSUFFICIENT_SCOPE" ? wwwAuthenticateChallenge(scope, "bare") : {}) };
     }
   }
   const metadata = (scope: string, write: boolean) => ({

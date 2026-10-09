@@ -90,7 +90,8 @@ Planner route → Project → Command → Executor route → ExecutionResult →
 
 - 存储：per-workspace 单文件 `<stateDir>/routing/<workspaceId>.json`；workspace 是安全边界。
 - 范式对齐 desktop store：`wx` 文件锁（`ROUTING_STORE_BUSY`）、tmp+rename+fsync 原子写、
-  `.initialized` 标记、损坏 fail closed（`ROUTING_STATE_CORRUPT`）。
+  `.initialized` 标记、损坏 fail closed（`ROUTING_STATE_CORRUPT`）。写纪律模板与 desktop store
+  共用 `src/core/durable-store.ts`（2026-10-09 收敛，行为合同不变）。
 - 与 desktop store 的差异：Routing 是全新 store，无历史兼容包袱——`revision` 必填
   （transient 空状态显式 `revision: 0`，首次 durable write 后为 1；persisted revision 缺失
   即 `ROUTING_STATE_CORRUPT`，不允许回退到 0 重新计数）；exact replay 不重写主 state 文件。

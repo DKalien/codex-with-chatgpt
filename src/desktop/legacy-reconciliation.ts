@@ -1,5 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
-import fs from "node:fs";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import { z } from "zod";
 import { ensureDir, getStateDir } from "../config/paths.js";
@@ -15,6 +14,11 @@ import { getRetiredLegacyCommandIds, readLegacyRetirements } from "./legacy-reti
 import { getAbandonedCommandIds, readAbandonedCommandIds } from "./abandonment.js";
 import { LegacyReconciliationError, withEvidenceLock } from "./recovery-evidence.js";
 import { withCommandOperation } from "../command-cleanup/fence.js";
+import {
+  readEvidenceState as readSharedEvidenceState,
+  writeEvidenceState as writeSharedEvidenceState,
+  type EvidenceReadMessages,
+} from "../core/evidence-store.js";
 export { LegacyReconciliationError, withEvidenceLock } from "./recovery-evidence.js";
 
 const terminalStatuses = new Set(["ok", "failed", "blocked"]);
@@ -97,58 +101,43 @@ function markerFile(workspaceId: string, stateDir = getStateDir()): string {
 }
 
 
-function hasTemporaryEvidence(workspaceId: string, stateDir = getStateDir()): boolean {
-  const dir = path.dirname(legacyReconciliationFile(workspaceId, stateDir));
-  const base = path.basename(legacyReconciliationFile(workspaceId, stateDir));
-  try {
-    return fs.readdirSync(dir).some(name => name.startsWith(`${base}.`) && name.endsWith(".tmp"));
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
-    throw new LegacyReconciliationError("LEGACY_RECONCILIATION_STORE_CORRUPT", "遗留 reconciliation 目录无法读取；拒绝继续。");
-  }
-}
-
 function corruptStore(message = "遗留 reconciliation 证据损坏或未完成；保留原文件并人工核对。"): never {
   throw new LegacyReconciliationError("LEGACY_RECONCILIATION_STORE_CORRUPT", message);
 }
 
-function readEvidenceState(workspaceId: string, stateDir = getStateDir()): { version: 1; workspaceId: string; entries: LegacyReconciliationEvidence[] } {
-  const file = legacyReconciliationFile(workspaceId, stateDir);
-  if (hasTemporaryEvidence(workspaceId, stateDir)) corruptStore();
-  const exists = fs.existsSync(file);
-  const marker = fs.existsSync(markerFile(workspaceId, stateDir));
-  if (!exists) {
-    if (marker) corruptStore("遗留 reconciliation 主文件缺失；拒绝重置证据。");
-    return { version: 1, workspaceId, entries: [] };
-  }
-  if (!marker) corruptStore("遗留 reconciliation 初始化标记缺失；拒绝读取证据。");
-  let parsed: unknown;
-  try { parsed = JSON.parse(fs.readFileSync(file, "utf8")); }
-  catch { corruptStore(); }
-  const state = evidenceStateSchema.safeParse(parsed);
-  if (!state.success || state.data.workspaceId !== workspaceId) corruptStore();
-  return state.data;
+const storeMessages: EvidenceReadMessages = {
+  directoryUnreadable: "遗留 reconciliation 目录无法读取；拒绝继续。",
+  temporaryFiles: "遗留 reconciliation 证据损坏或未完成；保留原文件并人工核对。",
+  missingMainFile: "遗留 reconciliation 主文件缺失；拒绝重置证据。",
+  missingMarker: "遗留 reconciliation 初始化标记缺失；拒绝读取证据。",
+  bodyCorrupt: "遗留 reconciliation 证据损坏或未完成；保留原文件并人工核对。",
+  schemaMismatch: "遗留 reconciliation 证据损坏或未完成；保留原文件并人工核对。",
+};
+
+type ReconciliationState = { version: 1; workspaceId: string; entries: LegacyReconciliationEvidence[] };
+
+function readEvidenceState(workspaceId: string, stateDir = getStateDir()): ReconciliationState {
+  return readSharedEvidenceState<ReconciliationState>({
+    file: legacyReconciliationFile(workspaceId, stateDir),
+    marker: markerFile(workspaceId, stateDir),
+    workspaceId,
+    schema: evidenceStateSchema,
+    emptyState: () => ({ version: 1, workspaceId, entries: [] }),
+    corrupt: message => corruptStore(message),
+    messages: storeMessages,
+  });
 }
 
-function writeEvidenceState(workspaceId: string, state: { version: 1; workspaceId: string; entries: LegacyReconciliationEvidence[] }, stateDir = getStateDir()): void {
-  const file = legacyReconciliationFile(workspaceId, stateDir);
-  const marker = markerFile(workspaceId, stateDir);
-  const temporary = `${file}.${randomUUID()}.tmp`;
-  const parsed = evidenceStateSchema.parse(state);
-  const fd = fs.openSync(temporary, "wx", 0o600);
-  try {
-    fs.writeFileSync(fd, JSON.stringify(parsed));
-    fs.fsyncSync(fd);
-  } finally { fs.closeSync(fd); }
-  try {
-    fs.renameSync(temporary, file);
-    try { fs.chmodSync(file, 0o600); } catch { /* best effort on Windows */ }
-    if (!fs.existsSync(marker)) {
-      const markerFd = fs.openSync(marker, "wx", 0o600);
-      try { fs.writeFileSync(markerFd, "1\n"); fs.fsyncSync(markerFd); }
-      finally { fs.closeSync(markerFd); }
-    }
-  } finally { fs.rmSync(temporary, { force: true }); }
+function writeEvidenceState(workspaceId: string, state: ReconciliationState, stateDir = getStateDir()): void {
+  // 历史行为：不做 ensureDir、openSync/parse 失败原样外溢、prepare 失败保留 tmp 残片。
+  writeSharedEvidenceState<ReconciliationState>({
+    file: legacyReconciliationFile(workspaceId, stateDir),
+    marker: markerFile(workspaceId, stateDir),
+    schema: evidenceStateSchema,
+    wrapParseErrors: false,
+    openTmpInsideTry: false,
+    cleanupTmpOnPrepareFailure: false,
+  }, state);
 }
 
 function canonical(value: unknown): value is string {

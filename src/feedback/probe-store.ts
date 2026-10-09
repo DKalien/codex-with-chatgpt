@@ -29,7 +29,7 @@ export function isFeedbackProbeEnabled(): boolean {
 }
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const HEX64 = /^[a-f0-9]{64}$/;
+import { HEX64 } from "../core/hex.js";
 const HEX32 = /^[a-f0-9]{32}$/;
 
 export const probeLabelSchema = z.string().regex(/^[A-Za-z0-9_-]{0,64}$/).optional();

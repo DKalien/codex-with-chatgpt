@@ -4,7 +4,13 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import { Workspace } from "../workspace/manager.js";
 import { GatewayRegistryError } from "../gateway/registry.js";
-import { resolveToolWorkspace, workspaceIdShape, type WorkspaceSource } from "./tool-shared.js";
+import {
+  requireScopeReauth as requireScope,
+  resolveToolWorkspace,
+  wwwAuthenticateChallenge,
+  workspaceIdShape,
+  type WorkspaceSource,
+} from "./tool-shared.js";
 import {
   resolveConversationPrincipal,
   requireConversationPrincipal,
@@ -94,13 +100,7 @@ function fail(code: string, message: string, scope?: string): ToolResult {
   return {
     isError: true,
     content: [{ type: "text", text: JSON.stringify({ error: code, message }) }],
-    ...(scope ? {
-      _meta: {
-        "mcp/www_authenticate": [
-          `Bearer error="insufficient_scope", error_description="Reauthorize this connector with ${scope}", scope="${scope}"`,
-        ],
-      },
-    } : {}),
+    ...(scope ? wwwAuthenticateChallenge(scope, "reauth") : {}),
   };
 }
 
@@ -117,14 +117,6 @@ function mapError(error: unknown): ToolResult {
     return fail(code, (error as Error).message);
   }
   return fail("FEEDBACK_INTERNAL", error instanceof Error ? error.message : String(error));
-}
-
-function requireScope(authInfo: AuthInfo | undefined, scope: string): ToolResult | null {
-  if (!authInfo) return null;
-  if (!authInfo.scopes.includes(scope)) {
-    return fail("INSUFFICIENT_SCOPE", `This operation requires the '${scope}' scope.`, scope);
-  }
-  return null;
 }
 
 type Extra = {

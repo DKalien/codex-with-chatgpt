@@ -103,7 +103,7 @@ Normal C2C 的 Computer Use 小消息流程仍是独立支持模式；不把它�
 | `feedback/` | Production feedback outbox + companion transport: pairing/credential, route-principal attestation (challenge → `feedback_companion_route_confirm` → VERIFIED), reserve/begin-send/ack/retire, stale → `outcome_unknown`, exact late-positive ACK |
 | `browser-companion/` | MV3 sources → `dist/browser-companion`: SW-only Bridge HTTP + durable send journal + route-attestation fence; content_scripts use built classic artifacts (including `*-global.js` and classic wrappers), while ESM `dom-adapter`/`turn-observer`/`route-attestation*` stay for the SW import graph; autonomy default OFF; zero DOM/Send unless explicit production one-shot or armed heartbeat; production Send requires **route VERIFIED**；display-only toolbar indicator uses `C/C!/C×`，低频 `alarms` 只做 `/state` discovery |
 | `process/` | Daemon spawn/reuse, health probing, graceful shutdown; Windows daemon spawn escapes Job kill-on-close via the Python stdlib helper `daemon_spawn.py` (`CREATE_BREAKAWAY_FROM_JOB` → WMI `Win32_Process.Create` relay, fail closed when Job escape cannot be proven), handing a bounded explicit allowlisted daemon env over through a 0600 JSON file (OS/runtime/path variables plus the exact C2C config set the bridge reads; unknown parent secrets/context excluded; a fresh startup lease is injected explicitly after projection, never inherited from the parent) so the bridge survives its spawner (e.g. Codex) exiting |
-| `core/` | Verified machine install metadata, guarded rollout and per-workspace pending upgrades; real installs reclaim unreferenced immutable releases through the existing `gc --apply` gates (maintenance lock, rollout fence, start lock, tombstone + no-follow delete); `--protect-current` never deletes |
+| `core/` | Verified machine install metadata, guarded rollout and per-workspace pending upgrades; real installs reclaim unreferenced immutable releases through the existing `gc --apply` gates (maintenance lock, rollout fence, start lock, tombstone + no-follow delete); `--protect-current` never deletes。另承载零业务依赖的共享安全原语：`durable-store.ts`（durable store 事务模板唯一实现点：wx 锁、fsyncSync、initialized marker、tmp wx 0600、原子 rename、noWrite/revision 策略注入）、`evidence-store.ts`（行政证据 store read/write 模板）、`hex.ts`（HEX64 唯一定义）；安全门禁清单与定期审查机制见 [security-gate-audit](security-gate-audit.md) |
 | `cli/` | `c2c` commands; `--json` everywhere for the Skill |
 | `supervisor/` | Per-workspace desired state, exact process lease, conservative recovery through existing daemon authority, and least-privilege Windows user-logon task registration |
 | `config/`, `logger/` | OS-convention state dir, secret-redacting logger |
@@ -155,12 +155,14 @@ command48 最终 gate **未通过**：唯一 serial full 158 files/3200 tests中
 
 ### R5 source status
 
-The current source includes the reviewed R5a-R5c slices:
+The current source includes the reviewed R5 slices:
 
 - R5a defines generic endpoint contracts and a fixed registry in `src/endpoints/`.
 - R5b adds the Bridge-owned Active Executor Binding in `src/executor-control/`; the production registry still contains only Codex Desktop, and local binding remains explicit.
 - R5c adds the Bridge-owned Active Web Sink Binding in `src/web-sink-control/`; Browser Connect is explicit and navigation does not retarget the sink.
-- R5d Result Bus, dynamic endpoint switching, and Bridge lifecycle retirement are not implemented.
+- R5d adds the Result Bus in `src/result-bus/`（含 shadow reconciliation、begin-send 冻结 sendTarget 与 R5d3 cutover）以及 dynamic endpoint switching 的 Bus 侧切换；对应 `tests/r5d1-*`/`r5d2-*`/`r5d3-*`。
+- R5e adds the Executor Dispatch durable target pin（`src/endpoint-switch/`、`src/executor-control/dispatch-*`）与 Web Sink switch 独立性边界；对应 `tests/r5e-*`。
+- R5g/R5h add cross-plugin end-to-end 与 command cleanup（`src/command-cleanup/`）；对应 `tests/r5g-*`/`r5h-*`。
 
 These are source/repository facts only. They do not claim that the current machine runtime has installed or rolled out this checkout; verify `status --json` and the named idle rollout gates before deployment.
 
@@ -218,6 +220,7 @@ R4.5 是面向 R5 的行为保持型结构整理，不是协议、持久化 sche
 - **Desktop TypeScript IPC**：`src/desktop/ipc.ts` 保持稳定 facade；contracts、transport、errors、validation 和 client 分层，调用方继续使用原公共入口。
 - **Python Desktop helper**：`desktop_ipc.py` 是精确 sibling bootstrap，加载 `c2c_desktop_ipc` package；dispatch、common、history、identity、operations、reconciliation、result、transport 各自负责窄领域，使用 `python -I` 时不修改 `sys.path`。
 - **Feedback / Companion**：`src/feedback/store.ts` 与 `companion.ts` 是兼容 facade；`state-store` 是唯一 feedback lock/write transaction owner，receiver、delivery-lifecycle、projection-store 分离。Companion 的 common/state/pairing/route/rebind/delivery/projection 分模块；ACK transition 集中在 delivery lifecycle。Browser Companion 仍是 return-only transport。
+- **durable 写纪律（2026-10-09 收敛）**：六份 durable store（executor-control/dispatch/web-sink/routing/result-bus/desktop）与四份行政证据 store 的写事务模板分别唯一实现于 `src/core/durable-store.ts` 与 `src/core/evidence-store.ts`；各 store 只保留读语义、域错误注入与差异回调（错误码/文案/noWrite/revision 公式逐店原样）。行为合同不变，详见 [security-gate-audit §5.1](security-gate-audit.md)。
 - **Desktop result / finalizer / recovery**：`result.ts` 与 `receipt-finalizer.ts` 是稳定 facade；result-schema/evidence/commit/record/finalization 分层。可信 output 与 receipt append 只有一个 commit path；receipt-finalizer 的 schema/store/worker 分离，worker 仅做 orchestration。`recovery-evidence` 持有通用 evidence lock/proof primitive，administrative recovery 仍不代表 completion。
 - **Session / workflow / MCP**：`session/state.ts` facade 组合 schema、conversation、store、operations，store 是唯一 session lock/atomic-write owner。`workflow/readiness.ts` facade 组合 model、policy、projection，policy 是只依赖 model 的 pure module。`mcp/server.ts` 是 composition root，组合 workspace、execution、write-probe 及既有 remote/desktop/feedback groups；shared contracts 位于 tool-shared/base-schemas。
 - **Dependency fences**：domain modules 不依赖 CLI；canonical Routing projector/outbox 不依赖 Feedback/Browser；Companion 不获得 task-delivery、executor 或 Desktop IPC authority；内部模块依赖窄的 owning module，而不是反向穿透 public facade。

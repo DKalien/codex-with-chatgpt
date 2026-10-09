@@ -12,7 +12,7 @@ Codex with ChatGPT 让 ChatGPT 负责规划与 Review，由 Codex 保留执行�
 
 ## 入口与目录
 
-- `src/` 是实现，`tests/` 是回归，`skill/SKILL.md` 是用户流程权威；安全和机制分别见 `docs/security.md`、`docs/architecture.md`。
+- `src/` 是实现，`tests/` 是回归，`skill/SKILL.md` 是用户流程权威；安全和机制分别见 `docs/security.md`、`docs/architecture.md`；安全门禁清单、价值评估矩阵与定期审查机制见 `docs/security-gate-audit.md`。
 - `scripts/dev-install.ps1` 构建并安装机器 Core、Skill，随后执行 best-effort rollout；真实安装成功后自动通过已安装 launcher 执行 `gc --apply` 回收无引用旧 release（best effort，失败仅告警；`--protect-current` 冻结修复不回收）。日常 CLI 使用安装返回的稳定 launcher；checkout 入口只用于明确的源码维护/验证。
 - 机器 `current.json` 指向不可变 `releases/<buildId>`；源码 build 不等于安装，安装也不等于所有运行中的 Bridge 已升级。先只读核对 `status --json` 的 `runtimeUpgrade`。
 - Skill 只有一个 `<C2C_LAUNCHER_PATH>` 占位符，部署后核对源码替换结果与实际安装内容一致。

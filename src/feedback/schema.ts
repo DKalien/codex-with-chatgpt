@@ -27,7 +27,7 @@ export const COMPANION_ROUTE_ATTEST_TTL_MS = 10 * 60_000;
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const HEX32 = /^[a-f0-9]{32}$/;
-const HEX64 = /^[a-f0-9]{64}$/;
+import { HEX64 } from "../core/hex.js";
 export const WORKSPACE_ID = /^[a-f0-9]{12}$/;
 const DESKTOP_ID = /^[A-Za-z0-9_-]{1,128}$/;
 

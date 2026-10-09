@@ -298,7 +298,7 @@ claimed/observed/outcome_unknown/retired_unknown
 
 即 queued/reserved 均未冻结目的地；begin-send（reserved → claimed）是冻结边界，冻结后 target 不可消失或改指。
 
-R5d2 lifecycle core 状态机（全部经由 result-bus store-owned 事务原语写盘；单锁、revision +1 恰好一次、noWrite 字节等价、fsync + atomic rename）：
+R5d2 lifecycle core 状态机（全部经由 result-bus store 的事务入口写盘，写纪律模板统一实现在 `src/core/durable-store.ts`（2026-10-09 收敛）；单锁、revision +1 恰好一次、noWrite 字节等价、fsync + atomic rename）：
 
 ```text
 queued -> reserved                    reserve-next：按 createdAt 升序 + busEntryId 决胜，

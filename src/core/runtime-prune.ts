@@ -54,7 +54,7 @@ export interface RuntimePruneApplyResult {
 }
 
 const WORKSPACE_ID = /^[a-f0-9]{12}$/;
-const HEX64 = /^[a-f0-9]{64}$/;
+import { HEX64 } from "./hex.js";
 
 /**
  * Base schema allows missing/legacy runtimeBuildId only.

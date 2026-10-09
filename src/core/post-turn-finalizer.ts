@@ -5,7 +5,7 @@ import { z } from "zod";
 import { Workspace } from "../workspace/manager.js";
 import { assertMaintenanceHandle, type MaintenanceLockHandle } from "./maintenance-lock.js";
 
-const HEX64 = /^[a-f0-9]{64}$/;
+import { HEX64 } from "./hex.js";
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const WORKSPACE_ID = /^[a-f0-9]{12}$/;
 

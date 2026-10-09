@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { MAX_MESSAGE_BYTES } from "./store.js";
 import { z } from "zod";
 import { sanitizeExecutionOutput } from "../execution/sanitize.js";
 import {
@@ -78,7 +79,7 @@ export const receiptFinalizationOwnershipSnapshotSchema = z.object({
   projectId: z.string().min(1).max(128),
   workspaceRoot: z.string().min(1).max(32_768),
   intent: z.enum(["development_plan", "revision"]),
-  messageBytes: z.number().int().safe().min(1).max(65_536),
+  messageBytes: z.number().int().safe().min(1).max(MAX_MESSAGE_BYTES),
   messageSha256: z.string().regex(/^[a-f0-9]{64}$/),
   ownership: z.enum(["origin", "native_continuation"]),
   originTurnId: UUID,

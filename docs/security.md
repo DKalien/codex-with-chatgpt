@@ -322,3 +322,7 @@ can still influence Desktop behavior under the local user's authorization, the
 session's existing permissions and Desktop approval flow. There is no promise
 against a malicious client that already has the Desktop scope. The separate
 write probe remains limited to its documented C2C state record.
+
+## 安全门禁清单与定期审查
+
+全部安全门禁的清单、价值评估矩阵、冗余处置结论（含保留建议与证据）以及季度轻扫 + 双 release 复审的定期审查机制，见 [security-gate-audit.md](security-gate-audit.md)。新增或修改安全控制时须同步补该报告的矩阵行。

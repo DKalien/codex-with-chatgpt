@@ -1,5 +1,5 @@
-import { createHash, randomUUID } from "node:crypto";
-import fs from "node:fs";
+import { createHash } from "node:crypto";
+import { MAX_MESSAGE_BYTES } from "./store.js";
 import path from "node:path";
 import { z } from "zod";
 import { ensureDir, getStateDir } from "../config/paths.js";
@@ -11,6 +11,7 @@ import { withEvidenceLock } from "./recovery-evidence.js";
 import { readLegacyRetirements } from "./legacy-retirement.js";
 import { DesktopError, desktopId, readDesktop, type DesktopDelivery, type DesktopState } from "./store.js";
 import { withCommandOperation } from "../command-cleanup/fence.js";
+import { readEvidenceState, writeEvidenceState, type EvidenceReadMessages } from "../core/evidence-store.js";
 
 const uuid = z.string().uuid();
 const sha256 = z.string().regex(/^[a-f0-9]{64}$/);
@@ -23,7 +24,7 @@ const deliverySchema = z.object({
   bindingId: uuid,
   intent: z.union([z.literal("development_plan"), z.literal("revision"), z.null()]),
   messageSha256: sha256,
-  messageBytes: z.number().int().positive().max(64 * 1024),
+  messageBytes: z.number().int().positive().max(MAX_MESSAGE_BYTES),
   threadId: uuid,
   deliveryStatus: z.literal("outcome_unknown"),
   createdAt: z.string().datetime(),
@@ -93,62 +94,42 @@ function resolutionFile(workspaceId: string, stateDir = getStateDir()): string {
 }
 export function outcomeResolutionFile(workspaceId: string, stateDir = getStateDir()): string { return resolutionFile(workspaceId, stateDir); }
 function markerFile(workspaceId: string, stateDir = getStateDir()): string { return `${resolutionFile(workspaceId, stateDir)}.initialized`; }
-function hasTemp(workspaceId: string, stateDir = getStateDir()): boolean {
-  const file = resolutionFile(workspaceId, stateDir);
-  try {
-      return fs.readdirSync(path.dirname(file)).some(name => name.startsWith(`${path.basename(file)}.`) && name.endsWith(".tmp"));
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
-    return corrupt("行政 resolution 目录无法读取；拒绝继续。");
-  }
-}
+const storeMessages: EvidenceReadMessages = {
+  directoryUnreadable: "行政 resolution 目录无法读取；拒绝继续。",
+  temporaryFiles: "行政 resolution 含未完成临时文件；拒绝继续。",
+  missingMainFile: "行政 resolution 主文件缺失；拒绝重置证据。",
+  missingMarker: "行政 resolution 初始化标记缺失；拒绝读取证据。",
+  bodyCorrupt: "行政 resolution 证据损坏；保留文件并人工核对。",
+  schemaMismatch: "行政 resolution schema 或 workspaceId 不一致；拒绝继续。",
+};
 
 function readState(workspaceId: string, stateDir = getStateDir()): ResolutionState {
-  const file = resolutionFile(workspaceId, stateDir);
-  if (hasTemp(workspaceId, stateDir)) return corrupt("行政 resolution 含未完成临时文件；拒绝继续。");
-  const exists = fs.existsSync(file);
-  const marker = fs.existsSync(markerFile(workspaceId, stateDir));
-  if (!exists) {
-    if (marker) return corrupt("行政 resolution 主文件缺失；拒绝重置证据。");
-    return { version: 1, workspaceId, entries: [] };
-  }
-  if (!marker) return corrupt("行政 resolution 初始化标记缺失；拒绝读取证据。");
-  let parsed: unknown;
-  try { parsed = JSON.parse(fs.readFileSync(file, "utf8")); }
-  catch { return corrupt("行政 resolution 证据损坏；保留文件并人工核对。"); }
-  const state = stateSchema.safeParse(parsed);
-  if (!state.success || state.data.workspaceId !== workspaceId) return corrupt("行政 resolution schema 或 workspaceId 不一致；拒绝继续。");
-  return state.data;
+  return readEvidenceState<ResolutionState>({
+    file: resolutionFile(workspaceId, stateDir),
+    marker: markerFile(workspaceId, stateDir),
+    workspaceId,
+    schema: stateSchema,
+    emptyState: () => ({ version: 1, workspaceId, entries: [] }),
+    corrupt: message => corrupt(message),
+    messages: storeMessages,
+  });
 }
 
 function writeState(workspaceId: string, state: ResolutionState, stateDir = getStateDir()): void {
-  const file = resolutionFile(workspaceId, stateDir);
-  const marker = markerFile(workspaceId, stateDir);
-  const temporary = `${file}.${randomUUID()}.tmp`;
-  let fd: number | undefined;
-  let prepared = false;
-  try {
-    const parsed = stateSchema.parse(state);
-    ensureDir(path.dirname(file));
-    fd = fs.openSync(temporary, "wx", 0o600);
-    fs.writeFileSync(fd, JSON.stringify(parsed), "utf8");
-    fs.fsyncSync(fd);
-    prepared = true;
-  } catch { return corrupt("行政 resolution 证据无法写入；保留原文件并人工核对。"); }
-  finally {
-    if (fd !== undefined) fs.closeSync(fd);
-    if (!prepared) fs.rmSync(temporary, { force: true });
-  }
-  try {
-    fs.renameSync(temporary, file);
-    try { fs.chmodSync(file, 0o600); } catch { /* best effort on Windows */ }
-    if (!fs.existsSync(marker)) {
-      const markerFd = fs.openSync(marker, "wx", 0o600);
-      try { fs.writeFileSync(markerFd, "1\n", "utf8"); fs.fsyncSync(markerFd); }
-      finally { fs.closeSync(markerFd); }
-    }
-  } catch { return corrupt("行政 resolution 证据提交失败；保留原文件并人工核对。"); }
-  finally { fs.rmSync(temporary, { force: true }); }
+  // 历史行为：写失败一律映射为 STORE_CORRUPT，而不是 STORE_WRITE。
+  writeEvidenceState<ResolutionState>({
+    file: resolutionFile(workspaceId, stateDir),
+    marker: markerFile(workspaceId, stateDir),
+    schema: stateSchema,
+    wrapParseErrors: true,
+    ensureDir,
+    openTmpInsideTry: true,
+    cleanupTmpOnPrepareFailure: true,
+    writeEncoding: "utf8",
+    onWriteError: phase => corrupt(phase === "prepare"
+      ? "行政 resolution 证据无法写入；保留原文件并人工核对。"
+      : "行政 resolution 证据提交失败；保留原文件并人工核对。"),
+  }, state);
 }
 
 function canonicalDelivery(delivery: DesktopDelivery): z.infer<typeof deliverySchema> {

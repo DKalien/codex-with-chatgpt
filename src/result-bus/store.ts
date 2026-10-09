@@ -1,7 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { ensureDir, getStateDir } from "../config/paths.js";
+import { getStateDir } from "../config/paths.js";
+import { runDurableStoreTransaction, simpleWxLock } from "../core/durable-store.js";
 import { resolveWorkspaceIdentity, type RoutingWorkspaceIdentity } from "../routing/store.js";
 import { resultBusResultDigest, type OfficialResult } from "./official-result.js";
 import { routingCommandIdSchema, routingWorkspaceIdSchema, type RoutingResult } from "../routing/schema.js";
@@ -53,22 +54,6 @@ function emptyState(identity: RoutingWorkspaceIdentity): ResultBusState {
   return { version: 1, workspaceId: identity.id, workspaceRoot: identity.root, revision: 0, entries: [] };
 }
 
-function writeAtomic(file: string, state: ResultBusState): void {
-  const temporary = `${file}.${randomUUID()}.tmp`;
-  const fd = fs.openSync(temporary, "wx", 0o600);
-  try {
-    fs.writeFileSync(fd, JSON.stringify(resultBusStateSchema.parse(state)));
-    fs.fsyncSync(fd);
-  } finally {
-    fs.closeSync(fd);
-  }
-  try {
-    fs.renameSync(temporary, file);
-  } finally {
-    fs.rmSync(temporary, { force: true });
-  }
-}
-
 /**
  * Result Bus 事务变更描述。
  * - 无 noWrite：语义写；revision +1、fsync + atomic rename。
@@ -78,42 +63,48 @@ function writeAtomic(file: string, state: ResultBusState): void {
  */
 type ResultBusChange<T> = { state: ResultBusState | null; result: T; noWrite?: boolean };
 
+/**
+ * 写纪律模板统一由 src/core/durable-store.ts 保证：wx 锁、tmp wx 0600、
+ * fsyncSync、initialized marker 先于 rename、原子 rename、失败清 tmp、锁清理吞错。
+ * tmp 写前的写侧 strict parse（损坏 fail closed）由 serialize 钩子保留。
+ */
 function withLock<T>(identity: RoutingWorkspaceIdentity, stateDir: string, fn: (state: ResultBusState | null) => ResultBusChange<T>): T {
   const file = resultBusFile(identity.id, stateDir);
-  ensureDir(path.dirname(file));
-  let lock: number;
-  try {
-    lock = fs.openSync(`${file}.lock`, "wx", 0o600);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new ResultBusError("RESULT_BUS_BUSY", "Workspace Result Bus 写锁繁忙。 ");
-    throw error;
-  }
-  try {
-    fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, createdAt: Date.now() }));
-    fs.fsyncSync(lock);
-    const previous = readState(identity, stateDir);
-    const next = fn(previous);
-    if (next.noWrite) {
-      if (!previous) {
-        // 唯一合法的 null-state 只读路径：noWrite + state null；注入非空 state 即 corrupt。
-        if (next.state !== null) throw corrupt();
-        return next.result;
+  return runDurableStoreTransaction<ResultBusState, T>({
+    file,
+    marker: resultBusInitializedFile(identity.id, stateDir),
+    markerContent: `${identity.id}\n`,
+    markerOpenMode: 0o600,
+    lockPath: `${file}.lock`,
+    lock: simpleWxLock({
+      payload: () => JSON.stringify({ pid: process.pid, createdAt: Date.now() }),
+      openMode: 0o600,
+      busyError: (cause) => {
+        // 仅占用映射 BUSY；其余 errno 保持原始错误外溢。
+        if ((cause as NodeJS.ErrnoException).code === "EEXIST") {
+          return new ResultBusError("RESULT_BUS_BUSY", "Workspace Result Bus 写锁繁忙。 ");
+        }
+        throw cause;
+      },
+      cleanup: "swallow-independent",
+    }),
+    tmpName: (target) => `${target}.${randomUUID()}.tmp`,
+    serialize: (state) => JSON.stringify(resultBusStateSchema.parse(state)),
+    noWrite: {
+      mode: "allow-absent-null",
+      onChanged: () => corrupt(),
+    },
+    sequence: "assign-first",
+    // assign-first：noWrite 判定后 store 派生 revision（首次 1、上限 fail closed），
+    // 裸 zod parse（ZodError 原样外溢）；写路径不校验 identity（readState 读侧已校验）。
+    assignParseAndCheckIdentity: (state, previous) => {
+      const revision = previous ? previous.revision + 1 : 1;
+      if (revision > Number.MAX_SAFE_INTEGER) {
+        throw new ResultBusError("RESULT_BUS_REVISION_EXHAUSTED", "Result Bus revision 已到上限。 ");
       }
-      if (JSON.stringify(next.state) !== JSON.stringify(previous)) throw corrupt();
-      return next.result;
-    }
-    const revision = previous ? previous.revision + 1 : 1;
-    if (revision > Number.MAX_SAFE_INTEGER) throw new ResultBusError("RESULT_BUS_REVISION_EXHAUSTED", "Result Bus revision 已到上限。 ");
-    const valid = resultBusStateSchema.parse({ ...next.state, revision });
-    if (!fs.existsSync(resultBusInitializedFile(identity.id, stateDir))) {
-      const marker = fs.openSync(resultBusInitializedFile(identity.id, stateDir), "wx", 0o600);
-      try { fs.writeFileSync(marker, `${identity.id}\n`); fs.fsyncSync(marker); } finally { fs.closeSync(marker); }
-    }
-    writeAtomic(file, valid);
-    return next.result;
-  } finally {
-    try { fs.closeSync(lock); } finally { fs.rmSync(`${file}.lock`, { force: true }); }
-  }
+      return resultBusStateSchema.parse({ ...(state as ResultBusState | null), revision });
+    },
+  }, fn, () => readState(identity, stateDir)).result;
 }
 
 function canonicalEntry(identity: RoutingWorkspaceIdentity, result: RoutingResult | OfficialResult, stateDir: string): ResultBusEntry {

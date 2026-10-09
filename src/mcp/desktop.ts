@@ -3,7 +3,7 @@ import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { GatewayRegistryError } from "../gateway/registry.js";
-import { resolveToolWorkspace, type WorkspaceSource } from "./tool-shared.js";
+import { authExpired, resolveToolWorkspace, scopeSatisfied, wwwAuthenticateChallenge, type WorkspaceSource } from "./tool-shared.js";
 import { DesktopError, desktopIntent, sendInput, statusInput } from "../desktop/store.js";
 import { desktopStatus } from "../desktop/service.js";
 import { DESKTOP_CONTROL_SCOPE, DESKTOP_READ_SCOPE } from "../auth/store.js";
@@ -73,7 +73,7 @@ function fail(code: string, message: string, scope?: string): ToolResult {
   return {
     isError: true,
     content: [{ type: "text", text: JSON.stringify({ error: code, message }) }],
-    ...(scope ? { _meta: { "mcp/www_authenticate": [`Bearer error="insufficient_scope", scope="${scope}"`] } } : {}),
+    ...(scope ? wwwAuthenticateChallenge(scope, "bare") : {}),
   };
 }
 
@@ -86,7 +86,7 @@ function safeError(error: unknown): ToolResult {
 
 function requireAuth(auth: AuthInfo | undefined, scope: string): AuthInfo {
   if (!auth) throw new DesktopError("UNAUTHORIZED", "Desktop Control 需要有效的 OAuth 授权。" );
-  if (!auth.scopes.includes(scope)) throw new DesktopError("INSUFFICIENT_SCOPE", `需要 ${scope} 授权。`);
+  if (!scopeSatisfied(auth, scope)) throw new DesktopError("INSUFFICIENT_SCOPE", `需要 ${scope} 授权。`);
   if (!auth.clientId || auth.clientId.length > 256) {
     throw new DesktopError("UNAUTHORIZED", "缺少有效的 OAuth 客户端身份。" );
   }
@@ -94,7 +94,7 @@ function requireAuth(auth: AuthInfo | undefined, scope: string): AuthInfo {
 }
 
 function authorizeNow(auth: AuthInfo): void {
-  if (auth.expiresAt !== undefined && auth.expiresAt <= Math.floor(Date.now() / 1000)) {
+  if (authExpired(auth)) {
     throw new DesktopError("AUTH_EXPIRED", "OAuth 授权已过期，请重新授权后再操作。" );
   }
 }

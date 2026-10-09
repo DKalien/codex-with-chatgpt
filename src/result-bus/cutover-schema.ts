@@ -2,7 +2,7 @@ import path from "node:path";
 import { z } from "zod";
 import { routingWorkspaceIdSchema } from "../routing/schema.js";
 
-const HEX64 = /^[a-f0-9]{64}$/;
+import { HEX64 } from "../core/hex.js";
 /** legacy Feedback eventId 是 32-hex；ledger 只记录迁移身份。 */
 const HEX32 = /^[a-f0-9]{32}$/;
 

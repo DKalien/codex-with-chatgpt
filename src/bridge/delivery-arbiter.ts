@@ -5,6 +5,7 @@ import { getStateDir } from "../config/paths.js";
 import { resolveWorkspaceIdentity, type RoutingWorkspaceIdentity } from "../routing/store.js";
 import { readResultBus } from "../result-bus/store.js";
 import { recoverStaleFeedback } from "../feedback/state-store.js";
+import { INFLIGHT_FENCE_STATUSES } from "../feedback/delivery-lifecycle.js";
 import { FeedbackError } from "../feedback/schema.js";
 import { ResultBusDeliveryError } from "./result-bus-delivery.js";
 
@@ -27,7 +28,7 @@ import { ResultBusDeliveryError } from "./result-bus-delivery.js";
  */
 
 
-const FEEDBACK_INFLIGHT = new Set(["reserved", "claimed", "outcome_unknown"]);
+const FEEDBACK_INFLIGHT = INFLIGHT_FENCE_STATUSES;
 
 export function deliveryArbiterLockFile(workspaceId: string, stateDir = getStateDir()): string {
   return path.join(path.resolve(stateDir), "delivery-arbiter", `${workspaceId}.lock`);

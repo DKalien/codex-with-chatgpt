@@ -28,6 +28,7 @@ import {
 } from "./conversation-principal.js";
 import { RoutingError } from "../routing/schema.js";
 import { DesktopError } from "../desktop/store.js";
+import { authExpired, scopeSatisfied, wwwAuthenticateChallenge } from "./tool-shared.js";
 
 export { EXECUTOR_CONTROL_SCOPE, EXECUTOR_READ_SCOPE };
 
@@ -113,13 +114,13 @@ function fail(code: string, message: string, scope?: string): ToolResult {
   return {
     isError: true,
     content: [{ type: "text", text: JSON.stringify({ error: code, message }) }],
-    ...(scope ? { _meta: { "mcp/www_authenticate": [`Bearer error="insufficient_scope", scope="${scope}"`] } } : {}),
+    ...(scope ? wwwAuthenticateChallenge(scope, "bare") : {}),
   };
 }
 
 function requireAuth(auth: AuthInfo | undefined, scope: string): AuthInfo {
   if (!auth) throw new ExecutorControlError("UNAUTHORIZED", "Executor 工具需要有效的 OAuth 授权。");
-  if (!auth.scopes.includes(scope)) throw new ExecutorControlError("INSUFFICIENT_SCOPE", `需要 ${scope} 授权。`);
+  if (!scopeSatisfied(auth, scope)) throw new ExecutorControlError("INSUFFICIENT_SCOPE", `需要 ${scope} 授权。`);
   if (!auth.clientId || auth.clientId.length > 256) {
     throw new ExecutorControlError("UNAUTHORIZED", "缺少有效的 OAuth 客户端身份。");
   }
@@ -127,7 +128,7 @@ function requireAuth(auth: AuthInfo | undefined, scope: string): AuthInfo {
 }
 
 function authorizeNow(auth: AuthInfo): void {
-  if (auth.expiresAt !== undefined && auth.expiresAt <= Math.floor(Date.now() / 1000)) {
+  if (authExpired(auth)) {
     throw new ExecutorControlError("AUTH_EXPIRED", "OAuth 授权已过期，请重新授权后再操作。");
   }
 }

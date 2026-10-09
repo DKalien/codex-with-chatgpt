@@ -43,7 +43,7 @@ export interface GcPlan {
   totals: GcPlanTotals;
 }
 
-const HEX64 = /^[a-f0-9]{64}$/;
+import { HEX64 } from "./hex.js";
 const BOOTSTRAP_KEY_SET = new Set<string>(RELEASE_BOOTSTRAP_KEYS);
 
 function isInside(root: string, target: string): boolean {

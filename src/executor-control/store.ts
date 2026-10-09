@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { getStateDir } from "../config/paths.js";
+import { runDurableStoreTransaction, simpleWxLock } from "../core/durable-store.js";
 import {
   ExecutorControlError,
   parseExecutorControlState,
@@ -66,6 +67,12 @@ export function updateExecutorControl<T>(
   return updateExecutorControlDetailed(workspaceId, workspaceRoot, change).result;
 }
 
+/**
+ * Durable update with bounded lock + fsyncSync + initialized marker（.initialized）。
+ * change 回调在锁内重读状态；可返回 noWrite 表示幂等无写（byte-equality 校验）。
+ * 写纪律模板统一由 src/core/durable-store.ts 保证：wx 锁、tmp wx 0600、
+ * fsyncSync、initialized marker 先于 rename、原子 rename、失败清 tmp、锁清理吞错。
+ */
 export function updateExecutorControlDetailed<T>(
   workspaceId: string,
   workspaceRoot: string,
@@ -74,86 +81,52 @@ export function updateExecutorControlDetailed<T>(
 ): ExecutorControlUpdateResult<T> {
   assertWorkspaceId(workspaceId);
   const file = executorControlFile(workspaceId);
-  const marker = executorControlInitializedFile(workspaceId);
-  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-  const lock = `${file}.lock`;
-  let lockFd: number | null = null;
-  try {
-    lockFd = fs.openSync(lock, "wx");
-  } catch {
-    throw new ExecutorControlError("EXECUTOR_CONTROL_LOCK_BUSY", "executor binding 状态锁被占用。");
-  }
-  try {
-    const lockPayload = `${process.pid}\n${new Date().toISOString()}\n`;
-    fs.writeFileSync(lockFd, lockPayload);
-    fs.fsyncSync(lockFd);
-
-    const previous = readExecutorControl(workspaceId);
-    if (previous && previous.workspaceRoot !== workspaceRoot) {
-      throw new ExecutorControlError(
-        "EXECUTOR_CONTROL_WORKSPACE_MISMATCH",
-        "executor binding 状态 workspaceRoot 不匹配。",
-      );
-    }
-    const next = change(previous);
+  const outcome = runDurableStoreTransaction<ExecutorControlState, T>({
+    file,
+    marker: executorControlInitializedFile(workspaceId),
+    markerContent: `${workspaceId}\n`,
+    lockPath: `${file}.lock`,
+    lock: simpleWxLock({
+      payload: () => `${process.pid}\n${new Date().toISOString()}\n`,
+      busyError: () => new ExecutorControlError("EXECUTOR_CONTROL_LOCK_BUSY", "executor binding 状态锁被占用。"),
+      cleanup: "swallow",
+    }),
+    tmpName: (target) => `${target}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    serialize: (state) => `${JSON.stringify(state, null, 2)}\n`,
+    noWrite: {
+      mode: "require-previous",
+      onMissingPrevious: () => new ExecutorControlError(
+        "EXECUTOR_CONTROL_STATE_CORRUPT",
+        "noWrite 要求已存在 durable state；拒绝无状态成功。",
+      ),
+      onChanged: () => new ExecutorControlError(
+        "EXECUTOR_CONTROL_STATE_CORRUPT",
+        "noWrite 状态与 previous 不一致。",
+      ),
+    },
+    afterRead: (previous) => {
+      if (previous && previous.workspaceRoot !== workspaceRoot) {
+        throw new ExecutorControlError(
+          "EXECUTOR_CONTROL_WORKSPACE_MISMATCH",
+          "executor binding 状态 workspaceRoot 不匹配。",
+        );
+      }
+    },
+    sequence: "identity-first",
     // 每次写入前 runtime parse + workspace identity 校验。
-    const validated = parseExecutorControlState(next.state);
-    if (validated.workspaceId !== workspaceId || validated.workspaceRoot !== workspaceRoot) {
-      throw corrupt();
-    }
-    if (next.noWrite) {
-      if (!previous) {
-        throw new ExecutorControlError(
-          "EXECUTOR_CONTROL_STATE_CORRUPT",
-          "noWrite 要求已存在 durable state；拒绝无状态成功。",
-        );
+    parseAndCheckIdentity: (state) => {
+      const validated = parseExecutorControlState(state);
+      if (validated.workspaceId !== workspaceId || validated.workspaceRoot !== workspaceRoot) {
+        throw corrupt();
       }
-      if (JSON.stringify(validated) !== JSON.stringify(previous)) {
-        throw new ExecutorControlError(
-          "EXECUTOR_CONTROL_STATE_CORRUPT",
-          "noWrite 状态与 previous 不一致。",
-        );
-      }
-      return { result: next.result, noWrite: true, state: validated };
-    }
-    if (previous && validated.revision !== previous.revision + 1) {
-      throw corrupt();
-    }
-    if (!previous && validated.revision !== 1) {
-      throw corrupt();
-    }
-    if (!fs.existsSync(marker)) {
-      const markerFd = fs.openSync(marker, "wx");
-      try {
-        fs.writeFileSync(markerFd, `${workspaceId}\n`);
-        fs.fsyncSync(markerFd);
-      } finally {
-        fs.closeSync(markerFd);
-      }
-    }
-    const tmp = `${file}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    try {
-      const fd = fs.openSync(tmp, "wx", 0o600);
-      try {
-        fs.writeFileSync(fd, `${JSON.stringify(validated, null, 2)}\n`);
-        fs.fsyncSync(fd);
-      } finally {
-        fs.closeSync(fd);
-      }
-      fs.renameSync(tmp, file);
-    } catch (error) {
-      try { fs.unlinkSync(tmp); } catch { /* keep primary error */ }
-      throw error;
-    }
-    return { result: next.result, noWrite: false, state: validated };
-  } finally {
-    try {
-      if (lockFd !== null) fs.closeSync(lockFd);
-      fs.unlinkSync(lock);
-    } catch {
-      // lock cleanup failure must not hide the primary result/error
-    }
-  }
+      return validated;
+    },
+    verifyRevision: (validated, previous) => {
+      if (previous && validated.revision !== previous.revision + 1) throw corrupt();
+      if (!previous && validated.revision !== 1) throw corrupt();
+    },
+  }, change, () => readExecutorControl(workspaceId));
+  return { result: outcome.result, noWrite: outcome.noWrite, state: outcome.state as ExecutorControlState };
 }
 
 export function nextEpoch(current: number): number {

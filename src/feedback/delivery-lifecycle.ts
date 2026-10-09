@@ -234,7 +234,8 @@ function requireActiveCompanionBinding(
   return state.binding;
 }
 
-const INFLIGHT_FENCE_STATUSES = new Set(["reserved", "claimed", "outcome_unknown"]);
+/** 单飞 in-flight 状态集合；唯一定义源（delivery-arbiter 等共享）。 */
+export const INFLIGHT_FENCE_STATUSES = new Set(["reserved", "claimed", "outcome_unknown"]);
 
 /** ready → reserved；binding 范围内任一 reserved/claimed/outcome_unknown 时 single-flight fence。 */
 export function reserveNext(input: {

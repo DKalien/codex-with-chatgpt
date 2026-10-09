@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { getStateDir } from "../config/paths.js";
+import { runDurableStoreTransaction, simpleWxLock } from "../core/durable-store.js";
 import {
   WebSinkControlError,
   parseWebSinkControlState,
@@ -52,6 +53,12 @@ export type WebSinkControlUpdateResult<T> = {
   state: WebSinkControlState;
 };
 
+/**
+ * Durable update with bounded lock + fsyncSync + initialized marker（.initialized）。
+ * change 回调在锁内重读状态；可返回 noWrite 表示幂等无写（byte-equality 校验）。
+ * 写纪律模板统一由 src/core/durable-store.ts 保证：wx 锁、tmp wx 0600、
+ * fsyncSync、initialized marker 先于 rename、原子 rename、失败清 tmp、锁清理吞错。
+ */
 export function updateWebSinkControlDetailed<T>(
   workspaceId: string,
   change: (state: WebSinkControlState | null) => {
@@ -62,71 +69,38 @@ export function updateWebSinkControlDetailed<T>(
 ): WebSinkControlUpdateResult<T> {
   assertWorkspaceId(workspaceId);
   const file = webSinkControlFile(workspaceId);
-  const marker = webSinkControlInitializedFile(workspaceId);
-  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-  const lock = `${file}.lock`;
-  let lockFd: number | null = null;
-  try {
-    lockFd = fs.openSync(lock, "wx");
-  } catch {
-    throw new WebSinkControlError("WEB_SINK_LOCK_BUSY", "web sink binding 状态锁被占用。");
-  }
-  try {
-    fs.writeFileSync(lockFd, `${process.pid}\n${new Date().toISOString()}\n`);
-    fs.fsyncSync(lockFd);
-
-    const previous = readWebSinkControl(workspaceId);
-    const next = change(previous);
-    const validated = parseWebSinkControlState(next.state);
-    if (validated.workspaceId !== workspaceId) throw corrupt();
-
-    if (next.noWrite) {
-      if (!previous) {
-        throw new WebSinkControlError(
-          "WEB_SINK_STATE_CORRUPT",
-          "noWrite 要求已存在 durable state；拒绝无状态成功。",
-        );
-      }
-      if (JSON.stringify(validated) !== JSON.stringify(previous)) {
-        throw new WebSinkControlError("WEB_SINK_STATE_CORRUPT", "noWrite 状态与 previous 不一致。");
-      }
-      return { result: next.result, noWrite: true, state: validated };
-    }
-    if (previous && validated.revision !== previous.revision + 1) throw corrupt();
-    if (!previous && validated.revision !== 1) throw corrupt();
-
-    if (!fs.existsSync(marker)) {
-      const markerFd = fs.openSync(marker, "wx");
-      try {
-        fs.writeFileSync(markerFd, `${workspaceId}\n`);
-        fs.fsyncSync(markerFd);
-      } finally {
-        fs.closeSync(markerFd);
-      }
-    }
-    const tmp = `${file}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    try {
-      const fd = fs.openSync(tmp, "wx", 0o600);
-      try {
-        fs.writeFileSync(fd, `${JSON.stringify(validated, null, 2)}\n`);
-        fs.fsyncSync(fd);
-      } finally {
-        fs.closeSync(fd);
-      }
-      fs.renameSync(tmp, file);
-    } catch (error) {
-      try { fs.unlinkSync(tmp); } catch { /* keep primary error */ }
-      throw error;
-    }
-    return { result: next.result, noWrite: false, state: validated };
-  } finally {
-    try {
-      if (lockFd !== null) fs.closeSync(lockFd);
-      fs.unlinkSync(lock);
-    } catch {
-      // lock cleanup failure must not hide the primary result/error
-    }
-  }
+  const outcome = runDurableStoreTransaction<WebSinkControlState, T>({
+    file,
+    marker: webSinkControlInitializedFile(workspaceId),
+    markerContent: `${workspaceId}\n`,
+    lockPath: `${file}.lock`,
+    lock: simpleWxLock({
+      payload: () => `${process.pid}\n${new Date().toISOString()}\n`,
+      busyError: () => new WebSinkControlError("WEB_SINK_LOCK_BUSY", "web sink binding 状态锁被占用。"),
+      cleanup: "swallow",
+    }),
+    tmpName: (target) => `${target}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    serialize: (state) => `${JSON.stringify(state, null, 2)}\n`,
+    noWrite: {
+      mode: "require-previous",
+      onMissingPrevious: () => new WebSinkControlError(
+        "WEB_SINK_STATE_CORRUPT",
+        "noWrite 要求已存在 durable state；拒绝无状态成功。",
+      ),
+      onChanged: () => new WebSinkControlError("WEB_SINK_STATE_CORRUPT", "noWrite 状态与 previous 不一致。"),
+    },
+    sequence: "identity-first",
+    parseAndCheckIdentity: (state) => {
+      const validated = parseWebSinkControlState(state);
+      if (validated.workspaceId !== workspaceId) throw corrupt();
+      return validated;
+    },
+    verifyRevision: (validated, previous) => {
+      if (previous && validated.revision !== previous.revision + 1) throw corrupt();
+      if (!previous && validated.revision !== 1) throw corrupt();
+    },
+  }, change, () => readWebSinkControl(workspaceId));
+  return { result: outcome.result, noWrite: outcome.noWrite, state: outcome.state as WebSinkControlState };
 }
 
 export function nextWebSinkEpoch(current: number): number {

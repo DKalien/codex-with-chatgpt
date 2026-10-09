@@ -1,4 +1,5 @@
-import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
+import { safeEqual } from "../auth/store.js";
 
 /**
  * PairingCode: a short-lived, one-time, local verification credential shown
@@ -131,7 +132,7 @@ export class PairingManager {
         this.sessions.delete(session.id);
         return { ok: false, reason: "too_many_attempts" };
       }
-      const match = timingSafeEqual(inputHash, session.codeHash);
+      const match = safeEqual(inputHash.toString("hex"), session.codeHash.toString("hex"));
       if (match) {
         // one-time use: destroy immediately
         session.used = true;

@@ -2,7 +2,7 @@ import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { GatewayRegistryError } from "../gateway/registry.js";
-import { resolveToolWorkspace, workspaceIdShape, type WorkspaceSource } from "./tool-shared.js";
+import { authExpired, resolveToolWorkspace, scopeSatisfied, wwwAuthenticateChallenge, workspaceIdShape, type WorkspaceSource } from "./tool-shared.js";
 import { WEB_SINK_READ_SCOPE } from "../auth/store.js";
 import { WebSinkControlError } from "../web-sink-control/schema.js";
 import {
@@ -71,18 +71,18 @@ function fail(code: string, message: string, scope?: string): ToolResult {
   return {
     isError: true,
     content: [{ type: "text", text: JSON.stringify({ error: code, message }) }],
-    ...(scope ? { _meta: { "mcp/www_authenticate": [`Bearer error="insufficient_scope", scope="${scope}"`] } } : {}),
+    ...(scope ? wwwAuthenticateChallenge(scope, "bare") : {}),
   };
 }
 
 function requireAuth(auth: AuthInfo | undefined, scope: string): AuthInfo {
   if (!auth) throw new WebSinkControlError("UNAUTHORIZED", "Web Sink 工具需要有效的 OAuth 授权。");
-  if (!auth.scopes.includes(scope)) throw new WebSinkControlError("INSUFFICIENT_SCOPE", `需要 ${scope} 授权。`);
+  if (!scopeSatisfied(auth, scope)) throw new WebSinkControlError("INSUFFICIENT_SCOPE", `需要 ${scope} 授权。`);
   return auth;
 }
 
 function authorizeNow(auth: AuthInfo): void {
-  if (auth.expiresAt !== undefined && auth.expiresAt <= Math.floor(Date.now() / 1000)) {
+  if (authExpired(auth)) {
     throw new WebSinkControlError("AUTH_EXPIRED", "OAuth 授权已过期，请重新授权后再操作。");
   }
 }

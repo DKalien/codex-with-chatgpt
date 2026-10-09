@@ -235,22 +235,36 @@ export function validateDesktopDiagnosis(value: unknown): DesktopDiagnosis {
   };
 }
 
-export function validateResultOwnershipExpectation(value: DesktopResultOwnershipExpectation): DesktopResultOwnershipExpectation {
-  if (!value || typeof value !== "object" || Array.isArray(value)) throw error("DESKTOP_INVALID_REQUEST");
+/** expectation 共享形状校验：键集（含可选 deliveryId 变体）+ workspaceId/commandId/intent/messageBytes/messageSha256/deliveryId。 */
+function assertExpectationShape(
+  value: Record<string, unknown>,
+  requiredKeys: string[],
+  extraFieldCheck?: (value: Record<string, unknown>) => boolean,
+): void {
   const keys = Object.keys(value).sort();
-  const baseKeys = ["commandId", "intent", "messageBytes", "messageSha256", "originTurnId", "workspaceId"].sort().join(",");
-  const deliveryKeys = ["commandId", "deliveryId", "intent", "messageBytes", "messageSha256", "originTurnId", "workspaceId"].sort().join(",");
+  const baseKeys = [...requiredKeys].sort().join(",");
+  const deliveryKeys = [...requiredKeys, "deliveryId"].sort().join(",");
   if (keys.join(",") !== baseKeys &&
       (keys.join(",") !== deliveryKeys || !Object.prototype.hasOwnProperty.call(value, "deliveryId"))) {
     throw error("DESKTOP_INVALID_REQUEST");
   }
-  if (!/^[A-Za-z0-9_-]{1,128}$/u.test(value.workspaceId) || !/^[A-Za-z0-9_-]{1,128}$/u.test(value.commandId) ||
-      !["development_plan", "revision"].includes(value.intent) || !isUuid(value.originTurnId) ||
-      !Number.isSafeInteger(value.messageBytes) || value.messageBytes < 1 || value.messageBytes > MAX_MESSAGE_BYTES ||
-      !/^[a-f0-9]{64}$/u.test(value.messageSha256) ||
-      (Object.prototype.hasOwnProperty.call(value, "deliveryId") && !isUuid(value.deliveryId))) {
+  if (!/^[A-Za-z0-9_-]{1,128}$/u.test(value.workspaceId as string) || !/^[A-Za-z0-9_-]{1,128}$/u.test(value.commandId as string) ||
+      !["development_plan", "revision"].includes(value.intent as string) ||
+      !Number.isSafeInteger(value.messageBytes) || (value.messageBytes as number) < 1 || (value.messageBytes as number) > MAX_MESSAGE_BYTES ||
+      !/^[a-f0-9]{64}$/u.test(value.messageSha256 as string) ||
+      (Object.prototype.hasOwnProperty.call(value, "deliveryId") && !isUuid(value.deliveryId)) ||
+      (extraFieldCheck ? !extraFieldCheck(value) : false)) {
     throw error("DESKTOP_INVALID_REQUEST");
   }
+}
+
+export function validateResultOwnershipExpectation(value: DesktopResultOwnershipExpectation): DesktopResultOwnershipExpectation {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw error("DESKTOP_INVALID_REQUEST");
+  assertExpectationShape(
+    value as unknown as Record<string, unknown>,
+    ["commandId", "intent", "messageBytes", "messageSha256", "originTurnId", "workspaceId"],
+    (raw) => isUuid(raw.originTurnId),
+  );
   return { ...value };
 }
 
@@ -372,20 +386,10 @@ export function validateResultClassification(value: unknown, target: DesktopTarg
 
 export function validateUnknownReconcileExpectation(value: DesktopUnknownReconcileExpectation): DesktopUnknownReconcileExpectation {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw error("DESKTOP_INVALID_REQUEST");
-  const keys = Object.keys(value).sort();
-  const baseKeys = ["commandId", "intent", "messageBytes", "messageSha256", "workspaceId"].sort().join(",");
-  const exactDeliveryKeys = ["commandId", "deliveryId", "intent", "messageBytes", "messageSha256", "workspaceId"].sort().join(",");
-  if (keys.join(",") !== baseKeys &&
-      (keys.join(",") !== exactDeliveryKeys || !Object.prototype.hasOwnProperty.call(value, "deliveryId"))) {
-    throw error("DESKTOP_INVALID_REQUEST");
-  }
-  if (!/^[A-Za-z0-9_-]{1,128}$/u.test(value.workspaceId) || !/^[A-Za-z0-9_-]{1,128}$/u.test(value.commandId) ||
-      !["development_plan", "revision"].includes(value.intent) ||
-      !Number.isSafeInteger(value.messageBytes) || value.messageBytes < 1 || value.messageBytes > MAX_MESSAGE_BYTES ||
-      !/^[a-f0-9]{64}$/u.test(value.messageSha256) ||
-      (Object.prototype.hasOwnProperty.call(value, "deliveryId") && !isUuid(value.deliveryId))) {
-    throw error("DESKTOP_INVALID_REQUEST");
-  }
+  assertExpectationShape(
+    value as unknown as Record<string, unknown>,
+    ["commandId", "intent", "messageBytes", "messageSha256", "workspaceId"],
+  );
   return { ...value };
 }
 

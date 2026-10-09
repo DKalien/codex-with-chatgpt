@@ -64,10 +64,42 @@ export function okStructured<T extends object>(data: T): ToolResult {
   return { ...ok(data), structuredContent: data as Record<string, unknown> };
 }
 
-export function fail(code: string, message: string): ToolResult {
+/** WWW-Authenticate challenge 的既有逐字变体：none=不带 _meta；bare=scope 提示；reauth=要求重新授权描述。 */
+export type WwwAuthenticateChallengeVariant = "none" | "bare" | "reauth";
+
+/** 唯一的 mcp/www_authenticate challenge 构造点（三种变体文本逐字保持既有契约，返回 _meta 形状）。 */
+export function wwwAuthenticateChallenge(
+  scope: string,
+  variant: WwwAuthenticateChallengeVariant,
+): Record<string, unknown> | undefined {
+  if (variant === "none") return undefined;
+  const challenge =
+    variant === "reauth"
+      ? `Bearer error="insufficient_scope", error_description="Reauthorize this connector with ${scope}", scope="${scope}"`
+      : `Bearer error="insufficient_scope", scope="${scope}"`;
+  return { _meta: { "mcp/www_authenticate": [challenge] } };
+}
+
+/** scope 判定谓词（共享；各 throw 点保留本地错误类与文案）。 */
+export function scopeSatisfied(auth: AuthInfo, scope: string): boolean {
+  return auth.scopes.includes(scope);
+}
+
+/** AuthInfo 过期判定谓词（expiresAt 缺省时不按过期拦截，语义与既有 authorizeNow 一致）。 */
+export function authExpired(auth: AuthInfo): boolean {
+  return auth.expiresAt !== undefined && auth.expiresAt <= Math.floor(Date.now() / 1000);
+}
+
+export function fail(
+  code: string,
+  message: string,
+  challenge: WwwAuthenticateChallengeVariant = "none",
+  scope?: string,
+): ToolResult {
   return {
     content: [{ type: "text", text: JSON.stringify({ error: code, message }) }],
     isError: true,
+    ...(scope ? wwwAuthenticateChallenge(scope, challenge) : {}),
   };
 }
 
@@ -77,11 +109,21 @@ export function mapError(error: unknown): ToolResult {
   return fail("INTERNAL_ERROR", error instanceof Error ? error.message : String(error));
 }
 
-export function requireScope(authInfo: AuthInfo | undefined, scope: string, requireAuth = false): ToolResult | null {
+export function requireScope(
+  authInfo: AuthInfo | undefined,
+  scope: string,
+  requireAuth = false,
+  challenge: WwwAuthenticateChallengeVariant = "none",
+): ToolResult | null {
   // authInfo is absent only for trusted in-process clients (tests / local stdio).
   if (!authInfo) return requireAuth ? fail("AUTH_REQUIRED", "This operation requires an authenticated OAuth client.") : null;
-  if (!authInfo.scopes.includes(scope)) {
-    return fail("INSUFFICIENT_SCOPE", `This operation requires the '${scope}' scope.`);
+  if (!scopeSatisfied(authInfo, scope)) {
+    return fail("INSUFFICIENT_SCOPE", `This operation requires the '${scope}' scope.`, challenge, scope);
   }
   return null;
+}
+
+/** Feedback/Probe 系工具的 reauth 变体（challenge 文本要求重新授权）。 */
+export function requireScopeReauth(authInfo: AuthInfo | undefined, scope: string): ToolResult | null {
+  return requireScope(authInfo, scope, false, "reauth");
 }

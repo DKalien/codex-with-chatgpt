@@ -4,7 +4,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { Workspace, WorkspaceError } from "../workspace/manager.js";
 import { readDesktop } from "../desktop/store.js";
 import { readExecutorDispatchState } from "../executor-control/dispatch-store.js";
-import { ensureDir, getStateDir } from "../config/paths.js";
+import { getStateDir } from "../config/paths.js";
+import { runDurableStoreTransaction, simpleWxLock } from "../core/durable-store.js";
 import { assertCleanupStoreFile, readCleanupJournal, withCommandOperation } from "../command-cleanup/fence.js";
 import { assertCleanupArtifacts, cleanupArtifact, CommandCleanupError, type CleanupArtifact, type CommandCleanupTarget } from "../command-cleanup/schema.js";
 import {
@@ -131,6 +132,8 @@ export function readRouting(
  * callback 返回 noWrite: true 表示 exact replay：不 bump revision、不重写主 state 文件。
  * noWrite 附带内部断言：previous 必须存在，且 next.state 与 previous 语义完全相同；
  * 违反即内部不变量错误（fail fast），防止内部代码误把 mutation 标成 noWrite。
+ * 写纪律模板统一由 src/core/durable-store.ts 保证：wx 锁、tmp wx 0600、
+ * fsyncSync、initialized marker 先于 rename、原子 rename、失败清 tmp、锁清理。
  */
 function updateRouting<T>(
   identity: RoutingWorkspaceIdentity,
@@ -139,69 +142,46 @@ function updateRouting<T>(
 ): T {
   const resolved = resolveWorkspaceIdentity(identity);
   const file = routingFile(resolved.id, stateDir);
-  ensureDir(path.dirname(file));
-  let lock: number;
-  try {
-    lock = fs.openSync(`${file}.lock`, "wx", 0o600);
-  } catch {
-    throw new RoutingError(
-      "ROUTING_STORE_BUSY",
-      "Routing 状态写锁繁忙；遗留锁须人工核对进程和历史后恢复，不要删除 ID 历史。",
-    );
-  }
-  const temporary = `${file}.${randomUUID()}.tmp`;
-  try {
-    fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, createdAt: Date.now() }));
-    fs.fsyncSync(lock);
-    const previous = readRouting(identity, stateDir);
-    const next = change(previous);
-    // exact replay：返回原记录，不 bump revision、不重写主 state 文件。
-    if (next.noWrite) {
-      if (!previous) {
-        throw new RoutingError(
-          "ROUTING_INTERNAL_INVARIANT",
-          "noWrite replay 要求已存在的 previous state；这是内部不变量错误。",
-        );
+  return runDurableStoreTransaction<RoutingState, T>({
+    file,
+    marker: `${file}.initialized`,
+    markerContent: "1\n",
+    markerOpenMode: 0o600,
+    lockPath: `${file}.lock`,
+    lock: simpleWxLock({
+      payload: () => JSON.stringify({ pid: process.pid, createdAt: Date.now() }),
+      openMode: 0o600,
+      busyError: () => new RoutingError(
+        "ROUTING_STORE_BUSY",
+        "Routing 状态写锁繁忙；遗留锁须人工核对进程和历史后恢复，不要删除 ID 历史。",
+      ),
+      cleanup: "propagate",
+    }),
+    tmpName: (target) => `${target}.${randomUUID()}.tmp`,
+    serialize: (state) => JSON.stringify(state),
+    noWrite: {
+      mode: "require-previous",
+      onMissingPrevious: () => new RoutingError(
+        "ROUTING_INTERNAL_INVARIANT",
+        "noWrite replay 要求已存在的 previous state；这是内部不变量错误。",
+      ),
+      onChanged: () => new RoutingError(
+        "ROUTING_INTERNAL_INVARIANT",
+        "noWrite replay 不允许携带状态变更；请改用显式 mutation API。",
+      ),
+    },
+    sequence: "assign-first",
+    // assign-first：noWrite 判定后 store 派生 revision +1（首次 1），
+    // 裸 zod parse（ZodError 原样外溢）后做写前 identity 校验。
+    assignParseAndCheckIdentity: (state, previous) => {
+      const revision = (previous?.revision ?? 0) + 1;
+      const valid = routingStateSchema.parse({ ...(state as RoutingState), revision });
+      if (valid.workspaceId !== resolved.id || valid.workspaceRoot !== resolved.root) {
+        throw corrupt();
       }
-      if (JSON.stringify(next.state) !== JSON.stringify(previous)) {
-        throw new RoutingError(
-          "ROUTING_INTERNAL_INVARIANT",
-          "noWrite replay 不允许携带状态变更；请改用显式 mutation API。",
-        );
-      }
-      return next.result;
-    }
-    const revision = (previous?.revision ?? 0) + 1;
-    const valid = routingStateSchema.parse({ ...next.state, revision });
-    if (valid.workspaceId !== resolved.id || valid.workspaceRoot !== resolved.root) {
-      throw corrupt();
-    }
-    if (!fs.existsSync(`${file}.initialized`)) {
-      const marker = fs.openSync(`${file}.initialized`, "wx", 0o600);
-      try {
-        fs.writeFileSync(marker, "1\n");
-        fs.fsyncSync(marker);
-      } finally {
-        fs.closeSync(marker);
-      }
-    }
-    const fd = fs.openSync(temporary, "wx", 0o600);
-    try {
-      fs.writeFileSync(fd, JSON.stringify(valid));
-      fs.fsyncSync(fd);
-    } finally {
-      fs.closeSync(fd);
-    }
-    fs.renameSync(temporary, file);
-    return next.result;
-  } finally {
-    try {
-      fs.rmSync(temporary, { force: true });
-    } finally {
-      fs.closeSync(lock);
-      fs.unlinkSync(`${file}.lock`);
-    }
-  }
+      return valid;
+    },
+  }, change, () => readRouting(identity, stateDir)).result;
 }
 
 function locatorEquals(
