@@ -5,19 +5,18 @@ import {
   parseExecutorBindingCandidate,
   type ExecutorBinding,
   type ExecutorBindingCandidate,
-  type ExecutorDeliveryTargetSnapshot,
 } from "../endpoints/schema.js";
 import {
-  parseExecutorDeliveryAcceptance,
   parseExecutorPluginDescriptor,
   type ExecutorActiveExecutionProjection,
-  type ExecutorDeliveryAcceptance,
-  type ExecutorDeliveryRequest,
   type ExecutorPlugin,
   type ExecutorPluginCapabilities,
   type ExecutorPluginDescriptor,
   type ExecutorSessionProjection,
 } from "../endpoints/executor-contract.js";
+
+import { codexExecutorProjectId, CodexTargetTranslationError } from "./codex-target.js";
+export { CodexTargetTranslationError } from "./codex-target.js";
 
 export const CODEX_DESKTOP_EXECUTOR_ID = "codex-desktop" as const;
 
@@ -129,110 +128,23 @@ export class CodexDesktopAdapter implements ExecutorAdapter {
 
 export const codexDesktopAdapter = new CodexDesktopAdapter();
 
-export interface ExecutorRegistry {
-  get(id: string): ExecutorAdapter;
-  list(): readonly ExecutorDescriptor[];
-}
-
-/** 固定内置注册表；不做插件发现、PATH 探测、网络发现或动态加载。 */
-export function createExecutorRegistry(adapters: readonly ExecutorAdapter[] = [codexDesktopAdapter]): ExecutorRegistry {
-  const byId = new Map<string, ExecutorAdapter>();
-  for (const adapter of adapters) {
-    if (byId.has(adapter.descriptor.id)) throw new Error(`Duplicate executor id: ${adapter.descriptor.id}`);
-    byId.set(adapter.descriptor.id, adapter);
-  }
-  return Object.freeze({
-    get(id: string): ExecutorAdapter {
-      const adapter = byId.get(id);
-      if (!adapter) throw new Error(`Unknown executor: ${id}`);
-      return adapter;
-    },
-    list(): readonly ExecutorDescriptor[] {
-      return [...byId.values()].map(adapter => adapter.descriptor);
-    },
-  });
-}
-
-export const executorRegistry = createExecutorRegistry();
-
-export function getExecutor(id: string = CODEX_DESKTOP_EXECUTOR_ID): ExecutorAdapter {
-  return executorRegistry.get(id);
-}
-
-/**
- * 窄翻译边界：generic Codex binding/snapshot → 已校验的 legacy ExecutorTarget。
- * foreign pluginId 或 malformed locator 在调用 Desktop adapter 前 fail closed。
- */
-export class CodexTargetTranslationError extends Error {
-  constructor(
-    readonly code: string,
-    message: string,
-  ) {
-    super(message);
-    this.name = "CodexTargetTranslationError";
-  }
-}
-
-const CODEX_EXECUTOR_PROJECT_KEY = "executorProjectId";
-const CODEX_EXECUTOR_PROJECT_ID = /^[A-Za-z0-9_-]{1,128}$/;
-
-function translateGenericToCodexTarget(input: {
-  readonly pluginId: string;
-  readonly workspaceRoot: string;
-  readonly instanceId: string;
-  readonly sessionId: string;
-  readonly locator: Readonly<Record<string, string>>;
-}): ExecutorTarget {
+/** foreign plugin 或 malformed locator 在调用 Desktop adapter 前拒绝。 */
+function translateBindingToCodexTarget(
+  input: Pick<ExecutorBinding, "pluginId" | "workspaceRoot" | "instanceId" | "sessionId" | "locator">,
+): ExecutorTarget {
   if (input.pluginId !== CODEX_DESKTOP_EXECUTOR_ID) {
     throw new CodexTargetTranslationError(
       "FOREIGN_PLUGIN",
       `generic target pluginId ${input.pluginId} 不是 Codex Desktop`,
     );
   }
-  const keys = Object.keys(input.locator).sort();
-  if (keys.length !== 1 || keys[0] !== CODEX_EXECUTOR_PROJECT_KEY) {
-    throw new CodexTargetTranslationError(
-      "LOCATOR_INVALID",
-      "Codex locator 必须且只包含 executorProjectId",
-    );
-  }
-  const projectId = input.locator[CODEX_EXECUTOR_PROJECT_KEY];
-  if (typeof projectId !== "string" || !CODEX_EXECUTOR_PROJECT_ID.test(projectId)) {
-    throw new CodexTargetTranslationError(
-      "LOCATOR_INVALID",
-      "executorProjectId 不是有效 bounded 值",
-    );
-  }
+  const projectId = codexExecutorProjectId(input.locator);
   return {
     threadId: input.sessionId,
     hostId: input.instanceId,
     projectId,
     workspaceRoot: input.workspaceRoot,
   };
-}
-
-function translateBindingToCodexTarget(
-  binding: Pick<ExecutorBinding, "pluginId" | "workspaceRoot" | "instanceId" | "sessionId" | "locator">,
-): ExecutorTarget {
-  return translateGenericToCodexTarget({
-    pluginId: binding.pluginId,
-    workspaceRoot: binding.workspaceRoot,
-    instanceId: binding.instanceId,
-    sessionId: binding.sessionId,
-    locator: binding.locator,
-  });
-}
-
-function translateSnapshotToCodexTarget(
-  target: Pick<ExecutorDeliveryTargetSnapshot, "pluginId" | "workspaceRoot" | "instanceId" | "sessionId" | "locator">,
-): ExecutorTarget {
-  return translateGenericToCodexTarget({
-    pluginId: target.pluginId,
-    workspaceRoot: target.workspaceRoot,
-    instanceId: target.instanceId,
-    sessionId: target.sessionId,
-    locator: target.locator,
-  });
 }
 
 /**
@@ -256,21 +168,21 @@ export function projectCodexDesktopTargetToExecutorBindingCandidate(input: {
 }
 
 const CODEX_DESKTOP_PLUGIN_CAPABILITIES: ExecutorPluginCapabilities = Object.freeze({
-  bindExistingSession: true,
-  createSession: false,
-  delivery: true,
-  activeExecutionInspection: true,
-  approvalVisibility: true,
-  trustedTerminalReceipt: true,
-  cancellationInterrupt: false,
+  bindExistingSession: CODEX_DESKTOP_CAPABILITIES.existingSessionBinding,
+  createSession: CODEX_DESKTOP_CAPABILITIES.createSession,
+  delivery: CODEX_DESKTOP_CAPABILITIES.delivery,
+  activeExecutionInspection: CODEX_DESKTOP_CAPABILITIES.busyActiveInspection,
+  approvalVisibility: CODEX_DESKTOP_CAPABILITIES.approvalVisibility,
+  trustedTerminalReceipt: CODEX_DESKTOP_CAPABILITIES.trustedTerminalReceipt,
+  cancellationInterrupt: CODEX_DESKTOP_CAPABILITIES.cancellationInterrupt,
   resume: false,
 });
 
 const CODEX_DESKTOP_PLUGIN_DESCRIPTOR: ExecutorPluginDescriptor = parseExecutorPluginDescriptor(
   Object.freeze({
-    pluginId: CODEX_DESKTOP_EXECUTOR_ID,
-    kind: CODEX_DESKTOP_EXECUTOR_ID,
-    name: "Codex Desktop",
+    pluginId: CODEX_DESKTOP_DESCRIPTOR.id,
+    kind: CODEX_DESKTOP_DESCRIPTOR.kind,
+    name: CODEX_DESKTOP_DESCRIPTOR.name,
     capabilities: CODEX_DESKTOP_PLUGIN_CAPABILITIES,
   }),
 );
@@ -307,39 +219,6 @@ export class CodexDesktopExecutorPlugin implements ExecutorPlugin {
       locator: { executorProjectId: session.projectId },
       activity: projectDesktopActivity(session),
     };
-  }
-
-  async deliver(request: ExecutorDeliveryRequest): Promise<ExecutorDeliveryAcceptance> {
-    let target: ExecutorTarget;
-    try {
-      target = translateSnapshotToCodexTarget(request.target);
-    } catch (error) {
-      if (error instanceof CodexTargetTranslationError) {
-        return parseExecutorDeliveryAcceptance({
-          status: "rejected",
-          reasonCode: error.code.toLowerCase(),
-          reason: "generic target is not a valid Codex Desktop delivery target",
-        });
-      }
-      throw error;
-    }
-    const connection = await this.adapter.prepare(target, requireDesktopRuntimeFence(request.target.workspaceId, request.target.workspaceRoot));
-    try {
-      const sent = await connection.send(request.payload);
-      if (sent.threadId !== request.target.sessionId) {
-        return parseExecutorDeliveryAcceptance({
-          status: "rejected",
-          reasonCode: "session_mismatch",
-          reason: "returned session identity does not match frozen delivery target",
-        });
-      }
-      return parseExecutorDeliveryAcceptance({
-        status: "accepted",
-        deliveryId: sent.turnId,
-      });
-    } finally {
-      connection.close();
-    }
   }
 
   async inspectActiveExecution(binding: ExecutorBinding): Promise<ExecutorActiveExecutionProjection> {

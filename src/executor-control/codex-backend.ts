@@ -5,6 +5,7 @@ import {
   locatorExactEqual,
   type ExecutorDeliveryTargetSnapshot,
 } from "../endpoints/schema.js";
+import { codexExecutorProjectId, CodexTargetTranslationError } from "../executor/codex-target.js";
 import { ExecutorControlError } from "./schema.js";
 
 export interface ProductionSendRequest {
@@ -39,7 +40,6 @@ export interface ExecutorProductionBackend {
 }
 
 const CODEX_PLUGIN_ID = "codex-desktop";
-const CODEX_EXECUTOR_PROJECT_ID = /^[A-Za-z0-9_-]{1,128}$/;
 
 function reject(code: string, message: string): never {
   throw new ExecutorControlError(code, message);
@@ -55,15 +55,11 @@ function assertExactWorkspace(
 }
 
 function assertExactCodexLocator(target: ExecutorDeliveryTargetSnapshot): string {
-  const keys = Object.keys(target.locator).sort();
-  if (keys.length !== 1 || keys[0] !== "executorProjectId") {
-    reject("EXECUTOR_BINDING_STALE", "Codex locator 必须且只包含 executorProjectId。");
+  try { return codexExecutorProjectId(target.locator); }
+  catch (error) {
+    if (error instanceof CodexTargetTranslationError) reject("EXECUTOR_BINDING_STALE", `${error.message}。`);
+    throw error;
   }
-  const projectId = target.locator.executorProjectId;
-  if (typeof projectId !== "string" || !CODEX_EXECUTOR_PROJECT_ID.test(projectId)) {
-    reject("EXECUTOR_BINDING_STALE", "executorProjectId 不是有效 bounded 值。");
-  }
-  return projectId;
 }
 
 /**
@@ -105,7 +101,7 @@ function assertGenericMatchesLegacyDesktop(
 /**
  * Codex Desktop production delivery backend。
  * 委托现有 deliverCurrentCommand durable R4 transport。
- * 绝不调用 ExecutorPlugin.deliver() / raw connection.send()。
+ * production 投递只通过受控 transport。
  */
 export class CodexDesktopProductionBackend implements ExecutorProductionBackend {
   readonly pluginId = CODEX_PLUGIN_ID;

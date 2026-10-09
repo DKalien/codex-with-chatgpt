@@ -5,6 +5,7 @@ import { findBridgeObservation, runtimeFile, type BridgeObservation } from "../b
 import { ensureBridgeAndTunnel } from "../process/daemon.js";
 import { readReleaseReferenceJson } from "../core/release-references.js";
 import { getStateDir } from "../config/paths.js";
+import { ensureConfiguredGatewaySupervisor } from "../gateway/startup.js";
 import { Workspace } from "../workspace/manager.js";
 import { isNamedTunnelReady, readTunnelState } from "../tunnel/state.js";
 import { hasSupervisorState, withSupervisorOperation } from "./store.js";
@@ -130,7 +131,7 @@ export async function withSupervisorLifecycleFence<T>(action: (maintenance: Main
 /** Only explicit CLI intent changes desired state; rollout/daemon primitives do not. */
 export async function withExplicitSupervisorIntent<T>(root: string, desiredState: "running" | "stopped",
   tunnel: boolean | undefined, action: (tunnel: boolean, maintenance: MaintenanceLockHandle) => Promise<T>, stateDir = getStateDir()): Promise<T> {
-  return withSupervisorLifecycleFence(async maintenance => {
+  const result = await withSupervisorLifecycleFence(async maintenance => {
     if (!hasSupervisorState(root, stateDir)) return action(tunnel ?? false, maintenance);
     return withSupervisorOperation(root, async tx => {
       const current = tx.readConfig();
@@ -139,4 +140,13 @@ export async function withExplicitSupervisorIntent<T>(root: string, desiredState
       return action(updated.tunnel, maintenance);
     }, { stateDir });
   }, stateDir);
+  if (desiredState === "running") {
+    try { await ensureConfiguredGatewaySupervisor({ stateDir }); }
+    catch (error) {
+      if (!(error instanceof Error)) throw new Error("Bridge 已就绪，但 Gateway/公网隧道启动失败", { cause: error });
+      error.message = `Bridge 已就绪，但 Gateway/公网隧道启动失败：${error.message}`;
+      throw error;
+    }
+  }
+  return result;
 }

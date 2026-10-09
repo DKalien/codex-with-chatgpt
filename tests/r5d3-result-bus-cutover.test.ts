@@ -39,12 +39,14 @@ import {
 import { ackObservedForCompanion as legacyAck } from "../src/feedback/delivery-lifecycle.js";
 import {
   confirmRouteAttestation,
+  companionPublicState,
   createPairingIntent,
   exchangePairingIntent,
   verifyCompanionCredential,
 } from "../src/feedback/companion.js";
 import { applyProjection, feedbackEventId, finalReceiptRequiredEventId } from "../src/feedback/projection-store.js";
-import { canonicalFeedbackEvent } from "../src/feedback/canonical-compat.js";
+import { canonicalFeedbackEvent } from "./helpers/canonical-compat.js";
+import { reconcileHistoricalFeedbackFixtures } from "./helpers/legacy-feedback-fixtures.js";
 import { reconcileFeedbackOutbox } from "../src/feedback/projector.js";
 import { writeState, feedbackStateFile } from "../src/feedback/state-store.js";
 import { cleanupJournalFile } from "../src/command-cleanup/fence.js";
@@ -950,13 +952,16 @@ describe("R5d3 Result Bus cutover", () => {
     ctxCompanionId = ctxOf(paired.credential).companionId;
     const { result } = seedBusEntry("r5d3-fix4a");
     bindSink(ROUTE_A);
-    projectPinnedLegacy(result, { status: "claimed", companionId: "01a00000-0000-7000-8000-0000000009d9" });
+    const legacy = projectPinnedLegacy(result, { status: "claimed", companionId: "01a00000-0000-7000-8000-0000000009d9" });
     const stateView = resultBusCompanionState({
       workspaceId: workspace.id, workspaceRoot: wsRoot, credential: paired.credential, stateDir,
     });
     expect(stateView).toMatchObject({ blockedByLegacyInFlight: true, cutoverReady: false });
     expect((stateView as { inFlight: unknown }).inFlight).toBeNull();
     expect(JSON.stringify(stateView)).not.toContain("messageSha256");
+    expect(stateView).toMatchObject({ unsafeLegacyInFlight: [], unsafeLegacyInFlightCount: 1, events: [] });
+    expect(JSON.stringify(stateView)).not.toContain(legacy.eventId);
+    expect(JSON.stringify(stateView)).not.toContain(legacy.commandId);
   });
 
   it("FIX 4b: Bus attempt 冻结到 B 时，当前 verified route A 不收到可恢复载荷", () => {
@@ -1072,13 +1077,95 @@ describe("R5d3 Result Bus cutover", () => {
     expectCode(() => reserveViaAdapter(paired.credential), "FEEDBACK_NO_READY_EVENT");
   });
 
-  it("FIX A/C: legacy 非 canonical/control ready + 无 Active Sink → 仍可正常预约", () => {
+  it("历史非 canonical execution ready 不可新预约或领取，并报告排空", () => {
     enableBinding();
     const paired = pairCompanion(ROUTE_A);
     seedLegacyReceipt("legacy-noncanon-a");
-    // 无 Active Sink：adapter legacy fallback 携带排除集（空 ownership）→ 正常预约
+    const before = readFeedbackState(workspace.id, stateDir);
+    expectCode(() => reserveViaAdapter(paired.credential), "RESULT_BUS_LEGACY_DRAIN_REQUIRED");
+    const binding = before.binding!;
+    expectCode(() => claimNextForMcp({ workspace, principal: principalA(), bindingId: binding.bindingId,
+      epoch: binding.epoch, stateDir }), "RESULT_BUS_LEGACY_DRAIN_REQUIRED");
+    expect(readFeedbackState(workspace.id, stateDir).events).toEqual(before.events);
+    expect(resultBusCompanionState({ workspaceId: workspace.id, workspaceRoot: wsRoot,
+      credential: paired.credential, stateDir })).toMatchObject({ pendingReady: 0, cutoverReady: false,
+      legacyDrainPending: 1, legacyDrainRequired: true });
+  });
+
+  it("控制专用自动回流保留 reserve/begin/ACK；不消费旁边的历史执行结果", () => {
+    enableBinding();
+    const paired = pairCompanion();
+    seedLegacyReceipt("legacy-control-peer");
+    const control = projectControlEvent("control-only-send");
     const reserved = reserveViaAdapter(paired.credential);
-    expect((reserved.delivery as { commandId: string }).commandId).toBe("legacy-noncanon-a");
+    expect(reserved.delivery.eventId).toBe(control.eventId);
+    const sent = beginViaAdapter(paired.credential, control.eventId, reserved.reservationId);
+    expect(sent.message).toContain("STATE: FINAL_RECEIPT_REQUIRED");
+    expect(ackViaAdapter(paired.credential, control.eventId, sent.attemptId).status).toBe("observed");
+    expect(readFeedbackState(workspace.id, stateDir).events.find(event => event.commandId === "legacy-control-peer")!.status).toBe("ready");
+  });
+
+  it("历史排空诊断仅返回聚合值，不暴露其他 binding 的执行身份", () => {
+    enableBinding();
+    const paired = pairCompanion();
+    seedLegacyReceipt("foreign-legacy-drain");
+    const snapshot = readFeedbackState(workspace.id, stateDir);
+    const event = snapshot.events[0]!;
+    writeState(workspace.id, stateDir, { ...snapshot, events: snapshot.events.map(item => ({ ...item,
+      targetBindingId: randomUUID(), targetEpoch: 2, targetPrincipalFingerprint: "b".repeat(32) })) });
+    const before = JSON.stringify(readFeedbackState(workspace.id, stateDir));
+    const state = resultBusCompanionState({ workspaceId: workspace.id, workspaceRoot: wsRoot,
+      credential: paired.credential, stateDir });
+    expect(state).toMatchObject({ legacyDrainRequired: true, legacyDrainPending: 1, events: [] });
+    expect(JSON.stringify(state)).not.toContain(event.commandId);
+    expect(JSON.stringify(state)).not.toContain(event.eventId);
+    expect(JSON.stringify(readFeedbackState(workspace.id, stateDir))).toBe(before);
+  });
+
+  it("foreign/MCP 旧非 canonical in-flight 只形成全局 fence，不泄漏身份", () => {
+    enableBinding();
+    const paired = pairCompanion();
+    seedLegacyReceipt("foreign-mcp-history");
+    const snapshot = readFeedbackState(workspace.id, stateDir);
+    const event = snapshot.events[0]!;
+    writeState(workspace.id, stateDir, { ...snapshot, events: snapshot.events.map(item => ({ ...item,
+      status: "claimed", attemptId: CLAIM_ATTEMPT, claimedAt: new Date().toISOString() })) });
+    const before = JSON.stringify(readFeedbackState(workspace.id, stateDir));
+    const state = resultBusCompanionState({ workspaceId: workspace.id, workspaceRoot: wsRoot,
+      credential: paired.credential, stateDir });
+    expect(state).toMatchObject({ blockedByLegacyInFlight: true, cutoverReady: false, inFlight: null,
+      unsafeLegacyInFlight: [], unsafeLegacyInFlightCount: 1, legacyDrainRequired: true, events: [] });
+    for (const hidden of [event.commandId, event.eventId, CLAIM_ATTEMPT]) expect(JSON.stringify(state)).not.toContain(hidden);
+    expect(JSON.stringify(readFeedbackState(workspace.id, stateDir))).toBe(before);
+  });
+
+  it.each(["reserved", "claimed", "outcome_unknown"] as const)("历史执行 %s 不可 begin 或重放 Send，原证据保持", status => {
+    enableBinding();
+    const paired = pairCompanion();
+    const ctx = ctxOf(paired.credential);
+    const result = routingResult(`history-no-send-${status}`);
+    const legacy = projectPreR4cLegacy(result, { status, companionId: ctx.companionId });
+    const before = JSON.stringify(readFeedbackState(workspace.id, stateDir));
+    expectCode(() => beginViaAdapter(paired.credential, legacy.eventId, RESERVATION), "RESULT_BUS_LEGACY_DRAIN_REQUIRED");
+    expect(JSON.stringify(readFeedbackState(workspace.id, stateDir))).toBe(before);
+  });
+
+  it.each(["reserved", "claimed", "outcome_unknown"] as const)("旧执行 %s 的自身恢复 state 禁止 Send，保留原身份与只读证据", status => {
+    enableBinding();
+    const paired = pairCompanion();
+    const ctx = ctxOf(paired.credential);
+    const result = routingResult(`history-state-no-send-${status}`);
+    const legacy = projectPreR4cLegacy(result, { status, companionId: ctx.companionId });
+    const before = JSON.stringify(readFeedbackState(workspace.id, stateDir));
+    for (const state of [
+      resultBusCompanionState({ workspaceId: workspace.id, workspaceRoot: wsRoot, credential: paired.credential, stateDir }),
+      companionPublicState({ workspaceId: workspace.id, ctx, stateDir }),
+    ]) {
+      expect(state.inFlight).toMatchObject({ eventId: legacy.eventId,
+        status: status === "claimed" ? "outcome_unknown" : status, reservationId: RESERVATION, sendAllowed: false });
+      if (status !== "reserved") expect(state.inFlight).toHaveProperty("messageSha256");
+    }
+    expect(JSON.stringify(readFeedbackState(workspace.id, stateDir))).toBe(before);
   });
 
   /** legacy 非 canonical 投影路径：trusted receipt + reconcile（无 routing command）。 */
@@ -1138,7 +1225,7 @@ describe("R5d3 Result Bus cutover", () => {
         desktopBindingId: "22222222-2222-4222-8222-222222222222",
       });
     });
-    if (options.reconcile !== false) reconcileFeedbackOutbox(workspace.id, stateDir, wsRoot);
+    if (options.reconcile !== false) reconcileHistoricalFeedbackFixtures(workspace.id, stateDir, wsRoot);
   }
 
   /** stale in-flight legacy fixture：把 seedLegacyReceipt 产生的 ready 事件回填为 stale reserved/claimed。 */
@@ -1720,7 +1807,7 @@ describe("R5d3 Result Bus cutover", () => {
       expect(readFeedbackState(workspace.id, stateDir)!.events.find(e => e.eventId === preR4c.eventId)!.status).toBe("ready");
     });
 
-    it("HTTP FIX2-2D: 有效 legacy credential fallback 仍然可用", async () => {
+    it("HTTP FIX2-2D: 有效 credential 保留控制专用回流，旧 execution 返回明确排空错误", async () => {
       enableBinding();
       const paired = pairCompanion();
       seedLegacyReceipt("r5d3-auth-d");
@@ -1728,8 +1815,14 @@ describe("R5d3 Result Bus cutover", () => {
       const reserved = await fetchJson("/api/companion/v1/reserve", {
         method: "POST", headers: auth, body: JSON.stringify({ routeCanonical: ROUTE_A }),
       });
-      expect(reserved.status).toBe(200);
-      expect(reserved.body.delivery.commandId).toBe("r5d3-auth-d");
+      expect(reserved.status).toBe(409);
+      expect(reserved.body.error).toBe("RESULT_BUS_LEGACY_DRAIN_REQUIRED");
+      const control = projectControlEvent("r5d3-auth-d-control");
+      const notification = await fetchJson("/api/companion/v1/reserve", {
+        method: "POST", headers: auth, body: JSON.stringify({ routeCanonical: ROUTE_A }),
+      });
+      expect(notification.status).toBe(200);
+      expect(notification.body.delivery.eventId).toBe(control.eventId);
     });
 
     it("HTTP AUTH-A: 无效 credential + stale reserved → 401 且 stale 状态字节不变", async () => {

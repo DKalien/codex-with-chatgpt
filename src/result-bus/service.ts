@@ -3,6 +3,7 @@ import { enqueueResultBusEntries, readResultBus } from "./store.js";
 import { isCanonicalRoutingResult } from "./schema.js";
 import { readCleanupJournal, withCommandOperation } from "../command-cleanup/fence.js";
 import { getStateDir } from "../config/paths.js";
+import { routingCommandIdSchema } from "../routing/schema.js";
 import { CommandCleanupError } from "../command-cleanup/schema.js";
 
 export type ResultBusReconciliation = {
@@ -10,11 +11,16 @@ export type ResultBusReconciliation = {
   replayed: number;
 };
 
-/**
- * Shadow/backfill only: reconcile every persisted canonical RoutingResult into the
- * Result Bus, planner- and sink-independent. Legacy results are never promoted.
- * Single-lock, idempotent; safe to retry from production reconciliation at any time.
- */
+/** 仅在 command lifecycle 锁内重读当前 command，再幂等投影到 Result Bus。 */
+export function reconcileCommandResultBus(identity: RoutingWorkspaceIdentity, commandId: string, stateDir = getStateDir()): ResultBusReconciliation {
+  const resolved = resolveWorkspaceIdentity(identity);
+  const parsedCommandId = routingCommandIdSchema.parse(commandId);
+  return withCommandOperation(resolved.id, parsedCommandId, () =>
+    enqueueResultBusEntries(resolved, listResults(resolved, stateDir).filter(result =>
+      result.commandId === parsedCommandId && isCanonicalRoutingResult(result)), stateDir), stateDir);
+}
+
+/** 恢复/维护入口：补齐全部持久化 canonical RoutingResult；legacy result 不升级。 */
 export function reconcileWorkspaceResultBus(identity: RoutingWorkspaceIdentity, stateDir?: string): ResultBusReconciliation {
   const { projected, replayed } = reconcileResults(identity, stateDir, false);
   return { projected, replayed };
@@ -45,10 +51,7 @@ function reconcileResults(identity: RoutingWorkspaceIdentity, stateDir: string |
       continue;
     }
     try {
-      const outcome = withCommandOperation(resolved.id, commandId, () => {
-        // Re-read under lifecycle authority: stale pre-cleanup sources cannot backfill.
-        return enqueueResultBusEntries(resolved, listResults(resolved, directory).filter(result => result.commandId === commandId && isCanonicalRoutingResult(result)), directory);
-      }, directory);
+      const outcome = reconcileCommandResultBus(resolved, commandId, directory);
       projected += outcome.projected; replayed += outcome.replayed;
     } catch (error) {
       if (!isolateUnavailable || !(error instanceof CommandCleanupError)

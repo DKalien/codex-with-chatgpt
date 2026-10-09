@@ -51,6 +51,10 @@ export function writeBuildId(distDir = path.join(projectRoot, "dist")) {
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   // launcher/格式实现也属于实际程序版本；只改安装代码也必须生成新 buildId。
   const dist = process.argv[2] ? path.resolve(process.argv[2]) : path.join(projectRoot, "dist");
+  // tsc 不删除已退役源码的旧产物；发布前排除仅供历史测试的兼容 writer。
+  for (const suffix of [".js", ".js.map"]) {
+    fs.rmSync(path.join(dist, "feedback", `canonical-compat${suffix}`), { force: true });
+  }
   const assets = path.join(dist, "core-assets");
   fs.mkdirSync(assets, { recursive: true });
   for (const name of ["core-release.cjs", "core-launcher.cjs", "install-core.mjs"]) {

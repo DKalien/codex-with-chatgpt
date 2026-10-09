@@ -14,6 +14,8 @@
 
 当前源码已实现机器级 Unified Gateway、显式 workspace/client 授权路由，以及 Remote、Desktop、feedback 与 Web Sink 工具整合。多项目 Companion 和 Gateway Supervisor 也已有源码实现；双项目真实 Send/observed、完整现场验收与旧插件退役仍待完成。当前合同见 [官方路线](docs/official-route.md)，源码、部署与验收状态统一见 [Gateway 计划](docs/unified-gateway-plan.md)。
 
+本机已配置 `gateway supervisor` 时，启动或重启 workspace Bridge 会自动启动或复用共享 Gateway、Cloudflare origin 与 Secure MCP Tunnel，并等待就绪；未配置时保持原 workspace 启动流程。停止当前 workspace 的 Bridge 不会停止共享 Gateway。Gateway 启动失败会报告 Bridge 已就绪和具体错误，不宣称整组启动成功。
+
 已配对浏览器在具体 ChatGPT 对话中点击“连接当前对话”，新建或切换回流目标时由用户在本机确认工作区与完整 URL；该确认只授权结果回流。连接状态与自动回流、未知发送分别判断；“清空历史显示”只隐藏本地终态列表，保留待发送、隔离与防重放证据。操作和恢复见 [日常连接](docs/troubleshooting.md#日常连接与本机确认)。
 
 ## 实验性 Desktop Control（默认关闭）

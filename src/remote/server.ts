@@ -3,6 +3,7 @@ import type { Server } from "node:http";
 import path from "node:path";
 import fs from "node:fs";
 import { randomUUID } from "node:crypto";
+import { z } from "zod";
 import { AuthStore } from "../auth/store.js";
 import { createOAuthRouter } from "../auth/oauth.js";
 import { bearerAuth } from "../auth/middleware.js";
@@ -31,6 +32,7 @@ export interface GatewayServerOptions {
   publicUrl: string;
   authStoreFile?: string;
   pairingTtlMs?: number;
+  healthIdentity?: { pid: number; creationTime: string; buildId: string };
 }
 
 export interface GatewayServer {
@@ -90,6 +92,11 @@ export const GATEWAY_AUTH_ID = "machine-gateway";
 export async function startGatewayServer(opts: GatewayServerOptions): Promise<GatewayServer> {
   if (!Number.isInteger(opts.port) || opts.port < 0 || opts.port > 65535) throw new RemoteError("INVALID_PORT");
   httpsOrigin(opts.publicUrl);
+  const healthIdentity = opts.healthIdentity === undefined ? undefined : z.object({
+    pid: z.number().int().positive().max(0xffffffff).refine(pid => pid === process.pid),
+    creationTime: z.string().regex(/^[a-zA-Z0-9:-]{1,128}$/),
+    buildId: z.string().regex(/^[a-f0-9]{64}$/),
+  }).strict().parse(opts.healthIdentity);
   const registry = new GatewayRegistry();
   registry.list(); // Corrupt registry stops startup; no discovery or implicit registration.
   // One owner for the memory-cached machine AuthStore; never reclaim a crash lock automatically.
@@ -116,6 +123,7 @@ export async function startGatewayServer(opts: GatewayServerOptions): Promise<Ga
     const endpoint = await startEndpoint({ ...opts, identity: GATEWAY_AUTH_ID, name: "本机 Gateway（仅显式授权项目）",
       authStoreFile: opts.authStoreFile ?? path.join(getStateDir(), "auth", "gateway.json"),
       allowAnonymousDiscovery: true,
+      gatewayHealth: healthIdentity,
       makeServer: (authStore) => createGatewayMcpServer(registry, (auth, scope) => {
         const verdict = authStore.verifyAccessToken(auth.token);
         if (!verdict.ok || verdict.record.workspaceId !== GATEWAY_AUTH_ID ||
@@ -132,6 +140,7 @@ export async function startGatewayServer(opts: GatewayServerOptions): Promise<Ga
 async function startEndpoint(opts: GatewayServerOptions & {
   identity: string; name: string; authStoreFile: string; makeServer: (authStore: AuthStore) => McpServer;
   allowAnonymousDiscovery?: boolean;
+  gatewayHealth?: GatewayServerOptions["healthIdentity"];
 }): Promise<GatewayServer> {
   if (!Number.isInteger(opts.port) || opts.port < 0 || opts.port > 65535) throw new RemoteError("INVALID_PORT");
   const publicUrl = httpsOrigin(opts.publicUrl);
@@ -153,6 +162,20 @@ async function startEndpoint(opts: GatewayServerOptions & {
     });
     next();
   });
+  if (opts.gatewayHealth) {
+    app.get("/internal/gateway/health", (req, res) => {
+      const port = (server.address() as { port: number }).port;
+      if (req.socket.remoteAddress !== "127.0.0.1" || req.headers.host !== `127.0.0.1:${port}` ||
+          Object.keys(req.headers).some(name => name === "forwarded" || name.startsWith("x-forwarded-") ||
+            name === "cf-connecting-ip" || name === "cf-ray")) {
+        res.sendStatus(404);
+        return;
+      }
+      res.setHeader("Cache-Control", "no-store");
+      res.json({ service: "machine-gateway", pid: opts.gatewayHealth!.pid, creationTime: opts.gatewayHealth!.creationTime,
+        buildId: opts.gatewayHealth!.buildId, port, publicUrl });
+    });
+  }
   app.use(createOAuthRouter({
     store: authStore,
     pairing,

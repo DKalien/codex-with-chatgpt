@@ -245,7 +245,7 @@ describe("Desktop receipt terminal fence", () => {
     const source = fs.readFileSync(receiptFinalizerCliSource, "utf8");
     expect(source).toMatch(/if\s*\(\s*["']record["']\s+in\s+result\s*\)\s*\{[\s\S]*?reconcileTrustedDesktopExecutionResult\([\s\S]*?draft\.commandId/);
     expect(source).toMatch(/runReceiptFinalizer\(draft,\s*\{[\s\S]*?beforeReceiptCommit:\s*receiptAlreadyExists\s*=>\s*prepareResultReconciliation/);
-    expect(source).toMatch(/const reconciliationNeeded\s*=\s*resultOutbox\.status\s*===\s*["']reconciliation_needed["'][\s\S]*?if\s*\(\s*reconciliationNeeded\s*\)\s*process\.exitCode\s*=\s*1/);
+    expect(source).toMatch(/const reconciliationNeeded\s*=\s*resultReconciliation\.status\s*===\s*["']reconciliation_needed["'][\s\S]*?if\s*\(\s*reconciliationNeeded\s*\)\s*process\.exitCode\s*=\s*1/);
     expect(source).not.toMatch(/reconcileTrustedDesktopExecutionResult[\s\S]{0,300}reconcileFeedbackOutbox/);
   });
 

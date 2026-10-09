@@ -2,7 +2,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   EndpointSchemaError,
   PluginRegistryError,
-  assertDeliveryTargetMatchesBinding,
   assertSendTargetImmutable,
   assertTrustedEvidenceAllowed,
   createExecutorBinding,
@@ -13,14 +12,11 @@ import {
   freezeWebSinkSendTarget,
   parseExecutorBinding,
   parseExecutorBindingCandidate,
-  parseExecutorDeliveryAcceptance,
   parseExecutorExecutionEvidence,
   parseExecutorPluginDescriptor,
   parseWebSinkBinding,
   parseWebSinkSendTargetSnapshot,
   validateExecutorPlugin,
-  type ExecutorDeliveryAcceptance,
-  type ExecutorDeliveryRequest,
   type ExecutorExecutionEvidence,
   type ExecutorPlugin,
   type ExecutorPluginCapabilities,
@@ -37,17 +33,15 @@ import {
   CodexTargetTranslationError,
   codexDesktopAdapter,
   codexDesktopExecutorPlugin,
-  createExecutorRegistry,
-  executorRegistry,
-  getExecutor,
   projectCodexDesktopTargetToExecutorBindingCandidate,
   type ExecutorCapabilities,
   type ExecutorConnection,
-  type ExecutorDescriptor,
   type ExecutorTarget,
 } from "../src/executor/index.js";
 import { updateDesktop } from "../src/desktop/store.js";
 import { cleanup, makeTmpDir } from "./helpers.js";
+import { codexExecutorProjectId } from "../src/executor/codex-target.js";
+import { assertExactCodexLocator } from "../src/executor-control/codex-backend.js";
 
 const workspaceId = "2582910bf0d2";
 const workspaceRoot = "D:\\python\\codex-with-chatgpt";
@@ -60,6 +54,18 @@ const runtimeFence = {
   appServerExe: "C:\\Program Files\\ChatGPT\\codex.exe",
   appServerCreation: "1000002",
 };
+
+it.each([{}, { wrongKey: "p" }, { executorProjectId: "p", extra: "x" }, { executorProjectId: "" },
+  { executorProjectId: "含中文" }, { executorProjectId: "p".repeat(129) }])("Codex locator 无效时保留入口错误码 %j", locator => {
+  expect(() => codexExecutorProjectId(locator)).toThrow(CodexTargetTranslationError);
+  try { assertExactCodexLocator({ locator } as ExecutorDeliveryTargetSnapshot); }
+  catch (error) { expect(error).toMatchObject({ code: "EXECUTOR_BINDING_STALE" }); return; }
+  throw new Error("无效 locator 未被拒绝");
+});
+
+it("Codex locator 接受 bounded projectId", () => {
+  expect(codexExecutorProjectId({ executorProjectId: "p".repeat(128) })).toBe("p".repeat(128));
+});
 
 function validCandidate(overrides: Partial<ExecutorBindingCandidate> = {}): ExecutorBindingCandidate {
   return parseExecutorBindingCandidate({
@@ -124,9 +130,6 @@ function fakePlugin(id: string, capabilities = boundedCapabilities()): ExecutorP
     },
     async inspectSession() {
       return { sessionId: candidate.sessionId, instanceId: candidate.instanceId, locator: candidate.locator };
-    },
-    async deliver() {
-      return { status: "accepted", deliveryId: `deliv_${id}` };
     },
   };
 }
@@ -432,13 +435,12 @@ describe("R5a executor plugin registration trust gate", () => {
           },
           discoverCurrent: async () => validCandidate({ pluginId: "p1" }),
           inspectSession: async () => ({ sessionId: "s", instanceId: "i", locator: {} }),
-          deliver: async () => ({ status: "accepted", deliveryId: "d1" }),
         },
       ]),
     ).toThrow();
   });
 
-  it("rejects missing deliver/discoverCurrent/inspectSession", () => {
+  it("拒绝缺少 discoverCurrent/inspectSession 的插件", () => {
     const base = {
       descriptor: parseExecutorPluginDescriptor({
         pluginId: "p1",
@@ -450,22 +452,13 @@ describe("R5a executor plugin registration trust gate", () => {
     expect(() =>
       validateExecutorPlugin({
         ...base,
-        discoverCurrent: async () => validCandidate({ pluginId: "p1" }),
         inspectSession: async () => ({ sessionId: "s", instanceId: "i", locator: {} }),
-      }),
-    ).toThrow(/deliver/);
-    expect(() =>
-      validateExecutorPlugin({
-        ...base,
-        inspectSession: async () => ({ sessionId: "s", instanceId: "i", locator: {} }),
-        deliver: async () => ({ status: "accepted", deliveryId: "d1" }),
       }),
     ).toThrow(/discoverCurrent/);
     expect(() =>
       validateExecutorPlugin({
         ...base,
         discoverCurrent: async () => validCandidate({ pluginId: "p1" }),
-        deliver: async () => ({ status: "accepted", deliveryId: "d1" }),
       }),
     ).toThrow(/inspectSession/);
   });
@@ -481,74 +474,6 @@ describe("R5a executor plugin registration trust gate", () => {
   });
 });
 
-describe("R5a delivery snapshot immutability", () => {
-  it("rejects delivery when any frozen identity field drifts", () => {
-    const binding = validExecutorBinding();
-    const snapshot = freezeExecutorDeliveryTarget(binding, instant);
-    const request: ExecutorDeliveryRequest = {
-      request: "req-1",
-      target: snapshot,
-      payload: "hello",
-    };
-    expect(() => assertDeliveryTargetMatchesBinding(request, binding)).not.toThrow();
-
-    expect(() =>
-      assertDeliveryTargetMatchesBinding(
-        { ...request, target: { ...snapshot, sessionId: "other-session" } },
-        binding,
-      ),
-    ).toThrow(/不一致/);
-    expect(() =>
-      assertDeliveryTargetMatchesBinding(
-        { ...request, target: { ...snapshot, epoch: snapshot.epoch + 1 } },
-        binding,
-      ),
-    ).toThrow(/不一致/);
-    expect(() =>
-      assertDeliveryTargetMatchesBinding(
-        { ...request, target: { ...snapshot, workspaceRoot: "D:\\other\\root" } },
-        binding,
-      ),
-    ).toThrow(/不一致/);
-    expect(() =>
-      assertDeliveryTargetMatchesBinding(
-        { ...request, target: { ...snapshot, locator: { token: "changed" } } },
-        binding,
-      ),
-    ).toThrow(/不一致/);
-    expect(() =>
-      assertDeliveryTargetMatchesBinding(
-        { ...request, target: { ...snapshot, locator: { extra: "v", token: "value-1" } } },
-        binding,
-      ),
-    ).toThrow(/不一致/);
-    expect(() =>
-      assertDeliveryTargetMatchesBinding(
-        { ...request, target: { ...snapshot, bindingId: "other-binding" } },
-        binding,
-      ),
-    ).toThrow(/不一致/);
-  });
-});
-
-describe("R5a delivery acceptance contract", () => {
-  it("accepts non-UUID bounded delivery IDs and rejects malformed acceptance", () => {
-    const accepted = parseExecutorDeliveryAcceptance({ status: "accepted", deliveryId: "local.exec-42:abc" });
-    expect(accepted).toEqual({ status: "accepted", deliveryId: "local.exec-42:abc" });
-    expect(() => parseExecutorDeliveryAcceptance({ status: "accepted" })).toThrow();
-    expect(() => parseExecutorDeliveryAcceptance({ status: "accepted", deliveryId: "" })).toThrow();
-    expect(() =>
-      parseExecutorDeliveryAcceptance({ status: "rejected", reasonCode: "ok reason" }),
-    ).toThrow();
-    const rejected = parseExecutorDeliveryAcceptance({
-      status: "rejected",
-      reasonCode: "session_mismatch",
-      reason: "returned session identity does not match",
-    });
-    expect(rejected.status).toBe("rejected");
-  });
-});
-
 describe("R5a Codex Desktop adapter compatibility", () => {
   const target: ExecutorTarget = {
     threadId: "01a0d6cd-09f3-73e3-9726-4bd65df196d3",
@@ -560,12 +485,6 @@ describe("R5a Codex Desktop adapter compatibility", () => {
   it("retains existing executor adapter APIs", () => {
     expect(CODEX_DESKTOP_EXECUTOR_ID).toBe("codex-desktop");
     expect(codexDesktopAdapter).toBeInstanceOf(CodexDesktopAdapter);
-    expect(getExecutor()).toBe(codexDesktopAdapter);
-    expect(getExecutor("codex-desktop")).toBe(codexDesktopAdapter);
-    expect(executorRegistry.get("codex-desktop")).toBe(codexDesktopAdapter);
-    expect(() => executorRegistry.get("missing")).toThrow();
-    const registry = createExecutorRegistry();
-    expect(registry.list().map((d: ExecutorDescriptor) => d.id)).toEqual(["codex-desktop"]);
     const capabilities: ExecutorCapabilities = codexDesktopAdapter.descriptor.capabilities;
     expect(capabilities.trustedTerminalReceipt).toBe(true);
     expect(typeof codexDesktopAdapter.inspect).toBe("function");
@@ -610,7 +529,7 @@ describe("R5a Codex Desktop adapter compatibility", () => {
   });
 });
 
-describe("R5a Codex deliver with injected fake adapter", () => {
+describe("R5a Codex 精确目标检查与 adapter 注入", () => {
   let stateDir = "";
 
   beforeEach(() => {
@@ -642,42 +561,6 @@ describe("R5a Codex deliver with injected fake adapter", () => {
     workspaceRoot,
   };
 
-  function fakeAdapter(sendImpl: (message: string) => Promise<{ threadId: string; turnId: string }>): {
-    adapter: ConstructorParameters<typeof CodexDesktopExecutorPlugin>[0];
-    closed: { count: number };
-  } {
-    const closed = { count: 0 };
-    const connection: ExecutorConnection = {
-      async send(message: string) {
-        return sendImpl(message);
-      },
-      close() {
-        closed.count += 1;
-      },
-    };
-    return {
-      closed,
-      adapter: {
-        descriptor: codexDesktopAdapter.descriptor,
-        async inspect() {
-          return { ...target, title: "t" };
-        },
-        async currentIdentity() {
-          return { ...target, title: "t" };
-        },
-        async confirmCurrent() {
-          return { ...target, title: "t" };
-        },
-        async prepare() {
-          return connection;
-        },
-        async inspectActiveExecution() {
-          return { ...target, activeTurnId: "turn-1" };
-        },
-      },
-    };
-  }
-
   const candidate = projectCodexDesktopTargetToExecutorBindingCandidate({
     target,
     workspaceId,
@@ -688,38 +571,6 @@ describe("R5a Codex deliver with injected fake adapter", () => {
     epoch: 2,
     boundAt: instant,
   });
-  const targetSnapshot = freezeExecutorDeliveryTarget(binding, instant);
-  const request: ExecutorDeliveryRequest = {
-    request: "req-codex",
-    target: targetSnapshot,
-    payload: "hello",
-  };
-
-  it("returns accepted generic delivery identity when session matches and always closes", async () => {
-    const { adapter, closed } = fakeAdapter(async () => ({
-      threadId: target.threadId,
-      turnId: "turn-abc.42",
-    }));
-    const plugin = new CodexDesktopExecutorPlugin(adapter);
-    const acceptance: ExecutorDeliveryAcceptance = await plugin.deliver(request);
-    expect(acceptance).toEqual({ status: "accepted", deliveryId: "turn-abc.42" });
-    expect(closed.count).toBe(1);
-  });
-
-  it("fails closed on session mismatch and still closes", async () => {
-    const { adapter, closed } = fakeAdapter(async () => ({
-      threadId: "other-session",
-      turnId: "turn-x",
-    }));
-    const plugin = new CodexDesktopExecutorPlugin(adapter);
-    const acceptance = await plugin.deliver(request);
-    expect(acceptance.status).toBe("rejected");
-    if (acceptance.status === "rejected") {
-      expect(acceptance.reasonCode).toBe("session_mismatch");
-    }
-    expect(closed.count).toBe(1);
-  });
-
   function countingAdapter() {
     const counts = { prepare: 0, inspect: 0, inspectActive: 0, close: 0 };
     const connection: ExecutorConnection = {
@@ -753,62 +604,6 @@ describe("R5a Codex deliver with injected fake adapter", () => {
     };
     return { adapter, counts };
   }
-
-  function snapshotWith(overrides: Partial<ExecutorDeliveryTargetSnapshot>) {
-    return freezeExecutorDeliveryTarget(
-      createExecutorBinding(
-        {
-          pluginId: overrides.pluginId ?? candidate.pluginId,
-          workspaceId,
-          workspaceRoot: overrides.workspaceRoot ?? workspaceRoot,
-          instanceId: overrides.instanceId ?? "local",
-          sessionId: overrides.sessionId ?? target.threadId,
-          locator: overrides.locator ?? candidate.locator,
-        },
-        { bindingId: "codex-bind-1", epoch: 2, boundAt: instant },
-      ),
-      instant,
-    );
-  }
-
-  it("rejects foreign pluginId before adapter.prepare", async () => {
-    const { adapter, counts } = countingAdapter();
-    const plugin = new CodexDesktopExecutorPlugin(adapter);
-    const acceptance = await plugin.deliver({
-      request: "r",
-      target: snapshotWith({ pluginId: "other-plugin", sessionId: "sess-other" }),
-      payload: "x",
-    });
-    expect(acceptance.status).toBe("rejected");
-    expect(counts.prepare).toBe(0);
-    expect(counts.close).toBe(0);
-  });
-
-  it("rejects missing executorProjectId before adapter.prepare", async () => {
-    const { adapter, counts } = countingAdapter();
-    const plugin = new CodexDesktopExecutorPlugin(adapter);
-    const acceptance = await plugin.deliver({
-      request: "r",
-      target: snapshotWith({ locator: {} }),
-      payload: "x",
-    });
-    expect(acceptance.status).toBe("rejected");
-    expect(counts.prepare).toBe(0);
-  });
-
-  it("rejects extra locator key before adapter.prepare", async () => {
-    const { adapter, counts } = countingAdapter();
-    const plugin = new CodexDesktopExecutorPlugin(adapter);
-    const acceptance = await plugin.deliver({
-      request: "r",
-      target: snapshotWith({
-        locator: { executorProjectId: target.projectId, extraKey: "nope" },
-      }),
-      payload: "x",
-    });
-    expect(acceptance.status).toBe("rejected");
-    expect(counts.prepare).toBe(0);
-  });
 
   it("rejects foreign/malformed binding in inspectSession and inspectActiveExecution before adapter", async () => {
     const { adapter, counts } = countingAdapter();
@@ -844,13 +639,12 @@ describe("R5a Codex deliver with injected fake adapter", () => {
     expect(counts.prepare).toBe(0);
   });
 
-  it("valid Codex target keeps accepted delivery behavior", async () => {
+  it("有效 Codex 目标只提供检查能力", async () => {
     const { adapter, counts } = countingAdapter();
     const plugin = new CodexDesktopExecutorPlugin(adapter);
-    const acceptance = await plugin.deliver(request);
-    expect(acceptance).toEqual({ status: "accepted", deliveryId: "turn-1" });
-    expect(counts.prepare).toBe(1);
-    expect(counts.close).toBe(1);
+    expect("deliver" in plugin).toBe(false);
+    expect(counts.prepare).toBe(0);
+    expect(counts.close).toBe(0);
     const session = await plugin.inspectSession(binding);
     expect(session.sessionId).toBe(target.threadId);
     expect(counts.inspect).toBe(1);

@@ -10,6 +10,7 @@ import { buildDaemonEnv, spawnDetachedDaemon, resolveDaemonSpawnHelperPath, reso
 import { observeProcessPresence, probeProcess } from "./process-probe.js";
 import { persistSpawnProvenance, type LaunchIdentity, type readBridgeProvenance } from "./bridge-provenance.js";
 import { isRuntimeBuildId } from "../build-id.js";
+import { ensureConfiguredGatewaySupervisor } from "../gateway/startup.js";
 import {
   tryAcquireMaintenanceLock,
   assertMaintenanceHandle,
@@ -109,6 +110,15 @@ export async function ensureBridge(workspaceRoot: string, opts: {
     }
   }
   releaseMaintenanceOrThrow(ownedMaintenance, { result, actionError: actionError ?? undefined });
+  // Gateway 自己需要 maintenance；继承锁的 caller 必须在其围栏退出后启动。
+  if (ownedMaintenance) {
+    try { await ensureConfiguredGatewaySupervisor({ stateDir }); }
+    catch (error) {
+      if (!(error instanceof Error)) throw new Error("Bridge 已就绪，但 Gateway/公网隧道启动失败", { cause: error });
+      error.message = `Bridge 已就绪，但 Gateway/公网隧道启动失败：${error.message}`;
+      throw error;
+    }
+  }
   return result!;
 }
 

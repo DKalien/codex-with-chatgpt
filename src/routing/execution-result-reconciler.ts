@@ -9,46 +9,23 @@ import {
 import { projectTrustedDesktopExecutionResult } from "./execution-result-projector.js";
 import {
   clearResultReconciliationNeeded,
-  enqueueResultOutboxEntry,
-  listResultOutboxEntries,
   markResultReconciliationNeeded,
 } from "./result-outbox-store.js";
-import { reconcileWorkspaceResultBus } from "../result-bus/service.js";
+import { reconcileCommandResultBus, type ResultBusReconciliation } from "../result-bus/service.js";
+import { listResultBusEntries } from "../result-bus/store.js";
+import { canonicalRoutingResultDigest } from "./execution-result-digest.js";
 import { RoutingError, routingCommandIdSchema } from "./schema.js";
 import { withCommandOperation } from "../command-cleanup/fence.js";
 
 export type DesktopExecutionResultReconciliation =
   | { status: "not_applicable"; reason: "routing_command_missing" }
   | { status: "not_canonical"; reason: "receipt_not_trusted_or_legacy" }
-  | { status: "reconciled"; resultId: string; plannerRouteId: string; resultReplayed: boolean; outboxEntryId: string; outboxReplayed: boolean; resultBus: ResultBusShadowOutcome }
+  | { status: "reconciled"; resultId: string; plannerRouteId: string; resultReplayed: boolean; resultBus: ResultBusReconciliation }
   | { status: "reconciliation_needed"; reasonCode: string; issuePersisted: boolean };
-
-/**
- * R5d1 shadow seam outcome. The Result Bus is reconciled after the R4 canonical
- * result/outbox commit; its failure is reported but never blocks or invalidates
- * the independently deliverable R4 result/outbox. A later retry of this
- * reconciliation re-attempts the shadow backfill from persisted canonical results.
- */
-export type ResultBusShadowOutcome =
-  | { status: "reconciled"; projected: number; replayed: number }
-  | { status: "failed"; reasonCode: string };
 
 type DesktopExecutionResultReconciliationCore =
   | Exclude<DesktopExecutionResultReconciliation, { status: "reconciled" }>
   | Omit<Extract<DesktopExecutionResultReconciliation, { status: "reconciled" }>, "resultBus">;
-
-function resultBusReasonCode(error: unknown): string {
-  const code = reasonCode(error);
-  return code === "RESULT_RECONCILIATION_FAILED" ? "RESULT_BUS_RECONCILIATION_FAILED" : code;
-}
-
-function reconcileResultBusShadow(identity: RoutingWorkspaceIdentity): ResultBusShadowOutcome {
-  try {
-    return { status: "reconciled", ...reconcileWorkspaceResultBus(identity) };
-  } catch (error) {
-    return { status: "failed", reasonCode: resultBusReasonCode(error) };
-  }
-}
 
 function reasonCode(error: unknown): string {
   const code = error && typeof error === "object" && "code" in error && typeof error.code === "string"
@@ -112,11 +89,7 @@ function synchronizeUnknownCommandDelivery(
   });
 }
 
-/**
- * Local post-receipt seam: use only the accepted Command captured at delivery time and its
- * trusted local receipt. Receipt, RoutingResult and Result Outbox are separate durable commits;
- * this function is deliberately idempotent so a retry repairs result-only partial progress.
- */
+/** 只使用投递时保存的 accepted Command 与 trusted receipt；幂等修复分步持久化的结果与 Bus。 */
 export function reconcileTrustedDesktopExecutionResult(
   identity: RoutingWorkspaceIdentity,
   commandId: string,
@@ -155,13 +128,13 @@ export function reconcileTrustedDesktopExecutionResult(
         }
         if (matches.length === 0) {
           const hasResult = state!.results.some(item => item.commandId === command.commandId && item.iteration === 1);
-          const hasOutboxEntry = listResultOutboxEntries(identity).some(
+          const hasBusEntry = listResultBusEntries(identity).some(
             item => item.commandId === command.commandId && item.iteration === 1,
           );
           // The intent may have been committed before a receipt write failed. This check
           // is under the execution-record lock: a concurrent writer must publish a new
           // intent before its own receipt, so clearing this orphan cannot reopen a gap.
-          if (!hasResult && !hasOutboxEntry) clearResultReconciliationNeeded(identity, command.commandId);
+          if (!hasResult && !hasBusEntry) clearResultReconciliationNeeded(identity, command.commandId);
           return { status: "not_canonical", reason: "receipt_not_trusted_or_legacy" };
         }
         if (!isTrustedDesktopReceipt(matches[0]!, command.commandId) ||
@@ -175,14 +148,18 @@ export function reconcileTrustedDesktopExecutionResult(
           commandId: command.commandId,
           desktopReceiptSha256: matches[0]!.desktopReceiptSha256!,
         });
-        const hasResult = readRouting(identity)?.results.some(
-          item => item.commandId === command.commandId && item.iteration === candidate.iteration,
-        ) ?? false;
-        const hasOutboxEntry = listResultOutboxEntries(identity).some(
+        const existing = readRouting(identity)?.results.find(
           item => item.commandId === command.commandId && item.iteration === candidate.iteration,
         );
-        if (!hasResult || !hasOutboxEntry) {
-          // Publish before the first semantic commit. A crash after appendResult remains discoverable.
+        let busCommitted = false;
+        if (existing && "rawSummary" in existing && "machineEvidence" in existing) {
+          try {
+            busCommitted = listResultBusEntries(identity).some(item =>
+              item.commandId === command.commandId && item.iteration === existing.iteration &&
+              item.resultId === existing.resultId && item.resultSha256 === canonicalRoutingResultDigest(existing));
+          } catch { /* Bus 故障不阻止 canonical result 落盘；投影阶段会报告具体错误。 */ }
+        }
+        if (!busCommitted) {
           markResultReconciliationNeeded(identity, {
             commandId: command.commandId,
             reasonCode: "RESULT_RECONCILIATION_PENDING",
@@ -193,22 +170,11 @@ export function reconcileTrustedDesktopExecutionResult(
           throw new RoutingError("ROUTING_RESULT_LEGACY_CONFLICT", "既有 legacy RoutingResult 不能升级为 canonical result。");
         }
 
-        // The outbox store cross-checks this reference against the persisted result and command.
-        const queued = enqueueResultOutboxEntry(identity, {
-          commandId: command.commandId,
-          iteration: result.iteration,
-        });
-        clearResultReconciliationNeeded(identity, command.commandId);
-        // R4 result/outbox are durably committed above; the Result Bus shadow is
-        // reconciled afterwards and isolated so a bus-side failure can never
-        // suppress or invalidate the already valid R4 delivery state.
         return {
           status: "reconciled",
           resultId: result.resultId,
           plannerRouteId: command.plannerRouteId,
           resultReplayed,
-          outboxEntryId: queued.entry.outboxEntryId,
-          outboxReplayed: queued.replayed,
         };
       } catch (error) {
         return recordFailure(identity, command.commandId, error);
@@ -216,9 +182,17 @@ export function reconcileTrustedDesktopExecutionResult(
       });
     });
     if (core.status !== "reconciled") return core;
-    // Batch Result Bus reconciliation must reread its source only after releasing this
-    // command lock; otherwise a multi-command snapshot could invert lifecycle lock order.
-    return { ...core, resultBus: reconcileResultBusShadow(identity) };
+    // 先释放 receipt/result 阶段的 command 与 records 锁，再重新获取当前 command authority。
+    return withCommandOperation(identity.id, parsedCommandId.data, () => {
+      const state = readRouting(identity);
+      if (!state?.commands.some(item => item.commandId === parsedCommandId.data) ||
+          !state.results.some(item => item.resultId === core.resultId && item.commandId === parsedCommandId.data)) {
+        throw new RoutingError("ROUTING_COMMAND_NOT_FOUND", "Bus 投影前 canonical source 已不存在；不重建已清理结果。");
+      }
+      const resultBus = reconcileCommandResultBus(identity, parsedCommandId.data);
+      clearResultReconciliationNeeded(identity, parsedCommandId.data);
+      return { ...core, resultBus };
+    });
   } catch (error) {
     return recordFailure(identity, parsedCommandId.data, error);
   }

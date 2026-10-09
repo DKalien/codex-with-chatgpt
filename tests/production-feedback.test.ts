@@ -16,8 +16,9 @@ import {
   feedbackEventSchema,
   type FeedbackEvent,
 } from "../src/feedback/store.js";
+import { reconcileHistoricalFeedbackFixtures } from "./helpers/legacy-feedback-fixtures.js";
 import { reconcileFeedbackOutbox } from "../src/feedback/projector.js";
-import { reconcileCanonicalResultOutbox } from "../src/feedback/canonical-compat.js";
+import { reconcileCanonicalResultOutbox } from "./helpers/canonical-compat.js";
 import {
   resolveConversationPrincipal,
   ConversationPrincipalError,
@@ -162,6 +163,13 @@ describe("conversation principal 共享模块", () => {
 });
 
 describe("projection cursor baseline", () => {
+  it("生产 projector 不再把非 routed trusted receipt 写入 legacy 执行投递队列", () => {
+    reconcileFeedbackOutbox(workspace.id, stateDir, workspace.root);
+    seedTrustedReceipt("bus-only-non-routed");
+    const next = reconcileFeedbackOutbox(workspace.id, stateDir, workspace.root);
+    expect(next).toMatchObject({ projected: 0, state: { projectionCursor: 1, events: [] } });
+    expect(reconcileFeedbackOutbox(workspace.id, stateDir, workspace.root).projected).toBe(0);
+  });
   it("routed Command 在 canonical outbox 尚未就绪时禁止 legacy fallback", () => {
     const planner = registerRoute(workspace, {
       role: "planner", platform: "chatgpt_web", conversationId: principalA().fingerprint, locator: {},
@@ -176,7 +184,7 @@ describe("projection cursor baseline", () => {
     }, stateDir);
     seedTrustedReceipt("r4c2-routed-pending");
 
-    const result = reconcileFeedbackOutbox(workspace.id, stateDir, workspace.root);
+    const result = reconcileHistoricalFeedbackFixtures(workspace.id, stateDir, workspace.root);
     expect(result.projected).toBe(0);
     expect(result.state.events).toHaveLength(0);
     expect(result.state.projectionCursor).toBe(1);
@@ -309,27 +317,27 @@ describe("projection cursor baseline", () => {
 
   it("首次 state 不投历史 receipt；baseline 后新 receipt 产生 1 event；重复 reconcile 仍 1", () => {
     seedTrustedReceipt("hist-cmd");
-    const first = reconcileFeedbackOutbox(workspace.id, stateDir);
+    const first = reconcileHistoricalFeedbackFixtures(workspace.id, stateDir);
     expect(first.projected).toBe(0);
     expect(first.state.events).toHaveLength(0);
     expect(first.state.projectionCursor).toBe(1);
 
     seedTrustedReceipt("new-cmd");
-    const second = reconcileFeedbackOutbox(workspace.id, stateDir);
+    const second = reconcileHistoricalFeedbackFixtures(workspace.id, stateDir);
     expect(second.projected).toBe(1);
     expect(second.state.events).toHaveLength(1);
     expect(second.state.events[0]!.status).toBe("queued");
     expect(second.state.events[0]!.source).toBe("desktop");
 
-    const third = reconcileFeedbackOutbox(workspace.id, stateDir);
+    const third = reconcileHistoricalFeedbackFixtures(workspace.id, stateDir);
     expect(third.projected).toBe(0);
     expect(third.state.events).toHaveLength(1);
   });
 
   it("crash-gap：receipt 已存在尚未投影，下次 reconcile 恢复", () => {
-    reconcileFeedbackOutbox(workspace.id, stateDir);
+    reconcileHistoricalFeedbackFixtures(workspace.id, stateDir);
     seedTrustedReceipt("gap-cmd");
-    const r = reconcileFeedbackOutbox(workspace.id, stateDir);
+    const r = reconcileHistoricalFeedbackFixtures(workspace.id, stateDir);
     expect(r.projected).toBe(1);
   });
 
@@ -360,7 +368,7 @@ describe("projection cursor baseline", () => {
 
   it("Desktop identity 冲突 fail closed", () => {
     // 先 baseline，再追加冲突 receipt，第二次 reconcile 必须 fail closed
-    reconcileFeedbackOutbox(workspace.id, stateDir);
+    reconcileHistoricalFeedbackFixtures(workspace.id, stateDir);
     seedDesktopAccepted("bad-cmd");
     withExecutionRecordsLock(workspace.id, () => {
       appendExecutionRecordLocked(workspace.id, {
@@ -374,7 +382,7 @@ describe("projection cursor baseline", () => {
         desktopReceiptSha256: "c".repeat(64),
       } as never);
     });
-    expect(() => reconcileFeedbackOutbox(workspace.id, stateDir)).toThrow(/IDENTITY_CONFLICT|冲突|拒绝静默投影|身份不匹配/);
+    expect(() => reconcileHistoricalFeedbackFixtures(workspace.id, stateDir)).toThrow(/IDENTITY_CONFLICT|冲突|拒绝静默投影|身份不匹配/);
   });
 
   it("JSONL 短于 cursor fail closed", () => {
@@ -392,9 +400,9 @@ describe("projection cursor baseline", () => {
 
 describe("binding / claim / ack", () => {
   it("no binding -> queued；enable -> ready；same principal 幂等；other principal 拒绝", () => {
-    reconcileFeedbackOutbox(workspace.id, stateDir);
+    reconcileHistoricalFeedbackFixtures(workspace.id, stateDir);
     seedTrustedReceipt("e1");
-    reconcileFeedbackOutbox(workspace.id, stateDir);
+    reconcileHistoricalFeedbackFixtures(workspace.id, stateDir);
     expect(readFeedbackState(workspace.id, stateDir).events[0]!.status).toBe("queued");
 
     const enabled = enableReceiver({ workspaceId: workspace.id, principal: principalA(), widgetId: "wA", stateDir });
@@ -414,9 +422,9 @@ describe("binding / claim / ack", () => {
   });
 
   it("takeover CAS；ready 转移到 B；claimed/outcome_unknown 阻止 takeover", () => {
-    reconcileFeedbackOutbox(workspace.id, stateDir);
+    reconcileHistoricalFeedbackFixtures(workspace.id, stateDir);
     seedTrustedReceipt("t1");
-    reconcileFeedbackOutbox(workspace.id, stateDir);
+    reconcileHistoricalFeedbackFixtures(workspace.id, stateDir);
     enableReceiver({ workspaceId: workspace.id, principal: principalA(), widgetId: "wA", stateDir });
     expect(() => takeoverReceiver({
       workspaceId: workspace.id, principal: principalB(), widgetId: "wB", expectedEpoch: 99, stateDir,
@@ -440,9 +448,9 @@ describe("binding / claim / ack", () => {
   });
 
   it("old A epoch 在 takeover 后不能 claim", () => {
-    reconcileFeedbackOutbox(workspace.id, stateDir);
+    reconcileHistoricalFeedbackFixtures(workspace.id, stateDir);
     seedTrustedReceipt("old");
-    reconcileFeedbackOutbox(workspace.id, stateDir);
+    reconcileHistoricalFeedbackFixtures(workspace.id, stateDir);
     const en = enableReceiver({ workspaceId: workspace.id, principal: principalA(), widgetId: "wA", stateDir });
     const aBinding = { ...en.binding! };
     takeoverReceiver({ workspaceId: workspace.id, principal: principalB(), widgetId: "wB", expectedEpoch: 1, stateDir });
@@ -453,9 +461,9 @@ describe("binding / claim / ack", () => {
   });
 
   it("claim 先持久化 attempt；exact ack -> observed", () => {
-    reconcileFeedbackOutbox(workspace.id, stateDir);
+    reconcileHistoricalFeedbackFixtures(workspace.id, stateDir);
     seedTrustedReceipt("claim1");
-    reconcileFeedbackOutbox(workspace.id, stateDir);
+    reconcileHistoricalFeedbackFixtures(workspace.id, stateDir);
     const en = enableReceiver({ workspaceId: workspace.id, principal: principalA(), widgetId: "w", stateDir });
     const b = en.binding!;
     const claimed = claimNext({
@@ -480,9 +488,9 @@ describe("binding / claim / ack", () => {
   });
 
   it("stale claimed -> outcome_unknown；outcome_unknown 不自动重 claim；stop 保留 history", () => {
-    reconcileFeedbackOutbox(workspace.id, stateDir);
+    reconcileHistoricalFeedbackFixtures(workspace.id, stateDir);
     seedTrustedReceipt("stale1");
-    reconcileFeedbackOutbox(workspace.id, stateDir);
+    reconcileHistoricalFeedbackFixtures(workspace.id, stateDir);
     const en = enableReceiver({ workspaceId: workspace.id, principal: principalA(), widgetId: "w", stateDir });
     const b = en.binding!;
     const c = claimNext({ workspaceId: workspace.id, principal: principalA(), bindingId: b.bindingId, epoch: b.epoch, stateDir });
@@ -492,7 +500,7 @@ describe("binding / claim / ack", () => {
       new Date(Date.now() - 11 * 60_000).toISOString();
     fs.writeFileSync(file, JSON.stringify(raw, null, 2));
     // 仅 reconcile/status 即可恢复，无需再 claim
-    reconcileFeedbackOutbox(workspace.id, stateDir);
+    reconcileHistoricalFeedbackFixtures(workspace.id, stateDir);
     const after = readFeedbackState(workspace.id, stateDir).events.find((e) => e.eventId === c.event.eventId)!;
     expect(after.status).toBe("outcome_unknown");
     expect(() => claimNext({ workspaceId: workspace.id, principal: principalA(), bindingId: b.bindingId, epoch: b.epoch, stateDir }))
@@ -515,9 +523,9 @@ describe("E1a review-fix", () => {
   });
 
   it("stale：只 reconcile/status 恢复，不生成新 attempt；takeover 仍被阻止", () => {
-    reconcileFeedbackOutbox(workspace.id, stateDir);
+    reconcileHistoricalFeedbackFixtures(workspace.id, stateDir);
     seedTrustedReceipt("stale-only");
-    reconcileFeedbackOutbox(workspace.id, stateDir);
+    reconcileHistoricalFeedbackFixtures(workspace.id, stateDir);
     const en = enableReceiver({ workspaceId: workspace.id, principal: principalA(), widgetId: "w", stateDir });
     const b = en.binding!;
     const c = claimNext({ workspaceId: workspace.id, principal: principalA(), bindingId: b.bindingId, epoch: b.epoch, stateDir });
@@ -526,7 +534,7 @@ describe("E1a review-fix", () => {
     raw.events.find((e: FeedbackEvent) => e.eventId === c.event.eventId).claimedAt =
       new Date(Date.now() - 11 * 60_000).toISOString();
     fs.writeFileSync(file, JSON.stringify(raw, null, 2));
-    reconcileFeedbackOutbox(workspace.id, stateDir);
+    reconcileHistoricalFeedbackFixtures(workspace.id, stateDir);
     const after = readFeedbackState(workspace.id, stateDir).events.find((e) => e.eventId === c.event.eventId)!;
     expect(after.status).toBe("outcome_unknown");
     expect(after.attemptId).toBe(c.attemptId);
@@ -536,7 +544,7 @@ describe("E1a review-fix", () => {
   });
 
   it("desktopReceiptSha256 有但无 accepted delivery => fail closed", () => {
-    reconcileFeedbackOutbox(workspace.id, stateDir);
+    reconcileHistoricalFeedbackFixtures(workspace.id, stateDir);
     withExecutionRecordsLock(workspace.id, () => {
       appendExecutionRecordLocked(workspace.id, {
         taskId: "manual-x",
@@ -549,11 +557,11 @@ describe("E1a review-fix", () => {
         desktopReceiptSha256: "d".repeat(64),
       } as never);
     });
-    expect(() => reconcileFeedbackOutbox(workspace.id, stateDir)).toThrow(/IDENTITY_CONFLICT|拒绝静默投影|身份不匹配/);
+    expect(() => reconcileHistoricalFeedbackFixtures(workspace.id, stateDir)).toThrow(/IDENTITY_CONFLICT|拒绝静默投影|身份不匹配/);
   });
 
   it("desktop_* task 但 commandId 缺失 => fail closed", () => {
-    reconcileFeedbackOutbox(workspace.id, stateDir);
+    reconcileHistoricalFeedbackFixtures(workspace.id, stateDir);
     withExecutionRecordsLock(workspace.id, () => {
       appendExecutionRecordLocked(workspace.id, {
         taskId: "desktop_orphan",
@@ -564,7 +572,7 @@ describe("E1a review-fix", () => {
         timestamp: new Date().toISOString(),
       } as never);
     });
-    expect(() => reconcileFeedbackOutbox(workspace.id, stateDir)).toThrow(/IDENTITY_CONFLICT|拒绝静默投影|缺少 commandId/);
+    expect(() => reconcileHistoricalFeedbackFixtures(workspace.id, stateDir)).toThrow(/IDENTITY_CONFLICT|拒绝静默投影|缺少 commandId/);
   });
 
   it("普通 manual/finalizer 仍 skip 并前进 cursor", () => {
@@ -584,9 +592,9 @@ describe("E1a review-fix", () => {
   });
 
   it("observed 后 takeover 到 B，B 不能 ack A 的 eventId；A exact 幂等可", () => {
-    reconcileFeedbackOutbox(workspace.id, stateDir);
+    reconcileHistoricalFeedbackFixtures(workspace.id, stateDir);
     seedTrustedReceipt("ack-race");
-    reconcileFeedbackOutbox(workspace.id, stateDir);
+    reconcileHistoricalFeedbackFixtures(workspace.id, stateDir);
     const enA = enableReceiver({ workspaceId: workspace.id, principal: principalA(), widgetId: "wA", stateDir });
     const bA = enA.binding!;
     const claimed = claimNext({
@@ -639,7 +647,7 @@ describe("E1a review-fix", () => {
   });
 });
 
-describe("projector claimsDesktopReceipt provenance (live blocker)", () => {
+describe("历史 projector 的 Desktop receipt provenance fixture", () => {
   const LIVE_CMD = "phase_f1a_operational_readiness_review_fix_20260918_02";
 
   function appendGeneric(opts: {
@@ -663,35 +671,35 @@ describe("projector claimsDesktopReceipt provenance (live blocker)", () => {
   }
 
   it("accepted delivery + generic record same commandId → skip, cursor advances, no event", () => {
-    reconcileFeedbackOutbox(workspace.id, stateDir);
+    reconcileHistoricalFeedbackFixtures(workspace.id, stateDir);
     seedDesktopAccepted(LIVE_CMD);
     appendGeneric({ commandId: LIVE_CMD, taskId: LIVE_CMD, iteration: 1 });
-    const r = reconcileFeedbackOutbox(workspace.id, stateDir);
+    const r = reconcileHistoricalFeedbackFixtures(workspace.id, stateDir);
     expect(r.projected).toBe(0);
     expect(r.state.events).toHaveLength(0);
     expect(r.state.projectionCursor).toBeGreaterThan(0);
   });
 
   it("accepted + generic taskId no hash → skip", () => {
-    reconcileFeedbackOutbox(workspace.id, stateDir);
+    reconcileHistoricalFeedbackFixtures(workspace.id, stateDir);
     seedDesktopAccepted("gen-cmd");
     appendGeneric({ commandId: "gen-cmd", taskId: "generic_task", iteration: 1 });
-    const r = reconcileFeedbackOutbox(workspace.id, stateDir);
+    const r = reconcileHistoricalFeedbackFixtures(workspace.id, stateDir);
     expect(r.projected).toBe(0);
     expect(r.state.events).toHaveLength(0);
   });
 
   it("accepted + unrelated generic taskId no hash → skip", () => {
-    reconcileFeedbackOutbox(workspace.id, stateDir);
+    reconcileHistoricalFeedbackFixtures(workspace.id, stateDir);
     seedDesktopAccepted("unrel-cmd");
     appendGeneric({ commandId: "other-cmd", taskId: "other_task", iteration: 1 });
-    const r = reconcileFeedbackOutbox(workspace.id, stateDir);
+    const r = reconcileHistoricalFeedbackFixtures(workspace.id, stateDir);
     expect(r.projected).toBe(0);
     expect(r.state.events).toHaveLength(0);
   });
 
   it("hash present + wrong taskId → conflict", () => {
-    reconcileFeedbackOutbox(workspace.id, stateDir);
+    reconcileHistoricalFeedbackFixtures(workspace.id, stateDir);
     seedDesktopAccepted("wrong-task");
     appendGeneric({
       commandId: "wrong-task",
@@ -699,18 +707,18 @@ describe("projector claimsDesktopReceipt provenance (live blocker)", () => {
       iteration: 1,
       desktopReceiptSha256: "e".repeat(64),
     });
-    expect(() => reconcileFeedbackOutbox(workspace.id, stateDir)).toThrow(/IDENTITY_CONFLICT|拒绝静默投影|身份不匹配/);
+    expect(() => reconcileHistoricalFeedbackFixtures(workspace.id, stateDir)).toThrow(/IDENTITY_CONFLICT|拒绝静默投影|身份不匹配/);
   });
 
   it("desktop_ task + wrong commandId (no matching accepted) → conflict", () => {
-    reconcileFeedbackOutbox(workspace.id, stateDir);
+    reconcileHistoricalFeedbackFixtures(workspace.id, stateDir);
     seedDesktopAccepted("real-cmd");
     appendGeneric({ commandId: "other-cmd", taskId: "desktop_other-cmd", iteration: 1 });
-    expect(() => reconcileFeedbackOutbox(workspace.id, stateDir)).toThrow(/IDENTITY_CONFLICT|拒绝静默投影/);
+    expect(() => reconcileHistoricalFeedbackFixtures(workspace.id, stateDir)).toThrow(/IDENTITY_CONFLICT|拒绝静默投影/);
   });
 
   it("desktop_ task + iteration 2 → conflict", () => {
-    reconcileFeedbackOutbox(workspace.id, stateDir);
+    reconcileHistoricalFeedbackFixtures(workspace.id, stateDir);
     seedDesktopAccepted("iter2");
     appendGeneric({
       commandId: "iter2",
@@ -718,44 +726,44 @@ describe("projector claimsDesktopReceipt provenance (live blocker)", () => {
       iteration: 2,
       desktopReceiptSha256: "f".repeat(64),
     });
-    expect(() => reconcileFeedbackOutbox(workspace.id, stateDir)).toThrow(/IDENTITY_CONFLICT|拒绝静默投影|身份不匹配/);
+    expect(() => reconcileHistoricalFeedbackFixtures(workspace.id, stateDir)).toThrow(/IDENTITY_CONFLICT|拒绝静默投影|身份不匹配/);
   });
 
   it("trusted receipt → exactly 1 event", () => {
-    reconcileFeedbackOutbox(workspace.id, stateDir);
+    reconcileHistoricalFeedbackFixtures(workspace.id, stateDir);
     seedTrustedReceipt("ok-receipt");
-    const r = reconcileFeedbackOutbox(workspace.id, stateDir);
+    const r = reconcileHistoricalFeedbackFixtures(workspace.id, stateDir);
     expect(r.projected).toBe(1);
     expect(r.state.events).toHaveLength(1);
     expect(r.state.events[0]!.kind).toBe("C2C_EXECUTED");
   });
 
   it("no accepted delivery + hash → conflict", () => {
-    reconcileFeedbackOutbox(workspace.id, stateDir);
+    reconcileHistoricalFeedbackFixtures(workspace.id, stateDir);
     appendGeneric({
       commandId: "orphan-hash",
       taskId: "desktop_orphan-hash",
       iteration: 1,
       desktopReceiptSha256: "1".repeat(64),
     });
-    expect(() => reconcileFeedbackOutbox(workspace.id, stateDir)).toThrow(/IDENTITY_CONFLICT|拒绝静默投影/);
+    expect(() => reconcileHistoricalFeedbackFixtures(workspace.id, stateDir)).toThrow(/IDENTITY_CONFLICT|拒绝静默投影/);
   });
 
   it("no accepted delivery + desktop_ task → conflict", () => {
-    reconcileFeedbackOutbox(workspace.id, stateDir);
+    reconcileHistoricalFeedbackFixtures(workspace.id, stateDir);
     appendGeneric({ commandId: "orphan-task", taskId: "desktop_orphan-task", iteration: 1 });
-    expect(() => reconcileFeedbackOutbox(workspace.id, stateDir)).toThrow(/IDENTITY_CONFLICT|拒绝静默投影/);
+    expect(() => reconcileHistoricalFeedbackFixtures(workspace.id, stateDir)).toThrow(/IDENTITY_CONFLICT|拒绝静默投影/);
   });
 
   it("accepted + desktop_<commandId> + iteration 1 + missing receipt hash → conflict", () => {
-    reconcileFeedbackOutbox(workspace.id, stateDir);
+    reconcileHistoricalFeedbackFixtures(workspace.id, stateDir);
     seedDesktopAccepted("nohash-cmd");
     appendGeneric({
       commandId: "nohash-cmd",
       taskId: "desktop_nohash-cmd",
       iteration: 1,
     });
-    expect(() => reconcileFeedbackOutbox(workspace.id, stateDir)).toThrow(
+    expect(() => reconcileHistoricalFeedbackFixtures(workspace.id, stateDir)).toThrow(
       /IDENTITY_CONFLICT|拒绝静默投影|身份不匹配|trusted receipt/,
     );
   });
@@ -774,9 +782,9 @@ function patchEventStatus(
 }
 
 function claimOneReady(seedId: string) {
-  reconcileFeedbackOutbox(workspace.id, stateDir);
+  reconcileHistoricalFeedbackFixtures(workspace.id, stateDir);
   seedTrustedReceipt(seedId);
-  reconcileFeedbackOutbox(workspace.id, stateDir);
+  reconcileHistoricalFeedbackFixtures(workspace.id, stateDir);
   const en = enableReceiver({
     workspaceId: workspace.id,
     principal: principalA(),
@@ -829,7 +837,7 @@ describe("trusted MCP late-positive ACK (ackObserved)", () => {
     raw.events.find((e: FeedbackEvent) => e.eventId === claimed.event.eventId).claimedAt =
       new Date(Date.now() - 11 * 60_000).toISOString();
     fs.writeFileSync(file, JSON.stringify(raw, null, 2));
-    reconcileFeedbackOutbox(workspace.id, stateDir);
+    reconcileHistoricalFeedbackFixtures(workspace.id, stateDir);
     const after = readFeedbackState(workspace.id, stateDir).events.find(
       (e) => e.eventId === claimed.event.eventId,
     )!;
@@ -907,9 +915,9 @@ describe("trusted MCP late-positive ACK (ackObserved)", () => {
   });
 
   it("ready / reserved → reject", () => {
-    reconcileFeedbackOutbox(workspace.id, stateDir);
+    reconcileHistoricalFeedbackFixtures(workspace.id, stateDir);
     seedTrustedReceipt("late-ready");
-    reconcileFeedbackOutbox(workspace.id, stateDir);
+    reconcileHistoricalFeedbackFixtures(workspace.id, stateDir);
     const en = enableReceiver({
       workspaceId: workspace.id,
       principal: principalA(),

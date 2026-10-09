@@ -164,6 +164,11 @@ export function buildAckProof({ eventId, attemptId, status, terminalWitness }) {
   return { eventId, attemptId, status, ...(status === "terminal_gone" ? { terminalWitness } : {}) };
 }
 
+/** authenticated /state 的明确禁发标志；缺标志保留兼容行为。 */
+export function isRecoverySendDisabled(inFlight) {
+  return inFlight?.sendAllowed === false;
+}
+
 /**
  * Reconcile local CLAIMED against authenticated /state.inFlight.
  * Server is the upper fact: never resume write when server is missing/mismatched/outcome_unknown.
@@ -210,6 +215,10 @@ export function reconcileClaimedAgainstServer(journal, inFlight) {
     }
     if (inFlight.messageSha256 !== undefined && inFlight.messageSha256 !== journal.messageSha256) {
       return { action: "conflict", reason: "claimed_message_sha_mismatch", zeroWrite: true, zeroClick: true };
+    }
+    if (isRecoverySendDisabled(inFlight)) {
+      return { action: "adopt_outcome_unknown", reason: "recovery_send_disabled", zeroWrite: true, zeroClick: true,
+        attemptId: journal.attemptId, message: journal.message, messageSha256: journal.messageSha256 };
     }
     return {
       action: "resume",
@@ -349,17 +358,7 @@ export function buildProductionRecoverRequest(owner, journal, inFlight) {
   if (typeof owner.generation !== "number" || !Number.isFinite(owner.generation)) {
     return { ok: false, reason: "owner_generation_missing" };
   }
-  const safeInFlight = inFlight && typeof inFlight === "object"
-    ? {
-        status: inFlight.status ?? null,
-        eventId: inFlight.eventId ?? null,
-        reservationId: inFlight.reservationId ?? null,
-        attemptId: inFlight.attemptId ?? null,
-        message: typeof inFlight.message === "string" ? inFlight.message : null,
-        messageSha256: typeof inFlight.messageSha256 === "string" ? inFlight.messageSha256 : null,
-        ...(inFlight.terminalWitness === undefined ? {} : { terminalWitness: inFlight.terminalWitness }),
-      }
-    : null;
+  const safeInFlight = sanitizeInFlightForRecovery(inFlight);
   return {
     ok: true,
     tabId: owner.tabId,
@@ -489,6 +488,7 @@ export function sanitizeInFlightForRecovery(inFlight) {
     attemptId: inFlight.attemptId ?? null,
     message: typeof inFlight.message === "string" ? inFlight.message : null,
     messageSha256: typeof inFlight.messageSha256 === "string" ? inFlight.messageSha256 : null,
+    ...(isRecoverySendDisabled(inFlight) ? { sendAllowed: false } : {}),
     ...(inFlight.terminalWitness === undefined ? {} : { terminalWitness: inFlight.terminalWitness }),
   };
 }

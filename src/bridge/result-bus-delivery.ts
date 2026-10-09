@@ -65,7 +65,7 @@ import { getStateDir } from "../config/paths.js";
  *
  * - 认证：Bus canonical 路径只需 R5c Web Sink Companion 边界
  *   （verifyCompanionCredentialForWebSink），不要求 active Feedback receiver
- *   binding/principal；legacy/control 路径 lazy 使用 verifyCompanionCredential。
+ *   binding/principal；控制通知与历史恢复 lazy 使用 verifyCompanionCredential。
  * - 目标只来自 readActiveWebSinkBinding / 冻结 sendTarget；不读取 plannerRouteId /
  *   plannerPrincipalFingerprint（历史分类只做存在性检查与 immutable identity 匹配）。
  * - 全局单飞由 withDeliveryArbiter 在写 durable state 之前串行化（含 MCP claim）。
@@ -105,7 +105,7 @@ function isPinnedCanonicalEvent(event: FeedbackEvent): event is CanonicalFeedbac
  * R5d3 final-fix：canonical counterpart 分类只考虑 canonical-like 历史候选。
  * control/非 canonical 事件（FINAL_RECEIPT_REQUIRED 等）可与同一 canonical
  * execution 合法共存，不参与 ambiguity/drift 判定，由 legacy/control 路径
- * 按自身生命周期继续投递。
+ * 仅控制通知继续投递，旧执行事件只允许恢复。
  */
 function isCanonicalLikeCandidate(event: FeedbackEvent): boolean {
   if (isPinnedCanonicalEvent(event)) return true;
@@ -249,6 +249,9 @@ export type ResultBusCutoverReconciliation = {
   dispositionsWritten: number;
   dispositionsReplayed: number;
   unsafeLegacyInFlight: Array<{ commandId: string; iteration: number; status: string; legacyEventId: string }>;
+  /** 不自动迁移或投递的旧执行记录；控制通知不属于排空对象。 */
+  legacyDrainRequired: boolean;
+  legacyDrainPending: number;
   cutoverReady: boolean;
   /** 校验通过的抑制集：busEntryId → { disposition, legacyEventId }。 */
   suppressions: ReadonlyMap<string, { disposition: string; legacyEventId: string }>;
@@ -410,7 +413,7 @@ function reconcileCutover(input: Parameters<typeof reconcileResultBusCutover>[0]
       continue;
     }
     if (input.readOnly) throw new ResultBusCutoverError(
-      "RESULT_BUS_CUTOVER_REQUIRED", "历史 counterpart 尚无已验证处置；需要正常 legacy reconciliation，不能降级预约。",
+      "RESULT_BUS_CUTOVER_REQUIRED", "历史 counterpart 尚无已验证处置；需要正常 legacy reconciliation，不能新预约或发送历史执行。",
     );
     if (input.maintenanceOnly && dispositionsWritten >= 25) throw new ResultBusCutoverError("RESULT_BUS_MAINTENANCE_PENDING", "本次维护批量已满；下次从既有精确 disposition 继续。");
     const written = recordResultBusCutoverDisposition(identity, {
@@ -423,10 +426,10 @@ function reconcileCutover(input: Parameters<typeof reconcileResultBusCutover>[0]
     ledgerByEntry.set(written.entry.busEntryId, written.entry);
     dispositionsWritten += 1;
   }
-  // 无 Bus counterpart 的 legacy canonical in-flight 同样构成全局 fence。
+  // 无 Bus counterpart 的所有旧执行 in-flight 同样构成全局 fence。
   const matched = new Set(busEntries.map(entry => `${entry.commandId}\u0000${entry.iteration}`));
   for (const event of feedback.events) {
-    if (!isPinnedCanonicalEvent(event)) continue;
+    if (event.kind === "FINAL_RECEIPT_REQUIRED") continue;
     if (matched.has(`${event.commandId}\u0000${event.iteration}`)) continue;
     if (LEGACY_INFLIGHT_STATUSES.has(event.status)) {
       unsafeLegacyInFlight.push({
@@ -456,12 +459,18 @@ function reconcileCutover(input: Parameters<typeof reconcileResultBusCutover>[0]
       .map(row => [row.busEntryId, { disposition: row.disposition, legacyEventId: row.legacyEventId } as const]),
   );
   const ownedLegacyEventIds = new Set([...validated.values()].map(row => row.legacyEventId));
+  const legacyDrainRequired = feedback.events
+    .filter(event => event.kind !== "FINAL_RECEIPT_REQUIRED" && !ownedLegacyEventIds.has(event.eventId)
+      && (event.status === "ready" || event.status === "queued" || LEGACY_INFLIGHT_STATUSES.has(event.status)))
+    .length;
   return {
     projected,
     dispositionsWritten,
     dispositionsReplayed,
     unsafeLegacyInFlight,
-    cutoverReady: unsafeLegacyInFlight.length === 0,
+    legacyDrainRequired: legacyDrainRequired > 0,
+    legacyDrainPending: legacyDrainRequired,
+    cutoverReady: unsafeLegacyInFlight.length === 0 && legacyDrainRequired === 0,
     suppressions,
     ownedLegacyEventIds,
   };
@@ -506,7 +515,7 @@ function prepareCanonicalDelivery(identity: RoutingWorkspaceIdentity, stateDir?:
 
 type DeliverySource =
   | { source: "bus"; entry: ResultBusEntry }
-  | { source: "legacy"; event: FeedbackEvent };
+  | { source: "control" | "legacy_history"; event: FeedbackEvent };
 
 /** eventId 精确解析到唯一来源；Bus compat 与 legacy 同时命中 / 多重命中即 fail closed。
  * R5d3 auth-purity：source discovery 严格只读（readFeedbackState），不做 stale transition。 */
@@ -529,7 +538,7 @@ function resolveDeliverySource(input: {
     throw new ResultBusDeliveryError("RESULT_BUS_DELIVERY_ID_CONFLICT", "eventId 解析到多个来源；fail closed。");
   }
   if (busMatches.length === 1) return { source: "bus", entry: busMatches[0]! };
-  if (legacyMatches.length === 1) return { source: "legacy", event: legacyMatches[0]! };
+  if (legacyMatches.length === 1) return { source: legacyMatches[0]!.kind === "FINAL_RECEIPT_REQUIRED" ? "control" : "legacy_history", event: legacyMatches[0]! };
   return null;
 }
 
@@ -564,7 +573,7 @@ function tryWebSinkAuth(input: { workspaceId: string; credential: string; stateD
 
 type FeedbackAuth = CompanionAuthContext | { error: unknown };
 
-/** legacy/control 路径 lazy 使用既有 Feedback receiver 认证。 */
+/** 控制通知与历史恢复使用既有 Feedback receiver 认证。 */
 function tryFeedbackAuth(input: { workspaceId: string; credential: string; stateDir?: string }): FeedbackAuth {
   try {
     return verifyCompanionCredential(input);
@@ -579,7 +588,7 @@ function feedbackAuthOrThrow(input: { workspaceId: string; credential: string; s
   return auth;
 }
 
-function legacyReserve(input: {
+function reserveControlNotification(input: {
   workspaceId: string;
   /** 已建立的 legacy Feedback auth 边界（auth-first：调用前必须完成认证）。 */
   auth: CompanionAuthContext;
@@ -596,6 +605,7 @@ function legacyReserve(input: {
     principalFingerprint: input.auth.principalFingerprint,
     companionId: input.auth.companionId,
     excludeEventIds: input.ownedLegacyEventIds,
+    controlOnly: true,
     stateDir: input.stateDir,
   });
   return { reservationId: result.reservationId, delivery: publicCompanionDeliveryEvent(result.event) };
@@ -604,11 +614,11 @@ function legacyReserve(input: {
 /**
  * /reserve cutover（auth-first；全局单飞在 arbiter 内 pre-mutation 检查）：
  * 0. 认证边界先于一切 reconcile/mutation：Web Sink Companion auth 可用即用之；
- *    否则要求有效 legacy Feedback Companion auth（fallback-only）。无效 credential
+ *    否则要求有效 Feedback Companion auth（仅控制通知）。无效 credential
  *    直接 401，绝不触发 projector/Bus shadow/cutover ledger/lifecycle 的任何写入。
  * 1. 既有精确 in-flight（Bus 或 legacy；双方并存即 conflict）
  * 2. queued canonical Result Bus（经 validated 抑制集过滤）
- * 3. legacy 非 canonical/control ready 事件（排除 cutover-owned）
+ * 3. FINAL_RECEIPT_REQUIRED 控制通知（旧执行事件不可新发送）
  */
 export function resultBusCompanionReserve(input: {
   workspaceId: string;
@@ -647,9 +657,9 @@ export function resultBusCompanionReserve(input: {
       if (prepared?.legacyFeedbackDegraded) throw new ResultBusDeliveryError(
         "COMMAND_CLEANUP_BUSY", "legacy_feedback_enrichment 不可用；禁止 legacy fallback。",
       );
-      // Web Sink 边界不可用：维持 legacy 非 canonical/control 语义（feedback auth 必需），
+      // Web Sink 边界不可用：仅发送控制通知（feedback auth 必需），
       // cutover-owned 历史 legacy 事件经排除集永久不可预约。
-      return legacyReserve({
+      return reserveControlNotification({
         workspaceId: input.workspaceId,
         auth: legacyCtx
           ?? feedbackAuthOrThrow({ workspaceId: input.workspaceId, credential: input.credential, stateDir }),
@@ -709,14 +719,17 @@ export function resultBusCompanionReserve(input: {
     }
     // 本机 URL 证明仅接收 canonical Bus；空队列不回退到 legacy principal 通道。
     if (sinkAuth.routeProofKind === "local_user") {
+      if (cutover.legacyDrainRequired) throw new ResultBusDeliveryError(
+        "RESULT_BUS_LEGACY_DRAIN_REQUIRED", "历史执行结果尚未排空；保留原证据，禁止旧执行 Send。",
+      );
       throw new CompanionError("FEEDBACK_NO_READY_EVENT", "当前没有可投递的事件");
     }
-    // Bus 空（或全部被抑制）→ priority 3：legacy 非 canonical/control。
+    // Bus 空（或全部被抑制）→ 控制通知；旧执行结果只能诊断/恢复。
     if (prepared?.legacyFeedbackDegraded) {
-      // Full reconciliation is mandatory before making any legacy/control event reservable.
+      // 完整控制 alert 投影后才允许预约控制通知。
       throw new ResultBusDeliveryError("COMMAND_CLEANUP_BUSY", "legacy_feedback_enrichment 不可用；禁止 legacy fallback。");
     }
-    return legacyReserve({
+    return reserveControlNotification({
       workspaceId: input.workspaceId,
       auth: legacyCtx
         ?? feedbackAuthOrThrow({ workspaceId: input.workspaceId, credential: input.credential, stateDir }),
@@ -752,7 +765,7 @@ export function resultBusCompanionRelease(input: {
       }, stateDir);
       return { eventId: resultBusCompanionDeliveryId(released.entry.busEntryId), status: released.entry.deliveryStatus };
     }
-    if (source?.source === "legacy") {
+    if (source?.source === "control" || source?.source === "legacy_history") {
       const ctx = feedbackAuthOrThrow({ workspaceId: input.workspaceId, credential: input.credential, stateDir });
       if (!routesMatch(ctx.routeCanonical, input.routeCanonical)) throw companionRouteMismatch();
       const event = releaseReservation({
@@ -787,6 +800,9 @@ export function resultBusCompanionBeginSend(input: {
     // 无效/缺失/superseded credential 在此即被拒绝，绝不触碰 Feedback state/Bus/cutover ledger。
     verifyCompanionCredentialReadOnly({ workspaceId: input.workspaceId, credential: input.credential, stateDir });
     const source = resolveDeliverySource({ identity, eventId: input.eventId, stateDir });
+    if (source?.source === "legacy_history") throw new ResultBusDeliveryError(
+      "RESULT_BUS_LEGACY_DRAIN_REQUIRED", "历史执行结果不可开始或重放发送；仅允许原证据的 exact ACK、release 或显式 retire。",
+    );
     if (source?.source === "bus") {
       const sinkAuth = verifyCompanionCredentialForWebSink({ workspaceId: input.workspaceId, credential: input.credential, stateDir });
       // FIX B：credential verified route 必须与请求 route 一致（独立于 Active Sink 证据）。
@@ -832,7 +848,7 @@ export function resultBusCompanionBeginSend(input: {
         ...(outcome.entry.lifecycle === "ephemeral" ? { terminalWitness: issueTerminalWitness({ workspaceId: input.workspaceId, eventId: resultBusCompanionDeliveryId(outcome.entry.busEntryId), attemptId: outcome.attemptId, routeCanonical: outcome.sendTarget.canonicalUrl, companionId: sinkAuth.companionId }, stateDir) } : {}),
       };
     }
-    if (source?.source === "legacy") {
+    if (source?.source === "control") {
       const ctx = feedbackAuthOrThrow({ workspaceId: input.workspaceId, credential: input.credential, stateDir });
       if (!routesMatch(ctx.routeCanonical, input.routeCanonical)) throw companionRouteMismatch();
       assertRouteVerifiedForProduction(input.workspaceId, ctx, stateDir);
@@ -845,6 +861,7 @@ export function resultBusCompanionBeginSend(input: {
         eventId: input.eventId,
         reservationId: input.reservationId,
         stateDir,
+        controlOnly: true,
       });
       const delivery = productionFeedbackDelivery(result.event as FeedbackEvent & { attemptId: string });
       return {
@@ -859,7 +876,7 @@ export function resultBusCompanionBeginSend(input: {
   });
 }
 
-/** /ack：Bus compat + 精确 attemptId → ackResultBusObserved；legacy → 旧 ACK lifecycle。 */
+/** /ack：Bus compat + 精确 attemptId → ackResultBusObserved；控制通知/历史 exact attempt → 旧 ACK lifecycle。 */
 export function resultBusCompanionAck(input: {
   workspaceId: string;
   workspaceRoot: string;
@@ -893,7 +910,7 @@ export function resultBusCompanionAck(input: {
       }, {}, stateDir);
       return { eventId: resultBusCompanionDeliveryId(acked.entry.busEntryId), status: acked.entry.deliveryStatus, ...(acked.cleanupStatus ? { cleanupStatus: acked.cleanupStatus } : {}) };
     }
-    if (source?.source === "legacy") {
+    if (source?.source === "control" || source?.source === "legacy_history") {
       const ctx = feedbackAuthOrThrow({ workspaceId: input.workspaceId, credential: input.credential, stateDir });
       if (!routesMatch(ctx.routeCanonical, input.routeCanonical)) throw companionRouteMismatch();
       const event = ackObservedForCompanion({
@@ -1011,7 +1028,7 @@ export function resultBusCompanionTerminalGone(input: {
   };
 }
 
-/** /retire-unknown：Bus compat → retireResultBusOutcomeUnknown；legacy → 旧 retire。 */
+/** /retire-unknown：Bus compat → retireResultBusOutcomeUnknown；控制通知/历史 exact attempt → 旧 retire。 */
 export function resultBusCompanionRetire(input: {
   workspaceId: string;
   workspaceRoot: string;
@@ -1055,7 +1072,7 @@ export function resultBusCompanionRetire(input: {
         status: retired.entry.deliveryStatus,
       };
     }
-    if (source?.source === "legacy") {
+    if (source?.source === "control" || source?.source === "legacy_history") {
       const ctx = feedbackAuthOrThrow({ workspaceId: input.workspaceId, credential: input.credential, stateDir });
       if (!routesMatch(ctx.routeCanonical, input.routeCanonical)) throw companionRouteMismatch();
       const event = retireOutcomeUnknown({
@@ -1156,14 +1173,17 @@ export function resultBusCompanionState(input: {
         : busInFlightDto(entry, sinkAuth.companionId, stateDir);
     } else if (legacyInFlight.length === 1) {
       const event = legacyInFlight[0]!;
-      const owned = legacyCtx != null && event.reservedBy === legacyCtx.companionId;
+      const owned = legacyCtx != null && scoped.includes(event) && event.reservedBy === legacyCtx.companionId;
       if (!owned) {
         // FIX 4：foreign/MCP legacy in-flight 不暴露任何身份/载荷。
         blockedByLegacyInFlight = true;
       } else {
         inFlight = {
           eventId: event.eventId,
-          status: event.status,
+          // 旧扩展也会遵守 unknown 门禁；仅投影视图，不改原 attempt 或 durable status。
+          status: event.kind !== "FINAL_RECEIPT_REQUIRED" && event.status === "claimed"
+            ? "outcome_unknown" : event.status,
+          ...(event.kind !== "FINAL_RECEIPT_REQUIRED" ? { sendAllowed: false } : {}),
           ...(event.reservationId ? { reservationId: event.reservationId } : {}),
           ...(event.attemptId ? { attemptId: event.attemptId } : {}),
         };
@@ -1175,7 +1195,8 @@ export function resultBusCompanionState(input: {
       }
     }
       // FIX 4：foreign（reservedBy 非本 companion）事件不泄露 attempt/reservation 身份。
-      const events = scoped.map((e) => {
+      const events = scoped.filter(event => !LEGACY_INFLIGHT_STATUSES.has(event.status)
+        || event.reservedBy === sinkAuth.companionId).map((e) => {
         const dto = publicCompanionDeliveryEvent(e);
         if (legacyCtx && e.reservedBy !== undefined && e.reservedBy !== legacyCtx.companionId) {
           const { attemptId: _a, reservationId: _r, ...rest } = dto as Record<string, unknown>;
@@ -1208,7 +1229,7 @@ export function resultBusCompanionState(input: {
       cutoverReady: cutover.cutoverReady,
       blockedByLegacyInFlight,
       pendingReady:
-        scoped.filter((e) => e.status === "ready" && !isPinnedCanonicalEvent(e)).length
+        scoped.filter((e) => e.status === "ready" && e.kind === "FINAL_RECEIPT_REQUIRED").length
         + busEntries.filter((e) => e.deliveryStatus === "queued" && !suppressed.has(e.busEntryId)).length,
       reserved:
         scoped.filter((e) => e.status === "reserved").length
@@ -1224,7 +1245,11 @@ export function resultBusCompanionState(input: {
         + busEntries.filter((e) => e.deliveryStatus === "retired_unknown").length,
       inFlight,
       isolatedAttempts,
-      unsafeLegacyInFlight: cutover.unsafeLegacyInFlight,
+      unsafeLegacyInFlight: cutover.unsafeLegacyInFlight.filter(item => scoped.some(event =>
+        event.eventId === item.legacyEventId && event.reservedBy === sinkAuth.companionId)),
+      unsafeLegacyInFlightCount: cutover.unsafeLegacyInFlight.length,
+      legacyDrainRequired: cutover.legacyDrainRequired,
+      legacyDrainPending: cutover.legacyDrainPending,
       events,
     };
   }

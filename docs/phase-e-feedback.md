@@ -1,5 +1,7 @@
 # Phase E：部署基线与 ChatGPT 接收端预检
 
+2026-10-08 当前源码的 legacy 自动通知仅保留 `FINAL_RECEIPT_REQUIRED`；新执行结果经 Result Bus，历史执行反馈禁止新领取或发送，旧 attempt 的精确恢复仍受原门禁保护。详情见[执行与回流精简合同](runtime-simplification.md)，下方旧执行反馈路径按各自日期保留为历史记录。
+
 > **现役源码机制**：`GET /state` 已纯读，`alarms` 仅 discovery；有界维护由 Bridge 独立批次推进，生产发送仍需真实 exact-owner heartbeat。新 canonical result 由 Result Bus 统一发送，legacy 仅保留兼容范围。Unified Gateway 按显式 workspace/client grant 复用原 feedback 工具；Companion 的 local/session/alarm、页面选择与操作面板按 workspace 隔离，Pair 和 route VERIFIED 仍是独立门禁。`c2c record` 的 pending draft、trusted terminal receipt 与网页 ACK 是不同阶段。源码与现场验收边界见[官方路线](official-route.md)、[统一 Gateway 计划](unified-gateway-plan.md)；双项目真实 Send/observed、普通 Chat 原生 Events 与旧 Connector 退役仍未完成。下方带日期的 E0/E1/F 证据仅代表当轮，不是当前待办或机器快照。
 
 ## Sleep / wake 恢复边界

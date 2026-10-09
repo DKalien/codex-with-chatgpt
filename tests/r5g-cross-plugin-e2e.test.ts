@@ -157,7 +157,7 @@ describe("R5g isolated cross-plugin production chain", () => {
     const reconciled = reconcileTrustedDesktopExecutionResult(bridge.workspace, COMMAND);
     expect(reconciled.status).toBe("reconciled");
     if (reconciled.status !== "reconciled") throw new Error("canonical result reconciliation failed");
-    expect(reconciled.resultBus.status).toBe("reconciled");
+    expect(reconciled.resultBus).toEqual({ projected: 1, replayed: 0 });
     return { sent, close, executorA, receipt };
   }
 
@@ -223,12 +223,11 @@ describe("R5g isolated cross-plugin production chain", () => {
       originTurnId: TURN, resultTurnId: TURN, bindingId: readDesktop(bridge.workspace.id)!.binding!.bindingId,
     });
     const outbox = listResultOutboxEntries(bridge.workspace).filter(entry => entry.commandId === COMMAND);
-    expect(outbox).toHaveLength(1);
+    expect(outbox).toEqual([]);
     const bus = readResultBus(bridge.workspace, stateDir)!;
     expect(bus.entries.filter(entry => entry.commandId === COMMAND)).toHaveLength(1);
     expect(bus.entries[0]!.deliveryStatus).toBe("queued");
     expect(bus.entries[0]!.resultSha256).toBe(canonicalRoutingResultDigest(result));
-    expect(outbox[0]!.resultSha256).toBe(bus.entries[0]!.resultSha256);
     expect(readFeedbackState(bridge.workspace.id, stateDir)?.events.filter(event => event.commandId === COMMAND && event.kind === "C2C_EXECUTED")).toHaveLength(0);
 
     const credential = await pair(ROUTE_A);

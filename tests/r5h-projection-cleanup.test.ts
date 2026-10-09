@@ -12,7 +12,7 @@ import {
   deleteRoutingCleanupProjections,
   markResultReconciliationNeeded,
 } from "../src/routing/result-outbox-store.js";
-import { reconcileCanonicalResultOutbox } from "../src/feedback/canonical-compat.js";
+import { reconcileCanonicalResultOutbox } from "./helpers/canonical-compat.js";
 import {
   applyFeedbackCursorCleanup,
   deleteFeedbackCleanupArtifacts,

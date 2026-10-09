@@ -70,6 +70,7 @@ export function claimNextForMcp(input: {
       bindingId: input.bindingId,
       epoch: input.epoch,
       excludeEventIds: cutover.ownedLegacyEventIds,
+      controlOnly: true,
       stateDir: input.stateDir,
     });
   });

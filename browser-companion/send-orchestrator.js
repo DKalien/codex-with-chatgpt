@@ -511,6 +511,9 @@ export async function continueFromSendIntent(ctx, sendIntentJournal) {
   if (!sendIntentJournal || sendIntentJournal.state !== "SEND_INTENT") {
     return fail("journal_not_send_intent", { journal: sendIntentJournal });
   }
+  if (ctx.inFlight?.sendAllowed === false) {
+    return fail("recovery_send_disabled", { journal: sendIntentJournal, zeroWrite: true, zeroClick: true });
+  }
   let beginResult;
   try {
     beginResult = await beginSend({
@@ -558,6 +561,9 @@ export async function continueFromClaimed(ctx, claimedJournal, opts = {}) {
   const { doc, snapshotUserTurns, validateClaimedPayload } = ctx;
   if (!claimedJournal || claimedJournal.state !== "CLAIMED") {
     return fail("journal_not_claimed", { journal: claimedJournal });
+  }
+  if (ctx.inFlight?.sendAllowed === false) {
+    return fail("recovery_send_disabled", { journal: claimedJournal, zeroWrite: true, zeroClick: true });
   }
   const identityErr = requireJournalMatches(claimedJournal, {
     routeCanonical: ctx.routeCanonical,
@@ -756,6 +762,28 @@ export async function recoverSendOrchestration(ctx) {
   }
   if (journal.state === "OUTCOME_UNKNOWN") {
     return recoverLatePositiveAck(ctx);
+  }
+
+  if (inFlight?.sendAllowed === false && ["SEND_INTENT", "CLAIMED"].includes(journal.state)) {
+    const exactReservation = inFlight.eventId === journal.eventId && inFlight.reservationId === journal.reservationId;
+    const claimedMismatch = journal.state === "CLAIMED" && (inFlight.attemptId !== journal.attemptId ||
+      (inFlight.message !== undefined && inFlight.message !== journal.message) ||
+      (inFlight.messageSha256 !== undefined && inFlight.messageSha256 !== journal.messageSha256));
+    if (!exactReservation || claimedMismatch ||
+        !["claimed", "outcome_unknown"].includes(inFlight.status) || !inFlight.attemptId) {
+      return fail("recovery_send_disabled", { journal, action: "block", zeroWrite: true, zeroClick: true });
+    }
+    try {
+      const unknown = markOutcomeUnknown(journal, {
+        attemptId: inFlight.attemptId, message: inFlight.message, messageSha256: inFlight.messageSha256,
+        ...(inFlight.terminalWitness === undefined ? {} : { terminalWitness: inFlight.terminalWitness }),
+      });
+      await persist(persistJournal, unknown);
+      return recoverLatePositiveAck({ ...ctx, journal: unknown });
+    } catch (error) {
+      return fail("outcome_unknown_persist_failed", { journal, action: "block", zeroWrite: true, zeroClick: true,
+        error: String(error?.message || error) });
+    }
   }
 
   if (journal.state === "SEND_INTENT") {

@@ -41,6 +41,7 @@ import {
   withExecutionRecordsLock,
 } from "../src/execution/records.js";
 import { updateDesktop } from "../src/desktop/store.js";
+import { stageReceiptFinalization, writeReceiptFinalizationAlert } from "../src/desktop/receipt-finalizer.js";
 import { Workspace } from "../src/workspace/manager.js";
 import { CODEX_FEEDBACK_SCOPE, routeChallengeDigest } from "../src/feedback/store.js";
 import { cleanup, isolateStateDir, makeTmpDir } from "./helpers.js";
@@ -91,7 +92,7 @@ function principalB() {
   });
 }
 
-function seedTrustedReceipt(commandId: string) {
+function seedControlNotification(commandId: string) {
   updateDesktop(workspace.id, (previous) => {
     const base = previous ?? {
       version: 1 as const,
@@ -143,11 +144,18 @@ function seedTrustedReceipt(commandId: string) {
       outputAvailable: true,
     } as never);
   });
+  const draft = stageReceiptFinalization({
+    workspaceId: workspace.id, workspaceRoot: wsRoot, commandId,
+    threadId: "11111111-1111-4111-8111-111111111111",
+    originTurnId: "22222222-2222-4222-8222-222222222222",
+    resultTurnId: "33333333-3333-4333-8333-333333333333", inputMaterial: "bounded control notification",
+  }, { stateDir });
+  writeReceiptFinalizationAlert(draft, "terminality_unknown", { stateDir });
 }
 
 function setupReadyEvent(commandId = "cmd-1") {
   reconcileFeedbackOutbox(workspace.id, stateDir);
-  seedTrustedReceipt(commandId);
+  seedControlNotification(commandId);
   reconcileFeedbackOutbox(workspace.id, stateDir);
   enableReceiver({
     workspaceId: workspace.id,
@@ -1347,7 +1355,7 @@ describe("E1b3a single-flight fence", () => {
       reservationId: reserved.reservationId,
       stateDir,
     });
-    seedTrustedReceipt("fence-later-ready");
+    seedControlNotification("fence-later-ready");
     reconcileFeedbackOutbox(workspace.id, stateDir);
     expectCode(() => companionReserveNext({
       workspaceId: workspace.id,
@@ -1379,7 +1387,7 @@ describe("E1b3a single-flight fence", () => {
     state.events[0].claimedAt = new Date(Date.now() - 11 * 60_000).toISOString();
     fs.writeFileSync(file, JSON.stringify(state, null, 2));
 
-    seedTrustedReceipt("fence-unknown-later");
+    seedControlNotification("fence-unknown-later");
     reconcileFeedbackOutbox(workspace.id, stateDir);
     expectCode(() => companionReserveNext({
       workspaceId: workspace.id,
@@ -1450,13 +1458,13 @@ describe("E1b3a canonical production feedback message", () => {
     expect(first.message).toBe(second.message);
     expect(first.messageSha256).toBe(second.messageSha256);
     expect(first.message).toContain("[C2C_CONTROL]");
-    expect(first.message).toContain("STATE: EXECUTED");
+    expect(first.message).toContain("STATE: FINAL_RECEIPT_REQUIRED");
     expect(first.message).toContain(`WORKSPACE_ID: ${workspace.id}`);
     expect(first.message).toContain(`EVENT_ID: ${event.eventId}`);
     expect(first.message).toContain(`ATTEMPT_ID: ${first.attemptId}`);
-    expect(first.message).toContain("CHANGED_FILES:");
-    expect(first.message).toContain("TESTS:");
-    expect(first.message).toContain("OUTPUT_AVAILABLE:");
+    expect(first.message).toContain("REASON: terminality_unknown");
+    expect(first.message).toContain("INSTRUCTION:");
+    expect(first.message).not.toContain("CHANGED_FILES:");
     expect(first.message).toContain("INSTRUCTION:");
     // Public DTO / message must not leak internal identity material.
     // (Raw FeedbackEvent is server-internal; HTTP response only uses public fields.)
@@ -1934,7 +1942,7 @@ describe("E1b3d3b outcome_unknown retirement", () => {
       stateDir,
     });
     // Seed a second ready event.
-    seedTrustedReceipt("cmd-after-retire");
+    seedControlNotification("cmd-after-retire");
     reconcileFeedbackOutbox(workspace.id, stateDir);
     const next = companionReserveNext({
       workspaceId: workspace.id,
@@ -2042,7 +2050,7 @@ describe("public companion HTTP surface", () => {
 
   async function enableAndSeed() {
     reconcileFeedbackOutbox(workspace.id, stateDir);
-    seedTrustedReceipt("http-cmd");
+    seedControlNotification("http-cmd");
     reconcileFeedbackOutbox(workspace.id, stateDir);
     // enable 需要 principal；在 HTTP 路径下用 store 直接 enable
     enableReceiver({
@@ -2145,7 +2153,7 @@ describe("public companion HTTP surface", () => {
 
     // Single-flight: claimed blocks reserve of later ready events.
     await fetchJson("/api/companion/v1/state", { headers: auth }); // reconcile
-    seedTrustedReceipt("later-ready-cmd");
+    seedControlNotification("later-ready-cmd");
     const blocked = await fetchJson("/api/companion/v1/reserve", {
       method: "POST",
       headers: auth,
@@ -2670,7 +2678,7 @@ describe("public companion HTTP surface", () => {
 
   it("read-only /state: 新 receipt 由显式维护投影，GET 保持只读", async () => {
     reconcileFeedbackOutbox(workspace.id, stateDir);
-    seedTrustedReceipt("http-cmd");
+    seedControlNotification("http-cmd");
     reconcileFeedbackOutbox(workspace.id, stateDir);
     enableReceiver({
       workspaceId: workspace.id,
@@ -2685,7 +2693,7 @@ describe("public companion HTTP surface", () => {
     const baselineReady = baseline.body.pendingReady as number;
     expect(baselineReady).toBeGreaterThanOrEqual(1);
 
-    seedTrustedReceipt("auto-cmd-1");
+    seedControlNotification("auto-cmd-1");
     const bytes = fs.readFileSync(path.join(stateDir, "feedback", `${workspace.id}.json`));
     const unprojected = await fetchJson("/api/companion/v1/state", { headers: auth });
     expect(unprojected.body.pendingReady).toBe(baselineReady);
@@ -2718,7 +2726,7 @@ describe("public companion HTTP surface", () => {
     expect(empty.body.pendingReady).toBe(0);
 
     // 新 receipt 落盘；不 reconcile，不先 GET /state
-    seedTrustedReceipt("reserve-auto-cmd");
+    seedControlNotification("reserve-auto-cmd");
     const reserved = await fetchJson("/api/companion/v1/reserve", {
       method: "POST",
       headers: auth,
@@ -2731,7 +2739,7 @@ describe("public companion HTTP surface", () => {
 
   it("匿名 /state 401 且不推进 projectionCursor", async () => {
     reconcileFeedbackOutbox(workspace.id, stateDir);
-    seedTrustedReceipt("http-cmd");
+    seedControlNotification("http-cmd");
     reconcileFeedbackOutbox(workspace.id, stateDir);
     enableReceiver({
       workspaceId: workspace.id,
@@ -2742,7 +2750,7 @@ describe("public companion HTTP surface", () => {
 
     const before = readFeedbackState(workspace.id, stateDir).projectionCursor;
     // 有一条尚未投影的 trusted receipt
-    seedTrustedReceipt("anon-should-not-project");
+    seedControlNotification("anon-should-not-project");
     const mid = readFeedbackState(workspace.id, stateDir).projectionCursor;
     expect(mid).toBe(before);
 

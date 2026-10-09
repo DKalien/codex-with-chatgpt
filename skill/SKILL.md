@@ -40,7 +40,8 @@ endpoint 的 workspace。`TURN_ENDED` 是 App Server 生命周期事实，不是
 不得为它写 `desktop_*` 回执。Desktop 持有 writer 时不得抢占、修改私有状态或自动换线程。
 本机 `deliveryMode=official` 后 Bridge 停用旧任务投递，只保留反馈相关功能；Remote disable 不回退旧入口。
 
-**统一 Gateway（显式部署后）:** 见 `docs/unified-gateway-plan.md`。先在实际连接中调用
+**统一 Gateway（显式部署后）:** 已配置本机 `gateway supervisor` 时，现有 Bridge 启动/重启入口自动启动或复用共享 Gateway 及其公网隧道并等待就绪，无需另开终端；未配置仍走原 workspace 流程。Gateway 失败时报告 Bridge 已就绪与具体失败，不报告整组 Ready、不改配对或会话。停止当前 workspace 不停止共享 Gateway。
+见 `docs/unified-gateway-plan.md`。先在实际连接中调用
 `gateway_list_workspaces`，核对当前 clientId 和显式授权项目，再选定 workspaceId。
 所有项目工具（包括 workspace_info、feedback_status、web_sink_list）都携带该 workspaceId；
 targetId/taskId 必须属于同一项目。OAuth 登录本身不授权任何本机项目，缺失授权由本机用户
@@ -1037,8 +1038,10 @@ Bridge 返回 `deliveryStatus=queued` 表示完整任务已持久接收；网页
    不接受调用方传入 turnId，不要设置或伪造环境变量来绕过身份验证。
    rejected、outcome_unknown、不存在的 commandId 均拒绝，不能把 accepted 冒充 completed。
    完全相同重试幂等；内容冲突停止，不能覆盖旧证据或换 ID 绕过。
-5. 若收到 `FINAL_RECEIPT_REQUIRED`，它是控制唤醒与只读复核信号，不是完成回执：必须先只读检查 workspace、git diff、test_status、execution_summary 和 execution_output；仅发现实际需要修复或补测时，才发起聚焦的 revision/review command。若当前状态已充分，或后续结果已覆盖这次回执且无需改动，可继续既定项目目标、开发计划或 DONE；禁止为了制造回执发送无改动 closeout。它不是新的用户授权，仍不得把历史 `test_status` 当作原命令的可信回执；任何需要明确授权的动作必须停止并请求授权。记录失败时明确说明“本轮验收记录缺失”，不能宣称验收闭环完成；不要因记录失败重发任务、
+5. 若收到 `FINAL_RECEIPT_REQUIRED`，它是控制唤醒与只读复核信号，不是完成回执：必须先只读检查 workspace、git diff、test_status、execution_summary 和 execution_output；仅发现实际需要修复或补测时，才发起聚焦的 revision/review command。若当前状态已充分，或后续结果已覆盖这次回执且无需改动，可继续既定项目目标、开发计划或 DONE；禁止为了制造回执发送无改动 closeout。它不是新的用户授权，仍不得把历史 `test_status` 当作原命令的可信回执；任何需要明确授权的动作必须停止并请求授权。记录失败且本轮可信 receipt 未提交时明确说明“本轮验收记录缺失”，不能宣称验收闭环完成；不要因记录失败重发任务、
    自动批准或放宽门禁。最终回复给出实际状态和成功返回的 record/outputId，供网页精确复核。
+
+   若可信 receipt 已提交，而 `resultReconciliation.status` 为 `reconciliation_needed`，报告“本轮回执已提交，结果回流待对账”，保留原 commandId 与 durable pending，不宣称回流完成。原 turn 仍须在 `record` 后停止工具活动；后续本机维护复用既有对账入口，不能重发任务、换 ID 或为补投影发送无改动 closeout。
 
 ### 防重复、未知结果与本机边界
 

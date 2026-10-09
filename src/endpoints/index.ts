@@ -67,26 +67,18 @@ export type {
 } from "./schema.js";
 
 export {
-  DELIVERY_REASON_TEXT_MAX,
   EXECUTION_EVIDENCE_DETAIL_MAX,
-  assertDeliveryTargetMatchesBinding,
   assertTrustedEvidenceAllowed,
   assertValidExecutorPluginDescriptor,
   createExecutorPluginRegistry,
-  executorDeliveryAcceptanceSchema,
-  executorDeliveryAcceptedSchema,
-  executorDeliveryRejectedSchema,
   executorPluginCapabilitiesSchema,
   executorPluginDescriptorSchema,
   parseExecutionEvidenceList,
-  parseExecutorDeliveryAcceptance,
   parseExecutorPluginDescriptor,
   validateExecutorPlugin,
 } from "./executor-contract.js";
 export type {
   ExecutorActiveExecutionProjection,
-  ExecutorDeliveryAcceptance,
-  ExecutorDeliveryRequest,
   ExecutorExecutionEvidence,
   ExecutorPlugin,
   ExecutorPluginCapabilities,

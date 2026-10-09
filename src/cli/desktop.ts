@@ -167,11 +167,11 @@ export function registerDesktopCommands(program: Command): void {
           beforeReceiptCommit: receiptAlreadyExists =>
             prepareResultReconciliation(workspace, opts.commandId, receiptAlreadyExists),
         });
-        const resultOutbox = reconcileTrustedDesktopExecutionResult(workspace, opts.commandId);
-        const reconciliationNeeded = resultOutbox.status === "reconciliation_needed";
-        print({ ...result, ok: !reconciliationNeeded, receiptCommitted: true, resultOutbox }, opts.json,
+        const resultReconciliation = reconcileTrustedDesktopExecutionResult(workspace, opts.commandId);
+        const reconciliationNeeded = resultReconciliation.status === "reconciliation_needed";
+        print({ ...result, ok: !reconciliationNeeded, receiptCommitted: true, resultReconciliation }, opts.json,
           reconciliationNeeded
-            ? "Desktop trusted execution receipt 已记录；canonical RoutingResult 需本机重试对账。"
+            ? "Desktop trusted execution receipt 已记录；canonical RoutingResult / Result Bus 需本机重试对账。"
             : "本轮 Desktop execution receipt 已记录。");
         if (reconciliationNeeded) process.exitCode = 1;
       } catch (error) {
@@ -183,7 +183,7 @@ export function registerDesktopCommands(program: Command): void {
     });
 
   desktop.command("reconcile-result")
-    .description("从本机 trusted Desktop receipt 幂等恢复 canonical RoutingResult 与 planner-route outbox")
+    .description("从本机 trusted Desktop receipt 幂等恢复 canonical RoutingResult 与 Result Bus")
     .option("-w, --workspace <path>", "workspace 根目录")
     .requiredOption("--command-id <id>", "原 Routing Command commandId")
     .option("--json", "输出机器可读结果", false)
@@ -191,16 +191,16 @@ export function registerDesktopCommands(program: Command): void {
       const workspace = new Workspace(workspaceRoot(opts.workspace));
       const result = reconcileTrustedDesktopExecutionResult(workspace, opts.commandId);
       const message = result.status === "reconciled"
-        ? "canonical RoutingResult 与 planner-route outbox 已核对。"
+        ? "canonical RoutingResult 与 Result Bus 已核对。"
         : result.status === "reconciliation_needed"
           ? "reconciliation-needed 已记录；保留原 trusted receipt，请核对原因后重试。"
-          : "此 receipt 不适用于 canonical R4 outbox；未改写 legacy 或 generic 记录。";
+          : "此 receipt 不适用于 canonical Result Bus；未改写 legacy 或 generic 记录。";
       print({ ok: result.status !== "reconciliation_needed", workspaceId: workspace.id, ...result }, opts.json, message);
       if (result.status === "reconciliation_needed") process.exitCode = 1;
     });
 
   desktop.command("result-reconciliation-status")
-    .description("只读列出尚未收敛的 canonical RoutingResult 对账项")
+    .description("只读列出尚未收敛的 canonical RoutingResult / Result Bus 对账项")
     .option("-w, --workspace <path>", "workspace 根目录")
     .option("--json", "输出机器可读结果", false)
     .action((opts: { workspace?: string; json: boolean }) => {
@@ -208,9 +208,9 @@ export function registerDesktopCommands(program: Command): void {
         const workspace = new Workspace(workspaceRoot(opts.workspace));
         const entries = listResultReconciliationNeeded(workspace);
         print({ ok: true, workspaceId: workspace.id, count: entries.length, entries }, opts.json,
-          entries.length === 0 ? "没有待收敛的 canonical RoutingResult。" : `有 ${entries.length} 条待收敛的 canonical RoutingResult。`);
+          entries.length === 0 ? "没有待收敛的 canonical RoutingResult / Result Bus。" : `有 ${entries.length} 条待收敛的 canonical RoutingResult / Result Bus。`);
       } catch (error) {
-        const failure = safeCliError(error, "RESULT_RECONCILIATION_STATE_CORRUPT", "R4 reconciliation queue 读取失败；保留原文件。");
+        const failure = safeCliError(error, "RESULT_RECONCILIATION_STATE_CORRUPT", "结果 reconciliation queue 读取失败；保留原文件。");
         print({ ok: false, error: failure.code, message: failure.message }, opts.json, failure.message);
         process.exitCode = 1;
       }

@@ -60,7 +60,7 @@ describe("R5h command runtime auto-destroy / exact force cleanup", () => {
       desktopOriginTurnId: accepted.turnId!, desktopResultTurnId: accepted.turnId!, desktopBindingId: accepted.bindingId,
       outputId: output.id, outputAvailable: output.allowed,
     }));
-    expect(reconcileTrustedDesktopExecutionResult(workspace, commandId)).toMatchObject({ status: "reconciled", resultBus: { status: "reconciled" } });
+    expect(reconcileTrustedDesktopExecutionResult(workspace, commandId)).toMatchObject({ status: "reconciled", resultBus: { projected: 1, replayed: 0 } });
     return { entry: listResultBusEntries(workspace, stateDir).find(item => item.commandId === commandId)!, output };
   }
   function claim(commandId = "cleanup_x") {
@@ -170,6 +170,27 @@ describe("R5h command runtime auto-destroy / exact force cleanup", () => {
     expect(reconcileTrustedDesktopExecutionResult(workspace, "cleanup_x")).toMatchObject({ issuePersisted: false });
     expect(diagnostic).not.toHaveBeenCalled();
     expect(inspectCommandCleanupArtifacts(target())).toEqual([]);
+  });
+
+  it("cleanup 在 receipt/result 锁释放与 Bus 投影之间完成，不重建 producer 或诊断", () => {
+    canonical();
+    const operate = lifecycleFence.withCommandOperation;
+    let cleaned = false;
+    vi.spyOn(lifecycleFence, "withCommandOperation").mockImplementation((...args) => {
+      const result = operate(...args);
+      if (!cleaned && result && typeof result === "object" && "status" in result &&
+          result.status === "reconciled" && "plannerRouteId" in result && !("resultBus" in result)) {
+        cleaned = true;
+        const preview = previewCommandCleanup(target());
+        expect(confirmCommandCleanup(target(), preview.confirmationSha256!).status).toBe("cleaned");
+      }
+      return result;
+    });
+    expect(reconcileTrustedDesktopExecutionResult(workspace, "cleanup_x"))
+      .toMatchObject({ status: "reconciliation_needed", reasonCode: "ROUTING_COMMAND_NOT_FOUND", issuePersisted: false });
+    expect(cleaned).toBe(true);
+    expect(inspectCommandCleanupArtifacts(target())).toEqual([]);
+    expect(reconcileWorkspaceResultBus(workspace, stateDir)).toEqual({ projected: 0, replayed: 0 });
   });
 
   it("unfinished shared atomic write stays fail closed; ACK is terminal and residue is never ignored", () => {

@@ -8,6 +8,10 @@
 
 Gateway Desktop status/send 分别要求 `codex.desktop.read` / `codex.desktop.control`。入口重新核验 Gateway AuthStore 的原 bearer 有效期、撤销状态、machine-gateway 身份、clientId 与对应 scope；send 在原 Desktop durable commit 前再次核验原 bearer 和 registry 的 exact workspace/client/canonical root，拒绝使用请求入口快照跨越撤权。目标仍只来自本机确认绑定；enabled、bindingId、MCP conversation principal、userConfirmed、运行时身份、owner、审批、防重放和 outcome_unknown 门禁不变。Desktop 与后台 Remote 的 enable 独立；不会因 Remote disable 自动改投 Desktop，也不会把 codex_submit_task 重定向。
 
+已有 machine Gateway supervisor 配置时，Bridge 启动会复用其既有身份核验与后台启动流程；没有配置时不创建配置或授权。Bridge 的 start/startup lease 与 machine maintenance 围栏成功释放后才等待 Gateway；继承 maintenance 的 rollout 不启动或重启共享 Gateway。启动失败保持错误码并明确 Bridge 已就绪，不能隐式迁移 workspace tunnel、OAuth、session 或扩大 grant。workspace stop 不停止共享 Gateway。
+
+冷启动在 Gateway 自己的 maintenance 围栏内固定已安装 current release 并写入既有 launch pin，释放后通过现有 Windows Job 逃逸的 detached daemon（独立后台进程）启动并等待就绪。健康复用要求 native exact parent 与两个隧道子进程身份、supervisor/server 两锁和 runtime 一致，再核对只允许 loopback 的 `/internal/gateway/health` 与 OAuth origin；该健康路由拒绝 Forwarded、代理头和公网 Host，只返回服务与运行身份，不返回凭据。崩溃、损坏或未知 ownership 保留现有锁、runtime 与 pin，不自动接管。
+
 机器 OAuth 存储与旧 Bridge/单 workspace 官方 endpoint 分开；`gateway/server.lock` 防止多个运行实例覆盖认证缓存，遗留锁不自动删除。项目内 Remote task status/result/cancel 继续核验原 OAuth client。Feedback principal 由当前请求的 `openai/session` 与 clientId 推导，不接受工具参数；需要 active binding 的操作还要核验其 binding/epoch，接管必须提供 fresh `expectedEpoch`。旧 Connector 的 principal 不会自动转换成新 Gateway client。每个项目仍保留原 scope、Remote enable/official mode、target/task 所属检查、route attestation、Result Bus 与发送状态机；Gateway 不提供 Shell、provider 或审批旁路。
 
 Companion 的项目登记仅保存 workspaceId 与 Bridge origin，不扩大 Gateway allowlist。每项目 local/session/alarm 隔离，加载与 Pair 都核对 transport 的项目身份与 origin；只有确证旧 singleton 身份时复制迁移，未知或冲突停止并保留 attempt 历史。迁移先建立 TRUSTED_CONTEXTS；失败停止业务操作并尝试净化 transport credential，不声称无法清理的凭据已删除。Grant Bridge access 是唯一权限请求入口，Pair/Pair+Connect 缺已有权限时不获取 proof、不调用 /pair。生产回调固定发送原 workspace/tab/document；Popup 异步操作捕获项目身份，手动操作期间锁定所选项目，迟到状态读取不得覆盖新选择，切项目清空临时结果显示。存储失败不提交内存登记或选择。

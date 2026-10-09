@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import { AuthStore, DESKTOP_CONTROL_SCOPE, EXECUTOR_CONTROL_SCOPE } from "../auth/store.js";
 import type { Workspace } from "../workspace/manager.js";
-import { getExecutor, type ExecutorAdapter } from "../executor/index.js";
+import { codexDesktopAdapter, type ExecutorAdapter } from "../executor/index.js";
 import { DesktopError, publicDelivery, readDesktop, sendInput } from "../desktop/store.js";
 import { validateDesktopWireMessage } from "../desktop/ipc.js";
 import { readActiveExecutorBinding } from "../executor-control/service.js";
@@ -26,7 +26,7 @@ const digest = (value: string) => createHash("sha256").update(value).digest("hex
  * No thread creation/steering protocol is inferred from a busy Desktop snapshot.
  */
 export function createCommandMailbox(workspace: Workspace, authStore: Pick<AuthStore, "verifyAccessTokenHash">,
-  executor: ExecutorAdapter = getExecutor()) {
+  executor: ExecutorAdapter = codexDesktopAdapter) {
   let ticking = false, closed = false;
   let finishTick: (() => void) | undefined, tickFinished: Promise<void> | undefined;
   let maintenance: MaintenanceLockHandle | undefined;

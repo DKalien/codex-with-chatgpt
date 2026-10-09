@@ -26,7 +26,8 @@ describe("R5d1/R5d2/R5d3 Result Bus architecture fence", () => {
     const outbox = read("src/routing/result-outbox-store.ts");
     expect(outbox, "R4 outbox 必须 pin plannerRoute").toMatch(/plannerRouteId/);
     expect(outbox).not.toMatch(/web-sink-control|readActiveWebSinkBinding|webSinkStatus/);
-    expect(outbox).not.toMatch(/result-bus/);
+    const legacyWriter = outbox.slice(outbox.indexOf("export function enqueueResultOutboxEntry"));
+    expect(legacyWriter).not.toMatch(/result-bus|listResultBusEntries/);
     expect(read("src/routing/execution-result-digest.ts")).not.toMatch(/result-outbox-store/);
     expect(fs.existsSync(path.join(root, "src/routing/result-outbox-store.ts"))).toBe(true);
   });
@@ -74,8 +75,9 @@ describe("R5d1/R5d2/R5d3 Result Bus architecture fence", () => {
   it("R5d3: feedback projector is no longer a production consumer of the R4 outbox or Result Bus", () => {
     const projector = read("src/feedback/projector.ts");
     expect(projector).not.toMatch(/result-outbox|result-bus|canonical-compat/);
-    // 兼容投影保留在显式 compat 模块（审计/回滚/测试），不在 production 投递路径上。
-    expect(fs.existsSync(path.join(root, "src/feedback/canonical-compat.ts"))).toBe(true);
+    // 历史写入器只用于 fixture；新 release 不暴露生产 compat writer。
+    expect(fs.existsSync(path.join(root, "src/feedback/canonical-compat.ts"))).toBe(false);
+    expect(fs.existsSync(path.join(root, "tests/helpers/canonical-compat.ts"))).toBe(true);
     expect(read("src/routing/execution-result-reconciler.ts")).toMatch(/result-bus\/service\.js/);
   });
 
@@ -86,5 +88,16 @@ describe("R5d1/R5d2/R5d3 Result Bus architecture fence", () => {
     for (const [name, source] of [["reserveNext", reserveNext], ["claimNext", claimNext]] as const) {
       expect(source, name).toMatch(/plannerRouteId/);
     }
+  });
+
+  it("生产 Feedback 新获取与 begin 仅允许控制通知，历史执行只能恢复", () => {
+    for (const file of ["src/bridge/result-bus-delivery.ts", "src/feedback/companion-delivery.ts", "src/mcp/feedback.ts"]) {
+      const calls = [...read(file).matchAll(/\b(?:reserveNext|claimNext|beginSend)\(\{([\s\S]*?)\}\)/g)];
+      expect(calls.length, file).toBeGreaterThan(0);
+      for (const call of calls) expect(call[1], file).toContain("controlOnly: true");
+    }
+    const projector = read("src/feedback/projector.ts");
+    expect(projector).not.toMatch(/kind: "C2C_EXECUTED"|isTrustedDesktopReceipt|readDesktop/);
+    expect(projector).toMatch(/FINAL_RECEIPT_REQUIRED_EVENT_KIND/);
   });
 });

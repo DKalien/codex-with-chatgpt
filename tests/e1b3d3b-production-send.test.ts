@@ -29,6 +29,7 @@ import {
   buildClaimProof,
   buildAckProof,
   reconcileClaimedAgainstServer,
+  isRecoverySendDisabled,
   commitJournalDurably,
   findExactObservedEvent,
   evaluateServerObservedCloseout,
@@ -60,6 +61,8 @@ import {
   normalizeCanonicalDomText,
   resolveChatGptAction,
 } from "../browser-companion/dom-adapter.js";
+
+import { continueFromClaimed, continueFromSendIntent } from "../browser-companion/send-orchestrator.js";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const companionRoot = path.join(projectRoot, "browser-companion");
@@ -4029,5 +4032,172 @@ describe("command29 rich USER paragraph observation", () => {
     expect(spy.journal.state).toBe("NONE");
     expect(result.zeroWrite).toBe(true);
     expect(result.zeroClick).toBe(true);
+  });
+});
+
+
+describe("authenticated 禁发恢复", () => {
+  const disabledInFlight = (status = "claimed") => ({ status, eventId: EVENT_ID, reservationId: RES_ID,
+    attemptId: ATTEMPT, message: MESSAGE, messageSha256: MESSAGE_SHA, sendAllowed: false });
+  const local = (state: "SEND_INTENT" | "CLAIMED") => state === "CLAIMED" ? claimedJournal() : markSendIntent(reservedJournal(), {});
+
+  it.each(["SEND_INTENT", "CLAIMED"] as const)("%s 明确禁发时保留 unknown fence，零 begin/write/click", async state => {
+    const spy = makeSpies({ journal: local(state), inFlight: disabledInFlight(),
+      findCanonicalUserTurn: () => ({ ok: false, reason: "not_observed" }) });
+    const result = await recoverProductionSend(spy);
+    expect(result).toMatchObject({ ok: false, zeroWrite: true, zeroClick: true });
+    expect(spy.calls).toMatchObject({ beginSend: 0, write: 0, click: 0, ack: 0 });
+    expect(spy.journal).toMatchObject({ state: "OUTCOME_UNKNOWN", eventId: EVENT_ID, reservationId: RES_ID,
+      attemptId: ATTEMPT, message: MESSAGE, messageSha256: MESSAGE_SHA });
+    expect(spy.calls.persist).not.toContain("CLAIMED");
+  });
+
+  it.each(["SEND_INTENT", "CLAIMED"] as const)("%s 禁发仍允许同 attempt late-positive ACK", async state => {
+    for (const status of ["claimed", "outcome_unknown"]) {
+      const spy = makeSpies({ journal: local(state), inFlight: disabledInFlight(status) });
+      expect(await recoverProductionSend(spy)).toMatchObject({ ok: true, zeroWrite: true, zeroClick: true,
+        action: "late_positive_observed_then_acked" });
+      expect(spy.calls).toMatchObject({ beginSend: 0, write: 0, click: 0, ack: 1 });
+      expect(spy.journal.state).toBe("NONE");
+      expect(spy.calls.persist).toEqual(["OUTCOME_UNKNOWN", "OBSERVED_PENDING_ACK", "NONE"]);
+    }
+  });
+
+  it.each(["SEND_INTENT", "CLAIMED"] as const)("%s 禁发但身份不匹配时不能观察 ACK 或清 journal", async state => {
+    const original = local(state);
+    const spy = makeSpies({ journal: original, inFlight: { ...disabledInFlight(), eventId: "f".repeat(32) } });
+    expect(await recoverProductionSend(spy)).toMatchObject({ ok: false, zeroWrite: true, zeroClick: true });
+    expect(spy.calls).toMatchObject({ beginSend: 0, write: 0, click: 0, ack: 0, persist: [] });
+    expect(spy.journal).toBe(original);
+  });
+
+  it("reserved 明确禁发不重试 begin-send，也不清 SEND_INTENT", async () => {
+    const journal = local("SEND_INTENT");
+    const spy = makeSpies({ journal, inFlight: { ...disabledInFlight("reserved"), attemptId: null } });
+    expect(await recoverProductionSend(spy)).toMatchObject({ ok: false, zeroWrite: true, zeroClick: true });
+    expect(spy.calls).toMatchObject({ beginSend: 0, write: 0, click: 0, ack: 0, persist: [] });
+    expect(spy.journal).toBe(journal);
+  });
+
+  it("直接 continuation 也不能绕过 authenticated 禁发 gate", async () => {
+    const spy = makeSpies({ inFlight: disabledInFlight() });
+    expect(await continueFromSendIntent(spy, local("SEND_INTENT"))).toMatchObject({ reason: "recovery_send_disabled", zeroWrite: true, zeroClick: true });
+    expect(await continueFromClaimed(spy, local("CLAIMED"))).toMatchObject({ reason: "recovery_send_disabled", zeroWrite: true, zeroClick: true });
+    expect(spy.calls).toMatchObject({ beginSend: 0, write: 0, click: 0, ack: 0 });
+  });
+
+  it("sanitize 与 RPC 复制都保留明确 false，缺标志维持兼容", () => {
+    const source = { ...disabledInFlight(), credential: "secret" };
+    const sanitized = sanitizeInFlightForRecovery(source);
+    expect(sanitized?.sendAllowed).toBe(false);
+    expect(buildProductionRecoverRequest(OWNER, claimedJournal(), sanitized).message.inFlight.sendAllowed).toBe(false);
+    expect(JSON.stringify(sanitized)).not.toContain("secret");
+    expect(isRecoverySendDisabled({ sendAllowed: true })).toBe(false);
+    expect(isRecoverySendDisabled({})).toBe(false);
+    expect(sanitizeInFlightForRecovery({ status: "claimed" })).not.toHaveProperty("sendAllowed");
+  });
+
+  it("claimed 明确禁发不 mint claim proof，attempt mismatch 仍 conflict", () => {
+    const rec = reconcileClaimedAgainstServer(claimedJournal(), disabledInFlight());
+    expect(rec).toMatchObject({ action: "adopt_outcome_unknown", reason: "recovery_send_disabled", zeroWrite: true, zeroClick: true });
+    expect(rec).not.toHaveProperty("claimProof");
+    expect(reconcileClaimedAgainstServer(claimedJournal(), { ...disabledInFlight(), attemptId: RES_ID }))
+      .toMatchObject({ action: "conflict", reason: "claimed_attempt_mismatch" });
+  });
+
+  async function swRecovery(state: "SEND_INTENT" | "CLAIMED", status: string, persistFails = false) {
+    const source = fs.readFileSync(path.join(companionRoot, "service-worker.js"), "utf8");
+    const start = source.indexOf("async function recoverProductionSendSide(inFlight)");
+    const end = source.indexOf("\n/**", start);
+    let minted = 0;
+    const requests: any[] = [];
+    const sandbox: any = {
+      journal: local(state), ownerState: { owner: OWNER }, productionSendInFlight: false,
+      productionClaimProof: { stale: true }, productionAckProof: { stale: true },
+      sanitizeInFlightForRecovery, isRecoverySendDisabled, reconcileClaimedAgainstServer,
+      markOutcomeUnknown, clearJournal, summarizeProductionJournal, buildProductionRecoverRequest,
+      buildClaimProof: (...args: any[]) => { minted += 1; return buildClaimProof(...args); },
+      persistJournal: async () => { if (persistFails) throw new Error("storage failed"); },
+      refreshActionIndicator: async () => {},
+      chrome: { tabs: { sendMessage: async (_tab: number, request: any) => {
+        requests.push(request);
+        const spy = makeSpies({ journal: request.startJournal, inFlight: request.inFlight });
+        const response = await recoverProductionSend(spy);
+        expect(spy.calls).toMatchObject({ beginSend: 0, write: 0, click: 0, ack: 1 });
+        sandbox.journal = spy.journal;
+        return response;
+      } } },
+      inFlight: disabledInFlight(status),
+    };
+    const response = await vm.runInNewContext(`${source.slice(start, end)}; recoverProductionSendSide(inFlight)`, sandbox);
+    return { response, sandbox, minted, requests };
+  }
+
+  it.each(["SEND_INTENT", "CLAIMED"] as const)("SW %s 禁发先保留 unknown，再只观察 ACK，不 mint/resume proof", async state => {
+    for (const status of ["claimed", "outcome_unknown"]) {
+      const { response, sandbox, minted, requests } = await swRecovery(state, status);
+      expect(response).toMatchObject({ ok: true, zeroWrite: true, zeroClick: true });
+      expect(minted).toBe(0);
+      expect(sandbox.productionClaimProof).toBeNull();
+      expect(sandbox.productionAckProof).toBeNull();
+      expect(requests).toHaveLength(1);
+      expect(requests[0]).toMatchObject({ startJournal: { state: "OUTCOME_UNKNOWN", attemptId: ATTEMPT }, inFlight: { sendAllowed: false } });
+    }
+  });
+
+  it.each(["COMPOSER_WRITE_INTENT", "SEND_DISPATCH_INTENT", "OBSERVED_PENDING_ACK"] as const)("%s 禁发仍只观察/ACK，不恢复 DOM", async state => {
+    let journal = markComposerWriteIntent(claimedJournal(), {});
+    if (state !== "COMPOSER_WRITE_INTENT") journal = markSendDispatchIntent(journal, {});
+    if (state === "OBSERVED_PENDING_ACK") journal = markObservedPendingAck(journal, {});
+    const spy = makeSpies({ journal, inFlight: disabledInFlight() });
+    expect((await recoverProductionSend(spy)).ok).toBe(true);
+    expect(spy.calls).toMatchObject({ beginSend: 0, write: 0, click: 0, ack: 1 });
+    expect(spy.journal.state).toBe("NONE");
+  });
+
+  it("SW unknown fence 保存失败保留原 journal，零 proof/CS RPC", async () => {
+    const { response, sandbox, minted, requests } = await swRecovery("CLAIMED", "claimed", true);
+    expect(response).toMatchObject({ ok: false, reason: "outcome_unknown_persist_failed", zeroWrite: true, zeroClick: true });
+    expect(sandbox.journal.state).toBe("CLAIMED");
+    expect(minted).toBe(0);
+    expect(requests).toEqual([]);
+  });
+});
+
+
+describe("fresh classic 禁发恢复", () => {
+  function runtime() {
+    const sandbox: Record<string, any> = { URL };
+    sandbox.globalThis = sandbox;
+    const context = vm.createContext(sandbox);
+    for (const file of ["route-global.js", "production-send-runtime-global.js"]) {
+      vm.runInContext(fs.readFileSync(path.join(distCompanion, file), "utf8"), context);
+    }
+    return sandbox;
+  }
+
+  it.each(["SEND_INTENT", "CLAIMED"] as const)("构建后 classic %s 禁发零 write/click，但同 attempt 可 late-positive ACK", async state => {
+    const recover = runtime().__c2cRecoverProductionSend;
+    const journal = state === "CLAIMED" ? claimedJournal() : markSendIntent(reservedJournal(), {});
+    const inFlight = { status: "claimed", eventId: EVENT_ID, reservationId: RES_ID, attemptId: ATTEMPT,
+      message: MESSAGE, messageSha256: MESSAGE_SHA, sendAllowed: false };
+    const blocked = makeSpies({ journal, inFlight, findCanonicalUserTurn: () => ({ ok: false, reason: "not_observed" }) });
+    expect(await recover(blocked)).toMatchObject({ ok: false, zeroWrite: true, zeroClick: true });
+    expect(blocked.calls).toMatchObject({ beginSend: 0, write: 0, click: 0, ack: 0 });
+    expect(blocked.journal.state).toBe("OUTCOME_UNKNOWN");
+    const observed = makeSpies({ journal, inFlight });
+    expect(await recover(observed)).toMatchObject({ ok: true, zeroWrite: true, zeroClick: true });
+    expect(observed.calls).toMatchObject({ beginSend: 0, write: 0, click: 0, ack: 1 });
+    expect(observed.journal.state).toBe("NONE");
+  });
+
+  it("构建后 classic 缺禁发标志时保留正常发送与 claimed 恢复", async () => {
+    const classic = runtime();
+    const normal = makeSpies();
+    expect((await classic.__c2cRunProductionSend(normal)).ok).toBe(true);
+    expect(normal.calls).toMatchObject({ beginSend: 1, write: 1, click: 1, ack: 1 });
+    const claimed = makeSpies({ journal: claimedJournal() });
+    expect((await classic.__c2cRecoverProductionSend(claimed)).ok).toBe(true);
+    expect(claimed.calls).toMatchObject({ beginSend: 0, write: 1, click: 1, ack: 1 });
   });
 });

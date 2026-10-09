@@ -317,6 +317,7 @@ describe("G2 MCP request capability facts", () => {
       hostId: "local",
       projectId: "p1",
       title: "t",
+      workspaceRoot: workspace.root,
     } as never);
     const facts = await collectWorkflowCapabilityFacts(workspace, {
       kind: "mcp_request",

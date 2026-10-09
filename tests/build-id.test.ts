@@ -34,8 +34,12 @@ describe("runtime build ID", () => {
       write(dist, "cli/index.js", "// compiled CLI");
       write(dist, "browser-companion/service-worker.js", "// packaged Companion");
       write(dist, "build-id.txt", idA);
+      write(dist, "feedback/canonical-compat.js", "// retired compatibility writer");
+      write(dist, "feedback/canonical-compat.js.map", "{}");
       const finalize = () => execFileSync(process.execPath, [path.resolve("scripts/write-build-id.mjs"), dist], { windowsHide: true });
       finalize();
+      expect(fs.existsSync(path.join(dist, "feedback/canonical-compat.js"))).toBe(false);
+      expect(fs.existsSync(path.join(dist, "feedback/canonical-compat.js.map"))).toBe(false);
       const first = fs.readFileSync(path.join(dist, "build-id.txt"), "utf8").trim();
       expect(first).not.toBe(idA);
       expect(first).toBe(computeBuildId(dist));

@@ -7,11 +7,11 @@ import { bindCurrentDesktop, bindDesktop, desktopStatus, enableDesktop, sendDesk
 import {
   CODEX_DESKTOP_EXECUTOR_ID,
   codexDesktopAdapter,
-  createExecutorRegistry,
   type ExecutorAdapter,
 } from "../src/executor/index.js";
 import { DesktopError, readDesktop, updateDesktop } from "../src/desktop/store.js";
 import { cleanup, isolateStateDir } from "./helpers.js";
+import { inspectDesktopBinding } from "../src/desktop/binding-inspection.js";
 
 const workspace = { id: "executor_core_test", root: process.cwd() };
 const target = { threadId: "01a00000-0000-7000-8000-000000000011", hostId: "local" as const, projectId: "executor_project" };
@@ -36,11 +36,16 @@ function fakeAdapter(overrides: Partial<ExecutorAdapter> = {}): ExecutorAdapter 
   };
 }
 
-it("registry 只注册 Codex Desktop，并对未知 executor fail closed", () => {
-  const registry = createExecutorRegistry();
-  expect(registry.list().map(item => item.id)).toEqual([CODEX_DESKTOP_EXECUTOR_ID]);
-  expect(registry.get(CODEX_DESKTOP_EXECUTOR_ID)).toBe(codexDesktopAdapter);
-  expect(() => registry.get("claude-code")).toThrow("Unknown executor");
+it("保存 binding 检查缺少 runtime fence 时不得调用 adapter", async () => {
+  const adapter = fakeAdapter();
+  await expect(inspectDesktopBinding(workspace, target, null, adapter)).rejects.toMatchObject({ code: "DESKTOP_RUNTIME_FENCE_MISSING" });
+  expect(adapter.inspect).not.toHaveBeenCalled();
+});
+
+it.each(["threadId", "hostId", "projectId", "workspaceRoot"])("保存 binding 检查拒绝返回不一致的 %s", async key => {
+  const adapter = fakeAdapter({ inspect: vi.fn().mockResolvedValue({ ...info, [key]: "other" }) });
+  await expect(inspectDesktopBinding(workspace, target, runtimeFence, adapter)).rejects.toMatchObject({ code: "DESKTOP_BINDING_CHANGED" });
+  expect(adapter.inspect).toHaveBeenCalledWith({ ...target, workspaceRoot: workspace.root }, runtimeFence);
 });
 
 it("Codex Desktop capabilities 是有限描述，不宣称创建会话或取消支持", () => {

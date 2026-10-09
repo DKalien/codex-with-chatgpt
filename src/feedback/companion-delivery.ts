@@ -144,7 +144,10 @@ export function companionPublicState(input: {
   if (inflightEvent) {
     inFlight = {
       eventId: inflightEvent.eventId,
-      status: inflightEvent.status,
+      // 旧扩展也会遵守 unknown 门禁；仅投影视图，不改原 attempt 或 durable status。
+      status: inflightEvent.kind !== "FINAL_RECEIPT_REQUIRED" && inflightEvent.status === "claimed"
+        ? "outcome_unknown" : inflightEvent.status,
+      ...(inflightEvent.kind !== "FINAL_RECEIPT_REQUIRED" ? { sendAllowed: false } : {}),
       ...(inflightEvent.reservationId ? { reservationId: inflightEvent.reservationId } : {}),
       ...(inflightEvent.attemptId ? { attemptId: inflightEvent.attemptId } : {}),
     };
@@ -204,6 +207,7 @@ export function companionReserveNext(input: {
     workspaceId: input.workspaceId,
     ...companionAuthInput(input.ctx),
     stateDir: input.stateDir,
+    controlOnly: true,
   });
   return {
     reservationId: result.reservationId,
@@ -277,6 +281,7 @@ export function companionBeginSend(input: {
     eventId: input.eventId,
     reservationId: input.reservationId,
     stateDir: input.stateDir,
+    controlOnly: true,
   });
   // claimed 已 durable；message 由 server 唯一生成，browser 不得重拼。
   const delivery = productionFeedbackDelivery(result.event);

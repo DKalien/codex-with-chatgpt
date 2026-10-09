@@ -1,5 +1,7 @@
 # 核心与插件职责边界
 
+2026-10-08 的源码精简见[执行与回流精简合同](runtime-simplification.md)：删除 Plugin raw send 和生产 compatibility writer，复用精确 Desktop binding 检查，单 command 发布直接进入 Result Bus。自动网页控制提醒保留；旧执行反馈禁止新发送，历史证据与恢复门禁保留。下方各阶段记录不证明当前安装或机器状态。
+
 当前源码边界见[官方路线](official-route.md)：Remote store/controller 负责精确执行目标与官方 turn；单 workspace 官方 MCP 和机器级 Unified Gateway 负责项目读取与接单，Gateway 每次核验显式 workspace/client grant 与规范 root。Bridge 在显式 official 模式保留反馈连接和投递结果，Companion 按 workspace 隔离网页发送证据。Gateway、feedback 工具整合和机器级 Supervisor 已有源码；双项目真实 Send/observed、完整现场验收和旧插件退役仍待完成，旧 feedback Connector 与 Desktop mailbox 保留兼容。阶段与历史验收见[统一 Gateway 计划](unified-gateway-plan.md)，历史 PID/状态不代表当前运行态。
 
 2026-10-05 的职责增量见 [双向消息收件箱](agent-mailbox.md)：Routing 负责持久接收和排队，既有安全 sender 负责真实投递，Result Bus 负责 canonical 结果，Companion 保存逐条 DOM attempt 证据。busy 不拒收，单条 unknown 可隔离；所有权和原请求防重放仍核验。此段“未部署源码开发”和 2026-10-06 的单 workspace live 闭环、09:01 Bridge stopped 均为当时快照；下一次运行判断须重新核对身份和状态。

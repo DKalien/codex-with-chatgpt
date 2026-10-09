@@ -2,22 +2,22 @@ import {
   FeedbackError,
   type FeedbackEvent,
   type FeedbackState,
-} from "./schema.js";
-import { recoverStaleFeedback } from "./state-store.js";
-import { feedbackEventId, applyProjection } from "./projection-store.js";
-import { resolveResultOutboxEntries } from "../routing/result-outbox-store.js";
-import { resolveWorkspaceIdentity } from "../routing/store.js";
-import type { RoutingResult } from "../routing/schema.js";
-import { getStateDir } from "../config/paths.js";
-import { readFeedbackState } from "./state-store.js";
-import { assertFeedbackCommandSnapshot, withFeedbackCommandLocks } from "./command-locks.js";
+} from "../../src/feedback/schema.js";
+import { recoverStaleFeedback } from "../../src/feedback/state-store.js";
+import { feedbackEventId, applyProjection } from "../../src/feedback/projection-store.js";
+import { resolveResultOutboxEntries } from "../../src/routing/result-outbox-store.js";
+import { resolveWorkspaceIdentity } from "../../src/routing/store.js";
+import type { RoutingResult } from "../../src/routing/schema.js";
+import { getStateDir } from "../../src/config/paths.js";
+import { readFeedbackState } from "../../src/feedback/state-store.js";
+import { assertFeedbackCommandSnapshot, withFeedbackCommandLocks } from "../../src/feedback/command-locks.js";
 
 /**
  * R4 canonical Feedback projection —— R5d3 起 compatibility-only。
  *
  * 历史（pre-cutover）canonical Feedback 事件由此路径产生；R5d3 cutover 后
  * production canonical delivery 改由 Workspace Result Bus 承担，
- * reconcileFeedbackOutbox 不再调用本模块。保留为显式兼容读侧（审计/回滚/测试），
+ * 本模块只构造历史测试 fixture（含旧版 compat writer），
  * 不得重新接入 production canonical 投递路径。
  */
 

@@ -1,5 +1,7 @@
 # 实验性 Desktop Control（MVP）
 
+2026-10-08 的结果提交合同见[执行与回流精简](runtime-simplification.md)：trusted receipt 直接生成 canonical RoutingResult 并投影当前 command 到 Result Bus；Bus 成功后才清除 durable pending，新结果不再写 R4 outbox。CLI JSON 使用 `resultReconciliation`，查询、发送及完成凭证的原安全门禁保留。
+
 Desktop Control 是默认关闭的 MCP 写入能力。它只把 ChatGPT 已确认的完整计划
 投递到本机已经绑定、已经在 Desktop 中加载的会话。Bridge 入口持久排队，空闲后通过原安全入口投递；Gateway 入口直接复用同一 sender，遵守 idle/busy 门禁，不排队。它不会创建新的会话或直接 steer active turn。
 本功能依赖 Desktop 的版本绑定内部 IPC，不能当作公开稳定 API。

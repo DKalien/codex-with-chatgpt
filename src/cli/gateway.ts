@@ -1,4 +1,4 @@
-import { InvalidArgumentError, type Command } from "commander";
+import { InvalidArgumentError, Option, type Command } from "commander";
 import path from "node:path";
 import { GatewayRegistry } from "../gateway/registry.js";
 import {
@@ -118,10 +118,11 @@ export function registerGatewayCommands(program: Command): void {
 
   supervisor.command("run").description("前台运行已校验的 Gateway、Cloudflare origin 与 Secure MCP Tunnel；不注册 Scheduled Task")
     .option("--state-dir <path>", "机器状态目录")
-    .action(async (opts: { stateDir?: string }) => {
+    .addOption(new Option("--background").hideHelp())
+    .action(async (opts: { stateDir?: string; background?: boolean }) => {
       // All Gateway stores resolve the same machine directory for this CLI process.
       if (opts.stateDir) process.env.C2C_STATE_DIR = path.resolve(opts.stateDir);
-      await runGatewaySupervisor({ stateDir: opts.stateDir, onPairing: ({ code, expiresAt }) => {
+      await runGatewaySupervisor({ stateDir: opts.stateDir, onPairing: opts.background ? undefined : ({ code, expiresAt }) => {
         process.stdout.write(`Local pairing code: ${code} (expires ${new Date(expiresAt).toISOString()})\n`);
       } });
     });

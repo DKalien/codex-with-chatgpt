@@ -31,6 +31,7 @@ import {
 import { canonicalRoutingResultDigest as sharedCanonicalRoutingResultDigest } from "./execution-result-digest.js";
 import { assertCleanupStoreFile, readCleanupJournal, withCommandOperation } from "../command-cleanup/fence.js";
 import { assertCleanupArtifacts, cleanupArtifact, CommandCleanupError, type CleanupArtifact, type CommandCleanupTarget } from "../command-cleanup/schema.js";
+import { listResultBusEntries } from "../result-bus/store.js";
 import { deleteRoutingCommandAndResultsForCleanup } from "./store.js";
 export type {
   ResultOutboxEntry,
@@ -346,7 +347,7 @@ export function listResultReconciliationNeeded(
 
 /**
  * Persist the recovery intent before a canonical Desktop receipt is committed.
- * No Routing Command means this is a legacy/generic Desktop receipt, not R4 work.
+ * No Routing Command means this is a legacy/generic Desktop receipt.
  */
 export function prepareResultReconciliation(
   identity: RoutingWorkspaceIdentity,
@@ -375,11 +376,11 @@ export function prepareResultReconciliation(
     const result = routing.results.find(item => item.commandId === parsedCommandId && item.iteration === 1);
     if (result && "rawSummary" in result && "machineEvidence" in result) {
       try {
-        if (listResultOutboxEntries(resolved, stateDir).some(item =>
-          item.commandId === parsedCommandId && item.iteration === 1 && item.resultId === result.resultId)) return;
+        if (listResultBusEntries(resolved, stateDir).some(item =>
+          item.commandId === parsedCommandId && item.iteration === 1 && item.resultId === result.resultId &&
+          item.resultSha256 === sharedCanonicalRoutingResultDigest(result))) return;
       } catch {
-        // Leave an explicit recovery item; the reconciler will preserve the outbox
-        // file and replace this generic pending reason with the concrete failure.
+        // 保留恢复项；reconciler 会报告 Bus 的具体失败，不能以历史 outbox 代替完成。
       }
     }
   }

@@ -8,7 +8,7 @@ import { getRuntimeBuildId } from "../build-id.js";
 import { isProcessProvenMissing, probeProcess, processProbeSchema, type ProcessProbe } from "../process/process-probe.js";
 import { buildDaemonEnv, resolveDaemonSpawnHelperPath, resolveDaemonSpawnPython } from "../process/daemon-spawn.js";
 import { startGatewayServer, type GatewayServer } from "../remote/server.js";
-import { withMaintenanceLock } from "../core/maintenance-lock.js";
+import { assertMaintenanceHandle, MaintenanceBusyError, withMaintenanceLock, type MaintenanceLockHandle } from "../core/maintenance-lock.js";
 import { z } from "zod";
 
 const BUILD_ID = /^[a-f0-9]{64}$/;
@@ -525,7 +525,7 @@ function assertGatewayInactive(stateDir: string): void {
   }
 }
 
-type GatewayFileSnapshot = {
+export type GatewayFileSnapshot = {
   dev: number;
   ino: number;
   size: number;
@@ -534,7 +534,7 @@ type GatewayFileSnapshot = {
   bytes: Buffer;
 };
 
-function sameGatewayPath(left: string, right: string): boolean {
+export function sameGatewayPath(left: string, right: string): boolean {
   const normalize = (value: string): string => {
     const resolved = path.normalize(path.resolve(value));
     return process.platform === "win32" || process.platform === "darwin" ? resolved.toLowerCase() : resolved;
@@ -542,7 +542,7 @@ function sameGatewayPath(left: string, right: string): boolean {
   return normalize(left) === normalize(right);
 }
 
-function ensureGatewayDirectory(stateDir: string): string {
+export function ensureGatewayDirectory(stateDir: string): string {
   const root = path.resolve(stateDir);
   try { fs.mkdirSync(root, { recursive: true, mode: 0o700 }); }
   catch { throw new GatewaySupervisorError("GATEWAY_SUPERVISOR_RUN_FAILED", "Gateway supervisor state directory 无法创建。 "); }
@@ -565,7 +565,7 @@ function ensureGatewayDirectory(stateDir: string): string {
   }
 }
 
-function snapshotGatewayFile(file: string, allowMissing = false): GatewayFileSnapshot | null {
+export function snapshotGatewayFile(file: string, allowMissing = false): GatewayFileSnapshot | null {
   let stat: fs.Stats;
   try { stat = fs.lstatSync(file); }
   catch (error) {
@@ -586,7 +586,7 @@ function snapshotGatewayFile(file: string, allowMissing = false): GatewayFileSna
   return { dev: stat.dev, ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs, bytes };
 }
 
-function sameGatewaySnapshot(left: GatewayFileSnapshot | null, right: GatewayFileSnapshot | null): boolean {
+export function sameGatewaySnapshot(left: GatewayFileSnapshot | null, right: GatewayFileSnapshot | null): boolean {
   if (left === null || right === null) return left === right;
   return left.dev === right.dev && left.ino === right.ino && left.size === right.size &&
     left.mtimeMs === right.mtimeMs && left.ctimeMs === right.ctimeMs && left.bytes.equals(right.bytes);
@@ -624,6 +624,49 @@ function readGatewaySupervisorLaunch(stateDir: string, file: string | undefined,
   }
 }
 
+export interface GatewayLaunchReservation {
+  file: string;
+  identity: string;
+  launch: GatewaySupervisorLaunch;
+  snapshot: GatewayFileSnapshot;
+}
+
+function gatewayLaunchReservation(stateDir: string, file: string): GatewayLaunchReservation {
+  const snapshot = snapshotGatewayFile(file)!;
+  const { dev, ino, size, mtimeMs, ctimeMs } = snapshot;
+  const identity = JSON.stringify({ dev, ino, size, mtimeMs, ctimeMs,
+    sha256: createHash("sha256").update(snapshot.bytes).digest("hex") });
+  let buildId: string;
+  try { buildId = gatewaySupervisorLaunchSchema.parse(JSON.parse(snapshot.bytes.toString("utf8"))).buildId; }
+  catch { throw new GatewaySupervisorError("GATEWAY_SUPERVISOR_LAUNCH_INVALID", "Gateway launch pin 内容无效；保留 pin。"); }
+  const launch = readGatewaySupervisorLaunch(stateDir, file, identity, buildId)!;
+  return { file, identity, launch, snapshot };
+}
+
+export function listGatewaySupervisorLaunchPins(stateDir: string): GatewayLaunchReservation[] {
+  const folder = ensureGatewayDirectory(stateDir);
+  return fs.readdirSync(folder).filter(name => name.startsWith("supervisor.") && name.endsWith(".launch.json"))
+    .map(name => gatewayLaunchReservation(stateDir, path.join(folder, name)));
+}
+
+/** 发布 durable release pin 前必须确认调用方仍持有机器 maintenance fence。 */
+export function createGatewaySupervisorLaunch(buildId: string, stateDir: string, handle: MaintenanceLockHandle): GatewayLaunchReservation {
+  assertMaintenanceHandle(stateDir, handle);
+  ensureGatewayDirectory(stateDir);
+  const launch = gatewaySupervisorLaunchSchema.parse({ version: 1, scope: "machine", buildId,
+    nonce: randomUUID(), launcherPath: path.join(stateDir, "bin", "c2c.js"), createdAt: new Date().toISOString() });
+  const file = gatewaySupervisorLaunchFile(launch.nonce, stateDir);
+  const bytes = Buffer.from(JSON.stringify(launch), "utf8");
+  const fd = fs.openSync(file, "wx", 0o600);
+  let created: fs.Stats;
+  try { fs.writeFileSync(fd, bytes); fs.fsyncSync(fd); created = fs.fstatSync(fd); }
+  finally { fs.closeSync(fd); }
+  const reservation = gatewayLaunchReservation(stateDir, file);
+  if (reservation.snapshot.dev !== created.dev || reservation.snapshot.ino !== created.ino || !reservation.snapshot.bytes.equals(bytes))
+    throw new GatewaySupervisorError("GATEWAY_SUPERVISOR_LAUNCH_INVALID", "Gateway launch pin 文件身份发生变化；保留 pin。");
+  return reservation;
+}
+
 function unlinkGatewaySnapshot(file: string, expected: GatewayFileSnapshot): boolean {
   const actual = snapshotGatewayFile(file, false);
   if (!sameGatewaySnapshot(expected, actual)) return false;
@@ -631,7 +674,7 @@ function unlinkGatewaySnapshot(file: string, expected: GatewayFileSnapshot): boo
   return true;
 }
 
-function readGatewayLock(file: string): GatewaySupervisorLock {
+export function readGatewayLock(file: string): GatewaySupervisorLock {
   const snapshot = snapshotGatewayFile(file, false);
   try { return gatewayLockSchema.parse(JSON.parse(snapshot!.bytes.toString("utf8"))); }
   catch { throw new GatewaySupervisorError("GATEWAY_SUPERVISOR_BUSY", "Gateway supervisor lock 内容无法确认，拒绝接管。 "); }
@@ -1024,10 +1067,25 @@ export async function startGatewaySupervisor(options: GatewaySupervisorRunOption
   delete process.env[GATEWAY_LAUNCH_IDENTITY_ENV];
   const launch = readGatewaySupervisorLaunch(stateDir, launchFile, launchIdentity, buildId);
 
+  const maintenanceDeadline = Date.now() + 60_000;
+  const startupMaintenance = async <T>(operation: string, action: () => T): Promise<T> => {
+    while (true) {
+      if (options.signal?.aborted) throw new GatewaySupervisorError("GATEWAY_SUPERVISOR_RUN_FAILED", "Gateway startup maintenance 等待已取消；保留 launch pin。");
+      try { return withMaintenanceLock(operation, action, stateDir); }
+      catch (error) {
+        // 已验证的后台 launch 可等待其他 workspace 的短 fence；前台 busy 语义保持不变。
+        if (!launch || !(error instanceof MaintenanceBusyError)) throw error;
+        const remaining = maintenanceDeadline - Date.now();
+        if (remaining <= 0) throw new GatewaySupervisorError("GATEWAY_SUPERVISOR_BUSY", "Gateway startup maintenance 等待超时；保留 launch pin。");
+        await new Promise(resolve => setTimeout(resolve, Math.min(100, remaining)));
+      }
+    }
+  };
+
   const probe = gatewayProbe(options);
   const current = await requireGatewayIdentity(process.pid, probe);
   const owner = gatewayLockSchema.parse({ version: 1, scope: "machine", ...current, buildId, nonce: randomUUID() });
-  const { config, lock } = withMaintenanceLock("gateway-start", () => {
+  const { config, lock } = await startupMaintenance("gateway-start", () => {
     const config = readGatewaySupervisorConfig(stateDir);
     if (!config) throw new GatewaySupervisorError("GATEWAY_SUPERVISOR_CONFIG_CORRUPT", "先执行 gateway supervisor configure。 ");
     assertGatewayTunnelIdentity(gatewayTunnelIdentity(config));
@@ -1035,7 +1093,7 @@ export async function startGatewaySupervisor(options: GatewaySupervisorRunOption
       throw new GatewaySupervisorError("GATEWAY_SUPERVISOR_LAUNCH_INVALID", "Gateway launch pin 与配置的 stable launcher 不一致；保留 pin。 ");
     }
     return { config, lock: acquireGatewayLock(stateDir, owner) };
-  }, stateDir);
+  });
   let runtimeKey = "";
   const owned: GatewayOwnedChild[] = [];
   let runtimeSnapshot: GatewayFileSnapshot | null = null;
@@ -1049,7 +1107,8 @@ export async function startGatewaySupervisor(options: GatewaySupervisorRunOption
     if (typeof runtimeKey !== "string" || !runtimeKey.trim() || /[\r\n]/.test(runtimeKey)) {
       throw new GatewaySupervisorError("GATEWAY_SUPERVISOR_KEY_HELPER_FAILED", "Gateway runtime key 未能安全解密到内存。 ");
     }
-    gateway = await (options.startGateway ?? startGatewayServer)({ port: config.port, publicUrl: config.publicUrl });
+    gateway = await (options.startGateway ?? startGatewayServer)({ port: config.port, publicUrl: config.publicUrl,
+      healthIdentity: { pid: current.pid, creationTime: current.creationTime, buildId } });
     options.onPairing?.({ code: gateway.pairingCode, expiresAt: gateway.pairingExpiresAt });
     const commands = buildGatewaySupervisorCommandPlan(config, { cloudflaredPath: options.cloudflaredPath });
     const cwd = path.dirname(config.stableLauncher);
@@ -1095,7 +1154,8 @@ export async function startGatewaySupervisor(options: GatewaySupervisorRunOption
       ports: [config.port],
       children: owned.map(item => item.identity),
     });
-    runtimeSnapshot = withMaintenanceLock("gateway-start-handoff", () => {
+    runtimeSnapshot = await startupMaintenance("gateway-start-handoff", () => {
+      if (owned.some(item => childExited(item.child))) throw new GatewaySupervisorError("GATEWAY_SUPERVISOR_RUN_FAILED", "Gateway 子进程在 startup maintenance 等待期间退出；保留 launch pin。");
       writeGatewaySupervisorRuntime(runtime, stateDir);
       const published = snapshotGatewayFile(gatewaySupervisorRuntimeFile(stateDir), false);
       if (!published) throw new GatewaySupervisorError("GATEWAY_SUPERVISOR_RUN_FAILED", "Gateway supervisor runtime 发布失败。 ");
@@ -1117,7 +1177,7 @@ export async function startGatewaySupervisor(options: GatewaySupervisorRunOption
         gatewayLaunchPins.delete(launch);
       }
       return published;
-    }, stateDir);
+    });
 
     const stop = async (): Promise<boolean> => {
       if (released) return true;

@@ -32,7 +32,7 @@ import {
 } from "../src/feedback/store.js";
 import { resolveConversationPrincipal } from "../src/mcp/conversation-principal.js";
 import { CODEX_FEEDBACK_SCOPE } from "../src/feedback/store.js";
-import { reconcileFeedbackOutbox } from "../src/feedback/projector.js";
+import { reconcileHistoricalFeedbackFixtures } from "./helpers/legacy-feedback-fixtures.js";
 import {
   appendExecutionRecordLocked,
   withExecutionRecordsLock,
@@ -293,9 +293,9 @@ describe("server /state inFlight recovery projection", () => {
   });
 
   it("authenticated companion recovers own reservationId; no forbidden fields", () => {
-    reconcileFeedbackOutbox(workspace.id, stateDir);
+    reconcileHistoricalFeedbackFixtures(workspace.id, stateDir);
     seed("cmd-inflight");
-    reconcileFeedbackOutbox(workspace.id, stateDir);
+    reconcileHistoricalFeedbackFixtures(workspace.id, stateDir);
     enableReceiver({ workspaceId: workspace.id, principal: principalA(), widgetId: "w", stateDir });
     const intent = createPairingIntent({ workspaceId: workspace.id, principal: principalA(), stateDir });
     const paired = exchangePairingIntent({
@@ -323,6 +323,7 @@ describe("server /state inFlight recovery projection", () => {
       eventId: reserved.event.eventId,
       status: "reserved",
       reservationId: reserved.reservationId,
+      sendAllowed: false,
     });
     const json = JSON.stringify(state);
     expect(json).not.toContain("principalFingerprint");

@@ -195,7 +195,9 @@ describe("G2 request-scoped workspace_info.workflow over HTTP MCP", () => {
       hostId: "local",
       projectId: "p1",
       title: "t",
-    } as never);
+      workspaceRoot: bridge.workspace.root,
+      cwd: bridge.workspace.root,
+    });
 
     const full = await clientFor([
       "workspace.read",

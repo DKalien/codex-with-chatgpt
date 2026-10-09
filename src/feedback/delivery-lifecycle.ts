@@ -25,6 +25,8 @@ export function claimNext(input: {
   stateDir?: string;
   /** R5d3 cutover：永久不可预约的 legacy eventId 集（如已归属 Result Bus 的历史事件）。 */
   excludeEventIds?: ReadonlySet<string>;
+  /** 生产获取仅允许控制通知；旧执行生命周期保留供历史恢复验证。 */
+  controlOnly?: boolean;
 }): { event: FeedbackEvent; attemptId: string } {
   requireConversationPrincipal(input.principal);
   const stateDir = input.stateDir ?? getStateDir();
@@ -35,8 +37,12 @@ export function claimNext(input: {
     }
     return binding;
   }, (recovered, binding) => {
+    if (input.controlOnly && recovered.events.some(event => INFLIGHT_FENCE_STATUSES.has(event.status))) {
+      throw new FeedbackError("FEEDBACK_INFLIGHT_FENCE", "存在 reserved/claimed/outcome_unknown；控制通知不可越过历史 attempt。");
+    }
     const ready = recovered.events
       .filter((e) => e.status === "ready"
+        && (!input.controlOnly || e.kind === "FINAL_RECEIPT_REQUIRED")
         && !("plannerRouteId" in e)
         && !(input.excludeEventIds?.has(e.eventId) ?? false)
         && e.targetBindingId === binding.bindingId
@@ -44,6 +50,10 @@ export function claimNext(input: {
         && e.targetPrincipalFingerprint === binding.principalFingerprint)
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
     if (ready.length === 0) {
+      if (input.controlOnly && recovered.events.some(event => event.kind !== "FINAL_RECEIPT_REQUIRED"
+        && (event.status === "ready" || event.status === "queued") && !input.excludeEventIds?.has(event.eventId))) {
+        throw new FeedbackError("RESULT_BUS_LEGACY_DRAIN_REQUIRED", "历史执行结果未匹配可信 Bus 结果；保留只读记录，禁止新领取或发送，需要显式排空处置。");
+      }
       throw new FeedbackError("FEEDBACK_NO_READY_EVENT", "没有可领取的 ready 事件");
     }
     const target = ready[0]!;
@@ -236,6 +246,8 @@ export function reserveNext(input: {
   stateDir?: string;
   /** R5d3 cutover：永久不可预约的 legacy eventId 集（如已归属 Result Bus 的历史事件）。 */
   excludeEventIds?: ReadonlySet<string>;
+  /** 生产获取仅允许控制通知；旧执行生命周期保留供历史恢复验证。 */
+  controlOnly?: boolean;
 }): { event: FeedbackEvent; reservationId: string } {
   const stateDir = input.stateDir ?? getStateDir();
   return withRecoveredFeedbackState(input.workspaceId, stateDir,
@@ -252,6 +264,7 @@ export function reserveNext(input: {
     // ready/queued 事件在此成为不可预约的兼容只读记录。
     const ready = recovered.events
       .filter((e) => e.status === "ready"
+        && (!input.controlOnly || e.kind === "FINAL_RECEIPT_REQUIRED")
         && !("plannerRouteId" in e)
         && !(input.excludeEventIds?.has(e.eventId) ?? false)
         && e.targetBindingId === binding.bindingId
@@ -259,6 +272,10 @@ export function reserveNext(input: {
         && e.targetPrincipalFingerprint === binding.principalFingerprint)
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
     if (ready.length === 0) {
+      if (input.controlOnly && recovered.events.some(event => event.kind !== "FINAL_RECEIPT_REQUIRED"
+        && (event.status === "ready" || event.status === "queued") && !input.excludeEventIds?.has(event.eventId))) {
+        throw new FeedbackError("RESULT_BUS_LEGACY_DRAIN_REQUIRED", "历史执行结果未匹配可信 Bus 结果；保留只读记录，禁止新预约或发送，需要显式排空处置。");
+      }
       throw new FeedbackError("FEEDBACK_NO_READY_EVENT", "没有可预占的 ready 事件");
     }
     const target = ready[0]!;
@@ -350,10 +367,18 @@ export function beginSend(input: {
   eventId: string;
   reservationId: string;
   stateDir?: string;
+  controlOnly?: boolean;
 }): { event: FeedbackEvent; attemptId: string } {
   const stateDir = input.stateDir ?? getStateDir();
   return withRecoveredFeedbackState(input.workspaceId, stateDir,
-    previous => requireActiveCompanionBinding(previous, input), (recovered, binding) => {
+    previous => {
+      const binding = requireActiveCompanionBinding(previous, input);
+      const event = previous.events.find(event => event.eventId === input.eventId);
+      if (input.controlOnly && event && event.kind !== "FINAL_RECEIPT_REQUIRED") {
+        throw new FeedbackError("RESULT_BUS_LEGACY_DRAIN_REQUIRED", "历史执行结果不可开始或重放发送；仅允许原证据的 exact ACK、release 或显式 retire。");
+      }
+      return binding;
+    }, (recovered, binding) => {
     const event = recovered.events.find((e) => e.eventId === input.eventId);
     if (!event) throw new FeedbackError("FEEDBACK_EVENT_NOT_FOUND", "feedback 事件不存在");
     // claimed 幂等也必须绑定 reservedBy：其它 companion 不得继承本 attempt。

@@ -1,5 +1,7 @@
 # R5 Endpoint Architecture
 
+2026-10-08 当前源码：Executor Plugin 只提供发现、检查及证据，production send 由既有 backend/sender 执行；新 Desktop 结果直接投影 Result Bus。生产 legacy 自动通知收窄为 `FINAL_RECEIPT_REQUIRED`，旧执行结果仅保留严格恢复权限。覆盖下方旧兼容写入设计的合同见[执行与回流精简](runtime-simplification.md)，不表示已安装或现场验收。
+
 ## 消息与 endpoint 的职责更新（2026-10-05，源码与后端部署）
 
 [双向消息收件箱](agent-mailbox.md) 将“Bridge 已接收 queued”“Executor 已接受 accepted”“可信执行终态”“网页 observed/ACK”四件事分开。MCP 接收不等待 Executor 空闲；后台发送仍实时验证原 frozen target 和权限。未知任务不能换 ID 重发，但独立新任务可继续排队。Command 的 corrupt lifecycle authority 保留，worker 只跳过这条，不抢锁。

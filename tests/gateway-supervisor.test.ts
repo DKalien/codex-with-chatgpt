@@ -28,6 +28,7 @@ import {
 import { registerGatewayCommands } from "../src/cli/gateway.js";
 import { startGatewayServer, type GatewayServer } from "../src/remote/server.js";
 import { buildDaemonEnv } from "../src/process/daemon-spawn.js";
+import { tryAcquireMaintenanceLock, type MaintenanceLockHandle } from "../src/core/maintenance-lock.js";
 import { cleanup, isolateStateDir } from "./helpers.js";
 
 let stateDir: string;
@@ -324,6 +325,174 @@ describe("machine Gateway supervisor", () => {
       return !env.C2C_GATEWAY_SUPERVISOR_LAUNCH_PIN && !env.C2C_GATEWAY_SUPERVISOR_LAUNCH_IDENTITY;
     })).toBe(true);
     expect(await handle.stop()).toBe(true);
+  });
+
+  function holdMaintenance(): MaintenanceLockHandle {
+    const acquired = tryAcquireMaintenanceLock(stateDir, "workspace-bridge-fixture");
+    if (!acquired.ok) throw new Error("fixture maintenance acquisition failed");
+    return acquired.handle;
+  }
+
+  it("已验证 launch 在 initial 与 handoff maintenance 竞争时等待，只启动一对子进程", async () => {
+    writeGatewaySupervisorConfig(config(), stateDir);
+    const buildId = "6".repeat(64);
+    const pinFile = installLaunchPin(buildId);
+    const children = [fakeChild(2061), fakeChild(2062)];
+    const executableByPid = new Map<number, string>([[process.pid, process.execPath]]);
+    let initialLock: MaintenanceLockHandle | undefined;
+    let handoffLock: MaintenanceLockHandle | undefined;
+    let initialReady!: () => void;
+    let handoffReady!: () => void;
+    const initialHeld = new Promise<void>(resolve => { initialReady = resolve; });
+    const handoffHeld = new Promise<void>(resolve => { handoffReady = resolve; });
+    const readKey = vi.fn(() => "fixture-runtime-key");
+    const spawnImpl = vi.fn((command: string) => {
+      const child = children[spawnImpl.mock.calls.length - 1];
+      executableByPid.set(child.pid, command);
+      return child as any;
+    });
+    let handle: Awaited<ReturnType<typeof startGatewaySupervisor>> | undefined;
+    const starting = startGatewaySupervisor({ stateDir, platform: "win32", buildId, readKey,
+      startGateway: async () => gateway, spawnImpl: spawnImpl as any,
+      probeProcess: async (pid, expected) => {
+        if (pid === process.pid && !initialLock) { initialLock = holdMaintenance(); initialReady(); }
+        return { ...processProbe(pid, expected ?? `created-${pid}`), executable: executableByPid.get(pid)! };
+      },
+      oauthDiscoveryFetchImpl: readyOAuthDiscoveryFetch(url => {
+        if (url.pathname.includes("oauth-protected-resource")) { handoffLock = holdMaintenance(); handoffReady(); }
+      }),
+    });
+    try {
+      await initialHeld;
+      await new Promise(resolve => setTimeout(resolve, 120));
+      expect(readKey).not.toHaveBeenCalled();
+      expect(spawnImpl).not.toHaveBeenCalled();
+      expect(initialLock!.release()).toBe(true);
+      await handoffHeld;
+      await new Promise(resolve => setTimeout(resolve, 120));
+      expect(spawnImpl).toHaveBeenCalledTimes(2);
+      expect(fs.existsSync(path.join(stateDir, "gateway", "supervisor.runtime.json"))).toBe(false);
+      expect(fs.existsSync(pinFile)).toBe(true);
+      expect(handoffLock!.release()).toBe(true);
+      handle = await starting;
+      expect(handle.runtime.children).toHaveLength(2);
+      expect(readKey).toHaveBeenCalledTimes(1);
+      expect(spawnImpl).toHaveBeenCalledTimes(2);
+      expect(fs.existsSync(pinFile)).toBe(false);
+    } finally {
+      initialLock?.release(); handoffLock?.release();
+      if (handle) expect(await handle.stop()).toBe(true);
+    }
+  });
+
+  it("无 launch pin 的前台 maintenance busy 立即拒绝", async () => {
+    writeGatewaySupervisorConfig(config(), stateDir);
+    const maintenance = holdMaintenance();
+    const readKey = vi.fn(() => "fixture-key");
+    const spawnImpl = vi.fn();
+    try {
+      await expect(startGatewaySupervisor({ stateDir, platform: "win32", buildId: "5".repeat(64), readKey,
+        spawnImpl, probeProcess: async pid => processProbe(pid, `created-${pid}`) }))
+        .rejects.toMatchObject({ code: "MAINTENANCE_BUSY" });
+      expect(readKey).not.toHaveBeenCalled();
+      expect(spawnImpl).not.toHaveBeenCalled();
+      expect(fs.existsSync(gatewaySupervisorLockFile(stateDir))).toBe(false);
+    } finally { expect(maintenance.release()).toBe(true); }
+  });
+
+  it.each(["initial", "handoff"])("launch %s maintenance 等待取消，保留 pin 并清理自有子进程", async phase => {
+    writeGatewaySupervisorConfig(config(), stateDir);
+    const buildId = "4".repeat(64);
+    const pinFile = installLaunchPin(buildId);
+    const controller = new AbortController();
+    const children = [fakeChild(2071), fakeChild(2072)];
+    const executableByPid = new Map<number, string>([[process.pid, process.execPath]]);
+    const readKey = vi.fn(() => "fixture-runtime-key");
+    let held: MaintenanceLockHandle | undefined;
+    let ready!: () => void;
+    const holding = new Promise<void>(resolve => { ready = resolve; });
+    const spawnImpl = vi.fn((command: string) => {
+      const child = children[spawnImpl.mock.calls.length - 1];
+      executableByPid.set(child.pid, command); return child as any;
+    });
+    const result = startGatewaySupervisor({ stateDir, platform: "win32", buildId, readKey, signal: controller.signal,
+      startGateway: async () => gateway, spawnImpl: spawnImpl as any,
+      probeProcess: async (pid, expected) => {
+        if (phase === "initial" && pid === process.pid && !held) { held = holdMaintenance(); ready(); }
+        return { ...processProbe(pid, expected ?? `created-${pid}`), executable: executableByPid.get(pid)! };
+      },
+      oauthDiscoveryFetchImpl: readyOAuthDiscoveryFetch(url => {
+        if (phase === "handoff" && url.pathname.includes("oauth-protected-resource")) { held = holdMaintenance(); ready(); }
+      }),
+    }).then(() => new Error("Expected cancellation"), error => error as Error);
+    try {
+      await holding;
+      await new Promise(resolve => setTimeout(resolve, 120));
+      controller.abort();
+      expect(await result).toMatchObject({ code: "GATEWAY_SUPERVISOR_RUN_FAILED" });
+      expect(fs.existsSync(pinFile)).toBe(true);
+      expect(fs.existsSync(gatewaySupervisorLockFile(stateDir))).toBe(false);
+      expect(fs.existsSync(path.join(stateDir, "gateway", "supervisor.runtime.json"))).toBe(false);
+      expect(spawnImpl).toHaveBeenCalledTimes(phase === "initial" ? 0 : 2);
+      if (phase === "handoff") {
+        expect(children.every(child => child.kill.mock.calls.length === 1)).toBe(true);
+        expect(gateway.close).toHaveBeenCalledTimes(1);
+      } else expect(readKey).not.toHaveBeenCalled();
+    } finally { controller.abort(); held?.release(); }
+  });
+
+  it("launch maintenance 共享等待预算超时，保留 pin 且不启动子进程", async () => {
+    writeGatewaySupervisorConfig(config(), stateDir);
+    const buildId = "3".repeat(64);
+    const pinFile = installLaunchPin(buildId);
+    let ready!: () => void;
+    const holding = new Promise<void>(resolve => { ready = resolve; });
+    let held: MaintenanceLockHandle | undefined;
+    const readKey = vi.fn(() => "fixture-key");
+    const result = startGatewaySupervisor({ stateDir, platform: "win32", buildId, readKey,
+      probeProcess: async pid => { held = holdMaintenance(); ready(); return processProbe(pid, `created-${pid}`); },
+    }).then(() => new Error("Expected timeout"), error => error as Error);
+    await holding;
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 61_000);
+    try {
+      expect(await result).toMatchObject({ code: "GATEWAY_SUPERVISOR_BUSY" });
+      expect(readKey).not.toHaveBeenCalled();
+      expect(fs.existsSync(pinFile)).toBe(true);
+      expect(fs.existsSync(gatewaySupervisorLockFile(stateDir))).toBe(false);
+    } finally { clock.mockRestore(); held?.release(); }
+  });
+
+  it("launch handoff maintenance 等待期间 child 退出，清理后保留 pin", async () => {
+    writeGatewaySupervisorConfig(config(), stateDir);
+    const buildId = "2".repeat(64);
+    const pinFile = installLaunchPin(buildId);
+    const children = [fakeChild(2081), fakeChild(2082)];
+    const executableByPid = new Map<number, string>([[process.pid, process.execPath]]);
+    let held: MaintenanceLockHandle | undefined;
+    let ready!: () => void;
+    const holding = new Promise<void>(resolve => { ready = resolve; });
+    const spawnImpl = vi.fn((command: string) => {
+      const child = children[spawnImpl.mock.calls.length - 1]; executableByPid.set(child.pid, command); return child as any;
+    });
+    const result = startGatewaySupervisor({ stateDir, platform: "win32", buildId, readKey: () => "fixture-key",
+      startGateway: async () => gateway, spawnImpl: spawnImpl as any,
+      probeProcess: async (pid, expected) => ({ ...processProbe(pid, expected ?? `created-${pid}`), executable: executableByPid.get(pid)! }),
+      oauthDiscoveryFetchImpl: readyOAuthDiscoveryFetch(url => {
+        if (url.pathname.includes("oauth-protected-resource")) { held = holdMaintenance(); ready(); }
+      }),
+    }).then(() => new Error("Expected exited child failure"), error => error as Error);
+    try {
+      await holding;
+      await new Promise(resolve => setTimeout(resolve, 120));
+      children[0].kill();
+      expect(held!.release()).toBe(true);
+      expect(await result).toMatchObject({ code: "GATEWAY_SUPERVISOR_RUN_FAILED" });
+      expect(children[1].kill).toHaveBeenCalledTimes(1);
+      expect(gateway.close).toHaveBeenCalledTimes(1);
+      expect(fs.existsSync(pinFile)).toBe(true);
+      expect(fs.existsSync(gatewaySupervisorLockFile(stateDir))).toBe(false);
+      expect(fs.existsSync(path.join(stateDir, "gateway", "supervisor.runtime.json"))).toBe(false);
+    } finally { held?.release(); }
   });
 
   it("launch 文件身份不匹配时拒绝启动并保留 pin", async () => {

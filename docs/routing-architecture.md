@@ -1,5 +1,7 @@
 # Routing Architecture
 
+2026-10-08 当前源码：Desktop receipt → canonical RoutingResult → Result Bus，提交后仅投影当前 command。新结果停止写入 R4 outbox，旧 entries 和 durable reconciliation queue 保留恢复与清理合同。本文 R4 阶段记录是历史路径；当前接口与迁移边界见[执行与回流精简合同](runtime-simplification.md)。
+
 Routing 是 C2C 的新语义身份层：以 `{workspaceId, platform, conversationId}` 标识
 workspace 内特定平台上的对话。Route 另有注册后不可变的 planner / executor role；
 Command / ExecutionResult 是可持久化、可重放、可审计的记录。R1 只建立模型与 durable

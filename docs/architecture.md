@@ -1,6 +1,10 @@
 # Architecture
 
-## 单机统一 Gateway 源码状态（2026-10-08 当前 checkout）
+## 执行与回流精简（2026-10-08 当前 checkout）
+
+当前源码已收窄 Executor 合同并复用 Desktop binding 检查；receipt 提交仅投影当前 command，完成条件为 canonical RoutingResult 与 Result Bus，不再新增 R4 outbox entry。生产 Feedback 自动通知只生成 `FINAL_RECEIPT_REQUIRED`；旧执行事件保留证据及严格恢复权限，禁止新发送。接口迁移、历史 drain 和构建边界见[执行与回流精简合同](runtime-simplification.md)。下方 R4 shadow 与 legacy 实施记录保留原日期，不代表当前写入路径或部署状态。
+
+## 单机统一 Gateway 源码状态（2026-10-09 当前 checkout）
 
 源码中的 `gateway register/list/revoke` 维护机器级 workspace/client allowlist；`gateway serve` 以独立的 `machine-gateway` OAuth store 暴露 MCP。项目工具显式接收 workspaceId，每次调用重新核验 client grant 与 canonical root，再复用原 Workspace、Remote、Desktop、execution、feedback、Web Sink handler。各 workspace 的 Controller、Bridge、Result Bus 和业务存储仍各自独立；固定单 workspace `remote serve` 保留兼容。Gateway 不复制任务队列或结果权威。
 
@@ -8,7 +12,11 @@ Gateway 的 Desktop 入口独立于后台 Remote：先 `codex_desktop_status` �
 
 Gateway MCP 的匿名访问仅用于协议 discovery；工具调用仍要求 bearer OAuth 与原 scope。服务端 `/mcp`、`/oauth/token` 诊断日志只记录 method、固定 path 和 statusCode，不记录 query、body 或 headers。Browser Companion 源码已按 workspace 隔离存储、alarm、页面选择和发送上下文，操作面板请求固定 workspaceId；双项目真实 Send/observed 仍未完成。
 
-机器级 `gateway supervisor` 源码提供 Windows 前台 configure/status/validate/set-key/run、DPAPI key 保存、进程身份核验、启动 pin 与 GC release 引用保护；没有 Scheduled Task 注册或异常退出自动恢复。此前的部署与 live 验收时间线见[统一 Gateway 计划](unified-gateway-plan.md)；该源码说明和历史记录均不证明当前安装、进程或浏览器运行状态。
+机器级 `gateway supervisor` 源码提供 Windows configure/status/validate/set-key/run、DPAPI key 保存、进程身份核验、后台启动 pin 与 GC release 引用保护；没有 Scheduled Task 注册或异常退出自动恢复。已配置时，独立 `ensureBridge` 在 start/startup lease 与自持 machine maintenance 释放成功后等待共享 Gateway；显式 start/restart 的 inherited maintenance 在 `withExplicitSupervisorIntent` 围栏退出后等待。由 machine supervisor 启动或复用 Gateway、Cloudflare origin 与 Secure MCP Tunnel；setup/workspace/doctor/recover 经共享入口覆盖。只有持已验证 launch pin 的后台启动进程会对 initial/handoff 的 machine maintenance 冲突共用 60 秒有界等待；普通前台仍立即报告 busy，超时或取消保留既有所有权证据。后台日志位于机器 state 的 `logs/gateway-supervisor.out.log`，不写入 Gateway 权威目录。继承 maintenance 的 rollout 跳过共享 Gateway，stopped intent 不启动或停止它。没有配置返回原 workspace 行为；Gateway 失败保留原错误码并报告 Bridge 已就绪，不回退为整组成功，不修改 workspace tunnel、OAuth 或 session。此前的部署与 live 验收时间线见[统一 Gateway 计划](unified-gateway-plan.md)；该源码说明和历史记录均不证明当前安装、进程或浏览器运行状态。
+
+### 旧 Gateway 运行版本迁移
+
+旧 Gateway runtime 没有 `/internal/gateway/health` 合同，即使原服务仍可访问，新 Bridge 也会明确报告 Gateway 身份核验失败，并保留原服务、锁与状态；不回退到仅凭 OAuth metadata 认定健康。需要升级运行版本时，由用户在原 `gateway supervisor run` 前台终端按 Ctrl+C，让 owned parent 与两个隧道子进程正常退出并释放其所有权；确认退出后，再通过稳定 launcher 运行 Bridge `start` 或 `restart`，由已安装 current release 在后台启动整组服务。不得直接删锁或按旧 PID kill；退出或所有权无法确认时停止迁移并报告。
 
 ## Companion 当前连接与恢复
 

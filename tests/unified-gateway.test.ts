@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { EventEmitter } from "node:events";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -12,6 +13,7 @@ import { readResultBus } from "../src/result-bus/store.js";
 import { readFeedbackState, writeState } from "../src/feedback/state-store.js";
 import { applyProjection } from "../src/feedback/projection-store.js";
 import { FEEDBACK_CLAIM_STALE_MS } from "../src/feedback/schema.js";
+import { stageReceiptFinalization, writeReceiptFinalizationAlert } from "../src/desktop/receipt-finalizer.js";
 import { appendExecutionRecord } from "../src/execution/records.js";
 import { AuthStore } from "../src/auth/store.js";
 import { bindCurrentWebSink } from "../src/web-sink-control/service.js";
@@ -219,7 +221,7 @@ describe("machine Gateway over authenticated MCP", () => {
     expect(JSON.stringify(output)).not.toMatch(/principalFingerprint|credential|challenge|plannerRouteId|version/);
   });
 
-  it("stale claimed ACK rejects wrong session/epoch without writes and accepts exact late-positive ACK", async () => {
+  it.each(["control", "legacy_history"] as const)("%s stale claimed ACK rejects wrong session/epoch without writes and accepts exact late-positive ACK", async source => {
     for (const workspace of workspaces) registry.register(workspace.root, "gateway-client");
     const client = await connect();
     for (const [index, workspace] of workspaces.entries()) {
@@ -229,21 +231,33 @@ describe("machine Gateway over authenticated MCP", () => {
     const workspace = workspaces[1]!;
     const binding = readFeedbackState(workspace.id).binding!;
     const now = new Date().toISOString();
-    applyProjection({ workspaceId: workspace.id, stateDir, nextCursor: 0, newEvents: [{
-      version: 1, eventId: "a".repeat(32), kind: "C2C_EXECUTED", workspaceId: workspace.id, source: "desktop",
-      commandId: "gateway-late-ack", taskId: "desktop_gateway-late-ack", iteration: 1, result: "ok",
-      changedFilesSummary: [], testsSummary: "", outputAvailable: false, occurredAt: now, createdAt: now, updatedAt: now,
-      targetBindingId: null, targetEpoch: null, targetPrincipalFingerprint: null, status: "queued",
-    }] });
-    const claimed = await call(client, "feedback_claim_next", { workspaceId: workspace.id,
-      bindingId: binding.bindingId, epoch: binding.epoch }, "chat-1");
-    expect(claimed.error).not.toBe(true);
-    const event = claimed.data.event as { eventId: string; attemptId: string };
+    let event: { eventId: string; attemptId: string };
+    if (source === "control") {
+      const draft = stageReceiptFinalization({ workspaceId: workspace.id, workspaceRoot: workspace.root,
+        commandId: "gateway-late-ack", threadId: randomUUID(), originTurnId: randomUUID(),
+        resultTurnId: randomUUID(), inputMaterial: "bounded control notification" }, { stateDir });
+      writeReceiptFinalizationAlert(draft, "terminality_unknown", { stateDir });
+      const claimed = await call(client, "feedback_claim_next", { workspaceId: workspace.id,
+        bindingId: binding.bindingId, epoch: binding.epoch }, "chat-1");
+      expect(claimed.error).not.toBe(true);
+      expect(claimed.data.event.kind).toBe("FINAL_RECEIPT_REQUIRED");
+      event = claimed.data.event;
+    } else {
+      // 历史 attempt 已经存在；不能经生产 claim 新领取旧执行结果。
+      event = { eventId: "a".repeat(32), attemptId: randomUUID() };
+      applyProjection({ workspaceId: workspace.id, stateDir, nextCursor: 0, newEvents: [{
+        version: 1, eventId: event.eventId, kind: "C2C_EXECUTED", workspaceId: workspace.id, source: "desktop",
+        commandId: "gateway-late-ack", taskId: "desktop_gateway-late-ack", iteration: 1, result: "ok",
+        changedFilesSummary: [], testsSummary: "", outputAvailable: false, occurredAt: now, createdAt: now, updatedAt: now,
+        targetBindingId: null, targetEpoch: null, targetPrincipalFingerprint: null, status: "queued",
+      }] });
+    }
     const staleState = readFeedbackState(workspace.id);
     writeState(workspace.id, stateDir, {
       ...staleState,
       events: staleState.events.map(item => item.eventId === event.eventId
-        ? { ...item, claimedAt: new Date(Date.now() - FEEDBACK_CLAIM_STALE_MS - 1).toISOString() }
+        ? { ...item, status: "claimed", attemptId: event.attemptId,
+          claimedAt: new Date(Date.now() - FEEDBACK_CLAIM_STALE_MS - 1).toISOString() }
         : item),
     });
 

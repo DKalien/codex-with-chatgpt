@@ -155,6 +155,7 @@ function sendError(res: Response, error: unknown): void {
       || error.code === "COMPANION_REBIND_NOT_CONFIRMED"
       || error.code === "COMPANION_REBIND_NOT_SUCCESSOR"
       || error.code === "COMPANION_REBIND_ALREADY_INITIATED"
+      || error.code === "RESULT_BUS_LEGACY_DRAIN_REQUIRED"
       ? 409
       : error.code === "FEEDBACK_INFLIGHT_FENCE"
         || error.code === "FEEDBACK_RESERVED_FENCE"
@@ -183,6 +184,7 @@ function sendError(res: Response, error: unknown): void {
       || error.code === "RESULT_BUS_ISOLATION_UNSUPPORTED"
       || error.code === "COMPANION_RESULT_HISTORICAL_REFUSED"
       || error.code === "COMPANION_TERMINAL_WITNESS_INVALID"
+      || error.code === "RESULT_BUS_LEGACY_DRAIN_REQUIRED"
       ? 409
       : error.code === "COMPANION_RESULT_NOT_FOUND"
         ? 404

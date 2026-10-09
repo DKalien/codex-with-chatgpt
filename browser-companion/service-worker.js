@@ -115,6 +115,7 @@ import {
   buildClaimProof,
   buildAckProof,
   reconcileClaimedAgainstServer,
+  isRecoverySendDisabled,
   commitJournalDurably,
   findExactObservedEvent,
   evaluateServerObservedCloseout,
@@ -5413,6 +5414,33 @@ async function recoverProductionSendSide(inFlight) {
   }
   const owner = ownerState.owner;
   const safeInFlight = sanitizeInFlightForRecovery(inFlight);
+
+  // 新的 authenticated 禁发事实只允许保留 attempt 后观察/ACK，不能续发旧 journal。
+  if (isRecoverySendDisabled(safeInFlight)) {
+    productionClaimProof = null;
+    productionAckProof = null;
+    if (["SEND_INTENT", "CLAIMED"].includes(journal.state)) {
+      const claimed = journal.state === "CLAIMED" ? reconcileClaimedAgainstServer(journal, safeInFlight) : null;
+      if (safeInFlight.eventId !== journal.eventId || safeInFlight.reservationId !== journal.reservationId ||
+          (claimed && claimed.action !== "adopt_outcome_unknown") ||
+          !["claimed", "outcome_unknown"].includes(safeInFlight.status) || !safeInFlight.attemptId) {
+        return { ok: false, reason: "recovery_send_disabled", action: "block",
+          journal: summarizeProductionJournal(journal), zeroWrite: true, zeroClick: true };
+      }
+      const previous = journal;
+      try {
+        journal = markOutcomeUnknown(journal, {
+          attemptId: safeInFlight.attemptId, message: safeInFlight.message, messageSha256: safeInFlight.messageSha256,
+          ...(safeInFlight.terminalWitness === undefined ? {} : { terminalWitness: safeInFlight.terminalWitness }),
+        });
+        await persistJournal();
+      } catch {
+        journal = previous;
+        return { ok: false, reason: "outcome_unknown_persist_failed", action: "block",
+          journal: summarizeProductionJournal(journal), zeroWrite: true, zeroClick: true };
+      }
+    }
+  }
 
   // Local SEND_INTENT + no server inFlight → SW clears itself; never CS generic CAS.
   if (journal.state === "SEND_INTENT" && !safeInFlight) {

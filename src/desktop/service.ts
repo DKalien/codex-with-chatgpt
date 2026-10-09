@@ -3,7 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 import type { Workspace } from "../workspace/manager.js";
 import { isTrustedDesktopReceipt, readExecutionRecordsStrict } from "../execution/records.js";
-import { getExecutor, type ExecutorAdapter, type ExecutorConnection, type ExecutorExecutionInfo } from "../executor/index.js";
+import { codexDesktopAdapter, type ExecutorAdapter, type ExecutorConnection, type ExecutorExecutionInfo } from "../executor/index.js";
 import { DESKTOP_IPC_ERROR_MESSAGES, validateDesktopWireMessage } from "./ipc.js";
 import { DesktopError, desktopId, publicDelivery, readDesktop, sendInput, targetInput, updateDesktop,
   type DesktopBinding, type DesktopDelivery, type DesktopState } from "./store.js";
@@ -11,6 +11,7 @@ import { unresolvedOutcomeUnknownCommandIds, isOutcomeUnknownAdministrativelyRes
 import { withEvidenceLock } from "./recovery-evidence.js";
 import { withCommandOperationAsync } from "../command-cleanup/fence.js";
 import type { DesktopRuntimeFence } from "./ipc-contracts.js";
+import { desktopBindingTarget as target, requireBindingRuntimeFence as requireRuntimeFence, inspectDesktopBinding } from "./binding-inspection.js";
 
 type LocalWorkspace = Pick<Workspace, "id" | "root">;
 const POST_RESULT_SETTLE_TIMEOUT_MS = 30_000;
@@ -37,19 +38,12 @@ function authorized(workspace: LocalWorkspace, state: DesktopState | null, bindi
     throw new DesktopError("DESKTOP_BINDING_MISMATCH", "bindingId 已失效；不能自动切换到新的投递目标。");
   return current as DesktopState & { binding: DesktopBinding };
 }
-function target(workspace: LocalWorkspace, binding: z.infer<typeof targetInput>) {
-  return { threadId: binding.threadId, hostId: binding.hostId, projectId: binding.projectId, workspaceRoot: workspace.root };
-}
-function requireRuntimeFence(fence: DesktopState["runtimeFence"]): NonNullable<DesktopState["runtimeFence"]> {
-  if (!fence) throw new DesktopError("DESKTOP_RUNTIME_FENCE_MISSING", "Desktop 绑定缺少运行时身份 fence；请重新绑定当前 Desktop 会话。");
-  return fence;
-}
 function sameRuntimeFence(left: DesktopRuntimeFence, right: DesktopRuntimeFence): boolean {
   return left.desktopPid === right.desktopPid && left.desktopExe === right.desktopExe && left.desktopCreation === right.desktopCreation &&
     left.appServerPid === right.appServerPid && left.appServerExe === right.appServerExe && left.appServerCreation === right.appServerCreation;
 }
 
-export async function bindDesktop(workspace: LocalWorkspace, raw: z.infer<typeof targetInput>, executor: ExecutorAdapter = getExecutor()): Promise<DesktopBinding> {
+export async function bindDesktop(workspace: LocalWorkspace, raw: z.infer<typeof targetInput>, executor: ExecutorAdapter = codexDesktopAdapter): Promise<DesktopBinding> {
   const input = targetInput.parse(raw);
   const observed = executor.discoverForBinding
     ? await executor.discoverForBinding(target(workspace, input))
@@ -79,7 +73,7 @@ export function disableDesktop(workspace: LocalWorkspace): void {
 }
 
 /** 本地快捷路径：无 target 参数、无免确认标志；网页 MCP 不注册此操作。 */
-export async function bindCurrentDesktop(workspace: LocalWorkspace, executor: ExecutorAdapter = getExecutor()) {
+export async function bindCurrentDesktop(workspace: LocalWorkspace, executor: ExecutorAdapter = codexDesktopAdapter) {
   assertNoUncertainDelivery(workspace, checked(workspace, readDesktop(workspace.id)));
   const observed = await executor.currentIdentity(workspace.root);
   const observedFence = requireRuntimeFence(observed.runtimeFence);
@@ -207,7 +201,7 @@ async function prepareWithPostResultSettle(
 
 export async function sendDesktop(workspace: LocalWorkspace, raw: z.infer<typeof sendInput>, clientId: string,
   authorize: () => void = () => {}, settleOptions?: PostResultSettleOptions,
-  executor: ExecutorAdapter = getExecutor()): Promise<ReturnType<typeof publicDelivery>> {
+  executor: ExecutorAdapter = codexDesktopAdapter): Promise<ReturnType<typeof publicDelivery>> {
   const input = sendInput.parse(raw);
   if (input.workspaceId !== workspace.id) throw new DesktopError("DESKTOP_WRONG_WORKSPACE", "请求工作区不匹配。");
   if (!clientId || clientId.length > 256) throw new DesktopError("INSUFFICIENT_SCOPE", "缺少有效的 OAuth 客户端身份。");
@@ -300,12 +294,12 @@ async function sendDesktopLocked(workspace: LocalWorkspace, input: z.infer<typeo
   }
 }
 
-export async function desktopStatus(workspace: LocalWorkspace, commandId?: string, executor: ExecutorAdapter = getExecutor()) {
+export async function desktopStatus(workspace: LocalWorkspace, commandId?: string, executor: ExecutorAdapter = codexDesktopAdapter) {
   if (commandId !== undefined) desktopId.parse(commandId);
   let state = checked(workspace, readDesktop(workspace.id));
   let availability: { available: boolean; error?: string; message?: string } = { available: false };
   if (state.binding) {
-    try { await executor.inspect(target(workspace, state.binding), requireRuntimeFence(state.runtimeFence)); availability = { available: true }; }
+    try { await inspectDesktopBinding(workspace, state.binding, state.runtimeFence, executor); availability = { available: true }; }
     catch (error) {
       availability = { available: false, error: error instanceof DesktopError ? error.code : "DESKTOP_UNAVAILABLE",
         message: error instanceof DesktopError ? error.message : "Desktop 当前不可用；没有发送消息。" };

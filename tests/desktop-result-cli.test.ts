@@ -14,9 +14,9 @@ import { createCommand, readRouting, registerRoute, transitionCommandDelivery } 
 import {
   listResultOutboxEntries,
   listResultReconciliationNeeded,
-  resultOutboxFile,
   resultReconciliationQueueFile,
 } from "../src/routing/result-outbox-store.js";
+import { listResultBusEntries, resultBusFile } from "../src/result-bus/store.js";
 import { reconcileTrustedDesktopExecutionResult } from "../src/routing/execution-result-reconciler.js";
 
 const threadId = "01a00000-0000-7000-8000-000000000001";
@@ -131,7 +131,7 @@ function rejectSeededDelivery(): void {
   });
 }
 
-async function runRecord(extra: string[], rawSummary = "本轮已完成修改并通过所列验证。"): Promise<{ exitCode: number; stdout: string }> {
+async function runDesktop(args: string[]): Promise<{ exitCode: number; stdout: string }> {
   const previousExitCode = process.exitCode;
   process.exitCode = 0;
   let stdout = "";
@@ -142,21 +142,18 @@ async function runRecord(extra: string[], rawSummary = "本轮已完成修改并
   try {
     const program = new Command().exitOverride();
     registerDesktopCommands(program);
-    await program.parseAsync([
-      "node", "c2c", "desktop", "record-result", "-w", root,
-      "--command-id", commandId,
-      "--changed-files", "src/index.ts",
-      "--tests", "not run",
-      "--exit-status", "ok",
-      "--raw-summary", rawSummary,
-      "--json",
-      ...extra,
-    ]);
+    await program.parseAsync(["node", "c2c", "desktop", ...args]);
     return { exitCode: process.exitCode ?? 0, stdout };
   } finally {
     write.mockRestore();
     process.exitCode = previousExitCode;
   }
+}
+
+async function runRecord(extra: string[], rawSummary = "本轮已完成修改并通过所列验证。"): Promise<{ exitCode: number; stdout: string }> {
+  return runDesktop(["record-result", "-w", root, "--command-id", commandId,
+    "--changed-files", "src/index.ts", "--tests", "not run", "--exit-status", "ok",
+    "--raw-summary", rawSummary, "--json", ...extra]);
 }
 
 function json(stdout: string): Record<string, any> {
@@ -208,7 +205,7 @@ describe("desktop record-result CLI", () => {
     expect(json(conflict.stdout)).toMatchObject({ ok: false, error: "DESKTOP_RESULT_CONFLICT" });
   });
 
-  it("receipt 写入后立即归并 canonical RoutingResult 与原 planner-route outbox", async () => {
+  it("receipt 写入后立即归并 canonical RoutingResult 与唯一 Result Bus", async () => {
     const planner = registerRoute(workspace, {
       role: "planner", platform: "chatgpt_web", conversationId: "desktop-result-cli-planner", locator: {},
     });
@@ -228,15 +225,16 @@ describe("desktop record-result CLI", () => {
 
     const result = await runRecord(["--output", "outbox trigger output"]);
     const payload = json(result.stdout);
-    const entries = listResultOutboxEntries(workspace);
+    const entries = listResultBusEntries(workspace);
 
     expect(result.exitCode).toBe(0);
     expect(payload).toMatchObject({
       ok: true,
-      resultOutbox: { status: "reconciled", plannerRouteId: planner.routeId, resultReplayed: false, outboxReplayed: false },
+      resultReconciliation: { status: "reconciled", plannerRouteId: planner.routeId, resultReplayed: false, resultBus: { projected: 1, replayed: 0 } },
     });
     expect(entries).toHaveLength(1);
-    expect(entries[0]).toMatchObject({ commandId, plannerRouteId: planner.routeId, deliveryStatus: "pending" });
+    expect(entries[0]).toMatchObject({ commandId, deliveryStatus: "queued" });
+    expect(listResultOutboxEntries(workspace)).toEqual([]);
     expect(fs.existsSync(path.join(stateDir, "feedback"))).toBe(false);
   });
 
@@ -271,11 +269,11 @@ describe("desktop record-result CLI", () => {
     const retried = await runRecord(["--output", "saved after intent"]);
     expect(retried.exitCode).toBe(0);
     expect(json(retried.stdout)).toMatchObject({ ok: true, receiptCommitted: true,
-      resultOutbox: { status: "reconciled", plannerRouteId: planner.routeId } });
+      resultReconciliation: { status: "reconciled", plannerRouteId: planner.routeId } });
     expect(listResultReconciliationNeeded(workspace)).toEqual([]);
   });
 
-  it("outbox 不可写时显式报告 reconciliation-needed，但保留已提交 receipt 与 canonical result", async () => {
+  it("Bus 不可写时显式报告 reconciliation-needed，但保留已提交 receipt 与 canonical result", async () => {
     const planner = registerRoute(workspace, {
       role: "planner", platform: "chatgpt_web", conversationId: "desktop-result-cli-outbox-failure", locator: {},
     });
@@ -292,7 +290,8 @@ describe("desktop record-result CLI", () => {
       payloadSha256: "0".repeat(64),
     });
     transitionCommandDelivery(workspace, { commandId, deliveryStatus: "accepted" });
-    fs.writeFileSync(`${resultOutboxFile(workspace.id)}.lock`, "held");
+    fs.mkdirSync(path.dirname(resultBusFile(workspace.id)), { recursive: true });
+    fs.writeFileSync(`${resultBusFile(workspace.id)}.lock`, "held");
 
     const result = await runRecord(["--output", "outbox unavailable output"]);
     const payload = json(result.stdout);
@@ -301,9 +300,9 @@ describe("desktop record-result CLI", () => {
     expect(payload).toMatchObject({
       ok: false,
       receiptCommitted: true,
-      resultOutbox: {
+      resultReconciliation: {
         status: "reconciliation_needed",
-        reasonCode: "RESULT_OUTBOX_BUSY",
+        reasonCode: "RESULT_BUS_BUSY",
         issuePersisted: true,
       },
     });
@@ -311,10 +310,22 @@ describe("desktop record-result CLI", () => {
     expect(readRouting(workspace)?.results).toHaveLength(1);
     expect(listResultOutboxEntries(workspace)).toEqual([]);
     expect(listResultReconciliationNeeded(workspace)).toMatchObject([
-      { commandId, reasonCode: "RESULT_OUTBOX_BUSY" },
+      { commandId, reasonCode: "RESULT_BUS_BUSY" },
     ]);
 
-    fs.rmSync(`${resultOutboxFile(workspace.id)}.lock`);
+    const pendingReplay = await runRecord(["--output", "outbox unavailable output"]);
+    expect(pendingReplay.exitCode).toBe(1);
+    expect(json(pendingReplay.stdout)).toMatchObject({ receiptCommitted: true,
+      resultReconciliation: { status: "reconciliation_needed", reasonCode: "RESULT_BUS_BUSY" } });
+    expect(readExecutionRecordsStrict(workspace.id, stateDir)).toHaveLength(1);
+    const status = await runDesktop(["result-reconciliation-status", "-w", root, "--json"]);
+    expect(status.exitCode).toBe(0);
+    expect(json(status.stdout)).toMatchObject({ ok: true, count: 1, entries: [{ commandId, reasonCode: "RESULT_BUS_BUSY" }] });
+    const blockedRepair = await runDesktop(["reconcile-result", "-w", root, "--command-id", commandId, "--json"]);
+    expect(blockedRepair.exitCode).toBe(1);
+    expect(json(blockedRepair.stdout)).toMatchObject({ ok: false, status: "reconciliation_needed", reasonCode: "RESULT_BUS_BUSY" });
+
+    fs.rmSync(`${resultBusFile(workspace.id)}.lock`);
     expect(reconcileTrustedDesktopExecutionResult(workspace, commandId)).toMatchObject({ status: "reconciled" });
     expect(listResultReconciliationNeeded(workspace)).toEqual([]);
   });

@@ -7,7 +7,7 @@ import { readSession, resolveConversation, resolveThreadConversation } from "../
 import { readRemote, controllerOnline, RemoteError } from "../remote/store.js";
 import { readDesktop, DesktopError } from "../desktop/store.js";
 import { desktopIpc } from "../desktop/ipc.js";
-import { targetInput } from "../desktop/store.js";
+import { inspectDesktopBinding } from "../desktop/binding-inspection.js";
 import { unresolvedOutcomeUnknownCommandIds } from "../desktop/outcome-resolution.js";
 import {
   mapCheckpointFromSession,
@@ -147,13 +147,7 @@ export async function collectDesktopFacts(
         }
       }
       try {
-        const target = targetInput.parse({
-          threadId: binding.threadId,
-          hostId: binding.hostId,
-          projectId: binding.projectId,
-        });
-        if (!state?.runtimeFence) throw new DesktopError("DESKTOP_RUNTIME_FENCE_MISSING", "Desktop 绑定缺少运行时身份 fence；请重新绑定当前 Desktop 会话。");
-        await desktopIpc.inspect({ ...target, workspaceRoot: workspace.root }, state.runtimeFence);
+        await inspectDesktopBinding(workspace, binding, state.runtimeFence);
         bindingAvailability = "available";
       } catch (error) {
         const code = desktopErrorCode(error);

@@ -174,7 +174,7 @@ function result(action: () => unknown | Promise<unknown>, scope?: string): Promi
  * Generic Executor MCP tools。
  * 只读 list/status + control send。
  * 不提供 MCP executor_bind（本地绑定边界）。
- * executor_send 不调用 ExecutorPlugin.deliver()，只走 production backend。
+ * executor_send 只走 production backend 与既有 durable sender。
  */
 export function registerExecutorTools(
   server: McpServer,

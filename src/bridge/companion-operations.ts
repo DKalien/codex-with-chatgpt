@@ -6,8 +6,9 @@ import { readPanelAuthorization } from "../feedback/panel.js";
 import { readFeedbackState } from "../feedback/state-store.js";
 import { readRouting } from "../routing/store.js";
 import { canCancelMailbox } from "../routing/schema.js";
-import { readDesktop, requireDesktopRuntimeFence } from "../desktop/store.js";
-import { getExecutor, projectDesktopActivity } from "../executor/index.js";
+import { readDesktop } from "../desktop/store.js";
+import { inspectDesktopBinding } from "../desktop/binding-inspection.js";
+import { projectDesktopActivity } from "../executor/index.js";
 import { listResultBusEntries } from "../result-bus/store.js";
 import { resultBusCompanionDeliveryId } from "./result-bus-delivery.js";
 import { areChatgptConversationRoutesEquivalent } from "../chatgpt/route.js";
@@ -75,11 +76,7 @@ export async function readCompanionOperations(input: {
   let endpoint: ExecutorStatusProjection;
   try {
     if (desktopBinding) {
-      const target = { threadId: desktopBinding.threadId, hostId: desktopBinding.hostId,
-        projectId: desktopBinding.projectId, workspaceRoot: identity.root };
-      const session = await getExecutor().inspect(target, requireDesktopRuntimeFence(identity.id, identity.root, stateDir));
-      if (session.threadId !== target.threadId || session.hostId !== target.hostId
-        || session.projectId !== target.projectId || session.workspaceRoot !== target.workspaceRoot) throw new Error("Desktop target changed");
+      const session = await inspectDesktopBinding(identity, desktopBinding, desktopSnapshot!.runtimeFence);
       endpoint = { workspaceId: identity.id, activeBinding: null, plugins: [],
         availability: { available: true }, activity: projectDesktopActivity(session) };
     } else endpoint = officialMode

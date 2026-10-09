@@ -108,11 +108,11 @@ program
           return;
         }
         const result = { ok: true, autoPromotedDesktop: true, commandId: discovered.commandId, taskId: receipt.record.taskId, outputId: receipt.record.outputId };
-        const resultOutbox = reconcileTrustedDesktopExecutionResult({ id: workspace.id, root: workspace.root }, discovered.commandId);
-        const reconciliationNeeded = resultOutbox.status === "reconciliation_needed";
-        if (opts.json) say(JSON.stringify({ ...result, ok: !reconciliationNeeded, receiptCommitted: true, resultOutbox }));
-        else check(resultOutbox.status === "reconciliation_needed"
-          ? "Desktop trusted execution receipt 已记录；canonical RoutingResult 需本机重试对账。"
+        const resultReconciliation = reconcileTrustedDesktopExecutionResult({ id: workspace.id, root: workspace.root }, discovered.commandId);
+        const reconciliationNeeded = resultReconciliation.status === "reconciliation_needed";
+        if (opts.json) say(JSON.stringify({ ...result, ok: !reconciliationNeeded, receiptCommitted: true, resultReconciliation }));
+        else check(resultReconciliation.status === "reconciliation_needed"
+          ? "Desktop trusted execution receipt 已记录；canonical RoutingResult / Result Bus 需本机重试对账。"
           : "已自动记录 Desktop execution receipt");
         if (reconciliationNeeded) process.exitCode = 1;
         return;

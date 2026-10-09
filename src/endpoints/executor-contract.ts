@@ -3,19 +3,13 @@ import { createPluginRegistry } from "./registry.js";
 import {
   DESCRIPTOR_NAME_MAX,
   EVIDENCE_DETAIL_MAX,
-  REASON_TEXT_MAX,
   endpointInstantSchema,
   endpointPluginIdSchema,
-  endpointReasonTextSchema,
   executorBindingCandidateSchema,
   executorExecutionEvidenceSchema,
-  executorTargetIdentityEquals,
-  locatorExactEqual,
-  opaqueIdentitySchema,
   parseExecutorExecutionEvidence,
   type ExecutorBinding,
   type ExecutorBindingCandidate,
-  type ExecutorDeliveryTargetSnapshot,
   type ExecutorExecutionEvidenceRecord,
 } from "./schema.js";
 
@@ -27,7 +21,7 @@ import {
  * - plugin 只发现 session candidate；不铸造 bindingId/epoch/boundAt。
  * - trusted terminal receipt 是 capability，不是默认能力。
  * - 一个插件支持 delivery 不代表支持 trusted terminal receipt。
- * - delivery acceptance 保留 opaque 关联 ID，不暴露产品字段名。
+ * - production delivery 由受控 backend 提供，不暴露 raw send 合同。
  */
 
 export const executorPluginCapabilitiesSchema = z
@@ -62,51 +56,6 @@ export function parseExecutorPluginDescriptor(input: unknown): ExecutorPluginDes
   return parsed.data;
 }
 
-/** Delivery 请求：target 必须是已冻结 snapshot，禁止运行时重解析 executor。 */
-export interface ExecutorDeliveryRequest {
-  readonly request: string;
-  readonly target: ExecutorDeliveryTargetSnapshot;
-  readonly payload: string;
-}
-
-/**
- * Delivery acceptance：保留 opaque delivery/execution 关联。
- * 产品字段名不得进入本合同。
- */
-export type ExecutorDeliveryAcceptance =
-  | { readonly status: "accepted"; readonly deliveryId: string }
-  | {
-      readonly status: "rejected";
-      readonly reasonCode: string;
-      readonly reason?: string;
-    };
-
-export const executorDeliveryAcceptedSchema = z
-  .object({
-    status: z.literal("accepted"),
-    deliveryId: opaqueIdentitySchema,
-  })
-  .strict();
-export const executorDeliveryRejectedSchema = z
-  .object({
-    status: z.literal("rejected"),
-    reasonCode: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/),
-    reason: endpointReasonTextSchema.optional(),
-  })
-  .strict();
-export const executorDeliveryAcceptanceSchema = z.discriminatedUnion("status", [
-  executorDeliveryAcceptedSchema,
-  executorDeliveryRejectedSchema,
-]);
-
-export function parseExecutorDeliveryAcceptance(input: unknown): ExecutorDeliveryAcceptance {
-  const parsed = executorDeliveryAcceptanceSchema.safeParse(input);
-  if (!parsed.success) {
-    throw new Error(`delivery acceptance 无效: ${parsed.error.issues.map(i => i.message).join("; ")}`);
-  }
-  return parsed.data;
-}
-
 export type ExecutorExecutionEvidence = ExecutorExecutionEvidenceRecord;
 
 export interface ExecutorSessionProjection {
@@ -133,7 +82,6 @@ export interface ExecutorPlugin {
     readonly workspaceId: string;
   }): Promise<ExecutorBindingCandidate>;
   inspectSession(binding: ExecutorBinding): Promise<ExecutorSessionProjection>;
-  deliver(request: ExecutorDeliveryRequest): Promise<ExecutorDeliveryAcceptance>;
   inspectActiveExecution?(binding: ExecutorBinding): Promise<ExecutorActiveExecutionProjection>;
   /**
    * 仅当 capabilities.trustedTerminalReceipt === true 时可返回 trusted evidence。
@@ -142,28 +90,6 @@ export interface ExecutorPlugin {
   inspectExecutionEvidence?(binding: ExecutorBinding): Promise<readonly ExecutorExecutionEvidence[]>;
   cancel?(binding: ExecutorBinding): Promise<{ cancelled: boolean; reason?: string }>;
   resume?(binding: ExecutorBinding): Promise<{ resumed: boolean; reason?: string }>;
-}
-
-/** 完整 snapshot identity 精确比较（含 workspaceRoot 与 locator 结构相等）。 */
-export function assertDeliveryTargetMatchesBinding(
-  request: ExecutorDeliveryRequest,
-  binding: ExecutorBinding,
-): void {
-  const t = request.target;
-  const same =
-    t.version === binding.version &&
-    t.bindingId === binding.bindingId &&
-    t.pluginId === binding.pluginId &&
-    t.workspaceId === binding.workspaceId &&
-    t.workspaceRoot === binding.workspaceRoot &&
-    t.instanceId === binding.instanceId &&
-    t.sessionId === binding.sessionId &&
-    t.epoch === binding.epoch &&
-    locatorExactEqual(t.locator, binding.locator) &&
-    executorTargetIdentityEquals(t, binding);
-  if (!same) {
-    throw new Error("delivery target snapshot 与当前 binding 不一致");
-  }
 }
 
 /**
@@ -198,7 +124,7 @@ export function validateExecutorPlugin(plugin: unknown): ExecutorPlugin {
   }
   const candidate = plugin as Partial<ExecutorPlugin> & { descriptor?: unknown };
   const descriptor = parseExecutorPluginDescriptor(candidate.descriptor);
-  for (const method of ["discoverCurrent", "inspectSession", "deliver"] as const) {
+  for (const method of ["discoverCurrent", "inspectSession"] as const) {
     if (typeof candidate[method] !== "function") {
       throw new Error(`executor plugin ${descriptor.pluginId} 缺少必需方法 ${method}`);
     }
@@ -208,7 +134,7 @@ export function validateExecutorPlugin(plugin: unknown): ExecutorPlugin {
 
 /**
  * Executor-specialized 固定注册表：先做 runtime 合同校验，再委托 generic registry。
- * 不做动态发现；不替换 legacy ExecutorRegistry。
+ * 不做动态发现。
  */
 export function createExecutorPluginRegistry(
   plugins: readonly unknown[],
@@ -229,5 +155,4 @@ export function assertValidExecutorPluginDescriptor(input: unknown): ExecutorPlu
 }
 
 export const EXECUTION_EVIDENCE_DETAIL_MAX = EVIDENCE_DETAIL_MAX;
-export const DELIVERY_REASON_TEXT_MAX = REASON_TEXT_MAX;
 export { executorBindingCandidateSchema, endpointInstantSchema, endpointPluginIdSchema };
