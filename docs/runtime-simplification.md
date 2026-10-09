@@ -35,6 +35,17 @@ Bus busy、损坏、不可变摘要冲突或清除恢复项失败均返回 `reco
 
 相关实现：[Bus 与控制通知](../src/bridge/result-bus-delivery.ts)、[控制投影](../src/feedback/projector.ts)、[Feedback lifecycle](../src/feedback/delivery-lifecycle.ts)。历史 fixture 位于 [tests/helpers](../tests/helpers/)。
 
+## legacy 退役前置门禁（2026-10-09 固化，退役延后）
+
+legacy/Bus cutover 双轨、receipt-finalizer draft v1/v2/v3 兼容等退役类代码为迁移期代码，暂不逐条删检查。整体退役须先达成以下前置门禁，全部满足后再单独立项执行；未达成前保持现状：
+
+1. M4/M5 双项目真实 Send/observed 与同一插件双项目验收完成（见[统一 Gateway 计划](unified-gateway-plan.md)）。
+2. `legacyDrainPending` 清零：无可匹配可信 Bus 结果的历史执行事件遗留。
+3. 49 条 suppressed 历史 Bus 与 14 条 exact abandonment 走 exact manual cleanup 方案（绝不自动删历史；涉数据完整性，须逐条核验身份后人工处置）。
+4. receipt-finalizer draft v1/v2/v3 无存续消费方。
+
+退役是删除迁移期代码与历史兼容读取，不降低任何 AGENTS.md「必须保留的边界」门禁。
+
 ## 接口迁移与回滚
 
 - CLI JSON 的 `resultOutbox` 改为 `resultReconciliation`；成功值不再提供 `outboxEntryId` / `outboxReplayed`。外部脚本应读取 `resultReconciliation.status` 与 `resultBus.projected/replayed`，不能继续判断 shadow 的 `resultBus.status`。

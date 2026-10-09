@@ -6,7 +6,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { listExecutionOutputs } from "../src/execution/output.js";
-import { readExecutionRecordsStrict, isTrustedDesktopReceipt } from "../src/execution/records.js";
+import { readExecutionRecordsStrict, isTrustedDesktopReceipt, type StoredExecutionRecord } from "../src/execution/records.js";
 import { desktopIpc } from "../src/desktop/ipc.js";
 import * as desktopStore from "../src/desktop/store.js";
 import * as lifecycle from "../src/command-cleanup/fence.js";
@@ -914,5 +914,87 @@ describe("Desktop receipt terminal fence", () => {
     expect(alert.projected).toBeUndefined();
     expect(fs.existsSync(path.join(stateDir, "feedback", `${workspace.id}.json`))).toBe(false);
     expect(readReceiptFinalizationAlert(stateDir, workspace.id, pending.commandId)).toMatchObject(alert);
+  });
+});
+
+// isTrustedDesktopReceipt 8 谓词 zod 收敛（#10）的逐条等价性回归：
+// 仅信任判定本身——不读文件、不建 stateDir；每个翻转必须与旧手工谓词同判。
+describe("isTrustedDesktopReceipt 信任谓词等价性（#10 zod 收敛）", () => {
+  const COMMAND = "cmd_trusted_receipt";
+  const SHA = "a".repeat(64);
+  const valid = (): StoredExecutionRecord => ({
+    commandId: COMMAND,
+    taskId: `desktop_${COMMAND}`,
+    iteration: 1,
+    changedFiles: ["src/a.ts"],
+    tests: "1 passed",
+    exitStatus: "ok",
+    timestamp: "2026-10-09T08:30:00.000Z",
+    desktopReceiptSha256: SHA,
+  });
+  const gate = (record: unknown): boolean =>
+    isTrustedDesktopReceipt(record as StoredExecutionRecord, COMMAND);
+
+  it("合法 record 与三种终态/空 changedFiles 边界通过", () => {
+    expect(gate(valid())).toBe(true);
+    for (const exitStatus of ["ok", "failed", "blocked"] as const) {
+      expect(gate({ ...valid(), exitStatus })).toBe(true);
+    }
+    // 旧手工谓词对空数组 every 为 vacuous true，zod 同判
+    expect(gate({ ...valid(), changedFiles: [] })).toBe(true);
+  });
+
+  it("谓词 1-3：commandId/taskId/iteration 身份键翻转拒绝", () => {
+    expect(gate({ ...valid(), commandId: "other_command" })).toBe(false);
+    expect(gate({ ...valid(), taskId: "desktop_other_command" })).toBe(false);
+    expect(gate({ ...valid(), taskId: COMMAND })).toBe(false);
+    expect(gate({ ...valid(), iteration: 0 })).toBe(false);
+    expect(gate({ ...valid(), iteration: 2 })).toBe(false);
+    expect(gate({ ...valid(), commandId: undefined })).toBe(false);
+  });
+
+  it("谓词 4：changedFiles 必须全为字符串", () => {
+    expect(gate({ ...valid(), changedFiles: 0 })).toBe(false);
+    expect(gate({ ...valid(), changedFiles: ["ok", 1] })).toBe(false);
+    expect(gate({ ...valid(), changedFiles: undefined })).toBe(false);
+  });
+
+  it("谓词 5：tests 为非空白字符串", () => {
+    expect(gate({ ...valid(), tests: null })).toBe(false);
+    expect(gate({ ...valid(), tests: "" })).toBe(false);
+    expect(gate({ ...valid(), tests: "   " })).toBe(false);
+    expect(gate({ ...valid(), tests: undefined })).toBe(false);
+  });
+
+  it("谓词 6：exitStatus 仅三种终态", () => {
+    expect(gate({ ...valid(), exitStatus: "running" })).toBe(false);
+    expect(gate({ ...valid(), exitStatus: "OK" })).toBe(false);
+    expect(gate({ ...valid(), exitStatus: "" })).toBe(false);
+  });
+
+  it("谓词 7：timestamp 必须可解析且规范 ISO 往返相等", () => {
+    expect(gate({ ...valid(), timestamp: "not-a-date" })).toBe(false);
+    // 可被 Date.parse 解析但非规范 Z 后缀：往返字符串不等，旧手工谓词同样拒绝
+    expect(gate({ ...valid(), timestamp: "2026-10-09T08:30:00" })).toBe(false);
+    expect(gate({ ...valid(), timestamp: "2026-10-09 08:30:00Z" })).toBe(false);
+    expect(gate({ ...valid(), timestamp: "2026-10-09T08:30:00.000+00:00" })).toBe(false);
+    expect(gate({ ...valid(), timestamp: "" })).toBe(false);
+  });
+
+  it("谓词 8：desktopReceiptSha256 为 64 位小写 hex", () => {
+    expect(gate({ ...valid(), desktopReceiptSha256: undefined })).toBe(false);
+    expect(gate({ ...valid(), desktopReceiptSha256: "A".repeat(64) })).toBe(false);
+    expect(gate({ ...valid(), desktopReceiptSha256: "a".repeat(63) })).toBe(false);
+    expect(gate({ ...valid(), desktopReceiptSha256: "g".repeat(64) })).toBe(false);
+  });
+
+  it("passthrough：多余键与未纳入 8 谓词的字段不影响 gate（与旧手工谓词同判）", () => {
+    expect(gate({ ...valid(), unknownExtra: "x" })).toBe(true);
+    // rawSummary 等字段的形状归 storedExecutionRecordSchema 读取路径，gate 不重复校验
+    expect(gate({ ...valid(), rawSummary: 123 as unknown as string })).toBe(true);
+  });
+
+  it("commandId 参数化：同一 record 对不同期望 commandId 判定不同", () => {
+    expect(isTrustedDesktopReceipt(valid(), "other_command")).toBe(false);
   });
 });

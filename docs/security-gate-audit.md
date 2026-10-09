@@ -28,6 +28,8 @@
 
 ## 3. 门禁清单（按层分类）
 
+> 快照声明：本表为 2026-10-09 一次性评估记录快照，仅供审查追溯；现役安全边界以 [AGENTS.md「必须保留的边界」](../AGENTS.md) 为唯一权威，本表不作为独立约束源。
+
 | 门禁ID | 名称 | 冻结状态 | 位置（代表） | 层 |
 |---|---|---|---|---|
 | G-OA1 | OAuth PKCE S256 + 授权码一次性 + TTL | 冻结 | `src/auth/oauth.ts` | MCP 接入 |
@@ -162,14 +164,16 @@ C1 微差异（均在可达状态等价或 fail-safe 方向）：① dispatch `b
 | #21 | 行政证据 store 模板 ×4 → 共享 | **已完成**（C3，净删 235 行模板） |
 | #22 | TS 内同构 expectation 合并 | **已完成**（C4） |
 | #7 | challengeDigest 双查提取 | **已完成**（C4） |
-| #12 | Result Bus 单飞事务内层裁剪 | **证据否决**（FEEDBACK_INFLIGHT_FENCE wire 契约被 13 处测试钉死） |
+| #12 | Result Bus 单飞事务内层裁剪 | **证据否决**（FEEDBACK_INFLIGHT_FENCE 为对外 wire 合同——`src/bridge/companion.ts` 将 `error.code` 映射到 `body.error` 供 Companion 消费；13 处测试钉死的是合同而非"实现形状"，不可作为冗余放松） |
 | #14 | companion-rebind 三证删一 | **证据否决**（16 项 `||` 链是跨记录一致性断言合取，非副本校验） |
-| #17 | browser 侧 `liveFenceOk` 同步段重复 re-fence 裁剪 | 保留为未来候选：生产 Send 安全面；异步边界判定易错；配套测试（e1b3d3b 等 ≈ 400+ 项）成本极高 |
-| #10 | `isTrustedDesktopReceipt` 手工 8 项与 zod schema 收敛 | 保留为未来候选：Desktop receipt 信任判定，等价性论证成本 > 收益 |
+| #17 | browser 侧 `liveFenceOk` 同步段重复 re-fence 裁剪 | **代码级证据否决**（2026-10-09 复核 `browser-companion/production-send-runtime.js:215-340`）：无纯同步段重复——`writeCanonicalMessage`/`dispatchNativeSend` 的入口 fence 与 `mutationGuard` 之间跨 DOM mutation 点（React composer 操作与事件循环让出，页面脚本可导航/换 generation）；`beginSend` re-fence 与上游 fence 之间隔 `waitForSendReady` 真实轮询 await，且 fence 是 `/begin-send` RPC await 前最后一条同步语句。删任一处即开 generation drift 发送窗口 |
+| #10 | `isTrustedDesktopReceipt` 手工 8 项与 zod schema 收敛 | **已完成**（2026-10-09）：新增参数化 `trustedDesktopReceiptSchema(commandId)`（src/execution/records.ts），8 谓词逐条 zod 表达、hex 复用 `core/hex.ts`；gate schema `.passthrough()` 与旧手工谓词严格同判（不重复存储层 strict 校验）；函数 boolean 合同不变、13 调用点零改动；9 例翻转/边界等价性测试 + 受影响 7 套件 293 测试全绿 |
 | #4 | `userConfirmed: z.literal(true)` 常量共享 | 不实施：仅 3 行字面量，共享属过度抽象 |
 | B6-docs | `docs/security.md` "MCP 不是 shell/文件 RPC" 主题表述 | 不实施：经核实为 Gateway/Remote/Desktop/Web 四个信任边界各自的局部合同（非同一语句重复），合并会削弱各节边界语义 |
-| 退役类 | `result-bus-delivery.ts` legacy/Bus cutover 历史分类、receipt-finalizer draft v1/v2/v3 兼容 | 保留为未来候选：迁移期代码，待过渡完成后整体退役而非逐条删检查 |
+| 退役类 | `result-bus-delivery.ts` legacy/Bus cutover 历史分类、receipt-finalizer draft v1/v2/v3 兼容 | 保留为未来候选：迁移期代码，待过渡完成后整体退役而非逐条删检查；退役前置门禁见 [runtime-simplification.md](runtime-simplification.md)「legacy 退役前置门禁」 |
 | Python 双侧 wire 校验（#22 跨语言部分） | TS/Python 双侧校验 | 不实施：跨信任边界必须双侧 |
+
+**文本 fence 分类核实（2026-10-09，建议 2 落地记录）**：对 `r5b/r5c/r5d1/r5e-architecture` 等文本 fence 逐条核读，断言归两类——(a) 架构边界禁词护栏（`plannerRouteId`/`principalFingerprint`/`feedback`/`readActiveWebSinkBinding` 等，防跨层耦合与信息泄漏）、(b) 安全不变量/安全入口合同（`fsyncSync`/`noWrite`/`openSync wx 0600`/`\.initialized`/`verifyCompanionCredentialForWebSink`/`isWebSinkRouteVerified`/条目上限/状态机字面量）。无"纯实现细节"可放松项：文本 fence 是静态源码扫描机制，字面断言即其工作机制，无法在不改变 fence 物种（静态架构检查→动态测试）的前提下"放松为行为断言"。**结论：0 项可安全放松**，放松即降低架构安全。测试断言三分法原则（wire 合同/安全不变量/纯实现细节）已固化为约定，供未来抽模板重构遵循。
 
 ## 8. 性能与瘦身数据
 
@@ -227,6 +231,8 @@ C1 微差异（均在可达状态等价或 fail-safe 方向）：① dispatch `b
 
 ## 9. 保留建议与证据（删除即开洞清单）
 
+> 快照声明：本清单为 2026-10-09 评估记录快照，仅供审查追溯；现役安全边界以 [AGENTS.md「必须保留的边界」](../AGENTS.md) 为唯一权威，本表不作为独立约束源。
+
 以下边界经核实为真实安全边界，**不建议任何移除**；命中测试为回归证据锚点：
 
 | 边界 | 删除后果 | 命中测试 |
@@ -275,3 +281,4 @@ rg -n "function requireScope|function authorizeNow|function safeEqual|function h
 |---|---|---|---|---|
 | 2026-10-09 | Codex | 基线→B7 见 §8 | B1/B2/B4/B6 收敛完成（重复实现 37→10）；B3/B5 核实保留/仅记录；8 项冻结门禁 0 项删语义；closeout 全量 183 files/3854 tests 0-failed | 执行 §10 定期审查；§7 候选待后续授权 |
 | 2026-10-09 | Codex | C 阶段见 §8.2b | 二次瘦身：事务模板 6→1、证据 store 模板 4→1、store wx 锁 5→1（#19/#21/#22/#7 完成，#20 部分）；#12/#14 证据否决；closeout 全量 183 files/3854 tests 0-failed | #17/#10/退役类待后续授权；执行 §10 定期审查 |
+| 2026-10-09 | Codex | 无新增重复实现（本轮为候选收尾） | #10 已完成（8 谓词 zod 收敛，boolean 合同不变，13 调用点零改动）；#17 代码级证据否决（无纯同步段重复，mutationGuard 跨 DOM mutation 点、beginSend 跨轮询/RPC await）；退役类延后并固化 4 项前置门禁 | typecheck/build 通过；定向 7 套件 293 测试 0-failed；开发迭代未跑全量，closeout 时再跑 |

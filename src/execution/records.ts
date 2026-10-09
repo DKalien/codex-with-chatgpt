@@ -10,6 +10,7 @@ import { sanitizeExecutionOutput } from "./sanitize.js";
 import { isExecutionLockAcquisitionContention } from "./short-lock.js";
 import { applyFeedbackCursorCleanup, prepareFeedbackCursorCleanup } from "../feedback/cursor-cleanup.js";
 import { assertNoLegacyHistoryCleanup } from "../command-cleanup/legacy-history-fence.js";
+import { HEX64 } from "../core/hex.js";
 
 export const MAX_EXECUTION_SUMMARY_BYTES = 8 * 1024;
 export const executionSummarySchema = z.string().min(1).refine(
@@ -121,15 +122,38 @@ export function resolveTerminalExecutionRecord(
   throw new Error("缺少唯一匹配的执行终态记录；不能把其他任务或历史 test_status 当作本次完成。");
 }
 
+/**
+ * trusted Desktop receipt 的 8 项信任谓词（与原手工判定逐条等价的唯一权威表达）：
+ * 1. commandId 等于调用方期望的运行时 commandId；
+ * 2. taskId 固定为 `desktop_<commandId>`；
+ * 3. iteration 恰为 1；
+ * 4. changedFiles 为字符串数组（窄于 base schema 的 union）；
+ * 5. tests 为非空白字符串（base 允许 nullable）；
+ * 6. exitStatus 为 ok/failed/blocked 三种终态之一；
+ * 7. timestamp 可解析且规范 ISO 往返相等（new Date(ms).toISOString() === 原值）；
+ * 8. desktopReceiptSha256 为 64 位小写 hex。
+ * 独立声明并 passthrough：本 gate 只判定这 8 项，不重复 storedExecutionRecordSchema
+ * 读取路径的 strict 形状校验，也不因多余键拒绝（与旧手工谓词语义一致）。
+ */
+export function trustedDesktopReceiptSchema(commandId: string) {
+  return z.object({
+    commandId: z.literal(commandId),
+    taskId: z.literal(`desktop_${commandId}`),
+    iteration: z.literal(1),
+    changedFiles: z.array(z.string()),
+    tests: z.string().refine(value => value.trim().length > 0),
+    exitStatus: z.enum(TERMINAL_EXECUTION_STATUSES),
+    timestamp: z.string().refine((value) => {
+      const ms = Date.parse(value);
+      return Number.isFinite(ms) && new Date(ms).toISOString() === value;
+    }),
+    desktopReceiptSha256: z.string().regex(HEX64),
+  }).passthrough();
+}
+
 /** 本机 Desktop receipt 的严格终态条件；调用方必须先拒绝重复或冲突记录。 */
 export function isTrustedDesktopReceipt(record: StoredExecutionRecord, commandId: string): boolean {
-  return record.commandId === commandId && record.taskId === `desktop_${commandId}` && record.iteration === 1 &&
-    Array.isArray(record.changedFiles) && record.changedFiles.every(file => typeof file === "string") &&
-    typeof record.tests === "string" && record.tests.trim().length > 0 &&
-    ["ok", "failed", "blocked"].includes(record.exitStatus) &&
-    typeof record.timestamp === "string" && Number.isFinite(Date.parse(record.timestamp)) &&
-    new Date(record.timestamp).toISOString() === record.timestamp &&
-    typeof record.desktopReceiptSha256 === "string" && /^[a-f0-9]{64}$/.test(record.desktopReceiptSha256);
+  return trustedDesktopReceiptSchema(commandId).safeParse(record).success;
 }
 
 export class ExecutionRecordsBusyError extends Error {
