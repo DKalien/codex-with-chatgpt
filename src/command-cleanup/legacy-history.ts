@@ -23,7 +23,7 @@ import { legacyHistoryJournalFile, withLegacyHistoryOwner } from "./legacy-histo
 
 const digest = (bytes: string | Buffer) => createHash("sha256").update(bytes).digest("hex");
 const hex = z.string().regex(/^[a-f0-9]{64}$/);
-const fingerprintSchema = z.object({ dev: z.string(), ino: z.string(), size: z.number().int().nonnegative(),
+export const fingerprintSchema = z.object({ dev: z.string(), ino: z.string(), size: z.number().int().nonnegative(),
   mtime: z.string(), ctime: z.string(), sha256: hex }).strict();
 type Fingerprint = z.infer<typeof fingerprintSchema>;
 const snapshotSchema = z.object({ version: z.literal(1), workspaceId: z.string().regex(/^[a-f0-9]{12}$/), workspaceRoot: z.string().min(1),
@@ -40,7 +40,7 @@ type Stage = "journal" | "records" | "bodies" | "index" | "feedback";
 function fail(code = "LEGACY_HISTORY_CONFLICT"): never {
   throw new CommandCleanupError(code, "旧记录清理证据不匹配或仍有活动数据；保留现状，不能强行清空。");
 }
-function fileFingerprint(file: string, stateDir: string): Fingerprint | null {
+export function fileFingerprint(file: string, stateDir: string): Fingerprint | null {
   assertCleanupPath(file, stateDir);
   if (!assertExecutionArtifactPath(file, stateDir, "file")) return null;
   const before = fs.lstatSync(file, { bigint: true });
@@ -116,13 +116,13 @@ export function previewLegacyHistoryCleanup(raw: RoutingWorkspaceIdentity, state
     confirmationSha256: present ? digest(JSON.stringify(value)) : null, notice: LEGACY_HISTORY_NOTICE };
 }
 /** Fixed paths only. A completed replacement may be replayed; altered/replaced source is never deleted. */
-function removeExact(file: string, expected: Fingerprint | null, stateDir: string) {
+export function removeExact(file: string, expected: Fingerprint | null, stateDir: string) {
   const current = fileFingerprint(file, stateDir);
   if (!current) return;
   if (!same(current, expected)) fail();
   fs.unlinkSync(file);
 }
-function replaceExact(file: string, expected: Fingerprint | null, after: string, stateDir: string, confirmation: string) {
+export function replaceExact(file: string, expected: Fingerprint | null, after: string, stateDir: string, confirmation: string) {
   const current = fileFingerprint(file, stateDir), afterDigest = digest(after);
   const temporary = `${file}.${confirmation}.legacy-tmp`;
   const pending = fileFingerprint(temporary, stateDir);

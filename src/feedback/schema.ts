@@ -222,6 +222,7 @@ export const feedbackStateSchema = z.object({
   version: z.literal(1),
   workspaceId: z.string().regex(WORKSPACE_ID),
   projectionCursor: z.number().int().nonnegative(),
+  historyFormatSha256: z.string().regex(HEX64).optional(),
   binding: feedbackBindingSchema.nullable(),
   events: z.array(feedbackEventSchema).max(10000),
   panelGrant: panelGrantSchema.optional(),

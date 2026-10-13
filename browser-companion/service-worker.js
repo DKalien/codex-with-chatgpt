@@ -104,6 +104,7 @@ import {
   shouldRestorePairFenceAfterHttpError,
   reconcileRouteAttestAfterHydrate,
 } from "./route-attestation.js";
+import { renderCompletionNotification } from "./completion-notification.js";
 import {
   canStartProductionSend,
   buildProductionSendExecuteRequest,
@@ -171,6 +172,8 @@ import {
 import {
   createProjectChrome,
   createProjectContextRouter,
+  projectStorageKey,
+  PROJECT_REGISTRY_KEY,
 } from "./project-context.js";
 
 const LEGACY_LOCAL_KEYS = [
@@ -223,6 +226,7 @@ const LOCAL_ROUTE_KEY = "c2c_companion_local_route_request_v1";
 const TRANSPORT_KEY = "c2c_companion_transport_v1";
 const JOURNAL_KEY = "c2c_companion_journal_v1";
 const OUTCOME_UNKNOWN_ARCHIVE_KEY = "c2c_companion_outcome_unknown_archive_v1";
+const PANEL_FORMAT_KEY = "c2c.panel.format.v1";
 const SESSION_OWNER_KEY = "c2c_companion_owner_v1";
 const SESSION_REG_KEY = "c2c_companion_registry_v1";
 const SESSION_EVIDENCE_KEY = "c2c_companion_evidence_v1";
@@ -236,6 +240,8 @@ let transportIdentityBlocked = false;
 let journal = emptyJournal();
 let outcomeUnknownArchive = emptyOutcomeUnknownArchive();
 let outcomeUnknownArchiveValid = true;
+let formatRequestPending = null;
+let formatPreview = null;
 let evidence = null;
 /** @type {null | ReturnType<typeof mintOwnerProof>} */
 let ownerProof = null;
@@ -328,8 +334,10 @@ async function hydrate() {
     ROUTE_ATTEST_FENCE_KEY,
     CONNECT_FLOW_KEY,
     LOCAL_ROUTE_KEY,
+    PANEL_FORMAT_KEY,
   ]);
   const row = stored[LOCAL_KEY];
+  formatRequestPending = stored[PANEL_FORMAT_KEY] ?? null;
   localState = row && typeof row === "object"
     ? {
         schemaVersion: 1,
@@ -611,6 +619,7 @@ async function forceAutonomyOff(reason, { clearRearmPreference = false } = {}) {
 }
 
 async function rearmAutonomyAfterVerifiedConnect() {
+  if (formatRequestPending !== null) return { ok: false, mode: "off", reason: "panel_format_unknown" };
   const current = parseAutonomyPolicy(autonomyPolicy);
   if (!current.rearmOnConnect) return { ok: true, mode: current.mode };
   const routeVerified = storageProtected === true
@@ -657,6 +666,7 @@ async function persistSessionOwnership() {
 }
 
 function connectionReadiness(tabId = ownerState.owner?.tabId, documentId = ownerState.owner?.documentId) {
+  if (formatRequestPending !== null) return { ready: false, reason: "panel_format_unknown" };
   return deriveConnectionReadiness({
     transport, storageProtected, transportIdentityBlocked, transportMutationInFlight, routeAttestFence, connectFlow, connectReason,
     owner: documentId != null && isOwner(ownerState, tabId, documentId) ? ownerState.owner : null,
@@ -2832,6 +2842,27 @@ async function handleConnectPage(sender, message) {
   }
 }
 
+async function resolveCompletionPayload(body, workspaceId) {
+  if (!Object.hasOwn(body, "signal")) {
+    if (body.messageFormat === "signal-v1") throw new Error("completion signal missing");
+    return body;
+  }
+  if (Object.hasOwn(body, "message")
+    || (body.messageFormat !== undefined && body.messageFormat !== "signal-v1")) {
+    throw new Error("completion payload invalid");
+  }
+  const message = renderCompletionNotification(body.signal);
+  if (body.signal.workspaceId !== workspaceId || body.signal.attemptId !== body.attemptId
+    || typeof body.messageSha256 !== "string" || !/^[a-f0-9]{64}$/.test(body.messageSha256)) {
+    throw new Error("completion identity invalid");
+  }
+  if (!await unknownJournalMessageHashMatches({ message, messageSha256: body.messageSha256 })) {
+    throw new Error("completion message hash mismatch");
+  }
+  const { signal, ...normalized } = body;
+  return { ...normalized, message };
+}
+
 async function handleFetchState() {
   // A stale observation blocks writes, not a fresh read with the SAME credential.
   // Otherwise a transient rejection permanently disables its own recovery path.
@@ -2866,6 +2897,21 @@ async function handleFetchState() {
     const idCheck = validateStateIdentity(transport, res.body);
     if (!idCheck.ok) {
       return markAuthStale(idCheck.reason, res);
+    }
+    let inFlight = null;
+    if (res.body.inFlight != null) {
+      if (typeof res.body.inFlight !== "object" || Array.isArray(res.body.inFlight)) {
+        return { ok: false, reason: "state_response_invalid" };
+      }
+      try {
+        inFlight = await resolveCompletionPayload(res.body.inFlight, transport.workspaceId);
+      } catch {
+        return { ok: false, reason: "state_response_invalid" };
+      }
+      if (!isCurrentTransportResponse(res)
+        || requestTransports.get(res).requestAuthRevision !== authFailureRevision) {
+        return { ok: false, reason: "stale_transport_response" };
+      }
     }
     // Authenticated /state is the ONLY route-verification authority.
     const sync = syncTransportRouteVerification(transport, res.body);
@@ -2907,6 +2953,10 @@ async function handleFetchState() {
         await persistRouteAttestBoth();
       }
     }
+    if (!isCurrentTransportResponse(res)
+      || requestTransports.get(res).requestAuthRevision !== authFailureRevision) {
+      return { ok: false, reason: "stale_transport_response" };
+    }
     // Minimal observed proof from the same authenticated /state body only.
     // Never expose message / credential / principal / reservedBy.
     const observedLookup = findExactObservedEvent(res.body.events ?? [], journal);
@@ -2917,9 +2967,7 @@ async function handleFetchState() {
         reserved: res.body.reserved,
         claimed: res.body.claimed,
         outcomeUnknown: res.body.outcomeUnknown,
-        inFlight: res.body.inFlight && typeof res.body.inFlight === "object"
-          ? { ...res.body.inFlight, routeCanonical: res.body.routeCanonical }
-          : null,
+        inFlight: inFlight ? { ...inFlight, routeCanonical: res.body.routeCanonical } : null,
         isolatedAttempts: isolatedAttempts.attempts,
         enabled: res.body.enabled,
         serverObserved: observedLookup.ok ? observedLookup.observed : null,
@@ -3543,6 +3591,7 @@ let operationsReadInFlight = null;
 async function readOperations() {
   const local = () => ({
     autonomy: autonomyPolicy.mode,
+    formatPending: formatRequestPending !== null,
     web: {
       observedAt: evidence?.observedAt ?? null,
       ownerAvailable: !!ownerState.owner && !!evidence && isOwner(ownerState, evidence.tabId, evidence.documentId),
@@ -3696,9 +3745,170 @@ async function panelAction(message) {
   finally { productionSendInFlight = false; }
 }
 
+// 格式化只保留待核验 hash；未知响应只读核验，禁止再次提交删除。
+function formatGate(held = false) {
+  if (!storageProtected || !transport?.credential || transport.workspaceId !== project.workspaceId
+    || transport.authStale || transport.rebindPending || transportIdentityBlocked) return "transport_unavailable";
+  if ((!held && productionSendInFlight) || productionRecoveryInFlight || autonomyTickInFlight || connectInFlight
+    || writeProbeInFlight || sendProbeInFlight || localRouteActive()) return "format_operation_busy";
+  if (journal.state !== "NONE") return "delivery_journal_requires_recovery";
+  if (!["NONE", "VERIFIED"].includes(routeAttestFence.state) || !["NONE", "VERIFIED"].includes(routeAttestLatch.state)
+    || !["NONE", "COMPLETED"].includes(sendProbeLatch.state) || !["NONE", "DONE"].includes(connectFlow.state)) return "format_send_fence_active";
+  // authenticated VERIFIED 会移除临时正文；沿用已验证且身份相符的 durable fence。
+  const challenge = transport.challengeId ?? extractRouteChallengeId(transport.routeAttestationMessage)
+    ?? (transport.routeVerification === "VERIFIED" && routeAttestFence.state === "VERIFIED"
+      && routeAttestFence.companionId === transport.companionId
+      && areChatgptConversationRoutesEquivalent(routeAttestFence.routeCanonical, transport.routeCanonical)
+      ? routeAttestFence.challengeId : null);
+  if (routeAttestFence.state === "VERIFIED" && (!isUuid(challenge) || transport.routeVerification !== "VERIFIED"
+    || routeAttestFence.companionId !== transport.companionId || routeAttestFence.challengeId !== challenge
+    || !areChatgptConversationRoutesEquivalent(routeAttestFence.routeCanonical, transport.routeCanonical))) return "format_send_fence_active";
+  if (routeAttestLatch.state === "VERIFIED" && (!isUuid(challenge) || transport.routeVerification !== "VERIFIED"
+    || routeAttestLatch.challengeId !== challenge
+    || !areChatgptConversationRoutesEquivalent(routeAttestLatch.canonicalRoute, transport.routeCanonical))) return "format_send_fence_active";
+  if (!outcomeUnknownArchiveValid) return "isolation_archive_invalid";
+  if (outcomeUnknownArchive.entries.some(entry => !["isolated", "terminal_gone"].includes(entry.status))) return "format_isolation_pending";
+  return null;
+}
+
+async function formatHistoryKeys() {
+  const workspaceId = project.workspaceId;
+  const raw = globalThis.chrome.storage.local;
+  const legacyKeys = [OUTCOME_UNKNOWN_ARCHIVE_KEY, PANEL_ACTION_KEY, JOURNAL_KEY];
+  const scopedActionKey = projectStorageKey(workspaceId, PANEL_ACTION_KEY);
+  const stored = await raw.get([...legacyKeys, scopedActionKey, TRANSPORT_KEY, PROJECT_REGISTRY_KEY]);
+  const registry = stored[PROJECT_REGISTRY_KEY];
+  const legacyOwned = registry?.legacyMigration === "migrated"
+    && registry.projects?.some(row => row.workspaceId === workspaceId && row.legacy === true)
+    && stored[TRANSPORT_KEY]?.workspaceId === workspaceId
+    && stored[TRANSPORT_KEY]?.bridgeOrigin === project.bridgeOrigin;
+  if (legacyKeys.some(key => stored[key] !== undefined) && !legacyOwned
+    && (!/^[a-f0-9]{12}$/.test(stored[TRANSPORT_KEY]?.workspaceId ?? "") || stored[TRANSPORT_KEY]?.workspaceId === workspaceId)) throw new Error("format_legacy_identity_unknown");
+  // 迁移前的面板日志可能包含多个 workspace；只删除本项目条目。
+  const keys = [projectStorageKey(workspaceId, OUTCOME_UNKNOWN_ARCHIVE_KEY), scopedActionKey,
+    `c2c.panel.hidden.v1.${workspaceId}`, ...(legacyOwned ? legacyKeys : [])];
+  const retained = {};
+  for (const key of [scopedActionKey, ...(legacyOwned ? [PANEL_ACTION_KEY] : [])]) {
+    const value = stored[key];
+    if (value === undefined) continue;
+    if (value?.version !== 1 || !Array.isArray(value.operations)
+      || value.operations.some(item => !/^[a-f0-9]{12}$/.test(item?.workspaceId ?? ""))) throw new Error("panel_journal_corrupt");
+    const foreign = value.operations.filter(item => item.workspaceId !== workspaceId);
+    if (foreign.length) { retained[key] = { version: 1, operations: foreign }; keys.splice(keys.indexOf(key), 1); }
+  }
+  return { keys, retained };
+}
+
+function validFormatResponse(body, hash, status, requireCounts = true) {
+  return body && body.workspaceId === project.workspaceId && body.status === status
+    && /^[a-f0-9]{64}$/.test(body.confirmationSha256 ?? "")
+    && (hash == null || body.confirmationSha256 === hash)
+    && (body.counts === undefined ? !requireCounts : body.counts && typeof body.counts === "object" && !Array.isArray(body.counts)
+      && Object.values(body.counts).every(value => Number.isSafeInteger(value) && value >= 0))
+    && typeof body.notice === "string" && body.notice.length <= 4096;
+}
+
+async function panelFormat(message) {
+  if (!["preview", "confirm", "check"].includes(message.phase)) return { ok: false, reason: "bad_message" };
+  const paused = await forceAutonomyOff("format_history");
+  if (!paused.ok) return paused;
+  const blocked = formatGate();
+  if (blocked) return { ok: false, reason: blocked };
+  productionSendInFlight = true;
+  try { return await panelFormatHeld(message); }
+  finally { productionSendInFlight = false; }
+}
+
+async function panelFormatHeld(message) {
+  if (message.phase === "check" && formatRequestPending === null) return { ok: true, status: "none", autonomy: "off" };
+  if (formatRequestPending !== null && (formatRequestPending.version !== 1
+    || formatRequestPending.workspaceId !== project.workspaceId
+    || !/^[a-f0-9]{64}$/.test(formatRequestPending.confirmationSha256 ?? ""))) return { ok: false, reason: "panel_format_journal_corrupt" };
+  if (message.phase !== "check" && formatRequestPending !== null) return { ok: false, reason: "panel_format_unknown" };
+  const stored = (await chrome.storage.local.get(PANEL_ACTION_KEY))[PANEL_ACTION_KEY];
+  if (stored && (stored.version !== 1 || !Array.isArray(stored.operations))) return { ok: false, reason: "panel_journal_corrupt" };
+  if (stored?.operations.some(item => item.workspaceId === project.workspaceId && item.status === "pending")) return { ok: false, reason: "PANEL_OPERATION_PENDING" };
+  let keys;
+  try { keys = await formatHistoryKeys(); } catch (error) { return { ok: false, reason: error.message }; }
+  let intent = null;
+  if (message.phase === "confirm") {
+    if (message.confirmed !== true || !formatPreview || formatPreview !== message.confirmationSha256)
+      return { ok: false, reason: "explicit_confirmation_required" };
+    intent = { version: 1, workspaceId: project.workspaceId, confirmationSha256: formatPreview };
+    try { await chrome.storage.local.set({ [PANEL_FORMAT_KEY]: intent }); }
+    catch { return { ok: false, reason: "panel_format_persist_failed" }; }
+    formatRequestPending = intent;
+    formatPreview = null;
+  }
+  const hash = formatRequestPending?.confirmationSha256;
+  // 等待 storage 时可能已有 native 请求进入，必须重新核验后再发服务端请求。
+  const changed = formatGate(true);
+  if (changed) {
+    if (intent !== null && formatRequestPending === intent) {
+      // 尚未调用 fetch，只撤回本轮写入的精确 intent；已有未知请求仍保留。
+      try { await chrome.storage.local.remove(PANEL_FORMAT_KEY); }
+      catch { return { ok: false, reason: "panel_format_intent_cleanup_failed" }; }
+      formatRequestPending = null;
+    }
+    return { ok: false, reason: changed };
+  }
+  try {
+    const response = await fetchCompanion(message.phase === "check"
+      ? `/operations/format/result?confirmationSha256=${encodeURIComponent(hash)}`
+      : `/operations/format/${message.phase}`, message.phase === "check"
+      ? { method: "GET", cache: "no-store" }
+      : { method: "POST", body: JSON.stringify(message.phase === "confirm" ? { confirmationSha256: hash } : {}),
+          signal: AbortSignal.timeout(90_000) });
+    if (!isCurrentTransportResponse(response) || requestTransports.get(response)?.requestAuthRevision !== authFailureRevision)
+      return { ok: false, reason: "stale_transport_response" };
+    if (!response.ok) {
+      if (message.phase === "confirm" && response.body?.noMutation === true
+        && response.body.workspaceId === project.workspaceId && response.body.confirmationSha256 === hash) {
+        await chrome.storage.local.remove(PANEL_FORMAT_KEY); formatRequestPending = null;
+      }
+      return { ok: false, reason: response.body?.error ?? "panel_format_unknown" };
+    }
+    assertNoForbiddenFields(response.body);
+    if (message.phase === "preview") {
+      if (!["preview", "not_found"].includes(response.body?.status)
+        || !validFormatResponse(response.body, null, response.body.status)) return { ok: false, reason: "panel_format_response_invalid" };
+      formatPreview = response.body.confirmationSha256;
+      return { ok: true, ...response.body, autonomy: "off", browserArchiveCount: outcomeUnknownArchive.entries.length };
+    }
+    if (message.phase === "check" && validFormatResponse(response.body, hash, "pending", false))
+      return { ok: false, reason: "panel_format_server_pending", status: "pending", needsLocalReview: true };
+    if (!validFormatResponse(response.body, hash, "cleaned", message.phase !== "check")) return { ok: false, reason: "panel_format_unknown" };
+    // Chrome remove 不承诺事务：历史先删，唯一 pending 凭证最后删；失败只读恢复。
+    try {
+      if (Object.keys(keys.retained).length) await globalThis.chrome.storage.local.set(keys.retained);
+      await globalThis.chrome.storage.local.remove(keys.keys);
+      outcomeUnknownArchive = emptyOutcomeUnknownArchive();
+      productionClaimProof = null; productionAckProof = null;
+      lastRecoveryAt = null; lastRecoveryResult = null;
+      lastAutonomyTickAt = null;
+      await chrome.storage.local.remove(PANEL_FORMAT_KEY);
+    } catch { return { ok: false, reason: "panel_format_local_cleanup_failed", serverCleaned: true }; }
+    formatRequestPending = null;
+    return { ok: true, ...response.body, autonomy: "off" };
+  } catch { return { ok: false, reason: message.phase === "preview" ? "network_unreachable" : "panel_format_unknown" }; }
+}
+
 async function handleMessage(message, sender, { transportMutationHeld = false, managedAttestRollback = false } = {}) {
   await initPromise;
   if (!message || typeof message !== "object") return { ok: false, reason: "bad_message" };
+
+  if (message.type === "c2c.operations.format") {
+    if (!isOwnOperationsPanel(sender) || exactOperationsPanelWorkspaceId(sender, globalThis.chrome) !== project.workspaceId)
+      return { ok: false, reason: "extension_panel_required" };
+    const fields = message.phase === "confirm" ? ["type", "phase", "confirmationSha256", "confirmed"] : ["type", "phase"];
+    if (Object.keys(message).some(key => !fields.includes(key))) return { ok: false, reason: "bad_message" };
+    return runTransportMutation(() => panelFormat(message));
+  }
+  if (formatRequestPending !== null && ["c2c.operations.action", "c2c.unbind", "c2c.pair", "c2c.rebind.start", "c2c.rebind.complete",
+    "c2c.connect.page", "c2c.transport.clear", "c2c.reserve.page", "c2c.production.send.request", "c2c.production.journal.persist",
+    "c2c.production.begin.send", "c2c.production.ack", "c2c.write.probe.request", "c2c.send.probe.request",
+    "c2c.autonomy.arm", "c2c.autonomy.enable.shadow", ROUTE_ATTEST_SEND_TYPE].includes(message.type))
+    return { ok: false, reason: "panel_format_unknown" };
 
   if (message.type === "c2c.operations.action") {
     const ownPanel = isOwnOperationsPanel(sender);
@@ -4913,6 +5123,8 @@ async function handleProductionBeginSend(sender, message) {
     return { ok: false, reason: "epoch_mismatch" };
   }
 
+  const requestOwner = { ...ownerCheck.owner };
+  const requestJournal = exactJournalSnapshot(journal);
   let res;
   try {
     res = await fetchCompanion("/begin-send", {
@@ -4947,7 +5159,20 @@ async function handleProductionBeginSend(sender, message) {
     };
   }
   assertNoForbiddenFields(res.body);
-  const body = res.body || {};
+  let body;
+  try {
+    body = await resolveCompletionPayload(res.body || {}, transport.workspaceId);
+  } catch {
+    return { ok: false, reason: "begin_send_response_invalid", journal: summarizeProductionJournal(journal) };
+  }
+  if (!isCurrentTransportResponse(res)
+    || requestTransports.get(res).requestAuthRevision !== authFailureRevision) {
+    return { ok: false, reason: "stale_transport_response" };
+  }
+  if (!ownerStillMatches(requestOwner) || !requireExactOwnerSender(sender).ok
+    || !requireProtectedTransport().ok || requestJournal !== exactJournalSnapshot(journal)) {
+    return { ok: false, reason: "connection_changed", journal: summarizeProductionJournal(journal) };
+  }
   if (
     body.eventId !== journal.eventId
     || body.status !== "claimed"

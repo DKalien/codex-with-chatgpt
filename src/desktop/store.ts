@@ -1,3 +1,4 @@
+import { assertNoLegacyHistoryCleanup } from "../command-cleanup/legacy-history-fence.js";
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -91,9 +92,11 @@ export function requireDesktopRuntimeFence(workspaceId: string, workspaceRoot: s
 // 写纪律模板统一由 src/core/durable-store.ts 保证：wx 锁、tmp wx 0600、
 // fsyncSync、initialized marker 先于 rename、原子 rename、失败清 tmp、锁清理。
 export function updateDesktop<T>(workspaceId: string, change: (state: DesktopState | null) => { state: DesktopState; result: T }, stateDir = getStateDir()): T {
+  assertNoLegacyHistoryCleanup(workspaceId, stateDir);
   const file = desktopFile(workspaceId, stateDir);
   return runDurableStoreTransaction<DesktopState, T>({
     file,
+    afterRead: () => assertNoLegacyHistoryCleanup(workspaceId, stateDir),
     marker: `${file}.initialized`,
     markerContent: "1\n",
     markerOpenMode: 0o600,

@@ -1,3 +1,4 @@
+import { LIGHT_CONTENT_SCRIPTS, LEGACY_CONTENT_SCRIPTS } from "./browser-companion-chains.js";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -966,42 +967,13 @@ describe("G3 route attestation browser contract (source)", () => {
     expect(block).toMatch(/normalizeText/);
   });
 
-  it("manifest ships classic route-attestation scripts, not ESM content_scripts", () => {
+  it("默认 manifest 仅加载轻量 classic 能力，不自动加载旧 route-attestation", () => {
     const manifest = JSON.parse(fs.readFileSync(path.join(companionRoot, "manifest.json"), "utf8"));
     const js = (manifest.content_scripts ?? []).flatMap((cs: { js?: string[] }) => cs.js ?? []);
-    expect(js).toContain("route-attestation-global.js");
-    expect(js).toContain("route-attestation-run-global.js");
-    expect(js).toContain("feedback-bootstrap-run-global.js");
-    expect(js).toContain("dom-adapter-global.js");
-    expect(js).toContain("turn-observer-global.js");
-    expect(js).not.toContain("route-attestation.js");
-    expect(js).not.toContain("route-attestation-run.js");
-    expect(js).not.toContain("dom-adapter.js");
-    expect(js).not.toContain("turn-observer.js");
-    expect(js).toEqual([
-      "route-global.js",
-      "dom-adapter-global.js",
-      "turn-observer-global.js",
-      "shadow-evidence.js",
-      "composer-write-adapter.js",
-      "send-click-adapter.js",
-      "send-probe-message-global.js",
-      "send-probe-run.js",
-      "route-attestation-global.js",
-      "route-attestation-run-global.js",
-      "feedback-bootstrap-run-global.js",
-      "production-send-runtime-global.js",
-      "content-script.js",
-    ]);
-    // Dependency order: dom/turn before attest-global; write/click before run-global; attest before run.
-    expect(js.indexOf("dom-adapter-global.js")).toBeLessThan(js.indexOf("route-attestation-global.js"));
-    expect(js.indexOf("turn-observer-global.js")).toBeLessThan(js.indexOf("route-attestation-global.js"));
-    expect(js.indexOf("composer-write-adapter.js")).toBeLessThan(js.indexOf("route-attestation-run-global.js"));
-    expect(js.indexOf("send-click-adapter.js")).toBeLessThan(js.indexOf("route-attestation-run-global.js"));
-    expect(js.indexOf("route-attestation-global.js")).toBeLessThan(js.indexOf("route-attestation-run-global.js"));
-    expect(js.indexOf("route-attestation-run-global.js")).toBeLessThan(js.indexOf("content-script.js"));
-    expect(js.indexOf("route-attestation-run-global.js")).toBeLessThan(js.indexOf("feedback-bootstrap-run-global.js"));
-    expect(js.indexOf("feedback-bootstrap-run-global.js")).toBeLessThan(js.indexOf("content-script.js"));
+    expect(js).toEqual(LIGHT_CONTENT_SCRIPTS);
+    expect(js).not.toContain("route-attestation-global.js");
+    expect(js).not.toContain("route-attestation-run-global.js");
+    expect(js).not.toContain("feedback-bootstrap-run-global.js");
   });
 
   it("build script generates classic route-attestation artifacts with fail-fast gates", () => {
@@ -1031,9 +1003,10 @@ describe("G3 route attestation browser contract (source)", () => {
     expect(js).not.toContain("route-attestation-run.js");
     expect(js).not.toContain("dom-adapter.js");
     expect(js).not.toContain("turn-observer.js");
-    expect(js).toContain("route-attestation-global.js");
-    expect(js).toContain("route-attestation-run-global.js");
-    expect(js).toContain("feedback-bootstrap-run-global.js");
+    expect(js).toEqual(LIGHT_CONTENT_SCRIPTS);
+    expect(js).not.toContain("route-attestation-global.js");
+    expect(js).not.toContain("route-attestation-run-global.js");
+    expect(js).not.toContain("feedback-bootstrap-run-global.js");
     expect(js).toContain("dom-adapter-global.js");
     expect(js).toContain("turn-observer-global.js");
 
@@ -1141,7 +1114,7 @@ describe("G3 route attestation browser contract (source)", () => {
     }
   });
 
-  it("packaged content-script chain loads in order and exposes attest runtime wiring", async () => {
+  it("显式 legacy classic 链按序加载并保持 attest runtime wiring", async () => {
     const distCompanion = path.join(projectRoot, "dist", "browser-companion");
     const distManifestPath = path.join(distCompanion, "manifest.json");
     if (!fs.existsSync(distManifestPath)) {
@@ -1149,8 +1122,7 @@ describe("G3 route attestation browser contract (source)", () => {
       return;
     }
     const vm = await import("node:vm");
-    const distManifest = JSON.parse(fs.readFileSync(distManifestPath, "utf8"));
-    const js = (distManifest.content_scripts ?? []).flatMap((cs: { js?: string[] }) => cs.js ?? []);
+    const js = LEGACY_CONTENT_SCRIPTS;
 
     const listeners: unknown[] = [];
     const sandbox: Record<string, unknown> = {
@@ -1343,8 +1315,7 @@ describe("classic route-attestation post-write send-ready lifecycle", () => {
       return;
     }
     const vm = await import("node:vm");
-    const distManifest = JSON.parse(fs.readFileSync(path.join(distCompanion, "manifest.json"), "utf8"));
-    const js = (distManifest.content_scripts ?? []).flatMap((cs: { js?: string[] }) => cs.js ?? []);
+    const js = LEGACY_CONTENT_SCRIPTS;
     const sandbox: Record<string, unknown> = {
       console,
       setTimeout: () => 0,

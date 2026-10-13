@@ -28,8 +28,9 @@ import {
 import { registerGatewayCommands } from "../src/cli/gateway.js";
 import { startGatewayServer, type GatewayServer } from "../src/remote/server.js";
 import { buildDaemonEnv } from "../src/process/daemon-spawn.js";
-import { tryAcquireMaintenanceLock, type MaintenanceLockHandle } from "../src/core/maintenance-lock.js";
+import { assertMaintenanceHandle, tryAcquireMaintenanceLock, type MaintenanceLockHandle } from "../src/core/maintenance-lock.js";
 import { cleanup, isolateStateDir } from "./helpers.js";
+import * as lifecycle from "../src/supervisor/lifecycle.js";
 
 let stateDir: string;
 let oldState: string | undefined;
@@ -705,6 +706,105 @@ describe("machine Gateway supervisor", () => {
     expect(probe.mock.calls.length).toBeGreaterThanOrEqual(7);
     expect(fs.existsSync(path.join(stateDir, "gateway", "supervisor.runtime.json"))).toBe(true);
     expect(fs.existsSync(gatewaySupervisorLockFile(stateDir))).toBe(true);
+  });
+
+  it("unified runtime handoff 后在 async maintenance 内恢复旧 running workspace", async () => {
+    writeGatewaySupervisorConfig({ ...config(), unified: true }, stateDir);
+    const buildId = "c".repeat(64);
+    const pinFile = installLaunchPin(buildId);
+    const children = [fakeChild(2181), fakeChild(2182)];
+    const executableByPid = new Map<number, string>([[process.pid, process.execPath]]);
+    let index = 0;
+    let entered!: () => void;
+    const restoring = new Promise<void>(resolve => { entered = resolve; });
+    let finish!: () => void;
+    const pending = new Promise<void>(resolve => { finish = resolve; });
+    const restore = vi.spyOn(lifecycle, "restoreGatewayRunningWorkspaces").mockImplementation(async (maintenance, dir) => {
+      expect(dir).toBe(stateDir);
+      assertMaintenanceHandle(stateDir, maintenance);
+      expect(fs.existsSync(pinFile)).toBe(false);
+      expect(readGatewaySupervisorStatus(stateDir).runtime?.children).toHaveLength(2);
+      entered();
+      await pending;
+      assertMaintenanceHandle(stateDir, maintenance);
+    });
+    let handle: Awaited<ReturnType<typeof startGatewaySupervisor>> | undefined;
+    try {
+      const starting = startGatewaySupervisor({ stateDir, platform: "win32", buildId,
+        startGateway: async () => gateway, readKey: () => "fixture-key", oauthDiscoveryFetchImpl: readyOAuthDiscoveryFetch(),
+        spawnImpl: ((command: string) => { const child = children[index++]; executableByPid.set(child.pid, command); return child; }) as any,
+        probeProcess: async (pid, expected) => ({ ...processProbe(pid, expected ?? `created-${pid}`), executable: executableByPid.get(pid)! }),
+      });
+      await restoring;
+      expect(fs.existsSync(path.join(stateDir, "maintenance.lock"))).toBe(true);
+      finish();
+      handle = await starting;
+      expect(fs.existsSync(path.join(stateDir, "maintenance.lock"))).toBe(false);
+      expect(restore).toHaveBeenCalledTimes(1);
+    } finally {
+      finish();
+      if (handle) expect(await handle.stop()).toBe(true);
+      restore.mockRestore();
+    }
+  });
+
+  it("authenticated shutdown 意图等待全部 Bridge close 后释放 owner，不报 child 提前退出", async () => {
+    writeGatewaySupervisorConfig({ ...config(), unified: true }, stateDir);
+    const children = [fakeChild(2161), fakeChild(2162)];
+    const executableByPid = new Map<number, string>([[process.pid, process.execPath]]);
+    let index = 0;
+    let injected!: Parameters<typeof startGatewayServer>[0];
+    let finishClose!: () => void;
+    const allBridgesClosed = new Promise<void>(resolve => { finishClose = resolve; });
+    const originalClose = gateway.close;
+    gateway.close = vi.fn(async () => { await allBridgesClosed; await originalClose(); });
+    const handle = await startGatewaySupervisor({ stateDir, platform: "win32", buildId: "c".repeat(64),
+      readKey: () => "fixture-key", oauthDiscoveryFetchImpl: readyOAuthDiscoveryFetch(),
+      startGateway: async options => { injected = options; return gateway; },
+      spawnImpl: ((command: string) => { const child = children[index++]; executableByPid.set(child.pid, command); return child; }) as any,
+      probeProcess: async (pid, expected) => ({ ...processProbe(pid, expected ?? `created-${pid}`), executable: executableByPid.get(pid)! }),
+    });
+    expect(handle.runtime.children).toHaveLength(2);
+    expect(handle.runtime.ports).toEqual([config().port]);
+    expect(injected.sharedWorkspaces?.tunnelAvailable()).toBe(true);
+    children[0].exitCode = 0;
+    expect(injected.sharedWorkspaces?.tunnelAvailable()).toBe(false);
+    children[0].exitCode = null;
+    const waiting = handle.wait();
+    injected.onShutdown!();
+    await new Promise(resolve => setImmediate(resolve));
+    expect(gateway.close).toHaveBeenCalledWith("SIGTERM");
+    expect(children.every(child => child.kill.mock.calls.length === 0)).toBe(true);
+    expect(fs.existsSync(gatewaySupervisorLockFile(stateDir))).toBe(true);
+    expect(fs.existsSync(path.join(stateDir, "gateway", "supervisor.runtime.json"))).toBe(true);
+    finishClose();
+    await expect(waiting).resolves.toBeUndefined();
+    expect(injected.sharedWorkspaces?.tunnelAvailable()).toBe(false);
+    expect(children.every(child => child.kill.mock.calls.length === 1)).toBe(true);
+    expect(fs.existsSync(gatewaySupervisorLockFile(stateDir))).toBe(false);
+    expect(fs.existsSync(path.join(stateDir, "gateway", "supervisor.runtime.json"))).toBe(false);
+    expect(await handle.stop()).toBe(true);
+  });
+
+  it.each(["missing", "unknown"] as const)("关闭前 child native %s 保持 deathproof 门禁", async status => {
+    writeGatewaySupervisorConfig(config(), stateDir);
+    const children = [fakeChild(2171), fakeChild(2172)];
+    const executableByPid = new Map<number, string>([[process.pid, process.execPath]]);
+    let index = 0;
+    let stopping = false;
+    const handle = await startGatewaySupervisor({ stateDir, platform: "win32", buildId: "c".repeat(64),
+      startGateway: async () => gateway, readKey: () => "fixture-key", oauthDiscoveryFetchImpl: readyOAuthDiscoveryFetch(),
+      spawnImpl: ((command: string) => { const child = children[index++]; executableByPid.set(child.pid, command); return child; }) as any,
+      probeProcess: async (pid, expected) => stopping && pid !== process.pid ? {
+        ...processProbe(pid), status, executable: null, creationTime: null,
+        errors: { process: status === "missing" ? "PID_MISSING" : "PROBE_UNAVAILABLE", executable: null, creationTime: null, inAnyJob: null },
+      } : { ...processProbe(pid, expected ?? `created-${pid}`), executable: executableByPid.get(pid)! },
+    });
+    stopping = true;
+    expect(await handle.stop()).toBe(status === "missing");
+    expect(children.every(child => child.kill.mock.calls.length === 0)).toBe(true);
+    expect(fs.existsSync(gatewaySupervisorLockFile(stateDir))).toBe(status === "unknown");
+    expect(fs.existsSync(path.join(stateDir, "gateway", "supervisor.runtime.json"))).toBe(status === "unknown");
   });
 
   it("lock 已存在时拒绝启动且不读取 key", async () => {

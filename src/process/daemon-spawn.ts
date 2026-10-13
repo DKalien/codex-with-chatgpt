@@ -13,8 +13,8 @@ export { resolveDaemonSpawnHelperPath, resolveDaemonSpawnPython } from "./proces
  * escape Job membership: a spawner inside a kill-on-close Job (e.g. Codex
  * wrapping its child processes) also kills the detached daemon when the app
  * closes. On win32 we delegate to the Python stdlib helper
- * (see src/process/helper/daemon_spawn.py) which first tries
- * CREATE_BREAKAWAY_FROM_JOB and falls back to a WMI relay that leaves the
+ * (see src/process/helper/daemon_spawn.py) which uses WMI when Job membership
+ * is true/unknown, and only tries CREATE_BREAKAWAY_FROM_JOB outside Jobs. The relay leaves the
  * daemon outside any caller Job and with no live parent link.
  *
  * Fail-closed fallback policy (R5f prework): a direct detached spawn inside a
@@ -57,6 +57,7 @@ export interface DaemonSpawnOptions {
   allowUnprovenDirectFallback?: boolean;
 }
 
+// WMI Create 20s + relay result 20s；保留 5s 协议/探测余量，低于 Gateway 60s 启动预算。
 const DEFAULT_HELPER_TIMEOUT_MS = 45_000;
 
 /** Legacy fixture/diagnostic hint only. Runtime/start/reclaim must use process-probe evidence. */
@@ -185,6 +186,8 @@ function appendLogNote(logFile: string, note: string): void {
 
 interface HelperOutcome {
   ok: boolean;
+  /** 已创建或 WMI 创建结果未知时，禁止任何 fallback 重发。 */
+  spawn_started?: boolean;
   pid?: number;
   mode?: string;
   message?: string;
@@ -215,7 +218,7 @@ function runHelper(opts: DaemonSpawnOptions, python: string, helperPath: string,
     ], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
     const timer = setTimeout(() => {
       try { child.kill(); } catch { /* best effort */ }
-      finish({ ok: false, message: "helper 超时" });
+      finish({ ok: false, spawn_started: true, message: "helper 超时，启动结果未知；禁止重发" });
     }, opts.helperTimeoutMs ?? DEFAULT_HELPER_TIMEOUT_MS);
     child.stdout?.on("data", (chunk: Buffer) => { stdout += chunk.toString("utf8"); });
     child.once("error", (error) => finish({ ok: false, message: `helper 启动失败：${error.message}` }));
@@ -223,13 +226,13 @@ function runHelper(opts: DaemonSpawnOptions, python: string, helperPath: string,
     child.once("close", () => {
       const line = stdout.split("\n").map((entry) => entry.trim()).filter(Boolean).pop();
       if (!line) {
-        finish({ ok: false, message: "helper 无 JSON 输出" });
+        finish({ ok: false, spawn_started: true, message: "helper 无 JSON 输出，启动结果未知；禁止重发" });
         return;
       }
       try {
         finish(JSON.parse(line) as HelperOutcome);
       } catch {
-        finish({ ok: false, message: "helper 输出不是有效 JSON" });
+        finish({ ok: false, spawn_started: true, message: "helper 输出不是有效 JSON，启动结果未知；禁止重发" });
       }
     });
   });
@@ -279,13 +282,20 @@ export async function spawnDetachedDaemon(opts: DaemonSpawnOptions): Promise<Dae
       const mode: DaemonSpawnMode = outcome.mode === "breakaway" ? "helper-breakaway"
         : outcome.mode === "wmi" ? "helper-wmi"
         : outcome.mode === "posix" ? "posix" : "unknown";
+      const finalProcess = parseProcessProbe(outcome.final_probe, outcome.pid!);
+      if (finalProcess.status !== "identified" || finalProcess.inAnyJob !== false) {
+        throw new Error("已创建 daemon，但无法证明最终进程不在 Windows Job 内；禁止重发。");
+      }
       const helperPid = (outcome.helper_probe as { pid?: unknown } | undefined)?.pid;
       return { pid: outcome.pid!, mode, spawnAttemptId,
         helperInJob: typeof outcome.in_job === "boolean" ? outcome.in_job : null,
         spawner: parseProcessProbe(outcome.spawner_probe, process.pid),
         helper: typeof helperPid === "number" && Number.isSafeInteger(helperPid) && helperPid > 0
           ? parseProcessProbe(outcome.helper_probe, helperPid) : null,
-        finalProcess: parseProcessProbe(outcome.final_probe, outcome.pid!) };
+        finalProcess };
+    }
+    if (outcome.spawn_started === true || outcome.pid !== undefined) {
+      throw new Error(`daemon 启动结果未知或独立性未确认；禁止重发：${outcome.message ?? "helper 返回了已创建进程"}`);
     }
     // helper 失败：仅当 caller 被证明不在 Job 内（in_job === false）或显式
     // allowUnprovenDirectFallback 时才允许 direct fallback；其余 fail closed。

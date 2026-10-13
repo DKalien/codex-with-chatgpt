@@ -6,6 +6,10 @@ import { rollout } from "../src/core/rollout.js";
 import * as installModule from "../src/core/install.js";
 import * as buildId from "../src/build-id.js";
 import * as runtimeModule from "../src/bridge/runtime.js";
+import * as supervisorStore from "../src/supervisor/store.js";
+import * as gatewayControl from "../src/gateway/control.js";
+import * as gatewayStartup from "../src/gateway/startup.js";
+import * as nativeProcess from "../src/process/process-probe.js";
 import * as daemon from "../src/process/daemon.js";
 import * as finalizer from "../src/core/post-turn-finalizer.js";
 import { desktopIpc } from "../src/desktop/ipc.js";
@@ -1283,5 +1287,119 @@ describe("core rollout", () => {
     expect(resultFor(winnerSummary, context.workspace.id)).toMatchObject({ status: "upgraded" });
     expect(readPending(context.workspace)).toBeNull();
     expect(fs.existsSync(pendingFile(context.workspace.id))).toBe(false);
+  });
+});
+
+
+describe("shared Gateway owner rollout", () => {
+  function sharedPair() {
+    const a = addContext("shared-a");
+    const b = addContext("shared-b");
+    for (const context of [a, b]) {
+      context.runtime.hosting = "gateway";
+      context.info.hosting = "gateway";
+      writeRuntimeState(context.runtime);
+      makeAfter(context);
+    }
+    const identity = (context: Context) => ({ workspaceId: context.workspace.id, workspaceRoot: context.workspace.root,
+      pid: context.runtime.pid, startedAt: context.runtime.startedAt, port: context.runtime.port,
+      runtimeBuildId: context.runtime.runtimeBuildId ?? null });
+    const oldOwner = { pid: a.runtime.pid, creationTime: "old-creation", buildId: oldBuildId,
+      children: [{ pid: 31001, creationTime: "cloudflared" }, { pid: 31002, creationTime: "tunnel-client" }] };
+    let replaced = false;
+    const request = vi.fn(async (method: string, route: string, body?: unknown) => {
+      if (method === "GET" && route === "/internal/gateway/workspaces") return { workspaces: [identity(a), identity(b)] };
+      if (method === "POST" && route === "/internal/gateway/shutdown") {
+        expect(body).toMatchObject({ expectedOwner: { pid: oldOwner.pid, creationTime: "old-creation", buildId: oldBuildId } });
+        expect((body as { workspaces: unknown[] }).workspaces).toHaveLength(2);
+        return { accepted: true };
+      }
+      throw new Error("unexpected control request");
+    });
+    vi.spyOn(gatewayControl, "requireVerifiedGateway").mockImplementation(async () => ({ request,
+      runtime: replaced ? { ...oldOwner, pid: oldOwner.pid + 1, buildId: targetBuildId } : oldOwner } as never));
+    const coldStart = vi.spyOn(gatewayStartup, "ensureConfiguredGatewaySupervisor").mockImplementation(async () => {
+      // Caller must release maintenance during the existing cold-start protocol, but keep the rollout fence.
+      expect(fs.existsSync(path.join(stateDir, "maintenance.lock"))).toBe(false);
+      expect(fs.existsSync(path.join(stateDir, "rollout.lock"))).toBe(true);
+      replaced = true;
+      return null;
+    });
+    vi.spyOn(nativeProcess, "probeProcess").mockImplementation(async pid => ({ pid, status: "missing",
+      errors: { process: "PID_MISSING" } } as never));
+    const restore = vi.spyOn(daemon, "ensureBridgeAndTunnel").mockImplementation(async (root, options) => {
+      const context = [a, b].find(item => item.workspace.root === root)!;
+      expect(options.maintenance?.token).toBeTruthy();
+      context.runtime = context.afterRuntime!;
+      context.info = context.afterInfo!;
+      return { runtime: context.runtime, info: context.info, mcpUrl: `${context.host}/mcp` } as never;
+    });
+    return { a, b, request, coldStart, restore };
+  }
+
+  it("-w upgrades the whole hosted cohort exactly once and restores only those contexts", async () => {
+    const { a, request, coldStart, restore } = sharedPair();
+    const result = await rollout({ workspaceRoot: a.workspace.root });
+    expect(result.counts.upgraded).toBe(2);
+    expect(result.workspaces).toHaveLength(2);
+    expect(request.mock.calls.filter(call => call[0] === "POST")).toHaveLength(1);
+    expect(coldStart).toHaveBeenCalledTimes(1);
+    expect(restore).toHaveBeenCalledTimes(2);
+    expect(daemon.restartBridge).not.toHaveBeenCalled();
+    expect(fs.existsSync(path.join(stateDir, "maintenance.lock"))).toBe(false);
+    expect(fs.existsSync(path.join(stateDir, "rollout.lock"))).toBe(false);
+  });
+
+  it("a stop intent during owner cutover is respected instead of reviving that workspace", async () => {
+    const { a, b, restore } = sharedPair();
+    vi.spyOn(supervisorStore, "readSupervisorConfig").mockImplementation(root => root === b.workspace.root ?
+      { desiredState: "stopped" } as never : null);
+    const result = await rollout({ workspaceRoot: a.workspace.root });
+    expect(result.counts.upgraded).toBe(1);
+    expect(result.counts.stopped).toBe(1);
+    expect(restore).toHaveBeenCalledTimes(1);
+    expect(restore.mock.calls[0]![0]).toBe(a.workspace.root);
+  });
+
+  it("a busy sibling blocks the shared owner even when only A is selected", async () => {
+    const { a, b, request, coldStart, restore } = sharedPair();
+    b.info.pairingActive = true;
+    const result = await rollout({ workspaceRoot: a.workspace.root });
+    expect(result.counts.pending_busy).toBe(2);
+    expect(result.workspaces.every(item => item.reason === "pairing_active")).toBe(true);
+    expect(request.mock.calls.some(call => call[0] === "POST")).toBe(false);
+    expect(coldStart).not.toHaveBeenCalled();
+    expect(restore).not.toHaveBeenCalled();
+  });
+
+  it("a quick sibling blocks shared owner replacement", async () => {
+    const { a, b, request } = sharedPair();
+    b.info.tunnel = { provider: "cloudflare-quick", running: true, url: b.host };
+    const result = await rollout({ workspaceRoot: a.workspace.root });
+    expect(result.counts.skipped_quick).toBe(2);
+    expect(request.mock.calls.some(call => call[0] === "POST")).toBe(false);
+  });
+
+  it("unknown native shutdown evidence never cold-starts or restores", async () => {
+    const { a, coldStart, restore } = sharedPair();
+    vi.mocked(nativeProcess.probeProcess).mockResolvedValue({ status: "unknown" } as never);
+    const result = await rollout({ workspaceRoot: a.workspace.root });
+    expect(result.counts.pending).toBe(2);
+    expect(result.workspaces.every(item => item.reason === "runtime_unknown")).toBe(true);
+    expect(coldStart).not.toHaveBeenCalled();
+    expect(restore).not.toHaveBeenCalled();
+  });
+
+  it("a sibling becoming busy in the final gate prevents shutdown", async () => {
+    const { a, b, request } = sharedPair();
+    let reads = 0;
+    vi.mocked(runtimeModule.adminFetch).mockImplementation(async runtime => {
+      const context = contexts.get(runtime.workspaceId)!;
+      if (context === b && ++reads > 1) return { ...context.info, pairingActive: true } as never;
+      return context.info as never;
+    });
+    const result = await rollout({ workspaceRoot: a.workspace.root });
+    expect(result.counts.pending_busy).toBe(2);
+    expect(request.mock.calls.some(call => call[0] === "POST")).toBe(false);
   });
 });

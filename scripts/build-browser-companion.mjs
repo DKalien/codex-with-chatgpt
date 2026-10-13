@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * Package the Edge MV3 browser companion into dist/browser-companion.
- * No bundler framework — copy + compile shared route parser only.
+ * No bundler framework — copy compiled browser-safe shared modules.
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -12,6 +12,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const srcCompanion = path.join(root, "browser-companion");
 const distCompanion = path.join(root, "dist", "browser-companion");
 const routeJs = path.join(root, "dist", "chatgpt", "route.js");
+const completionJs = path.join(root, "dist", "browser", "completion-notification.js");
 
 function fail(msg) {
   console.error(`build-browser-companion: ${msg}`);
@@ -20,6 +21,14 @@ function fail(msg) {
 
 if (!fs.existsSync(routeJs)) {
   fail(`missing compiled route module at ${routeJs}; run tsc first`);
+}
+
+if (!fs.existsSync(completionJs)) {
+  fail(`missing compiled completion module at ${completionJs}; run tsc first`);
+}
+const completionEsm = fs.readFileSync(completionJs, "utf8");
+if (!/export function renderCompletionNotification/.test(completionEsm) || /^import\s/m.test(completionEsm)) {
+  fail("completion-notification.js must export a dependency-free browser renderer");
 }
 
 const routeEsm = fs.readFileSync(routeJs, "utf8");
@@ -75,6 +84,7 @@ function copyDir(from, to) {
 
 fs.rmSync(distCompanion, { recursive: true, force: true });
 copyDir(srcCompanion, distCompanion);
+fs.copyFileSync(completionJs, path.join(distCompanion, "completion-notification.js"));
 
 const domAdapter = fs.readFileSync(path.join(srcCompanion, "dom-adapter.js"), "utf8");
 // Classic CS artifact only. ESM dist/dom-adapter.js stays intact for service-worker imports.
@@ -580,10 +590,16 @@ for (const p of manifest.permissions ?? []) {
 
 const requiredFiles = [
   "manifest.json",
+  "bridge-client.js",
+  "bridge-operations.js",
+  "content-lite.js",
+  "popup/lightweight.html",
+  "popup/lightweight.js",
   "service-worker.js",
   "content-script.js",
   "ownership.js",
   // ESM artifacts (SW import graph)
+  "completion-notification.js",
   "dom-adapter.js",
   "turn-observer.js",
   // classic CS artifacts
@@ -617,7 +633,7 @@ for (const f of requiredFiles) {
   if (!fs.existsSync(path.join(distCompanion, f))) fail(`packaged file missing: ${f}`);
 }
 
-const popupHtml = fs.readFileSync(path.join(distCompanion, "popup", "popup.html"), "utf8");
+const popupHtml = fs.readFileSync(path.join(distCompanion, manifest.action.default_popup), "utf8");
 const popupScripts = [...popupHtml.matchAll(/<script\b([^>]*)><\/script>/gi)]
   .map(([, attributes]) => ({
     attributes,
@@ -695,6 +711,10 @@ for (const [name, observer] of [
 
 // G3 content_scripts packaging: classic only; ESM SW modules stay off the CS chain.
 const csJs = (manifest.content_scripts ?? []).flatMap((cs) => cs.js ?? []);
+const lightweightOrder = ["route-global.js","dom-adapter-global.js","turn-observer-global.js","composer-write-adapter.js","send-click-adapter.js","content-lite.js"];
+if (JSON.stringify(csJs) !== JSON.stringify(lightweightOrder)) fail("lightweight content_scripts order mismatch");
+// 旧组件继续生成供历史合同回归；它们不再注入用户页面。
+const legacyCsJs = ["route-global.js", "dom-adapter-global.js", "turn-observer-global.js", "shadow-evidence.js", "composer-write-adapter.js", "send-click-adapter.js", "send-probe-message-global.js", "send-probe-run.js", "route-attestation-global.js", "route-attestation-run-global.js", "feedback-bootstrap-run-global.js", "production-send-runtime-global.js", "content-script.js"];
 for (const bannedCs of [
   "route-attestation.js",
   "route-attestation-run.js",
@@ -707,33 +727,12 @@ for (const bannedCs of [
   }
 }
 for (const requiredCs of [
-  "route-attestation-global.js",
-  "route-attestation-run-global.js",
-  "feedback-bootstrap-run-global.js",
   "dom-adapter-global.js",
   "turn-observer-global.js",
 ]) {
   if (!csJs.includes(requiredCs)) {
     fail(`manifest content_scripts must load classic ${requiredCs}`);
   }
-}
-const expectedCsOrder = [
-  "route-global.js",
-  "dom-adapter-global.js",
-  "turn-observer-global.js",
-  "shadow-evidence.js",
-  "composer-write-adapter.js",
-  "send-click-adapter.js",
-  "send-probe-message-global.js",
-  "send-probe-run.js",
-  "route-attestation-global.js",
-  "route-attestation-run-global.js",
-  "feedback-bootstrap-run-global.js",
-  "production-send-runtime-global.js",
-  "content-script.js",
-];
-if (JSON.stringify(csJs) !== JSON.stringify(expectedCsOrder)) {
-  fail(`manifest content_scripts order mismatch: ${JSON.stringify(csJs)}`);
 }
 for (const f of csJs) {
   const p = path.join(distCompanion, f);
@@ -764,10 +763,10 @@ const routeAttestRunDeps = [
   { symbol: "isRouteAttestationMessage", file: "route-attestation-global.js", expose: /globalThis\.isRouteAttestationMessage\s*=/ },
   { symbol: "snapshotUserTurns", file: "turn-observer-global.js", expose: /globalThis\.snapshotUserTurns\s*=/ },
 ];
-const runGlobalIdx = csJs.indexOf("route-attestation-run-global.js");
+const runGlobalIdx = legacyCsJs.indexOf("route-attestation-run-global.js");
 if (runGlobalIdx < 0) fail("manifest missing route-attestation-run-global.js");
 for (const dep of routeAttestRunDeps) {
-  const idx = csJs.indexOf(dep.file);
+  const idx = legacyCsJs.indexOf(dep.file);
   if (idx < 0) fail(`route-attest run dep ${dep.symbol}: manifest missing ${dep.file}`);
   if (idx >= runGlobalIdx) {
     fail(`route-attest run dep ${dep.symbol}: ${dep.file} must load before route-attestation-run-global.js`);
@@ -782,10 +781,10 @@ const bootstrapRunDeps = [
   { symbol: "areChatgptConversationRoutesEquivalent", file: "route-global.js", expose: /globalThis\.areChatgptConversationRoutesEquivalent\s*=/ },
   { symbol: "collectBoundedDescendants", file: "turn-observer-global.js", expose: /globalThis\.collectBoundedDescendants\s*=/ },
 ];
-const bootstrapRunIdx = csJs.indexOf("feedback-bootstrap-run-global.js");
+const bootstrapRunIdx = legacyCsJs.indexOf("feedback-bootstrap-run-global.js");
 if (bootstrapRunIdx < 0) fail("manifest missing feedback-bootstrap-run-global.js");
 for (const dep of bootstrapRunDeps) {
-  const idx = csJs.indexOf(dep.file);
+  const idx = legacyCsJs.indexOf(dep.file);
   if (idx < 0 || idx >= bootstrapRunIdx) {
     fail(`feedback bootstrap dep ${dep.symbol}: ${dep.file} must load before feedback-bootstrap-run-global.js`);
   }
@@ -811,10 +810,10 @@ const sendProbeRunDeps = [
   { symbol: "__c2cResolveMutationCanonicalRoute", file: "composer-write-adapter.js", expose: /globalThis\.__c2cResolveMutationCanonicalRoute\s*=/ },
   { symbol: "buildSendProbeMessage", file: "send-probe-message-global.js", expose: /globalThis\.buildSendProbeMessage\s*=/ },
 ];
-const sendProbeRunIdx = csJs.indexOf("send-probe-run.js");
+const sendProbeRunIdx = legacyCsJs.indexOf("send-probe-run.js");
 if (sendProbeRunIdx < 0) fail("manifest missing send-probe-run.js");
 for (const dep of sendProbeRunDeps) {
-  const idx = csJs.indexOf(dep.file);
+  const idx = legacyCsJs.indexOf(dep.file);
   if (idx < 0) fail(`send-probe run dep ${dep.symbol}: manifest missing ${dep.file}`);
   if (idx >= sendProbeRunIdx) {
     fail(`send-probe run dep ${dep.symbol}: ${dep.file} must load before send-probe-run.js`);
@@ -885,7 +884,7 @@ if (/globalThis\.readCanonicalComposerText\s*=/.test(clickClassicGate)) {
   fail("send-click-adapter.js must not expose unnamespaced readCanonicalComposerText");
 }
 
-for (const f of ["ownership.js", "dom-adapter-global.js", "content-script.js", "service-worker.js", "turn-observer-global.js", "shadow-evidence.js", "dom-adapter.js", "turn-observer.js", "route-attestation.js"]) {
+for (const f of ["bridge-client.js", "bridge-operations.js", "content-lite.js", "ownership.js", "dom-adapter-global.js", "content-script.js", "service-worker.js", "turn-observer-global.js", "shadow-evidence.js", "dom-adapter.js", "turn-observer.js", "route-attestation.js", "completion-notification.js"]) {
   const text = fs.readFileSync(path.join(distCompanion, f), "utf8");
   if (/require\(["']node:/.test(text) || /from ["']node:/.test(text)) {
     fail(`${f} must not use Node-only imports`);

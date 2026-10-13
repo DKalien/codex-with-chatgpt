@@ -65,6 +65,7 @@ function operationKey(workspaceId: string, commandId: string, stateDir: string):
   return cleanupJournalFile(workspaceId, commandId, stateDir);
 }
 export function assertCommandWritable(workspaceId: string, commandId: string, stateDir = getStateDir()): void {
+  assertNoLegacyHistoryCleanup(workspaceId, stateDir);
   if (readCleanupJournal(workspaceId, commandId, stateDir))
     throw new CommandCleanupError("COMMAND_CLEANUP_IN_PROGRESS", "command 正在 cleanup；不得投递、记录或重新投影。");
 }
@@ -197,10 +198,11 @@ export function assertCommandOperationOwned(workspaceId: string, commandId: stri
 }
 
 function acquireCommandOperation(workspaceId: string, commandId: string, maintenance: boolean, stateDir: string): () => void {
+  assertNoLegacyHistoryCleanup(workspaceId, stateDir);
   let release: () => void;
   try { release = acquireLock(`${cleanupJournalFile(workspaceId, commandId, stateDir)}.lock`, stateDir, "command lifecycle"); }
   catch (error) { if (error instanceof CommandCleanupError) error.commandId = commandId; throw error; }
-  try { discardJournalTemps(workspaceId, commandId, stateDir); if (!maintenance) assertCommandWritable(workspaceId, commandId, stateDir); }
+  try { assertNoLegacyHistoryCleanup(workspaceId, stateDir); discardJournalTemps(workspaceId, commandId, stateDir); if (!maintenance) assertCommandWritable(workspaceId, commandId, stateDir); }
   catch (error) { release(); throw error; }
   return release;
 }

@@ -3,6 +3,20 @@
 > 生成日期：2026-10-09。执行：Codex（受用户委托）。基线 HEAD `98292c2`（分支 `codex/official-mcp-events`，审查开始时 working tree clean）。
 > 结论速览：项目安全控制呈 defense-in-depth 形态；冗余的主体是**同一检查的多份重复实现**（可安全收敛）与**看似重复、实为真实信任边界**的多层校验（不可删）。8 项冻结门禁 0 项可删语义；实施 4 批收敛（B1/B2/B4/B6），2 批（B3/B5）经逐点核实判定不满足删层判据而保留。
 
+## 2026-10-12 默认 Companion 合同更新
+
+本报告后续的 B/C 批次、冻结项与测试计数是原日期评估快照，不代表当前扩展仍默认加载旧实现。现役边界继续以 [AGENTS.md](../AGENTS.md) 为权威；默认链见[轻量 Companion](companion-lightweight.md)。
+
+| 控制 | 当前责任与变化 | 证据入口 |
+|---|---|---|
+| 默认加载 | `bridge-client.js` + `content-lite.js` + `popup/lightweight.html`；旧 phase/owner-proof/route-attest/fence/journal 实现保留兼容，不默认加载 | `browser-companion/manifest.json` |
+| 安全判定 | OAuth scope、本机确认、binding/enable、owner/project/workspace、版本/hash、审批、防重放和 outcome_unknown 全部由 Bridge 判定 | `src/bridge/companion.ts`、`src/bridge/result-bus-delivery.ts` |
+| 配对权限 | 独立 Grant 请求精确 origin；Pair 只 contains，密钥只在 popup 内存；JSON 自动登记并选择项目 | `browser-companion/popup/lightweight.js` |
+| 回流连接 | 配对后按需本机确认，状态推进 commit/bind；无需 route 验证消息；local_user 不授予 MCP principal | `browser-companion/bridge-client.js`、`src/bridge/companion-local-route.ts` |
+| 单次发送 | `/begin-send once:true` 只对首次 durable claim 授权 DOM 执行；重启或响应不明只观察原 attempt，精确 observed 后 ACK | `src/result-bus/delivery-lifecycle.ts`、`browser-companion/content-lite.js` |
+
+本节是源码合同更新，不补记新的全量回归、部署或真实网页验收。
+
 ## 1. 范围与方法
 
 - 范围：`src/`（含 Desktop Python helper）、`browser-companion/`、`scripts/`、`docs/`、`tests/` 全部安全控制（身份验证、授权、加密/哈希、访问限制、审计/防重放、状态机门禁、进程/环境隔离等）。

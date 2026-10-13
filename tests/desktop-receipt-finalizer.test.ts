@@ -25,6 +25,7 @@ import {
 } from "../src/desktop/receipt-finalizer.js";
 import { acquireReceiptFinalizationClaim, readReceiptFinalizationClaim, receiptFinalizationClaimPath, writeReceiptFinalizationWorkerFailureAlert } from "../src/desktop/receipt-finalizer-store.js";
 import { type DaemonSpawnOptions, type DaemonSpawnResult } from "../src/process/daemon-spawn.js";
+import { probeProcess } from "../src/process/process-probe.js";
 import { Workspace } from "../src/workspace/manager.js";
 
 const threadId = "01a00000-0000-7000-8000-000000000101";
@@ -785,6 +786,27 @@ describe("Desktop receipt terminal fence", () => {
     fs.writeFileSync(blocker, "x", "utf8");
     await expect(runReceiptFinalizer(pending, { stateDir: path.join(blocker, "state") }))
       .rejects.toThrow();
+  });
+
+  it.skipIf(process.platform !== "win32")("短命 receipt worker 经真实 helper 完成后不误报 worker_spawn_failed", async () => {
+    stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "c2c-receipt-finalizer-"));
+    const pending = draft(stateDir);
+    const markerFile = path.join(stateDir, "worker-completed.json");
+    const entry = path.join(stateDir, "short-worker.mjs");
+    fs.writeFileSync(entry, `import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(markerFile)}, JSON.stringify(process.argv.slice(2)));`, "utf8");
+    const spawned = await spawnReceiptFinalizerWorker(pending, { stateDir, entry });
+    expect(spawned.finalProcess).toMatchObject({ pid: spawned.pid, status: "identified", inAnyJob: false });
+    const deadline = Date.now() + 10_000;
+    let observed = await probeProcess(spawned.pid, undefined, undefined, spawned.finalProcess.creationTime!);
+    while (observed.status === "identified" && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+      observed = await probeProcess(spawned.pid, undefined, undefined, spawned.finalProcess.creationTime!);
+    }
+    expect(observed.status).toBe("missing");
+    expect(JSON.parse(fs.readFileSync(markerFile, "utf8"))).toEqual([
+      "desktop-receipt-finalizer", "run", "-w", pending.workspaceRoot, "--draft", pending.draftId,
+    ]);
+    expect(readReceiptFinalizationAlert(stateDir, pending.workspaceId, pending.commandId)).toBeNull();
   });
 
   it("worker awaits the Job-escaping daemon helper with an allowlisted environment", async () => {

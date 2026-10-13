@@ -179,7 +179,8 @@ function verifyWindowsAcls(targets: Array<{ path: string; mode: "set-directory" 
   let output: string;
   try {
     output = execFileSync(powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", ACL_SCRIPT], {
-      encoding: "utf8", windowsHide: true, timeout: 8000, maxBuffer: 16 * 1024,
+      // 预算包含 PowerShell 冷启动、ACL 校验与退出；超时仍拒绝本次操作。
+      encoding: "utf8", windowsHide: true, timeout: 15_000, maxBuffer: 16 * 1024,
       // 显式 pipe 防止 execFileSync 在抛错前将原始 PowerShell stderr 写到父进程。
       stdio: "pipe",
       env: {

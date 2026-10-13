@@ -1,8 +1,8 @@
 import { cleanupStrict, fixtureProcessIdentity, stopFixtureProcess, type FixtureProcessIdentity } from "./strict-teardown.js";
 import fs from "node:fs";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
-import { afterEach, describe, expect, it } from "vitest";
+import { spawn, spawnSync } from "node:child_process";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { STARTUP_LEASE_ENV } from "../src/core/startup-lease.js";
 import {
   buildDaemonEnv,
@@ -213,33 +213,48 @@ windowsTests("daemon spawn Windows Job escape", () => {
     expect(readLog(logFile)).toContain("allowUnprovenDirectFallback");
   }, 60_000);
 
-  it("helper 输出无效 JSON（in_job 未知）时 fail closed；逃生阀下回退 direct", async () => {
+  it("helper 输出无效 JSON 时结果未知，显式逃生阀也不能重发", async () => {
     const dir = tmp("daemon-garbage-helper");
-    const logFile = path.join(dir, "daemon.log");
-    const script = write(dir, "daemon.mjs", 'import { writeFileSync } from "node:fs";\nwriteFileSync(process.argv[2], "direct-ok");\n');
+    const marker = path.join(dir, "marker-should-not-exist.txt");
     const fakeHelper = write(dir, "garbage-helper.py", "import sys; sys.stdout.write('not json\\n')\n");
-    await expect(spawnDetachedDaemon({
-      cmd: process.execPath,
-      args: [script, path.join(dir, "marker-should-not-exist.txt")],
-      logFile,
-      env: { ...process.env },
-      helperPath: fakeHelper,
-    })).rejects.toThrow("in_job=unknown");
-    expect(fs.existsSync(path.join(dir, "marker-should-not-exist.txt"))).toBe(false);
-    const marker = path.join(dir, "marker.txt");
-    const result = await spawnDetachedDaemon({
-      cmd: process.execPath,
-      args: [script, marker],
-      logFile,
-      env: { ...process.env },
-      helperPath: fakeHelper,
-      allowUnprovenDirectFallback: true,
-    });
-    fixtureProcesses.push(fixtureProcessIdentity(result.finalProcess));
-    expect(result.mode).toBe("direct");
-    await waitForFile(marker);
-    expect(readLog(logFile)).toContain("helper spawn 失败");
+    for (const allowUnprovenDirectFallback of [false, true]) {
+      const spawnImpl = vi.fn(spawn);
+      await expect(spawnDetachedDaemon({
+        cmd: process.execPath, args: ["-e", ""], logFile: path.join(dir, "daemon.log"),
+        env: { ...process.env }, helperPath: fakeHelper, spawnImpl, allowUnprovenDirectFallback,
+      })).rejects.toThrow("禁止重发");
+      expect(spawnImpl).toHaveBeenCalledTimes(1);
+    }
+    expect(fs.existsSync(marker)).toBe(false);
   }, 60_000);
+
+  it.each([true, null, "missing"])("helper 报成功但最终 Job 证据为 %s 时拒绝且只启动一次", async (inAnyJob) => {
+    const dir = tmp("daemon-unproven-final");
+    const payload = { ok: true, pid: 321, mode: "breakaway", in_job: false, final_probe: {
+      pid: 321, status: "identified", executable: process.execPath, creationTime: "12345",
+      inAnyJob, observedAt: new Date().toISOString(),
+      errors: { process: null, executable: null, creationTime: null, inAnyJob: null },
+    } };
+    const fakeHelper = write(dir, "unproven-helper.py", `print(${JSON.stringify(JSON.stringify(payload))})\n`);
+    const spawnImpl = vi.fn(spawn);
+    await expect(spawnDetachedDaemon({ cmd: process.execPath, args: ["-e", ""],
+      logFile: path.join(dir, "daemon.log"), env: { ...process.env }, helperPath: fakeHelper,
+      spawnImpl, allowUnprovenDirectFallback: true,
+    })).rejects.toThrow("禁止重发");
+    expect(spawnImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("helper 已开始创建但丢失 ACK 时，即使 in_job=false 也不得 fallback", async () => {
+    const dir = tmp("daemon-unknown-start");
+    const payload = { ok: false, in_job: false, spawn_started: true };
+    const fakeHelper = write(dir, "unknown-helper.py", `print(${JSON.stringify(JSON.stringify(payload))})\n`);
+    const spawnImpl = vi.fn(spawn);
+    await expect(spawnDetachedDaemon({ cmd: process.execPath, args: ["-e", ""],
+      logFile: path.join(dir, "daemon.log"), env: { ...process.env }, helperPath: fakeHelper,
+      spawnImpl, allowUnprovenDirectFallback: true,
+    })).rejects.toThrow("禁止重发");
+    expect(spawnImpl).toHaveBeenCalledTimes(1);
+  });
 
   it("helper 超时（in_job 未知）时杀掉 helper 并 fail closed", async () => {
     const dir = tmp("daemon-slow-helper");
@@ -253,7 +268,8 @@ windowsTests("daemon spawn Windows Job escape", () => {
       env: { ...process.env },
       helperPath: slowHelper,
       helperTimeoutMs: 500,
-    })).rejects.toThrow("in_job=unknown");
+      allowUnprovenDirectFallback: true,
+    })).rejects.toThrow("禁止重发");
     expect(fs.existsSync(path.join(dir, "marker-should-not-exist.txt"))).toBe(false);
   }, 60_000);
 
@@ -324,7 +340,7 @@ windowsTests("daemon spawn Windows Job escape", () => {
     expect(result.finalProcess).toMatchObject({ pid: result.pid, status: "identified" });
     expect(result.finalProcess.executable?.toLowerCase()).toBe(process.execPath.toLowerCase());
     expect(result.finalProcess.creationTime).toMatch(/^[0-9]+$/);
-    expect(typeof result.finalProcess.inAnyJob).toBe("boolean");
+    expect(result.finalProcess.inAnyJob).toBe(false);
     expect(typeof result.helperInJob).toBe("boolean");
     expect(result.spawner).toMatchObject({ pid: process.pid, status: "identified" });
     await waitForFile(marker, 30_000);

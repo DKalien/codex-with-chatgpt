@@ -24,6 +24,7 @@ export interface RuntimeState {
   adminToken: string;
   publicUrl: string | null;
   startedAt: string;
+  hosting?: "gateway";
   runtimeBuildId?: string;
   capabilities?: readonly string[];
 }
@@ -40,16 +41,17 @@ export function readRuntimeState(workspaceId: string): RuntimeState | null {
   return readJsonIfExists<RuntimeState>(runtimeFile(workspaceId));
 }
 
-export function clearRuntimeState(workspaceId: string, expected?: Pick<RuntimeState, "pid" | "startedAt" | "adminToken">): void {
+export function clearRuntimeState(workspaceId: string, expected?: Pick<RuntimeState, "pid" | "startedAt" | "adminToken">): boolean {
   if (expected) {
     const current = readRuntimeState(workspaceId);
     if (!current || current.pid !== expected.pid || current.startedAt !== expected.startedAt ||
-      current.adminToken !== expected.adminToken) return;
+      current.adminToken !== expected.adminToken) return false;
   }
   try {
-    fs.rmSync(runtimeFile(workspaceId), { force: true });
+    fs.unlinkSync(runtimeFile(workspaceId));
+    return true;
   } catch {
-    // ignore
+    return false;
   }
 }
 
@@ -60,6 +62,7 @@ export interface HealthPayload {
   status: string;
   pid?: number;
   startedAt?: string;
+  hosting?: "gateway";
   runtimeBuildId?: string;
   capabilities?: readonly string[];
 }
@@ -120,17 +123,18 @@ export type BridgeObservation =
 async function authenticateRuntimeIdentity(runtime: RuntimeState, health: HealthPayload): Promise<boolean> {
   if (health.pid !== runtime.pid || typeof health.startedAt !== "string" || health.startedAt !== runtime.startedAt)
     return false;
+  if (health.hosting !== runtime.hosting) return false;
   if (health.runtimeBuildId !== undefined && runtime.runtimeBuildId !== undefined && health.runtimeBuildId !== runtime.runtimeBuildId)
     return false;
   try {
     const info = await adminFetch<Partial<RuntimeState>>(runtime, "GET", "/admin/info", 2000);
     if (info.service !== runtime.service || info.workspaceId !== runtime.workspaceId ||
       info.workspaceRoot !== runtime.workspaceRoot || info.pid !== runtime.pid ||
-      info.startedAt !== runtime.startedAt || info.port !== runtime.port ||
+      info.startedAt !== runtime.startedAt || info.port !== runtime.port || info.hosting !== runtime.hosting ||
       (runtime.runtimeBuildId !== undefined && info.runtimeBuildId !== runtime.runtimeBuildId)) return false;
     const confirmed = await probeBridge(runtime.port);
     return !!confirmed && confirmed.status === "ok" && confirmed.workspaceId === runtime.workspaceId &&
-      confirmed.pid === runtime.pid && confirmed.startedAt === runtime.startedAt &&
+      confirmed.pid === runtime.pid && confirmed.startedAt === runtime.startedAt && confirmed.hosting === runtime.hosting &&
       (runtime.runtimeBuildId === undefined || confirmed.runtimeBuildId === runtime.runtimeBuildId);
   } catch {
     return false;
@@ -158,6 +162,7 @@ export async function findBridgeObservation(workspaceId: string): Promise<Bridge
     if (health.status !== "ok" || typeof health.workspaceId !== "string" || !health.workspaceId) {
       return { state: "unknown", runtime, reason: "identity_mismatch" };
     }
+    if (health.hosting !== runtime.hosting) return { state: "unknown", runtime, reason: "identity_mismatch" };
     const legacy = health.pid === undefined && health.startedAt === undefined;
     const healthStart = typeof health.startedAt === "string" ? Date.parse(health.startedAt) : NaN;
     const identified = typeof health.pid === "number" && Number.isSafeInteger(health.pid) &&

@@ -702,7 +702,8 @@ describe("runtime unreachability (E1b3b safety gate)", () => {
     expect(js).not.toContain("turn-observer.js");
     expect(js).not.toContain("dom-adapter.js");
     expect(js).toContain("dom-adapter-global.js");
-    expect(js).toContain("shadow-evidence.js");
+    expect(js).not.toContain("shadow-evidence.js");
+    expect(js).toContain("content-lite.js");
     for (const p of manifest.permissions ?? []) {
       expect(["scripting", "debugger", "nativeMessaging", "webRequest"]).not.toContain(p);
     }

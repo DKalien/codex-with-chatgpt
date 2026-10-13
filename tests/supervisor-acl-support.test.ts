@@ -84,7 +84,7 @@ describe("supervisor failed fixture evidence", () => {
     if (process.platform === "win32") {
       expect(fs.readFileSync(path.join(evidence, "original-acls.jsonl"), "utf8")).toContain("original-sddl");
       expect(spawn).toHaveBeenCalledTimes(1);
-      expect(spawn.mock.calls[0][2]).toMatchObject({ timeout: 8000, windowsHide: true });
+      expect(spawn.mock.calls[0][2]).toMatchObject({ timeout: 15_000, windowsHide: true });
     }
   });
 

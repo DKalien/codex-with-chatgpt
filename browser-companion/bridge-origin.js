@@ -26,8 +26,14 @@ const FEEDBACK_ENDPOINTS = new Set([
   "/route/local/status",
   "/route/local/commit",
   "/operations",
+  "/operations/preview",
+  "/operations/confirm",
+  "/operations/reconcile",
   "/operations/result",
   "/operations/terminal-gone",
+  "/operations/format/preview",
+  "/operations/format/confirm",
+  "/operations/format/result",
   "/reserve",
   "/release",
   "/begin-send",
@@ -59,7 +65,12 @@ function feedbackEndpointPath(path) {
     if (!match || !UUID.test(match[1])) throw new BridgeOriginError("route/local/status query 无效");
     return `${COMPANION_API_PREFIX}${endpoint}${query}`;
   }
+  if (endpoint === "/operations/format/result") {
+    if (!/^\?confirmationSha256=[a-f0-9]{64}$/.test(query)) throw new BridgeOriginError("operations/format/result query 无效");
+    return `${COMPANION_API_PREFIX}${endpoint}${query}`;
+  }
   if (endpoint === "/operations/result") {
+    if (/^\?requestId=[0-9a-fA-F-]{36}$/.test(query) && UUID.test(query.slice(11))) return `${COMPANION_API_PREFIX}${endpoint}${query}`;
     const match = /^\?commandId=([A-Za-z0-9_-]{1,128})&iteration=([1-9][0-9]*)$/.exec(query);
     if (!match || !Number.isSafeInteger(Number(match[2])) || Number(match[2]) < 1) {
       throw new BridgeOriginError("operations/result query 无效");

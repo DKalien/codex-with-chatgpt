@@ -22,6 +22,7 @@ import { requestLocalRoute, finishLocalRouteConfirmation, commitLocalRoute, loca
 import { createCompanionRouter } from "../src/bridge/companion.js";
 import { requestJson } from "./http-json.js";
 import { grantPanelActions } from "../src/feedback/panel.js";
+import { renderCompletionNotification } from "../browser-companion/completion-notification.js";
 
 const { confirmMock } = vi.hoisted(() => ({ confirmMock: vi.fn() }));
 vi.mock("../src/feedback/local-route-confirm.js", () => ({ confirmLocalRoute: confirmMock }));
@@ -220,7 +221,11 @@ describe("本机 route 的单次授权", () => {
     const started = await post("begin-send", { eventId, reservationId: reserved.body.reservationId });
     expect(started.status, JSON.stringify(started.body)).toBe(200);
     expect(started.body.status).toBe("claimed");
-    expect(started.body.message).toContain("local route canonical result");
+    expect(started.body).not.toHaveProperty("message");
+    expect(started.body.signal).toEqual({ type: "execution_ended", version: 1, workspaceId, commandId,
+      taskId: `desktop_${commandId}`, attemptId: started.body.attemptId });
+    expect(started.body.messageSha256).toBe(sha256Hex(renderCompletionNotification(started.body.signal)));
+    expect(JSON.stringify(started.body)).not.toContain("local route canonical result");
     expect(await post("ack", { eventId, attemptId: started.body.attemptId })).toMatchObject({ status: 200, body: { status: "observed" } });
     expect(readResultBus(identity, stateDir)?.entries[0]?.sendTarget?.canonicalUrl).toBe(B);
     expect(readResultBus(identity, stateDir)?.entries[0]?.deliveryStatus).toBe("observed");

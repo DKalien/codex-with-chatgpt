@@ -5,8 +5,8 @@ process.  On Windows a spawner inside a Job Object (kill-on-close) also kills
 detached children via inherited Job membership, which is how closing Codex
 could take the daemon down.  This helper escapes in two layers:
 
-1. ``CREATE_BREAKAWAY_FROM_JOB``: cheap and keeps full env/stdio semantics;
-   ignored when the caller is not in a Job, denied when the Job forbids it.
+1. ``CREATE_BREAKAWAY_FROM_JOB``: used only when the helper is proven outside
+   all Jobs; successful creation alone does not prove escape from nested Jobs.
 2. WMI ``Win32_Process.Create`` relay: the process is created by the WMI
    service host (documented as NOT joining the caller's Job), which also breaks
    the ``taskkill /T`` parent-chain.  The relay re-spawns the daemon detached
@@ -16,6 +16,11 @@ could take the daemon down.  This helper escapes in two layers:
 Protocol (single JSON line on stdout):
   {"ok": true,  "pid": N, "mode": "breakaway" | "wmi" | "posix", "in_job": true|false|null}
   {"ok": false, "code": "...", "message": "...", "in_job": true|false|null}
+
+``spawn_started`` is true after creation or an uncertain WMI attempt; callers
+must never retry/fallback in that state. Windows success additionally requires
+creation-time final_probe identity and inAnyJob=false, captured by the relay
+before a short-lived worker can complete while WMI returns its acknowledgment.
 
 ``in_job`` reports IsProcessInJob(GetCurrentProcess()) for the helper itself
 (a direct child of the Node caller, so it shares the caller's Job membership).
@@ -35,6 +40,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import tempfile
 import sys
 import time
 from datetime import datetime, timezone
@@ -45,6 +51,7 @@ CREATE_NEW_PROCESS_GROUP = 0x00000200
 CREATE_BREAKAWAY_FROM_JOB = 0x01000000
 CREATE_NO_WINDOW = 0x08000000
 
+WMI_CREATE_TIMEOUT_SECONDS = 20.0
 WMI_RESULT_TIMEOUT_SECONDS = 20.0
 WMI_POLL_INTERVAL_SECONDS = 0.25
 
@@ -160,9 +167,9 @@ def _probe_process(pid: int, expected_creation: str | None = None) -> dict:
                 "observedAt": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")}
 
 
-def _spawn_evidence(pid: int) -> dict:
-    return {"final_probe": _probe_process(pid), "spawner_probe": _probe_process(os.getppid()),
-            "helper_probe": _probe_process(os.getpid())}
+def _spawn_evidence(pid: int, final_probe: dict | None = None) -> dict:
+    return {"final_probe": final_probe if final_probe is not None else _probe_process(pid),
+            "spawner_probe": _probe_process(os.getppid()), "helper_probe": _probe_process(os.getpid())}
 
 
 def _detect_in_job() -> "bool | None":
@@ -270,9 +277,14 @@ def _spawn_detached(command: list[str], log_path: str, env: dict,
 
 
 def _write_result(path: str, payload: dict) -> None:
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload))
+    # 轮询方只能看见完整回执，避免半写 JSON 被误判为启动结果未知。
+    fd, temporary = tempfile.mkstemp(prefix=f"{Path(path).name}.", suffix=".tmp", dir=Path(path).parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+        os.replace(temporary, path)
+    finally:
+        _delete_env_file(temporary)
 
 
 def _windows_argv_quote(argument: str) -> str:
@@ -317,7 +329,7 @@ def _wmi_create(command_line: str, cwd: str) -> int:
         ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive",
          "-ExecutionPolicy", "Bypass", "-Command", script],
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, encoding="utf-8", errors="replace", timeout=60,
+        text=True, encoding="utf-8", errors="replace", timeout=WMI_CREATE_TIMEOUT_SECONDS,
         creationflags=CREATE_NO_WINDOW if IS_WINDOWS else 0, close_fds=True,
     )
     lines = f"{result.stdout}\n{result.stderr}".strip().splitlines()
@@ -331,7 +343,7 @@ def _wmi_create(command_line: str, cwd: str) -> int:
     raise OSError(f"WMI 输出无法解析：{''.join(result.stderr.split())[:200]}")
 
 
-def _spawn_via_wmi_relay(options: dict, command: list[str]) -> int:
+def _spawn_via_wmi_relay(options: dict, command: list[str]) -> dict:
     script = str(Path(__file__).resolve())
     result_file = options["result_file"]
     try:
@@ -350,7 +362,7 @@ def _spawn_via_wmi_relay(options: dict, command: list[str]) -> int:
             payload = json.loads(Path(result_file).read_text(encoding="utf-8"))
             _delete_env_file(result_file)
             if payload.get("ok") is True:
-                return int(payload["pid"])
+                return payload
             raise OSError(str(payload.get("message") or "relay spawn 失败"))
         except FileNotFoundError:
             time.sleep(WMI_POLL_INTERVAL_SECONDS)
@@ -380,6 +392,8 @@ def main(argv: list[str]) -> int:
         try:
             env = _read_env_file(options["env_file"])
             _delete_env_file(options["env_file"])
+            if IS_WINDOWS and _detect_in_job() is not False:
+                raise OSError("WMI relay 无法证明不在 Windows Job 内；未创建 daemon")
             pid = _spawn_detached(command, options["log"], env, options["cwd"],
                                   DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
                                   if IS_WINDOWS else 0)
@@ -387,8 +401,12 @@ def main(argv: list[str]) -> int:
             _write_result(options["result_file"],
                           {"ok": False, "message": str(error)})
             return 1
-        _write_result(options["result_file"], {"ok": True, "pid": pid})
-        return 0
+        # WMI 调用返回可能晚于短任务退出；在 relay 创建时立即记录身份与 Job 证据。
+        final_probe = _probe_process(pid)
+        independent = (final_probe["status"] == "identified" and final_probe["inAnyJob"] is False)
+        _write_result(options["result_file"], {"ok": independent, "pid": pid, "final_probe": final_probe,
+                                             "message": None if independent else "relay 最终进程独立性无法确认；禁止重发"})
+        return 0 if independent else 1
 
     try:
         env = _read_env_file(options["env_file"])
@@ -399,26 +417,39 @@ def main(argv: list[str]) -> int:
 
     if IS_WINDOWS:
         in_job = _detect_in_job()
-        try:
-            pid = _spawn_detached(command, options["log"], env, options["cwd"],
-                                  DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
-                                  | CREATE_BREAKAWAY_FROM_JOB)
-            _delete_env_file(options["env_file"])
-            _emit({"ok": True, "pid": pid, "mode": "breakaway", "in_job": in_job, **_spawn_evidence(pid)})
-            return 0
-        except OSError as breakaway_error:
-            first_error = str(breakaway_error)
-        try:
-            pid = _spawn_via_wmi_relay(options, command)
-            # env 文件由 relay 删除；此处兜底（relay 已删时为 no-op）。
-            _delete_env_file(options["env_file"])
-            _emit({"ok": True, "pid": pid, "mode": "wmi", "in_job": in_job, **_spawn_evidence(pid)})
-            return 0
-        except Exception as wmi_error:  # noqa: BLE001 - 协议层统一报告
-            _emit({"ok": False, "code": "spawn_failed",
-                   "message": f"breakaway: {first_error}; wmi: {wmi_error}",
-                   "in_job": in_job})
-            return 1
+        pid = None
+        mode = "breakaway"
+        relay_probe = None
+        first_error = "helper 在 Job 内或成员关系未知，直接使用 WMI"
+        if in_job is False:
+            try:
+                pid = _spawn_detached(command, options["log"], env, options["cwd"],
+                                      DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+                                      | CREATE_BREAKAWAY_FROM_JOB)
+            except OSError as breakaway_error:
+                first_error = str(breakaway_error)
+        if pid is None:
+            mode = "wmi"
+            try:
+                relay_result = _spawn_via_wmi_relay(options, command)
+                pid = int(relay_result["pid"])
+                relay_probe = relay_result["final_probe"]
+            except Exception as wmi_error:  # noqa: BLE001 - WMI 可能已创建 daemon，但丢失回执。
+                _emit({"ok": False, "code": "spawn_failed", "spawn_started": True,
+                       "message": f"breakaway: {first_error}; wmi: {wmi_error}",
+                       "in_job": in_job})
+                return 1
+        _delete_env_file(options["env_file"])
+        evidence = _spawn_evidence(pid, relay_probe)
+        independent = (evidence["final_probe"]["status"] == "identified"
+                       and evidence["final_probe"]["inAnyJob"] is False)
+        payload = {"ok": independent, "pid": pid, "mode": mode, "in_job": in_job,
+                   "spawn_started": True, **evidence}
+        if not independent:
+            payload.update(code="independence_unproven",
+                           message="已创建 daemon，但无法证明最终进程不在 Windows Job 内；禁止重发")
+        _emit(payload)
+        return 0 if independent else 1
 
     try:
         pid = _spawn_detached(command, options["log"], env, options["cwd"], 0)
@@ -434,5 +465,5 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main(sys.argv[1:]))
     except Exception as error:  # noqa: BLE001 - helper 协议之外不输出 traceback
-        _emit({"ok": False, "code": "helper_crash", "message": str(error)})
+        _emit({"ok": False, "code": "helper_crash", "message": str(error), "spawn_started": True})
         raise SystemExit(1)

@@ -1,3 +1,4 @@
+import { LIGHT_CONTENT_SCRIPTS } from "./browser-companion-chains.js";
 import { describe, expect, it } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
@@ -1469,24 +1470,10 @@ describe("E1b3d2a SW write-probe contract (pure)", () => {
 });
 
 describe("E1b3d2a runtime packaging gates", () => {
-  it("manifest loads write-only capability, not send-adapter/orchestrator ESM", () => {
+  it("默认 manifest 加载轻量 DOM 能力，不加载旧 orchestrator", () => {
     const manifest = JSON.parse(fs.readFileSync(path.join(companionRoot, "manifest.json"), "utf8"));
     const js = (manifest.content_scripts ?? []).flatMap((cs: { js?: string[] }) => cs.js ?? []);
-    expect(js).toEqual([
-      "route-global.js",
-      "dom-adapter-global.js",
-      "turn-observer-global.js",
-      "shadow-evidence.js",
-      "composer-write-adapter.js",
-      "send-click-adapter.js",
-      "send-probe-message-global.js",
-      "send-probe-run.js",
-      "route-attestation-global.js",
-      "route-attestation-run-global.js",
-      "feedback-bootstrap-run-global.js",
-      "production-send-runtime-global.js",
-      "content-script.js",
-    ]);
+    expect(js).toEqual(LIGHT_CONTENT_SCRIPTS);
     expect(js).not.toContain("send-adapter.js");
     expect(js).not.toContain("send-orchestrator.js");
     expect(js).not.toContain("production-send-runtime.js");

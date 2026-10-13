@@ -1,3 +1,4 @@
+import { previewCompanionFormat, confirmCompanionFormat, readCompanionFormatResult } from "./companion-format.js";
 import { requestLocalRoute, finishLocalRouteConfirmation, commitLocalRoute, localRouteStatus } from "./companion-local-route.js";
 import { confirmLocalRoute } from "../feedback/local-route-confirm.js";
 import { authenticateOperations } from "./companion-operation-auth.js";
@@ -74,6 +75,7 @@ const beginSendBodySchema = z.object({
   routeCanonical: z.string().min(1).max(512),
   eventId: z.string().regex(/^[a-f0-9]{32}$/),
   reservationId: z.string().uuid(),
+  once: z.boolean().optional(),
 }).strict();
 
 const ackBodySchema = z.object({
@@ -115,6 +117,13 @@ const webSinkBindCurrentBodySchema = z.object({
 }).strict();
 
 function sendError(res: Response, error: unknown): void {
+  if (error && typeof error === "object" && "formatNoMutation" in error && error.formatNoMutation === true
+    && "workspaceId" in error && typeof error.workspaceId === "string"
+    && "confirmationSha256" in error && typeof error.confirmationSha256 === "string") {
+    res.status(409).json({ error: "code" in error && typeof error.code === "string" ? error.code : "WORKSPACE_HISTORY_REJECTED", noMutation: true,
+      workspaceId: error.workspaceId, confirmationSha256: error.confirmationSha256 });
+    return;
+  }
   if (error && typeof error === "object" && "panelNoMutation" in error && error.panelNoMutation === true) {
     res.status(409).json({ error: (error as { code?: string }).code ?? "PANEL_ACTION_REJECTED", noMutation: true, requestId: (error as { panelRequestId?: string }).panelRequestId });
     return;
@@ -351,6 +360,24 @@ export function createCompanionRouter(opts: CompanionRouterOptions): Router {
     } catch (error) { sendError(res, error); }
   });
 
+  for (const action of ["preview", "confirm"] as const) router.post(`/operations/format/${action}`, (req, res) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      const body = action === "preview" ? z.object({}).strict().parse(req.body)
+        : z.object({ confirmationSha256: z.string().regex(/^[a-f0-9]{64}$/) }).strict().parse(req.body);
+      const input = localInput(req, "format");
+      res.json(action === "preview" ? previewCompanionFormat(input)
+        : confirmCompanionFormat(input, (body as { confirmationSha256: string }).confirmationSha256));
+    } catch (error) { sendError(res, error); }
+  });
+  router.get("/operations/format/result", (req, res) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      const query = z.object({ confirmationSha256: z.string().regex(/^[a-f0-9]{64}$/) }).strict().parse(req.query);
+      res.json(readCompanionFormatResult(localInput(req, "format"), query.confirmationSha256));
+    } catch (error) { sendError(res, error); }
+  });
+
   router.post("/operations/reconcile", (req, res) => {
     res.setHeader("Cache-Control", "no-store");
     try {
@@ -531,6 +558,7 @@ export function createCompanionRouter(opts: CompanionRouterOptions): Router {
           routeCanonical: body.routeCanonical,
           eventId: body.eventId,
           reservationId: body.reservationId,
+          once: body.once,
           stateDir: opts.stateDir,
         });
         res.json({
@@ -549,10 +577,16 @@ export function createCompanionRouter(opts: CompanionRouterOptions): Router {
         routeCanonical: body.routeCanonical,
         eventId: body.eventId,
         reservationId: body.reservationId,
+        once: body.once,
         stateDir: opts.stateDir,
       });
       res.json(result);
     } catch (error) {
+      if (req.body?.once === true && error instanceof Error && error.name === "ResultBusError") {
+        const code = (error as Error & { code?: unknown }).code;
+        res.status(409).json({ error: typeof code === "string" ? code : "RESULT_BUS_REJECTED", message: error.message });
+        return;
+      }
       sendError(res, error);
     }
   });

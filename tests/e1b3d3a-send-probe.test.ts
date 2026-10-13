@@ -890,8 +890,8 @@ describe("E1b3d3a runtime packaging", () => {
     const manifest = JSON.parse(fs.readFileSync(path.join(companionRoot, "manifest.json"), "utf8"));
     const js = (manifest.content_scripts ?? []).flatMap((cs: { js?: string[] }) => cs.js ?? []);
     expect(js).toContain("send-click-adapter.js");
-    expect(js).toContain("send-probe-message-global.js");
-    expect(js).toContain("send-probe-run.js");
+    expect(js).not.toContain("send-probe-message-global.js");
+    expect(js).not.toContain("send-probe-run.js");
     expect(js).toContain("composer-write-adapter.js");
     expect(js).not.toContain("send-probe-message.js");
     expect(js).not.toContain("send-orchestrator.js");

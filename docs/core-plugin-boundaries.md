@@ -406,3 +406,11 @@ popup 分开显示已保存绑定的 VERIFIED、当前页面匹配与完整连�
 
 
 21:39 现场验收更新：用户重载扩展并刷新新网页；一次显式 Connect 重新取得当前 document 身份并返回 NOT_SUCCESSOR，随后用户通过既有 Abandon connect unknown 只清除本地旧自举 fence（state=NONE，zeroWrite/zeroClick/zeroBridgeMutation=true）。再次显式 Connect 后出现连接消息，服务端 receiver 正常变为 epoch13；新页面验证于 13:38:59.834Z verified，rebind 于 13:39:04.249Z consumed。最终 Companion 8bbc8000-15c9-4246-a9ed-a5fb04fe6d52 / binding 5dfd77e1-81c3-433b-8f47-0776c3efbebf / epoch13 与新 route 6ac252e9-86d0-83ec-b59c-3f0fc8736b79 一致；Web Sink epoch3 指向同一新 route。用户确认“当前对话已连接，自动回流已开启”。Bridge PID12676/build fb6ac93f 未变，events0；未发送开发任务或结果测试消息。旧失败缺少原始原因，因此本次恢复和已复现缺陷修复不被表述为原始故障分支已被现场证实。
+
+### 当前项目历史格式化
+
+任务面板的“格式化当前项目历史”是不可恢复的永久删除入口；“隐藏已结束历史”仍只是显示偏好。必须先通过本机 `operations authorize --local-user` 的当前 Companion 限时授权，再逐次预览并勾选确认。预览自动暂停回流，明确显示 workspace 和影响范围；完成后回流保持暂停，用户可重新开启。
+
+专用 `/operations/format/preview`、`confirm` 与只读 `result` 使用 Companion 认证，确认绑定 workspace 与精确 `confirmationSha256`。真实在途任务、非隔离结果不明、浏览器非 NONE journal、未收敛发送探针/route fence、待核验操作及 pending 隔离档案均阻止格式化。当前配对、已验证 route fence/latch、已完成探针 latch、Desktop binding、OAuth 和其他 workspace 保留；不会撤回已执行的工作或已发送消息。
+
+扩展只在服务器返回当前 workspace 的精确 cleaned/hash 后，删除当前项目隔离档案、已结束面板操作日志和隐藏 ID。项目 storage facade 提供物理 workspace 前缀隔离；legacy 历史只有在原 transport 与已迁移项目身份一致时清除。未知响应保留一个不含旧任务 ID 的本地 hash 凭证，阻止 Send、Pair、Connect 和重新开启回流；“核验上次格式化”只读查询原 hash，不重发删除。服务端成功而本机清理失败时，同一只读核验可完成本机清理；扩展清理先删除历史，最后单独删除本机凭证；部分删除失败仍保留凭证供只读恢复。

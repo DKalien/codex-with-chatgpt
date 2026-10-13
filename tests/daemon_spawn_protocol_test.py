@@ -34,6 +34,7 @@ MARKER_DAEMON_SOURCE = (
     "    handle.write(os.environ.get('C2C_PROTOCOL_TEST_MARKER', 'missing'))\n"
     "print('daemon-ready')\n"
     "sys.stderr.write('daemon-err')\n"
+    "import time; time.sleep(1)\n"
 )
 
 sys.path.insert(0, str(HELPER_DIR))
@@ -292,19 +293,28 @@ class DaemonSpawnWindowsProtocolTest(unittest.TestCase):
         )
         wait_pid_exit(payload["pid"])
 
+    def test_short_wmi_worker_keeps_creation_proof_after_it_has_completed(self):
+        Path(self.daemon_script).write_text(MARKER_DAEMON_SOURCE.replace("import time; time.sleep(1)\n", ""), encoding="utf-8")
+        options = {"log": self.log, "env_file": self.env_file, "cwd": self.tmp, "result_file": self.result_file}
+        payload = helper._spawn_via_wmi_relay(options, [sys.executable, self.daemon_script, self.marker])
+        self.daemon_pid = payload["pid"]
+        self.assertTrue(wait_until(lambda: os.path.exists(self.marker)))
+        wait_pid_exit(payload["pid"])
+        self.assertEqual(helper._probe_process(payload["pid"])["status"], "missing")
+        self.assertEqual(payload["final_probe"]["status"], "identified")
+        self.assertIs(payload["final_probe"]["inAnyJob"], False)
+
     def test_relay_mode_writes_result_and_removes_env_file(self):
-        result = run_helper([
-            "--relay", "--log", self.log, "--env-file", self.env_file,
-            "--cwd", self.tmp, "--result-file", self.result_file,
-            "--", sys.executable, self.daemon_script, self.marker,
-        ])
+        relay_argv = [sys.executable, "-I", "-B", "-X", "utf8", str(HELPER_SCRIPT),
+                      "--relay", "--log", self.log, "--env-file", self.env_file,
+                      "--cwd", self.tmp, "--result-file", self.result_file,
+                      "--", sys.executable, self.daemon_script, self.marker]
+        helper._wmi_create(" ".join(helper._windows_argv_quote(arg) for arg in relay_argv), self.tmp)
         self.assertTrue(wait_until(lambda: os.path.exists(self.result_file)))
         with open(self.result_file, encoding="utf-8") as handle:
             payload = json.load(handle)
         pid = payload.get("pid")
         self.daemon_pid = pid if type(pid) is int and pid > 0 else None
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), "", "relay 不应向 stdout 写协议")
         self.assertIs(payload["ok"], True)
         self.assertIs(type(payload["pid"]), int)
         self.assertGreater(payload["pid"], 0)
@@ -449,22 +459,131 @@ class ProcessProbeTest(unittest.TestCase):
         self.assertEqual(evidence["final_probe"]["pid"], 321)
         self.assertEqual(evidence["final_probe"]["status"], "unknown")
         self.assertNotIn("private", json.dumps(evidence))
-        for wmi in [False, True]:
-            options = {"relay": False, "log": "unused", "env_file": "unused", "cwd": "unused"}
-            with mock.patch.object(helper, "_parse_options", return_value=(options, ["daemon"])), \
-                    mock.patch.object(helper, "_read_env_file", return_value={}), \
-                    mock.patch.object(helper, "_delete_env_file"), \
-                    mock.patch.object(helper, "_detect_in_job", return_value=True), \
-                    mock.patch.object(helper, "_spawn_detached", side_effect=OSError() if wmi else None, return_value=321) as spawn, \
-                    mock.patch.object(helper, "_spawn_via_wmi_relay", return_value=321) as relay, \
-                    mock.patch.object(helper, "_probe_process_impl", side_effect=RuntimeError("probe failure")), \
-                    mock.patch.object(helper, "_emit") as emit:
-                self.assertEqual(helper.main([]), 0)
-            spawn.assert_called_once()
-            self.assertEqual(relay.call_count, 1 if wmi else 0)
-            value = emit.call_args.args[0]
-            self.assertEqual(value["mode"], "wmi" if wmi else "breakaway")
-            self.assertEqual(value["final_probe"]["pid"], 321)
+        for in_job in [False, True, None]:
+            with self.subTest(in_job=in_job):
+                options = {"relay": False, "log": "unused", "env_file": "unused", "cwd": "unused"}
+                with mock.patch.object(helper, "_parse_options", return_value=(options, ["daemon"])), \
+                        mock.patch.object(helper, "_read_env_file", return_value={}), \
+                        mock.patch.object(helper, "_delete_env_file"), \
+                        mock.patch.object(helper, "_detect_in_job", return_value=in_job), \
+                        mock.patch.object(helper, "_spawn_detached", return_value=321) as spawn, \
+                        mock.patch.object(helper, "_spawn_via_wmi_relay", return_value={"pid": 321, "final_probe": {"pid": 321, "status": "unknown", "inAnyJob": None}}) as relay, \
+                        mock.patch.object(helper, "_probe_process_impl", side_effect=RuntimeError("probe failure")), \
+                        mock.patch.object(helper, "_emit") as emit:
+                    self.assertEqual(helper.main([]), 1)
+                self.assertEqual(spawn.call_count, 1 if in_job is False else 0)
+                self.assertEqual(relay.call_count, 0 if in_job is False else 1)
+                value = emit.call_args.args[0]
+                self.assertFalse(value["ok"])
+                self.assertTrue(value["spawn_started"])
+                self.assertEqual(value["final_probe"]["pid"], 321)
+
+
+class RelayResultPublicationTest(unittest.TestCase):
+    def test_publishes_complete_json_without_exposing_partial_result(self):
+        for existing in [None, {"ok": False, "message": "previous"}]:
+            with self.subTest(existing=existing), tempfile.TemporaryDirectory() as directory:
+                target = Path(directory) / "result.json"
+                if existing is not None:
+                    target.write_text(json.dumps(existing), encoding="utf-8")
+                payload = {"ok": True, "pid": 321, "message": "完整回执"}
+                replace = os.replace
+                def publish(source, destination):
+                    self.assertEqual(Path(source).parent, target.parent)
+                    self.assertEqual(json.loads(Path(source).read_text(encoding="utf-8")), payload)
+                    self.assertEqual(json.loads(target.read_text(encoding="utf-8")) if target.exists() else None, existing)
+                    replace(source, destination)
+                with mock.patch.object(helper.os, "replace", side_effect=publish) as commit:
+                    helper._write_result(str(target), payload)
+                commit.assert_called_once()
+                self.assertEqual(json.loads(target.read_text(encoding="utf-8")), payload)
+                self.assertEqual(list(Path(directory).iterdir()), [target])
+
+    def test_failed_write_or_publish_preserves_previous_result_and_removes_temporary(self):
+        for failure in ["dump", "replace"]:
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+                target = Path(directory) / "result.json"
+                target.write_text('{"ok":false}', encoding="utf-8")
+                module = helper.json if failure == "dump" else helper.os
+                with mock.patch.object(module, failure, side_effect=OSError("fixture failure")):
+                    with self.assertRaises(OSError):
+                        helper._write_result(str(target), {"ok": True})
+                self.assertEqual(target.read_text(encoding="utf-8"), '{"ok":false}')
+                self.assertEqual(list(Path(directory).iterdir()), [target])
+
+    def test_wmi_reuses_creation_probe_without_probing_finished_worker_again(self):
+        options = {"relay": False, "log": "unused", "env_file": "unused", "cwd": "unused"}
+        creation_probe = {"pid": 321, "status": "identified", "inAnyJob": False}
+        with mock.patch.object(helper, "IS_WINDOWS", True), \
+                mock.patch.object(helper, "_parse_options", return_value=(options, ["daemon"])), \
+                mock.patch.object(helper, "_read_env_file", return_value={}), \
+                mock.patch.object(helper, "_delete_env_file"), \
+                mock.patch.object(helper, "_detect_in_job", return_value=True), \
+                mock.patch.object(helper, "_spawn_via_wmi_relay", return_value={"pid": 321, "final_probe": creation_probe}), \
+                mock.patch.object(helper, "_probe_process", return_value={"status": "missing"}) as probe, \
+                mock.patch.object(helper, "_emit") as emit:
+            self.assertEqual(helper.main([]), 0)
+        self.assertEqual(probe.call_args_list, [mock.call(os.getppid()), mock.call(os.getpid())])
+        self.assertIs(emit.call_args.args[0]["final_probe"], creation_probe)
+
+
+class DaemonSpawnIndependenceTest(unittest.TestCase):
+    def run_main(self, in_job, final_job, *, relay_mode=False, relay_error=None):
+        options = {"relay": relay_mode, "log": "unused", "env_file": "unused", "cwd": "unused", "result_file": "unused"}
+        evidence = {"final_probe": {"pid": 321, "status": "identified", "inAnyJob": final_job}}
+        with mock.patch.object(helper, "IS_WINDOWS", True), \
+                mock.patch.object(helper, "_parse_options", return_value=(options, ["daemon"])), \
+                mock.patch.object(helper, "_read_env_file", return_value={}), \
+                mock.patch.object(helper, "_delete_env_file"), \
+                mock.patch.object(helper, "_detect_in_job", return_value=in_job), \
+                mock.patch.object(helper, "_spawn_detached", return_value=321) as spawn, \
+                mock.patch.object(helper, "_spawn_via_wmi_relay", return_value={"pid": 321, "final_probe": evidence["final_probe"]}, side_effect=relay_error) as relay, \
+                mock.patch.object(helper, "_spawn_evidence", return_value=evidence), \
+                mock.patch.object(helper, "_probe_process", return_value=evidence["final_probe"]), \
+                mock.patch.object(helper, "_write_result") as result, \
+                mock.patch.object(helper, "_emit") as emit:
+            code = helper.main([])
+        return code, (result.call_args.args[1] if relay_mode else emit.call_args.args[0]), spawn, relay
+
+    def test_only_proven_no_job_uses_breakaway(self):
+        for in_job in [False, True, None]:
+            with self.subTest(in_job=in_job):
+                code, payload, spawn, relay = self.run_main(in_job, False)
+                self.assertEqual(code, 0)
+                self.assertTrue(payload["ok"])
+                self.assertEqual(spawn.call_count, 1 if in_job is False else 0)
+                self.assertEqual(relay.call_count, 0 if in_job is False else 1)
+
+    def test_created_daemon_in_job_or_unknown_is_rejected_without_second_spawn(self):
+        for in_job in [False, True, None]:
+            for final_job in [True, None]:
+                with self.subTest(in_job=in_job, final_job=final_job):
+                    code, payload, spawn, relay = self.run_main(in_job, final_job)
+                    self.assertEqual(code, 1)
+                    self.assertFalse(payload["ok"])
+                    self.assertEqual(payload["code"], "independence_unproven")
+                    self.assertTrue(payload["spawn_started"])
+                    self.assertEqual(spawn.call_count + relay.call_count, 1)
+
+    def test_wmi_timeout_marks_unknown_creation_without_retry(self):
+        code, payload, spawn, relay = self.run_main(True, False, relay_error=TimeoutError("ACK unknown"))
+        self.assertEqual(code, 1)
+        self.assertTrue(payload["spawn_started"])
+        spawn.assert_not_called()
+        relay.assert_called_once()
+
+    def test_relay_requires_its_own_no_job_proof_before_creation(self):
+        for in_job in [False, True, None]:
+            with self.subTest(in_job=in_job):
+                code, payload, spawn, relay = self.run_main(in_job, False, relay_mode=True)
+                self.assertEqual(code, 0 if in_job is False else 1)
+                self.assertEqual(payload["ok"], in_job is False)
+                self.assertEqual(spawn.call_count, 1 if in_job is False else 0)
+                relay.assert_not_called()
+
+    def test_wmi_create_and_result_fit_outer_helper_budget(self):
+        self.assertLess(helper.WMI_CREATE_TIMEOUT_SECONDS + helper.WMI_RESULT_TIMEOUT_SECONDS, 45)
+
 
 
 if __name__ == "__main__":

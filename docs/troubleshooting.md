@@ -28,9 +28,17 @@ A concurrent `rollout_busy` response performs no state writes; it does not creat
 Do not rebuild a compatible Connector or reauthorize OAuth merely because the Core build differs.
 Do not interrupt an active Review Bridge to clear pending status.
 
+### v2rayN 与 Gateway 代理
+
+使用 v2rayN 实际启用的 HTTP / mixed 端口，在完整的 `gateway supervisor configure` 参数中设置 `--proxy <url>`（保留其余原配置参数），配置无凭据的 HTTP(S) URL；不要把 SOCKS 端口当作 HTTP 代理。`http://127.0.0.1:10808` 只是 2026-10-13 本机观察值，不是固定默认端口。Gateway 的 `proxy` 仅传给 tunnel-client 的 `--control-plane.http-proxy`，不控制浏览器、Windows 全局代理或所有 Node 网络请求。
+
+已有 owner 时 configure 拒绝覆盖。修改现有代理需用户授权维护，使用既有身份校验与认证 shutdown 覆盖完整 hosted workspace 集合，确认旧 native 进程退出后，再通过既有配置入口保留原 config 的全部值，仅修改 `proxy`；冷启动只恢复既有 running intent。不要手改配置、删锁或按旧 PID kill，也不要借此改 OAuth、绑定或历史。
+
+验证时分别检查直连、显式代理、公网 `/health` 与 Gateway OAuth metadata，并记录所用客户端和 TLS 结果。curl 代理请求成功不代表 PowerShell 或浏览器成功；本机观察中 curl 显式 `10808` 返回 200、SSL verify 为 0，但 PowerShell 同 URL 显式代理出现 TLS EOF，不能据此宣称全网代理已验证。
+
 ### Bridge Supervisor Windows ACL 校验失败
 
-源码中的 owner-only ACL 校验保留原 8 秒子进程 deadline、owner SID、精确 DACL 与继承检查；失败继续返回 `SUPERVISOR_STORE_SECURITY`。错误只附带有限的 `classification`、有界单调时钟耗时、退出码和白名单 signal，不返回路径、SID、环境、原始 stdout/stderr 或 cause。`timeout` 表示子进程报告超时；`nonzero` 本身不能证明 ACL mismatch，仍需现场证据。诊断信息不授权重试、提权或放宽校验。
+源码中的 owner-only ACL 校验采用固定 15 秒子进程 deadline（包含 PowerShell 启动、ACL 执行与退出），保留 owner SID、精确 DACL 与继承检查；失败继续返回 `SUPERVISOR_STORE_SECURITY`。错误只附带有限的 `classification`、有界单调时钟耗时、退出码和白名单 signal，不返回路径、SID、环境、原始 stdout/stderr 或 cause。`timeout` 表示子进程报告超时，即使同时得到 exit 0 和完整 OK 输出也拒绝；`nonzero` 本身不能证明 ACL mismatch，仍需现场证据。诊断信息不授权重试、提权或放宽校验。
 
 `tests/supervisor-store.test.ts` 失败时先把 exact fixture 内容、原路径 ACL/SDDL 和测试侧子进程记录保存到 ignored `.tooling/supervisor-acl-diagnostics/<uuid>/`，再严格清理；ACL 快照采集失败则保留原 fixture。链接只记元数据，不跟随到其它目录。正常通过仍 strict teardown；单次 PASS 不替代原失败归因或正式门禁，也不代表已部署。
 
@@ -40,7 +48,9 @@ Do not interrupt an active Review Bridge to clear pending status.
 
 ## Common situations
 
-### 新网页接管完成，但 Companion 仍未连接
+### 兼容实现：旧网页接管完成，但 Companion 仍未连接
+
+以下高级诊断与 phase 恢复仅适用于保留的旧实现；当前 manifest 不加载旧 popup/SW。默认流程见下方“日常连接与本机确认”。
 
 “ChatGPT 已接管”、保存的 binding VERIFIED、当前网页已验证和完整连接是不同阶段。先查看高级诊断的 connectState、recovery、currentPageMatchesBinding、bindingEpoch、routeAttestFence、reason，连同当前 route 核对；不要复制配对密钥或凭据。任务面板的 Codex/网页可用性也分别判断。
 
@@ -51,17 +61,29 @@ Do not interrupt an active Review Bridge to clear pending status.
 
 ### 日常连接与本机确认
 
-已配对浏览器在新建或切换的具体 ChatGPT 对话中点“连接当前对话”，然后在本机确认工作区与完整目标地址。确认后自动完成凭据轮换与 Web Sink 核验，不发送 ChatGPT 验证指令。空白首页尚无对话地址时，先建立对话；首次配对与“授权连接服务”仍分别完成。
+**默认轻量弹窗**
 
-同一标签页刷新时，只有已完成连接、原标签页及对话地址一致、无活动发送记录或未知连接状态，才会通过只读服务端核验恢复当前页面。浏览器重启后无法证明原标签页身份，或换了标签页时，点击一次“连接当前对话”恢复；同一已验证目标无需再次本机确认。显式连接也会核验旧回流。连接成功与消息恢复分开显示：旧回流未能确认时，当前对话仍可已连接，自动回流保持暂停；旧消息不会因此重发，手动关闭也不会被重新开启。
+首次使用：在具体 ChatGPT 对话打开弹窗，粘贴配对 JSON，单独点击“授权 Bridge 访问”，再点击“配对并连接当前对话”。JSON 中的项目会自动登记并选中，无需再手工选择。已有配对时选择项目并点“连接当前对话”。在本机确认窗核对 workspace 与完整 URL，确认后自动 commit/bind；不需要第二次点击或发送 route 验证消息。空白首页没有具体对话地址时先建立对话。
 
-显示“请在本机确认”时检查本机确认窗；关闭或取消不改变回流目标。旧 Bridge 不支持该接口时明确提示升级，不会静默改用旧验证消息。仅构建扩展不等于 Bridge 已升级；应先核验运行时身份，再按既有 idle 门禁部署。首次使用本机确认前，当前 workspace 的 Bridge 和读取其状态的 Unified Gateway 都须支持新证明字段，再重载 Companion；旧版 Gateway 不能读取新状态，不能只更新扩展或单独切换 Bridge。其他 workspace 的绑定与状态不因此迁移。已在途的旧接管流程和未知发送继续使用上一节的原恢复规则。
+`bridge_permission_missing` 表示缺少显式 Bridge origin 权限；Pair 不会代为授权。`PENDING` 表示等待本机确认；`LOCAL_ROUTE_CANCELLED` / `LOCAL_ROUTE_EXPIRED` 表示取消或过期。弹窗每 1.5 秒查询状态，最长约 90 秒后保留待确认说明；关闭弹窗停止等待，可稍后“刷新状态”查询原申请。网络超时不表示操作失败或允许重试，查询原 requestId 并按 Bridge 状态完成提交/绑定，不自动发起新 requestId 或重新配对；DOM 发送只观察、不重复写入/点击。
 
-### 已连接，但扩展徽标显示 C×
+连接成功不代表旧回流已被观察。`claimed` / `outcome_unknown` 只观察已有正文与 ATTEMPT，不重复写入或点击；自动回流开关仍保留用户选择。浏览器重启后缺少原 tab/document 关联时，显式连接已验证的相同目标恢复关联；不能通过清空记录、改 ID 或重新配对绕过未知结果。
+
+旧 Bridge 不支持本机确认接口时应升级兼容运行时，不静默退回验证消息。build 不等于安装，安装不等于当前 Bridge 已升级或扩展已重载；机器部署和真实网页验证需另外授权。详见[轻量 Companion](companion-lightweight.md)。
+
+### 任务面板显示“无法确认”
+
+分别检查 Codex 绑定与网页状态。Codex 重启后保存的 runtime fence 可能失效，`desktop status` 返回 `DESKTOP_PROCESS_CHANGED`；同目标仍 enabled 时，仅重复 `bind-current` 也会拒绝，不能刷新旧 fence。用户明确授权恢复且无未决投递时，通过已安装稳定 launcher 执行 `desktop disable -w <workspace>`，再在目标 Desktop 会话执行 `desktop bind-current -w <workspace>`，由用户本人核对并点击本机确认窗；同目标保留 bindingId 与投递历史。之后只读复核 status，不能手改 fence、换 ID 或自动重发。`runtimeStatus:active` 可证明身份检查可用，实际发送仍要求 idle。
+
+扩展更新或 Reload 后，刷新实际 ChatGPT 对话页以加载当前 content script，无需重新配对；再查看页面连接、输入框和生成状态。若扩展重启后缺少原 tab/document 关联，按上文显式连接相同已验证目标。面板“可接收结果”只是当前接收条件，不证明已完成 DOM Send 或 observed/ACK；浏览器版本无法直接核验时应保留该验收缺口。
+
+### 兼容实现：已连接，但旧扩展徽标显示 C×
 
 当前对话已连接只表示页面连接成功。若本地发送日志为 `OUTCOME_UNKNOWN`，`C×` 表示某条回流是否送达尚未确认；自动回流开关可以仍为开启，但后续发送受恢复门禁阻挡。此时 popup 显示“已开启 · 回流待核验”，网页空闲且其他连接条件正常时，任务摘要也显示“回流待核验”；徽标悬停提示说明原因。不要清除日志或重复发送来消除标记。切换项目后徽标按所选项目重新计算，历史隔离记录的数量本身不决定徽标。
 
 ### 唯一发送标记存在，但回流仍未确认
+
+默认轻量链只观察原 attempt，精确匹配失败不 ACK、不重发。以下高级诊断字段属于旧兼容界面，轻量弹窗不提供这些按钮或统计。
 
 高级诊断的 `recoveryDiagnostic.representation` 与手动恢复结果的 `diagnostic.representation` 仅在唯一精确 ATTEMPT 标记候选存在时报告已知结构的严格正文统计。`richBodyWrapperScannedCount` / `richBodyNodeScannedCount` 分别是已访问 wrapper / 正文节点数（上限 64 / 128）；`richBodyCount` 是扫描中已发现的正文数，扫描提前拒绝时不代表完整总数。因子节点数量预检而拒绝时，已访问计数可能尚未到上限。
 
@@ -73,7 +95,7 @@ Do not interrupt an active Review Bridge to clear pending status.
 
 ### 清空任务面板的历史显示
 
-点击“清空历史显示”仅在扩展本地保存当前 workspace 的终态 commandId；popup 与面板使用相同过滤，可点“恢复已隐藏历史”撤销。新任务、执行中或执行不明任务仍显示，已隐藏任务重新活动也会显示。排队/待确认回流、发送 journal 与结果不明隔离提醒独立保留；隐藏不代表 ACK、不取消发送、不删除后台防重放或 unknown 证据，也不改变自动回流开关。设置读取失败或损坏时显示全部，保存失败时明确报错。仅刷新页面不会写入显示偏好。
+点击“清空历史显示”仅在扩展本地保存当前 workspace 的终态 commandId；任务面板按该偏好过滤，轻量 popup 只提供面板链接；可点“恢复已隐藏历史”撤销。新任务、执行中或执行不明任务仍显示，已隐藏任务重新活动也会显示。排队/待确认回流、发送 journal 与结果不明隔离提醒独立保留；隐藏不代表 ACK、不取消发送、不删除后台防重放或 unknown 证据，也不改变自动回流开关。设置读取失败或损坏时显示全部，保存失败时明确报错。仅刷新页面不会写入显示偏好。
 
 ### 任务面板 Codex 端显示 inspect_failed
 

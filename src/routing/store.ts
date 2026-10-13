@@ -1,3 +1,4 @@
+import { assertNoLegacyHistoryCleanup } from "../command-cleanup/legacy-history-fence.js";
 import fs from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
@@ -141,9 +142,11 @@ function updateRouting<T>(
   stateDir = getStateDir(),
 ): T {
   const resolved = resolveWorkspaceIdentity(identity);
+  assertNoLegacyHistoryCleanup(resolved.id, stateDir);
   const file = routingFile(resolved.id, stateDir);
   return runDurableStoreTransaction<RoutingState, T>({
     file,
+    afterRead: () => assertNoLegacyHistoryCleanup(resolved.id, stateDir),
     marker: `${file}.initialized`,
     markerContent: "1\n",
     markerOpenMode: 0o600,

@@ -1,3 +1,4 @@
+import { assertNoLegacyHistoryCleanup } from "../command-cleanup/legacy-history-fence.js";
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -230,6 +231,8 @@ export function canonicalRoutingResultDigest(result: RoutingResult): string {
 }
 
 function withRoutingFileLock<T>(file: string, busyCode: string, busyMessage: string, action: () => T): T {
+  const check = () => assertNoLegacyHistoryCleanup(path.basename(file).split(".")[0]!, path.dirname(path.dirname(file)));
+  check();
   ensureDir(path.dirname(file));
   let fd: number;
   try {
@@ -243,6 +246,7 @@ function withRoutingFileLock<T>(file: string, busyCode: string, busyMessage: str
   try {
     fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, createdAt: Date.now() }));
     fs.fsyncSync(fd);
+    check();
     return action();
   } finally {
     try {

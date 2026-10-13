@@ -17,6 +17,9 @@ import { Workspace } from "../workspace/manager.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { GatewayRegistry, GatewayRegistryError } from "../gateway/registry.js";
 import { createGatewayMcpServer } from "../mcp/gateway.js";
+import { GatewayWorkspaces } from "../gateway/workspaces.js";
+import { assertMaintenanceHandle, maintenanceLockPath } from "../core/maintenance-lock.js";
+import type { ShutdownReason } from "../process/bridge-provenance.js";
 import { DesktopError } from "../desktop/store.js";
 
 export interface OfficialRemoteServerOptions extends GatewayServerOptions {
@@ -28,6 +31,8 @@ export interface OfficialRemoteServer extends GatewayServer {
 }
 
 export interface GatewayServerOptions {
+  sharedWorkspaces?: { tunnelAvailable: () => boolean };
+  onShutdown?: () => void;
   port: number;
   publicUrl: string;
   authStoreFile?: string;
@@ -42,10 +47,10 @@ export interface GatewayServer {
   pairingExpiresAt: number;
   port: number;
   publicUrl: string;
-  /** Resolves after the loopback HTTP listener has closed. */
+  /** 在所有 workspace contexts 和 loopback HTTP listener 完整关闭后 resolve。 */
   closed: Promise<void>;
   localBaseUrl(): string;
-  close(): Promise<void>;
+  close(reason?: ShutdownReason): Promise<void>;
 }
 
 function httpsOrigin(raw: string): string {
@@ -97,6 +102,7 @@ export async function startGatewayServer(opts: GatewayServerOptions): Promise<Ga
     creationTime: z.string().regex(/^[a-zA-Z0-9:-]{1,128}$/),
     buildId: z.string().regex(/^[a-f0-9]{64}$/),
   }).strict().parse(opts.healthIdentity);
+  if (opts.sharedWorkspaces && !healthIdentity) throw new GatewayRegistryError("GATEWAY_HEALTH_IDENTITY_REQUIRED");
   const registry = new GatewayRegistry();
   registry.list(); // Corrupt registry stops startup; no discovery or implicit registration.
   // One owner for the memory-cached machine AuthStore; never reclaim a crash lock automatically.
@@ -133,7 +139,7 @@ export async function startGatewayServer(opts: GatewayServerOptions): Promise<Ga
       }),
     });
     let closing: Promise<void> | undefined;
-    return { ...endpoint, close: () => closing ??= endpoint.close().finally(release) };
+    return { ...endpoint, close: (reason) => closing ??= endpoint.close(reason).then(release) };
   } catch (error) { release(); throw error; }
 }
 
@@ -149,6 +155,25 @@ async function startEndpoint(opts: GatewayServerOptions & {
   const requestLogger = new Logger({ name: `remote-mcp-${opts.identity}`, level: "info" });
   const app = express();
   app.disable("x-powered-by");
+  const workspaces = opts.sharedWorkspaces ? new GatewayWorkspaces(new GatewayRegistry(), publicUrl, opts.sharedWorkspaces.tunnelAvailable) : null;
+  const localRequest = (req: Request): boolean => {
+    const port = (server.address() as { port: number }).port;
+    return req.socket.remoteAddress === "127.0.0.1" && req.headers.host === `127.0.0.1:${port}` &&
+      !Object.keys(req.headers).some(name => name === "forwarded" || name.startsWith("x-forwarded-") ||
+        name === "cf-connecting-ip" || name === "cf-ray");
+  };
+  if (workspaces) app.use((req, res, next) => {
+    const rawHosts = req.rawHeaders.filter((_value, index) => index % 2 === 0 && req.rawHeaders[index]?.toLowerCase() === "host");
+    if (rawHosts.length !== 1) { res.sendStatus(404); return; }
+    if (localRequest(req) && req.path.startsWith("/internal/gateway/")) { next(); return; }
+    if (req.path.startsWith("/internal/") || /^\/admin(?:\/|$)/i.test(req.path)) { res.sendStatus(404); return; }
+    try {
+      const dispatch = workspaces.dispatch(req.headers.host ?? "");
+      if (dispatch) { dispatch(req, res, next); return; }
+      if (req.headers.host !== new URL(publicUrl).host && !localRequest(req)) { res.sendStatus(404); return; }
+      next();
+    } catch { res.status(503).json({ error: "GATEWAY_HOST_UNAVAILABLE" }); }
+  });
   app.use((req, res, next) => {
     res.once("finish", () => {
       const requestPath = req.path;
@@ -165,15 +190,64 @@ async function startEndpoint(opts: GatewayServerOptions & {
   if (opts.gatewayHealth) {
     app.get("/internal/gateway/health", (req, res) => {
       const port = (server.address() as { port: number }).port;
-      if (req.socket.remoteAddress !== "127.0.0.1" || req.headers.host !== `127.0.0.1:${port}` ||
-          Object.keys(req.headers).some(name => name === "forwarded" || name.startsWith("x-forwarded-") ||
-            name === "cf-connecting-ip" || name === "cf-ray")) {
+      if (!localRequest(req)) {
         res.sendStatus(404);
         return;
       }
       res.setHeader("Cache-Control", "no-store");
       res.json({ service: "machine-gateway", pid: opts.gatewayHealth!.pid, creationTime: opts.gatewayHealth!.creationTime,
-        buildId: opts.gatewayHealth!.buildId, port, publicUrl });
+        buildId: opts.gatewayHealth!.buildId, port, publicUrl, ...(workspaces ? { unified: true } : {}) });
+    });
+  }
+  if (workspaces && opts.gatewayHealth) {
+    const guard: express.RequestHandler = (req, res, next) => {
+      if (!localRequest(req)) { res.sendStatus(404); return; }
+      res.setHeader("Cache-Control", "no-store");
+      next();
+    };
+    const failure = (res: Response, error: unknown) => res.status(409).json({
+      code: typeof (error as { code?: unknown })?.code === "string" ? (error as { code: string }).code : "GATEWAY_WORKSPACE_UNAVAILABLE",
+    });
+    app.get("/internal/gateway/workspaces", guard, (_req, res) => { res.json({ workspaces: workspaces.list() }); });
+    app.get("/internal/gateway/workspaces/:id", guard, (req, res) => {
+      try { res.json(workspaces.status(z.string().parse(req.params.id))); } catch (error) { failure(res, error); }
+    });
+    app.post("/internal/gateway/workspaces/:id/start", guard, express.json({ limit: "8kb" }), async (req, res) => {
+      try {
+        const request = z.object({ lease: z.string().min(1).max(8192), port: z.number().int().min(0).max(65535).optional(),
+          tunnel: z.boolean().optional() }).strict().parse(req.body);
+        const runtime = await workspaces.start(z.string().parse(req.params.id), request);
+        res.json({ started: true, runtime });
+      } catch (error) { failure(res, error); }
+    });
+    app.post("/internal/gateway/shutdown", guard, express.json({ limit: "1mb" }), async (req, res) => {
+      try {
+        const identity = z.object({ workspaceId: z.string().regex(/^[a-f0-9]{12}$/), workspaceRoot: z.string(),
+          pid: z.number().int().positive(), startedAt: z.string().datetime(), port: z.number().int().min(1).max(65535),
+          runtimeBuildId: z.string().regex(/^[a-f0-9]{64}$/).nullable() }).strict();
+        const body = z.object({ maintenanceToken: z.string().uuid(), expectedOwner: z.object({
+          pid: z.number().int().positive(), creationTime: z.string(), buildId: z.string().regex(/^[a-f0-9]{64}$/),
+        }).strict(), workspaces: z.array(identity).max(10000) }).strict().parse(req.body);
+        const stateDir = getStateDir();
+        const assertOwner = async () => {
+          const { readGatewaySupervisorRuntime, readGatewayLock, gatewaySupervisorLockFile, sameGatewayPath } = await import("../gateway/supervisor.js");
+          assertMaintenanceHandle(stateDir, { token: body.maintenanceToken, path: maintenanceLockPath(stateDir), release: () => false });
+          const runtime = readGatewaySupervisorRuntime(stateDir);
+          const currentOwner = readGatewayLock(gatewaySupervisorLockFile(stateDir));
+          const owner = body.expectedOwner;
+          if (!runtime || currentOwner.pid !== owner.pid || currentOwner.creationTime !== owner.creationTime || currentOwner.buildId !== owner.buildId ||
+              !sameGatewayPath(currentOwner.executable, runtime.executable) || runtime.pid !== owner.pid || runtime.creationTime !== owner.creationTime || runtime.buildId !== owner.buildId ||
+              owner.pid !== opts.gatewayHealth!.pid || owner.creationTime !== opts.gatewayHealth!.creationTime ||
+              owner.buildId !== opts.gatewayHealth!.buildId || !runtime.ports.includes((server.address() as { port: number }).port)) {
+            throw new GatewayRegistryError("GATEWAY_OWNER_MISMATCH");
+          }
+          workspaces.prepareShutdown(body.workspaces);
+        };
+        await assertOwner();
+        res.json({ shuttingDown: true });
+        if (opts.onShutdown) opts.onShutdown();
+        else void close("SIGTERM");
+      } catch (error) { failure(res, error); }
     });
   }
   app.use(createOAuthRouter({
@@ -196,6 +270,22 @@ async function startEndpoint(opts: GatewayServerOptions & {
   const server = await listen(app, opts.port);
   const session = pairing.create();
   let closePromise: Promise<void> | undefined;
+  let resolveClosed!: () => void;
+  const closed = new Promise<void>(resolve => { resolveClosed = resolve; });
+  const close = (reason: ShutdownReason = "SIGTERM"): Promise<void> => {
+    if (closePromise) return closePromise;
+    pairing.invalidateAll();
+    closePromise = (async () => {
+      await workspaces?.close(reason);
+      await new Promise<void>(resolve => {
+        const deadline = setTimeout(() => server.closeAllConnections(), 1000);
+        deadline.unref();
+        server.close(() => { clearTimeout(deadline); resolve(); });
+      });
+      resolveClosed();
+    })();
+    return closePromise;
+  };
   return {
     authStore,
     pairing,
@@ -203,17 +293,8 @@ async function startEndpoint(opts: GatewayServerOptions & {
     pairingExpiresAt: session.expiresAt,
     port: (server.address() as { port: number }).port,
     publicUrl,
-    closed: new Promise<void>(resolve => server.once("close", resolve)),
+    closed,
     localBaseUrl: () => `http://127.0.0.1:${(server.address() as { port: number }).port}`,
-    close: () => {
-      if (closePromise) return closePromise;
-      pairing.invalidateAll();
-      closePromise = new Promise<void>(resolve => {
-        const deadline = setTimeout(() => server.closeAllConnections(), 1000);
-        deadline.unref();
-        server.close(() => { clearTimeout(deadline); resolve(); });
-      });
-      return closePromise;
-    },
+    close,
   };
 }

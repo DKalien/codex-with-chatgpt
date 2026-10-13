@@ -467,8 +467,10 @@ describe("E1b3d3b2 SW / popup static contract", () => {
     expect(sw).toMatch(/c2c\.autonomy\.arm/);
     expect(sw).toMatch(/c2c\.autonomy\.disable/);
     expect(sw).toMatch(/autonomy_payload_forbidden/);
-    const start = sw.indexOf("c2c.autonomy.enable.shadow");
-    const block = sw.slice(start, start + 3200);
+    const start = sw.indexOf('message.type === "c2c.autonomy.enable.shadow"');
+    const end = sw.indexOf('if (message.type === "c2c.production.journal.persist")', start);
+    expect(start).toBeGreaterThan(0); expect(end).toBeGreaterThan(start);
+    const block = sw.slice(start, end);
     expect(block).toMatch(/message\.message != null/);
     expect(block).toMatch(/message\.eventId != null/);
     expect(block).toMatch(/message\.bindingId != null/);

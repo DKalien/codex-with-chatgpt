@@ -185,13 +185,13 @@ export function releaseResultBusReservation(
  * - 当前 Active Web Sink 仍匹配 reservation stamp → 冻结精确 sendTarget、铸造 attemptId；
  * - 不匹配（期间发生 Web Sink 切换）→ 不冻结旧 target、不铸造 attemptId，
  *   entry 安全回 queued 并返回 bounded stale_reservation；
- * - 已 claimed 且 reservationId 精确一致 → 幂等 noWrite，返回同一 attemptId/sendTarget；
+ * - 已 claimed 且 reservationId 精确一致 → 幂等 noWrite，返回同一 attemptId/sendTarget；once=true 则拒绝重放；
  *   任何其他 reservation/state 一律 fail closed。
  * R5e：全程持有 endpoint switch lock（web-sink 域），与 bind-current-web-sink 串行。
  */
 export function beginResultBusSend(
   identity: RoutingWorkspaceIdentity,
-  input: { busEntryId: string; reservationId: string },
+  input: { busEntryId: string; reservationId: string; once?: boolean },
   options: ResultBusLifecycleOptions = {},
   stateDir = getStateDir(),
 ): BeginResultBusSendOutcome {
@@ -200,6 +200,9 @@ export function beginResultBusSend(
     withResultBusTransaction<BeginResultBusSendOutcome>(resolved, previous => {
       const { state, index, entry } = requireEntry(previous, input.busEntryId);
       assertCommandWritable(resolved.id, entry.commandId, stateDir);
+      if (entry.deliveryStatus === "claimed" && input.once) {
+        throw new ResultBusError("RESULT_BUS_INVALID_TRANSITION", "一次性发送许可已使用；禁止重放 claimed attempt。");
+      }
       if (entry.deliveryStatus === "claimed") {
         if (entry.reservation?.reservationId !== input.reservationId || !entry.attempt || !entry.sendTarget) {
           throw new ResultBusError("RESULT_BUS_RESERVATION_MISMATCH", "claimed entry 与提供 reservation 不一致；拒绝重放。 ");
@@ -229,7 +232,7 @@ export function beginResultBusSend(
       if (sendTarget.workspaceId !== resolved.id) {
         throw new ResultBusError("RESULT_BUS_SINK_MISMATCH", "冻结 sendTarget workspace 与 entry 不一致。 ");
       }
-      const attempt: ResultBusAttempt = { attemptId: randomUUID(), claimedAt: isoNow(options.nowMs) };
+      const attempt: ResultBusAttempt = { attemptId: randomUUID(), claimedAt: isoNow(options.nowMs), messageFormat: "signal-v1" };
       const claimed: ResultBusEntry = { ...entry, deliveryStatus: "claimed", attempt, sendTarget };
       return {
         state: replaceEntry(state, index, claimed),

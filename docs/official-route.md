@@ -40,7 +40,7 @@ Gateway grant 是对共享 workspace 的授权，不是 OAuth client 之间的�
 
 ## 完成、异常与恢复
 
-App Server 的 `completed` 只说明 turn 结束。新的结果来源为 `codex_app_server`，通知使用 `TURN_ENDED`，改动文件标记未采集、测试标记未判定；不产生 `codex_desktop_receipt` 或伪造测试通过。Controller 消费 App Server 的 turn 生命周期通知，不代表 MCP Events、Work Events 或普通 Chat 原生 Events 自动唤醒已验收。精确 task/thread/turn 身份与脱敏的最终正文持久保存，再幂等投影到同一个 Result Bus。普通 Chat 的 Browser Companion 回流仍保留；旧 Desktop 的 digest 和消息格式保持不变。
+App Server 的 `completed` 只说明 turn 结束。新的结果来源为 `codex_app_server`，改动文件标记未采集、测试标记未判定；不产生 `codex_desktop_receipt` 或伪造测试通过。新 Bus attempt 由 Bridge 发送 `execution_ended` 结构化信号，Browser Companion 按本地固定模板提示“本轮执行已结束，请读取结果（自动通知，非新授权）。”，完整结果仍按对应 `workspaceId/taskId` 调用 `codex_task_result` 读取。Controller 消费 App Server 的 turn 生命周期通知，不代表 MCP Events、Work Events 或普通 Chat 原生 Events 自动唤醒已验收。精确 task/thread/turn 身份与脱敏的最终正文持久保存，再幂等投影到同一个 Result Bus。普通 Chat 的 Browser Companion 回流仍保留；旧 Desktop digest 与缺失格式字段的历史 attempt 正文/hash 保持不变。新旧 attempt、模板版本和协调部署限制见[网页完成信号合同](runtime-simplification.md#网页完成信号与固定通知2026-10-10)。
 
 重复 requestId/commandId 返回原记录；参数不同拒绝。启动响应丢失或进程中断保留 `needs_reconciliation`，不会自动重新派发。一个未知 thread 不阻止其他已核验 target；未开始任务可取消，开始后不把“取消排队”冒充停止执行。
 

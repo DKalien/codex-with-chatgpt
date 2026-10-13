@@ -76,6 +76,7 @@ export function registerGatewayCommands(program: Command): void {
     .requiredOption("--cloudflared <path>", "cloudflared 的绝对路径")
     .requiredOption("--tunnel-client <path>", "Secure MCP Tunnel client 的绝对路径")
     .option("--proxy <url>", "可选的 HTTP(S) proxy")
+    .option("--unified", "启用共享 Gateway、Bridge 与 Tunnel")
     .option("--state-dir <path>", "机器状态目录")
     .option("--json", "machine-readable output", false)
     .action((opts: {
@@ -87,6 +88,7 @@ export function registerGatewayCommands(program: Command): void {
       cloudflared: string;
       tunnelClient: string;
       proxy?: string;
+      unified?: boolean;
       stateDir?: string;
       json: boolean;
     }) => {
@@ -100,6 +102,7 @@ export function registerGatewayCommands(program: Command): void {
         cloudflaredPath: opts.cloudflared,
         tunnelClientPath: opts.tunnelClient,
         proxy: opts.proxy ?? null,
+        unified: opts.unified,
       });
       output(opts, { ok: true, config });
     });

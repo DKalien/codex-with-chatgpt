@@ -1,3 +1,4 @@
+import { renderCompletionNotification, type CompletionSignal } from "../browser/completion-notification.js";
 import { isResultBusInFlight } from "../result-bus/schema.js";
 import { canonicalRoutingResultDigest } from "../routing/execution-result-digest.js";
 import { isOfficialResult, resultBusResultDigest } from "../result-bus/official-result.js";
@@ -195,8 +196,22 @@ function busDeliveryDto(entry: ResultBusEntry): Record<string, unknown> {
   };
 }
 
-/** claimed/outcome_unknown 的确定性 canonical message（server 唯一生成）。 */
-export function resultBusDeliveryMessage(entry: ResultBusEntry, attemptId: string): { message: string; messageSha256: string } {
+type ResultBusDelivery = { messageSha256: string } & (
+  | { signal: CompletionSignal; message?: never }
+  | { message: string; signal?: never }
+);
+
+/** 格式随 attempt 冻结；新信号仅复用网页模板核验 hash，历史文本保持原字节。 */
+export function resultBusDeliveryMessage(entry: ResultBusEntry, attemptId: string): ResultBusDelivery {
+  if (entry.attempt?.messageFormat === "signal-v1") {
+    if (entry.attempt.attemptId !== attemptId) {
+      throw new ResultBusDeliveryError("RESULT_BUS_ATTEMPT_MISMATCH", "通知 attemptId 与持久化发送尝试不一致。");
+    }
+    const result = isOfficialResult(entry.result) ? entry.result : canonicalOf(entry);
+    const signal: CompletionSignal = { type: "execution_ended", version: 1, workspaceId: entry.workspaceId,
+      commandId: entry.commandId, taskId: result.machineEvidence.taskId, attemptId };
+    return { signal, messageSha256: productionFeedbackMessageSha256(renderCompletionNotification(signal)) };
+  }
   if (isOfficialResult(entry.result)) {
     const message = formatOfficialTurnMessage({ workspaceId: entry.workspaceId, result: entry.result,
       eventId: resultBusCompanionDeliveryId(entry.busEntryId), attemptId });
@@ -237,8 +252,7 @@ function busInFlightDto(entry: ResultBusEntry, companionId: string, stateDir?: s
   };
   if ((entry.deliveryStatus === "claimed" || entry.deliveryStatus === "outcome_unknown") && entry.attempt) {
     const delivery = resultBusDeliveryMessage(entry, entry.attempt.attemptId);
-    inFlight.message = delivery.message;
-    inFlight.messageSha256 = delivery.messageSha256;
+    Object.assign(inFlight, delivery);
     if (entry.lifecycle === "ephemeral" && entry.sendTarget) inFlight.terminalWitness = issueTerminalWitness({ workspaceId: entry.workspaceId, eventId: resultBusCompanionDeliveryId(entry.busEntryId), attemptId: entry.attempt.attemptId, routeCanonical: entry.sendTarget.canonicalUrl, companionId }, stateDir, false);
   }
   return inFlight;
@@ -795,7 +809,7 @@ export function resultBusCompanionRelease(input: {
   });
 }
 
-/** /begin-send：Bus compat → beginResultBusSend（stale → bounded 错误）；claimed 后才返回 message。 */
+/** /begin-send：Bus compat → beginResultBusSend（stale → bounded 错误）；claimed 后才返回冻结格式的载荷。 */
 export function resultBusCompanionBeginSend(input: {
   workspaceId: string;
   workspaceRoot: string;
@@ -803,8 +817,9 @@ export function resultBusCompanionBeginSend(input: {
   routeCanonical: string;
   eventId: string;
   reservationId: string;
+  once?: boolean;
   stateDir?: string;
-}): { eventId: string; status: string; attemptId: string; message: string; messageSha256: string; terminalWitness?: string } {
+}): ResultBusDelivery & { eventId: string; status: string; attemptId: string; terminalWitness?: string } {
   const stateDir = input.stateDir;
   return withDeliveryArbiter({ workspaceId: input.workspaceId, workspaceRoot: input.workspaceRoot, stateDir }, identity => {
     // R5d3 auth-purity：只读 credential pre-auth 先于 source resolution 与一切 mutation；
@@ -838,6 +853,7 @@ export function resultBusCompanionBeginSend(input: {
       const outcome = beginResultBusSend(identity, {
         busEntryId: source.entry.busEntryId,
         reservationId: input.reservationId,
+        once: input.once,
       }, {}, stateDir);
       if (outcome.status === "stale_reservation") {
         throw new ResultBusDeliveryError(
@@ -850,8 +866,7 @@ export function resultBusCompanionBeginSend(input: {
         eventId: resultBusCompanionDeliveryId(outcome.entry.busEntryId),
         status: outcome.entry.deliveryStatus,
         attemptId: outcome.attemptId,
-        message: delivery.message,
-        messageSha256: delivery.messageSha256,
+        ...delivery,
         ...(outcome.entry.lifecycle === "ephemeral" ? { terminalWitness: issueTerminalWitness({ workspaceId: input.workspaceId, eventId: resultBusCompanionDeliveryId(outcome.entry.busEntryId), attemptId: outcome.attemptId, routeCanonical: outcome.sendTarget.canonicalUrl, companionId: sinkAuth.companionId }, stateDir) } : {}),
       };
     }
@@ -867,6 +882,7 @@ export function resultBusCompanionBeginSend(input: {
         companionId: ctx.companionId,
         eventId: input.eventId,
         reservationId: input.reservationId,
+        once: input.once,
         stateDir,
         controlOnly: true,
       });

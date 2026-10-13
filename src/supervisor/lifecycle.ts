@@ -5,10 +5,13 @@ import { findBridgeObservation, runtimeFile, type BridgeObservation } from "../b
 import { ensureBridgeAndTunnel } from "../process/daemon.js";
 import { readReleaseReferenceJson } from "../core/release-references.js";
 import { getStateDir } from "../config/paths.js";
+import { GatewayRegistry } from "../gateway/registry.js";
+import { readGatewaySupervisorConfig } from "../gateway/supervisor.js";
+import { isUnifiedWorkspace, requireVerifiedGateway } from "../gateway/control.js";
 import { ensureConfiguredGatewaySupervisor } from "../gateway/startup.js";
 import { Workspace } from "../workspace/manager.js";
 import { isNamedTunnelReady, readTunnelState } from "../tunnel/state.js";
-import { hasSupervisorState, withSupervisorOperation } from "./store.js";
+import { hasSupervisorState, readSupervisorConfig, withSupervisorOperation } from "./store.js";
 import { assertMaintenanceHandle, MaintenanceBusyError, releaseMaintenanceOrThrow,
   tryAcquireMaintenanceLock, type MaintenanceLockHandle } from "../core/maintenance-lock.js";
 import type { SupervisorConfig } from "./schema.js";
@@ -131,16 +134,23 @@ export async function withSupervisorLifecycleFence<T>(action: (maintenance: Main
 /** Only explicit CLI intent changes desired state; rollout/daemon primitives do not. */
 export async function withExplicitSupervisorIntent<T>(root: string, desiredState: "running" | "stopped",
   tunnel: boolean | undefined, action: (tunnel: boolean, maintenance: MaintenanceLockHandle) => Promise<T>, stateDir = getStateDir()): Promise<T> {
+  const unified = isUnifiedWorkspace(new Workspace(root), stateDir);
+  if (unified && desiredState === "running") {
+    await ensureConfiguredGatewaySupervisor({ stateDir });
+    await requireVerifiedGateway({ stateDir });
+  }
   const result = await withSupervisorLifecycleFence(async maintenance => {
-    if (!hasSupervisorState(root, stateDir)) return action(tunnel ?? false, maintenance);
+    const hasState = hasSupervisorState(root, stateDir);
+    if (!hasState && !unified) return action(tunnel ?? false, maintenance);
     return withSupervisorOperation(root, async tx => {
       const current = tx.readConfig();
-      if (!current) throw new Error("SUPERVISOR_CONFIG_MISSING");
-      const updated = tx.updateConfig({ desiredState, ...(tunnel === undefined ? {} : { tunnel }) });
+      if (!current && hasState) throw new Error("SUPERVISOR_CONFIG_MISSING");
+      const updated = tx.updateConfig({ desiredState, ...(tunnel === undefined ? {} : { tunnel }),
+        ...(!current ? { registrationMode: "none" as const } : {}) });
       return action(updated.tunnel, maintenance);
     }, { stateDir });
   }, stateDir);
-  if (desiredState === "running") {
+  if (desiredState === "running" && !unified) {
     try { await ensureConfiguredGatewaySupervisor({ stateDir }); }
     catch (error) {
       if (!(error instanceof Error)) throw new Error("Bridge 已就绪，但 Gateway/公网隧道启动失败", { cause: error });
@@ -149,4 +159,23 @@ export async function withExplicitSupervisorIntent<T>(root: string, desiredState
     }
   }
   return result;
+}
+
+/** Restore persisted explicit intent only, after unified Gateway owner handoff. */
+export async function restoreGatewayRunningWorkspaces(maintenance: MaintenanceLockHandle, stateDir = getStateDir()): Promise<void> {
+  assertMaintenanceHandle(stateDir, maintenance);
+  if (readGatewaySupervisorConfig(stateDir)?.unified !== true) return;
+  const running = new GatewayRegistry(stateDir).list().map(entry => {
+    const workspace = new Workspace(entry.root);
+    if (workspace.id !== entry.workspaceId || workspace.root !== entry.root)
+      throw new Error("GATEWAY_WORKSPACE_ID_MISMATCH: 未恢复非规范 workspace。");
+    const config = readSupervisorConfig(workspace.root, { stateDir });
+    if (!config && hasSupervisorState(workspace.root, stateDir)) throw new Error("SUPERVISOR_CONFIG_MISSING");
+    return { workspace, config };
+  }).filter(item => item.config?.desiredState === "running");
+  for (const { workspace, config } of running) {
+    assertMaintenanceHandle(stateDir, maintenance);
+    await ensureBridgeAndTunnel(workspace.root, { maintenance, tunnel: config!.tunnel });
+    assertMaintenanceHandle(stateDir, maintenance);
+  }
 }

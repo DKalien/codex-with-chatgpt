@@ -1,3 +1,4 @@
+import { assertNoLegacyHistoryCleanup } from "../command-cleanup/legacy-history-fence.js";
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -69,9 +70,11 @@ type ResultBusChange<T> = { state: ResultBusState | null; result: T; noWrite?: b
  * tmp 写前的写侧 strict parse（损坏 fail closed）由 serialize 钩子保留。
  */
 function withLock<T>(identity: RoutingWorkspaceIdentity, stateDir: string, fn: (state: ResultBusState | null) => ResultBusChange<T>): T {
+  assertNoLegacyHistoryCleanup(identity.id, stateDir);
   const file = resultBusFile(identity.id, stateDir);
   return runDurableStoreTransaction<ResultBusState, T>({
     file,
+    afterRead: () => assertNoLegacyHistoryCleanup(identity.id, stateDir),
     marker: resultBusInitializedFile(identity.id, stateDir),
     markerContent: `${identity.id}\n`,
     markerOpenMode: 0o600,

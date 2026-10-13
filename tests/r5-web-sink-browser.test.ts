@@ -2645,3 +2645,242 @@ describe("同 document 等价 URL generation 变化的只读恢复", () => {
     expect(worker.tabsSendMessage).not.toHaveBeenCalled();
   });
 });
+
+describe("当前项目历史格式化 SW", () => {
+  const HASH = "f".repeat(64), FORMAT_KEY = "c2c.panel.format.v1", ACTION_KEY = "c2c.panel.action.v1";
+  const hidden = `c2c.panel.hidden.v1.${WORKSPACE}`;
+  const json = (body: any, status = 200) => ({ ok: status === 200, status, async json() { return body; } });
+  const proof = (status = "preview", overrides = {}) => ({ status, workspaceId: WORKSPACE,
+    confirmationSha256: HASH, counts: { tasks: 16, records: 0, feedback: 3 }, notice: "永久清空当前项目历史，无法恢复", ...overrides });
+  const archive = (status = "isolated") => ({ version: 1, entries: [{ journal: unknownJournal(), status,
+    archivedAt: "2026-10-01T00:00:02.000Z", isolatedAt: status === "isolated" ? "2026-10-01T00:00:03.000Z" : null, terminalGoneAt: null }] });
+  const request = (phase: string, extras = {}) => ({ type: "c2c.operations.format", workspaceId: WORKSPACE, phase, ...extras });
+  const preview = (w: Awaited<ReturnType<typeof loadWorker>>) => w.send(request("preview"), w.panelSender);
+  const confirm = (w: Awaited<ReturnType<typeof loadWorker>>) => w.send(request("confirm", { confirmationSha256: HASH, confirmed: true }), w.panelSender);
+  const check = (w: Awaited<ReturnType<typeof loadWorker>>) => w.send(request("check"), w.panelSender);
+  it("清精确项目、hidden和已认定legacy历史，保留连接、安全与其他workspace", async () => {
+    const other = projectStorageKey("aaaaaaaaaaaa", ISOLATION_ARCHIVE_KEY);
+    const w = await loadWorker({ local: { [ISOLATION_ARCHIVE_KEY]: archive(), [ACTION_KEY]: { version: 1, operations: [] },
+      [hidden]: ["old"], [other]: archive(), "c2c.panel.hidden.v1.aaaaaaaaaaaa": ["keep"] },
+      fetch: async url => json(proof(String(url).endsWith("/confirm") ? "cleaned" : "preview")) });
+    expect(await preview(w)).toMatchObject({ ok: true, status: "preview", autonomy: "off" });
+    expect(await confirm(w)).toMatchObject({ ok: true, status: "cleaned", workspaceId: WORKSPACE });
+    for (const key of [projectKey(ISOLATION_ARCHIVE_KEY), projectKey(ACTION_KEY), projectKey(FORMAT_KEY), hidden, ISOLATION_ARCHIVE_KEY, ACTION_KEY])
+      expect(w.local.values.has(key)).toBe(false);
+    expect(w.local.values.get(other)).toEqual(archive());
+    expect(w.local.values.get("c2c.panel.hidden.v1.aaaaaaaaaaaa")).toEqual(["keep"]);
+    expect(w.local.values.get(projectKey(TRANSPORT_KEY))).toEqual(w.initial.transport);
+    expect(w.local.values.get(projectKey(AUTONOMY_KEY))).toMatchObject({ mode: "off" });
+    expect(w.tabsSendMessage).not.toHaveBeenCalled();
+  });
+  it("未授权和普通网页不能格式化，缺少显式确认不能发confirm", async () => {
+    const w = await loadWorker({ local: { [ISOLATION_ARCHIVE_KEY]: archive() }, fetch: async () => json({ error: "PANEL_LOCAL_AUTHORIZATION_REQUIRED" }, 403) });
+    expect(await w.send(request("preview"), w.ownerSender)).toMatchObject({ ok: false });
+    expect(await preview(w)).toMatchObject({ ok: false, reason: "PANEL_LOCAL_AUTHORIZATION_REQUIRED" });
+    expect(await confirm(w)).toMatchObject({ ok: false, reason: "explicit_confirmation_required" });
+    expect(w.local.values.get(projectKey(ISOLATION_ARCHIVE_KEY))).toEqual(archive());
+    expect(w.fetchMock.mock.calls.some(call => String(call[0]).endsWith("/confirm"))).toBe(false);
+  });
+  it.each(["journal", "route_fence", "pending_archive", "pending_action"])("%s 阻挡且保留证据", async kind => {
+    const w = await loadWorker({ local: {
+      [ISOLATION_ARCHIVE_KEY]: archive(kind === "pending_archive" ? "pending" : "isolated"),
+      ...(kind === "journal" ? { [JOURNAL_KEY]: unknownJournal() } : {}),
+      ...(kind === "pending_action" ? { [ACTION_KEY]: { version: 1, operations: [{ status: "pending", workspaceId: WORKSPACE }] } } : {}),
+    }, ...(kind === "route_fence" ? { routeFence: { state: "OUTCOME_UNKNOWN" } } : {}), fetch: async () => json(proof()) });
+    const before = w.local.values.get(projectKey(ISOLATION_ARCHIVE_KEY));
+    expect(await preview(w)).toMatchObject({ ok: false });
+    expect(w.local.values.get(projectKey(ISOLATION_ARCHIVE_KEY))).toEqual(before);
+    expect(w.fetchMock.mock.calls.some(call => String(call[0]).includes("/operations/format"))).toBe(false);
+  });
+  it("服务器响应未知禁止重发，重启后只按原hash核验并完成本机清理", async () => {
+    const w = await loadWorker({ local: { [ISOLATION_ARCHIVE_KEY]: archive(), [hidden]: ["old"] }, fetch: async url => {
+      if (String(url).endsWith("/confirm")) throw new Error("lost response"); return json(proof());
+    } });
+    expect(await preview(w)).toMatchObject({ ok: true });
+    expect(await confirm(w)).toMatchObject({ ok: false, reason: "panel_format_unknown" });
+    expect(await confirm(w)).toMatchObject({ ok: false, reason: "panel_format_unknown" });
+    for (const type of ["c2c.pair", "c2c.connect.page", "c2c.production.send.request", "c2c.autonomy.arm"])
+      expect(await w.send({ type, workspaceId: WORKSPACE, tabId: 7, canonicalRoute: ROUTE_A }, { id: "browser-companion-test-id" })).toMatchObject({ ok: false, reason: "panel_format_unknown" });
+    expect(w.local.values.get(projectKey(ISOLATION_ARCHIVE_KEY))).toEqual(archive());
+    expect(w.local.values.get(hidden)).toEqual(["old"]);
+    expect(w.fetchMock.mock.calls.filter(call => String(call[0]).endsWith("/confirm"))).toHaveLength(1);
+    const restarted = await loadWorker({ storage: { local: w.local, session: w.session }, fetch: async () => json(proof("cleaned")) });
+    expect(await check(restarted)).toMatchObject({ ok: true, status: "cleaned" });
+    expect(restarted.fetchMock.mock.calls.filter(call => String(call[0]).includes("/operations/format"))).toHaveLength(1);
+    expect(restarted.fetchMock.mock.calls[0][1]).toMatchObject({ method: "GET" });
+    expect(String(restarted.fetchMock.mock.calls[0][0])).toContain(`confirmationSha256=${HASH}`);
+    expect(restarted.local.values.has(hidden)).toBe(false);
+    expect(restarted.local.values.has(projectKey(FORMAT_KEY))).toBe(false);
+  });
+  it.each(["workspace", "hash"])("cleaned 的 %s 不匹配不能清本机历史", async wrong => {
+    const w = await loadWorker({ local: { [ISOLATION_ARCHIVE_KEY]: archive() }, fetch: async url => json(
+      String(url).endsWith("/confirm") ? proof("cleaned", wrong === "workspace" ? { workspaceId: "aaaaaaaaaaaa" } : { confirmationSha256: "0".repeat(64) }) : proof()) });
+    await preview(w); expect(await confirm(w)).toMatchObject({ ok: false, reason: "panel_format_unknown" });
+    expect(w.local.values.get(projectKey(ISOLATION_ARCHIVE_KEY))).toEqual(archive());
+    expect(w.local.values.has(projectKey(FORMAT_KEY))).toBe(true);
+  });
+  it("本机删除失败只读恢复，其他项目legacy历史保留", async () => {
+    const w = await loadWorker({ preMigrated: true, local: { [ISOLATION_ARCHIVE_KEY]: archive(), [hidden]: ["old"] },
+      fetch: async url => json(proof(String(url).endsWith("/preview") ? "preview" : "cleaned")) });
+    w.local.values.set(TRANSPORT_KEY, { workspaceId: "aaaaaaaaaaaa" });
+    const remove = w.local.remove.bind(w.local);
+    let failed = false;
+    w.local.remove = async keys => { if (!failed) { failed = true; throw new Error("storage"); } return remove(keys); };
+    await preview(w); expect(await confirm(w)).toMatchObject({ ok: false, reason: "panel_format_local_cleanup_failed", serverCleaned: true });
+    expect(w.local.values.has(projectKey(ISOLATION_ARCHIVE_KEY))).toBe(true);
+    expect(await check(w)).toMatchObject({ ok: true, status: "cleaned" });
+    expect(w.local.values.get(ISOLATION_ARCHIVE_KEY)).toEqual(archive());
+    expect(w.fetchMock.mock.calls.filter(call => String(call[0]).endsWith("/confirm"))).toHaveLength(1);
+  });
+  it("健康VERIFIED route和COMPLETED probe可格式化且不重置发送fence", async () => {
+    const fence = { state: "VERIFIED", companionId: COMPANION, challengeId: connectedFlow().challengeId,
+      routeCanonical: ROUTE_A, challengeExpiresAt: "2099-01-01T00:00:00.000Z", createdAt: 1, updatedAt: 1 };
+    const w = await loadWorker({ routeFence: fence, connectFlow: connectedFlow(), fetch: async url => json(proof(String(url).endsWith("/confirm") ? "cleaned" : "preview")) });
+    // Hydrate后合法终态latch不会改durable fence；COMPLETED沿用原reset能力，不被format删除。
+    const latchKey = "c2c_route_attest_latch_v1", sendKey = "c2c_send_probe_latch_v1";
+    w.session.values.set(projectKey(latchKey), { state: "VERIFIED", challengeId: fence.challengeId, canonicalRoute: ROUTE_A });
+    w.session.values.set(projectKey(sendKey), { state: "COMPLETED" });
+    const restarted = await loadWorker({ storage: { local: w.local, session: w.session }, fetch: async url => json(proof(String(url).endsWith("/confirm") ? "cleaned" : "preview")) });
+    expect(await preview(restarted)).toMatchObject({ ok: true });
+    expect(await confirm(restarted)).toMatchObject({ ok: true, status: "cleaned" });
+    expect(restarted.local.values.get(projectKey(FENCE_KEY))).toEqual(fence);
+    expect(restarted.session.values.get(projectKey(sendKey))).toMatchObject({ state: "COMPLETED" });
+  });
+  it("真实在途nativeSend阻止format，零格式化请求且保留journal", async () => {
+    let entered!: () => void, release!: (value: any) => void;
+    const reached = new Promise<void>(resolve => { entered = resolve; });
+    const pending = new Promise(resolve => { release = resolve; });
+    const reserved = { ...unknownJournal(), state: "RESERVED" };
+    const w = await loadWorker({ connectFlow: connectedFlow(), local: { [JOURNAL_KEY]: reserved },
+      tabsSendMessage: async () => { entered(); return pending; }, fetch: async () => json(apiState(null)) });
+    await w.send({ type: "c2c.heartbeat", canonicalRoute: ROUTE_A, generation: 1,
+      safety: { composer: "empty", generation: "idle", safe: true } }, w.ownerSender);
+    const sending = w.send({ type: "c2c.production.send.request" });
+    await Promise.race([reached, sending.then(reply => { throw new Error(JSON.stringify(reply)); })]);
+    expect(await preview(w)).toMatchObject({ ok: false, reason: "format_operation_busy" });
+    expect(w.fetchMock.mock.calls.some(call => String(call[0]).includes("/operations/format"))).toBe(false);
+    expect(w.local.values.get(projectKey(JOURNAL_KEY))).toEqual(reserved);
+    release({ ok: false, reason: "test_complete" }); await sending;
+  });
+  it("exact零写拒绝只释放pending凭证，保留历史供新预览", async () => {
+    const w = await loadWorker({ local: { [ISOLATION_ARCHIVE_KEY]: archive() }, fetch: async url =>
+      String(url).endsWith("/confirm") ? json({ error: "COMMAND_CLEANUP_CONFIRMATION_MISMATCH", noMutation: true,
+        workspaceId: WORKSPACE, confirmationSha256: HASH }, 409) : json(proof()) });
+    await preview(w); expect(await confirm(w)).toMatchObject({ ok: false, reason: "COMMAND_CLEANUP_CONFIRMATION_MISMATCH" });
+    expect(w.local.values.has(projectKey(FORMAT_KEY))).toBe(false);
+    expect(w.local.values.get(projectKey(ISOLATION_ARCHIVE_KEY))).toEqual(archive());
+    expect(await preview(w)).toMatchObject({ ok: true });
+  });
+
+  it.each(["confirm", "remove_failure", "check"])("storage等待时gate变化：%s只撤回本轮未发出的intent", async phase => {
+    const pending = { version: 1, workspaceId: WORKSPACE, confirmationSha256: HASH };
+    let stale = false;
+    const w = await loadWorker({ preMigrated: true, local: { [ISOLATION_ARCHIVE_KEY]: archive(), [hidden]: ["old"],
+      ...(phase === "check" ? { [FORMAT_KEY]: pending } : {}) }, fetch: async url =>
+      String(url).endsWith("/state") ? stale ? json({ error: "COMPANION_UNAUTHORIZED" }, 401) : json(apiState(null)) : json(proof()) });
+    if (phase !== "check") expect(await preview(w)).toMatchObject({ ok: true });
+    let entered!: () => void, release!: () => void;
+    const reached = new Promise<void>(resolve => { entered = resolve; }), held = new Promise<void>(resolve => { release = resolve; });
+    if (phase === "check") {
+      const get = w.local.get.bind(w.local);
+      w.local.get = async keys => { const row = await get(keys); if (keys === projectKey(ACTION_KEY)) { entered(); await held; } return row; };
+    } else {
+      const set = w.local.set.bind(w.local);
+      w.local.set = async row => { await set(row); if (row[projectKey(FORMAT_KEY)]) { entered(); await held; } };
+    }
+    const remove = vi.spyOn(w.local, "remove");
+    if (phase === "remove_failure") remove.mockRejectedValue(new Error("storage"));
+    const operation = phase === "check" ? check(w) : confirm(w);
+    await reached;
+    stale = true; expect(await w.send({ type: "c2c.fetch.state" })).toMatchObject({ ok: false });
+    w.fetchMock.mockClear(); release();
+    expect(await operation).toMatchObject({ ok: false, reason: phase === "remove_failure" ? "panel_format_intent_cleanup_failed" : "transport_unavailable" });
+    expect(w.fetchMock).not.toHaveBeenCalled();
+    expect(w.local.values.get(projectKey(ISOLATION_ARCHIVE_KEY))).toEqual(archive()); expect(w.local.values.get(hidden)).toEqual(["old"]);
+    expect(w.local.values.has(projectKey(FORMAT_KEY))).toBe(phase !== "confirm");
+    if (phase === "check") expect(remove).not.toHaveBeenCalled(); else expect(remove).toHaveBeenCalledWith(projectKey(FORMAT_KEY));
+    stale = false; expect(await w.send({ type: "c2c.fetch.state" })).toMatchObject({ ok: true });
+    if (phase === "confirm") expect(await preview(w)).toMatchObject({ ok: true });
+    else expect(await confirm(w)).toMatchObject({ ok: false, reason: "panel_format_unknown" });
+  });
+
+  it.each(["partial_history", "pending_delete"])("%s 失败仍保留唯一凭证，重建后只读恢复", async failure => {
+    const w = await loadWorker({ local: { [ISOLATION_ARCHIVE_KEY]: archive(), [hidden]: ["old"] },
+      fetch: async url => json(proof(String(url).endsWith("/preview") ? "preview" : "cleaned")) });
+    const remove = w.local.remove.bind(w.local); let once = false;
+    w.local.remove = async keys => {
+      const list = Array.isArray(keys) ? keys : [keys];
+      if (!once && ((failure === "partial_history" && list.includes(projectKey(ISOLATION_ARCHIVE_KEY)))
+        || (failure === "pending_delete" && list.includes(projectKey(FORMAT_KEY))))) {
+        once = true;
+        if (failure === "partial_history") await remove(projectKey(ISOLATION_ARCHIVE_KEY));
+        throw new Error("partial storage failure");
+      }
+      return remove(keys);
+    };
+    await preview(w); expect(await confirm(w)).toMatchObject({ ok: false, reason: "panel_format_local_cleanup_failed" });
+    expect(w.local.values.has(projectKey(FORMAT_KEY))).toBe(true);
+    const restarted = await loadWorker({ storage: { local: w.local, session: w.session }, fetch: async () => {
+      const { counts: _counts, ...body } = proof("cleaned"); return json(body);
+    } });
+    expect(await check(restarted)).toMatchObject({ ok: true, status: "cleaned" });
+    expect(restarted.local.values.has(projectKey(FORMAT_KEY))).toBe(false);
+    expect(restarted.local.values.has(hidden)).toBe(false);
+    expect(restarted.fetchMock.mock.calls.every(call => call[1]?.method === "GET")).toBe(true);
+  });
+  it("迁移前面板日志中的其他项目条目保留，未知legacy身份拒绝", async () => {
+    const foreign = { workspaceId: "aaaaaaaaaaaa", status: "completed", request: { commandId: "keep" } };
+    const w = await loadWorker({ local: { [ACTION_KEY]: { version: 1, operations: [foreign,
+      { workspaceId: WORKSPACE, status: "completed", request: { commandId: "old" } }] } },
+      fetch: async url => json(proof(String(url).endsWith("/preview") ? "preview" : "cleaned")) });
+    await preview(w); expect(await confirm(w)).toMatchObject({ ok: true });
+    expect(w.local.values.get(ACTION_KEY)).toEqual({ version: 1, operations: [foreign] });
+    expect(w.local.values.get(projectKey(ACTION_KEY))).toEqual({ version: 1, operations: [foreign] });
+    const unknown = await loadWorker({ preMigrated: true, local: { [ISOLATION_ARCHIVE_KEY]: archive() }, fetch: async () => json(proof()) });
+    unknown.local.values.delete(TRANSPORT_KEY);
+    expect(await preview(unknown)).toMatchObject({ ok: false, reason: "format_legacy_identity_unknown" });
+  });
+
+  it("服务端空历史not_found也需合法hash确认，完成本机残留清空", async () => {
+    const w = await loadWorker({ local: { [ISOLATION_ARCHIVE_KEY]: archive(), [hidden]: ["old"] },
+      fetch: async url => json(proof(String(url).endsWith("/preview") ? "not_found" : "cleaned", { counts: { tasks: 0, feedback: 0 } })) });
+    expect(await preview(w)).toMatchObject({ ok: true, status: "not_found", confirmationSha256: HASH });
+    expect(await confirm(w)).toMatchObject({ ok: true, status: "cleaned" });
+    expect(w.local.values.has(projectKey(ISOLATION_ARCHIVE_KEY))).toBe(false);
+    expect(w.local.values.has(hidden)).toBe(false);
+  });
+
+  it("服务端pending明确要求本机核验，保留恢复凭证和本机历史", async () => {
+    const w = await loadWorker({ preMigrated: true, local: { [ISOLATION_ARCHIVE_KEY]: archive(), [FORMAT_KEY]: {
+      version: 1, workspaceId: WORKSPACE, confirmationSha256: HASH } }, fetch: async () => json(proof("pending")) });
+    expect(await check(w)).toMatchObject({ ok: false, reason: "panel_format_server_pending", needsLocalReview: true });
+    expect(w.local.values.has(projectKey(FORMAT_KEY))).toBe(true);
+    expect(w.local.values.get(projectKey(ISOLATION_ARCHIVE_KEY))).toEqual(archive());
+    expect(w.fetchMock.mock.calls.every(call => call[1]?.method === "GET")).toBe(true);
+  });
+
+  it("普通Pair经authenticated VERIFIED清临时正文后仍能预览，fence保持原样", async () => {
+    const fence = { state: "VERIFIED", companionId: COMPANION, challengeId: connectedFlow().challengeId,
+      routeCanonical: ROUTE_A, challengeExpiresAt: "2099-01-01T00:00:00.000Z", createdAt: 1, updatedAt: 1 };
+    const w = await loadWorker({ routeFence: fence, connectFlow: connectedFlow(), fetch: async url =>
+      json(String(url).endsWith("/state") ? apiState(null) : proof()) });
+    expect(await w.send({ type: "c2c.fetch.state" })).toMatchObject({ ok: true });
+    expect(w.local.values.get(projectKey(TRANSPORT_KEY))).not.toHaveProperty("routeAttestationMessage");
+    expect(w.local.values.get(projectKey(TRANSPORT_KEY))).not.toHaveProperty("challengeId");
+    expect(await preview(w)).toMatchObject({ ok: true, status: "preview" });
+    expect(w.local.values.get(projectKey(FENCE_KEY))).toEqual(fence);
+    expect(w.tabsSendMessage).not.toHaveBeenCalled();
+    const restarted = await loadWorker({ storage: { local: w.local, session: w.session }, fetch: async () => json(proof()) });
+    expect(await preview(restarted)).toMatchObject({ ok: true });
+  });
+  it.each(["companion", "route", "challenge"])("无临时正文时不同%s fence仍拒绝预览", async wrong => {
+    const fence = { state: "VERIFIED", companionId: wrong === "companion" ? BINDING : COMPANION,
+      challengeId: wrong === "challenge" ? null : connectedFlow().challengeId,
+      routeCanonical: wrong === "route" ? ROUTE_B : ROUTE_A, createdAt: 1, updatedAt: 1 };
+    const w = await loadWorker({ routeFence: fence, connectFlow: connectedFlow(), local: {
+      [TRANSPORT_KEY]: { ...initialState().transport, routeAttestationMessage: null } }, fetch: async () => json(proof()) });
+    expect(await preview(w)).toMatchObject({ ok: false, reason: "format_send_fence_active" });
+    expect(w.fetchMock.mock.calls.some(call => String(call[0]).includes("/operations/format"))).toBe(false);
+  });
+
+});

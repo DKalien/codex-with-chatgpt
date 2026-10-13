@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ensureDir, getStateDir } from "../config/paths.js";
-import { adminFetch, findBridgeObservation, findLiveBridge, type RuntimeState } from "../bridge/runtime.js";
+import { adminFetch, findBridgeObservation, findLiveBridge, runtimeFile, type RuntimeState } from "../bridge/runtime.js";
 import { Workspace } from "../workspace/manager.js";
 import type { DesktopCompatibility } from "../auth/store.js";
 import { detectTunnelBinaries } from "../tunnel/detect.js";
@@ -10,6 +10,7 @@ import { buildDaemonEnv, spawnDetachedDaemon, resolveDaemonSpawnHelperPath, reso
 import { observeProcessPresence, probeProcess } from "./process-probe.js";
 import { persistSpawnProvenance, type LaunchIdentity, type readBridgeProvenance } from "./bridge-provenance.js";
 import { isRuntimeBuildId } from "../build-id.js";
+import { isUnifiedWorkspace, requireVerifiedGateway, isGatewayWorkspaceClosed, type VerifiedGateway, type GatewayWorkspaceStatus } from "../gateway/control.js";
 import { ensureConfiguredGatewaySupervisor } from "../gateway/startup.js";
 import {
   tryAcquireMaintenanceLock,
@@ -66,11 +67,19 @@ export function buildServeArgs(baseArgs: string[], workspaceRoot: string, port?:
  */
 export async function ensureBridge(workspaceRoot: string, opts: {
   port?: number;
+  tunnel?: boolean;
   /** rollout 已持有 maintenance 时传入，避免 nested self-deadlock。 */
   maintenance?: MaintenanceLockHandle;
 } = {}): Promise<EnsureBridgeResult> {
   const workspace = new Workspace(workspaceRoot);
   const stateDir = getStateDir();
+  const unified = isUnifiedWorkspace(workspace, stateDir);
+  let gateway: VerifiedGateway | undefined;
+  if (unified) {
+    if (opts.maintenance) assertMaintenanceHandle(stateDir, opts.maintenance);
+    else await ensureConfiguredGatewaySupervisor({ stateDir });
+    gateway = await requireVerifiedGateway({ stateDir });
+  }
   const start = createStartLock(stateDir, workspace.id);
   let ownedMaintenance: MaintenanceLockHandle | null = null;
   if (opts.maintenance) {
@@ -93,7 +102,7 @@ export async function ensureBridge(workspaceRoot: string, opts: {
   let result: EnsureBridgeResult | undefined;
   let actionError: unknown = null;
   try {
-    result = await ensureUnlocked(workspace, { ...opts, startupLease: lease });
+    result = await ensureUnlocked(workspace, { ...opts, startupLease: lease, gateway });
   } catch (error) {
     actionError = error;
   }
@@ -111,7 +120,7 @@ export async function ensureBridge(workspaceRoot: string, opts: {
   }
   releaseMaintenanceOrThrow(ownedMaintenance, { result, actionError: actionError ?? undefined });
   // Gateway 自己需要 maintenance；继承锁的 caller 必须在其围栏退出后启动。
-  if (ownedMaintenance) {
+  if (ownedMaintenance && !unified) {
     try { await ensureConfiguredGatewaySupervisor({ stateDir }); }
     catch (error) {
       if (!(error instanceof Error)) throw new Error("Bridge 已就绪，但 Gateway/公网隧道启动失败", { cause: error });
@@ -124,13 +133,41 @@ export async function ensureBridge(workspaceRoot: string, opts: {
 
 export type { StartupLease };
 
-async function ensureUnlocked(workspace: Workspace, opts: { port?: number; startupLease?: StartupLease }): Promise<EnsureBridgeResult> {
+async function ensureUnlocked(workspace: Workspace, opts: { port?: number; tunnel?: boolean; startupLease?: StartupLease; gateway?: VerifiedGateway }): Promise<EnsureBridgeResult> {
   const observation = await findBridgeObservation(workspace.id);
-  if (observation.state === "healthy") return { runtime: observation.runtime, spawned: false };
+  if (opts.gateway && fs.existsSync(runtimeFile(workspace.id)) && !observation.runtime)
+    throw new Error("GATEWAY_WORKSPACE_UNKNOWN: runtime 身份无法读取，未启动 workspace。");
+  if (observation.state === "healthy") {
+    if (opts.gateway) {
+      await verifyHostedBridge(workspace, observation.runtime, opts.gateway);
+      const hosted = await opts.gateway.request<GatewayWorkspaceStatus>("GET", `/internal/gateway/workspaces/${workspace.id}`);
+      if (hosted.hosted !== true || !hosted.current || !sameHostedIdentity(hosted.current, observation.runtime))
+        throw new Error("GATEWAY_WORKSPACE_UNKNOWN: Gateway 未确认当前 workspace 实例。");
+    }
+    return { runtime: observation.runtime, spawned: false };
+  }
   if (observation.state === "unknown") {
     throw new Error(
       `Bridge state is uncertain (${observation.reason}); refusing to start another bridge.`
     );
+  }
+
+  if (opts.gateway) {
+    if (!isUnifiedWorkspace(workspace) || !opts.startupLease) throw new Error("GATEWAY_WORKSPACE_AUTHORITY_CHANGED");
+    if (observation.runtime?.hosting === "gateway") {
+      const oldHostExited = observation.runtime.pid !== opts.gateway.runtime.pid &&
+        await observeProcessPresence(observation.runtime.pid) === "missing";
+      if (!oldHostExited && !await isGatewayWorkspaceClosed(opts.gateway, observation.runtime))
+        throw new Error("GATEWAY_WORKSPACE_UNKNOWN: 旧实例尚未完整关闭。");
+    }
+    await opts.gateway.request("POST", `/internal/gateway/workspaces/${workspace.id}/start`, {
+      lease: encodeStartupLease(opts.startupLease), ...(opts.port === undefined ? {} : { port: opts.port }),
+      ...(opts.tunnel === undefined ? {} : { tunnel: opts.tunnel }),
+    });
+    const current = await findBridgeObservation(workspace.id);
+    if (current.state !== "healthy") throw new Error("GATEWAY_WORKSPACE_START_UNCONFIRMED");
+    await verifyHostedBridge(workspace, current.runtime, opts.gateway);
+    return { runtime: current.runtime, spawned: true };
   }
 
   const logDir = ensureDir(path.join(getStateDir(), "logs"));
@@ -186,9 +223,26 @@ async function ensureUnlocked(workspace: Workspace, opts: { port?: number; start
   throw new Error(`Bridge did not become healthy within 20s. See ${logFile}`);
 }
 
+function sameHostedIdentity(identity: { workspaceId: string; workspaceRoot: string; pid: number; startedAt: string; port: number; runtimeBuildId: string | null }, runtime: RuntimeState): boolean {
+  return identity.workspaceId === runtime.workspaceId && identity.workspaceRoot === runtime.workspaceRoot &&
+    identity.pid === runtime.pid && identity.startedAt === runtime.startedAt && identity.port === runtime.port &&
+    identity.runtimeBuildId === (runtime.runtimeBuildId ?? null);
+}
+
+async function verifyHostedBridge(workspace: Workspace, runtime: RuntimeState, gateway: VerifiedGateway): Promise<void> {
+  const info = await adminFetch<BridgeAdminInfo>(runtime, "GET", "/admin/info", 2000);
+  if (runtime.hosting !== "gateway" || info.hosting !== "gateway" || runtime.workspaceId !== workspace.id ||
+      runtime.workspaceRoot !== workspace.root || runtime.pid !== gateway.runtime.pid ||
+      runtime.runtimeBuildId !== gateway.runtime.buildId || info.service !== runtime.service ||
+      info.workspaceId !== workspace.id || info.workspaceRoot !== workspace.root || info.pid !== runtime.pid ||
+      info.startedAt !== runtime.startedAt || info.port !== runtime.port || info.runtimeBuildId !== runtime.runtimeBuildId)
+    throw new Error("GATEWAY_WORKSPACE_IDENTITY_MISMATCH: 保留现有 Bridge，未覆盖或降级启动。");
+}
+
 function sameRuntime(a: RuntimeState, b: RuntimeState): boolean {
   return a.workspaceId === b.workspaceId && a.workspaceRoot === b.workspaceRoot &&
-    a.pid === b.pid && a.startedAt === b.startedAt && a.port === b.port && a.adminToken === b.adminToken;
+    a.pid === b.pid && a.startedAt === b.startedAt && a.port === b.port && a.adminToken === b.adminToken && a.hosting === b.hosting &&
+    (a.runtimeBuildId ?? null) === (b.runtimeBuildId ?? null);
 }
 
 /** True confirms authenticated shutdown acceptance only; it does not prove OS process exit. */
@@ -219,6 +273,7 @@ export interface BridgeAdminInfo {
   desktopCompatibility?: DesktopCompatibility;
   connectorContractVersion?: number;
   feedbackControlEventVersion?: number;
+  hosting?: "gateway";
   runtimeBuildId?: string | null;
   pairingActive: boolean;
   writeProbeEnabled?: boolean;
@@ -231,11 +286,11 @@ export async function ensureBridgeAndTunnel(
   workspaceRoot: string,
   opts: { tunnel: boolean; maintenance?: MaintenanceLockHandle }
 ): Promise<{ runtime: RuntimeState; info: BridgeAdminInfo; mcpUrl: string | null }> {
-  const { runtime } = await ensureBridge(workspaceRoot, { maintenance: opts.maintenance });
+  const { runtime } = await ensureBridge(workspaceRoot, { maintenance: opts.maintenance, tunnel: opts.tunnel });
   let info = await adminFetch<BridgeAdminInfo>(runtime, "GET", "/admin/info");
   let mcpUrl: string | null = info.publicUrl ? `${info.publicUrl}/mcp` : null;
   if (opts.tunnel && !info.publicUrl) {
-    if (!detectTunnelBinaries().cloudflared) {
+    if (runtime.hosting !== "gateway" && !detectTunnelBinaries().cloudflared) {
       throw new Error("NEED_CLOUDFLARED: cloudflared is not installed. Install it first (macOS: brew install cloudflared).");
     }
     const result = await adminFetch<{ url?: string; message?: string }>(runtime, "POST", "/admin/tunnel/start", 90_000);
@@ -258,13 +313,19 @@ export async function restartBridge(
     throw new Error("Bridge runtime 已被替换或停止，未继续重启。");
   }
   if (before.state === "healthy") {
+    const gateway = before.runtime.hosting === "gateway" ? await requireVerifiedGateway() : undefined;
+    if (gateway) await verifyHostedBridge(workspace, before.runtime, gateway);
     await opts.beforeShutdown?.();
     if (!await stopBridge(workspace.root, before.runtime, opts.shutdownReason ?? "restart")) throw new Error("Bridge 认证关闭失败，未重启。");
     const deadline = Date.now() + 5000;
     while (true) {
       await new Promise((resolve) => setTimeout(resolve, 100));
       const current = await findBridgeObservation(workspace.id);
-      if (current.state === "stopped") {
+      if (gateway) {
+        if (current.runtime && !sameRuntime(current.runtime, before.runtime))
+          throw new Error("Bridge runtime 已被替换，未继续重启。");
+        if (await isGatewayWorkspaceClosed(gateway, before.runtime)) break;
+      } else if (current.state === "stopped") {
         // A legacy server may delete runtime before exiting. Never lose the original
         // process fence just because its HTTP listener or runtime file disappeared.
         if (await observeProcessPresence(before.runtime.pid) === "missing") break;

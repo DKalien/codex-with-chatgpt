@@ -628,6 +628,8 @@ describe("extension static safety (E1b2 + E1b3a)", () => {
       "bridge-origin.js",
       // E1b3d3b CS production DI shell wires beginSend/persist/ack names to SW RPC only.
       "content-script.js",
+      // 默认轻量 Service Worker owns Bridge reserve/begin-send/ack.
+      "bridge-client.js",
     ]);
     for (const f of files) {
       if (capability.has(path.basename(f))) continue;

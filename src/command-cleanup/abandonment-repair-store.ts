@@ -179,6 +179,21 @@ export function assertNoAbandonmentRepair(lock: string): void {
   }
 }
 
+/** 已完成 quarantine 是历史档案；此只读检查不探测 PID，也不授权回收活动锁。 */
+export function inspectCompletedRepairHistory(identity: { id: string; root: string }, commandId: string, stateDir = getStateDir()) {
+  const p = repairPaths(identity.id, commandId, stateDir);
+  const journal = parseFile(p.journal, journalSchema); validateIntent(journal.value, identity.id, commandId);
+  repairAssert(journal.value.proof.workspaceRoot === identity.root && journal.value.state === "completed"
+    && journal.value.quarantine?.size === 0 && journal.value.abandonmentBatchSha256 !== null);
+  for (const active of [p.lock, p.fence, p.reclaim, `${p.lock}.reclaim`, `${p.fence}.tmp`, `${p.journal}.tmp`, p.lock.slice(0, -5)]) {
+    canonical(active); repairAssert(!present(active));
+  }
+  const quarantine = path.join(p.directory, `${journal.value.repairId}.lock`), saved = repairSnapshot(quarantine);
+  repairAssert(isDeepStrictEqual(saved.fingerprint, journal.value.quarantine));
+  equalFile(p.journal, journal.snapshot);
+  return [{ file: p.journal, fingerprint: journal.snapshot.fingerprint }, { file: quarantine, fingerprint: saved.fingerprint }];
+}
+
 /** Read only; a journal alone is never permission to discard an unexplained lock. */
 export async function inspectRepair(workspaceId: string, commandId: string, options: RepairOptions = {}) {
   assertResidue(workspaceId, commandId);

@@ -27,10 +27,10 @@
   };
   function render() {
     const view = C2COperations.derive(response, Date.now(), hiddenIds);
-    el("clear-history").disabled = pending || historyPending || !view.serviceFresh || !workspaceId || view.workspaceId !== workspaceId || !view.rows.some(C2COperations.canHide);
-    el("restore-history").disabled = pending || historyPending || !workspaceId || view.workspaceId !== workspaceId || !hiddenIds.length;
+    el("clear-history").disabled = actionPending || pending || historyPending || !view.serviceFresh || !workspaceId || view.workspaceId !== workspaceId || !view.rows.some(C2COperations.canHide);
+    el("restore-history").disabled = actionPending || pending || historyPending || !workspaceId || view.workspaceId !== workspaceId || !hiddenIds.length;
     el("history-status").textContent = historyError || `已隐藏 ${view.hiddenCount} 条历史；新任务及重新活动的任务仍显示。`;
-    el("feedback-status").textContent = `自动回流${view.autonomy}；${view.pendingFeedback.length} 条排队、待确认或隔离回流（含已隐藏任务）。清空历史显示不取消发送。${response?.journal?.state && response.journal.state !== "NONE" ? `当前发送日志：${response.journal.state}；仍需核验。` : ""}`;
+    el("feedback-status").textContent = `自动回流${view.autonomy}；${view.pendingFeedback.length} 条排队、待确认或隔离回流（含已隐藏任务）。隐藏历史不取消发送。${response?.journal?.state && response.journal.state !== "NONE" ? `当前发送日志：${response.journal.state}；仍需核验。` : ""}`;
     el("feedback-pending").replaceChildren(...view.pendingFeedback.map(event => text("li", `${event.commandId} · ${event.label} · event ${event.eventId} · attempt ${event.attemptId ?? "尚未开始"}`)));
     document.body.classList.toggle("stale", !view.serviceFresh);
     for (const key of ["codex", "web", "bridge", "autonomy"]) el(key).textContent = view[key];
@@ -67,6 +67,10 @@
     el("diagnostic").textContent = !view.serviceFresh ? `当前状态无法核验${view.reason ? `（${view.reason}）` : ""}。请勿据此重发消息。`
       : view.reason ? `Codex 状态待核验（${view.reason}）。` : "状态仅代表最近一次观察，发送前仍会重新检查。";
     const permission = response?.snapshot?.panelAuthorization;
+    el("format-history").disabled = pending || historyPending || actionPending || !view.serviceFresh
+      || !workspaceId || view.workspaceId !== workspaceId || !permission?.enabled || response?.formatPending === true;
+    el("check-format").hidden = response?.formatPending !== true;
+    el("check-format").disabled = actionPending || pending || historyPending;
     el("authorization").textContent = permission?.enabled
       ? `操作授权有效至 ${time(permission.expiresAt)}。手动操作前请暂停自动回流。`
       : `操作默认关闭。请在本机明确授权当前 Companion（${permission?.companionId ?? "尚未配对"}）：c2c operations authorize -w <项目路径> --companion-id <此 ID> --local-user；默认有效 15 分钟。`;
@@ -186,6 +190,12 @@
     for (const [key, value] of identities) if (value != null) el("identities").append(text("dt", key), text("dd", value));
   }
   const actionReasons = {
+    panel_format_unknown: "原格式化请求结果不明，仅允许核验原请求。",
+    panel_format_server_pending: "服务端格式化尚未完成，需在本机核验；原凭证保留，不会再次提交删除。",
+    panel_format_local_cleanup_failed: "服务端已清空，本机清理失败；可核验原请求以完成本机清理。",
+    format_operation_busy: "仍有发送、恢复或连接操作在执行，请等待其结束。",
+    format_send_fence_active: "发送或连接安全屏障（fence）尚未收敛，格式化不会清除此证据。",
+    format_isolation_pending: "本机隔离档案仍待确认，请先核验原发送。",
     PANEL_LOCAL_AUTHORIZATION_REQUIRED: "操作未获本机授权或已过期，请重新授权当前 Companion。",
     PANEL_CONFIRMATION_MISMATCH: "预览后任务或授权发生变化，未执行操作；请刷新后重新预览。",
     PANEL_CLEANUP_REQUIRES_LOCAL_REVIEW: "任务仍在途、结果不明或未结束，必须先在本机核验和行政处置。",
@@ -196,6 +206,43 @@
     delivery_journal_requires_recovery: "浏览器仍有在途发送日志，请先核验原消息；不会清除日志来重试。",
     COMMAND_CLEANUP_BUSY: "任务生命周期锁无法取得，保留原证据；需要本机核验。",
   };
+  const formatCountLabels = { tasks: "任务", records: "执行记录", outputs: "输出", feedback: "回流历史", resultBus: "结果总线",
+    routing: "路由历史", desktop: "Desktop 投递历史", dispatch: "下发历史", administrative: "处置记录", repairHistory: "已完成修复档案", panelOperations: "面板操作",
+    threads: "线程历史", audit: "审计历史", cutover: "结果切换记录", outbox: "输出队列" };
+  const showFormatStatus = value => {
+    el("format-status").textContent = value;
+    el("operation-status").textContent = value;
+  };
+  async function previewFormat() {
+    if (actionPending || el("format-history").disabled) return;
+    actionPending = true; render();
+    showFormatStatus("正在核验当前项目历史，请等待预览；尚未删除任何记录。");
+    try {
+      const result = await send({ type: "c2c.operations.format", phase: "preview" });
+      if (!result?.ok) throw new Error(result?.reason ?? "preview_failed");
+      if (result.workspaceId !== workspaceId) throw new Error("workspace_selection_mismatch");
+      actionPreview = { ...result, format: true };
+      el("confirm-title").textContent = "确认不可恢复格式化";
+      el("confirm-task").textContent = `当前项目 ${workspaceId}`;
+      el("confirm-notice").textContent = `${result.notice} ${Object.entries(result.counts ?? {}).map(([key, count]) => `${formatCountLabels[key] ?? key} ${count} 条`).join("；")}；本机隔离档案 ${result.browserArchiveCount ?? response?.isolationArchive?.entries?.length ?? 0} 条。自动回流已暂停。此操作永久删除历史，无法恢复；不会撤回已执行的工作。`;
+      el("confirm-check").checked = false; el("confirm-action").disabled = true;
+      el("confirm-dialog").showModal();
+      showFormatStatus("预览已完成，请在确认窗口核对不可恢复的影响范围。");
+    } catch (error) { showFormatStatus(actionReasons[error.message] ?? `格式化受阻：${error.message}`); }
+    finally { actionPending = false; await refresh(); }
+  }
+  el("format-history").onclick = previewFormat;
+  el("check-format").onclick = async () => {
+    if (actionPending) return;
+    actionPending = true; render();
+    try {
+      const result = await send({ type: "c2c.operations.format", phase: "check" });
+      showFormatStatus(result?.ok && result.status === "cleaned" && result.workspaceId === workspaceId
+        ? "已核验并完成当前项目格式化；未重新提交删除。自动回流保持暂停。"
+        : `格式化仍待核验：${actionReasons[result?.reason] ?? result?.reason ?? result?.status ?? "unknown"}；未重新提交删除。`);
+    } catch { showFormatStatus("格式化仍待核验；没有再次提交删除。"); }
+    finally { actionPending = false; await refresh(); }
+  };
   async function previewAction(request) {
     if (actionPending) return;
     actionPending = true; render();
@@ -203,6 +250,7 @@
       const result = await send({ type: "c2c.operations.action", phase: "preview", request });
       if (!result?.ok) throw new Error(result?.reason ?? "preview_failed");
       actionPreview = result;
+      el("confirm-title").textContent = "确认任务操作";
       el("confirm-task").textContent = request.commandId;
       el("confirm-notice").textContent = result.notice;
       el("confirm-check").checked = false; el("confirm-action").disabled = true;
@@ -217,11 +265,19 @@
     actionPending = true; el("confirm-action").disabled = true;
     const preview = actionPreview; actionPreview = null; el("confirm-dialog").close(); render();
     try {
-      const result = await send({ type: "c2c.operations.action", phase: "confirm", request: preview.request,
-        confirmationSha256: preview.confirmationSha256, confirmed: true });
-      el("operation-status").textContent = result?.ok && result.status === "completed" ? "本地操作已完成。外部任务及消息状态请以详情中的证据为准。"
+      const result = await send(preview.format
+        ? { type: "c2c.operations.format", phase: "confirm", confirmationSha256: preview.confirmationSha256, confirmed: true }
+        : { type: "c2c.operations.action", phase: "confirm", request: preview.request, confirmationSha256: preview.confirmationSha256, confirmed: true });
+      if (preview.format) {
+        showFormatStatus(result?.ok && result.status === "cleaned" && result.workspaceId === workspaceId
+          ? "当前项目历史已永久清空；自动回流保持暂停。"
+          : `格式化尚未完成：${actionReasons[result?.reason] ?? result?.reason ?? "unknown"}；请核验上次格式化，不要再次提交。`);
+      } else el("operation-status").textContent = result?.ok && result.status === "completed" ? "本地操作已完成。外部任务及消息状态请以详情中的证据为准。"
         : actionReasons[result?.reason] ?? `操作待核验：${result?.reason ?? result?.status ?? "unknown"}。请保留 requestId ${preview.request.requestId}。`;
-    } catch { el("operation-status").textContent = actionReasons.panel_operation_unknown; }
+    } catch {
+      if (preview.format) showFormatStatus(actionReasons.panel_format_unknown);
+      else el("operation-status").textContent = actionReasons.panel_operation_unknown;
+    }
     finally { actionPending = false; await refresh(); }
   };
   el("check-operation").onclick = async () => {
@@ -233,7 +289,7 @@
     await refresh();
   };
   async function refresh() {
-    if (pending || historyPending || document.hidden) return;
+    if (pending || historyPending || actionPending || document.hidden) return;
     pending = true; el("refresh").disabled = true; clearTimeout(timer);
     let deadline;
     try {
@@ -255,7 +311,7 @@
   }
   async function changeHistory(restore) {
     const view = C2COperations.derive(response, Date.now(), hiddenIds);
-    if (pending || historyPending || !workspaceId || view.workspaceId !== workspaceId || !view.serviceFresh) return;
+    if (actionPending || pending || historyPending || !workspaceId || view.workspaceId !== workspaceId || !view.serviceFresh) return;
     // 与 refresh 串行，项目切换及迟到读取不会覆盖本次明确选择。
     const ids = restore ? [] : [...new Set([...hiddenIds, ...view.rows.filter(C2COperations.canHide).map(row => row.commandId)])];
     historyPending = true; render();

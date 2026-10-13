@@ -14,17 +14,19 @@ Gateway Desktop status/send 分别要求 `codex.desktop.read` / `codex.desktop.c
 
 机器 OAuth 存储与旧 Bridge/单 workspace 官方 endpoint 分开；`gateway/server.lock` 防止多个运行实例覆盖认证缓存，遗留锁不自动删除。项目内 Remote task status/result/cancel 继续核验原 OAuth client。Feedback principal 由当前请求的 `openai/session` 与 clientId 推导，不接受工具参数；需要 active binding 的操作还要核验其 binding/epoch，接管必须提供 fresh `expectedEpoch`。旧 Connector 的 principal 不会自动转换成新 Gateway client。每个项目仍保留原 scope、Remote enable/official mode、target/task 所属检查、route attestation、Result Bus 与发送状态机；Gateway 不提供 Shell、provider 或审批旁路。
 
-Companion 的项目登记仅保存 workspaceId 与 Bridge origin，不扩大 Gateway allowlist。每项目 local/session/alarm 隔离，加载与 Pair 都核对 transport 的项目身份与 origin；只有确证旧 singleton 身份时复制迁移，未知或冲突停止并保留 attempt 历史。迁移先建立 TRUSTED_CONTEXTS；失败停止业务操作并尝试净化 transport credential，不声称无法清理的凭据已删除。Grant Bridge access 是唯一权限请求入口，Pair/Pair+Connect 缺已有权限时不获取 proof、不调用 /pair。生产回调固定发送原 workspace/tab/document；Popup 异步操作捕获项目身份，手动操作期间锁定所选项目，迟到状态读取不得覆盖新选择，切项目清空临时结果显示。存储失败不提交内存登记或选择。
+Companion 的项目登记仅保存 workspaceId 与 Bridge origin，不扩大 Gateway allowlist。默认[轻量运行链](companion-lightweight.md)复用项目 registry 与每项目受保护存储；凭据仅由 SW 持有，content 与 popup 不获得长期凭据。Bridge 负责 OAuth scope、本机确认、binding/enable、owner/project/workspace、版本/hash、审批、防重放与 outcome_unknown 判定。浏览器只关联真实 MessageSender、调用已授权接口、执行 DOM 操作与回报观察结果。
+
+“授权 Bridge 访问”是唯一 `permissions.request` 入口，按点击时确定的精确 origin 授权；Pair 只调用 `permissions.contains`，缺权限返回 `bridge_permission_missing`，不调用 `/pair`。配对密钥仅保留在 popup 内存中，不写入 local/session。生产回调固定原 tab/document，网页不能提供受信 owner proof 或自行批准发送。`/begin-send` 的 `once:true` 由 Bridge 在持久化发送状态中判定；首次授权后才执行一次写入/点击，重复 begin-send 不再授权 DOM 发送。重启、响应丢失、claimed 与 outcome_unknown 只观察原 attempt，不自动重发。
 
 上述为源码边界，不表示机器部署或双项目真实网页验收已完成；阶段状态见[统一 Gateway 计划](unified-gateway-plan.md)。
 
 ## Companion 本机确认回流地址
 
-已配对浏览器可显式请求本机确认当前 ChatGPT 对话。Bridge 的 `/route/local/request` 固定 workspace 与完整规范化 URL，快速返回短时 requestId，并在本机显示确认窗；网页不能代替用户点击。`/route/local/commit` 只消费已确认、未过期且原 Companion、receiver 与 Active Web Sink 均未变化的申请。浏览器在提交前后核验真实 owner document；取消、身份变化、在途发送或未知结果不能通过重发或清空状态解决。
+“配对并连接当前对话”完成配对后按需请求 `/route/local/request`；已配对项目使用“连接当前对话”。申请先保存精确 requestId 与候选 URL，Bridge 在本机显示 workspace 与完整目标地址，必须由用户本人确认。随后状态查询推进一次 `/route/local/commit` 与 `/web-sink/bind-current`；无需手工输入 binding/epoch、额外 route 验证按钮或 ChatGPT 验证消息。
 
-该授权标记为 `local_user`，仅证明用户允许此 URL 接收 canonical Result Bus 回流；它不是 MCP `openai/session` principal，不能用于旧 Feedback receiver、route confirm 或面板写授权。旧 `mcp_principal` 证明保持兼容，缺少证明仍不可发送。成功时轮换唯一 Companion 的 credential、companionId 与 challengeId，随后通过既有 Active Web Sink 入口收敛；不增加第二份主绑定，不修改 Desktop/Gateway 执行权限。
+Bridge 只消费已确认、未过期且原 Companion、receiver 与 Active Web Sink 均未变化的申请。授权标记 `local_user` 仅证明允许此 URL 接收 canonical Result Bus 回流，不是 MCP `openai/session` principal，不能替代旧 Feedback receiver、route confirm 或面板写授权。成功轮换唯一 Companion 凭据并收敛既有 Web Sink；Desktop/Gateway 执行权限不变。
 
-申请与提交各发送一次，先保存本地阶段；网络返回丢失只读查询原 requestId。旧凭据只在原申请有效期、原认证凭据和精确后继身份均匹配时恢复新凭据，服务端不持久化明文 credential。本机确认后，浏览器在提交前将尚未生效的候选凭据存入受保护的临时申请；提交返回丢失并跨越有效期时，只以候选凭据读取服务端精确后继身份。候选凭据未生效不能授权发送，成功收敛后移除临时副本；popup 状态不暴露它。连接不会迁移旧 attempt 的冻结目标、ACK 或清除 `outcome_unknown`；自动回流仍尊重用户保存的开关。
+申请或提交响应不明时查询原 requestId，按 Bridge 状态完成提交/绑定，不自动发起新 requestId；服务端以单次消费和锁判定是否可提交。DOM 发送响应不明只观察原 attempt，不能换 ID、清空记录、重复写入/点击或伪造已观察。连接不迁移旧 attempt 的冻结目标，也不清除 outcome_unknown。旧详细 phase/fence/journal 恢复属于兼容实现，当前 manifest 不加载；历史记录仍保留。
 
 ## 消息收件箱与单条隔离（2026-10-05，源码开发）
 
@@ -39,12 +41,12 @@ Companion 的项目登记仅保存 workspaceId 与 Bridge origin，不扩大 Gat
 
 POST preview/confirm 只允许显式单个 commandId/eventId；摘要绑定请求、grant、当前身份和完整证据。confirm 使用既有 delivery arbiter/command fence，预约重排再持 endpoint fence，不提供任意文件路径、shell 或 force 修锁。扩展 action 仅 operations 自有页面可调用；网页 content script 无此权限。逐条确认前后都重新校验，pending 意图先于任何领域变更落盘。
 
-响应丢失/存储中断不自动重试；相同 command 的 pending 不因新 requestId 绕过。显式 reconciliation 只在已有精确域证据证明请求效果时完成本地操作记录，不能把任务或网页发送标记成功。claimed/outcome_unknown 不得重新排队，accepted 未有可信终态不能直接清理；原历史行政处置/损坏锁修复仍使用本机专用协议。原 OAuth、Grant Bridge access、Pair、route fence、防重放与发送权限不变。
+响应丢失/存储中断不自动重试；相同 command 的 pending 不因新 requestId 绕过。显式 reconciliation 只在已有精确域证据证明请求效果时完成本地操作记录，不能把任务或网页发送标记成功。claimed/outcome_unknown 不得重新排队，accepted 未有可信终态不能直接清理；原历史行政处置/损坏锁修复仍使用本机专用协议。OAuth、Grant Bridge access、Pair、防重放与发送权限继续由既有权威判定；旧 route fence 属于兼容实现，不作为轻量浏览器的独立安全门禁。
 
 
 ## Bridge Supervisor Windows ACL 错误信息
 
-Windows owner-only 校验仍要求当前用户 owner SID、唯一 Allow FullControl DACL 与原目录/文件继承规则，原 8 秒 deadline 和 fail-closed 条件不变。错误只提供有界分类、耗时/exit 信息与白名单 signal；原始子进程 stderr 不回显，路径、SID、环境和 cause 不进入生产错误。测试失败的完整 fixture 与 ACL/SDDL 仅留在 ignored `.tooling`，不属于生产返回值；见[诊断流程](troubleshooting.md#bridge-supervisor-windows-acl-校验失败)。
+Windows owner-only 校验仍要求当前用户 owner SID、唯一 Allow FullControl DACL 与原目录/文件继承规则，子进程采用固定 15 秒 deadline，预算包含 PowerShell 启动、ACL 执行与退出；超时仍 fail-closed，不因 exit 0 或完整 OK 输出而接受。错误只提供有界分类、耗时/exit 信息与白名单 signal；原始子进程 stderr 不回显，路径、SID、环境和 cause 不进入生产错误。测试失败的完整 fixture 与 ACL/SDDL 仅留在 ignored `.tooling`，不属于生产返回值；见[诊断流程](troubleshooting.md#bridge-supervisor-windows-acl-校验失败)。
 
 ## MCP Remote Control 授权边界
 
@@ -91,7 +93,7 @@ Remote disable 拒绝新调用和消费，正在执行的 turn 需另用 control
 | Log credential leakage | Logger redacts token prefixes, bearer headers, token-like parameters, and pairing-code-shaped strings before writing |
 | Execution output leak | Codex may nominate logs or Remote turn final responses; a local sanitizer redacts tokens, pairing-code-shaped strings and home paths, truncates size, and refuses private-key blocks entirely. Restricted items are listed without a body. Read-only tools cannot run commands; Remote Control and Desktop Control are separate, explicitly authorized paths. |
 | Checkpoint / resume dump | Session checkpoints store short protocol fields only (capped). Resume uses the existing chat or HANDOFF — no new protocol state, no log paste, no re-pairing. |
-| Companion pair ≠ Send authority | Pairing registers credential+route only. Production reserve/begin-send require authenticated `/state` route VERIFIED: legacy Feedback requires MCP principal proof; canonical Web Sink also accepts explicit local-user route confirmation. Browser durable fence + pair barrier survive restart; a new local confirmation rotates companion/challenge identity, never clears an unknown attempt. Wrong-principal confirm does not consume the challenge. |
+| Companion pair ≠ Send authority | Pairing registers credential+route only. Production reserve/begin-send require authenticated `/state` route VERIFIED: legacy Feedback requires MCP principal proof; canonical Web Sink also accepts explicit local-user route confirmation. Bridge persists single-attempt authority; once-mode replay cannot authorize another DOM send. A new local confirmation rotates companion/challenge identity, never clears an unknown attempt. Wrong-principal confirm does not consume the challenge. |
 
 ## Token & scope design
 

@@ -26,6 +26,9 @@ import {
   resultBusFile,
   withResultBusTransaction,
 } from "../src/result-bus/store.js";
+import { resultBusDeliveryMessage, resultBusCompanionDeliveryId } from "../src/bridge/result-bus-delivery.js";
+import { renderCompletionNotification } from "../src/browser/completion-notification.js";
+import { formatCanonicalExecutedMessage, productionFeedbackMessageSha256 } from "../src/feedback/message.js";
 import { reconcileWorkspaceResultBus } from "../src/result-bus/service.js";
 
 const HEX64 = "c".repeat(64);
@@ -55,7 +58,7 @@ afterEach(() => {
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-function canonicalResult(commandId: string, iteration = 1) {
+function canonicalResult(commandId: string, iteration = 1, status: "ok" | "failed" | "blocked" = "ok") {
   const planner = registerRoute(identity, {
     role: "planner", platform: "chatgpt_web", conversationId: PLANNER, locator: {},
   }, stateDir);
@@ -68,11 +71,11 @@ function canonicalResult(commandId: string, iteration = 1) {
     intent: "development_plan", payloadBytes: 1, payloadSha256: HEX64,
   }, stateDir);
   return appendResult(identity, {
-    commandId, executorRouteId: executor.routeId, iteration, status: "ok",
+    commandId, executorRouteId: executor.routeId, iteration, status,
     rawSummary: `R5d2 canonical result ${commandId}`,
     machineEvidence: {
       version: 1, source: "codex_desktop_receipt", desktopReceiptSha256: HEX64,
-      taskId: `desktop_${commandId}`, iteration, status: "ok", threadId: EXECUTOR,
+      taskId: `desktop_${commandId}`, iteration, status, threadId: EXECUTOR,
       originTurnId: EXECUTOR, resultTurnId: EXECUTOR, bindingId: BINDING,
       changedFiles: [], testsSummary: "r5d2 passed",
     },
@@ -816,5 +819,87 @@ describe("R5d2 review-fix: persisted invariants", () => {
     expect(fs.readFileSync(file, "utf8")).toBe(before);
     expect(readResultBus(identity, stateDir)!.entries[0]!.busEntryId).toBe(entry.busEntryId);
     expect(entry.busEntryId).toBeTruthy();
+  });
+});
+
+
+describe("Result Bus 短通知与历史消息兼容", () => {
+  it.each(["ok", "failed", "blocked"] as const)("%s 仅通知结束，持久读取、claimed 重放及 unknown 重建保持信号和 hash", status => {
+    bindSink(URL_A);
+    const result = canonicalResult(`signal-${status}`, 1, status);
+    if (!("rawSummary" in result)) throw new Error("expected canonical");
+    const entry = enqueueResultBusEntry(identity, result, stateDir).entry;
+    const reserved = reserveNextResultBusEntry(identity);
+    if (reserved.status !== "reserved") throw new Error("expected reserved");
+    expect(reserved.entry.attempt).toBeNull();
+    const input = { busEntryId: entry.busEntryId, reservationId: reserved.entry.reservation!.reservationId };
+    const begun = beginResultBusSend(identity, input);
+    if (begun.status !== "claimed") throw new Error("expected claimed");
+    expect(begun.entry.attempt?.messageFormat).toBe("signal-v1");
+    const delivery = resultBusDeliveryMessage(begun.entry, begun.attemptId);
+    expect(delivery).toEqual({ signal: { type: "execution_ended", version: 1, workspaceId: identity.id,
+      commandId: result.commandId, taskId: `desktop_${result.commandId}`, attemptId: begun.attemptId },
+      messageSha256: productionFeedbackMessageSha256(renderCompletionNotification(delivery.signal)) });
+    expect(delivery).not.toHaveProperty("message");
+    expect(JSON.stringify(delivery)).not.toContain(result.rawSummary!);
+    expect(JSON.stringify(delivery)).not.toContain("r5d2 passed");
+    const file = busFilePath(), bytes = fs.readFileSync(file, "utf8");
+    const loaded = readResultBus(identity, stateDir)!.entries[0]!;
+    expect(resultBusDeliveryMessage(loaded, begun.attemptId)).toEqual(delivery);
+    expect(() => resultBusDeliveryMessage(loaded, PLANNER)).toThrow("attemptId");
+    const replay = beginResultBusSend(identity, input);
+    if (replay.status !== "claimed") throw new Error("expected claimed");
+    expect(replay.noWrite).toBe(true);
+    expect(resultBusDeliveryMessage(replay.entry, replay.attemptId)).toEqual(delivery);
+    expect(fs.readFileSync(file, "utf8")).toBe(bytes);
+    markResultBusOutcomeUnknown(identity, { busEntryId: entry.busEntryId, attemptId: begun.attemptId });
+    expect(resultBusDeliveryMessage(readResultBus(identity, stateDir)!.entries[0]!, begun.attemptId)).toEqual(delivery);
+    expect(ackResultBusObserved(identity, { busEntryId: entry.busEntryId, attemptId: begun.attemptId }).status).toBe("observed");
+  });
+
+  it("缺失 messageFormat 的历史 canonical attempt 不补写，保持原消息/hash 与 exact ACK", () => {
+    bindSink(URL_A);
+    const entry = queueEntry("legacy-notification");
+    const reserved = reserveNextResultBusEntry(identity);
+    if (reserved.status !== "reserved") throw new Error("expected reserved");
+    const input = { busEntryId: entry.busEntryId, reservationId: reserved.entry.reservation!.reservationId };
+    const begun = beginResultBusSend(identity, input);
+    if (begun.status !== "claimed") throw new Error("expected claimed");
+    const file = busFilePath(), state = JSON.parse(fs.readFileSync(file, "utf8"));
+    delete state.entries[0].attempt.messageFormat;
+    fs.writeFileSync(file, JSON.stringify(state));
+    const bytes = fs.readFileSync(file, "utf8");
+    const canonical = entry.result;
+    if (!("rawSummary" in canonical) || !("machineEvidence" in canonical)) throw new Error("expected canonical");
+    const evidence = canonical.machineEvidence;
+    const oldMessage = formatCanonicalExecutedMessage({ workspaceId: identity.id,
+      commandId: entry.commandId, taskId: evidence.taskId, iteration: entry.iteration, result: "ok",
+      eventId: resultBusCompanionDeliveryId(entry.busEntryId), attemptId: begun.attemptId,
+      changedFilesSummary: [], testsSummary: evidence.testsSummary, outputAvailable: false,
+      rawSummary: canonical.rawSummary, machineEvidence: { version: 1, source: "codex_desktop_receipt",
+        status: "ok", changedFiles: [], testsSummary: evidence.testsSummary, output: undefined } });
+    const replay = beginResultBusSend(identity, input);
+    if (replay.status !== "claimed") throw new Error("expected claimed");
+    expect(replay.entry.attempt).not.toHaveProperty("messageFormat");
+    expect(replay.noWrite).toBe(true);
+    expect(resultBusDeliveryMessage(replay.entry, replay.attemptId)).toEqual({ message: oldMessage,
+      messageSha256: productionFeedbackMessageSha256(oldMessage) });
+    expect(fs.readFileSync(file, "utf8")).toBe(bytes);
+    markResultBusOutcomeUnknown(identity, { busEntryId: entry.busEntryId, attemptId: begun.attemptId });
+    expect(resultBusDeliveryMessage(readResultBus(identity, stateDir)!.entries[0]!, begun.attemptId).message).toBe(oldMessage);
+    expect(ackResultBusObserved(identity, { busEntryId: entry.busEntryId, attemptId: begun.attemptId }).status).toBe("observed");
+  });
+
+  it.each(["legacy", "future", null])("非法 messageFormat %s 损坏状态 fail closed 且不写盘", messageFormat => {
+    bindSink(URL_A); queueEntry("invalid-format");
+    const reserved = reserveNextResultBusEntry(identity);
+    if (reserved.status !== "reserved") throw new Error("expected reserved");
+    beginResultBusSend(identity, { busEntryId: reserved.entry.busEntryId, reservationId: reserved.entry.reservation!.reservationId });
+    const file = busFilePath(), state = JSON.parse(fs.readFileSync(file, "utf8"));
+    state.entries[0].attempt.messageFormat = messageFormat;
+    fs.writeFileSync(file, JSON.stringify(state));
+    const bytes = fs.readFileSync(file, "utf8");
+    expect(busErrorCode(() => readResultBus(identity, stateDir))).toBe("RESULT_BUS_STATE_CORRUPT");
+    expect(fs.readFileSync(file, "utf8")).toBe(bytes);
   });
 });

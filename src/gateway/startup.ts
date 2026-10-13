@@ -132,7 +132,10 @@ export async function ensureConfiguredGatewaySupervisor(options: GatewayStartupO
         if (!health || health.service !== "machine-gateway" || health.pid !== state.runtime.pid ||
             health.creationTime !== state.runtime.creationTime || health.buildId !== state.runtime.buildId ||
             health.port !== state.config.port || health.publicUrl !== new URL(state.config.publicUrl).origin ||
-            Object.keys(health).sort().join(",") !== "buildId,creationTime,pid,port,publicUrl,service") ownershipError("Gateway loopback health 身份或 origin 不匹配");
+            health.unified !== (state.config.unified ? true : undefined) ||
+            Object.keys(health).sort().join(",") !== (state.config.unified
+              ? "buildId,creationTime,pid,port,publicUrl,service,unified"
+              : "buildId,creationTime,pid,port,publicUrl,service")) ownershipError("Gateway loopback health 身份或 origin 不匹配");
         const origin = new URL(state.config.publicUrl).origin;
         for (const [route, expected] of [
           ["/.well-known/oauth-protected-resource/mcp", { resource: `${origin}/mcp`, authorization_servers: [origin] }],

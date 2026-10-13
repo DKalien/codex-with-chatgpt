@@ -71,6 +71,7 @@ export function readRemote(workspaceId: string, stateDir = getStateDir()): Remot
 // ponytail: 每个工作区一个短锁和 JSON；达到历史容量就停止接单，未来可迁移 SQLite，不能淘汰幂等 ID。
 export function updateRemote<T>(workspaceId: string, change: (state: RemoteState | null) => { state: RemoteState; result: T }, stateDir = getStateDir()): T {
   const file = remoteFile(workspaceId, stateDir);
+  assertNoLegacyHistoryCleanup(workspaceId, stateDir);
   ensureDir(path.dirname(file));
   let lock: number;
   try { lock = fs.openSync(`${file}.lock`, "wx", 0o600); }
@@ -82,6 +83,7 @@ export function updateRemote<T>(workspaceId: string, change: (state: RemoteState
   try {
     fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, createdAt: Date.now() }));
     fs.fsyncSync(lock);
+    assertNoLegacyHistoryCleanup(workspaceId, stateDir);
     const next = change(readRemote(workspaceId, stateDir));
     const valid = remoteStateSchema.parse(next.state);
     const fd = fs.openSync(temporary, "wx", 0o600);

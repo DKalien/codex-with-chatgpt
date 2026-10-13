@@ -369,8 +369,8 @@ describe("Companion read-only presentation", () => {
     }
     const source = fs.readFileSync("browser-companion/operations/operations.js", "utf8");
     expect([...source.matchAll(/type: "([^"]+)"/g)].map(match => match[1])).toEqual([
-      "c2c.operations.action", "c2c.operations.result.read", "c2c.operations.action",
-      "c2c.operations.action", "c2c.operations.action", "c2c.operations.read",
+      "c2c.operations.action", "c2c.operations.result.read", "c2c.operations.format", "c2c.operations.format",
+      "c2c.operations.action", "c2c.operations.format", "c2c.operations.action", "c2c.operations.action", "c2c.operations.read",
     ]);
   });
   it("historical accepted without a record is debt; administrative closure never displays success", () => {
@@ -599,7 +599,7 @@ describe("B5 extension manual action crash and sender boundaries", () => {
   function worker() {
     const stored: Record<string, any> = {};
     const ctx: any = { console, URL, project: { workspaceId: "aaaaaaaaaaaa" }, encodeURIComponent, storageProtected: true, transport: { credential: "test", workspaceId: "aaaaaaaaaaaa" }, authFailureRevision: 0,
-      autonomyPolicy: { mode: "off" }, productionSendInFlight: false, autonomyTickInFlight: false, connectInFlight: false,
+      formatRequestPending: null, autonomyPolicy: { mode: "off" }, productionSendInFlight: false, autonomyTickInFlight: false, connectInFlight: false,
       journal: { state: "NONE" }, requestTransports: new WeakMap(), assertNoForbiddenFields: vi.fn(),
       isCurrentTransportResponse: () => true, clearJournal: () => ({ state: "NONE" }), persistJournal: vi.fn(),
       chrome: { runtime: { id: "extension", getURL: (file: string) => `chrome-extension://extension/${file}` },
@@ -613,6 +613,7 @@ describe("B5 extension manual action crash and sender boundaries", () => {
     const source = fs.readFileSync("browser-companion/service-worker.js", "utf8");
     const context = vm.createContext(ctx);
     vm.runInContext(source.slice(source.indexOf('function isOwnOperationsPanel('), source.indexOf('const LOCAL_KEY =')), context);
+    vm.runInContext(source.slice(source.indexOf('function exactOperationsPanelWorkspaceId('), source.indexOf('const projectRouter =')), context);
     vm.runInContext(source.slice(source.indexOf('const PANEL_ACTION_KEY ='), source.indexOf('async function handleMessage(')) + '\nglobalThis.action = panelAction;', context);
     const handler = source.slice(source.indexOf('async function handleMessage('), source.indexOf('  if (message.type === "c2c.operations.read")'));
     vm.runInContext(handler + '\nreturn { ok: false, reason: "unsupported" }; } globalThis.routeAction = handleMessage;', context);
@@ -623,16 +624,18 @@ describe("B5 extension manual action crash and sender boundaries", () => {
   it("content scripts and spoofed extension senders cannot call panel actions", async () => {
     const { ctx, routeAction } = worker();
     for (const sender of [{ id: "extension", url: "https://chatgpt.com/c/x", tab: { id: 1 } }, { id: "foreign", url: "chrome-extension://extension/operations/operations.html" }])
-      expect(await routeAction({ type: "c2c.operations.action", ...confirm() }, sender)).toMatchObject({ ok: false, reason: "extension_panel_required" });
+      for (const type of ["c2c.operations.action", "c2c.operations.format"])
+        expect(await routeAction({ type, ...confirm() }, sender)).toMatchObject({ ok: false, reason: "extension_panel_required" });
     expect(ctx.fetchCompanion).not.toHaveBeenCalled(); expect(ctx.chrome.storage.local.set).not.toHaveBeenCalled();
   });
   it("panel actions require the exact extension page and explicit project query", async () => {
     const { ctx, routeAction } = worker();
     const panel = "chrome-extension://extension/operations/operations.html?workspaceId=aaaaaaaaaaaa";
     for (const url of [panel.replace("extension/operations", "foreign/operations"), panel.replace("aaaaaaaaaaaa", "bbbbbbbbbbbb"), `${panel}&workspaceId=aaaaaaaaaaaa`, `${panel}#changed`]) {
-      expect(await routeAction({ type: "c2c.operations.action", ...confirm() }, {
-        id: "extension", url, tab: { id: 1, url },
-      })).toMatchObject({ ok: false, reason: "extension_panel_required" });
+      for (const type of ["c2c.operations.action", "c2c.operations.format"])
+        expect(await routeAction({ type, ...confirm() }, {
+          id: "extension", url, tab: { id: 1, url },
+        })).toMatchObject({ ok: false, reason: "extension_panel_required" });
     }
     expect(ctx.fetchCompanion).not.toHaveBeenCalled();
     expect(await routeAction({ type: "c2c.operations.action", ...confirm() }, {

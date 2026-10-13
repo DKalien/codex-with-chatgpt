@@ -1,3 +1,4 @@
+import { assertNoLegacyHistoryCleanup } from "../command-cleanup/legacy-history-fence.js";
 import fs from "node:fs";
 import path from "node:path";
 import { ensureDir, getStateDir } from "../config/paths.js";
@@ -16,6 +17,7 @@ function lockFile(workspaceId: string, stateDir = getStateDir()): string {
 }
 
 export function withEvidenceLock<T>(workspaceId: string, action: () => T, stateDir = getStateDir()): T {
+  assertNoLegacyHistoryCleanup(workspaceId, stateDir);
   const file = lockFile(workspaceId, stateDir);
   ensureDir(path.dirname(file));
   let fd: number;
@@ -29,6 +31,7 @@ export function withEvidenceLock<T>(workspaceId: string, action: () => T, stateD
   try {
     fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, createdAt: Date.now() }));
     fs.fsyncSync(fd);
+    assertNoLegacyHistoryCleanup(workspaceId, stateDir);
     return action();
   } finally {
     try { fs.closeSync(fd); }

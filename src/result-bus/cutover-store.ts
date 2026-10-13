@@ -1,3 +1,4 @@
+import { assertNoLegacyHistoryCleanup } from "../command-cleanup/legacy-history-fence.js";
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -72,6 +73,7 @@ function writeAtomic(file: string, state: ResultBusCutoverState): void {
 type CutoverChange<T> = { state: ResultBusCutoverState | null; result: T; noWrite?: boolean };
 
 function withCutoverLock<T>(identity: RoutingWorkspaceIdentity, stateDir: string, fn: (state: ResultBusCutoverState | null) => CutoverChange<T>): T {
+  assertNoLegacyHistoryCleanup(identity.id, stateDir);
   const file = resultBusCutoverFile(identity.id, stateDir);
   ensureDir(path.dirname(file));
   let lock: number;
@@ -84,6 +86,7 @@ function withCutoverLock<T>(identity: RoutingWorkspaceIdentity, stateDir: string
   try {
     fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, createdAt: Date.now() }));
     fs.fsyncSync(lock);
+    assertNoLegacyHistoryCleanup(identity.id, stateDir);
     const previous = readState(identity, stateDir);
     const next = fn(previous);
     if (next.noWrite) {

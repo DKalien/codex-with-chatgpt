@@ -931,7 +931,8 @@ describe("R5d3 Result Bus cutover", () => {
     const reserved = reserveViaAdapter(paired.credential);
     const sent = beginViaAdapter(paired.credential, (reserved.delivery as { eventId: string }).eventId, reserved.reservationId);
     expect(sent.status).toBe("claimed");
-    expect(sent.message).toContain(`COMMAND_ID: r5d3-fix2`);
+    expect(sent.signal).toMatchObject({ commandId: "r5d3-fix2", workspaceId: workspace.id });
+    expect(sent).not.toHaveProperty("message");
     // legacy 路径仍要求旧 Feedback 认证：无 binding → FEEDBACK_NOT_ENABLED
     expectCode(() => ctxOf(paired.credential), "FEEDBACK_NOT_ENABLED");
     // stale/different receiver principal 不阻断 Bus：恢复 binding 但 principal 改变
@@ -979,7 +980,8 @@ describe("R5d3 Result Bus cutover", () => {
       workspaceId: workspace.id, workspaceRoot: wsRoot, credential: paired.credential, stateDir,
     });
     expect((full.inFlight as Record<string, unknown>)).toMatchObject({ status: "claimed" });
-    expect((full.inFlight as Record<string, unknown>)).toHaveProperty("message");
+    expect(full.inFlight).toMatchObject({ signal: sentB.signal, messageSha256: sentB.messageSha256 });
+    expect(full.inFlight).not.toHaveProperty("message");
     // 模拟 companion 已迁到 C（re-pair 视角）：frozen A 对 C 为 pinned-away
     // 直接用 core 检查：sendTarget.canonicalUrl(A) !== C → pinnedToOtherRoute
     const frozenUrl = readResultBus(workspace, stateDir)!.entries[0]!.sendTarget!.canonicalUrl;
@@ -1332,7 +1334,8 @@ describe("R5d3 Result Bus cutover", () => {
       });
       expect(sent.status).toBe(200);
       expect(sent.body.status).toBe("claimed");
-      expect(sent.body.message).toContain("[C2C_CONTROL]");
+      expect(sent.body.signal).toMatchObject({ type: "execution_ended", version: 1, workspaceId: workspace.id, commandId: "r5d3-http1" });
+      expect(sent.body).not.toHaveProperty("message");
     });
 
     it("HTTP: exact isolate frees the next result; retry is idempotent and late ACK remains observed", async () => {
@@ -1390,7 +1393,7 @@ describe("R5d3 Result Bus cutover", () => {
       expect(state).toMatchObject({ status: 200, body: { inFlight: null, isolatedAttempts: [{
         ...target, isolated: true, status: "outcome_unknown",
       }] } });
-      expect(JSON.stringify(state.body)).not.toContain(sent.body.message);
+      expect(JSON.stringify(state.body)).not.toContain(JSON.stringify(sent.body.signal));
       const frozenReadBytes = fs.readFileSync(resultBusFile(workspace.id, stateDir));
       expect(await fetchJson(resultPath, { headers })).toMatchObject({ status: 200, body: {
         resultId: first.result.resultId, resultSha256: canonicalRoutingResultDigest(first.result),

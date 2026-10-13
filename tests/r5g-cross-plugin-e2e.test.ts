@@ -32,6 +32,7 @@ import { reconcileWorkspaceResultBus } from "../src/result-bus/service.js";
 import { emptyJournal, markClaimed, markOutcomeUnknown, markReserveRequested, markReserved, markSendIntent } from "../browser-companion/reservation-journal.js";
 import { recoverProductionSend, runProductionSend } from "../browser-companion/production-send-runtime.js";
 import { hasExactAttemptMarker } from "../browser-companion/turn-observer.js";
+import { renderCompletionNotification } from "../browser-companion/completion-notification.js";
 import { cleanup, isolateStateDir, makeTmpDir } from "./helpers.js";
 
 const ROUTE_A = "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111";
@@ -76,6 +77,16 @@ describe("R5g isolated cross-plugin production chain", () => {
       },
     });
     return { status: response.status, body: await response.json() as Record<string, any> };
+  }
+
+  function completionPayload(body: Wire["body"]) {
+    expect(body).not.toHaveProperty("message");
+    expect(body.signal).toEqual({ type: "execution_ended", version: 1, workspaceId: bridge.workspace.id,
+      commandId: COMMAND, taskId: `desktop_${COMMAND}`, attemptId: body.attemptId });
+    const message = renderCompletionNotification(body.signal);
+    expect(body.messageSha256).toBe(createHash("sha256").update(message).digest("hex"));
+    const { signal, ...normalized } = body;
+    return { ...normalized, message };
   }
 
   async function pair(route: string, verify = true): Promise<string> {
@@ -262,12 +273,13 @@ describe("R5g isolated cross-plugin production chain", () => {
           eventId: input.eventId, reservationId: input.reservationId, routeCanonical: input.routeCanonical,
         });
         if (response.status !== 200) throw new Error(String(response.body.error));
-        claimedMessage = response.body.message as string;
+        const payload = completionPayload(response.body);
+        claimedMessage = payload.message;
         claimedMessageSha256 = response.body.messageSha256 as string;
         terminalWitness = response.body.terminalWitness as string;
         attemptId = response.body.attemptId as string;
         frozenTarget = readResultBus(bridge.workspace, stateDir)!.entries[0]!.sendTarget;
-        return response.body;
+        return payload;
       },
       ackObserved: async (input: { eventId: string; attemptId: string; routeCanonical: string }) => {
         const response = await http("/ack", credential, {
@@ -298,7 +310,7 @@ describe("R5g isolated cross-plugin production chain", () => {
     expect(browser.ok, JSON.stringify(browser)).toBe(true);
     expect(clicks).toBe(1);
     expect(userTurns).toEqual([claimedMessage]);
-    expect(claimedMessage).toContain(receipt.record.rawSummary);
+    expect(claimedMessage).not.toContain(receipt.record.rawSummary);
     expect(claimedMessageSha256).toBe(createHash("sha256").update(claimedMessage).digest("hex"));
     expect(journal.state).toBe("NONE");
     expect(ackBody).toMatchObject({ status: "observed", cleanupStatus: "cleaned" });
@@ -393,7 +405,7 @@ describe("R5g isolated cross-plugin production chain", () => {
       routeCanonical: ROUTE_B, eventId, reservationId: reservedB.body.reservationId,
     });
     expect(claimedB).toMatchObject({ status: 200, body: { status: "claimed" } });
-    expect(hasExactAttemptMarker(claimedB.body.message, claimedB.body.attemptId).ok).toBe(true);
+    expect(hasExactAttemptMarker(completionPayload(claimedB.body).message, claimedB.body.attemptId).ok).toBe(true);
     const frozen = readResultBus(bridge.workspace, stateDir)!.entries[0]!;
     expect(frozen.sendTarget?.bindingId).toBe(sinkB.bindingId);
     expect(frozen.sendTarget?.canonicalUrl).toBe(ROUTE_B);
@@ -430,6 +442,7 @@ describe("R5g isolated cross-plugin production chain", () => {
     const reservationId = reserved.body.reservationId as string;
     const claimed = await http("/begin-send", credentialB, { routeCanonical: ROUTE_B, eventId, reservationId });
     expect(claimed.status).toBe(200);
+    const claimedPayload = completionPayload(claimed.body);
     const beforeUnknown = readResultBus(bridge.workspace, stateDir)!.entries[0]!;
     const marked = markResultBusOutcomeUnknown(bridge.workspace, {
       busEntryId: beforeUnknown.busEntryId, attemptId: claimed.body.attemptId,
@@ -441,16 +454,17 @@ describe("R5g isolated cross-plugin production chain", () => {
     const serverState = await http("/state", credentialB);
     expect(serverState.body.inFlight).toMatchObject({
       status: "outcome_unknown", eventId, reservationId,
-      attemptId: claimed.body.attemptId, message: claimed.body.message,
+      attemptId: claimed.body.attemptId, signal: claimed.body.signal,
       messageSha256: claimed.body.messageSha256,
     });
+    const recoveryPayload = completionPayload(serverState.body.inFlight);
     const claimedJournal = markClaimed(markSendIntent(markReserved(markReserveRequested(emptyJournal(), {
       routeCanonical: ROUTE_B, bindingId: sinkB.bindingId, epoch: sinkB.epoch,
     }), {
       eventId, reservationId, routeCanonical: ROUTE_B, bindingId: sinkB.bindingId, epoch: sinkB.epoch,
     }), {}), {
       eventId, reservationId, attemptId: claimed.body.attemptId,
-      message: claimed.body.message, messageSha256: claimed.body.messageSha256,
+      message: claimedPayload.message, messageSha256: claimedPayload.messageSha256,
     });
     const unknownJournal = markOutcomeUnknown(claimedJournal, {});
     const write = vi.fn();
@@ -458,7 +472,7 @@ describe("R5g isolated cross-plugin production chain", () => {
     const ack = vi.fn();
     const begin = vi.fn();
     const recovered = await recoverProductionSend({
-      journal: unknownJournal, inFlight: serverState.body.inFlight, doc: {},
+      journal: unknownJournal, inFlight: recoveryPayload, doc: {},
       expectedRoute: ROUTE_B, expectedGeneration: 1,
       getCurrentRoute: () => ROUTE_B, getCurrentGeneration: () => 1,
       findCanonicalUserTurn: () => ({ ok: false, reason: "not_observed" }),

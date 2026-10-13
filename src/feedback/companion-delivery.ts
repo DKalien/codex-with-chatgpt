@@ -269,6 +269,7 @@ export function companionBeginSend(input: {
   routeCanonical: string;
   eventId: string;
   reservationId: string;
+  once?: boolean;
   stateDir?: string;
 }): { event: FeedbackEvent; attemptId: string; message: string; messageSha256: string } {
   requireRouteMatch(input.ctx, input.routeCanonical);
@@ -280,6 +281,7 @@ export function companionBeginSend(input: {
     ...companionAuthInput(input.ctx),
     eventId: input.eventId,
     reservationId: input.reservationId,
+    once: input.once,
     stateDir: input.stateDir,
     controlOnly: true,
   });

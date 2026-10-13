@@ -650,9 +650,10 @@ describe("runtime unreachability", () => {
     expect(js).not.toContain("send-adapter.js");
     expect(js).toContain("turn-observer-global.js"); // E1b3d1 read-only shadow classic
     expect(js).not.toContain("turn-observer.js");
-    expect(js).toContain("shadow-evidence.js");
+    expect(js).not.toContain("shadow-evidence.js");
+    expect(js).toContain("content-lite.js");
     // E1b3d3b: production classic runtime is isolated; raw ESM orchestrator stays unloaded.
-    expect(js).toContain("production-send-runtime-global.js");
+    expect(js).not.toContain("production-send-runtime-global.js");
     expect(js).not.toContain("production-send-runtime.js");
     expect(js).not.toContain("send-orchestrator.js");
 

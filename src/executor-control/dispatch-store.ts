@@ -1,3 +1,4 @@
+import { assertNoLegacyHistoryCleanup } from "../command-cleanup/legacy-history-fence.js";
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -479,6 +480,7 @@ function runDispatchUpdate<T>(
     }
     return tmpPath;
   };
+  assertNoLegacyHistoryCleanup(workspaceId, stateDir);
   const outcome = runDurableStoreTransaction<ExecutorDispatchState, T>({
     file,
     marker,
@@ -499,6 +501,7 @@ function runDispatchUpdate<T>(
       ),
     },
     afterRead: (previous) => {
+      assertNoLegacyHistoryCleanup(workspaceId, stateDir);
       // 读阶段路径硬化断言 + workspaceRoot 身份校验。
       assertExecutorDispatchArtifactPath(path.dirname(file), stateDir, "directory");
       if (previous && previous.workspaceRoot !== workspaceRoot) {

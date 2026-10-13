@@ -1,3 +1,4 @@
+import { LIGHT_CONTENT_SCRIPTS } from "./browser-companion-chains.js";
 import { describe, expect, it } from "vitest";
 import fs from "node:fs";
 import { sanitizeRecoveryDiagnostic } from "../browser-companion/autonomy.js";
@@ -2026,21 +2027,14 @@ describe("E1b3d3b runtime capability wiring", () => {
 });
 
 describe("E1b3d3b packaging regression", () => {
-  it("manifest loads production classic after write/click adapters", () => {
+  it("默认 manifest 按序加载轻量 DOM 能力，不自动加载旧 production runtime", () => {
     const manifest = JSON.parse(fs.readFileSync(path.join(companionRoot, "manifest.json"), "utf8"));
     const js = (manifest.content_scripts ?? []).flatMap((cs: { js?: string[] }) => cs.js ?? []);
-    expect(js).toContain("production-send-runtime-global.js");
+    expect(js).toEqual(LIGHT_CONTENT_SCRIPTS);
+    expect(js).not.toContain("production-send-runtime-global.js");
     expect(js).not.toContain("production-send-runtime.js");
     expect(js).not.toContain("send-orchestrator.js");
     expect(js).not.toContain("reservation-journal.js");
-    const writeIdx = js.indexOf("composer-write-adapter.js");
-    const clickIdx = js.indexOf("send-click-adapter.js");
-    const prodIdx = js.indexOf("production-send-runtime-global.js");
-    const csIdx = js.indexOf("content-script.js");
-    expect(writeIdx).toBeGreaterThanOrEqual(0);
-    expect(clickIdx).toBeGreaterThan(writeIdx);
-    expect(prodIdx).toBeGreaterThan(clickIdx);
-    expect(csIdx).toBeGreaterThan(prodIdx);
   });
 
   it("classic production artifact has no export/import and only expected globals", () => {
@@ -2071,7 +2065,7 @@ describe("E1b3d3b packaging regression", () => {
     expect(typeof mod.canStartProductionSend).toBe("function");
   });
 
-  it("full manifest load-order VM execution exposes production globals only after adapters", () => {
+  it("显式 legacy 链 VM 在 adapters 加载后暴露 production globals", () => {
     const classicPath = path.join(distCompanion, "production-send-runtime-global.js");
     const writePath = path.join(distCompanion, "composer-write-adapter.js");
     if (!fs.existsSync(classicPath) || !fs.existsSync(writePath)) {

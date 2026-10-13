@@ -8,7 +8,7 @@ import { OutputStoreBusyError, readExecutionOutputMetadataStrict, saveExecutionO
 import { sanitizeExecutionOutput } from "../execution/sanitize.js";
 import { ResultBusError } from "../result-bus/store.js";
 import { Workspace } from "../workspace/manager.js";
-import { projectRemoteResult } from "./results.js";
+import { projectRemoteResult, assertRemoteTaskCurrent } from "./results.js";
 import { assertRemoteCommandIdAvailable, audit, authorized, readRemote, RemoteError, taskTargetForThread, updateRemote, type RemoteState, type RemoteTask, type RemoteTarget, type RemoteThread } from "./store.js";
 
 const terminal = new Set<RemoteTask["status"]>(["completed", "failed", "cancelled"]);
@@ -76,6 +76,7 @@ function appendTerminalRecord(workspaceId: string, task: RemoteTask): { outputId
   const iteration = task.targetId ? 1 : 0;
   const timestamp = task.completedAt ?? task.updatedAt;
   return withCommandOperation(workspaceId, task.commandId, () => {
+    assertRemoteTaskCurrent(workspaceId, task);
     const existing = readExecutionRecordsStrict(workspaceId).filter(item => item.taskId === task.taskId || item.commandId === task.commandId);
     if (existing.length > 1 || existing.some(item => item.taskId !== task.taskId || item.commandId !== task.commandId))
       throw new Error("Remote execution record identity conflicts; refusing a duplicate record.");

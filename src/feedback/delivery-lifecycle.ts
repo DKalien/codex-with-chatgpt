@@ -367,6 +367,7 @@ export function beginSend(input: {
   companionId: string;
   eventId: string;
   reservationId: string;
+  once?: boolean;
   stateDir?: string;
   controlOnly?: boolean;
 }): { event: FeedbackEvent; attemptId: string } {
@@ -383,7 +384,7 @@ export function beginSend(input: {
     const event = recovered.events.find((e) => e.eventId === input.eventId);
     if (!event) throw new FeedbackError("FEEDBACK_EVENT_NOT_FOUND", "feedback 事件不存在");
     // claimed 幂等也必须绑定 reservedBy：其它 companion 不得继承本 attempt。
-    if (event.status === "claimed" && event.reservationId === input.reservationId) {
+    if (!input.once && event.status === "claimed" && event.reservationId === input.reservationId) {
       if (event.reservedBy !== input.companionId) {
         throw new FeedbackError(
           "FEEDBACK_RESERVATION_MISMATCH",

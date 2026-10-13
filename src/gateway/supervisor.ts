@@ -8,8 +8,9 @@ import { getRuntimeBuildId } from "../build-id.js";
 import { isProcessProvenMissing, probeProcess, processProbeSchema, type ProcessProbe } from "../process/process-probe.js";
 import { buildDaemonEnv, resolveDaemonSpawnHelperPath, resolveDaemonSpawnPython } from "../process/daemon-spawn.js";
 import { startGatewayServer, type GatewayServer } from "../remote/server.js";
-import { assertMaintenanceHandle, MaintenanceBusyError, withMaintenanceLock, type MaintenanceLockHandle } from "../core/maintenance-lock.js";
+import { assertMaintenanceHandle, MaintenanceBusyError, releaseMaintenanceOrThrow, tryAcquireMaintenanceLock, withMaintenanceLock, type MaintenanceLockHandle } from "../core/maintenance-lock.js";
 import { z } from "zod";
+import { writeGatewayTunnelIngress } from "./tunnel-ingress.js";
 
 const BUILD_ID = /^[a-f0-9]{64}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -73,6 +74,7 @@ export type GatewayTunnelIdentity = z.infer<typeof gatewayTunnelIdentitySchema>;
 export const gatewaySupervisorConfigSchema = z.object({
   version: z.literal(1),
   scope: z.literal("machine"),
+  unified: z.boolean().optional(),
   publicUrl: publicUrlSchema,
   port: portSchema,
   tunnelName: z.string().regex(TUNNEL_NAME),
@@ -216,6 +218,7 @@ export function writeGatewaySupervisorConfig(value: unknown, stateDir = getState
 
 export interface GatewaySupervisorConfigureOptions {
   stateDir?: string;
+  unified?: boolean;
   publicUrl: string;
   port: number;
   tunnelName: string;
@@ -246,7 +249,13 @@ export function configureGatewaySupervisor(options: GatewaySupervisorConfigureOp
     assertGatewayInactive(stateDir);
     const existing = readGatewaySupervisorConfig(stateDir);
     const keyFile = normalizeGatewayConfigPath(options.keyFile ?? existing?.keyFile ?? gatewaySupervisorKeyFile(stateDir), "keyFile");
+    if (existing && (options.unified === true || existing.unified === true) &&
+        (new URL(existing.publicUrl).origin !== new URL(options.publicUrl).origin ||
+         existing.tunnelName !== options.tunnelName || existing.tunnelId !== options.tunnelId)) {
+      throw new GatewaySupervisorError("GATEWAY_TUNNEL_IDENTITY_MISMATCH", "共享模式配置必须保留现有 Gateway hostname 与 Tunnel identity。");
+    }
     const candidate = {
+      ...(options.unified !== undefined || existing?.unified !== undefined ? { unified: options.unified ?? existing?.unified } : {}),
       version: 1 as const,
       scope: "machine" as const,
       publicUrl: options.publicUrl,
@@ -258,7 +267,7 @@ export function configureGatewaySupervisor(options: GatewaySupervisorConfigureOp
       tunnelClientPath: normalizeGatewayConfigPath(options.tunnelClientPath, "tunnelClientPath"),
       proxy: options.proxy ?? null,
       keyFile,
-      keyReference: gatewaySupervisorKeyReference(keyFile),
+      keyReference: existing && keyFile === existing.keyFile ? existing.keyReference : gatewaySupervisorKeyReference(keyFile),
     };
     return writeGatewaySupervisorConfig(candidate, stateDir);
   }, stateDir);
@@ -777,15 +786,20 @@ export interface GatewaySupervisorCommandPlan {
 /** Build the child argv without ever including the runtime key. */
 export function buildGatewaySupervisorCommandPlan(
   rawConfig: GatewaySupervisorConfig,
-  options: { cloudflaredPath?: string } = {},
+  options: { cloudflaredPath?: string; ingressFile?: string } = {},
 ): GatewaySupervisorCommandPlan {
   const config = gatewaySupervisorConfigSchema.parse(rawConfig);
   assertGatewayTunnelIdentity(gatewayTunnelIdentity(config));
   const cloudflaredPath = options.cloudflaredPath ?? config.cloudflaredPath;
+  if (config.unified && (!options.ingressFile || !ABSOLUTE_PATH(options.ingressFile))) {
+    throw new GatewaySupervisorError("GATEWAY_SUPERVISOR_CONFIG_CORRUPT", "共享 Tunnel 必须使用机器 owner 管理的 ingress 配置。");
+  }
   const cloudflared: GatewaySupervisorCommand = {
     kind: "cloudflared",
     executable: cloudflaredPath,
-    args: ["tunnel", "--no-autoupdate", "--url", `http://127.0.0.1:${config.port}`, "run", config.tunnelName],
+    args: config.unified
+      ? ["tunnel", "--no-autoupdate", "--config", options.ingressFile!, "run", config.tunnelName]
+      : ["tunnel", "--no-autoupdate", "--url", `http://127.0.0.1:${config.port}`, "run", config.tunnelName],
   };
   const tunnelArgs = [
     "run",
@@ -880,6 +894,7 @@ async function stopOwnedChild(
   let observed: ProcessProbe;
   try { observed = processProbeSchema.parse(await probe(owned.identity.pid, owned.identity.creationTime)); }
   catch { return false; }
+  if (observed.pid === owned.identity.pid && isProcessProvenMissing(observed)) return true;
   if (observed.status !== "identified" || observed.pid !== owned.identity.pid || observed.creationTime !== owned.identity.creationTime ||
       !observed.executable || !sameGatewayPath(observed.executable, owned.identity.executable)) return false;
   try { owned.child.kill("SIGTERM"); }
@@ -1068,10 +1083,19 @@ export async function startGatewaySupervisor(options: GatewaySupervisorRunOption
   const launch = readGatewaySupervisorLaunch(stateDir, launchFile, launchIdentity, buildId);
 
   const maintenanceDeadline = Date.now() + 60_000;
-  const startupMaintenance = async <T>(operation: string, action: () => T): Promise<T> => {
+  const startupMaintenance = async <T>(operation: string, action: (handle: MaintenanceLockHandle) => T | Promise<T>): Promise<T> => {
     while (true) {
       if (options.signal?.aborted) throw new GatewaySupervisorError("GATEWAY_SUPERVISOR_RUN_FAILED", "Gateway startup maintenance 等待已取消；保留 launch pin。");
-      try { return withMaintenanceLock(operation, action, stateDir); }
+      try {
+        const acquired = tryAcquireMaintenanceLock(stateDir, operation);
+        if (!acquired.ok) throw new MaintenanceBusyError();
+        let result: T | undefined;
+        let actionError: unknown;
+        try { result = await action(acquired.handle); }
+        catch (error) { actionError = error; }
+        releaseMaintenanceOrThrow(acquired.handle, { result, actionError });
+        return result as T;
+      }
       catch (error) {
         // 已验证的后台 launch 可等待其他 workspace 的短 fence；前台 busy 语义保持不变。
         if (!launch || !(error instanceof MaintenanceBusyError)) throw error;
@@ -1100,6 +1124,8 @@ export async function startGatewaySupervisor(options: GatewaySupervisorRunOption
   let childIdentityAmbiguous = false;
   let released = false;
   let gateway: GatewayServer | undefined;
+  const intent = new AbortController();
+  const shutdownSignal = options.signal ? AbortSignal.any([options.signal, intent.signal]) : intent.signal;
   try {
     const existingRuntime = readGatewaySupervisorRuntime(stateDir);
     if (existingRuntime) throw new GatewaySupervisorError("GATEWAY_SUPERVISOR_BUSY", "Gateway supervisor runtime 已存在，拒绝覆盖。 ");
@@ -1107,10 +1133,16 @@ export async function startGatewaySupervisor(options: GatewaySupervisorRunOption
     if (typeof runtimeKey !== "string" || !runtimeKey.trim() || /[\r\n]/.test(runtimeKey)) {
       throw new GatewaySupervisorError("GATEWAY_SUPERVISOR_KEY_HELPER_FAILED", "Gateway runtime key 未能安全解密到内存。 ");
     }
+    const ingressFile = config.unified ? await startupMaintenance("gateway-ingress", handle =>
+      writeGatewayTunnelIngress(config, stateDir, handle)) : undefined;
     gateway = await (options.startGateway ?? startGatewayServer)({ port: config.port, publicUrl: config.publicUrl,
-      healthIdentity: { pid: current.pid, creationTime: current.creationTime, buildId } });
+      healthIdentity: { pid: current.pid, creationTime: current.creationTime, buildId },
+      onShutdown: () => intent.abort(),
+      ...(config.unified ? { sharedWorkspaces: { tunnelAvailable: () =>
+        Boolean(owned[0] && !childExited(owned[0].child)) } } : {}),
+    });
     options.onPairing?.({ code: gateway.pairingCode, expiresAt: gateway.pairingExpiresAt });
-    const commands = buildGatewaySupervisorCommandPlan(config, { cloudflaredPath: options.cloudflaredPath });
+    const commands = buildGatewaySupervisorCommandPlan(config, { cloudflaredPath: options.cloudflaredPath, ingressFile });
     const cwd = path.dirname(config.stableLauncher);
     const spawnChild = options.spawnImpl ?? ((command, args, spawnOptions) => spawn(command, args, spawnOptions));
     const commandEntries: Array<{ command: GatewaySupervisorCommand; key?: string }> = [
@@ -1118,10 +1150,10 @@ export async function startGatewaySupervisor(options: GatewaySupervisorRunOption
       { command: commands.tunnelClient, key: runtimeKey },
     ];
     for (const entry of commandEntries) {
-      if (options.signal?.aborted) throw new GatewaySupervisorError("GATEWAY_SUPERVISOR_RUN_FAILED", "Gateway supervisor run 已被取消，未完成子进程启动。 ");
+      if (shutdownSignal.aborted) throw new GatewaySupervisorError("GATEWAY_SUPERVISOR_RUN_FAILED", "Gateway supervisor run 已被取消，未完成子进程启动。 ");
       if (entry.command.kind === "tunnel-client") {
         await waitForGatewayOAuthDiscovery(config.publicUrl, {
-          signal: options.signal,
+          signal: shutdownSignal,
           fetchImpl: options.oauthDiscoveryFetchImpl,
           timeoutMs: options.oauthDiscoveryTimeoutMs,
         });
@@ -1179,13 +1211,23 @@ export async function startGatewaySupervisor(options: GatewaySupervisorRunOption
       return published;
     });
 
-    const stop = async (): Promise<boolean> => {
+    if (config.unified) {
+      const { restoreGatewayRunningWorkspaces } = await import("../supervisor/lifecycle.js");
+      await startupMaintenance("gateway-restore-workspaces", handle => restoreGatewayRunningWorkspaces(handle, stateDir));
+    }
+
+    let stopping: Promise<boolean> | undefined;
+    const stop = (): Promise<boolean> => {
+      intent.abort();
+      return stopping ??= cleanupOwned();
+    };
+    const cleanupOwned = async (): Promise<boolean> => {
       if (released) return true;
       let ok = true;
+      try { await gateway!.close("SIGTERM"); } catch { ok = false; }
       for (const child of [...owned].reverse()) {
         if (!await stopOwnedChild(child, probe, options.childStopTimeoutMs)) ok = false;
       }
-      try { await gateway!.close(); } catch { ok = false; }
       // Keep both ownership records when any child identity is ambiguous. A
       // later run must stop and inspect rather than hide an unowned process.
       if (ok && runtimeSnapshot && !unlinkGatewaySnapshot(gatewaySupervisorRuntimeFile(stateDir), runtimeSnapshot)) ok = false;
@@ -1195,18 +1237,20 @@ export async function startGatewaySupervisor(options: GatewaySupervisorRunOption
       return ok;
     };
     const wait = async (signal?: AbortSignal): Promise<void> => {
-      const reason = await waitForGatewayChildren(owned, gateway!.closed, signal);
+      const waitingSignal = signal ? AbortSignal.any([shutdownSignal, signal]) : shutdownSignal;
+      const reason = await waitForGatewayChildren(owned, gateway!.closed, waitingSignal);
+      const unexpectedExit = reason === "child-exit" && !waitingSignal.aborted;
       const stopped = await stop();
       if (!stopped) throw new GatewaySupervisorError("GATEWAY_SUPERVISOR_OWNERSHIP_LOST", "Gateway supervisor 子进程或 runtime ownership 无法确认。 ");
-      if (reason === "child-exit" && !signal?.aborted) throw new GatewaySupervisorError("GATEWAY_SUPERVISOR_RUN_FAILED", "Gateway supervisor 子进程提前退出。 ");
+      if (unexpectedExit) throw new GatewaySupervisorError("GATEWAY_SUPERVISOR_RUN_FAILED", "Gateway supervisor 子进程提前退出。 ");
     };
     return { runtime, commands, stop, wait };
   } catch (error) {
     let childrenStopped = true;
+    try { await gateway?.close("SIGTERM"); } catch { childrenStopped = false; }
     for (const child of [...owned].reverse()) {
       if (!await stopOwnedChild(child, probe, options.childStopTimeoutMs)) childrenStopped = false;
     }
-    try { await gateway?.close(); } catch { childrenStopped = false; }
     const runtimeRemoved = !childIdentityAmbiguous && childrenStopped &&
       (!runtimeSnapshot || unlinkGatewaySnapshot(gatewaySupervisorRuntimeFile(stateDir), runtimeSnapshot));
     if (childrenStopped && runtimeRemoved) releaseGatewayLock(lock);

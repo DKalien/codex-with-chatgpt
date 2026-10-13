@@ -12,12 +12,20 @@ export function legacyHistoryJournalFile(workspaceId: string, stateDir: string):
 export function withLegacyHistoryOwner<T>(workspaceId: string, stateDir: string, action: () => T): T {
   return owner.run(legacyHistoryJournalFile(workspaceId, stateDir), action);
 }
+export function workspaceHistoryJournalFile(workspaceId: string, stateDir: string): string {
+  legacyHistoryJournalFile(workspaceId, stateDir);
+  return path.join(path.resolve(stateDir), "workspace-history-format", `${workspaceId}.json`);
+}
+export function withWorkspaceHistoryOwner<T>(workspaceId: string, stateDir: string, action: () => T): T {
+  return owner.run(workspaceHistoryJournalFile(workspaceId, stateDir), action);
+}
 export function assertNoLegacyHistoryCleanup(workspaceId: string, stateDir: string): void {
-  const file = legacyHistoryJournalFile(workspaceId, stateDir);
-  if (owner.getStore() === file) return;
+  for (const file of [legacyHistoryJournalFile(workspaceId, stateDir), workspaceHistoryJournalFile(workspaceId, stateDir)]) {
+  if (owner.getStore() === file) continue;
   try {
     const parent = fs.lstatSync(path.dirname(file));
     if (parent.isDirectory() && !parent.isSymbolicLink()) fs.lstatSync(file);
-  } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
-  throw new CommandCleanupError("LEGACY_HISTORY_CLEANUP_PENDING", "旧记录清理尚未完成；保留 journal，先通过本机精确确认恢复。");
+  } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
+  throw new CommandCleanupError("LEGACY_HISTORY_CLEANUP_PENDING", "工作区历史清理尚未完成；保留 journal，先通过本机精确确认恢复。");
+  }
 }

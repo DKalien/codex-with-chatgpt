@@ -58,6 +58,8 @@ function processResult(pid: number, status: "identified" | "missing" | "unknown"
 
 function fakeProbe(missing = new Set<number>(), unknown = new Set<number>()) {
   return async (pid: number, expected?: string) => {
+    // 真实 native probe 等待子进程 I/O；假探针也让出事件循环，避免同步 ACL 链阻塞状态报告。
+    await new Promise<void>(resolve => setImmediate(resolve));
     if (pid === process.pid) {
       if (expected && expected !== "fixture-creation:1") return processResult(pid, "unknown", undefined, "IDENTITY_CHANGED");
       return processResult(pid, "identified", "fixture-creation:1");
@@ -106,6 +108,29 @@ afterEach(async ({ task }) => {
 });
 
 describe("supervisor durable config", () => {
+  it.skipIf(process.platform !== "win32")("completes real owner-only ACL verification beyond the former 8s deadline", async () => {
+    const { execFileSync: execute } = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+    let delayed = false;
+    const executeWithDelay = ((file, args, spawnOptions) => {
+      if (!delayed && spawnOptions?.env?.C2C_SUPERVISOR_ACL_TARGETS) {
+        delayed = true;
+        expect(spawnOptions.timeout).toBe(15_000);
+        return execute(file, [...args!.slice(0, -1), `[System.Threading.Thread]::Sleep(8100)\n${args!.at(-1)}`], spawnOptions);
+      }
+      return execute(file, args, spawnOptions);
+    }) as typeof childProcess.execFileSync;
+    vi.mocked(childProcess.execFileSync).mockImplementation(observeSupervisorAclCall(aclCalls, executeWithDelay));
+
+    await expect(withSupervisorOperation(workspaceRoot, () => {}, options)).resolves.toBeUndefined();
+    expect(delayed).toBe(true);
+    expect(aclCalls.length).toBeGreaterThan(1);
+    expect(aclCalls.every(call => call.success)).toBe(true);
+    expect(aclCalls[0].durationMs).toBeGreaterThan(8000);
+    expect(aclCalls[0].durationMs).toBeLessThan(15_000);
+    expect(aclCalls[0].output).toMatch(/^OK:S-\d(?:-\d+)+\s*$/i);
+    console.info("supervisor delayed ACL evidence", JSON.stringify(aclCalls.map(({ durationMs, success }) => ({ durationMs, success }))));
+  });
+
   it("pristine presence detection creates nothing and rejects orphan/linked evidence", () => {
     expect(hasSupervisorState(workspaceRoot, stateDir)).toBe(false);
     expect(fs.readdirSync(stateDir)).toEqual([]);

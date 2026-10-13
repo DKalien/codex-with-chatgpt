@@ -62,6 +62,7 @@ export type ResultBusReservation = z.infer<typeof resultBusReservationSchema>;
 export const resultBusAttemptSchema = z.object({
   attemptId: routingUuidSchema,
   claimedAt: endpointInstantSchema,
+  messageFormat: z.literal("signal-v1").optional(),
 }).strict();
 export type ResultBusAttempt = z.infer<typeof resultBusAttemptSchema>;
 

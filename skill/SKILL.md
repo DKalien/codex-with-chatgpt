@@ -40,7 +40,7 @@ endpoint 的 workspace。`TURN_ENDED` 是 App Server 生命周期事实，不是
 不得为它写 `desktop_*` 回执。Desktop 持有 writer 时不得抢占、修改私有状态或自动换线程。
 本机 `deliveryMode=official` 后 Bridge 停用旧任务投递，只保留反馈相关功能；Remote disable 不回退旧入口。
 
-**统一 Gateway（显式部署后）:** 已配置本机 `gateway supervisor` 时，现有 Bridge 启动/重启入口自动启动或复用共享 Gateway 及其公网隧道并等待就绪，无需另开终端；未配置仍走原 workspace 流程。Gateway 失败时报告 Bridge 已就绪与具体失败，不报告整组 Ready、不改配对或会话。停止当前 workspace 不停止共享 Gateway。
+**统一 Gateway（显式部署后）:** 已配置本机 `gateway supervisor` 时，现有启动入口自动启动或复用机器 Gateway 及其公网隧道。显式配置 `--unified` 后，各 workspace Bridge 由同一 Gateway 进程托管，共享 Cloudflare origin；原 named 域名、OAuth、绑定、历史及存储隔离保留。迁移旧域名 DNS 必须在明确部署范围内完成，生成 ingress 不会自动改 DNS。冷启动只恢复既有 `desiredState=running`，无配置或 stopped 不启动；停止当前 workspace 不停止共享 Gateway，rollout 则核验同一 owner 全部活动 workspace 后整体升级。未配置 unified 保留原流程；Gateway 失败报告具体错误，保留状态，不报告整组 Ready。
 见 `docs/unified-gateway-plan.md`。先在实际连接中调用
 `gateway_list_workspaces`，核对当前 clientId 和显式授权项目，再选定 workspaceId。
 所有项目工具（包括 workspace_info、feedback_status、web_sink_list）都携带该 workspaceId；
@@ -891,9 +891,11 @@ Desktop Control 是发送到本机 Desktop 已有会话的独立 MCP 路径，�
 
 ### 日常 UX：连接网页回流
 
-已有配对的 Browser Companion 在具体 ChatGPT 对话中点击“连接当前对话”，新建或切换回流目标时由本机确认窗显示工作区与完整目标 URL。用户本人确认后，系统轮换 Companion 凭据并收敛 Web Sink；不需要用户输入 binding、epoch 或让 ChatGPT 执行验证指令。该本机确认仅授权结果回流，不授权执行任务，也不变更 Desktop 目标或 Gateway OAuth scopes。
+默认 Companion 是轻量弹窗。首次在具体 ChatGPT 对话粘贴配对 JSON，独立点击“授权 Bridge 访问”，再点“配对并连接当前对话”；自动登记并选择 JSON 中的项目，不额外要求手动选择。已有配对时选择项目并点“连接当前对话”。在本机确认窗由用户本人核对 workspace 与完整 URL，随后自动 commit/bind，无需第二次点击、binding/epoch 输入或 ChatGPT route 验证消息。该确认仅授权结果回流，不授权执行任务或变更 Desktop/Gateway 权限。
 
-空白首页尚无具体 conversation URL 时，先建立对话。首次未配对仍走配对与明确的 Bridge 访问授权；旧 Bridge 不支持本机确认时应升级兼容运行时，不能静默发送旧式验证消息。既有未知发送与旧流程按原安全恢复规则处理；不能清除 journal 或伪造已连接。构建/安装不等于当前 Bridge 已升级，也不等于扩展已重载或真实网页流程已通过。
+自动回流由独立启停按钮控制并保留用户选择。Grant 是唯一权限请求入口，Pair 只检查已有权限；密钥仅本次弹窗内存。Bridge 决定所有安全门禁与 `once` 发送许可；浏览器只报告页面、执行一次 DOM 操作并观察结果。连接响应丢失时查询原 requestId，按 Bridge 状态完成提交/绑定，不自动发起新 requestId。DOM 发送重启、响应丢失、claimed 或 outcome_unknown 只观察原 attempt，不重复写入或点击、不清空记录。弹窗待确认时查询原申请；超时或关闭后可刷新状态。
+
+空白首页先建立具体对话。旧 Bridge 不支持本机确认时升级兼容运行时，不静默发送旧式验证消息。旧 phase/owner-proof/route-attest/fence/journal 链仅为兼容实现，manifest 不默认加载。构建/安装不等于运行时已升级、扩展已重载或真实网页已验收；完整合同见仓库 `docs/companion-lightweight.md`。
 
 ### 日常 UX：绑定当前 Desktop 会话
 

@@ -2,8 +2,12 @@
   "manifest_version": 3,
   "name": "C2C Browser Companion",
   "version": "0.1.1",
-  "description": "ChatGPT conversation ownership companion for Codex with ChatGPT (E1b2 transport+reserve, E1b3d3b explicit production one-shot Send).",
-  "permissions": ["storage", "activeTab", "alarms"],
+  "description": "轻量 ChatGPT 网页伴侣：连接、DOM 操作与结果观察由 Bridge 统一调度。",
+  "permissions": [
+    "storage",
+    "activeTab",
+    "alarms"
+  ],
   "host_permissions": [
     "https://chatgpt.com/*",
     "https://www.chatgpt.com/*"
@@ -14,12 +18,12 @@
     "http://localhost/*"
   ],
   "background": {
-    "service_worker": "service-worker.js",
+    "service_worker": "bridge-client.js",
     "type": "module"
   },
   "action": {
     "default_title": "C2C Companion",
-    "default_popup": "popup/popup.html"
+    "default_popup": "popup/lightweight.html"
   },
   "content_scripts": [
     {
@@ -31,16 +35,9 @@
         "route-global.js",
         "dom-adapter-global.js",
         "turn-observer-global.js",
-        "shadow-evidence.js",
         "composer-write-adapter.js",
         "send-click-adapter.js",
-        "send-probe-message-global.js",
-        "send-probe-run.js",
-        "route-attestation-global.js",
-        "route-attestation-run-global.js",
-        "feedback-bootstrap-run-global.js",
-        "production-send-runtime-global.js",
-        "content-script.js"
+        "content-lite.js"
       ],
       "run_at": "document_idle",
       "all_frames": false

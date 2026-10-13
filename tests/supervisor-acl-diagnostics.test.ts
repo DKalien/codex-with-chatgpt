@@ -84,7 +84,7 @@ describe("supervisor Windows ACL diagnostics", () => {
     expect(executable).toBe(path.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"));
     expect(args.slice(0, 6)).toEqual(["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"]);
     expect(createHash("sha256").update(args[6]).digest("hex")).toBe("55e3ddeb322922c4c0ee9c4b94a8179377377c050792bdd7ba945b77da65e6bf");
-    expect(options).toMatchObject({ encoding: "utf8", windowsHide: true, timeout: 8000, maxBuffer: 16 * 1024, stdio: "pipe" });
+    expect(options).toMatchObject({ encoding: "utf8", windowsHide: true, timeout: 15_000, maxBuffer: 16 * 1024, stdio: "pipe" });
     const env = options.env as Record<string, string>;
     expect(Object.keys(env).sort()).toEqual([
       "C2C_SUPERVISOR_ACL_TARGETS", "PATH", "SystemRoot", "TEMP", "TMP", "USERPROFILE", "WINDIR",
@@ -95,6 +95,7 @@ describe("supervisor Windows ACL diagnostics", () => {
 
   it.each([
     { name: "timeout", fields: { code: "ETIMEDOUT", signal: "SIGTERM", killed: true }, classification: "timeout", signal: "SIGTERM" },
+    { name: "timeout despite successful exit and output", fields: { code: "ETIMEDOUT", status: 0, signal: null, stdout: "OK:S-1-5-21-100-200-300-1000\r\n" }, classification: "timeout", exitCode: 0 },
     { name: "nonzero", fields: { status: 9999 }, classification: "nonzero", exitCode: 9999 },
     { name: "spawn failure", fields: { code: "ENOENT" }, classification: "spawn_failure" },
     { name: "interrupted", fields: { code: "EINTR", signal: "SIGINT" }, classification: "interrupted", signal: "SIGINT" },
@@ -130,12 +131,12 @@ describe("supervisor Windows ACL diagnostics", () => {
     expect(error.durationMs).toBe(60_000);
   });
 
-  it("reports the observed overrun separately from the unchanged 8000ms deadline", () => {
+  it("reports the observed overrun separately from the bounded 15000ms deadline", () => {
     execFileSyncMock.mockImplementation(() => { throw rawChildFailure({ code: "ETIMEDOUT" }); });
-    vi.spyOn(performance, "now").mockReturnValueOnce(0).mockReturnValueOnce(8027);
+    vi.spyOn(performance, "now").mockReturnValueOnce(0).mockReturnValueOnce(15027);
     const error = onWindows(() => captureError(() => readSupervisorConfig(workspaceRoot, { stateDir }))) as AclError;
-    expect(error.durationMs).toBe(8027);
-    expect(execFileSyncMock.mock.calls[0][2]).toMatchObject({ timeout: 8000 });
+    expect(error.durationMs).toBe(15027);
+    expect(execFileSyncMock.mock.calls[0][2]).toMatchObject({ timeout: 15_000 });
   });
 
   it.each(["RAW_INVALID_ACL_OUTPUT", "OK:S-1", "OK:S-1-5-21-100\nextra output"])("fails closed for invalid ACL output %j", output => {

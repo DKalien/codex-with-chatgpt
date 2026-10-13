@@ -2,18 +2,22 @@
 
 本文是“一个机器级 Gateway、一个 ChatGPT 插件，覆盖本机所有显式授权项目”的现役实施计划。下列各阶段完成前，计划目标都不得写成已交付。旧时间线仍保留在[开发计划](development-plan.md)；单 workspace 官方投递的当前合同见[官方路线](official-route.md)。
 
-## 当前状态（2026-10-08 当前 checkout）
+<a id="当前状态2026-10-08-当前-checkout"></a>
+
+## 当前状态（2026-10-13 当前 checkout）
+
+三合一与轻量 Companion 已部署：两个 workspace 由同一 Gateway owner 托管，运行版本均为 current。正式串行门禁 194 files / 4,087 tests 通过，后续两处小修的定向门禁 7 files / 138 tests 通过；最终 typecheck/build/diff 与 Python 协议门禁通过。Desktop 经用户本机确认恢复可用；用户刷新真实 ChatGPT 页面后复核面板“可接收结果”。精确 build、运行身份、代理观察和验收边界统一见[轻量 Companion 部署快照](companion-lightweight.md#部署与验收观察快照)。真实 Desktop task delivery、DOM Send、M4/M5 双项目 Send/observed、浏览器运行版本直接核验、旧 Connector 退役、开机自启及异常恢复仍待完成。
 
 ### 当前源码能力
 
 - M1–M3 已有源码：`gateway register/list/revoke` 把规范 workspaceId/root 与获准 clientIds 写入机器 allowlist；`gateway serve` 使用独立 `machine-gateway` OAuth store 和单实例 owner lock。`gateway_list_workspaces` 只列出当前 client 的授权项目；workspace、Remote、Desktop、execution、feedback、Web Sink 工具显式带 workspaceId，每次调用重新解析 grant 与 canonical root。Remote 工具仍要求该 workspace 处于 official delivery mode。
 - MCP Gateway 复用原工具 handler 与每项目业务状态，不增加 Gateway 任务/反馈队列。`/mcp` 与 `/oauth/token` 诊断日志只记录 method、固定 path 和 statusCode；不记录 query、body、headers。匿名访问只开放协议 discovery，工具调用仍要求 bearer OAuth 和原 scope。
-- M4 已有多 workspace Companion 源码：每项目 local/session/alarm 存储隔离，页面选择固定 workspaceId 与 canonical route，DOM mutation 按 tab 串行，操作面板请求带 workspaceId 并忽略旧项目迟到响应。测试覆盖双项目状态隔离；双项目真实 Send/observed 尚待现场验收。
+- M4 已有多 workspace Companion 源码：默认 bridge-client 按 workspace 隔离凭据、偏好与页面关联，页面选择固定 workspaceId 与 canonical route，DOM mutation 按 tab 串行，操作面板请求带 workspaceId 并忽略旧项目迟到响应；namespaced alarm 仅保留在旧兼容链。测试覆盖双项目状态隔离；双项目真实 Send/observed 尚待现场验收。
 - Gateway Desktop 复用本机绑定与原 sender：先 status 再 send，直接投递并保留 idle/busy 门禁；Bridge mailbox 才持久排队。Desktop read/control 与 Remote enable 独立，`codex_submit_task` 始终是后台 Remote 工具，失败不自动转投。详见 [Desktop 合同](desktop-control.md#gateway-直接投递)。
-- Companion 已配对页面的新回流目标由本机确认完整 URL，`local_user` 不替代 MCP principal。popup、toolbar、面板与新增 reserve 统一使用 SW 的 `connectionReadiness`；同 tab 刷新只在原身份稳定且 fresh 服务端核验通过时恢复。隐藏终态历史保留 unknown/发送与防重放证据，正文观察仍须唯一精确 ATTEMPT 和全文相等。机制见 [架构](architecture.md#companion-当前连接与恢复)，操作与诊断见 [排障](troubleshooting.md#日常连接与本机确认)。
-- M6 已有 Windows 前台 Gateway/Tunnel Supervisor 源码：configure/status/validate/set-key/run、DPAPI key 保存、exact process identity、launcher startup pin、受限 OAuth metadata preflight，以及 GC 对 Gateway/Controller release 引用的保护。尚无 Scheduled Task 注册或异常退出自动恢复。
+- Companion 默认使用轻量 bridge-client/content/popup，新回流目标由本机确认完整 URL，`local_user` 不替代 MCP principal。Bridge 判定连接与单次发送许可；浏览器关联真实 tab/document，执行一次已授权 DOM 操作并精确观察正文与 ATTEMPT，未知结果只观察、不重发。旧 SW `connectionReadiness` 与 proof/fence/journal 链保留兼容回归，不默认加载。机制见 [架构](architecture.md#companion-当前连接与恢复)，操作与诊断见 [排障](troubleshooting.md#日常连接与本机确认)。
+- M6 已有 Windows 机器级 Gateway/Tunnel Supervisor 源码：configure/status/validate/set-key/run、稳定 launcher 后台启动、DPAPI key 保存、exact process identity、launcher startup pin、受限 OAuth metadata preflight，以及 GC 对 Gateway/Controller release 引用的保护。显式统一模式由单个 Node owner 托管已授权 workspace，只恢复原 running intent；尚无 Scheduled Task 注册或异常退出自动恢复。
 
-### 当前未交付与验证边界
+### 历史验证边界（2026-10-08）
 
 本轮唯一一次正式串行全量（2026-10-08 20:48:08–21:22:52，Asia/Shanghai）为 **180 files：177 PASS / 3 FAIL；3762 tests：3759 PASS / 3 FAIL；Duration 2078.78s，exit 1**，未出现 unhandled banner。`supervisor-store` 在未修改的源码/测试中遇原 8 秒 ACL 调用超时（8133ms）；保存的 ACL 快照合格，但变慢根因未明，未放宽门限。另两项静态测试分别因固定 1800 字符截取遗漏既有 `if (!res.ok)`、字符串判断把 `===` 当赋值而失败；仅修两行测试后一次定向 **2 files / 42 tests PASS、exit 0**，生产源码未变。未再跑正式全量，不能把原全量改写为通过。此前相关回归 **15 files / 889 tests**、typecheck/build 与本次 Python 协议 **89+20+4=113 项**通过，均不替代失败的正式全量；Vite `route-esm.js → route.js.map` 的 ENOENT 警告仍保留。证据在 ignored `.tooling/neat-closeout-20261008/`。
 

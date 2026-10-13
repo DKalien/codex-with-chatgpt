@@ -1870,13 +1870,14 @@ describe("E1b3d1 exact Send vs Stop disambiguation (real Edge 2026-09-16)", () =
 });
 
 describe("E1b3d1 packaging + runtime safety gates", () => {
-  it("manifest loads read-only capability only", () => {
+  it("默认 manifest 加载轻量能力，不加载旧 shadow runtime", () => {
     const manifest = JSON.parse(fs.readFileSync(path.join(companionRoot, "manifest.json"), "utf8"));
     const js = (manifest.content_scripts ?? []).flatMap((cs: { js?: string[] }) => cs.js ?? []);
     expect(js).toContain("turn-observer-global.js");
     expect(js).not.toContain("turn-observer.js");
     expect(js).not.toContain("dom-adapter.js");
-    expect(js).toContain("shadow-evidence.js");
+    expect(js).not.toContain("shadow-evidence.js");
+    expect(js).toContain("content-lite.js");
     expect(js).not.toContain("send-adapter.js");
     expect(js).not.toContain("send-orchestrator.js");
     for (const p of manifest.permissions ?? []) {

@@ -278,10 +278,33 @@ describe("findBridgeObservation", () => {
     const old = stubRuntime("cleanup-owner", "unused", process.pid, 1);
     const current = { ...old, adminToken: "replacement-token" };
     writeRuntimeState(current);
-    clearRuntimeState(old.workspaceId, old);
+    expect(clearRuntimeState(old.workspaceId, old)).toBe(false);
     expect(readRuntimeState(old.workspaceId)).toEqual(current);
-    clearRuntimeState(current.workspaceId, current);
+    expect(clearRuntimeState(current.workspaceId, current)).toBe(true);
     expect(readRuntimeState(current.workspaceId)).toBeNull();
+    expect(clearRuntimeState(current.workspaceId, current)).toBe(false);
+  });
+
+  it("runtime 删除失败保留原身份且不能报告关闭成功", () => {
+    dirs.push(isolateStateDir());
+    const runtime = stubRuntime("cleanup-error", "unused", process.pid, 1);
+    writeRuntimeState(runtime);
+    const unlink = fs.unlinkSync.bind(fs);
+    vi.spyOn(fs, "unlinkSync").mockImplementation(file => {
+      if (String(file) === runtimeFile(runtime.workspaceId)) throw new Error("fixture delete failure");
+      return unlink(file);
+    });
+    expect(clearRuntimeState(runtime.workspaceId, runtime)).toBe(false);
+    expect(readRuntimeState(runtime.workspaceId)).toEqual(runtime);
+  });
+
+  it("无expected的legacy清理仍可删除，但缺失runtime不报告retire成功", () => {
+    dirs.push(isolateStateDir());
+    const runtime = stubRuntime("cleanup-legacy", "unused", process.pid, 1);
+    expect(clearRuntimeState(runtime.workspaceId)).toBe(false);
+    writeRuntimeState(runtime);
+    expect(clearRuntimeState(runtime.workspaceId)).toBe(true);
+    expect(readRuntimeState(runtime.workspaceId)).toBeNull();
   });
 
   it("Bridge close 不会清除已经替换的 runtime", async () => {

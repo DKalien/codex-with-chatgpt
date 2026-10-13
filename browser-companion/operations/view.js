@@ -60,9 +60,9 @@
     const web = response?.web;
     let webLabel = "无法确认";
     if (serviceFresh && fresh(web?.observedAt, now)) {
-      webLabel = !web.ownerAvailable ? "当前页面无 owner"
+      webLabel = !web.ownerAvailable ? response?.runtime === "lightweight" ? "等待页面连接" : "当前页面无 owner"
         : !web.routeMatches ? "页面与绑定不一致"
-          : !web.verified ? "对话待验证"
+          : !web.verified ? response?.runtime === "lightweight" ? "等待 Bridge 确认连接" : "对话待验证"
             : web.generation === "streaming" || web.generation === "generating" ? "正在生成"
               : web.composer === "nonempty" ? "输入框有未发送内容"
                 : web.composer === "empty" && web.generation === "idle" && web.safe === true

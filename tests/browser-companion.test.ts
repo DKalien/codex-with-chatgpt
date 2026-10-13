@@ -1,3 +1,4 @@
+import { LIGHT_CONTENT_SCRIPTS } from "./browser-companion-chains.js";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -180,7 +181,9 @@ describe("browser companion manifest", () => {
     expect(manifest.optional_host_permissions ?? []).toContain("https://*/*");
     expect(manifest.host_permissions).not.toContain("<all_urls>");
     expect(manifest.optional_host_permissions).not.toContain("<all_urls>");
-    expect(manifest.background?.service_worker).toBe("service-worker.js");
+    expect(manifest.background?.service_worker).toBe("bridge-client.js");
+    expect(manifest.action?.default_popup).toBe("popup/lightweight.html");
+    expect(manifest.content_scripts?.[0]?.js).toEqual(LIGHT_CONTENT_SCRIPTS);
     expect(manifest.background?.type).toBe("module");
     expect(manifest.content_scripts?.[0]?.all_frames).toBe(false);
     // Edge rejects unrecognized keys; do not ship unsupported manifest fields.
@@ -702,5 +705,19 @@ describe("R3o trusted route authority + witness", () => {
     expect(verdict).toEqual({ verdict: "mismatch" });
     // Same for a valid authority contradicted by an unparseable/null witness.
     expect(resolveObservationRouteVerdict(send(ROUTE, ROUTE), null)).toEqual({ verdict: "mismatch" });
+  });
+});
+
+describe("格式化接口固定路径", () => {
+  it("只接受固定路径和精确hash query", () => {
+    const origin = "https://bridge.example.test", hash = "f".repeat(64);
+    for (const phase of ["preview", "confirm"])
+      expect(companionApiUrl(origin, `/operations/format/${phase}`)).toBe(`${origin}/api/companion/v1/operations/format/${phase}`);
+    expect(companionApiUrl(origin, `/operations/format/result?confirmationSha256=${hash}`))
+      .toBe(`${origin}/api/companion/v1/operations/format/result?confirmationSha256=${hash}`);
+    for (const path of ["/operations/format/result", `/operations/format/result?confirmationSha256=${hash}&workspaceId=x`,
+      `/operations/format/result?confirmationSha256=${hash.toUpperCase()}`, `/operations/format/confirm?confirmationSha256=${hash}`,
+      "/operations/format/all", "/operations%2Fformat/confirm"])
+      expect(() => companionApiUrl(origin, path)).toThrow(BridgeOriginError);
   });
 });

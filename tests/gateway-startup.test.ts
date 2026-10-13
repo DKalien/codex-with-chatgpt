@@ -125,6 +125,25 @@ describe("configured Gateway background ensure", () => {
     expect(opts.spawnDaemon).not.toHaveBeenCalled();
     expect(readCurrentInstall).not.toHaveBeenCalled();
   });
+  it("unified owner 只能复用带 exact unified:true 的健康 Gateway", async () => {
+    const config = configure(); writeGatewaySupervisorConfig({ ...config, unified: true }, stateDir); publish();
+    const opts = options(); opts.fetchImpl = http({ unified: true });
+    expect(await ensureConfiguredGatewaySupervisor(opts)).toEqual(runtime());
+    expect(opts.spawnDaemon).not.toHaveBeenCalled();
+  });
+  it.each([{}, { unified: false }, { unified: true, extra: "unknown" }])("unified health 模式缺失或异常 %j 保留 owner", async health => {
+    const config = configure(); writeGatewaySupervisorConfig({ ...config, unified: true }, stateDir); publish();
+    const opts = options(); opts.fetchImpl = http(health);
+    await expect(ensureConfiguredGatewaySupervisor(opts)).rejects.toMatchObject({ code: "GATEWAY_SUPERVISOR_OWNERSHIP_LOST" });
+    expect(opts.spawnDaemon).not.toHaveBeenCalled();
+    expect(fs.existsSync(gatewaySupervisorRuntimeFile(stateDir))).toBe(true);
+  });
+  it("legacy 配置拒绝复用带 unified 身份的 Gateway", async () => {
+    configure(); publish();
+    const opts = options(); opts.fetchImpl = http({ unified: true });
+    await expect(ensureConfiguredGatewaySupervisor(opts)).rejects.toMatchObject({ code: "GATEWAY_SUPERVISOR_OWNERSHIP_LOST" });
+    expect(opts.spawnDaemon).not.toHaveBeenCalled();
+  });
   it("两个并发 ensure 只 spawn 一次，第二个等待 pin handoff", async () => {
     configure();
     let release!: () => void;

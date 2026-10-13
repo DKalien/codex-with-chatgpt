@@ -21,8 +21,11 @@
       <div class="toolbar"><h2>消息与任务 <span id="count" class="count">0</span></h2><div class="filters" aria-label="筛选任务">
         <button type="button" data-filter="all" aria-pressed="true">全部任务</button><button type="button" data-filter="active" aria-pressed="false">进行中</button><button type="button" data-filter="attention" aria-pressed="false">需要处理</button><button type="button" data-filter="historical" aria-pressed="false">历史遗留</button>
       </div></div>
-      <div class="filters"><button id="clear-history" type="button" class="quiet" disabled>清空历史显示</button><button id="restore-history" type="button" class="quiet" disabled>恢复已隐藏历史</button></div>
-      <p class="muted">仅隐藏已结束任务；不删除运行记录，也不取消回流。执行中或仍需核验的任务保持可见。</p><p id="history-status" role="status" aria-live="polite"></p>
+      <div class="filters"><button id="clear-history" type="button" class="quiet" disabled>隐藏已结束历史</button><button id="restore-history" type="button" class="quiet" disabled>恢复已隐藏历史</button></div>
+      <div class="filters"><button id="format-history" type="button" disabled>格式化当前项目历史</button><button id="check-format" type="button" class="quiet" hidden>核验上次格式化</button></div>
+      <p id="format-status" role="status" aria-live="polite"></p>
+      <p class="muted">格式化永久删除当前项目任务、执行记录、输出、回流历史及本机隔离档案，无法恢复；保留连接与配对，并暂停自动回流。在途或未核验状态会阻止格式化。</p>
+      <p class="muted">隐藏仅隐藏已结束任务；不删除运行记录，也不取消回流。执行中或仍需核验的任务保持可见。</p><p id="history-status" role="status" aria-live="polite"></p>
       <div class="search"><label for="search">查找任务</label><input id="search" type="search" placeholder="按 commandId 查找" autocomplete="off"></div>
       <div class="table-scroll"><table><thead><tr><th>指令</th><th>到达 Codex</th><th>执行 / record</th><th>返回网页</th><th><span class="sr-only">详情</span></th></tr></thead><tbody id="rows"></tbody></table></div>
       <p id="empty" class="empty">正在查询当前可核验的记录…</p>
@@ -30,7 +33,7 @@
       <p class="footnote">包括本项目仍存在的历史任务、异常投递和清理残留，仅展示状态与标识。已清理记录不会恢复；记录消失不代表回流成功。</p>
     </section>
     <section id="detail" class="detail" hidden aria-label="任务详情"><div class="toolbar"><h2 id="detail-title">任务详情</h2><button id="close-detail" class="quiet" type="button">收起详情</button></div><p id="detail-note" class="muted"></p><ol id="timeline"></ol><div id="execution-results" class="execution-results"></div><pre id="execution-result" hidden aria-live="polite"></pre><dl id="identities"></dl><div id="task-actions" class="filters"></div><p id="action-note" class="muted"></p></section>
-    <dialog id="confirm-dialog"><h2>确认任务操作</h2><p id="confirm-task"></p><p id="confirm-notice"></p><label><input id="confirm-check" type="checkbox">我已核对任务及影响范围</label><div class="filters"><button id="confirm-cancel" type="button" class="quiet">返回</button><button id="confirm-action" type="button" disabled>确认操作</button></div></dialog>
+    <dialog id="confirm-dialog"><h2 id="confirm-title">确认任务操作</h2><p id="confirm-task"></p><p id="confirm-notice"></p><label><input id="confirm-check" type="checkbox">我已核对任务及影响范围</label><div class="filters"><button id="confirm-cancel" type="button" class="quiet">返回</button><button id="confirm-action" type="button" disabled>确认操作</button></div></dialog>
     <footer>本页刷新保持只读。操作需本机限时授权及逐条确认；结果不明不会自动重试。已执行任务不能从本面板强制中断。</footer>
   </main>
   <script src="view.js"></script><script src="history.js"></script><script src="operations.js"></script>

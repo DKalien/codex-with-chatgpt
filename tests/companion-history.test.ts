@@ -16,6 +16,7 @@ const data = (workspaceId = a) => ({ ok: true, autonomy: "off", snapshot: { work
 function harness(stored: Record<string, any> = {}) {
   const elements = new Map<string, any>();
   const node = () => ({ textContent: "", value: "", hidden: false, disabled: false, children: [] as any[],
+    showModal: vi.fn(), close: vi.fn(),
     append(...items: any[]) { this.children.push(...items); },
     replaceChildren(...items: any[]) { this.children = items; }, setAttribute() {}, scrollIntoView() {} });
   const el = (id: string) => { if (!elements.has(id)) elements.set(id, node()); return elements.get(id); };
@@ -133,5 +134,52 @@ describe("Companion 本地历史显示", () => {
       expect(html.indexOf('history.js"></script>')).toBeLessThan(html.indexOf(`${script}"></script>`));
     }
     expect(() => new vm.Script(fs.readFileSync("browser-companion/operations/history.js", "utf8"))).not.toThrow();
+  });
+});
+
+describe("格式化按钮", () => {
+  it("无本机授权禁用；预览绑定项目并明确不可恢复，勾选后才confirm", async () => {
+    const h = harness(); h.run("operations/operations.js");
+    await vi.waitFor(() => expect(h.el("count").textContent).toBe("3"));
+    expect(h.el("format-history").disabled).toBe(true);
+    const authorized = { ...data(), journal: { state: "NONE" }, snapshot: { ...data().snapshot, panelAuthorization: { enabled: true } } };
+    h.chrome.runtime.sendMessage.mockImplementation(async (message: any) => message.type === "c2c.operations.format"
+      ? { ok: true, status: message.phase === "preview" ? "preview" : "cleaned", workspaceId: a, confirmationSha256: "f".repeat(64), counts: { tasks: 16, outputs: 2, feedback: 3 }, browserArchiveCount: 1, notice: "永久删除本项目任务与回流历史" } : authorized);
+    await h.el("refresh").onclick();
+    expect(h.el("format-history").disabled).toBe(false);
+    await h.el("format-history").onclick();
+    expect(h.el("confirm-title").textContent).toContain("不可恢复");
+    expect(h.el("confirm-task").textContent).toContain(a);
+    expect(h.el("confirm-notice").textContent).toContain("无法恢复");
+    expect(h.el("confirm-notice").textContent).toContain("任务 16 条");
+    expect(h.el("confirm-notice").textContent).toContain("本机隔离档案 1 条");
+    await h.el("confirm-action").onclick();
+    expect(h.chrome.runtime.sendMessage.mock.calls.some(([m]) => m.phase === "confirm")).toBe(false);
+    h.el("confirm-check").checked = true;
+    await h.el("confirm-action").onclick();
+    expect(h.chrome.runtime.sendMessage.mock.calls.find(([m]) => m.phase === "confirm")?.[0]).toMatchObject({
+      type: "c2c.operations.format", workspaceId: a, phase: "confirm", confirmationSha256: "f".repeat(64), confirmed: true });
+    expect(h.el("operation-status").textContent).toContain("永久清空");
+    expect(h.chrome.storage.local.set).not.toHaveBeenCalled();
+  });
+});
+
+describe("格式化预览受阻提示", () => {
+  it("错误紧邻按钮显示，保持精确拒绝原因且不打开确认或删除", async () => {
+    const h = harness();
+    const authorized = { ...data(), snapshot: { ...data().snapshot, panelAuthorization: { enabled: true } } };
+    h.chrome.runtime.sendMessage.mockImplementation(async (message: any) => message.type === "c2c.operations.format"
+      ? { ok: false, reason: "format_send_fence_active" } : authorized);
+    h.run("operations/operations.js");
+    await vi.waitFor(() => expect(h.el("format-history").disabled).toBe(false));
+    await h.el("format-history").onclick();
+    expect(h.el("format-status").textContent).toContain("安全屏障");
+    expect(h.el("format-status").textContent).toBe(h.el("operation-status").textContent);
+    expect(h.el("confirm-dialog").showModal).not.toHaveBeenCalled();
+    expect(h.chrome.runtime.sendMessage.mock.calls.some(([message]) => message.phase === "confirm")).toBe(false);
+    expect(h.chrome.storage.local.set).not.toHaveBeenCalled();
+    const html = fs.readFileSync("browser-companion/operations/operations.html", "utf8");
+    expect(html.indexOf('id="format-status"')).toBeGreaterThan(html.indexOf('id="format-history"'));
+    expect(html.indexOf('id="format-status"')).toBeLessThan(html.indexOf('id="history-status"'));
   });
 });

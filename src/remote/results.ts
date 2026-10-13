@@ -1,7 +1,17 @@
+import { readRemote } from "./store.js";
+import { readFeedbackStatusState } from "../feedback/state-store.js";
+import { withCommandOperation } from "../command-cleanup/fence.js";
 import type { Workspace } from "../workspace/manager.js";
 import type { RemoteTask } from "./store.js";
 import { enqueueResultBusEntry } from "../result-bus/store.js";
 import { OFFICIAL_TESTS_UNKNOWN, officialResultSchema } from "../result-bus/official-result.js";
+
+/** After a reset, a cached historical task is never authority to recreate records or results. */
+export function assertRemoteTaskCurrent(workspaceId: string, task: RemoteTask): void {
+  if (!readFeedbackStatusState(workspaceId).historyFormatSha256) return;
+  const current = readRemote(workspaceId)?.tasks.find(item => item.taskId === task.taskId);
+  if (!current || JSON.stringify(current) !== JSON.stringify(task)) throw new Error("Official task snapshot is stale after workspace history format");
+}
 
 /** Replayable projection of an observed official turn; never imports or fabricates a receipt. */
 export function projectRemoteResult(workspace: Workspace, task: RemoteTask): void {
@@ -9,6 +19,8 @@ export function projectRemoteResult(workspace: Workspace, task: RemoteTask): voi
   if (!task.targetId || !task.turnId || !task.completedAt) return;
   if (task.workspaceId !== workspace.id || !["completed", "failed", "cancelled"].includes(task.status))
     throw new Error("Official result workspace or terminal identity mismatch");
+  return withCommandOperation(workspace.id, task.commandId, () => {
+  assertRemoteTaskCurrent(workspace.id, task);
   const result = officialResultSchema.parse({
     commandId: task.commandId, iteration: 1, resultId: task.taskId,
     createdAt: task.completedAt, updatedAt: task.completedAt, status: task.status,
@@ -22,4 +34,5 @@ export function projectRemoteResult(workspace: Workspace, task: RemoteTask): voi
     },
   });
   enqueueResultBusEntry({ id: workspace.id, root: workspace.root }, result);
+  });
 }

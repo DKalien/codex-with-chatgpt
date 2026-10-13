@@ -15,7 +15,7 @@ export type SupervisorAclCall = {
   error?: { code: unknown; status: unknown; signal: unknown; stdout: string; stderr: string };
 };
 
-/** 仅测试观察：参数、返回值、异常和原始 8s deadline 均原样透传。 */
+/** 仅测试观察：参数、返回值、异常和调用方 deadline 均原样透传。 */
 export function observeSupervisorAclCall(records: SupervisorAclCall[], call: typeof execFileSync): typeof execFileSync {
   return ((file, args, options) => {
     const environment = options?.env;
@@ -94,7 +94,7 @@ export function preserveSupervisorFailure(name: string, roots: string[], calls: 
     const executable = path.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
     try {
       const output = execFileSync(executable, ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", READ_ACLS], {
-        encoding: "utf8", windowsHide: true, timeout: 8000, maxBuffer: 256 * 1024, stdio: "pipe",
+        encoding: "utf8", windowsHide: true, timeout: 15_000, maxBuffer: 256 * 1024, stdio: "pipe",
         env: { SystemRoot: systemRoot, WINDIR: process.env.WINDIR ?? systemRoot, PATH: process.env.PATH ?? "",
           TEMP: process.env.TEMP ?? "", TMP: process.env.TMP ?? "", USERPROFILE: process.env.USERPROFILE ?? "",
           C2C_TEST_ACL_PATHS: JSON.stringify(aclPaths) },

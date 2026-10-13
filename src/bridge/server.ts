@@ -47,6 +47,9 @@ function tunnelForWorkspace(workspaceId: string, logger: Logger): TunnelProvider
 }
 
 export interface BridgeOptions {
+  hosting?: "gateway";
+  /** 固定原 workspace origin，避免共享 listener 改变 OAuth issuer。 */
+  publicOrigin?: string;
   workspaceRoot: string;
   port?: number;
   host?: string;
@@ -62,6 +65,8 @@ export interface BridgeOptions {
 }
 
 export interface Bridge {
+  expressApp: express.Express;
+  closed: Promise<void>;
   workspace: Workspace;
   port: number;
   host: string;
@@ -71,6 +76,7 @@ export interface Bridge {
   tunnel: TunnelProvider;
   getPublicBaseUrl(): string | null;
   localBaseUrl(): string;
+  startTunnel(): Promise<string>;
   close(reason?: ShutdownReason): Promise<void>;
 }
 
@@ -101,6 +107,11 @@ function listen(app: express.Express, host: string, preferredPort: number): Prom
 export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   const logger = opts.logger ?? nullLogger;
   const workspace = new Workspace(opts.workspaceRoot);
+  if (opts.publicOrigin !== undefined) {
+    const origin = new URL(opts.publicOrigin);
+    if (origin.protocol !== "https:" || origin.origin !== opts.publicOrigin || origin.username || origin.password ||
+        origin.pathname !== "/" || origin.search || origin.hash) throw new Error("publicOrigin 必须是无路径、无凭据的 HTTPS origin");
+  }
   const host = opts.host ?? DEFAULT_HOST;
   if (host !== "127.0.0.1" && host !== "::1" && host !== "localhost") {
     throw new Error("The bridge only binds to loopback addresses. Public exposure goes through the tunnel.");
@@ -118,11 +129,26 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
 
   let publicBaseUrl: string | null = null;
 
+  let shuttingDown = false;
+  const activeResponses = new Set<Response>();
+  let finishRequests: (() => void) | undefined;
   const app = express();
+  if (opts.hosting === "gateway") app.use((_req, res, next) => {
+    if (shuttingDown) { res.sendStatus(503); return; }
+    activeResponses.add(res);
+    const finished = () => {
+      activeResponses.delete(res);
+      if (!activeResponses.size) finishRequests?.();
+    };
+    res.once("finish", finished);
+    res.once("close", finished);
+    next();
+  });
   app.set("trust proxy", true);
   app.disable("x-powered-by");
 
   const getBaseUrl = (req: Request): string => {
+    if (opts.publicOrigin) return opts.publicOrigin;
     if (publicBaseUrl) return publicBaseUrl;
     const proto = req.protocol;
     const hostHeader = req.get("host") ?? `${host}:${port}`;
@@ -135,6 +161,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   app.get("/health", (_req, res) => {
     res.json({ service: SERVICE_NAME, version: VERSION, workspaceId: workspace.id, status: "ok",
       pid: process.pid, startedAt, capabilities: RUNTIME_CAPABILITIES,
+      ...(opts.hosting ? { hosting: opts.hosting } : {}),
       ...(runtimeBuildId === null ? {} : { runtimeBuildId }) });
   });
 
@@ -257,17 +284,15 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
       capabilities: RUNTIME_CAPABILITIES,
       pid: process.pid,
       startedAt,
+      ...(opts.hosting ? { hosting: opts.hosting } : {}),
       ...(runtimeBuildId === null ? {} : { runtimeBuildId }),
       bridgeProvenance: readBridgeProvenance(runtimeState()),
     });
   });
 
   app.post("/admin/tunnel/start", adminGuard, (_req, res) => {
-    tunnel
-      .start(port)
+    startTunnel()
       .then((url) => {
-        publicBaseUrl = url;
-        persistRuntime();
         res.json({ url });
       })
       .catch((error: Error) => {
@@ -297,7 +322,8 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     noteShutdown(reason);
     res.json({ shuttingDown: true });
     setTimeout(() => {
-      void shutdown(reason).then(() => process.exit(0));
+      void shutdown(reason).then(() => { if (opts.hosting !== "gateway") process.exit(0); })
+        .catch(() => logger.error("Bridge shutdown failed; closure evidence unavailable"));
     }, 100);
   });
 
@@ -315,11 +341,19 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
       publicUrl: publicBaseUrl,
       startedAt,
       capabilities: RUNTIME_CAPABILITIES,
+      ...(opts.hosting ? { hosting: opts.hosting } : {}),
       ...(runtimeBuildId === null ? {} : { runtimeBuildId }),
     });
   const persistRuntime = (): void => {
     if (opts.persistRuntime === false) return;
     writeRuntimeState(runtimeState());
+  };
+  const startTunnel = async (): Promise<string> => {
+    if (shuttingDown) throw new Error("Bridge 正在关闭，不能开启 tunnel");
+    const url = await tunnel.start(port);
+    publicBaseUrl = url;
+    persistRuntime();
+    return url;
   };
   persistRuntime();
   const maintain = createWorkspaceMaintenance(workspace);
@@ -346,6 +380,8 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   mailboxTimer?.unref();
 
   let shutdownPromise: Promise<void> | undefined;
+  let resolveClosed!: () => void;
+  const closed = new Promise<void>(resolve => { resolveClosed = resolve; });
   let shutdownNoted = false;
   const noteShutdown = (reason: ShutdownReason): void => {
     if (shutdownNoted || opts.persistRuntime === false) return;
@@ -356,31 +392,37 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   const shutdown = (reason: ShutdownReason = "close"): Promise<void> => {
     if (shutdownPromise) return shutdownPromise;
     noteShutdown(reason);
+    shuttingDown = true;
     if (maintenanceTimer) clearInterval(maintenanceTimer);
     if (mailboxTimer) clearInterval(mailboxTimer);
     shutdownPromise = (async () => {
       await commandMailbox.close();
       logger.info(`Bridge stopping (${reason})`);
-      const httpClosed = new Promise<void>((resolve) => {
-        // Stop accepting first; unfinished headers/bodies must not pin shutdown
-        // forever. Leave headroom in restartBridge's 5-second exact-exit fence.
-        const deadline = setTimeout(() => {
-          logger.warn("Bridge HTTP drain deadline reached; closing remaining connections");
-          server.closeAllConnections();
-        }, 1000);
-        server.close(() => { clearTimeout(deadline); resolve(); });
-      });
-      await Promise.all([tunnel.stop().catch(() => undefined), httpClosed]);
+      const deadline = setTimeout(() => {
+        logger.warn("Bridge HTTP drain deadline reached; closing remaining connections");
+        server.closeAllConnections();
+        for (const response of activeResponses) response.destroy();
+      }, 1000);
+      const sharedRequestsClosed = activeResponses.size === 0 ? Promise.resolve() : new Promise<void>(resolve => { finishRequests = resolve; });
+      const httpClosed = Promise.all([sharedRequestsClosed, new Promise<void>(resolve => server.close(() => resolve()))])
+        .then(() => { clearTimeout(deadline); });
+      await Promise.all([opts.hosting === "gateway" ? tunnel.stop() : tunnel.stop().catch(() => undefined), httpClosed]);
       // A process-exit path cannot prove its own exit. Keep the runtime/release pin
       // until an external observer proves exit; a subsequent safe start replaces it.
       // Embedded callers closing only this server retain the existing close contract.
-      if (reason === "close" && opts.persistRuntime !== false) clearRuntimeState(workspace.id, { pid: process.pid, startedAt, adminToken });
+      if ((reason === "close" || (opts.hosting === "gateway" && reason !== "SIGINT" && reason !== "SIGTERM")) && opts.persistRuntime !== false) {
+        const cleared = clearRuntimeState(workspace.id, { pid: process.pid, startedAt, adminToken });
+        if (opts.hosting === "gateway" && !cleared) throw new Error("BRIDGE_RUNTIME_CLEAR_FAILED");
+      }
       logger.info("Bridge stopped");
+      resolveClosed();
     })();
     return shutdownPromise;
   };
 
   return {
+    expressApp: app,
+    closed,
     workspace,
     port,
     host,
@@ -390,6 +432,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     tunnel,
     getPublicBaseUrl: () => publicBaseUrl,
     localBaseUrl: () => `http://${host}:${port}`,
+    startTunnel,
     close: shutdown,
   };
 }

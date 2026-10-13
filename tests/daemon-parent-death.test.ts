@@ -1,4 +1,4 @@
-import { cleanupStrict } from "./strict-teardown.js";
+import { cleanupStrict, fixtureProcessIdentity, stopFixtureProcess } from "./strict-teardown.js";
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -10,6 +10,7 @@ import {
 } from "../src/process/daemon-spawn.js";
 import { makeTmpDir, write } from "./helpers.js";
 import type { DaemonSpawnResult } from "../src/process/daemon-spawn.js";
+import { probeProcess, type ProcessProbe } from "../src/process/process-probe.js";
 
 const temporaryDirs: string[] = [];
 
@@ -40,20 +41,12 @@ async function pollUntil(check: () => boolean, timeoutMs: number, what: string):
   expect(check(), what).toBe(true);
 }
 
-/** breakaway try 块首行注入 raise 的唯一锚点（posix 块同一调用以 ", 0)" 结尾，不匹配）。 */
-const BREAKAWAY_ANCHOR =
-  '        try:\n            pid = _spawn_detached(command, options["log"], env, options["cwd"],\n';
-
-/** 生成强制 breakaway 失败的 helper 副本：生产代码原样落入 WMI relay 路径。 */
+/** 强制选择现有 WMI 分支；relay 自身仍使用真实 Job 探测。 */
 function writeForcedWmiHelper(dir: string): string {
   const original = fs.readFileSync(resolveDaemonSpawnHelperPath(), "utf8");
-  expect(original).toContain(BREAKAWAY_ANCHOR);
-  const patched = original.replace(
-    BREAKAWAY_ANCHOR,
-    `${BREAKAWAY_ANCHOR.slice(0, BREAKAWAY_ANCHOR.indexOf("\n") + 1)}            raise OSError("breakaway disabled by test")\n${BREAKAWAY_ANCHOR.slice(BREAKAWAY_ANCHOR.indexOf("\n") + 1)}`,
-  );
-  expect(patched).toContain('raise OSError("breakaway disabled by test")');
-  return write(dir, "daemon_spawn_forced_wmi.py", patched);
+  const anchor = "        in_job = _detect_in_job()";
+  expect(original.split(anchor)).toHaveLength(2);
+  return write(dir, "daemon_spawn_forced_wmi.py", original.replace(anchor, "        in_job = True"));
 }
 
 interface ParentDeathOutcome {
@@ -75,6 +68,7 @@ async function runParentDeathE2E(
   name: string,
   helperPath?: string,
   onAlive?: (spawned: DaemonSpawnResult) => void,
+  exerciseSelfJob = false,
 ): Promise<ParentDeathOutcome> {
   const dir = tmp(name);
   const resultFile = path.join(dir, "daemon-result.json");
@@ -111,6 +105,17 @@ async function runParentDeathE2E(
     [
       `import { writeFileSync } from "node:fs";`,
       `writeFileSync(process.argv[2], "alive");`,
+      ...(exerciseSelfJob ? [
+        `import { existsSync } from "node:fs";`,
+        `import { spawn } from "node:child_process";`,
+        `const trigger = process.argv[2] + ".spawn-child";`,
+        `const timer = setInterval(() => {`,
+        `  if (!existsSync(trigger)) return;`,
+        `  clearInterval(timer);`,
+        `  const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60_000)"], { stdio: "ignore", windowsHide: true });`,
+        `  writeFileSync(process.argv[2] + ".child", String(child.pid));`,
+        `}, 100);`,
+      ] : []),
       `setTimeout(() => {}, 60_000);`,
     ].join("\n"),
   );
@@ -146,6 +151,19 @@ async function runParentDeathE2E(
     // daemon 必须真正执行（marker 落盘）。
     await waitForFile(marker, 30_000);
 
+    let managedChild: ProcessProbe | null = null;
+    if (exerciseSelfJob) {
+      const initial = await probeProcess(spawned.pid, undefined, undefined, spawned.finalProcess.creationTime!);
+      expect(initial).toMatchObject({ status: "identified", inAnyJob: false });
+      fs.writeFileSync(marker + ".spawn-child", "go");
+      await waitForFile(marker + ".child", 10_000);
+      managedChild = await probeProcess(Number(fs.readFileSync(marker + ".child", "utf8")));
+      expect(managedChild).toMatchObject({ status: "identified", inAnyJob: true });
+      const afterSpawn = await probeProcess(spawned.pid, undefined, undefined, initial.creationTime!);
+      expect(afterSpawn).toMatchObject({ status: "identified", executable: initial.executable,
+        creationTime: initial.creationTime, inAnyJob: true });
+    }
+
     // 父死亡：taskkill /T /F 全树击杀。kill-on-close Job 在沙箱环境无法自建
     // （kernel 对 Job 内/breakaway/WMI relay 调用者一律拒绝
     // SetInformationJobObject(KILL_ON_JOB_CLOSE)，实测 ERROR_INVALID_PARAMETER），
@@ -172,37 +190,19 @@ async function runParentDeathE2E(
     await new Promise((resolve) => setTimeout(resolve, 1_000));
     expect(isPidAlive(spawned.pid)).toBe(true);
 
+    if (managedChild) {
+      expect(await probeProcess(spawned.pid, undefined, undefined, spawned.finalProcess.creationTime!))
+        .toMatchObject({ status: "identified", inAnyJob: true });
+      expect(await probeProcess(managedChild.pid, undefined, undefined, managedChild.creationTime!))
+        .toMatchObject({ status: "identified", executable: managedChild.executable, inAnyJob: true });
+    }
+
     // daemon 仍存活时的额外断言窗口（如 Job 成员不变量探测）。
     onAlive?.(spawned);
 
-    // 安全收尾：终止 sacrificial daemon 并确认停止。
-    expect(() => process.kill(spawned.pid)).not.toThrow();
-    await pollUntil(() => !isPidAlive(spawned.pid), 10_000, "daemon 未被终止");
   } finally {
-    // leak-safe：sacrificial daemon PID 一旦已知，任何失败路径（taskkill/断言/
-    // 探测失败）都在此 best-effort 终止（不用 expect，避免掩盖原始错误），
-    // 绝不让 detached daemon 泄漏到后续 suite。
-    if (isPidAlive(spawned.pid)) {
-      try {
-        process.kill(spawned.pid);
-      } catch {
-        // best-effort
-      }
-      const deadline = Date.now() + 10_000;
-      while (isPidAlive(spawned.pid) && Date.now() < deadline) {
-        await new Promise((resolve) => setTimeout(resolve, 200));
-      }
-      if (isPidAlive(spawned.pid)) {
-        try {
-          spawnSync("taskkill", ["/F", "/PID", String(spawned.pid)], {
-            windowsHide: true,
-            encoding: "utf8",
-          });
-        } catch {
-          // best-effort
-        }
-      }
-    }
+    // 只终止创建时证据绑定的 fixture；libuv 自持 Job 随 daemon 退出关闭其受管理子进程。
+    await stopFixtureProcess(fixtureProcessIdentity(spawned.finalProcess));
   }
 
   return { spawned, info, parentStderr: parentStderrText() };
@@ -211,8 +211,8 @@ async function runParentDeathE2E(
 /**
  * Job 逃生不变量探测：daemon 不在任何 Job 内（IsProcessInJob(daemon) ===
  * false），任何祖先 kill-on-close Job 都无法波及——kernel 可证的 escape
- * 证据，仅对 WMI relay 路径断言（本沙箱会把 breakaway 后的 node.exe 重新
- * 纳入宿主管理 Job，属于环境伪影，不代表生产语义）。
+ * 创建时逃生证据；不创建子进程的自然/强制 WMI fixture 在存活窗口仍为 false。
+ * Node 首次非 detached spawn 可进入自身持有的 libuv Job，不能据此推断继承了 launcher Job。
  */
 function probeJobMembership(pid: number): { ok: boolean; inJob: boolean } {
   const membershipProbe = path.resolve("tests/fixtures/daemon_job_membership_probe.py");
@@ -228,9 +228,17 @@ const windowsTests = describe.skipIf(process.platform !== "win32");
 
 windowsTests("daemon survives parent tree kill (R5f prework)", () => {
   it("自然路径：taskkill /T 全树击杀后 canary 死亡而 daemon 存活", async () => {
-    const { spawned } = await runParentDeathE2E("daemon-parent-death");
+    const { spawned } = await runParentDeathE2E("daemon-parent-death", undefined, (result) => {
+      expect(result.finalProcess).toMatchObject({ pid: result.pid, status: "identified", inAnyJob: false });
+      expect(probeJobMembership(result.pid)).toEqual({ ok: true, inJob: false });
+    });
     expect(["helper-breakaway", "helper-wmi"]).toContain(spawned.mode);
-    expect(spawned.finalProcess).toMatchObject({ pid: spawned.pid, status: "identified" });
+    expect(spawned.finalProcess).toMatchObject({ pid: spawned.pid, status: "identified", inAnyJob: false });
+  }, 180_000);
+
+  it("Node 创建受管理子进程后进入自身 Job，原 launcher 树死亡后 daemon 与子进程仍存活", async () => {
+    const { spawned } = await runParentDeathE2E("daemon-self-job", undefined, undefined, true);
+    expect(spawned.finalProcess).toMatchObject({ status: "identified", inAnyJob: false });
   }, 180_000);
 
   it("强制 WMI 路径：全树击杀后 daemon 存活且不在任何 Job 内（kernel 可证 Job 逃生）", async () => {
