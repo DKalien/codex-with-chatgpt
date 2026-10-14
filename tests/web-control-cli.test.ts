@@ -33,14 +33,16 @@ describe("本地 Web Control CLI（独立进程，跨重读持久化）", () => 
       ["registerSessionCommands", "session"],
       ["registerRecordCommand", "record"],
     ]) {
-      for (const [source, prefix] of [[production, "\\./"], [fixture, "\\.\\./\\.\\./src/cli/"]]) {
-        expect(source).toMatch(new RegExp(`import\\s+\\{[^}]*\\b${registration}\\b[^}]*\\}\\s+from "${prefix}${module}\\.js"`));
-        expect(source).toContain(`${registration}(program);`);
-      }
+      expect(production).toMatch(new RegExp(`import\\s+\\{[^}]*\\b${registration}\\b[^}]*\\}\\s+from "\\./${module}\\.js"`));
+      expect(production).toContain(`${registration}(program);`);
+      expect(fixture).toContain(`case "${module}": {`);
+      expect(fixture).toMatch(new RegExp(`const\\s+\\{\\s*${registration}\\s*\\}\\s*=\\s*await import\\("\\.\\./\\.\\./src/cli/${module}\\.js"\\);\\s*${registration}\\(program\\);\\s*break;`));
     }
     // Only the registration graph is smaller; every invocation still boots a
     // fresh Node/tsx process and loads the real command actions/store code.
     expect(fixture.match(/register\w+\(program\);/g)).toHaveLength(3);
+    expect(fixture).toContain("switch (process.argv[2])");
+    expect(fixture.match(/case "[^"]+":/g)).toHaveLength(3);
     expect(fixture).toContain("program.parseAsync(process.argv)");
   });
 

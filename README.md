@@ -45,7 +45,7 @@ Detailed docs below are in English · 详细中文文档见 **[README.zh-CN.md](
 
 本机已配置 `gateway supervisor` 时，启动或重启 workspace Bridge 会自动启动或复用共享 Gateway、Cloudflare origin 与 Secure MCP Tunnel，并等待就绪；未配置时保持原 workspace 启动流程。停止当前 workspace 的 Bridge 不会停止共享 Gateway。Gateway 启动失败会报告 Bridge 已就绪和具体错误，不宣称整组启动成功。仍在运行的旧 Gateway 需按[运行版本迁移说明](docs/architecture.md#旧-gateway-运行版本迁移)正常退出后再启动。
 
-已配对浏览器在具体 ChatGPT 对话中点击“连接当前对话”，新建或切换回流目标时由用户在本机确认工作区与完整 URL；该确认只授权结果回流。连接状态与自动回流、未知发送分别判断；“清空历史显示”只隐藏本地终态列表，保留待发送、隔离与防重放证据。默认扩展只负责连接、DOM 操作与结果观察，所有安全判定由 Bridge 承担；源码与部署验收边界见[轻量 Companion](docs/companion-lightweight.md)，操作和恢复见 [日常连接](docs/troubleshooting.md#日常连接与本机确认)。
+已配对浏览器在具体 ChatGPT 对话中点击“连接当前对话”，新建或切换回流目标时由用户在本机确认工作区与完整 URL；该确认只授权结果回流。连接状态与自动回流、未知发送分别判断；“清空历史显示”只隐藏本地终态列表，保留待发送、隔离与防重放证据。默认扩展只负责连接、DOM 操作与结果观察，所有安全判定由 Bridge 承担；源码与部署验收边界见[轻量 Companion](docs/companion-lightweight.md)，操作和恢复见 [日常连接](docs/troubleshooting.md#日常连接与本机确认)。2026-10-13 本轮已从源码退役旧伴侣入口、专属编排与测试，构建不再产出旧入口；尚未部署，Bridge legacy 协议、Result Bus 与 receipt 历史兼容保留。
 
 ## Experimental Desktop Control · 实验性桌面控制
 

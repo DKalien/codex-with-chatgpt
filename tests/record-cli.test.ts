@@ -9,7 +9,7 @@ import { Workspace } from "../src/workspace/manager.js";
 import { cleanup, makeTmpDir } from "./helpers.js";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const cliEntry = path.join(projectRoot, "src/cli/index.ts");
+const cliEntry = path.join(projectRoot, "tests/fixtures/web-control-cli.ts");
 
 function runRecord(root: string, args: string[]) {
   const env = { ...process.env };

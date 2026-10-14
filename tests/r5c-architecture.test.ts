@@ -69,9 +69,6 @@ describe("R5c architecture fence", () => {
     expect(companion).toMatch(/bindCurrentWebSinkFromDurableCompanion/);
     const allow = read("browser-companion/bridge-origin.js");
     expect(allow).toMatch(/web-sink\/bind-current/);
-    const sw = read("browser-companion/service-worker.js");
-    expect(sw).toMatch(/web-sink\/bind-current/);
-    expect(sw).toMatch(/convergeExplicitVerifiedConnect/);
   });
 
   it("legacy R4 result routing does not read active web sink", () => {
@@ -93,9 +90,6 @@ describe("R5c architecture fence", () => {
     expect(statusBlock).not.toMatch(/bindCurrentWebSink/);
     const allow = read("browser-companion/bridge-origin.js");
     expect(allow).toMatch(/\/web-sink\/status/);
-    const sw = read("browser-companion/service-worker.js");
-    expect(sw).toMatch(/syncActiveWebSinkFromBridge/);
-    expect(sw).toMatch(/activeWebSinkProjection/);
     const outbox = read("src/routing/result-outbox-store.ts");
     expect(outbox).not.toMatch(/web-sink-control|readActiveWebSinkBinding/);
   });

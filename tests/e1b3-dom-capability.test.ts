@@ -1,33 +1,25 @@
 import { describe, expect, it } from "vitest";
-import {
-  resolveChatGptComposer,
-  resolveChatGptAction,
-  observeChatGptSafety,
-  normalizeCanonicalDomText,
-  matchesSendTargetIdentity,
-  inspectActiveComposerControls,
-} from "../browser-companion/dom-adapter.js";
-import {
-  inspectComposerWriteCapability,
-  writeCanonicalMessage,
-  verifyCanonicalComposer,
-  dispatchNativeSend,
-} from "../browser-companion/send-adapter.js";
-import {
-  snapshotUserTurns,
-  findCanonicalUserTurn,
-  hasExactAttemptMarker,
-  buildMarkerRepresentationDiagnostic,
-} from "../browser-companion/turn-observer.js";
+
+import { resolveChatGptComposer, resolveChatGptAction, observeChatGptSafety, normalizeCanonicalDomText, matchesSendTargetIdentity, inspectActiveComposerControls } from "../browser-companion/dom-adapter.js";
+
+import { inspectComposerWriteCapability, writeCanonicalMessage, verifyCanonicalComposer } from "../browser-companion/composer-write-adapter.js";
+import { dispatchNativeSend } from "../browser-companion/send-click-adapter.js";
+
+import { snapshotUserTurns, findCanonicalUserTurn, hasExactAttemptMarker, buildMarkerRepresentationDiagnostic } from "../browser-companion/turn-observer.js";
+
 import fs from "node:fs";
+
 import path from "node:path";
+
 import { fileURLToPath } from "node:url";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
 const companionRoot = path.join(projectRoot, "browser-companion");
 
 const MESSAGE =
   "[C2C_CONTROL]\nSTATE: EXECUTED\nATTEMPT_ID: 22222222-2222-4222-8222-222222222222\n";
+
 const ATTEMPT = "22222222-2222-4222-8222-222222222222";
 
 type ClickSpy = { clicks: number; click: () => void };
@@ -553,6 +545,19 @@ describe("B. pre-write + write + fresh Send", () => {
 });
 
 describe("C. dispatchNativeSend fail-closed matrix", () => {
+  it.each(["false", "throw"])("mutationGuard %s 时真实 Send 门禁拒绝且零点击", kind => {
+    const { doc, sendClicks } = makeEdgeDom({ mode: "send", text: MESSAGE });
+    const result = dispatchNativeSend(doc, MESSAGE, {
+      routeValid: true,
+      mutationGuard: () => {
+        if (kind === "throw") throw new Error("页面身份检查失败");
+        return false;
+      },
+    });
+    expect(result).toMatchObject({ ok: false, reason: "send_mutation_guard_failed" });
+    expect(sendClicks.clicks).toBe(0);
+  });
+
   it("route/text/stop/idle/unknown never click", () => {
     const idle = makeEdgeDom({ mode: "idle", text: MESSAGE });
     expect(dispatchNativeSend(idle.doc, MESSAGE, { routeValid: false }).reason).toBe("route_invalid");
@@ -707,34 +712,6 @@ describe("runtime unreachability (E1b3b safety gate)", () => {
     for (const p of manifest.permissions ?? []) {
       expect(["scripting", "debugger", "nativeMessaging", "webRequest"]).not.toContain(p);
     }
-  });
-
-  it("content-script and service-worker do not implement send/observer capability", () => {
-    const cs = fs.readFileSync(path.join(companionRoot, "content-script.js"), "utf8");
-    // E1b3d3b: CS may name production DI keys that wire runtime globals; it must not implement them.
-    expect(cs).not.toMatch(/function writeCanonicalMessage/);
-    expect(cs).not.toMatch(/function dispatchNativeSend/);
-    expect(cs).not.toMatch(/function findCanonicalUserTurn/);
-    expect(cs).not.toMatch(/function snapshotUserTurns/);
-    expect(cs).not.toMatch(/send-adapter/);
-    expect(cs).not.toMatch(/turn-observer/);
-    expect(cs).not.toMatch(/\/begin-send/);
-    expect(cs).not.toMatch(/\/ack\b/);
-    const sw = fs.readFileSync(path.join(companionRoot, "service-worker.js"), "utf8");
-    expect(sw).not.toMatch(/writeCanonicalMessage/);
-    expect(sw).not.toMatch(/dispatchNativeSend/);
-    expect(sw).not.toMatch(/findCanonicalUserTurn/);
-    expect(sw).not.toMatch(/snapshotUserTurns/);
-    expect(sw).not.toMatch(/send-adapter/);
-    expect(sw).not.toMatch(/turn-observer/);
-  });
-
-  it("content-script remains free of DOM mutation / native Send", () => {
-    const text = fs.readFileSync(path.join(companionRoot, "content-script.js"), "utf8");
-    expect(text).not.toMatch(/\.click\(\)/);
-    expect(text).not.toMatch(/requestSubmit/);
-    expect(text).not.toMatch(/form\.submit/);
-    expect(text).not.toMatch(/dispatchEvent\(/);
   });
 });
 

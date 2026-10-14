@@ -79,9 +79,6 @@ describe("Companion 本地历史显示", () => {
     expect(stored.journal).toEqual({ state: "OUTCOME_UNKNOWN" });
     expect(stored.archive).toEqual({ secret: "protected" });
     expect(h.chrome.runtime.sendMessage.mock.calls.every(([message]) => message.type === "c2c.operations.read")).toBe(true);
-    h.run("popup/operations-summary.js");
-    await vi.waitFor(() => expect(h.el("operations-summary").textContent).toContain("1 条可见任务"));
-    expect(h.el("operations-summary").textContent).toContain("3 条排队");
     await h.el("restore-history").onclick();
     expect(h.el("count").textContent).toBe("3");
     expect(h.stored[key(a)]).toEqual([]);
@@ -100,25 +97,10 @@ describe("Companion 本地历史显示", () => {
     expect(h.el("count").textContent).toBe("3");
     await expect(h.history.write("bad", [])).rejects.toThrow("项目标识无效");
   });
-  it("popup 项目切换后 A 的迟到偏好不会覆盖 B", async () => {
-    const h = harness({ [key(b)]: [] });
-    let finish!: (value: any) => void;
-    h.chrome.storage.local.get.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
-    h.run("popup/operations-summary.js");
-    await vi.waitFor(() => expect(finish).toBeTypeOf("function"));
-    h.chrome.runtime.sendMessage.mockResolvedValue(data(b));
-    h.listeners["c2c-project-selection"]({ detail: { workspaceId: b } });
-    await vi.waitFor(() => expect(h.el("operations-summary").textContent).toContain("3 条可见任务"));
-    finish({ [key(a)]: ["old", "new"] });
-    await Promise.resolve(); await Promise.resolve();
-    expect(h.el("operations-summary").textContent).toContain("3 条可见任务");
-    expect(h.chrome.storage.local.set).not.toHaveBeenCalled();
-  });
   it("返回项目不匹配时不读写其他项目；存储 ID 与条数均有界", async () => {
     const h = harness(); h.chrome.runtime.sendMessage.mockResolvedValue(data(b));
-    h.run("operations/operations.js"); h.run("popup/operations-summary.js");
+    h.run("operations/operations.js");
     await vi.waitFor(() => expect(h.el("history-status").textContent).toContain("项目不一致"));
-    await vi.waitFor(() => expect(h.el("operations-summary").textContent).toContain("不一致"));
     await h.el("clear-history").onclick();
     expect(h.chrome.storage.local.get).not.toHaveBeenCalled();
     expect(h.chrome.storage.local.set).not.toHaveBeenCalled();
@@ -128,8 +110,8 @@ describe("Companion 本地历史显示", () => {
       await expect(h.history.read(a)).rejects.toThrow("设置损坏");
     }
   });
-  it("两个入口均以 classic script 在调用前加载共享显示存储", () => {
-    for (const [file, script] of [["operations/operations.html", "operations.js"], ["popup/popup.html", "operations-summary.js"]]) {
+  it("任务面板以 classic script 在调用前加载共享显示存储", () => {
+    for (const [file, script] of [["operations/operations.html", "operations.js"]]) {
       const html = fs.readFileSync(`browser-companion/${file}`, "utf8");
       expect(html.indexOf('history.js"></script>')).toBeLessThan(html.indexOf(`${script}"></script>`));
     }

@@ -1,22 +1,23 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import {
-  createProjectChrome,
-  createProjectContextRouter,
-  PROJECT_REGISTRY_KEY,
-  PROJECT_SELECTION_KEY,
-  projectStorageKey,
-} from "../browser-companion/project-context.js";
 
-import { createCompanionIndicatorApplier, deriveCompanionIndicator } from "../browser-companion/action-indicator.js";
+import { createProjectChrome, createProjectContextRouter, PROJECT_REGISTRY_KEY, PROJECT_SELECTION_KEY, projectStorageKey } from "../browser-companion/project-context.js";
 
 const EXTENSION_ID = "gateway-companion-test-id";
+
 const WORKSPACE_A = "111111aaaaaa";
+
 const WORKSPACE_B = "222222bbbbbb";
+
 const ORIGIN_A = "https://bridge-a.example.test";
+
 const ORIGIN_B = "https://bridge-b.example.test";
+
 const ROUTE_A = "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111";
+
 const ROUTE_B = "https://chatgpt.com/c/22222222-2222-4222-8222-222222222222";
+
 const TRANSPORT_KEY = "c2c_companion_transport_v1";
+
 const JOURNAL_KEY = "c2c_companion_journal_v1";
 
 function event() {
@@ -82,51 +83,6 @@ function deferred<T>() {
 function popupSender() { return { id: EXTENSION_ID }; }
 
 describe("Gateway Companion project contexts", () => {
-  it("does not cache action updates skipped by an unselected project", async () => {
-    let selected = false;
-    const action = { setBadgeText: vi.fn(async (_value: { text: string }) => undefined), setTitle: vi.fn(async () => undefined) };
-    const scoped = createProjectChrome({ action }, WORKSPACE_A, () => selected);
-    const apply = createCompanionIndicatorApplier(() => scoped.action);
-    const unknown = deriveCompanionIndicator({ journal: { state: "OUTCOME_UNKNOWN" } });
-    expect(await apply(unknown)).toBe(false);
-    expect(action.setBadgeText).not.toHaveBeenCalled();
-    expect(action.setTitle).not.toHaveBeenCalled();
-    selected = true;
-    expect(await apply(unknown)).toBe(true);
-    expect(await apply(unknown)).toBe(false);
-    expect(action.setBadgeText).toHaveBeenCalledTimes(1);
-    expect(action.setTitle).toHaveBeenCalledTimes(1);
-  });
-
-  it("reapplies cached A → B → A indicators on project switches while deduplicating the selected project", async () => {
-    const action = { setBadgeText: vi.fn(async (_value: { text: string }) => undefined), setTitle: vi.fn(async () => undefined) };
-    const browser = { ...browserWithStorage(), action };
-    const refreshes = new Map<string, () => Promise<boolean>>();
-    const router = createProjectContextRouter({ browser, createContext(project, isSelected) {
-      const scoped = createProjectChrome(browser, project.workspaceId, isSelected);
-      const apply = createCompanionIndicatorApplier(() => scoped.action);
-      const indicator = deriveCompanionIndicator({ hydrated: true, storageProtected: true, bridgePermissionGranted: true,
-        transport: { connected: true, bridgeOrigin: project.bridgeOrigin, routeVerification: "VERIFIED",
-          connectionReadiness: { ready: true, reason: null } },
-        owner: { available: true }, autonomy: { mode: "armed", identityExact: true },
-        journal: { state: project.workspaceId === WORKSPACE_A ? "OUTCOME_UNKNOWN" : "NONE" } });
-      const refresh = () => apply(indicator);
-      refreshes.set(project.workspaceId, refresh);
-      return { ownsTabRoute: async () => false,
-        refreshSelectedIndicator: async () => { apply.invalidate(); await refresh(); } };
-    } });
-    for (const [workspaceId, bridgeOrigin] of [[WORKSPACE_A, ORIGIN_A], [WORKSPACE_B, ORIGIN_B]]) {
-      expect(await router.handle({ type: "c2c.project.add", project: { workspaceId, bridgeOrigin } }, popupSender()))
-        .toMatchObject({ ok: true });
-    }
-    for (const workspaceId of [WORKSPACE_A, WORKSPACE_B, WORKSPACE_A, WORKSPACE_A]) {
-      expect(await router.handle({ type: "c2c.project.select", workspaceId, tabId: 7, canonicalRoute: ROUTE_A }, popupSender()))
-        .toMatchObject({ ok: true });
-      expect(await refreshes.get(workspaceId)!()).toBe(false);
-    }
-    expect(action.setBadgeText.mock.calls.map(([value]) => value.text)).toEqual(["C×", "C", "C×"]);
-    expect(action.setTitle).toHaveBeenCalledTimes(3);
-  });
 
   it("keeps two contexts isolated through concurrent page RPCs and A-only unknown/revoke/refresh", async () => {
     const local = storageArea();
@@ -403,135 +359,6 @@ describe("Gateway Companion project contexts", () => {
       .toMatchObject({ ok: false, reason: "legacy_state_identity_unknown" });
     expect(local.values.get("c2c_companion_transport_v1")).toEqual(legacyTransport);
     expect(local.values.has(projectStorageKey(WORKSPACE_A, TRANSPORT_KEY))).toBe(false);
-  });
-
-  it("rejects a transport stored under another project namespace and clears the block only after durable clear", async () => {
-    const local = storageArea({
-      [PROJECT_REGISTRY_KEY]: {
-        schemaVersion: 1,
-        projects: [
-          { workspaceId: WORKSPACE_A, bridgeOrigin: ORIGIN_A },
-          { workspaceId: WORKSPACE_B, bridgeOrigin: ORIGIN_B },
-        ],
-        legacyMigration: "none",
-      },
-      [projectStorageKey(WORKSPACE_A, "c2c_companion_local_v1")]: { schemaVersion: 1, paired: true, targetRoute: ROUTE_A },
-      [projectStorageKey(WORKSPACE_A, TRANSPORT_KEY)]: {
-        workspaceId: WORKSPACE_B,
-        bridgeOrigin: ORIGIN_B,
-        companionId: "33333333-3333-4333-8333-333333333333",
-        bindingId: "44444444-4444-4444-8444-444444444444",
-        epoch: 1,
-        routeCanonical: ROUTE_B,
-        credential: "wrong-project-credential",
-      },
-      [projectStorageKey(WORKSPACE_B, "c2c_companion_local_v1")]: { schemaVersion: 1, paired: true, targetRoute: ROUTE_B },
-      [projectStorageKey(WORKSPACE_B, TRANSPORT_KEY)]: {
-        workspaceId: WORKSPACE_B,
-        bridgeOrigin: ORIGIN_B,
-        companionId: "55555555-5555-4555-8555-555555555555",
-        bindingId: "66666666-6666-4666-8666-666666666666",
-        epoch: 3,
-        routeCanonical: ROUTE_B,
-        credential: "credential-b",
-        authStale: false,
-        routeVerification: "VERIFIED",
-        pairedAt: "2026-10-01T00:00:00.000Z",
-      },
-      [projectStorageKey(WORKSPACE_B, JOURNAL_KEY)]: { state: "OUTCOME_UNKNOWN" },
-    });
-    const session = storageArea();
-    const fetchObserved = deferred<void>();
-    const fetchMock = vi.fn(async () => {
-      fetchObserved.resolve();
-      return ({
-      ok: true,
-      status: 200,
-      async json() {
-        return {
-          workspaceId: WORKSPACE_B,
-          companionId: "55555555-5555-4555-8555-555555555555",
-          bindingId: "66666666-6666-4666-8666-666666666666",
-          epoch: 3,
-          routeCanonical: ROUTE_B,
-          routeVerification: "VERIFIED",
-          pendingReady: 0,
-          reserved: 0,
-          claimed: 0,
-          outcomeUnknown: 0,
-          inFlight: null,
-          events: [],
-          isolatedAttempts: [],
-        };
-      },
-      });
-    });
-    const runtimeOnMessage = event();
-    const noOpEvent = event();
-    const alarms = {
-      onAlarm: event(),
-      async get() { return null; },
-      async create() {},
-      async clear() { return true; },
-    };
-    const tabs = {
-      sendMessage: vi.fn(async () => ({ ok: true })),
-      async query() { return []; },
-      onRemoved: event(),
-      onActivated: event(),
-    };
-    const chrome = {
-      runtime: {
-        id: EXTENSION_ID,
-        getURL: (path: string) => `chrome-extension://${EXTENSION_ID}/${path}`,
-        onMessage: runtimeOnMessage,
-        onInstalled: noOpEvent,
-        onStartup: noOpEvent,
-      },
-      storage: { local, session },
-      tabs,
-      alarms,
-      windows: { WINDOW_ID_NONE: -1, onFocusChanged: event() },
-      action: { async setBadgeText() {}, async setTitle() {} },
-      permissions: { async contains() { return true; } },
-    };
-    vi.stubGlobal("chrome", chrome);
-    vi.stubGlobal("fetch", fetchMock);
-    vi.resetModules();
-    await import("../browser-companion/service-worker.js");
-    const sender = popupSender();
-    const [runtimeListener] = runtimeOnMessage.getListeners();
-    const sendMessage = (message: Record<string, unknown>) => new Promise(resolve => {
-      runtimeListener(message, sender, resolve);
-    });
-    alarms.onAlarm.fire({ name: `c2c_companion_project_v1:${WORKSPACE_A}:alarm:c2c.feedback.discovery` });
-    alarms.onAlarm.fire({ name: `c2c_companion_project_v1:${WORKSPACE_B}:alarm:c2c.feedback.discovery` });
-    expect(await sendMessage({ type: "c2c.project.list" })).toMatchObject({ ok: true });
-    await fetchObserved.promise;
-    await new Promise(resolve => setTimeout(resolve, 0));
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(new URL(String(fetchMock.mock.calls[0][0])).origin).toBe(ORIGIN_B);
-
-    expect(await sendMessage({ type: "c2c.fetch.state", workspaceId: WORKSPACE_A }))
-      .toMatchObject({ ok: false, reason: "transport_identity_mismatch" });
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(local.values.get(projectStorageKey(WORKSPACE_A, TRANSPORT_KEY))).toMatchObject({
-      workspaceId: WORKSPACE_B,
-      credential: "wrong-project-credential",
-    });
-
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(local.values.get(projectStorageKey(WORKSPACE_B, TRANSPORT_KEY))).toMatchObject({
-      workspaceId: WORKSPACE_B,
-      credential: "credential-b",
-    });
-
-    expect(await sendMessage({ type: "c2c.transport.clear", workspaceId: WORKSPACE_A })).toMatchObject({ ok: true });
-    expect(local.values.has(projectStorageKey(WORKSPACE_A, TRANSPORT_KEY))).toBe(false);
-    expect(await sendMessage({ type: "c2c.fetch.state", workspaceId: WORKSPACE_A }))
-      .toMatchObject({ ok: false, reason: "transport_missing" });
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(local.values.get(projectStorageKey(WORKSPACE_B, TRANSPORT_KEY))).toMatchObject({ credential: "credential-b" });
   });
 });
 

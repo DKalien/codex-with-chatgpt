@@ -219,7 +219,7 @@ function seedLaunch() {
 
 describe("supervisor startup pin handoff", () => {
   it("validates the exact launch identity and installed release before handoff", async () => {
-    await createConfig();
+    await withSupervisorOperation(workspaceRoot, () => {}, options);
     const pin = seedLaunch();
     const moduleUrl = pathToFileURL(path.join(stateDir, "releases", pin.buildId, "dist/supervisor/run.js")).href;
     const launch = validateSupervisorLaunch(workspace, stateDir, pin.file, pin.buildId, pin.identity, moduleUrl);
@@ -231,9 +231,7 @@ describe("supervisor startup pin handoff", () => {
   });
 
   it("publishes runtime before consuming exact startup pin and retains it for a long session", async () => {
-    // The independent validation/retirement cases retain the config writes.
-    // This launch-only fixture still creates and verifies the real private
-    // store through its operation lock, ACL and exact process-identity path.
+    // 通过真实操作锁、ACL 和进程身份校验初始化私有目录。
     await withSupervisorOperation(workspaceRoot, () => {}, options);
     const pin = seedLaunch();
     const moduleUrl = pathToFileURL(path.join(stateDir, "releases", pin.buildId, "dist/supervisor/run.js")).href;
@@ -278,7 +276,8 @@ describe("supervisor startup pin handoff", () => {
   });
 
   it("failure before acquiring the exact runtime leaves the startup pin intact", async () => {
-    await createConfig(); const pin = seedLaunch(), raw = fs.readFileSync(pin.file, "utf8");
+    // 此处只需初始化真实私有目录；配置写入由独立场景覆盖。
+    await withSupervisorOperation(workspaceRoot, () => {}, options); const pin = seedLaunch(), raw = fs.readFileSync(pin.file, "utf8");
     const launch = readSupervisorLaunch(workspaceRoot, pin.file, pin.buildId, pin.identity, options), action = vi.fn();
     await expect(withSupervisorLaunch(workspaceRoot, launch, action, { ...options,
       probeProcess: async pid => processResult(pid, "unknown") })).rejects.toMatchObject({ code: "SUPERVISOR_IDENTITY_UNAVAILABLE" });
@@ -287,8 +286,7 @@ describe("supervisor startup pin handoff", () => {
   });
 
   it("identical-content replacement between validation and handoff is retained and fails closed", async () => {
-    // The pre-read replacement case below owns the original config fixture;
-    // initialize this independent launch store through the same real authority.
+    // 此启动场景只需通过真实操作初始化独立私有目录。
     await withSupervisorOperation(workspaceRoot, () => {}, options);
     const pin = seedLaunch(), raw = fs.readFileSync(pin.file, "utf8");
     const launch = readSupervisorLaunch(workspaceRoot, pin.file, pin.buildId, pin.identity, options), action = vi.fn();
@@ -306,7 +304,7 @@ describe("supervisor startup pin handoff", () => {
   });
 
   it("identical-content replacement before the child reads the pin fails the original launcher proof", async () => {
-    await createConfig(); const pin = seedLaunch(), raw = fs.readFileSync(pin.file, "utf8");
+    await withSupervisorOperation(workspaceRoot, () => {}, options); const pin = seedLaunch(), raw = fs.readFileSync(pin.file, "utf8");
     fs.renameSync(pin.file, `${pin.file}.original`);
     fs.writeFileSync(pin.file, raw, { mode: 0o600 });
     expect(() => readSupervisorLaunch(workspaceRoot, pin.file, pin.buildId, pin.identity, options))
@@ -387,48 +385,66 @@ describe("supervisor operation lock", () => {
   });
 
   it("refuses an unknown or reused operation owner", async () => {
-    await createConfig();
     const file = supervisorOperationLockFile(workspace.id, stateDir);
     const deadPid = process.pid === 424242 ? 424243 : 424242;
-    const probe = fakeProbe(new Set([deadPid]));
-    seedLock(file, "operation", { pid: deadPid });
-    await expect(withSupervisorOperation(workspaceRoot, () => "must-not-run", {
+    const probe = fakeProbe(new Set(), new Set([deadPid]));
+    const action = vi.fn(() => "must-not-run");
+    let seeded = false;
+    await expect(withSupervisorOperation(workspaceRoot, action, {
       ...options,
-      probeProcess: async (pid, expected) => pid === deadPid
-        ? processResult(pid, "unknown", undefined, "IDENTITY_CHANGED")
-        : (await probe(pid, expected)),
+      probeProcess: async (pid, expected) => {
+        if (!seeded && pid === process.pid && expected === undefined) {
+          seeded = true;
+          seedLock(file, "operation", { pid: deadPid });
+        }
+        return probe(pid, expected);
+      },
     })).rejects.toMatchObject({ code: "SUPERVISOR_BUSY" });
+    expect(seeded).toBe(true);
+    expect(action).not.toHaveBeenCalled();
     expect(fs.existsSync(file)).toBe(true);
   });
 
   it("rechecks operation lock identity before unlink and preserves a replacement", async () => {
-    await createConfig();
     const file = supervisorOperationLockFile(workspace.id, stateDir);
     const deadPid = process.pid === 424242 ? 424243 : 424242;
     const probe = fakeProbe(new Set([deadPid]));
     const originalNonce = randomUUID();
-    seedLock(file, "operation", { pid: deadPid, nonce: originalNonce });
-    let changed = false;
+    const action = vi.fn(() => "must-not-run");
+    let seeded = false, changed = false;
     const mutatingProbe = async (pid: number, expected?: string) => {
+      if (!seeded && pid === process.pid && expected === undefined) {
+        seeded = true;
+        seedLock(file, "operation", { pid: deadPid, nonce: originalNonce });
+      }
       if (pid === deadPid && !changed) {
         changed = true;
         seedLock(file, "operation", { pid: deadPid, nonce: randomUUID() });
-        return processResult(pid, "missing");
       }
-      if (pid === deadPid) return processResult(pid, "missing");
       return probe(pid, expected);
     };
-    await expect(withSupervisorOperation(workspaceRoot, () => "must-not-run", { ...options, probeProcess: mutatingProbe }))
+    await expect(withSupervisorOperation(workspaceRoot, action, { ...options, probeProcess: mutatingProbe }))
       .rejects.toMatchObject({ code: "SUPERVISOR_BUSY" });
+    expect(seeded).toBe(true);
+    expect(action).not.toHaveBeenCalled();
     expect(changed).toBe(true);
     expect(JSON.parse(fs.readFileSync(file, "utf8")).nonce).not.toBe(originalNonce);
   });
 
   it("corrupt owner is busy and preserved", async () => {
-    await createConfig();
     const file = supervisorOperationLockFile(workspace.id, stateDir);
-    fs.writeFileSync(file, "{broken", { mode: 0o600 });
-    await expect(withSupervisorOperation(workspaceRoot, () => "must-not-run", options)).rejects.toMatchObject({ code: "SUPERVISOR_BUSY" });
+    const probe = fakeProbe(), action = vi.fn(() => "must-not-run");
+    let seeded = false;
+    await expect(withSupervisorOperation(workspaceRoot, action, { ...options,
+      probeProcess: async (pid, expected) => {
+        if (!seeded && pid === process.pid && expected === undefined) {
+          seeded = true;
+          fs.writeFileSync(file, "{broken", { mode: 0o600 });
+        }
+        return probe(pid, expected);
+      } })).rejects.toMatchObject({ code: "SUPERVISOR_BUSY" });
+    expect(seeded).toBe(true);
+    expect(action).not.toHaveBeenCalled();
     expect(fs.readFileSync(file, "utf8")).toBe("{broken");
   });
 

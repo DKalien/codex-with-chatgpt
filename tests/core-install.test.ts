@@ -47,7 +47,7 @@ function legacyPointer(state: string, metadata: ReturnType<typeof installCore>) 
 }
 
 describe("immutable installed Core", () => {
-  it.each(["service-worker.js", "popup/popup.js", "manifest.json"])("拒绝发布 ID 后修改的 Companion artifact：%s", file => {
+  it.each(["bridge-client.js", "popup/lightweight.js", "manifest.json"])("拒绝发布 ID 后修改的 Companion artifact：%s", file => {
     const state = machine(), source = checkout();
     const artifact = write(source.root, `dist/browser-companion/${file}`, "packaged-v1");
     const id = rebuild(source.root, "A");

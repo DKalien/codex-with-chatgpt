@@ -1,45 +1,85 @@
 import { bindCurrentWebSink, projectChatgptRouteToWebSinkCandidate } from "../src/web-sink-control/index.js";
+
 import { projectAvailableResultBusCommands } from "../src/result-bus/service.js";
+
 import { previewPanelAction, confirmPanelAction, reconcilePanelAction } from "../src/bridge/companion-actions.js";
+
 import { grantPanelActions, revokePanelActions, readPanelAuthorization } from "../src/feedback/panel.js";
-import { readFeedbackState, recoverStaleFeedback } from "../src/feedback/state-store.js";
+
+import { readFeedbackState } from "../src/feedback/state-store.js";
+
 import { readRouting, assertCommandNotCancelled } from "../src/routing/store.js";
+
 import { listResultBusEntries } from "../src/result-bus/store.js";
+
 import { reserveNextResultBusEntry } from "../src/result-bus/delivery-lifecycle.js";
+
 import { withConnectionMutation } from "../src/bridge/connection.js";
+
 import { resultBusCompanionState } from "../src/bridge/result-bus-delivery.js";
+
 import { deliveryArbiterLockFile } from "../src/bridge/delivery-arbiter.js";
+
 import { createWorkspaceMaintenance } from "../src/bridge/maintenance.js";
+
 import { beginExecutorDispatch } from "../src/executor-control/dispatch-service.js";
+
 import fs from "node:fs";
+
 import path from "node:path";
+
 import vm from "node:vm";
+
 import { createHash, randomUUID } from "node:crypto";
+
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
 import { Workspace } from "../src/workspace/manager.js";
+
 import { readCompanionOperations } from "../src/bridge/companion-operations.js";
+
 import { createMcpServer } from "../src/mcp/server.js";
+
 import { resolveConversationPrincipal } from "../src/mcp/conversation-principal.js";
+
 import { enableReceiver } from "../src/feedback/receiver.js";
+
 import { ensureFeedbackState, feedbackStateFile } from "../src/feedback/state-store.js";
+
 import { confirmRouteAttestation, createPairingIntent, exchangePairingIntent, revokeCompanion } from "../src/feedback/companion.js";
+
 import { appendResult, createCommand, registerRoute, transitionCommandDelivery, routingFile } from "../src/routing/store.js";
+
 import type { CommandMailbox } from "../src/routing/schema.js";
+
 import { enqueueResultBusEntry } from "../src/result-bus/store.js";
+
 import { cleanupJournalFile, withCommandOperation } from "../src/command-cleanup/fence.js";
+
 import { codexDesktopAdapter } from "../src/executor/index.js";
+
 import { readDesktop, updateDesktop } from "../src/desktop/store.js";
+
 import { setRemoteEnabled, updateRemote } from "../src/remote/store.js";
+
 import { takeoverReceiver } from "../src/feedback/receiver.js";
+
 import { isolateStateDir, makeTmpDir } from "./helpers.js";
+
 import { cleanupStrict } from "./strict-teardown.js";
 
 const route = "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111";
+
 const extra = { authInfo: { token: "test", clientId: "test-client", scopes: ["codex.feedback"] }, _meta: { "openai/session": "test-session" } };
+
 let stateDir: string, root: string, workspace: Workspace;
+
 const principal = () => resolveConversationPrincipal(extra as never);
+
 beforeEach(() => { stateDir = isolateStateDir(); root = makeTmpDir("operations"); workspace = new Workspace(root); });
+
 afterEach(async () => { vi.restoreAllMocks(); await cleanupStrict(stateDir, root); });
+
 function pair(verified = true) {
   ensureFeedbackState(workspace.id, 0, stateDir);
   enableReceiver({ workspaceId: workspace.id, principal: principal(), widgetId: "widget", stateDir });
@@ -49,6 +89,7 @@ function pair(verified = true) {
     challengeId: paired.routeAttestation.challengeId, challengeDigest: paired.routeAttestation.challengeDigest, stateDir });
   return { workspaceId: workspace.id, workspaceRoot: root, credential: paired.credential, stateDir };
 }
+
 function seed(commandId: string, owner = principal().fingerprint, result = false) {
   const planner = registerRoute(workspace, { platform: "chatgpt_web", role: "planner", conversationId: owner, locator: {} }, stateDir);
   const executor = registerRoute(workspace, { platform: "codex_desktop", role: "executor", conversationId: randomUUID(), locator: { hostId: "local", executorProjectId: "test" } }, stateDir);
@@ -60,13 +101,16 @@ function seed(commandId: string, owner = principal().fingerprint, result = false
       threadId: executor.conversationId, originTurnId: randomUUID(), resultTurnId: randomUUID(), bindingId: randomUUID(), changedFiles: [], testsSummary: "PASS", output: { outputId: 42, outputAvailable: true } } }, stateDir);
   enqueueResultBusEntry(workspace, canonical, stateDir);
 }
+
 const inspect = async () => ({ workspaceId: workspace.id, activeBinding: null, plugins: [], availability: { available: false as const, reasonCode: "no_active_binding", message: "not bound" } });
+
 function snapshot(dir: string): unknown {
   return fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name)).map(item => {
     const file = path.join(dir, item.name), stat = fs.statSync(file);
     return item.isDirectory() ? [item.name, snapshot(file)] : [item.name, stat.ino, stat.mtimeMs, stat.size, createHash("sha256").update(fs.readFileSync(file)).digest("hex")];
   });
 }
+
 function tools() {
   return (createMcpServer({ workspace, logger: { info() {}, error() {}, warn() {}, debug() {} } as never }) as unknown as {
     _registeredTools: Record<string, { handler: (a: unknown, e: unknown) => Promise<any>; annotations: { readOnlyHint: boolean } }>
@@ -362,7 +406,7 @@ describe("Companion read-only presentation", () => {
     expect(row.needsAttention).toBe(true);
   });
   it("panel scripts parse as classic, have no HTML injection or persistent-history writer", () => {
-    for (const file of ["operations/view.js", "operations/operations.js", "popup/operations-summary.js"]) {
+    for (const file of ["operations/view.js", "operations/operations.js"]) {
       const source = fs.readFileSync(`browser-companion/${file}`, "utf8");
       expect(() => new vm.Script(source)).not.toThrow();
       expect(source).not.toMatch(/innerHTML|chrome\.storage|localStorage|\.click\(/);
@@ -381,7 +425,6 @@ describe("Companion read-only presentation", () => {
     expect(row.issueLabels).toContain("空生命周期锁，需人工核验");
   });
 });
-
 
 describe("B2 connection/maintenance and B5 manual panel actions", () => {
   function authorized() {
@@ -591,142 +634,5 @@ describe("B2 connection/maintenance and B5 manual panel actions", () => {
     expect(readPanelAuthorization(workspace.id, stateDir).pending).toHaveLength(1);
     expect(() => previewPanelAction(input, request("target"))).toThrow(/换 ID/);
     expect(snapshot(stateDir)).toEqual(before);
-  });
-});
-
-
-describe("B5 extension manual action crash and sender boundaries", () => {
-  function worker() {
-    const stored: Record<string, any> = {};
-    const ctx: any = { console, URL, project: { workspaceId: "aaaaaaaaaaaa" }, encodeURIComponent, storageProtected: true, transport: { credential: "test", workspaceId: "aaaaaaaaaaaa" }, authFailureRevision: 0,
-      formatRequestPending: null, autonomyPolicy: { mode: "off" }, productionSendInFlight: false, autonomyTickInFlight: false, connectInFlight: false,
-      journal: { state: "NONE" }, requestTransports: new WeakMap(), assertNoForbiddenFields: vi.fn(),
-      isCurrentTransportResponse: () => true, clearJournal: () => ({ state: "NONE" }), persistJournal: vi.fn(),
-      chrome: { runtime: { id: "extension", getURL: (file: string) => `chrome-extension://extension/${file}` },
-        storage: { local: { get: async (key: string) => ({ [key]: stored[key] }), set: vi.fn(async (value: any) => Object.assign(stored, JSON.parse(JSON.stringify(value)))) } } },
-      initPromise: Promise.resolve(), runTransportMutation: (fn: () => unknown) => fn() };
-    ctx.fetchCompanion = vi.fn(async (_path: string, options: any) => {
-      const request = options.body ? JSON.parse(options.body).request : undefined;
-      const response = { ok: true, body: { requestId: request?.requestId, status: "completed" } };
-      ctx.requestTransports.set(response, { requestAuthRevision: 0 }); return response;
-    });
-    const source = fs.readFileSync("browser-companion/service-worker.js", "utf8");
-    const context = vm.createContext(ctx);
-    vm.runInContext(source.slice(source.indexOf('function isOwnOperationsPanel('), source.indexOf('const LOCAL_KEY =')), context);
-    vm.runInContext(source.slice(source.indexOf('function exactOperationsPanelWorkspaceId('), source.indexOf('const projectRouter =')), context);
-    vm.runInContext(source.slice(source.indexOf('const PANEL_ACTION_KEY ='), source.indexOf('async function handleMessage(')) + '\nglobalThis.action = panelAction;', context);
-    const handler = source.slice(source.indexOf('async function handleMessage('), source.indexOf('  if (message.type === "c2c.operations.read")'));
-    vm.runInContext(handler + '\nreturn { ok: false, reason: "unsupported" }; } globalThis.routeAction = handleMessage;', context);
-    return { ctx, stored, action: ctx.action, routeAction: ctx.routeAction };
-  }
-  const raw = (commandId = "one") => ({ requestId: randomUUID(), commandId, action: "cleanup" });
-  const confirm = (request = raw()) => ({ phase: "confirm", request, confirmationSha256: "a".repeat(64), confirmed: true });
-  it("content scripts and spoofed extension senders cannot call panel actions", async () => {
-    const { ctx, routeAction } = worker();
-    for (const sender of [{ id: "extension", url: "https://chatgpt.com/c/x", tab: { id: 1 } }, { id: "foreign", url: "chrome-extension://extension/operations/operations.html" }])
-      for (const type of ["c2c.operations.action", "c2c.operations.format"])
-        expect(await routeAction({ type, ...confirm() }, sender)).toMatchObject({ ok: false, reason: "extension_panel_required" });
-    expect(ctx.fetchCompanion).not.toHaveBeenCalled(); expect(ctx.chrome.storage.local.set).not.toHaveBeenCalled();
-  });
-  it("panel actions require the exact extension page and explicit project query", async () => {
-    const { ctx, routeAction } = worker();
-    const panel = "chrome-extension://extension/operations/operations.html?workspaceId=aaaaaaaaaaaa";
-    for (const url of [panel.replace("extension/operations", "foreign/operations"), panel.replace("aaaaaaaaaaaa", "bbbbbbbbbbbb"), `${panel}&workspaceId=aaaaaaaaaaaa`, `${panel}#changed`]) {
-      for (const type of ["c2c.operations.action", "c2c.operations.format"])
-        expect(await routeAction({ type, ...confirm() }, {
-          id: "extension", url, tab: { id: 1, url },
-        })).toMatchObject({ ok: false, reason: "extension_panel_required" });
-    }
-    expect(ctx.fetchCompanion).not.toHaveBeenCalled();
-    expect(await routeAction({ type: "c2c.operations.action", ...confirm() }, {
-      id: "extension", url: panel, tab: { id: 1, url: panel },
-    })).toMatchObject({ ok: true });
-  });
-  it.each(["armed", "claimed", "unknown", "sending"])("%s prevents manual side effects", async mode => {
-    const { ctx, action } = worker();
-    if (mode === "armed") ctx.autonomyPolicy.mode = "armed";
-    if (mode === "claimed" || mode === "unknown") ctx.journal = { state: mode === "claimed" ? "CLAIMED" : "OUTCOME_UNKNOWN" };
-    if (mode === "sending") ctx.productionSendInFlight = true;
-    expect((await action(confirm())).ok).toBe(false);
-    expect(ctx.fetchCompanion).not.toHaveBeenCalled(); expect(ctx.chrome.storage.local.set).not.toHaveBeenCalled();
-  });
-  it("explicit checkbox is required before durable intent or POST", async () => {
-    const { ctx, action } = worker();
-    expect(await action({ ...confirm(), confirmed: false })).toMatchObject({ reason: "explicit_confirmation_required" });
-    expect(ctx.fetchCompanion).not.toHaveBeenCalled(); expect(ctx.chrome.storage.local.set).not.toHaveBeenCalled();
-  });
-  it("lost response persists pending, blocks same-command new-ID retry, and isolates another task", async () => {
-    const { ctx, action, stored } = worker();
-    ctx.fetchCompanion.mockRejectedValue(new Error("network"));
-    expect(await action(confirm())).toMatchObject({ reason: "panel_operation_unknown" });
-    expect(Object.values(stored)[0].operations[0].status).toBe("pending");
-    expect(await action(confirm(raw("one")))).toMatchObject({ reason: "panel_operation_unknown" });
-    expect(ctx.fetchCompanion).toHaveBeenCalledTimes(1);
-    await action({ phase: "preview", request: raw("other") });
-    expect(ctx.fetchCompanion).toHaveBeenCalledTimes(2);
-  });
-  it("known pre-mutation rejection permits a fresh preview without erasing unknown evidence", async () => {
-    const { ctx, action, stored } = worker(), request = raw();
-    ctx.fetchCompanion.mockImplementation(async () => {
-      const response = { ok: false, body: { error: "PANEL_CONFIRMATION_MISMATCH", noMutation: true, requestId: request.requestId } };
-      ctx.requestTransports.set(response, { requestAuthRevision: 0 }); return response;
-    });
-    expect(await action(confirm(request))).toMatchObject({ reason: "PANEL_CONFIRMATION_MISMATCH" });
-    expect(Object.values(stored)[0].operations[0].status).toBe("rejected");
-  });
-  it("stale transport response leaves pending evidence and delivery journal intact", async () => {
-    const { ctx, action, stored } = worker(); ctx.isCurrentTransportResponse = () => false;
-    const before = ctx.journal;
-    expect(await action(confirm())).toMatchObject({ reason: "stale_transport_response" });
-    expect(Object.values(stored)[0].operations[0].status).toBe("pending"); expect(ctx.journal).toBe(before);
-  });
-  it("read-only check never resends a lost operation and only exact completed proof closes it", async () => {
-    const { ctx, action, stored } = worker(), request = raw();
-    ctx.fetchCompanion.mockRejectedValueOnce(new Error("network")); await action(confirm(request));
-    ctx.fetchCompanion.mockImplementation(async (_path: string, options: any) => {
-      expect(options.method).toBe("GET"); const response = { ok: true, body: { requestId: request.requestId, status: "unknown" } };
-      ctx.requestTransports.set(response, { requestAuthRevision: 0 }); return response;
-    });
-    expect((await action({ phase: "check" })).status).toBe("unknown");
-    expect(Object.values(stored)[0].operations[0].status).toBe("pending");
-    ctx.fetchCompanion.mockImplementation(async () => { const response = { ok: true, body: { requestId: request.requestId, status: "completed" } };
-      ctx.requestTransports.set(response, { requestAuthRevision: 0 }); return response; });
-    expect((await action({ phase: "check" })).status).toBe("completed");
-    expect(Object.values(stored)[0].operations[0].status).toBe("completed");
-  });
-  it("auth revision drift prevents reconciliation response from clearing pending evidence", async () => {
-    const { ctx, action, stored } = worker(), request = raw();
-    ctx.fetchCompanion.mockRejectedValueOnce(new Error("network")); await action(confirm(request));
-    ctx.fetchCompanion.mockImplementation(async () => {
-      const response = { ok: true, body: { requestId: request.requestId, status: "completed" } };
-      ctx.requestTransports.set(response, { requestAuthRevision: 0 }); ctx.authFailureRevision = 1; return response;
-    });
-    expect((await action({ phase: "reconcile", requestId: request.requestId })).ok).toBe(false);
-    expect(Object.values(stored)[0].operations[0].status).toBe("pending");
-  });
-  it("pending and completed panel intents are isolated by workspace even for identical command and request IDs", async () => {
-    const { ctx, action, stored } = worker(), request = raw();
-    ctx.fetchCompanion.mockRejectedValueOnce(new Error("network")); await action(confirm(request));
-    ctx.transport = { credential: "other-workspace", workspaceId: "bbbbbbbbbbbb" };
-    expect(await action({ phase: "check" })).toMatchObject({ status: "none" });
-    expect(await action(confirm(request))).toMatchObject({ status: "completed" });
-    const journal = Object.values(stored)[0];
-    expect(journal.operations).toHaveLength(2);
-    expect(journal.operations.find((item: any) => item.workspaceId === "aaaaaaaaaaaa").status).toBe("pending");
-    expect(journal.operations.find((item: any) => item.workspaceId === "bbbbbbbbbbbb").status).toBe("completed");
-    ctx.transport = { credential: "original-workspace", workspaceId: "aaaaaaaaaaaa" };
-    expect(await action(confirm(request))).toMatchObject({ reason: "panel_operation_unknown" });
-    expect(ctx.fetchCompanion).toHaveBeenCalledTimes(2);
-  });
-  it("an operation journal without workspace identity is preserved and refuses mutation", async () => {
-    const { ctx, action, stored } = worker(), request = raw();
-    stored["c2c.panel.action.v1"] = { version: 1, operations: [{ request, status: "pending" }] };
-    const before = JSON.stringify(stored);
-    expect(await action(confirm(request))).toMatchObject({ reason: "panel_journal_corrupt" });
-    expect(ctx.fetchCompanion).not.toHaveBeenCalled(); expect(JSON.stringify(stored)).toBe(before);
-  });
-  it("storage failure before request means zero POST", async () => {
-    const { ctx, action } = worker(); ctx.chrome.storage.local.set.mockRejectedValue(new Error("disk"));
-    await expect(action(confirm())).rejects.toThrow("disk"); expect(ctx.fetchCompanion).not.toHaveBeenCalled();
   });
 });

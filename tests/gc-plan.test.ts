@@ -10,6 +10,7 @@ import { Workspace } from "../src/workspace/manager.js";
 import { buildCoreFixture, cleanup, makeTmpDir, write } from "./helpers.js";
 
 const project = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const cliEntry = path.join(project, "tests/fixtures/gc-cli.ts");
 const dirs: string[] = [];
 afterEach(() => {
   dirs.splice(0).forEach(cleanup);
@@ -249,6 +250,26 @@ describe("immutable Core release GC plan", () => {
 });
 
 describe("GC plan fail-closed 状态矩阵", () => {
+  it("轻量 GC 入口复用生产注册、Commander 设置和错误边界", () => {
+    const production = fs.readFileSync(path.join(project, "src/cli/index.ts"), "utf8");
+    const fixture = fs.readFileSync(cliEntry, "utf8");
+    for (const [source, prefix] of [[production, "\\./"], [fixture, "\\.\\./\\.\\./src/cli/"]]) {
+      expect(source).toMatch(new RegExp(`import\\s+\\{[^}]*\\bregisterGcCommand\\b[^}]*\\}\\s+from "${prefix}gc-maintenance\\.js"`));
+      expect(source).toMatch(/import \{ Command \} from "commander"/);
+      expect(source).toMatch(/import \{ PRODUCT_NAME, VERSION \} from ".*\/version\.js"/);
+      expect(source).toMatch(/import \{ cross \} from ".*\/shared\.js"/);
+      expect(source).toContain("const program = new Command();");
+      expect(source).toContain("registerGcCommand(program);");
+      expect(source.indexOf("registerGcCommand(program);")).toBeLessThan(source.indexOf('.name("c2c")'));
+      expect(source).toContain('.name("c2c")');
+      expect(source).toContain('.description(`${PRODUCT_NAME} — ChatGPT thinks. Codex works.`)');
+      expect(source).toContain('.version(VERSION, "-v, --version")');
+      expect(source).toContain(".configureHelp({ sortSubcommands: true });");
+      expect(source).toMatch(/program\.parseAsync\(process\.argv\)\.catch\(\(error: Error\) => \{\s+cross\(error\.message\);\s+process\.exit\(1\);\s+\}\);/);
+    }
+    expect(fixture.match(/register\w+\(program\);/g)).toEqual(["registerGcCommand(program);"]);
+  });
+
   it.each(["runtime", "runtime-upgrades", "post-turn-finalizers", "releases"])("%s directory link is a global traversal blocker", folder => {
     const { state } = fixture(["A", "B"]);
     const original = path.join(state, folder), outside = makeTmpDir("gc-directory-target");
@@ -418,7 +439,7 @@ describe("GC plan fail-closed 状态矩阵", () => {
     const { state, releases } = fixture(["A", "B"]);
     const plan = planGc(state);
     const env = { ...process.env, C2C_STATE_DIR: state };
-    const entry = path.join(project, "src/cli/index.ts");
+    const entry = cliEntry;
     const run = (...args: string[]) => spawnSync(process.execPath, ["--import", "tsx", entry, ...args], {
       cwd: project, encoding: "utf8", windowsHide: true, env,
     });
@@ -427,7 +448,10 @@ describe("GC plan fail-closed 状态矩阵", () => {
     expect(plain.status).not.toBe(0);
     expect(plain.stdout + plain.stderr).toMatch(/--plan|--dry-run/);
 
-    const healthyPlanRun = run("gc", "--plan", "--json");
+    // 保留一次完整生产入口的成功 plan，覆盖实际集成接线。
+    const healthyPlanRun = spawnSync(process.execPath, ["--import", "tsx", path.join(project, "src/cli/index.ts"), "gc", "--plan", "--json"], {
+      cwd: project, encoding: "utf8", windowsHide: true, env,
+    });
     const healthyDryRun = run("gc", "--dry-run", "--json");
     expect(healthyPlanRun.status).toBe(0);
     expect(healthyDryRun.status).toBe(0);
@@ -464,7 +488,7 @@ describe("GC plan fail-closed 状态矩阵", () => {
     expect(planGc(state).ok).toBe(false);
 
     const env = { ...process.env, C2C_STATE_DIR: state };
-    const entry = path.join(project, "src/cli/index.ts");
+    const entry = cliEntry;
     const run = (...args: string[]) => spawnSync(process.execPath, ["--import", "tsx", entry, ...args], {
       cwd: project, encoding: "utf8", windowsHide: true, env,
     });

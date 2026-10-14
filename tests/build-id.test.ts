@@ -32,7 +32,7 @@ describe("runtime build ID", () => {
     const dist = makeTmpDir("build-finalizer");
     try {
       write(dist, "cli/index.js", "// compiled CLI");
-      write(dist, "browser-companion/service-worker.js", "// packaged Companion");
+      write(dist, "browser-companion/bridge-client.js", "// packaged Companion");
       write(dist, "build-id.txt", idA);
       write(dist, "feedback/canonical-compat.js", "// retired compatibility writer");
       write(dist, "feedback/canonical-compat.js.map", "{}");

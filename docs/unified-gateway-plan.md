@@ -12,9 +12,9 @@
 
 - M1–M3 已有源码：`gateway register/list/revoke` 把规范 workspaceId/root 与获准 clientIds 写入机器 allowlist；`gateway serve` 使用独立 `machine-gateway` OAuth store 和单实例 owner lock。`gateway_list_workspaces` 只列出当前 client 的授权项目；workspace、Remote、Desktop、execution、feedback、Web Sink 工具显式带 workspaceId，每次调用重新解析 grant 与 canonical root。Remote 工具仍要求该 workspace 处于 official delivery mode。
 - MCP Gateway 复用原工具 handler 与每项目业务状态，不增加 Gateway 任务/反馈队列。`/mcp` 与 `/oauth/token` 诊断日志只记录 method、固定 path 和 statusCode；不记录 query、body、headers。匿名访问只开放协议 discovery，工具调用仍要求 bearer OAuth 和原 scope。
-- M4 已有多 workspace Companion 源码：默认 bridge-client 按 workspace 隔离凭据、偏好与页面关联，页面选择固定 workspaceId 与 canonical route，DOM mutation 按 tab 串行，操作面板请求带 workspaceId 并忽略旧项目迟到响应；namespaced alarm 仅保留在旧兼容链。测试覆盖双项目状态隔离；双项目真实 Send/observed 尚待现场验收。
+- M4 已有多 workspace Companion 源码：默认 bridge-client 按 workspace 隔离凭据、偏好与页面关联，页面选择固定 workspaceId 与 canonical route，DOM mutation 按 tab 串行，操作面板请求带 workspaceId 并忽略旧项目迟到响应；旧 namespaced alarm 编排已于 2026-10-13 从源码退役。测试覆盖双项目状态隔离；双项目真实 Send/observed 尚待现场验收。
 - Gateway Desktop 复用本机绑定与原 sender：先 status 再 send，直接投递并保留 idle/busy 门禁；Bridge mailbox 才持久排队。Desktop read/control 与 Remote enable 独立，`codex_submit_task` 始终是后台 Remote 工具，失败不自动转投。详见 [Desktop 合同](desktop-control.md#gateway-直接投递)。
-- Companion 默认使用轻量 bridge-client/content/popup，新回流目标由本机确认完整 URL，`local_user` 不替代 MCP principal。Bridge 判定连接与单次发送许可；浏览器关联真实 tab/document，执行一次已授权 DOM 操作并精确观察正文与 ATTEMPT，未知结果只观察、不重发。旧 SW `connectionReadiness` 与 proof/fence/journal 链保留兼容回归，不默认加载。机制见 [架构](architecture.md#companion-当前连接与恢复)，操作与诊断见 [排障](troubleshooting.md#日常连接与本机确认)。
+- Companion 默认使用轻量 bridge-client/content/popup，新回流目标由本机确认完整 URL，`local_user` 不替代 MCP principal。Bridge 判定连接与单次发送许可；浏览器关联真实 tab/document，执行一次已授权 DOM 操作并精确观察正文与 ATTEMPT，未知结果只观察、不重发。2026-10-13 本轮已从源码退役旧 SW `connectionReadiness` 与专属 proof/fence/journal 编排及测试，尚未部署；Bridge legacy 协议、Result Bus 与 receipt 历史兼容保留。机制见 [架构](architecture.md#companion-当前连接与恢复)，操作与诊断见 [排障](troubleshooting.md#日常连接与本机确认)。
 - M6 已有 Windows 机器级 Gateway/Tunnel Supervisor 源码：configure/status/validate/set-key/run、稳定 launcher 后台启动、DPAPI key 保存、exact process identity、launcher startup pin、受限 OAuth metadata preflight，以及 GC 对 Gateway/Controller release 引用的保护。显式统一模式由单个 Node owner 托管已授权 workspace，只恢复原 running intent；尚无 Scheduled Task 注册或异常退出自动恢复。
 
 ### 历史验证边界（2026-10-08）
@@ -67,7 +67,7 @@ M2/M3 的源码通过 `gateway serve --port <port> --public-url <HTTPS origin>` 
 
 新 Gateway client 不继承旧 Connector 的 conversation fingerprint；反馈接管仍要求显式 takeover 与 fresh expectedEpoch。`feedback_companion_pair` 附加 workspaceId 供浏览器明确选择，secret 仍为一次性。路由认证消息同时携带精确 workspaceId、challengeId 与 digest，供同一插件确认对应项目。领取反馈在 reconcile/cutover 前核对 principal 与 binding/epoch；ACK 在 stale recovery 写盘前核对主体及 event/attempt，拒绝路径不推进历史。
 
-M4 源码复用单份 Companion 状态机，为每个显式 workspace 建立 local/session/alarm 命名空间。Popup 从完整 Pair 输出登记 workspaceId 与 Bridge origin，再明确选择项目；登记不授予 Gateway 项目权限，也不调用 Pair。操作面板 URL 固定 workspaceId；页面绑定按 tab/route 选择项目，生产发送回调固定原 workspace/tab/document，同 tab 的 DOM mutation 串行。后台唤醒监听在 registry 加载前同步注册，namespaced alarm 只进入对应项目，关闭 tab 的选择清理先等待 session 加载。旧 singleton 只有完整身份与 route 可核对时复制迁移，保留旧 journal、attempt 与 archive；未知或冲突状态停止迁移。
+2026-10-06 当时的 M4 源码复用单份旧 Companion 状态机，为每个显式 workspace 建立 local/session/alarm 命名空间。Popup 从完整 Pair 输出登记 workspaceId 与 Bridge origin，再明确选择项目；登记不授予 Gateway 项目权限，也不调用 Pair。操作面板 URL 固定 workspaceId；页面绑定按 tab/route 选择项目，生产发送回调固定原 workspace/tab/document，同 tab 的 DOM mutation 串行。后台唤醒监听在 registry 加载前同步注册，namespaced alarm 只进入对应项目，关闭 tab 的选择清理先等待 session 加载。旧 singleton 只有完整身份与 route 可核对时复制迁移，保留旧 journal、attempt 与 archive；未知或冲突状态停止迁移。上述后台唤醒/alarm 和旧 singleton journal/archive 迁移属于当时实现，已于 2026-10-13 随旧伴侣源码退役。现役轻量 bridge-client 按 workspace 使用 registry、受保护 transport 与页面关联；浏览器重启后缺少原 tab/document 关联时，显式连接相同已验证目标恢复关联，不运行旧 journal/archive 迁移编排。
 
 Popup 的项目选择、列表和页面状态读取使用 revision 检查，迟到响应不能覆盖新项目或新页面；手动操作复用项目操作锁直到响应与显示更新完成，期间不能切换项目。切项目清空临时结果显示，保留持久历史；解绑后按钮保留最新 owner 状态。
 当前 Popup 的空白“请选择项目”项不解除既有 tab/route 的项目映射，刷新会恢复原选择；切项目须选择明确的已登记项目。解除 tab 映射不是该空白项已实现的操作。

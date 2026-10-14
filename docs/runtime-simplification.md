@@ -29,15 +29,15 @@ Bus busy、损坏、不可变摘要冲突或清除恢复项失败均返回 `reco
 
 历史 canonical queued/ready 事件由原 cutover 合同精确匹配并永久归 Bus 所有；observed/retired 的永久抑制继续生效。无法匹配可信 Bus 结果的历史执行事件通过 `legacyDrainRequired` 布尔值与 `legacyDrainPending` 数量只读报告，不暴露其他 route 的任务身份；没有控制通知可领取时，旧执行结果不能充当 fallback，返回 `RESULT_BUS_LEGACY_DRAIN_REQUIRED`。
 
-旧 reserved/claimed/outcome_unknown 保留原全局 fence、冻结目标及 attempt，只允许按原严格身份 release、exact ACK 或显式 retire；禁止开始、重放或改目标发送。控制通知继续受 Feedback 主体、route VERIFIED、单飞仲裁和 Bridge 持久 attempt 约束；轻量 Companion 只观察原 attempt，浏览器 journal/proof 链仅保留旧兼容。源码升级不自动排空、清理或改写真实机器历史。
+旧 reserved/claimed/outcome_unknown 保留原全局 fence、冻结目标及 attempt，只允许按原严格身份 release、exact ACK 或显式 retire；禁止开始、重放或改目标发送。控制通知继续受 Feedback 主体、route VERIFIED、单飞仲裁和 Bridge 持久 attempt 约束；轻量 Companion 只观察原 attempt，旧浏览器 journal/proof 编排已于 2026-10-13 从源码退役，Bridge 历史兼容仍保留。源码升级不自动排空、清理或改写真实机器历史。
 
-旧执行 in-flight 的公开状态携带 `sendAllowed: false`；原 claimed 在公开查询中保守呈现为 `outcome_unknown`，阻止旧扩展继续发送，durable 原状态与 attempt 不变。当前轻量 Companion 对旧执行 attempt 仅允许观察和 exact ACK，不写入 DOM；旧兼容链不再为该历史 journal 铸造发送 proof。Bus 和控制通知按 Bridge 持久 attempt 的原恢复合同执行。
+旧执行 in-flight 的公开状态携带 `sendAllowed: false`；原 claimed 在公开查询中保守呈现为 `outcome_unknown`，阻止旧扩展继续发送，durable 原状态与 attempt 不变。当前轻量 Companion 对旧执行 attempt 仅允许观察和 exact ACK，不写入 DOM；已退役的旧浏览器编排不再属于现役发送路径。Bus 和控制通知按 Bridge 持久 attempt 的原恢复合同执行。
 
 相关实现：[Bus 与控制通知](../src/bridge/result-bus-delivery.ts)、[控制投影](../src/feedback/projector.ts)、[Feedback lifecycle](../src/feedback/delivery-lifecycle.ts)。历史 fixture 位于 [tests/helpers](../tests/helpers/)。
 
 ## 网页完成信号与固定通知（2026-10-10）
 
-新 Result Bus attempt 在首次 `reserved → claimed` 的原事务内固定 `messageFormat: signal-v1`。Bridge 的 begin-send 与 state 恢复载荷只返回结构化 `signal`（`type: execution_ended`、`version: 1`、`workspaceId`、`commandId`、`taskId`、`attemptId`）和 `messageSha256`，不发送通知文本或执行详情。Browser Companion 使用自己的固定模板生成三行通知；Bridge 持久 attempt 是发送与恢复权威，轻量版按单次授权发送、观察原 attempt 并 exact ACK，旧兼容版仍使用原 journal/proof 流程：
+新 Result Bus attempt 在首次 `reserved → claimed` 的原事务内固定 `messageFormat: signal-v1`。Bridge 的 begin-send 与 state 恢复载荷只返回结构化 `signal`（`type: execution_ended`、`version: 1`、`workspaceId`、`commandId`、`taskId`、`attemptId`）和 `messageSha256`，不发送通知文本或执行详情。Browser Companion 使用自己的固定模板生成三行通知；Bridge 持久 attempt 是发送与恢复权威，轻量版按单次授权发送、观察原 attempt 并 exact ACK。旧浏览器 journal/proof 编排已在 2026-10-13 从源码退役。固定通知如下：
 
 ```text
 本轮执行已结束，请读取结果（自动通知，非新授权）。
@@ -47,7 +47,7 @@ ATTEMPT_ID: <attemptId>
 
 通知只唤醒网页读取结果；所有 canonical `ok/failed/blocked` 与 official `completed/failed/cancelled` 使用相同中性正文，不表示业务完成、测试通过或用户新授权。完整 `rawSummary`、`machineEvidence`、测试与输出仍留在原结果存储，通过只读 MCP 查询：官方任务按 `workspaceId/taskId` 调用 `codex_task_result`；Desktop 按同一 workspace 与 exact commandId 核验 receipt、`test_status`、`execution_summary` 和 `execution_output`。网页无需处理完整结果来拼通知。
 
-纯模板模块由 Browser 所有；Bridge 只共享 renderer 计算现有正文 hash。`signal-v1` 正文与字段规范必须冻结；后续文案或规范改变需引入新格式版本并保留旧模板重建，不能把它当作可随意替换的 UI 文案，否则在途 attempt（包括旧兼容 journal）与正文 hash 将不一致。信号字段、模板版本或 attempt 不符时停止发送，route VERIFIED、冻结目标、Bridge 持久 attempt、防重复和送达证明仍按原合同执行；旧兼容 journal/proof 不成为默认轻量版的发送权威。没有新增推送信道、自动重试或文本 fallback。
+纯模板模块由 Browser 所有；Bridge 只共享 renderer 计算现有正文 hash。`signal-v1` 正文与字段规范必须冻结；后续文案或规范改变需引入新格式版本并保留旧模板重建，不能把它当作可随意替换的 UI 文案，否则在途 attempt（包括旧兼容 journal）与正文 hash 将不一致。信号字段、模板版本或 attempt 不符时停止发送，route VERIFIED、冻结目标、Bridge 持久 attempt、防重复和送达证明仍按原合同执行；已退役的浏览器 journal/proof 编排不参与现役发送。没有新增推送信道、自动重试或文本 fallback。
 
 缺失 `messageFormat` 的历史 claimed/outcome_unknown attempt 继续生成原 canonical/official 正文与原 hash；读取和 claimed 精确重放不补写字段、不换 ID、不改原状态字节。旧 queued/reserved 尚未开始发送，在新运行时首次 begin-send 时才选择 `signal-v1`。`FINAL_RECEIPT_REQUIRED` 控制通知保持原文字与授权边界。
 
@@ -59,17 +59,19 @@ ATTEMPT_ID: <attemptId>
 
 格式化按本机授权和精确预览确认清空当前 workspace 历史，保留连接、配对、绑定及其他 workspace。快照列出实际输出正文和已完成修复档案，不另设文件总数上限；每项仍校验路径、指纹和重复项。执行输出原有的保留数量策略不变。
 
-轻量网页在确认请求发出前持久化 workspaceId 与确认摘要；响应丢失只读查询原摘要，不自动重新提交格式化。仅 Bridge 返回精确匹配的 `noMutation:true` 拒绝证据时移除本轮待确认标识；`cleaned` 结果才清理该 workspace 的浏览器历史与 pending 标识。未知、错误或身份不匹配保留待核验状态。旧兼容 SW 的 intent 撤回流程仅用于原入口。
+轻量网页在确认请求发出前持久化 workspaceId 与确认摘要；响应丢失只读查询原摘要，不自动重新提交格式化。仅 Bridge 返回精确匹配的 `noMutation:true` 拒绝证据时移除本轮待确认标识；`cleaned` 结果才清理该 workspace 的浏览器历史与 pending 标识。未知、错误或身份不匹配保留待核验状态。旧 SW 的 intent 撤回入口已于 2026-10-13 从源码退役。
 
-相关实现：[工作区格式化](../src/command-cleanup/workspace-history.ts)、[轻量网页操作入口](../browser-companion/bridge-operations.js)；旧 `service-worker.js` 仅保留兼容入口。
+相关实现：[工作区格式化](../src/command-cleanup/workspace-history.ts)、[轻量网页操作入口](../browser-companion/bridge-operations.js)。
 
 ## 轻量 Companion 与当前部署（2026-10-13）
 
-默认 manifest 已切换到 `bridge-client.js`、`content-lite.js` 与轻量弹窗，网页只连接、操作 DOM 与回报观察；Bridge 承担全部安全判定。旧 SW/proof/fence/journal 链保留兼容回归，不再是默认运行链。源码合同、正式门禁、已安装/运行 build、Desktop 本机重新确认与用户网页复核统一见[轻量 Companion](companion-lightweight.md#部署与验收观察快照)，下方旧部署记录只代表各自标注时点。
+默认 manifest 已切换到 `bridge-client.js`、`content-lite.js` 与轻量弹窗，网页只连接、操作 DOM 与回报观察；Bridge 承担全部安全判定。本轮已从源码退役旧 SW/content/popup、专属 proof/fence/journal/phase/route-attest/autonomy/send-probe 编排及测试，构建不再产出旧入口；共享 DOM/observer/write/click/route/project-context 与 operations 面板保留。本轮退役尚未部署，Bridge legacy 协议、Result Bus 与 receipt 历史兼容不变。源码合同、正式门禁、已安装/运行 build、Desktop 本机重新确认与用户网页复核统一见[轻量 Companion](companion-lightweight.md#部署与验收观察快照)，下方旧部署记录只代表各自标注时点。
 
 真实 Desktop task delivery、DOM Send 与双 workspace Send/observed 仍未完成；浏览器运行版本直接核验和 PowerShell 显式代理 TLS EOF 原因也仍待定位。当前状态可用及用户面板反馈不替代真实发送验收。
 
 ## legacy 退役前置门禁（2026-10-09 固化，退役延后）
+
+本节约束 Bridge legacy/Bus cutover 与 receipt 历史兼容的后续退役；不约束已单独授权的 2026-10-13 旧浏览器实现及专属测试退役。
 
 legacy/Bus cutover 双轨、receipt-finalizer draft v1/v2/v3 兼容等退役类代码为迁移期代码，暂不逐条删检查。整体退役须先达成以下前置门禁，全部满足后再单独立项执行；未达成前保持现状：
 

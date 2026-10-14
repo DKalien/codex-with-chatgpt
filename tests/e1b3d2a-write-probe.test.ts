@@ -1,42 +1,22 @@
-import { LIGHT_CONTENT_SCRIPTS } from "./browser-companion-chains.js";
 import { describe, expect, it } from "vitest";
+
 import fs from "node:fs";
+
 import path from "node:path";
+
 import { fileURLToPath } from "node:url";
-import {
-  inspectComposerWriteCapability,
-  writeCanonicalMessage,
-  verifyCanonicalComposer,
-  runWriteProbe,
-  buildProbeReadback,
-  readCanonicalComposerText,
-} from "../browser-companion/composer-write-adapter.js";
-import {
-  WRITE_PROBE_MESSAGE,
-  buildWriteProbeRequest,
-  validateWriteProbeResponse,
-  parseChatgptRouteStrict,
-  resolveMutationCanonicalRoute,
-} from "../browser-companion/write-probe.js";
-import { parseChatgptConversationRoute } from "../src/chatgpt/route.js";
-import { dispatchNativeSend } from "../browser-companion/send-adapter.js";
-import { resolveChatGptComposer, resolveChatGptAction } from "../browser-companion/dom-adapter.js";
+
+import { inspectComposerWriteCapability, writeCanonicalMessage, verifyCanonicalComposer, buildProbeReadback, readCanonicalComposerText } from "../browser-companion/composer-write-adapter.js";
+
+const WRITE_PROBE_MESSAGE = "[C2C_WRITE_PROBE]\nNONCE: 1\n仅验证编辑器写入，不发送。\n";
+
+import { dispatchNativeSend } from "../browser-companion/send-click-adapter.js";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
 const companionRoot = path.join(projectRoot, "browser-companion");
-const distCompanion = path.join(projectRoot, "dist", "browser-companion");
 
 const ROUTE = "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111";
-const GPT_ROUTE = "https://chatgpt.com/g/g-p-example/c/11111111-1111-4111-8111-111111111111";
-const GPT_ROUTE_B = "https://chatgpt.com/g/g-p-b/c/11111111-1111-4111-8111-111111111111";
-
-/** Companion shared route parser (single mutation-fence authority). */
-function sharedParse(href: string) {
-  return parseChatgptConversationRoute(href, {
-    allowQueryOrHash: false,
-    conversationIdPolicy: "uuid",
-  });
-}
 
 function MESSAGE() {
   return "[C2C_CONTROL]\nSTATE: EXECUTED\nATTEMPT_ID: 22222222-2222-4222-8222-222222222222\n";
@@ -228,7 +208,6 @@ describe("E1b3d2a write/send physical split", () => {
     expect(src).toMatch(/export function inspectComposerWriteCapability/);
     expect(src).toMatch(/export function writeCanonicalMessage/);
     expect(src).toMatch(/export function verifyCanonicalComposer/);
-    expect(src).toMatch(/export function runWriteProbe/);
     expect(code).not.toMatch(/dispatchNativeSend/);
     expect(code).not.toMatch(/\.click\(/);
     expect(code).not.toMatch(/chrome\.tabs/);
@@ -237,101 +216,6 @@ describe("E1b3d2a write/send physical split", () => {
     expect(code).not.toMatch(/begin-send/);
     expect(code).not.toMatch(/\/ack\b/);
     expect(code).not.toMatch(/journalActive|markReserved|markReserveRequested|SEND_INTENT/);
-  });
-
-  it("send-adapter re-exports write APIs and keeps dispatchNativeSend only for click", () => {
-    const src = fs.readFileSync(path.join(companionRoot, "send-adapter.js"), "utf8");
-    expect(src).toMatch(/from "\.\/composer-write-adapter\.js"/);
-    expect(src).toMatch(/inspectComposerWriteCapability/);
-    expect(src).toMatch(/writeCanonicalMessage/);
-    expect(src).toMatch(/verifyCanonicalComposer/);
-    expect(src).toMatch(/from "\.\/send-click-adapter\.js"/);
-    expect(src).toMatch(/dispatchNativeSend/);
-    // Runtime still must not load send-adapter.
-    const manifest = JSON.parse(fs.readFileSync(path.join(companionRoot, "manifest.json"), "utf8"));
-    const js = (manifest.content_scripts ?? []).flatMap((cs: { js?: string[] }) => cs.js ?? []);
-    expect(js).toContain("composer-write-adapter.js");
-    expect(js).not.toContain("send-adapter.js");
-    expect(js).not.toContain("send-orchestrator.js");
-  });
-
-  it("dispatchNativeSend still works via re-export path (compat)", () => {
-    const { doc, clicks } = makeComposerDom({ mode: "send", text: MESSAGE() });
-    const r = dispatchNativeSend(doc, MESSAGE(), { routeValid: true });
-    expect(r.ok).toBe(true);
-    expect(clicks.n).toBe(1);
-  });
-});
-
-describe("E1b3d2a fixed write probe message", () => {
-  it("is a fixed multiline constant; popup cannot supply message", () => {
-    expect(WRITE_PROBE_MESSAGE).toBe("[C2C_WRITE_PROBE]\nNO_SEND=1\nTOKEN=e1b3d2\n");
-    const sw = fs.readFileSync(path.join(companionRoot, "service-worker.js"), "utf8");
-    expect(sw).toMatch(/write_probe_payload_forbidden/);
-    expect(sw).toMatch(/c2c\.write\.probe\.request/);
-    const popup = fs.readFileSync(path.join(companionRoot, "popup", "popup.js"), "utf8");
-    expect(popup).toMatch(/c2c\.write\.probe\.request/);
-    const html = fs.readFileSync(path.join(companionRoot, "popup", "popup.html"), "utf8");
-    expect(html).toMatch(/Write probe text \(NO SEND\)/);
-    expect(html).toMatch(/WRITES COMPOSER — DOES NOT SEND/);
-    expect(popup).not.toMatch(/type:\s*"c2c\.write\.probe\.request",\s*message:/);
-  });
-});
-
-describe("E1b3d2a write probe success path", () => {
-  it("empty idle primary composer: write once, exact multiline, verify, zero click", () => {
-    const { doc, state, clicks } = makeComposerDom({ mode: "idle", text: "" });
-    const r = runWriteProbe(doc, {
-      expectedRoute: ROUTE,
-      expectedGeneration: 7,
-      locationHref: ROUTE,
-      parseRoute: sharedParse,
-      localGeneration: 7,
-    });
-    expect(r.ok).toBe(true);
-    expect(r.mode).toBe("write_probe_no_send");
-    expect(r.wrote).toBe(true);
-    expect(r.verified).toBe(true);
-    expect(r.noSend).toBe(true);
-    expect(r.editorKind).toBe("contenteditable");
-    expect(r.composerEvidence).toBe("prompt_textarea");
-    expect(r.generation).toBe(7);
-    expect(r.canonicalRoute).toBe(ROUTE);
-    expect(state.text).toBe(WRITE_PROBE_MESSAGE);
-    expect(state.text.split("\n").length).toBeGreaterThan(2);
-    expect(clicks.n).toBe(0);
-  });
-
-  it("GPT-shaped route /g/g-.../c/<uuid>: full canonical match, write once, zero Send", () => {
-    const { doc, state, clicks } = makeComposerDom({ mode: "idle", text: "" });
-    const r = runWriteProbe(doc, {
-      expectedRoute: GPT_ROUTE,
-      expectedGeneration: 5,
-      locationHref: GPT_ROUTE,
-      parseRoute: sharedParse,
-      localGeneration: 5,
-    });
-    expect(r.ok).toBe(true);
-    expect(r.wrote).toBe(true);
-    expect(r.verified).toBe(true);
-    expect(r.canonicalRoute).toBe(GPT_ROUTE);
-    expect(state.text).toBe(WRITE_PROBE_MESSAGE);
-    expect(clicks.n).toBe(0);
-  });
-
-  it("same conversation UUID but different GPT prefix → route_drift, zero write", () => {
-    const { doc, state, clicks } = makeComposerDom({ mode: "idle", text: "" });
-    const r = runWriteProbe(doc, {
-      expectedRoute: GPT_ROUTE,
-      expectedGeneration: 5,
-      locationHref: GPT_ROUTE_B,
-      parseRoute: sharedParse,
-      localGeneration: 5,
-    });
-    expect(r.ok).toBe(false);
-    expect(r.reason).toBe("write_probe_route_drift");
-    expect(state.text).toBe("");
-    expect(clicks.n).toBe(0);
   });
 });
 
@@ -469,83 +353,6 @@ describe("E1b3d2a real readback diagnostic (wrote semantics)", () => {
     return { doc, editor, state, calls };
   }
 
-  it("A. block DOM: P-block canonical reader recovers exact probe → write succeeds", () => {
-    const { doc, state, calls } = makeBlockComposerDom({ execCommandImpl: "blocks" });
-    const r = runWriteProbe(doc, {
-      expectedRoute: ROUTE,
-      expectedGeneration: 1,
-      locationHref: ROUTE,
-      parseRoute: sharedParse,
-      localGeneration: 1,
-    });
-    // Real Edge shape: 4 P including empty final → join("\n") === WRITE_PROBE_MESSAGE.
-    expect(r.ok).toBe(true);
-    expect(r.wrote).toBe(true);
-    expect(r.verified).toBe(true);
-    expect(r.mutationAttempted).toBe(true);
-    expect(calls.execCommand).toBe(1);
-    expect(calls.clicks).toBe(0);
-    expect(state.blocks.length).toBe(4);
-    expect(state.blocks[3]).toBe("");
-    expect(r.readback?.canonical?.representation).toBe("prosemirror_p_blocks");
-    expect(r.readback?.canonical?.exact).toBe(true);
-  });
-
-  it("B. trailing-LF only mismatch: exact=false exactWithoutFinalLf=true; verify still fails", () => {
-    const { doc } = makeBlockComposerDom({ execCommandImpl: "noFinalLf" });
-    const r = runWriteProbe(doc, {
-      expectedRoute: ROUTE,
-      expectedGeneration: 1,
-      locationHref: ROUTE,
-      parseRoute: sharedParse,
-      localGeneration: 1,
-    });
-    expect(r.ok).toBe(false);
-    expect(r.reason).toBe("composer_write_mismatch");
-    expect(r.wrote).toBe(true);
-    expect(r.mutationAttempted).toBe(true);
-    expect(r.verified).toBe(false);
-    const rb = r.readback!;
-    expect(rb.textContent.exact).toBe(false);
-    expect(rb.textContent.exactWithoutFinalLf).toBe(true);
-    expect(rb.canonical?.representation).toBe("prosemirror_p_blocks");
-    expect(rb.canonical?.exact).toBe(false);
-  });
-
-  it("C. pre-mutation route drift: wrote=false mutationAttempted=false", () => {
-    const { doc, clicks } = makeComposerDom({ mode: "idle", text: "" });
-    const r = runWriteProbe(doc, {
-      expectedRoute: ROUTE,
-      expectedGeneration: 1,
-      locationHref: "https://chatgpt.com/c/99999999-9999-4999-8999-999999999999",
-      parseRoute: sharedParse,
-      localGeneration: 1,
-    });
-    expect(r.ok).toBe(false);
-    expect(r.reason).toBe("write_probe_route_drift");
-    expect(r.wrote).toBe(false);
-    expect(r.mutationAttempted).toBe(false);
-    expect(clicks.n).toBe(0);
-  });
-
-  it("D. stable synthetic exact: wrote=true verified=true mutationAttempted=true zero Send", () => {
-    const { doc, state, clicks } = makeComposerDom({ mode: "idle", text: "" });
-    const r = runWriteProbe(doc, {
-      expectedRoute: ROUTE,
-      expectedGeneration: 4,
-      locationHref: ROUTE,
-      parseRoute: sharedParse,
-      localGeneration: 4,
-    });
-    expect(r.ok).toBe(true);
-    expect(r.wrote).toBe(true);
-    expect(r.verified).toBe(true);
-    expect(r.mutationAttempted).toBe(true);
-    expect(state.text).toBe(WRITE_PROBE_MESSAGE);
-    expect(clicks.n).toBe(0);
-    expect(r.readback?.textContent.exact).toBe(true);
-  });
-
   it("buildProbeReadback never emits raw text/HTML/nodes", () => {
     const { editor } = makeBlockComposerDom({ execCommandImpl: "blocks" });
     // Seed blocks as if written.
@@ -563,49 +370,6 @@ describe("E1b3d2a real readback diagnostic (wrote semantics)", () => {
       "length",
       "newlineCount",
     ]);
-  });
-
-  it("CS/SW source carries mutationAttempted + readback; popup renders them", () => {
-    const cs = fs.readFileSync(path.join(companionRoot, "content-script.js"), "utf8");
-    expect(cs).toMatch(/mutationAttempted/);
-    expect(cs).toMatch(/readback/);
-    const sw = fs.readFileSync(path.join(companionRoot, "service-worker.js"), "utf8");
-    expect(sw).toMatch(/mutationAttempted/);
-    expect(sw).toMatch(/readback/);
-    const popup = fs.readFileSync(path.join(companionRoot, "popup", "popup.js"), "utf8");
-    expect(popup).toMatch(/mutationAttempted=/);
-    expect(popup).toMatch(/textContent: len=/);
-    expect(popup).toMatch(/NO SEND PERFORMED/);
-    const adapter = fs.readFileSync(path.join(companionRoot, "composer-write-adapter.js"), "utf8");
-    expect(adapter).toMatch(/export function buildProbeReadback/);
-    expect(adapter).toMatch(/mutationAttempted: true/);
-  });
-
-  it("validateWriteProbeResponse preserves wrote=true on composer_write_mismatch", () => {
-    const owner = { tabId: 1, documentId: "d", canonicalRoute: ROUTE, generation: 2 };
-    const transport = { routeCanonical: ROUTE, authStale: false };
-    const v = validateWriteProbeResponse(
-      {
-        ok: false,
-        reason: "composer_write_mismatch",
-        wrote: true,
-        verified: false,
-        mutationAttempted: true,
-        mode: "write_probe_no_send",
-        noSend: true,
-        canonicalRoute: ROUTE,
-        generation: 2,
-        readback: { textContent: { length: 10, exact: false } },
-      },
-      owner,
-      transport,
-    );
-    expect(v.ok).toBe(false);
-    expect(v.reason).toBe("composer_write_mismatch");
-    expect(v.wrote).toBe(true);
-    expect(v.verified).toBe(false);
-    expect(v.mutationAttempted).toBe(true);
-    expect(v.readback).toBeTruthy();
   });
 });
 
@@ -997,13 +761,9 @@ describe("E1b3d2a final mutation fence (TOCTOU)", () => {
 
   it("focus-triggered route drift: execCommand=0, text empty, write_probe_route_drift", () => {
     const { doc, state, calls, getCurrentHref } = makeToctouDom({ driftOn: "focus" });
-    const r = runWriteProbe(doc, {
-      expectedRoute: ROUTE,
-      expectedGeneration: 3,
-      locationHref: ROUTE,
-      parseRoute: sharedParse,
-      localGeneration: 3,
-      getCurrentHref,
+    const r = writeCanonicalMessage(doc, WRITE_PROBE_MESSAGE, {
+      routeValid: true,
+      mutationGuard: () => getCurrentHref() === ROUTE,
     });
     expect(r.ok).toBe(false);
     expect(r.reason).toBe("write_probe_route_drift");
@@ -1016,13 +776,9 @@ describe("E1b3d2a final mutation fence (TOCTOU)", () => {
 
   it("selection-triggered route drift after addRange: execCommand still blocked", () => {
     const { doc, state, calls, getCurrentHref } = makeToctouDom({ driftOn: "addRange" });
-    const r = runWriteProbe(doc, {
-      expectedRoute: ROUTE,
-      expectedGeneration: 3,
-      locationHref: ROUTE,
-      parseRoute: sharedParse,
-      localGeneration: 3,
-      getCurrentHref,
+    const r = writeCanonicalMessage(doc, WRITE_PROBE_MESSAGE, {
+      routeValid: true,
+      mutationGuard: () => getCurrentHref() === ROUTE,
     });
     expect(r.ok).toBe(false);
     expect(r.reason).toBe("write_probe_route_drift");
@@ -1034,22 +790,12 @@ describe("E1b3d2a final mutation fence (TOCTOU)", () => {
   });
 
   it("textarea native-setter drift: no setter, no input event, value unchanged", () => {
-    // With locationHref provided: read1 = prewrite D, read2 = mutationGuard.
-    // Flip on read 2 so only the last fence sees OTHER_ROUTE.
-    let reads = 0;
-    const getCurrentHref = () => {
-      reads += 1;
-      if (reads >= 2) return OTHER_ROUTE;
-      return ROUTE;
-    };
+    // 最后 mutationGuard 读取当前页面，导航变化时禁止 native setter。
+    const getCurrentHref = () => OTHER_ROUTE;
     const { doc, calls } = makeToctouDom({ textarea: true });
-    const r = runWriteProbe(doc, {
-      expectedRoute: ROUTE,
-      expectedGeneration: 2,
-      locationHref: ROUTE,
-      parseRoute: sharedParse,
-      localGeneration: 2,
-      getCurrentHref,
+    const r = writeCanonicalMessage(doc, WRITE_PROBE_MESSAGE, {
+      routeValid: true,
+      mutationGuard: () => getCurrentHref() === ROUTE,
     });
     expect(r.ok).toBe(false);
     expect(r.reason).toBe("write_probe_route_drift");
@@ -1061,21 +807,38 @@ describe("E1b3d2a final mutation fence (TOCTOU)", () => {
 
   it("stable route: write once + verify exact + zero Send/click (success regression)", () => {
     const { doc, state, calls, getCurrentHref } = makeToctouDom({});
-    const r = runWriteProbe(doc, {
-      expectedRoute: ROUTE,
-      expectedGeneration: 9,
-      locationHref: ROUTE,
-      parseRoute: sharedParse,
-      localGeneration: 9,
-      getCurrentHref,
+    const r = writeCanonicalMessage(doc, WRITE_PROBE_MESSAGE, {
+      routeValid: true,
+      mutationGuard: () => getCurrentHref() === ROUTE,
     });
     expect(r.ok).toBe(true);
     expect(r.wrote).toBe(true);
-    expect(r.verified).toBe(true);
-    expect(r.noSend).toBe(true);
+    expect(verifyCanonicalComposer(doc, WRITE_PROBE_MESSAGE, { routeValid: true }).ok).toBe(true);
     expect(state.text).toBe(WRITE_PROBE_MESSAGE);
     expect(calls.execCommand).toBe(1);
     expect(calls.clicks).toBe(0);
+  });
+
+  it("source: mutationGuard sits immediately before execCommand / setNativeValue", () => {
+    const src = fs.readFileSync(path.join(companionRoot, "composer-write-adapter.js"), "utf8");
+    const ce = src.slice(src.indexOf("function writeContentEditable"));
+    const ceBody = ce.slice(0, ce.indexOf("export function verifyCanonicalComposer"));
+    const guardIdx = ceBody.indexOf("runMutationGuard");
+    const execIdx = ceBody.indexOf('doc.execCommand("insertText"');
+    expect(guardIdx).toBeGreaterThan(-1);
+    expect(execIdx).toBeGreaterThan(guardIdx);
+    // No await between guard and execCommand.
+    const between = ceBody.slice(guardIdx, execIdx);
+    expect(between).not.toMatch(/\bawait\b/);
+
+    const ta = src.slice(src.indexOf("export function writeCanonicalMessage"));
+    const taBody = ta.slice(0, ta.indexOf("function writeContentEditable"));
+    const taGuard = taBody.indexOf("runMutationGuard");
+    const taSet = taBody.indexOf("setNativeValue(editor, message, win)");
+    expect(taGuard).toBeGreaterThan(-1);
+    expect(taSet).toBeGreaterThan(taGuard);
+    expect(taBody.slice(taGuard, taSet)).not.toMatch(/\bawait\b/);
+
   });
 
   it("writeCanonicalMessage mutationGuard: false/throw fail closed without write", () => {
@@ -1099,424 +862,6 @@ describe("E1b3d2a final mutation fence (TOCTOU)", () => {
     expect(thrown.reason).toBe("write_probe_route_drift");
     expect(state.text).toBe("");
     expect(calls.execCommand).toBe(0);
-  });
-
-  it("source: mutationGuard sits immediately before execCommand / setNativeValue", () => {
-    const src = fs.readFileSync(path.join(companionRoot, "composer-write-adapter.js"), "utf8");
-    const ce = src.slice(src.indexOf("function writeContentEditable"));
-    const ceBody = ce.slice(0, ce.indexOf("export function verifyCanonicalComposer"));
-    const guardIdx = ceBody.indexOf("runMutationGuard");
-    const execIdx = ceBody.indexOf('doc.execCommand("insertText"');
-    expect(guardIdx).toBeGreaterThan(-1);
-    expect(execIdx).toBeGreaterThan(guardIdx);
-    // No await between guard and execCommand.
-    const between = ceBody.slice(guardIdx, execIdx);
-    expect(between).not.toMatch(/\bawait\b/);
-
-    const ta = src.slice(src.indexOf("export function writeCanonicalMessage"));
-    const taBody = ta.slice(0, ta.indexOf("function writeContentEditable"));
-    const taGuard = taBody.indexOf("runMutationGuard");
-    const taSet = taBody.indexOf("setNativeValue(editor, message, win)");
-    expect(taGuard).toBeGreaterThan(-1);
-    expect(taSet).toBeGreaterThan(taGuard);
-    expect(taBody.slice(taGuard, taSet)).not.toMatch(/\bawait\b/);
-
-    // runWriteProbe builds live href guard via shared parser, not a cached boolean.
-    const probe = src.slice(src.indexOf("export function runWriteProbe"));
-    expect(probe).toMatch(/mutationGuard/);
-    expect(probe).toMatch(/getCurrentHref|readHref/);
-    expect(probe).toMatch(/resolveMutationCanonicalRoute/);
-    expect(probe).toMatch(/parseRoute/);
-    // No independent pathname regex left in write-probe mutation authority.
-    const wp = fs.readFileSync(path.join(companionRoot, "write-probe.js"), "utf8");
-    expect(wp).toMatch(/parseChatgptConversationRoute/);
-    expect(wp).not.toMatch(/^\/c\\\/\(\[0-9a-fA-F\]/m);
-  });
-});
-
-describe("E1b3d2a write probe negative fences", () => {
-  it("dirty composer → zero write", () => {
-    const { doc, state, clicks } = makeComposerDom({ mode: "idle", text: "already here" });
-    const before = state.text;
-    const r = runWriteProbe(doc, {
-      expectedRoute: ROUTE,
-      expectedGeneration: 1,
-      locationHref: ROUTE,
-      parseRoute: sharedParse,
-      localGeneration: 1,
-    });
-    expect(r.ok).toBe(false);
-    expect(r.reason).toBe("composer_dirty");
-    expect(state.text).toBe(before);
-    expect(clicks.n).toBe(0);
-  });
-
-  it("action=stop → zero write", () => {
-    const { doc, state, clicks } = makeComposerDom({ mode: "stop", text: "" });
-    const r = runWriteProbe(doc, {
-      expectedRoute: ROUTE,
-      expectedGeneration: 1,
-      locationHref: ROUTE,
-      parseRoute: sharedParse,
-      localGeneration: 1,
-    });
-    expect(r.ok).toBe(false);
-    expect(r.reason).toBe("generation_active");
-    expect(state.text).toBe("");
-    expect(clicks.n).toBe(0);
-  });
-
-  it("action=unknown → zero write", () => {
-    const { doc, state, clicks } = makeComposerDom({ mode: "unknown", text: "" });
-    const r = runWriteProbe(doc, {
-      expectedRoute: ROUTE,
-      expectedGeneration: 1,
-      locationHref: ROUTE,
-      parseRoute: sharedParse,
-      localGeneration: 1,
-    });
-    expect(r.ok).toBe(false);
-    expect(r.reason).toBe("generation_unknown");
-    expect(state.text).toBe("");
-    expect(clicks.n).toBe(0);
-  });
-
-  it("wrong route → zero write", () => {
-    const { doc, state, clicks } = makeComposerDom({ mode: "idle", text: "" });
-    const r = runWriteProbe(doc, {
-      expectedRoute: ROUTE,
-      expectedGeneration: 1,
-      locationHref: "https://chatgpt.com/c/99999999-9999-4999-8999-999999999999",
-      parseRoute: sharedParse,
-      localGeneration: 1,
-    });
-    expect(r.ok).toBe(false);
-    expect(r.reason).toBe("write_probe_route_drift");
-    expect(state.text).toBe("");
-    expect(clicks.n).toBe(0);
-  });
-
-  it("generation mismatch → zero write", () => {
-    const { doc, state, clicks } = makeComposerDom({ mode: "idle", text: "" });
-    const r = runWriteProbe(doc, {
-      expectedRoute: ROUTE,
-      expectedGeneration: 3,
-      locationHref: ROUTE,
-      parseRoute: sharedParse,
-      localGeneration: 4,
-    });
-    expect(r.ok).toBe(false);
-    expect(r.reason).toBe("write_probe_generation_mismatch");
-    expect(state.text).toBe("");
-    expect(clicks.n).toBe(0);
-  });
-
-  it("second probe after successful write is rejected as dirty (no auto-clear)", () => {
-    const { doc, state, clicks } = makeComposerDom({ mode: "idle", text: "" });
-    const first = runWriteProbe(doc, {
-      expectedRoute: ROUTE,
-      expectedGeneration: 2,
-      locationHref: ROUTE,
-      parseRoute: sharedParse,
-      localGeneration: 2,
-    });
-    expect(first.ok).toBe(true);
-    const second = runWriteProbe(doc, {
-      expectedRoute: ROUTE,
-      expectedGeneration: 2,
-      locationHref: ROUTE,
-      parseRoute: sharedParse,
-      localGeneration: 2,
-    });
-    expect(second.ok).toBe(false);
-    expect(second.reason).toBe("composer_dirty");
-    expect(state.text).toBe(WRITE_PROBE_MESSAGE);
-    expect(clicks.n).toBe(0);
-  });
-});
-
-describe("E1b3d2a SW write-probe contract (pure)", () => {
-  const owner = {
-    tabId: 5,
-    documentId: "doc-1",
-    canonicalRoute: ROUTE,
-    generation: 11,
-  };
-  const transport = { routeCanonical: ROUTE, authStale: false };
-
-  it("buildWriteProbeRequest uses sendOptions.documentId + fixed type", () => {
-    const req = buildWriteProbeRequest(owner, transport);
-    expect(req.ok).toBe(true);
-    expect(req.tabId).toBe(5);
-    expect(req.sendOptions).toEqual({ documentId: "doc-1" });
-    expect(req.message.type).toBe("c2c.write.probe.execute");
-    expect(req.message.expectedRoute).toBe(ROUTE);
-    expect(req.message.expectedGeneration).toBe(11);
-  });
-
-  it("rejects invalid owner / authStale / route mismatch / missing generation", () => {
-    expect(buildWriteProbeRequest({ ...owner, documentId: "" }, transport).reason)
-      .toBe("owner_document_invalid");
-    expect(buildWriteProbeRequest(owner, { ...transport, authStale: true }).reason)
-      .toBe("auth_stale");
-    expect(buildWriteProbeRequest(
-      { ...owner, canonicalRoute: ROUTE.replace("1111", "9999") },
-      transport,
-    ).reason).toBe("owner_route_mismatch");
-    expect(buildWriteProbeRequest({ ...owner, generation: undefined as unknown as number }, transport)
-      .reason).toBe("owner_generation_missing");
-  });
-
-  it("validateWriteProbeResponse requires mode/noSend/route/generation AND wrote+verified", () => {
-    const base = {
-      ok: true,
-      mode: "write_probe_no_send",
-      noSend: true,
-      canonicalRoute: ROUTE,
-      generation: 11,
-      wrote: true,
-      verified: true,
-    };
-    expect(validateWriteProbeResponse(base, owner, transport).ok).toBe(true);
-    expect(validateWriteProbeResponse({ ...base, mode: "read_only" }, owner, transport).reason)
-      .toBe("write_probe_response_invalid");
-    expect(validateWriteProbeResponse({ ...base, noSend: false }, owner, transport).reason)
-      .toBe("write_probe_response_invalid");
-    expect(validateWriteProbeResponse({ ...base, generation: 10 }, owner, transport).reason)
-      .toBe("write_probe_generation_mismatch");
-    expect(validateWriteProbeResponse(
-      { ...base, canonicalRoute: ROUTE.replace("1111", "9999") },
-      owner,
-      transport,
-    ).reason).toBe("write_probe_route_mismatch");
-  });
-
-  it("explicit CS failure is known failure — never success, reason preserved", () => {
-    const dirty = {
-      ok: false,
-      reason: "composer_dirty",
-      wrote: false,
-      verified: false,
-      mode: "write_probe_no_send",
-      noSend: true,
-      canonicalRoute: ROUTE,
-      generation: 11,
-    };
-    const r = validateWriteProbeResponse(dirty, owner, transport);
-    expect(r.ok).toBe(false);
-    expect(r.reason).toBe("composer_dirty");
-    expect(r.knownFailure).toBe(true);
-    expect(r.wrote).toBe(false);
-    expect(r.verified).toBe(false);
-
-    for (const reason of [
-      "generation_active",
-      "generation_unknown",
-      "write_probe_route_drift",
-      "composer_write_error",
-      "composer_write_mismatch",
-      "composer_text_mismatch",
-      "write_probe_generation_mismatch",
-    ]) {
-      const res = validateWriteProbeResponse({ ...dirty, reason }, owner, transport);
-      expect(res.ok).toBe(false);
-      expect(res.reason).toBe(reason);
-    }
-
-    const noReason = validateWriteProbeResponse(
-      { ...dirty, reason: undefined as unknown as string },
-      owner,
-      transport,
-    );
-    expect(noReason.reason).toBe("write_probe_failed");
-  });
-
-  it("ok=true with wrote/verified not both true → write_probe_response_inconsistent", () => {
-    const base = {
-      mode: "write_probe_no_send",
-      noSend: true,
-      canonicalRoute: ROUTE,
-      generation: 11,
-    };
-    const wroteOnly = validateWriteProbeResponse(
-      { ...base, ok: true, wrote: true, verified: false },
-      owner,
-      transport,
-    );
-    expect(wroteOnly.ok).toBe(false);
-    expect(wroteOnly.reason).toBe("write_probe_response_inconsistent");
-    const verifiedOnly = validateWriteProbeResponse(
-      { ...base, ok: true, wrote: false, verified: true },
-      owner,
-      transport,
-    );
-    expect(verifiedOnly.reason).toBe("write_probe_response_inconsistent");
-    const neither = validateWriteProbeResponse(
-      { ...base, ok: true, wrote: false, verified: false },
-      owner,
-      transport,
-    );
-    expect(neither.reason).toBe("write_probe_response_inconsistent");
-  });
-
-  it("SW source: journal gate, in-flight, outcome_unknown no-retry, popup sender", () => {
-    const sw = fs.readFileSync(path.join(companionRoot, "service-worker.js"), "utf8");
-    expect(sw).toMatch(/c2c\.write\.probe\.request/);
-    expect(sw).toMatch(/write_probe_journal_active/);
-    expect(sw).toMatch(/write_probe_in_flight/);
-    expect(sw).toMatch(/write_outcome_unknown/);
-    expect(sw).toMatch(/retryAllowed:\s*false/);
-    expect(sw).toMatch(/writeProbeInFlight/);
-    expect(sw).toMatch(/journalActive\(journal\)/);
-    expect(sw).toMatch(/tabs\.sendMessage\(\s*request\.tabId,\s*request\.message,\s*request\.sendOptions/);
-    expect(sw).toMatch(/popup_sender_required/);
-    expect(sw).toMatch(/write_probe_payload_forbidden/);
-    const probeStart = sw.indexOf("async function handleWriteProbe");
-    const probeEnd = sw.indexOf("/** Exact-owner document check for CS production RPCs. */");
-    expect(probeStart).toBeGreaterThan(0);
-    expect(probeEnd).toBeGreaterThan(probeStart);
-    const probeBody = sw.slice(probeStart, probeEnd);
-    expect(probeBody).not.toMatch(/markReserveRequested|markReserved|begin-send|\/ack\b|SEND_INTENT|CLAIMED/);
-  });
-
-  it("CS source: local fences + __c2cRunWriteProbe, same handler no await between check and write", () => {
-    const cs = fs.readFileSync(path.join(companionRoot, "content-script.js"), "utf8");
-    expect(cs).toMatch(/c2c\.write\.probe\.execute/);
-    expect(cs).toMatch(/__c2cRunWriteProbe/);
-    expect(cs).not.toMatch(/\.click\(/);
-    // E1b3d3b: CS may wire production DI globals by name; it must not implement them.
-    expect(cs).not.toMatch(/function writeCanonicalMessage/);
-    expect(cs).not.toMatch(/function dispatchNativeSend/);
-  });
-
-  it("SW source: known CS failure ≠ outcome_unknown; success requires wrote+verified", () => {
-    const sw = fs.readFileSync(path.join(companionRoot, "service-worker.js"), "utf8");
-    expect(sw).toMatch(/validateWriteProbeResponse/);
-    // Known failure path returns concrete reason with wrote/verified + retryAllowed false.
-    const probeFn = sw.slice(sw.indexOf("async function handleWriteProbe"));
-    const probeBody = probeFn.slice(0, probeFn.indexOf("chrome.runtime.onMessage"));
-    expect(probeBody).toMatch(/journalUnchanged:\s*true/);
-    expect(probeBody).toMatch(/retryAllowed:\s*false/);
-    // write_outcome_unknown only for rpcThrew/null — not for received CS failure.
-    const unknownIdx = probeBody.indexOf("write_outcome_unknown");
-    const checkIdx = probeBody.indexOf("validateWriteProbeResponse");
-    expect(unknownIdx).toBeGreaterThan(-1);
-    expect(unknownIdx).toBeLessThan(checkIdx);
-  });
-
-  it("parseChatgptRouteStrict delegates to shared parser (no independent regex)", () => {
-    expect(parseChatgptRouteStrict(ROUTE, sharedParse)?.canonical).toBe(ROUTE);
-    expect(parseChatgptRouteStrict("https://www.chatgpt.com/c/11111111-1111-4111-8111-111111111111", sharedParse)?.canonical)
-      .toBe(ROUTE);
-    expect(parseChatgptRouteStrict("https://chatgpt.com/c/11111111-1111-4111-8111-111111111111/", sharedParse)?.canonical)
-      .toBe(ROUTE);
-    // UUID charset accepts mixed case; shared parser preserves conversation id as-is.
-    expect(parseChatgptRouteStrict("https://chatgpt.com/c/11111111-1111-4111-8111-11111111111A", sharedParse)?.canonical)
-      .toBe("https://chatgpt.com/c/11111111-1111-4111-8111-11111111111A");
-  });
-
-  it("shared-parser parity: /c and /g/g-.../c accepted; GPT prefix preserved", () => {
-    const uuid = "11111111-1111-4111-8111-111111111111";
-    expect(resolveMutationCanonicalRoute(`https://chatgpt.com/c/${uuid}`, sharedParse))
-      .toEqual({ ok: true, canonical: `https://chatgpt.com/c/${uuid}` });
-    expect(resolveMutationCanonicalRoute(`https://www.chatgpt.com/c/${uuid}`, sharedParse))
-      .toEqual({ ok: true, canonical: `https://chatgpt.com/c/${uuid}` });
-    const gpt = `https://chatgpt.com/g/g-abc123/c/${uuid}`;
-    expect(resolveMutationCanonicalRoute(gpt, sharedParse))
-      .toEqual({ ok: true, canonical: gpt });
-    expect(resolveMutationCanonicalRoute(`https://www.chatgpt.com/g/g-abc123/c/${uuid}`, sharedParse))
-      .toEqual({ ok: true, canonical: gpt });
-    // Must NOT collapse GPT route to /c/<uuid>.
-    expect(parseChatgptRouteStrict(gpt, sharedParse)?.canonical).toBe(gpt);
-  });
-
-  it("parseChatgptRouteStrict rejects query/hash/extra path/protocol/host", () => {
-    const uuid = "11111111-1111-4111-8111-111111111111";
-    expect(parseChatgptRouteStrict(`https://chatgpt.com/c/${uuid}?x=1`, sharedParse)).toBeNull();
-    expect(parseChatgptRouteStrict(`https://chatgpt.com/c/${uuid}#x`, sharedParse)).toBeNull();
-    expect(parseChatgptRouteStrict(`https://chatgpt.com/c/${uuid}/extra`, sharedParse)).toBeNull();
-    expect(parseChatgptRouteStrict(`http://chatgpt.com/c/${uuid}`, sharedParse)).toBeNull();
-    expect(parseChatgptRouteStrict(`https://evil.example/c/${uuid}`, sharedParse)).toBeNull();
-    expect(parseChatgptRouteStrict("https://chatgpt.com/", sharedParse)).toBeNull();
-    expect(parseChatgptRouteStrict("", sharedParse)).toBeNull();
-    expect(parseChatgptRouteStrict("not a url", sharedParse)).toBeNull();
-    // Default https:443 is same as no port under companion policy.
-    expect(parseChatgptRouteStrict(`https://chatgpt.com:443/c/${uuid}`, sharedParse)?.canonical).toBe(ROUTE);
-    // Non-default port rejected.
-    expect(parseChatgptRouteStrict(`https://chatgpt.com:8443/c/${uuid}`, sharedParse)).toBeNull();
-    // Malformed UUID / gpt id rejected.
-    expect(parseChatgptRouteStrict("https://chatgpt.com/c/not-a-uuid", sharedParse)).toBeNull();
-    expect(parseChatgptRouteStrict(`https://chatgpt.com/g/bad_id/c/${uuid}`, sharedParse)).toBeNull();
-  });
-
-  it("parser unavailable → write_probe_route_parser_missing, never loose fallback", () => {
-    const missing = resolveMutationCanonicalRoute(ROUTE, undefined as never);
-    // globalThis.parseChatgptConversationRoute is not installed in this unit file.
-    expect(missing.ok).toBe(false);
-    expect(missing.reason).toBe("write_probe_route_parser_missing");
-    const { doc, state, clicks } = makeComposerDom({ mode: "idle", text: "" });
-    const r = runWriteProbe(doc, {
-      expectedRoute: ROUTE,
-      expectedGeneration: 1,
-      locationHref: ROUTE,
-      parseRoute: undefined as never,
-      localGeneration: 1,
-    });
-    expect(r.ok).toBe(false);
-    expect(r.reason).toBe("write_probe_route_parser_missing");
-    expect(state.text).toBe("");
-    expect(clicks.n).toBe(0);
-  });
-});
-
-describe("E1b3d2a runtime packaging gates", () => {
-  it("默认 manifest 加载轻量 DOM 能力，不加载旧 orchestrator", () => {
-    const manifest = JSON.parse(fs.readFileSync(path.join(companionRoot, "manifest.json"), "utf8"));
-    const js = (manifest.content_scripts ?? []).flatMap((cs: { js?: string[] }) => cs.js ?? []);
-    expect(js).toEqual(LIGHT_CONTENT_SCRIPTS);
-    expect(js).not.toContain("send-adapter.js");
-    expect(js).not.toContain("send-orchestrator.js");
-    expect(js).not.toContain("production-send-runtime.js");
-    expect(js).not.toContain("route-attestation.js");
-    expect(js).not.toContain("route-attestation-run.js");
-    expect(js).not.toContain("feedback-bootstrap-run.js");
-    expect(js).not.toContain("dom-adapter.js");
-    expect(js).not.toContain("turn-observer.js");
-    expect(js).toContain("dom-adapter-global.js");
-    expect(js).toContain("turn-observer-global.js");
-    for (const p of manifest.permissions ?? []) {
-      expect(["scripting", "debugger", "nativeMessaging", "webRequest"]).not.toContain(p);
-    }
-  });
-
-  it("classic write adapter exposes only __c2cRunWriteProbe and write globals", () => {
-    if (!fs.existsSync(path.join(distCompanion, "composer-write-adapter.js"))) {
-      expect(true).toBe(true);
-      return;
-    }
-    const classic = fs.readFileSync(path.join(distCompanion, "composer-write-adapter.js"), "utf8");
-    expect(classic).toMatch(/globalThis\.__c2cRunWriteProbe/);
-    expect(classic).toMatch(/WRITE_PROBE_MESSAGE/);
-    expect(classic).toMatch(/globalThis\.__c2cResolveMutationCanonicalRoute\s*=/);
-    expect(classic).not.toMatch(/globalThis\.resolveMutationCanonicalRoute\s*=/);
-    expect(classic).not.toMatch(/dispatchNativeSend/);
-    expect(classic).not.toMatch(/\.click\(/);
-    expect(classic).not.toMatch(/runSendOrchestration/);
-    expect(classic).not.toMatch(/begin-send/);
-    const cs = fs.readFileSync(path.join(distCompanion, "content-script.js"), "utf8");
-    // E1b3d3b: CS may name production DI keys; must not implement write/click.
-    expect(cs).not.toMatch(/function writeCanonicalMessage/);
-    expect(cs).not.toMatch(/function dispatchNativeSend/);
-    expect(cs).not.toMatch(/\.click\(/);
-  });
-
-  it("build script forbids send/click in classic write adapter", () => {
-    const build = fs.readFileSync(path.join(projectRoot, "scripts", "build-browser-companion.mjs"), "utf8");
-    expect(build).toMatch(/composer-write-adapter\.js/);
-    expect(build).toMatch(/__c2cResolveMutationCanonicalRoute/);
-    expect(build).toMatch(/must not expose unnamespaced resolveMutationCanonicalRoute/);
-    expect(build).toMatch(/__c2cRunWriteProbe/);
-    expect(build).toMatch(/must stay write-only/);
   });
 });
 

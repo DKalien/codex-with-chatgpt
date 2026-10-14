@@ -45,18 +45,6 @@ import { stageReceiptFinalization, writeReceiptFinalizationAlert } from "../src/
 import { Workspace } from "../src/workspace/manager.js";
 import { CODEX_FEEDBACK_SCOPE, routeChallengeDigest } from "../src/feedback/store.js";
 import { cleanup, isolateStateDir, makeTmpDir } from "./helpers.js";
-import {
-  clearJournal,
-  markClaimed,
-  markComposerWriteIntent,
-  markObservedPendingAck,
-  markReserveRequested,
-  markReserved,
-  markSendDispatchIntent,
-  markSendIntent,
-  reconcileSendJournal,
-  emptyJournal,
-} from "../browser-companion/reservation-journal.js";
 
 let stateDir: string;
 let wsRoot: string;
@@ -1537,7 +1525,7 @@ describe("E1b3a canonical production feedback message", () => {
 });
 
 describe("E1b3a late positive ACK", () => {
-  it("ACK response-loss contract: observed inFlight=null; journal retry_ack; idempotent ACK", () => {
+  it("ACK response-loss contract: observed inFlight=null; idempotent ACK", () => {
     // 1) reserve
     const event = setupReadyEvent("ack-lost");
     const paired = pairCompanion();
@@ -1561,39 +1549,6 @@ describe("E1b3a late positive ACK", () => {
       reservationId: reserved.reservationId,
       stateDir,
     });
-    // 3) local journal → OBSERVED_PENDING_ACK (pure only; no DOM)
-    let journal = emptyJournal();
-    journal = markReserveRequested(journal, {
-      routeCanonical: ROUTE,
-      bindingId: ctx.bindingId,
-      epoch: ctx.epoch,
-    });
-    journal = markReserved(journal, {
-      eventId: event.eventId,
-      reservationId: reserved.reservationId,
-      routeCanonical: ROUTE,
-      bindingId: ctx.bindingId,
-      epoch: ctx.epoch,
-    });
-    journal = markSendIntent(journal, {
-      eventId: event.eventId,
-      reservationId: reserved.reservationId,
-      routeCanonical: ROUTE,
-      bindingId: ctx.bindingId,
-      epoch: ctx.epoch,
-    });
-    journal = markClaimed(journal, {
-      eventId: event.eventId,
-      reservationId: reserved.reservationId,
-      attemptId: sent.attemptId,
-      message: sent.message,
-      messageSha256: sent.messageSha256,
-    });
-    journal = markComposerWriteIntent(journal, { attemptId: sent.attemptId });
-    journal = markSendDispatchIntent(journal, { attemptId: sent.attemptId });
-    journal = markObservedPendingAck(journal, { attemptId: sent.attemptId });
-    expect(journal.state).toBe("OBSERVED_PENDING_ACK");
-
     // 4) server ACK success (response lost to client)
     companionAckObserved({
       workspaceId: workspace.id,
@@ -1612,10 +1567,6 @@ describe("E1b3a late positive ACK", () => {
     });
     expect(st.inFlight).toBeNull();
 
-    // 6) reconcile: retry_ack (idempotent ACK, never resend)
-    const rec = reconcileSendJournal(journal, st.inFlight);
-    expect(rec.action).toBe("retry_ack");
-
     // 7) duplicate exact ACK still observed
     const again = companionAckObserved({
       workspaceId: workspace.id,
@@ -1627,9 +1578,7 @@ describe("E1b3a late positive ACK", () => {
     });
     expect(again.status).toBe("observed");
 
-    // 8) after successful ACK response, journal can clear
-    const cleared = clearJournal();
-    expect(cleared.state).toBe("NONE");
+
   });
 
   it("exact late ACK：outcome_unknown → observed", () => {

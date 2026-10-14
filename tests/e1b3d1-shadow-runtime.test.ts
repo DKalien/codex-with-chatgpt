@@ -1,355 +1,22 @@
 import { describe, expect, it } from "vitest";
+
 import fs from "node:fs";
+
 import path from "node:path";
+
 import { fileURLToPath } from "node:url";
-import {
-  observeChatGptSafety,
-  resolveChatGptComposer,
-  resolveChatGptAction,
-  normalizeCanonicalDomText,
-  inspectChatGptActionEvidence,
-  inspectActiveComposerControls,
-  inspectComposerContainerInventory,
-  isExcludedEmbeddedEditor,
-} from "../browser-companion/dom-adapter.js";
+
+import { resolveChatGptComposer, resolveChatGptAction, inspectChatGptActionEvidence, inspectActiveComposerControls, inspectComposerContainerInventory, isExcludedEmbeddedEditor } from "../browser-companion/dom-adapter.js";
+
 import { snapshotUserTurns, findCanonicalUserTurn } from "../browser-companion/turn-observer.js";
-import { inspectShadowEvidence } from "../browser-companion/shadow-evidence.js";
-import {
-  isExtensionInternalSender,
-  buildShadowInspectRequest,
-  validateShadowInspectResponse,
-  buildOwnerLocalShadowInspectRequest,
-  validateOwnerLocalShadowInspectResponse,
-} from "../browser-companion/shadow-rpc.js";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
 const companionRoot = path.join(projectRoot, "browser-companion");
-const distCompanion = path.join(projectRoot, "dist", "browser-companion");
 
-const ROUTE = "https://chatgpt.com/c/11111111-1111-4111-8111-111111111111";
 const ATTEMPT = "22222222-2222-4222-8222-222222222222";
+
 const MESSAGE = `[C2C_CONTROL]\nSTATE: EXECUTED\nATTEMPT_ID: ${ATTEMPT}\n`;
-
-function parseRoute(href: string) {
-  const m = /https:\/\/chatgpt\.com\/c\/([0-9a-f-]{36})/i.exec(href);
-  if (!m) throw new Error("bad route");
-  return { canonical: `https://chatgpt.com/c/${m[1]!.toLowerCase()}` };
-}
-
-function makeEdgeDom(mode: "idle" | "send" | "stop" | "empty-doc", text = "") {
-  const state = { text };
-  const voice = {
-    className: "composer-submit-button-color text-submit-btn-text",
-    getAttribute: (n: string) => (n === "aria-label" ? "启动语音功能" : null),
-    hasAttribute: () => false,
-    disabled: false,
-  };
-  const send = {
-    className: "composer-submit-button-color text-submit-btn-text",
-    getAttribute: (n: string) => (n === "data-testid" ? "send-button" : null),
-    hasAttribute: (n: string) => n === "data-testid",
-    disabled: false,
-  };
-  const stop = {
-    className: "composer-submit-button-color composer-submit-btn",
-    getAttribute: (n: string) => (n === "data-testid" ? "composer-stop-button" : null),
-    hasAttribute: (n: string) => n === "data-testid",
-    disabled: false,
-  };
-  const form = {
-    querySelector(selector: string) {
-      if (mode === "idle" && selector === "button.composer-submit-button-color") return voice;
-      if (mode === "send" && selector === 'button[data-testid="send-button"]') return send;
-      if (mode === "stop" && selector === "button.composer-submit-button-color") return stop;
-      return null;
-    },
-  };
-  const editor = {
-    getAttribute: (n: string) => (n === "contenteditable" ? "true" : null),
-    hasAttribute: () => false,
-    closest: (s: string) => (s === "form" ? form : null),
-    focus: () => {
-      throw new Error("shadow must not focus");
-    },
-  };
-  Object.defineProperty(editor, "textContent", {
-    get() {
-      return state.text;
-    },
-    set() {
-      throw new Error("shadow must not write");
-    },
-    configurable: true,
-  });
-  if (mode === "empty-doc") {
-    return {
-      doc: {
-        querySelector: () => null,
-        querySelectorAll: () => [],
-      } as never,
-      state,
-    };
-  }
-  return {
-    doc: {
-      querySelector(selector: string) {
-        if (selector.includes("ProseMirror") || selector === "#prompt-textarea") return editor;
-        if (selector.includes("textarea")) return null;
-        if (selector === "body") return {};
-        if (selector === "main") return {};
-        if (mode === "stop" && selector.includes("Stop")) {
-          return { getAttribute: () => "Stop generating", hasAttribute: () => false, disabled: false };
-        }
-        return null;
-      },
-      querySelectorAll: () => [],
-    } as never,
-    state,
-  };
-}
-
-const helpers = {
-  observeChatGptSafety,
-  resolveChatGptComposer,
-  resolveChatGptAction,
-  inspectChatGptActionEvidence,
-  normalizeCanonicalDomText,
-  snapshotUserTurns,
-  parseChatgptConversationRoute: parseRoute,
-};
-
-describe("E1b3d1 shadow evidence (read-only)", () => {
-  it("scenario A empty composer: idle, no exact send-button, safe idle", () => {
-    const { doc } = makeEdgeDom("idle", "");
-    const ev = inspectShadowEvidence(doc, {
-      ...helpers,
-      locationHref: ROUTE,
-      now: 1,
-    });
-    expect(ev.ok).toBe(true);
-    expect(ev.mode).toBe("read_only");
-    expect(ev.canonicalRoute).toBe(ROUTE);
-    expect(ev.composer.present).toBe(true);
-    expect(ev.composer.editorKind).toBe("contenteditable");
-    expect(ev.composer.textEmpty).toBe(true);
-    expect(ev.action.kind).toBe("idle");
-    expect(ev.action.hasExactSendButton).toBe(false);
-    expect(ev.composer.evidence).toBe("prompt_textarea");
-    expect(ev.safety.generation).toBe("idle");
-    expect(ev.safety.safe).toBe(true);
-  });
-
-  it("scenario B dirty composer: send + exact send-button", () => {
-    const { doc } = makeEdgeDom("send", MESSAGE);
-    const ev = inspectShadowEvidence(doc, {
-      ...helpers,
-      locationHref: ROUTE,
-      now: 2,
-    });
-    expect(ev.ok).toBe(true);
-    expect(ev.composer.textEmpty).toBe(false);
-    expect(ev.action.kind).toBe("send");
-    expect(ev.action.enabled).toBe(true);
-    expect(ev.action.hasExactSendButton).toBe(true);
-    expect(ev.safety.safe).toBe(false); // dirty
-  });
-
-  it("stop/generating and empty document fail closed", () => {
-    const stopDom = makeEdgeDom("stop", "");
-    const stopEv = inspectShadowEvidence(stopDom.doc, { ...helpers, locationHref: ROUTE });
-    expect(stopEv.safety.generation).toBe("generating");
-    expect(stopEv.safety.safe).toBe(false);
-
-    const empty = makeEdgeDom("empty-doc");
-    const emptyEv = inspectShadowEvidence(empty.doc, { ...helpers, locationHref: ROUTE });
-    expect(emptyEv.composer.present).toBe(false);
-  });
-
-  it("capability_missing when helpers absent", () => {
-    const { doc } = makeEdgeDom("idle", "");
-    const ev = inspectShadowEvidence(doc, { locationHref: ROUTE });
-    // globals not set in unit test unless injected
-    expect(ev.ok).toBe(false);
-    expect(ev.reason).toBe("capability_missing");
-  });
-
-  it("never focuses / writes even if editor is hostile", () => {
-    const { doc } = makeEdgeDom("idle", "");
-    expect(() => inspectShadowEvidence(doc, { ...helpers, locationHref: ROUTE })).not.toThrow();
-  });
-});
-
-describe("E1b3d1 exact owner RPC contract (pure validation)", () => {
-  function validateShadowResponse(response: Record<string, unknown>, route: string) {
-    if (!response || typeof response !== "object") return "malformed_shadow_response";
-    if (response.mode !== "read_only") return "shadow_response_invalid";
-    if (response.canonicalRoute !== route) return "shadow_route_mismatch";
-    if (response.documentCanonicalRoute && response.documentCanonicalRoute !== route) {
-      return "shadow_route_mismatch";
-    }
-    return null;
-  }
-
-  it("wrong document / route changed rejects; correct route accepts", () => {
-    expect(validateShadowResponse({ mode: "read_only", canonicalRoute: ROUTE }, ROUTE)).toBeNull();
-    expect(validateShadowResponse({ mode: "write", canonicalRoute: ROUTE }, ROUTE))
-      .toBe("shadow_response_invalid");
-    expect(validateShadowResponse({ mode: "read_only", canonicalRoute: ROUTE }, ROUTE.replace("1111", "9999")))
-      .toBe("shadow_route_mismatch");
-    expect(validateShadowResponse({
-      mode: "read_only",
-      canonicalRoute: ROUTE,
-      documentCanonicalRoute: ROUTE.replace("1111", "9999"),
-    }, ROUTE)).toBe("shadow_route_mismatch");
-    expect(validateShadowResponse(null, ROUTE)).toBe("malformed_shadow_response");
-  });
-});
-
-describe("E1b3d1 exact-document RPC (sendMessage options + generation + sender)", () => {
-  const owner = {
-    tabId: 7,
-    documentId: "doc-abc",
-    canonicalRoute: ROUTE,
-    generation: 12,
-  };
-  const transport = {
-    routeCanonical: ROUTE,
-    authStale: false,
-  };
-
-  it("buildShadowInspectRequest uses sendOptions.documentId (not payload-only)", () => {
-    const req = buildShadowInspectRequest(owner, transport);
-    expect(req.ok).toBe(true);
-    expect(req.tabId).toBe(7);
-    // Third-argument delivery options must carry exact documentId.
-    expect(req.sendOptions).toEqual({ documentId: "doc-abc" });
-    expect(req.sendOptions.documentId).toBe(owner.documentId);
-    expect(req.message.type).toBe("c2c.send.shadow.inspect");
-  });
-
-  it("owner route mismatch / invalid owner rejects before RPC", () => {
-    expect(buildShadowInspectRequest(
-      { ...owner, canonicalRoute: ROUTE.replace("1111", "9999") },
-      transport,
-    ).reason).toBe("owner_route_mismatch");
-    expect(buildShadowInspectRequest(
-      { ...owner, documentId: "" },
-      transport,
-    ).reason).toBe("owner_document_invalid");
-    expect(buildShadowInspectRequest(owner, { ...transport, authStale: true }).reason)
-      .toBe("auth_stale");
-  });
-
-  it("validateShadowInspectResponse requires exact generation", () => {
-    const base = { mode: "read_only", canonicalRoute: ROUTE, generation: 12 };
-    expect(validateShadowInspectResponse(base, owner, transport).ok).toBe(true);
-    expect(validateShadowInspectResponse(
-      { ...base, generation: 11 },
-      owner,
-      transport,
-    ).reason).toBe("shadow_generation_mismatch");
-    expect(validateShadowInspectResponse(
-      { ...base, generation: undefined },
-      owner,
-      transport,
-    ).reason).toBe("shadow_generation_mismatch");
-    expect(validateShadowInspectResponse(
-      { mode: "read_only", canonicalRoute: ROUTE.replace("1111", "9999"), generation: 12 },
-      owner,
-      transport,
-    ).reason).toBe("shadow_route_mismatch");
-  });
-
-  it("isExtensionInternalSender: popup yes, content-script tab no", () => {
-    expect(isExtensionInternalSender({ id: "ext" })).toBe(true);
-    expect(isExtensionInternalSender({ id: "ext", tab: undefined })).toBe(true);
-    expect(isExtensionInternalSender({ tab: { id: 3 } })).toBe(false);
-    expect(isExtensionInternalSender(null)).toBe(false);
-  });
-
-  it("SW source uses document-targeted sendMessage third arg", () => {
-    const sw = fs.readFileSync(path.join(companionRoot, "service-worker.js"), "utf8");
-    expect(sw).toMatch(/tabs\.sendMessage\(\s*request\.tabId,\s*request\.message,\s*request\.sendOptions/);
-    expect(sw).toMatch(/isExtensionInternalSender/);
-    expect(sw).toMatch(/popup_sender_required/);
-    expect(sw).toMatch(/shadow_generation_mismatch|validateOwnerLocalShadowInspectResponse/);
-  });
-});
-
-describe("R3i owner-local read-only shadow RPC", () => {
-  const owner = {
-    tabId: 7,
-    documentId: "doc-current-chat",
-    canonicalRoute: ROUTE
-      .replace("11111111-1111-4111-8111-111111111111", "33333333-3333-4333-8333-333333333333")
-      .replace("/c/", "/g/g-p-test/c/"),
-    generation: 19,
-  };
-
-  it("inspects a different owner route without consulting old transport", () => {
-    expect(buildShadowInspectRequest(owner, { routeCanonical: ROUTE, authStale: false }).reason)
-      .toBe("owner_route_mismatch");
-    const req = buildOwnerLocalShadowInspectRequest(owner);
-    expect(req).toEqual({
-      ok: true,
-      tabId: owner.tabId,
-      message: { type: "c2c.send.shadow.inspect" },
-      sendOptions: { documentId: owner.documentId },
-    });
-    expect(validateOwnerLocalShadowInspectResponse({
-      mode: "read_only",
-      canonicalRoute: owner.canonicalRoute,
-      documentCanonicalRoute: owner.canonicalRoute,
-      generation: owner.generation,
-      composer: { present: true },
-    }, owner).ok).toBe(true);
-  });
-
-  it("uses only owner route/document/generation and has no caller body fields", () => {
-    const req = buildOwnerLocalShadowInspectRequest(owner);
-    expect(req.message).toEqual({ type: "c2c.send.shadow.inspect" });
-    expect(req.sendOptions.documentId).toBe(owner.documentId);
-    expect(validateOwnerLocalShadowInspectResponse({
-      mode: "read_only",
-      canonicalRoute: owner.canonicalRoute,
-      documentCanonicalRoute: owner.canonicalRoute,
-      generation: owner.generation,
-    }, owner).ok).toBe(true);
-  });
-
-  it("fails closed on missing owner, malformed response, route mismatch, or generation mismatch", () => {
-    expect(buildOwnerLocalShadowInspectRequest(null).reason).toBe("owner_document_invalid");
-    expect(validateOwnerLocalShadowInspectResponse(null, owner).reason).toBe("malformed_shadow_response");
-    expect(validateOwnerLocalShadowInspectResponse({
-      mode: "read_only",
-      canonicalRoute: owner.canonicalRoute,
-      documentCanonicalRoute: ROUTE,
-      generation: owner.generation,
-    }, owner).reason).toBe("shadow_route_mismatch");
-    expect(validateOwnerLocalShadowInspectResponse({
-      mode: "read_only",
-      canonicalRoute: owner.canonicalRoute,
-      documentCanonicalRoute: owner.canonicalRoute,
-      generation: owner.generation + 1,
-    }, owner).reason).toBe("shadow_generation_mismatch");
-  });
-
-  it("service-worker inspect stays owner-local and read-only", () => {
-    const sw = fs.readFileSync(path.join(companionRoot, "service-worker.js"), "utf8").replace(/\r\n/g, "\n");
-    const start = sw.indexOf("async function handleShadowInspect() {");
-    const end = sw.indexOf("\n}\n\n/**", start);
-    expect(start).toBeGreaterThan(-1);
-    expect(end).toBeGreaterThan(start);
-    const body = sw.slice(start, end);
-    expect(body).toMatch(/if \(!ownerState\.owner\)[\s\S]*reason: "owner_missing"/);
-    expect(body).toMatch(/buildOwnerLocalShadowInspectRequest\(owner\)/);
-    expect(body).toMatch(/validateOwnerLocalShadowInspectResponse\(response, owner\)/);
-    expect(body).not.toMatch(/requireProtectedTransport|\btransport\b|journal\s*=|autonomy|connectFlow|persist|\.click\(|writeCanonicalMessage/);
-    const cs = fs.readFileSync(path.join(companionRoot, "content-script.js"), "utf8");
-    expect(cs).toMatch(/if \(message\.type === "c2c\.send\.shadow\.inspect"\)[\s\S]*?__c2cInspectShadowEvidence/);
-    expect(cs).not.toMatch(/function writeCanonicalMessage|function dispatchNativeSend|\.click\(\)/);
-  });
-});
 
 describe("E1b3d1 stop diagnostic (read-only, no priority change)", () => {
   function makeDiagDom(opts: {
@@ -472,34 +139,6 @@ describe("E1b3d1 stop diagnostic (read-only, no priority change)", () => {
     const diag = inspectChatGptActionEvidence(doc, editor);
     expect(diag.action.kind).toBe("idle");
     expect(diag.stopEvidence).toBeNull();
-  });
-
-  it("5. diagnostic is zero side-effect", () => {
-    const { doc, editor } = makeDiagDom({ docStop: true, formSend: true, text: MESSAGE });
-    expect(() => inspectChatGptActionEvidence(doc, editor)).not.toThrow();
-    const ev = inspectShadowEvidence(doc, {
-      ...helpers,
-      locationHref: ROUTE,
-      now: 1,
-    });
-    expect(ev.ok).toBe(true);
-    expect(ev.action.stopEvidence?.source).toBe("document_stop_button");
-    expect(ev.action.evidence).toBe("legacy_stop");
-  });
-
-  it("6. popup source renders evidence + stop diagnostic + READ ONLY", () => {
-    const popup = fs.readFileSync(path.join(companionRoot, "popup", "popup.js"), "utf8");
-    expect(popup).toMatch(/READ ONLY — no composer write \/ no Send/);
-    expect(popup).toMatch(/evidence=\$\{a\.evidence/);
-    expect(popup).toMatch(/stopSource=/);
-    expect(popup).toMatch(/stopTestId=/);
-    expect(popup).toMatch(/stopAria=/);
-    expect(popup).toMatch(/stopInForm=/);
-    expect(popup).toMatch(/formatControlInventory/);
-    expect(popup).toMatch(/shadow-controls/);
-    expect(popup).toMatch(/formatContainerInventory/);
-    expect(popup).toMatch(/shadow-containers/);
-    expect(popup).not.toMatch(/writeCanonicalMessage|dispatchNativeSend|\.click\(\)/);
   });
 });
 
@@ -817,49 +456,6 @@ describe("E1b3d1 action inventory (read-only, no resolver change)", () => {
       "title",
       "type",
     ]);
-  });
-
-  it("shadow evidence exposes action.inventory without changing kind/evidence semantics", () => {
-    const send = makeButton({
-      dataTestId: "send-button",
-      className: "composer-submit-button-color",
-    });
-    const form = {
-      querySelector: (sel: string) =>
-        sel === 'button[data-testid="send-button"]' ? send : null,
-      querySelectorAll: (sel: string) => (sel === "button" ? [send] : []),
-    };
-    const editor = {
-      getAttribute: () => "true",
-      hasAttribute: () => false,
-      closest: (s: string) => (s === "form" ? form : null),
-    };
-    Object.defineProperty(editor, "textContent", {
-      get: () => MESSAGE,
-      set() {
-        throw new Error("no write");
-      },
-      configurable: true,
-    });
-    const doc = {
-      querySelector: (sel: string) =>
-        sel.includes("ProseMirror") || sel === "#prompt-textarea" ? editor : null,
-      querySelectorAll: () => [],
-    } as never;
-    const ev = inspectShadowEvidence(doc, {
-      ...helpers,
-      inspectActiveComposerControls,
-      locationHref: ROUTE,
-      now: 3,
-    });
-    expect(ev.ok).toBe(true);
-    expect(ev.action.kind).toBe("send");
-    expect(ev.action.hasExactSendButton).toBe(true);
-    expect(ev.action.evidence).toBe("form_send_button");
-    const inv = (ev.action as { inventory?: { formPresent: boolean; buttonCount: number; buttons: InvButton[] } }).inventory;
-    expect(inv?.formPresent).toBe(true);
-    expect(inv?.buttonCount).toBe(1);
-    expect(inv?.buttons[0]?.matchesKnownSend).toBe(true);
   });
 
   it("resolver priority unchanged: stop still wins over send when both present", () => {
@@ -1205,49 +801,6 @@ describe("E1b3d1 composer container inventory (read-only, no form, no resolver c
     expect(b).not.toHaveProperty("value");
   });
 
-  it("8. zero side effect: hostile focus/click/write never invoked", () => {
-    const btn = makeBtn({ dataTestId: "x" });
-    const { doc, editor } = makeNoFormDom({
-      chainButtons: { 1: [btn] },
-      editorText: MESSAGE,
-    });
-    expect(() => inspectComposerContainerInventory(doc, editor)).not.toThrow();
-    expect(() => inspectChatGptActionEvidence(doc, editor)).not.toThrow();
-    expect(() => inspectShadowEvidence(doc, {
-      ...helpers,
-      inspectComposerContainerInventory,
-      locationHref: ROUTE,
-    })).not.toThrow();
-  });
-
-  it("shadow evidence exposes action.containerInventory; form inventory still present", () => {
-    const sendLike = makeBtn({ dataTestId: "send-button", className: "composer-submit-button-color" });
-    const { doc, editor } = makeNoFormDom({
-      chainButtons: { 1: [sendLike] },
-      chainMeta: { 1: { testId: "composer-shell", className: "composer-shell" } },
-      editorText: MESSAGE,
-    });
-    const ev = inspectShadowEvidence(doc, {
-      ...helpers,
-      inspectComposerContainerInventory,
-      locationHref: ROUTE,
-      now: 4,
-    });
-    expect(ev.ok).toBe(true);
-    expect(ev.action.kind).toBe("unknown");
-    const a = ev.action as {
-      inventory?: { formPresent: boolean };
-      containerInventory?: {
-        ancestors: { depth: number; dataTestId: string | null; descendantButtonCount: number }[];
-        controlContainers: { depth: number; buttons: ContainerButton[] }[];
-      };
-    };
-    expect(a.inventory?.formPresent).toBe(false);
-    expect(a.containerInventory?.ancestors[0]?.depth).toBe(1);
-    expect(a.containerInventory?.ancestors[0]?.dataTestId).toBe("composer-shell");
-    expect(a.containerInventory?.controlContainers[0]?.buttons[0]?.dataTestId).toBe("send-button");
-  });
-
   it("diagnostic includes containerInventory while keeping old inventory fields", () => {
     const { doc, editor } = makeNoFormDom({ chainButtons: { 1: [] }, editorText: MESSAGE });
     const diag = inspectChatGptActionEvidence(doc, editor);
@@ -1354,55 +907,6 @@ describe("E1b3d1 composer identity (Writing Block exclusion, no Send change)", (
     expect(isExcludedEmbeddedEditor(standalone)).toBe(false);
   });
 
-  it("1. collision: Writing Block ProseMirror first + #prompt-textarea primary → primary wins", () => {
-    const wb = makeWritingBlockEditor("WB");
-    const primary = makePrimaryComposer(MESSAGE);
-    const doc = {
-      querySelector(selector: string) {
-        if (selector === "#prompt-textarea") return primary.editor;
-        if (selector.includes("ProseMirror") || selector.includes("contenteditable")) {
-          return wb.editor;
-        }
-        if (selector.includes("textarea")) return null;
-        if (selector === "body") return {};
-        if (selector === "main") return {};
-        return null;
-      },
-      querySelectorAll(selector: string) {
-        if (selector.includes("ProseMirror") || selector.includes("contenteditable")) {
-          return [wb.editor];
-        }
-        return [];
-      },
-    } as never;
-
-    const resolved = resolveChatGptComposer(doc);
-    expect(resolved.editor).toBe(primary.editor);
-    expect(resolved.editor).not.toBe(wb.editor);
-    expect(resolved.evidence).toBe("prompt_textarea");
-    expect(resolved.kind).toBe("contenteditable");
-    expect(String(resolved.editor?.textContent)).toContain("C2C_CONTROL");
-
-    const action = resolveChatGptAction(doc, resolved.editor);
-    expect(action.kind).toBe("send");
-    expect(action.evidence).toBe("form_send_button");
-
-    const ev = inspectShadowEvidence(doc, {
-      ...helpers,
-      locationHref: ROUTE,
-      now: 10,
-    });
-    expect(ev.ok).toBe(true);
-    expect(ev.composer.present).toBe(true);
-    expect(ev.composer.evidence).toBe("prompt_textarea");
-    expect(ev.composer.textEmpty).toBe(false);
-    expect(ev.action.kind).toBe("send");
-    // Writing Block buttons are outside primary form scope.
-    const inv = (ev.action as { inventory?: { formPresent: boolean } }).inventory;
-    expect(inv?.formPresent).toBe(true);
-    expect(JSON.stringify(ev)).not.toContain("WRITING BLOCK SECRET");
-  });
-
   it("2. no #prompt-textarea; generic candidates: WB first, standalone second → standalone", () => {
     const wb = makeWritingBlockEditor("WB");
     const standaloneForm = {
@@ -1446,36 +950,6 @@ describe("E1b3d1 composer identity (Writing Block exclusion, no Send change)", (
     expect(resolved.editor).toBe(standalone);
     expect(resolved.evidence).toBe("fallback_prosemirror");
     expect(isExcludedEmbeddedEditor(resolved.editor)).toBe(false);
-  });
-
-  it("3. only Writing Block editor → composer missing, fail closed", () => {
-    const wb = makeWritingBlockEditor("WB ONLY");
-    const doc = {
-      querySelector(selector: string) {
-        if (selector === "#prompt-textarea") return null;
-        if (selector.includes("ProseMirror") || selector.includes("contenteditable")) {
-          return wb.editor;
-        }
-        if (selector.includes("textarea")) return null;
-        if (selector === "body") return {};
-        if (selector === "main") return {};
-        return null;
-      },
-      querySelectorAll(selector: string) {
-        if (selector.includes("ProseMirror") || selector.includes("contenteditable")) {
-          return [wb.editor];
-        }
-        return [];
-      },
-    } as never;
-    const resolved = resolveChatGptComposer(doc);
-    expect(resolved.editor).toBeNull();
-    expect(resolved.kind).toBe("unknown");
-    expect(resolved.evidence).toBeNull();
-
-    const ev = inspectShadowEvidence(doc, { ...helpers, locationHref: ROUTE });
-    expect(ev.composer.present).toBe(false);
-    expect(ev.composer.textEmpty).toBeNull();
   });
 
   it("4. textarea primary path retained (textarea[data-id=root])", () => {
@@ -1554,13 +1028,6 @@ describe("E1b3d1 composer identity (Writing Block exclusion, no Send change)", (
       querySelectorAll: (s: string) => (s === "form textarea" || s === "textarea" ? [ta] : []),
     } as never;
     expect(resolveChatGptComposer(docTa).evidence).toBe("fallback_textarea");
-  });
-
-  it("popup source shows composerEvidence and READ ONLY", () => {
-    const popup = fs.readFileSync(path.join(companionRoot, "popup", "popup.js"), "utf8");
-    expect(popup).toMatch(/composerEvidence=/);
-    expect(popup).toMatch(/READ ONLY — no composer write \/ no Send/);
-    expect(popup).not.toMatch(/writeCanonicalMessage|dispatchNativeSend|\.click\(\)/);
   });
 
   it("packaging exports isExcludedEmbeddedEditor; resolver source keeps strong id first", () => {
@@ -1674,24 +1141,6 @@ describe("E1b3d1 exact Send vs Stop disambiguation (real Edge 2026-09-16)", () =
     expect(b.matchesKnownSend).toBe(true);
     expect(b.matchesKnownActionSlot).toBe(true);
     expect(b.matchesKnownStop).toBe(false);
-  });
-
-  it("real Edge dirty shadow: composerEvidence=prompt_textarea, action=send, gen=idle, safe=false", () => {
-    const { doc } = makeRealEdgeDirtySendDom();
-    const ev = inspectShadowEvidence(doc, {
-      ...helpers,
-      locationHref: ROUTE,
-      now: 20,
-    });
-    expect(ev.ok).toBe(true);
-    expect(ev.composer.evidence).toBe("prompt_textarea");
-    expect(ev.composer.textEmpty).toBe(false);
-    expect(ev.action.kind).toBe("send");
-    expect(ev.action.evidence).toBe("form_send_button");
-    expect(ev.action.hasExactSendButton).toBe(true);
-    expect(ev.action.stopEvidence).toBeNull();
-    expect(ev.safety.generation).toBe("idle");
-    expect(ev.safety.safe).toBe(false); // dirty composer
   });
 
   it("A. data-testid=stop-button still stop", () => {
@@ -1870,104 +1319,6 @@ describe("E1b3d1 exact Send vs Stop disambiguation (real Edge 2026-09-16)", () =
 });
 
 describe("E1b3d1 packaging + runtime safety gates", () => {
-  it("默认 manifest 加载轻量能力，不加载旧 shadow runtime", () => {
-    const manifest = JSON.parse(fs.readFileSync(path.join(companionRoot, "manifest.json"), "utf8"));
-    const js = (manifest.content_scripts ?? []).flatMap((cs: { js?: string[] }) => cs.js ?? []);
-    expect(js).toContain("turn-observer-global.js");
-    expect(js).not.toContain("turn-observer.js");
-    expect(js).not.toContain("dom-adapter.js");
-    expect(js).not.toContain("shadow-evidence.js");
-    expect(js).toContain("content-lite.js");
-    expect(js).not.toContain("send-adapter.js");
-    expect(js).not.toContain("send-orchestrator.js");
-    for (const p of manifest.permissions ?? []) {
-      expect(["scripting", "debugger", "nativeMessaging", "webRequest"]).not.toContain(p);
-    }
-  });
-
-  it("content-script + shadow path have no write/click/begin-send/ack", () => {
-    for (const name of ["shadow-evidence.js", "turn-observer.js"]) {
-      const text = fs.readFileSync(path.join(companionRoot, name), "utf8");
-      expect(text).not.toMatch(/writeCanonicalMessage/);
-      expect(text).not.toMatch(/dispatchNativeSend/);
-      expect(text).not.toMatch(/runSendOrchestration/);
-      expect(text).not.toMatch(/\/begin-send/);
-      expect(text).not.toMatch(/\.click\(\)/);
-      expect(text).not.toMatch(/execCommand\(/);
-    }
-    // E1b3d3b: CS may name DI wrappers for production runtime globals, but must not implement write/click.
-    const cs = fs.readFileSync(path.join(companionRoot, "content-script.js"), "utf8");
-    expect(cs).not.toMatch(/function writeCanonicalMessage/);
-    expect(cs).not.toMatch(/function dispatchNativeSend/);
-    expect(cs).not.toMatch(/runSendOrchestration/);
-    expect(cs).not.toMatch(/\/begin-send/);
-    expect(cs).not.toMatch(/\.click\(\)/);
-    expect(cs).not.toMatch(/execCommand\(/);
-    const sw = fs.readFileSync(path.join(companionRoot, "service-worker.js"), "utf8");
-    expect(sw).toMatch(/c2c\.shadow\.send\.inspect/);
-    expect(sw).toMatch(/isExtensionInternalSender/);
-    expect(sw).toMatch(/shadow-rpc\.js/);
-    const rpc = fs.readFileSync(path.join(companionRoot, "shadow-rpc.js"), "utf8");
-    expect(rpc).toMatch(/c2c\.send\.shadow\.inspect/);
-    expect(rpc).toMatch(/documentId/);
-    // E1b3d3b: SW may own production /begin-send and /ack; CS still must not.
-    expect(sw).toMatch(/c2c\.production\.send\.request/);
-    expect(sw).not.toMatch(/function writeCanonicalMessage/);
-    expect(sw).not.toMatch(/function dispatchNativeSend/);
-    expect(sw).not.toMatch(/runSendOrchestration/);
-    expect(cs).not.toMatch(/\/begin-send/);
-    expect(cs).not.toMatch(/\/ack\b/);
-    const popup = fs.readFileSync(path.join(companionRoot, "popup", "popup.html"), "utf8");
-    expect(popup).toMatch(/READ ONLY/);
-    expect(popup).not.toMatch(/Send message/i);
-  });
-
-  it("popup has no Send button, only shadow inspect", () => {
-    const html = fs.readFileSync(path.join(companionRoot, "popup", "popup.html"), "utf8");
-    expect(html).toMatch(/shadow-inspect/);
-    expect(html).toMatch(/Inspect Send capability \(read-only\)/);
-    expect(html).toMatch(/shadow-controls/);
-    expect(html).toMatch(/Control inventory — READ ONLY/);
-    expect(html).toMatch(/shadow-containers/);
-    expect(html).toMatch(/Composer containers — READ ONLY/);
-    const js = fs.readFileSync(path.join(companionRoot, "popup", "popup.js"), "utf8");
-    expect(js).toMatch(/c2c\.shadow\.send\.inspect/);
-    expect(js).toMatch(/formatControlInventory/);
-    expect(js).toMatch(/formatContainerInventory/);
-    expect(js).not.toMatch(/writeCanonicalMessage/);
-    expect(js).not.toMatch(/dispatchNativeSend/);
-    expect(js).not.toMatch(/\.click\(\)/);
-  });
-
-  it("dist packages read-only capability when built", () => {
-    if (!fs.existsSync(distCompanion)) {
-      // Build not run in this unit pass — packaging gate still enforced at build time.
-      expect(true).toBe(true);
-      return;
-    }
-    for (const f of ["turn-observer.js", "shadow-evidence.js", "content-script.js"]) {
-      expect(fs.existsSync(path.join(distCompanion, f))).toBe(true);
-    }
-    const cs = fs.readFileSync(path.join(distCompanion, "content-script.js"), "utf8");
-    // E1b3d3b: CS may name production DI keys; must not implement write/click.
-    expect(cs).not.toMatch(/function writeCanonicalMessage/);
-    expect(cs).not.toMatch(/function dispatchNativeSend/);
-    expect(cs).not.toMatch(/\.click\(\)/);
-    const shadow = fs.readFileSync(path.join(distCompanion, "shadow-evidence.js"), "utf8");
-    expect(shadow).not.toMatch(/writeCanonicalMessage|dispatchNativeSend|\.click\(\)/);
-    const dom = fs.readFileSync(path.join(distCompanion, "dom-adapter-global.js"), "utf8");
-    expect(dom).toMatch(/inspectActiveComposerControls/);
-    expect(dom).toMatch(/globalThis\.inspectActiveComposerControls/);
-    expect(dom).toMatch(/inspectComposerContainerInventory/);
-    expect(dom).toMatch(/globalThis\.inspectComposerContainerInventory/);
-    expect(dom).toMatch(/isExcludedEmbeddedEditor/);
-    expect(dom).toMatch(/globalThis\.isExcludedEmbeddedEditor/);
-    expect(dom).not.toMatch(/writeCanonicalMessage|dispatchNativeSend|\.click\(\)/);
-    // ESM SW artifact must not carry classic footer.
-    const domEsm = fs.readFileSync(path.join(distCompanion, "dom-adapter.js"), "utf8");
-    expect(domEsm).toMatch(/^export\s/m);
-    expect(domEsm).not.toMatch(/globalThis\.resolveChatGptComposer\s*=/);
-  });
 
   it("dom-adapter inventory source stays read-only and privacy-capped", () => {
     const src = fs.readFileSync(path.join(companionRoot, "dom-adapter.js"), "utf8");
@@ -2010,91 +1361,5 @@ describe("user-turn observer still available for shadow", () => {
   it("snapshotUserTurns / findCanonicalUserTurn remain read-only exports", () => {
     expect(typeof snapshotUserTurns).toBe("function");
     expect(typeof findCanonicalUserTurn).toBe("function");
-  });
-});
-
-describe("E1b3d1 R3 current-voice shadow diagnostic (read-only)", () => {
-  // R3 2026-09-25 observed blank-composer voice control: 4 form buttons, the
-  // main control carries exact aria `开始语音` + both structural class tokens.
-  function makeCurrentVoiceShadowDom(
-    opts: { voiceClass?: string; voiceAria?: string; voiceDisabled?: boolean; text?: string } = {},
-  ) {
-    const voice = {
-      className: opts.voiceClass ?? "size-token-button-composer bg-composer-primary",
-      getAttribute: (n: string) => (n === "aria-label" ? (opts.voiceAria ?? "开始语音") : null),
-      hasAttribute: () => false,
-      disabled: opts.voiceDisabled ?? false,
-    };
-    const buttons = [
-      { className: "bg-token-button", getAttribute: () => null, hasAttribute: () => false, disabled: false },
-      { className: "bg-token-button", getAttribute: () => null, hasAttribute: () => false, disabled: false },
-      { className: "bg-token-button", getAttribute: () => null, hasAttribute: () => false, disabled: false },
-      voice,
-    ];
-    const form = {
-      querySelector: () => null,
-      querySelectorAll(sel: string) {
-        if (sel === "button") return buttons;
-        if (
-          sel === 'button[aria-label="开始语音"]'
-          && (opts.voiceAria ?? "开始语音") === "开始语音"
-        ) {
-          return [voice];
-        }
-        return [];
-      },
-    };
-    const editor = {
-      getAttribute: (n: string) => (n === "contenteditable" ? "true" : null),
-      hasAttribute: () => false,
-      className: "ProseMirror",
-      closest: (s: string) => (s === "form" ? form : null),
-    };
-    Object.defineProperty(editor, "textContent", {
-      get: () => opts.text ?? "",
-      set: () => {
-        throw new Error("no write");
-      },
-    });
-    const doc = {
-      querySelector(selector: string) {
-        if (selector.includes("ProseMirror") || selector === "#prompt-textarea") return editor;
-        if (selector === "body" || selector === "main") return {};
-        return null;
-      },
-      querySelectorAll: () => [],
-    };
-    return { doc: doc as never };
-  }
-
-  it("current fixture: action=idle/current_voice_idle, gen=idle, safe=true, inventory boolean true", () => {
-    const { doc } = makeCurrentVoiceShadowDom({});
-    const ev = inspectShadowEvidence(doc, { ...helpers, locationHref: ROUTE, now: 1 });
-    expect(ev.ok).toBe(true);
-    expect(ev.action.kind).toBe("idle");
-    expect(ev.action.enabled).toBe(true);
-    expect(ev.action.evidence).toBe("current_voice_idle");
-    expect(ev.action.hasExactSendButton).toBe(false);
-    expect(ev.safety.composer).toBe("empty");
-    expect(ev.safety.generation).toBe("idle");
-    expect(ev.safety.safe).toBe(true);
-    const voiceRow = ev.action.inventory.buttons.find(
-      (b: { ariaLabel?: string | null }) => b.ariaLabel === "开始语音",
-    );
-    expect(voiceRow?.matchesKnownVoiceIdle).toBe(true);
-    expect(voiceRow?.matchesKnownStop).toBe(false);
-  });
-
-  it("missing class token: shadow stays unknown, gen unknown, inventory boolean false", () => {
-    const { doc } = makeCurrentVoiceShadowDom({ voiceClass: "bg-composer-primary" });
-    const ev = inspectShadowEvidence(doc, { ...helpers, locationHref: ROUTE, now: 1 });
-    expect(ev.ok).toBe(true);
-    expect(ev.action.kind).toBe("unknown");
-    expect(ev.safety.generation).toBe("unknown");
-    expect(ev.safety.safe).toBe(false);
-    const voiceRow = ev.action.inventory.buttons.find(
-      (b: { ariaLabel?: string | null }) => b.ariaLabel === "开始语音",
-    );
-    expect(voiceRow?.matchesKnownVoiceIdle).toBe(false);
   });
 });

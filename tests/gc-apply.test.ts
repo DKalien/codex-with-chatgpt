@@ -547,7 +547,7 @@ describe("gc apply 安全算法", () => {
 describe("gc apply CLI contract", () => {
   function run(state: string, ...args: string[]) {
     const env = { ...process.env, C2C_STATE_DIR: state };
-    const entry = path.join(project, "src/cli/index.ts");
+    const entry = path.join(project, "tests/fixtures/gc-cli.ts");
     return spawnSync(process.execPath, ["--import", "tsx", entry, "gc", ...args], {
       cwd: project, encoding: "utf8", windowsHide: true, env,
     });

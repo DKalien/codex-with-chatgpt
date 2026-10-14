@@ -20,7 +20,7 @@
 - `bridge-client.js`：每项目凭据与偏好、Bridge 请求、真实 tab/document 关联及任务面板请求。
 - `content-lite.js`：转发真实页面身份，报告 DOM 状态，执行一次已授权 DOM 操作并观察精确结果；DOM adapter 使用构建后的 classic artifacts。
 
-项目 registry 继续使用 `c2c_companion_projects_v1`；项目凭据与偏好使用每 workspace 的受保护存储。content 与 popup 不接收长期凭据。旧 `service-worker.js`、`content.js`、`popup/popup.html` 及 phase/owner-proof/route-attest/fence/journal 链保留兼容和回归用途，当前 manifest 不默认加载。
+项目 registry 继续使用 `c2c_companion_projects_v1`；项目凭据与偏好使用每 workspace 的受保护存储。content 与 popup 不接收长期凭据。2026-10-13 本轮已从源码退役旧 `service-worker.js`、`content-script.js`、`popup/popup.html`、专属 phase/owner-proof/route-attest/fence/journal/autonomy/send-probe 编排与测试，构建不再产出这些旧入口。共享 DOM/observer/write/click/route/project-context 依赖和 operations 任务面板保留；Bridge legacy 协议、Result Bus 与 receipt 历史兼容合同不变。本轮退役尚未部署，不代表已安装扩展或运行中的 Bridge 已升级。
 
 ## Bridge 与浏览器的职责
 
@@ -42,7 +42,7 @@ Bridge 判定 OAuth scope、本机确认、binding/enable、owner/project/worksp
 
 ## 部署与验收观察快照
 
-以下为 2026-10-13（北京时间）的本机观察，不代表之后的实时状态。
+以下为 2026-10-13（北京时间）、本轮旧伴侣源码退役之前的本机观察，不代表之后的实时状态或本轮退役验收。
 
 - 正式串行全量回归：194 个文件、4087 个 tests 通过，exit 0。随后 `formatPending` / `www` 两处小修的定向回归为 7 个文件、138 个 tests 通过；最终 `typecheck`、`build` 与 `git diff --check` 通过。Python Desktop 89 项、daemon 29 项通过。
 - 已安装轻量实现 build `c30737ce0e7e553f4fde34882041279c951087721eb3368d30016728b899a0df`；workspace `2582910bf0d2` / `d94af68105aa` 由同一 Gateway PID `19868` 托管，运行版本均为 current，无 pending。

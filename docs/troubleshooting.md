@@ -48,9 +48,9 @@ Do not interrupt an active Review Bridge to clear pending status.
 
 ## Common situations
 
-### 兼容实现：旧网页接管完成，但 Companion 仍未连接
+### 历史诊断：旧网页接管完成，但 Companion 仍未连接（2026-10-13 源码退役）
 
-以下高级诊断与 phase 恢复仅适用于保留的旧实现；当前 manifest 不加载旧 popup/SW。默认流程见下方“日常连接与本机确认”。
+以下为已退役旧 popup/SW 的历史诊断，不作为现役恢复步骤。本轮只退役源码及专属测试，尚未部署；Bridge 历史状态与恢复合同仍保留。现役流程见下方“日常连接与本机确认”。
 
 “ChatGPT 已接管”、保存的 binding VERIFIED、当前网页已验证和完整连接是不同阶段。先查看高级诊断的 connectState、recovery、currentPageMatchesBinding、bindingEpoch、routeAttestFence、reason，连同当前 route 核对；不要复制配对密钥或凭据。任务面板的 Codex/网页可用性也分别判断。
 
@@ -77,13 +77,13 @@ Do not interrupt an active Review Bridge to clear pending status.
 
 扩展更新或 Reload 后，刷新实际 ChatGPT 对话页以加载当前 content script，无需重新配对；再查看页面连接、输入框和生成状态。若扩展重启后缺少原 tab/document 关联，按上文显式连接相同已验证目标。面板“可接收结果”只是当前接收条件，不证明已完成 DOM Send 或 observed/ACK；浏览器版本无法直接核验时应保留该验收缺口。
 
-### 兼容实现：已连接，但旧扩展徽标显示 C×
+### 历史诊断：已连接，但旧扩展徽标显示 C×（2026-10-13 源码退役）
 
-当前对话已连接只表示页面连接成功。若本地发送日志为 `OUTCOME_UNKNOWN`，`C×` 表示某条回流是否送达尚未确认；自动回流开关可以仍为开启，但后续发送受恢复门禁阻挡。此时 popup 显示“已开启 · 回流待核验”，网页空闲且其他连接条件正常时，任务摘要也显示“回流待核验”；徽标悬停提示说明原因。不要清除日志或重复发送来消除标记。切换项目后徽标按所选项目重新计算，历史隔离记录的数量本身不决定徽标。
+以下徽标与旧弹窗描述仅供历史理解；现役轻量流程见上方“日常连接与本机确认”。当前对话已连接只表示页面连接成功。若旧本地发送日志为 `OUTCOME_UNKNOWN`，`C×` 表示某条回流是否送达尚未确认；自动回流开关可以仍为开启，但后续发送受恢复门禁阻挡。此时 popup 显示“已开启 · 回流待核验”，网页空闲且其他连接条件正常时，任务摘要也显示“回流待核验”；徽标悬停提示说明原因。不要清除日志或重复发送来消除标记。切换项目后徽标按所选项目重新计算，历史隔离记录的数量本身不决定徽标。
 
 ### 唯一发送标记存在，但回流仍未确认
 
-默认轻量链只观察原 attempt，精确匹配失败不 ACK、不重发。以下高级诊断字段属于旧兼容界面，轻量弹窗不提供这些按钮或统计。
+默认轻量链只观察原 attempt，精确匹配失败不 ACK、不重发。以下高级诊断字段属于 2026-10-13 已从源码退役的旧界面，仅供历史理解；共享 DOM 精确正文观察仍保留，轻量弹窗不提供这些旧按钮或统计。
 
 高级诊断的 `recoveryDiagnostic.representation` 与手动恢复结果的 `diagnostic.representation` 仅在唯一精确 ATTEMPT 标记候选存在时报告已知结构的严格正文统计。`richBodyWrapperScannedCount` / `richBodyNodeScannedCount` 分别是已访问 wrapper / 正文节点数（上限 64 / 128）；`richBodyCount` 是扫描中已发现的正文数，扫描提前拒绝时不代表完整总数。因子节点数量预检而拒绝时，已访问计数可能尚未到上限。
 

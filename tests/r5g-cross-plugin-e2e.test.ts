@@ -29,9 +29,6 @@ import { resultBusCompanionDeliveryId } from "../src/bridge/result-bus-delivery.
 import { inspectCommandCleanupArtifacts } from "../src/command-cleanup/service.js";
 import { readCleanupJournal } from "../src/command-cleanup/fence.js";
 import { reconcileWorkspaceResultBus } from "../src/result-bus/service.js";
-import { emptyJournal, markClaimed, markOutcomeUnknown, markReserveRequested, markReserved, markSendIntent } from "../browser-companion/reservation-journal.js";
-import { recoverProductionSend, runProductionSend } from "../browser-companion/production-send-runtime.js";
-import { hasExactAttemptMarker } from "../browser-companion/turn-observer.js";
 import { renderCompletionNotification } from "../browser-companion/completion-notification.js";
 import { cleanup, isolateStateDir, makeTmpDir } from "./helpers.js";
 
@@ -55,7 +52,8 @@ const fence = {
 type Wire = { status: number; body: Record<string, any> };
 type ToolResponse = { isError?: boolean; content: Array<{ text: string }> };
 
-describe("R5g isolated cross-plugin production chain", () => {
+// 隔离 fixture 验证 Bridge HTTP 与持久状态；Desktop IPC 使用模拟适配器。
+describe("R5g 隔离跨插件 Bridge HTTP 与持久状态链", () => {
   let stateDir: string;
   let wsRoot: string;
   let previousStateDir: string | undefined;
@@ -198,7 +196,7 @@ describe("R5g isolated cross-plugin production chain", () => {
     cleanup(stateDir);
   });
 
-  it("真实 MCP→Desktop receipt→canonical Bus→Companion HTTP→Browser Send/ACK，重放不二次发送", async () => {
+  it("MCP→Desktop receipt→canonical Bus→Bridge HTTP begin-send/ACK，Desktop 派发重放保持幂等", async () => {
     const { sent, close, executorA, receipt } = await prepareCanonical();
     expect(close).toHaveBeenCalledTimes(1);
     expect(readDesktop(bridge.workspace.id)?.deliveries).toHaveLength(1);
@@ -253,66 +251,18 @@ describe("R5g isolated cross-plugin production chain", () => {
     const reservationId = reserved.body.reservationId as string;
     expect(eventId).toBe(resultBusCompanionDeliveryId(bus.entries[0]!.busEntryId));
 
-    let journal = markReserved(markReserveRequested(emptyJournal(), {
-      routeCanonical: ROUTE_A, bindingId: sinkA.bindingId, epoch: sinkA.epoch,
-    }), { eventId, reservationId, routeCanonical: ROUTE_A, bindingId: sinkA.bindingId, epoch: sinkA.epoch });
-    let composer = "";
-    const userTurns: string[] = [];
-    let claimedMessage = "";
-    let claimedMessageSha256 = "";
-    let terminalWitness = "";
-    let attemptId = "";
-    let frozenTarget: unknown;
-    let ackBody: Record<string, any> = {};
-    let clicks = 0;
-    const browser = await runProductionSend({
-      journal,
-      persistJournal: async (next: typeof journal) => { journal = next; return next; },
-      beginSend: async (input: { eventId: string; reservationId: string; routeCanonical: string }) => {
-        const response = await http("/begin-send", credential, {
-          eventId: input.eventId, reservationId: input.reservationId, routeCanonical: input.routeCanonical,
-        });
-        if (response.status !== 200) throw new Error(String(response.body.error));
-        const payload = completionPayload(response.body);
-        claimedMessage = payload.message;
-        claimedMessageSha256 = response.body.messageSha256 as string;
-        terminalWitness = response.body.terminalWitness as string;
-        attemptId = response.body.attemptId as string;
-        frozenTarget = readResultBus(bridge.workspace, stateDir)!.entries[0]!.sendTarget;
-        return payload;
-      },
-      ackObserved: async (input: { eventId: string; attemptId: string; routeCanonical: string }) => {
-        const response = await http("/ack", credential, {
-          eventId: input.eventId, attemptId: input.attemptId, routeCanonical: input.routeCanonical,
-          terminalWitness,
-        });
-        if (response.status !== 200) throw new Error(String(response.body.error));
-        ackBody = response.body;
-        return response.body;
-      },
-      writeCanonicalMessage: async (_doc: unknown, message: string) => { composer = message; return { ok: true }; },
-      verifyCanonicalComposer: async (_doc: unknown, message: string) => ({ ok: composer === message }),
-      dispatchNativeSend: async () => { clicks += 1; userTurns.push(composer); composer = ""; return { ok: true, clicked: 1 }; },
-      inspectComposerWriteCapability: () => ({ ok: true, editorKind: "contenteditable", action: { kind: "idle", enabled: true } }),
-      snapshotUserTurns: () => [],
-      findCanonicalUserTurn: (_doc: unknown, input: { message: string; attemptId: string }) => {
-        const exact = userTurns.filter(text => text === input.message && hasExactAttemptMarker(text, input.attemptId).ok);
-        return exact.length === 1 ? { ok: true, turn: { id: "r5g-user-turn", text: exact[0] } } : { ok: false, reason: "not_observed" };
-      },
-      hasExactAttemptMarker,
-      getCurrentRoute: () => ROUTE_A,
-      getCurrentGeneration: () => 1,
-      waitForSendReady: async () => ({ ok: true }),
-      doc: {}, expectedRoute: ROUTE_A, expectedGeneration: 1,
-      routeCanonical: ROUTE_A, bindingId: sinkA.bindingId, epoch: sinkA.epoch,
-      maxPollAttempts: 1, pollIntervalMs: 1, sleep: async () => {},
-    });
-    expect(browser.ok, JSON.stringify(browser)).toBe(true);
-    expect(clicks).toBe(1);
-    expect(userTurns).toEqual([claimedMessage]);
+    const claimed = await http("/begin-send", credential, { eventId, reservationId, routeCanonical: ROUTE_A });
+    expect(claimed.status).toBe(200);
+    const claimedMessage = completionPayload(claimed.body).message;
+    const claimedMessageSha256 = claimed.body.messageSha256 as string;
+    const terminalWitness = claimed.body.terminalWitness as string;
+    const attemptId = claimed.body.attemptId as string;
+    const frozenTarget = readResultBus(bridge.workspace, stateDir)!.entries[0]!.sendTarget;
+    const ack = await http("/ack", credential, { eventId, attemptId, routeCanonical: ROUTE_A, terminalWitness });
+    expect(ack.status).toBe(200);
+    const ackBody = ack.body;
     expect(claimedMessage).not.toContain(receipt.record.rawSummary);
     expect(claimedMessageSha256).toBe(createHash("sha256").update(claimedMessage).digest("hex"));
-    expect(journal.state).toBe("NONE");
     expect(ackBody).toMatchObject({ status: "observed", cleanupStatus: "cleaned" });
     expect(frozenTarget).toMatchObject({ bindingId: sinkA.bindingId, canonicalUrl: ROUTE_A });
     const cleanupTarget = { workspaceId: bridge.workspace.id, workspaceRoot: wsRoot, commandId: COMMAND, iteration: 1, stateDir };
@@ -337,7 +287,6 @@ describe("R5g isolated cross-plugin production chain", () => {
     expect(inspectCommandCleanupArtifacts(cleanupTarget)).toEqual([]);
     expect(fs.readFileSync(resultBusFile(bridge.workspace.id, stateDir), "utf8")).toBe(bytes);
     expect(sent).toHaveBeenCalledTimes(1);
-    expect(clicks).toBe(1);
   });
 
   it("未验证/无 Sink 不投递；stale reservation 重新排队；claimed 冻结目标拒绝 B 路由取消息或 ACK", async () => {
@@ -405,7 +354,7 @@ describe("R5g isolated cross-plugin production chain", () => {
       routeCanonical: ROUTE_B, eventId, reservationId: reservedB.body.reservationId,
     });
     expect(claimedB).toMatchObject({ status: 200, body: { status: "claimed" } });
-    expect(hasExactAttemptMarker(completionPayload(claimedB.body).message, claimedB.body.attemptId).ok).toBe(true);
+    expect(completionPayload(claimedB.body).message.split("\n").at(-1)).toBe(`ATTEMPT_ID: ${claimedB.body.attemptId}`);
     const frozen = readResultBus(bridge.workspace, stateDir)!.entries[0]!;
     expect(frozen.sendTarget?.bindingId).toBe(sinkB.bindingId);
     expect(frozen.sendTarget?.canonicalUrl).toBe(ROUTE_B);
@@ -432,7 +381,7 @@ describe("R5g isolated cross-plugin production chain", () => {
     expect(readResultBus(bridge.workspace, stateDir)!.entries[0]!.deliveryStatus).toBe("claimed");
   });
 
-  it("真实 Bus outcome_unknown 保留冻结目标；Browser recovery 不重试，切 Sink 也不暴露结果", async () => {
+  it("Bridge outcome_unknown 持久状态保留冻结目标；切 Sink 后 HTTP state/reserve 不暴露结果", async () => {
     await prepareCanonical();
     const credentialB = await pair(ROUTE_B);
     const sinkB = await bindSink(ROUTE_B, credentialB);
@@ -457,34 +406,6 @@ describe("R5g isolated cross-plugin production chain", () => {
       attemptId: claimed.body.attemptId, signal: claimed.body.signal,
       messageSha256: claimed.body.messageSha256,
     });
-    const recoveryPayload = completionPayload(serverState.body.inFlight);
-    const claimedJournal = markClaimed(markSendIntent(markReserved(markReserveRequested(emptyJournal(), {
-      routeCanonical: ROUTE_B, bindingId: sinkB.bindingId, epoch: sinkB.epoch,
-    }), {
-      eventId, reservationId, routeCanonical: ROUTE_B, bindingId: sinkB.bindingId, epoch: sinkB.epoch,
-    }), {}), {
-      eventId, reservationId, attemptId: claimed.body.attemptId,
-      message: claimedPayload.message, messageSha256: claimedPayload.messageSha256,
-    });
-    const unknownJournal = markOutcomeUnknown(claimedJournal, {});
-    const write = vi.fn();
-    const click = vi.fn();
-    const ack = vi.fn();
-    const begin = vi.fn();
-    const recovered = await recoverProductionSend({
-      journal: unknownJournal, inFlight: recoveryPayload, doc: {},
-      expectedRoute: ROUTE_B, expectedGeneration: 1,
-      getCurrentRoute: () => ROUTE_B, getCurrentGeneration: () => 1,
-      findCanonicalUserTurn: () => ({ ok: false, reason: "not_observed" }),
-      persistJournal: vi.fn(), ackObserved: ack,
-      writeCanonicalMessage: write, dispatchNativeSend: click, beginSend: begin,
-    });
-    expect(recovered).toMatchObject({ ok: false, reason: "outcome_unknown", zeroWrite: true, zeroClick: true });
-    expect(write).not.toHaveBeenCalled();
-    expect(click).not.toHaveBeenCalled();
-    expect(begin).not.toHaveBeenCalled();
-    expect(ack).not.toHaveBeenCalled();
-
     const credentialA = await pair(ROUTE_A);
     await bindSink(ROUTE_A, credentialA);
     expect((await http("/state", credentialA)).body.inFlight).toMatchObject({

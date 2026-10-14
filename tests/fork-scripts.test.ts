@@ -22,6 +22,7 @@ const temporaryDirs: string[] = [];
 const seeds: { root: string; snapshot: string }[] = [];
 let devSeed: string | undefined;
 let upstreamSeed: string | undefined;
+let upstreamTrackingSeed: string | undefined;
 
 afterEach(async () => {
   try {
@@ -103,9 +104,10 @@ function powerShell(script: string, repo: string, args: string[] = [], extraEnv:
   };
 }
 
-function makeUpstreamRepo(name: string): { repo: string; remote: string; script: string } {
+function makeUpstreamRepo(name: string, tracking = true): { repo: string; remote: string; script: string } {
   upstreamSeed ??= createUpstreamSeed();
-  const pair = copySeed(upstreamSeed, `fork-${name}`);
+  if (tracking) upstreamTrackingSeed ??= createUpstreamTrackingSeed(upstreamSeed);
+  const pair = copySeed(tracking ? upstreamTrackingSeed! : upstreamSeed, `fork-${name}`);
   const repo = path.join(pair, "repo"), remote = path.join(pair, "remote");
   const url = git(repo, "remote", "get-url", "upstream").trim();
   expect(url).toBe("../remote");
@@ -125,6 +127,19 @@ function createUpstreamSeed(): string {
   git(repo, "remote", "add", "upstream", "../remote");
   git(repo, "push", "upstream", "main");
   copyIntoRepo(repo, updateSource, "scripts/update-upstream-track.ps1");
+  seed.snapshot = seedSnapshot(root);
+  return root;
+}
+
+function createUpstreamTrackingSeed(source: string): string {
+  const root = makeTmpDir("fork-upstream-tracking-seed");
+  const seed = { root, snapshot: "" };
+  seeds.push(seed); // 部分复制或初始化失败时仍交给严格清理。
+  fs.cpSync(source, root, { recursive: true, force: false, errorOnExist: true });
+  expect(seedSnapshot(root)).toBe(seeds.find(item => item.root === source)!.snapshot);
+  const repo = path.join(root, "repo");
+  const result = update({ repo, script: path.join(repo, "scripts/update-upstream-track.ps1") });
+  expect(result.status, result.output).toBe(0);
   seed.snapshot = seedSnapshot(root);
   return root;
 }
@@ -399,7 +414,7 @@ windowsTests("fork maintenance scripts", () => {
   }, 120_000);
 
   it("创建 upstream-main 并设置 upstream/main tracking", () => {
-    const fixture = makeUpstreamRepo("create");
+    const fixture = makeUpstreamRepo("create", false);
     const result = update(fixture);
 
     expect(result.status, result.output).toBe(0);
@@ -411,8 +426,6 @@ windowsTests("fork maintenance scripts", () => {
 
   it("equal 状态不移动引用，远端快进时只做 fast-forward", () => {
     const fixture = makeUpstreamRepo("states");
-    const created = update(fixture);
-    expect(created.status, created.output).toBe(0);
     const equalSha = git(fixture.repo, "rev-parse", "refs/heads/upstream-main").trim();
     const equal = update(fixture);
     expect(equal.status).toBe(0);
@@ -431,8 +444,6 @@ windowsTests("fork maintenance scripts", () => {
 
   it("local-ahead 和 diverged 都停止且不覆盖 upstream-main", () => {
     const ahead = makeUpstreamRepo("ahead");
-    const aheadCreated = update(ahead);
-    expect(aheadCreated.status, aheadCreated.output).toBe(0);
     write(ahead.repo, "local-only.txt", "local only\n");
     git(ahead.repo, "add", "local-only.txt");
     git(ahead.repo, "commit", "-m", "local only");
@@ -444,8 +455,6 @@ windowsTests("fork maintenance scripts", () => {
     expect(git(ahead.repo, "rev-parse", "refs/heads/upstream-main").trim()).toBe(aheadSha);
 
     const diverged = makeUpstreamRepo("diverged");
-    const divergedCreated = update(diverged);
-    expect(divergedCreated.status, divergedCreated.output).toBe(0);
     const writer = tempDir("fork-diverged-writer");
     git(writer, "clone", "--branch", "main", diverged.remote, ".");
     write(diverged.repo, "local-only.txt", "local only\n");
@@ -467,8 +476,6 @@ windowsTests("fork maintenance scripts", () => {
 
   it("linked worktree checkout upstream-main 时拒绝移动", () => {
     const fixture = makeUpstreamRepo("worktree");
-    const created = update(fixture);
-    expect(created.status, created.output).toBe(0);
     const linked = tempDir("fork-linked-worktree");
     git(fixture.repo, "worktree", "add", linked, "upstream-main");
 
@@ -480,8 +487,6 @@ windowsTests("fork maintenance scripts", () => {
 
   it("同步时保留当前 branch、HEAD、dirty/staged/untracked 工作区和 stash", () => {
     const fixture = makeUpstreamRepo("preserve");
-    const created = update(fixture);
-    expect(created.status, created.output).toBe(0);
     const writer = tempDir("fork-preserve-writer");
     git(writer, "clone", "--branch", "main", fixture.remote, ".");
     write(writer, "remote-change.txt", "remote change\n");

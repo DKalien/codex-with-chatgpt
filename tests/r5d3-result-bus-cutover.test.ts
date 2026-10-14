@@ -57,7 +57,6 @@ import { projectChatgptRouteToWebSinkCandidate } from "../src/web-sink-control/i
 import { createCompanionRouter } from "../src/bridge/companion.js";
 import { readCompanionOperations } from "../src/bridge/companion-operations.js";
 import { claimNextForMcp } from "../src/mcp/feedback.js";
-import { evaluateServerObservedCloseout, findExactObservedEvent } from "../browser-companion/production-send.js";
 import { requestJson } from "./http-json.js";
 
 let stateDir: string;
@@ -1591,16 +1590,6 @@ describe("R5d3 Result Bus cutover", () => {
       expect(state.body.inFlight).toBeNull();
       const observed = { eventId, status: "observed", attemptId };
       expect(state.body.events.filter((event: { eventId: string }) => event.eventId === eventId)).toEqual([observed]);
-      for (const journalState of ["OUTCOME_UNKNOWN", "OBSERVED_PENDING_ACK"]) {
-        const journal = { state: journalState, eventId, attemptId };
-        const found = findExactObservedEvent(state.body.events, journal);
-        expect(found).toEqual({ ok: true, observed });
-        expect(evaluateServerObservedCloseout({ journal, inFlight: state.body.inFlight, serverObserved: found.observed }))
-          .toEqual({ ok: true, action: "server_observed_clear" });
-      }
-      expect(findExactObservedEvent(state.body.events, {
-        state: "OBSERVED_PENDING_ACK", eventId, attemptId: CLAIM_ATTEMPT_ALT,
-      }).ok).toBe(false);
       const duplicate = await fetchJson("/api/companion/v1/ack", {
         method: "POST", headers: auth, body: JSON.stringify(ackBody),
       });
@@ -1616,9 +1605,7 @@ describe("R5d3 Result Bus cutover", () => {
       });
       expect(otherRoute.status).toBe(200);
       expect(otherRoute.body.events).not.toContainEqual(observed);
-      expect(findExactObservedEvent(otherRoute.body.events, {
-        state: "OBSERVED_PENDING_ACK", eventId, attemptId,
-      }).ok).toBe(false);
+
     });
 
     for (const sameRouteSuccessor of [false, true]) {
