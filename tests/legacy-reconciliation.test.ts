@@ -349,7 +349,7 @@ describe("legacy accepted reconciliation", () => {
     expect(fs.readFileSync(file, "utf8")).toBe(before);
   });
 
-  it.each([1, 7, 40])("retention horizon 后正常 command cleanup 删除 %i 条仍只读重验 snapshot", holes => {
+  it("retention horizon 后正常 command cleanup 删除 1/7/40 条仍只读重验 snapshot", () => {
     seedDelivery();
     seedEvidenceSources();
     reconcileLegacyAccepted(workspace, commandId);
@@ -357,21 +357,25 @@ describe("legacy accepted reconciliation", () => {
     for (let i = 0; i < MAX_OUTPUT_RECORDS; i++) saveExecutionOutput(workspace.id, {
       command: "new flow", raw: "output", commandId: `new-${i}`, taskId: `desktop_new-${i}`, iteration: 1,
     });
-    for (let i = 0; i < holes; i++) {
-      const target = { workspaceId: workspace.id, workspaceRoot: workspace.root, commandId: `new-${i}`, iteration: 1 as const, stateDir };
-      const preview = previewCommandCleanup(target);
-      expect(confirmCommandCleanup(target, preview.confirmationSha256!).status).toBe("cleaned");
-      expect(previewCommandCleanup(target).status).toBe("not_found");
+    // 三个检查点共享相同的真实 retention 起点，累计清理 command 前缀。
+    let cleaned = 0;
+    for (const holes of [1, 7, MAX_OUTPUT_RECORDS]) {
+      for (; cleaned < holes; cleaned++) {
+        const target = { workspaceId: workspace.id, workspaceRoot: workspace.root, commandId: `new-${cleaned}`, iteration: 1 as const, stateDir };
+        const preview = previewCommandCleanup(target);
+        expect(confirmCommandCleanup(target, preview.confirmationSha256!).status).toBe("cleaned");
+      }
+      const indexFile = path.join(stateDir, "execution-outputs", workspace.id, "index.json");
+      const before = fs.readFileSync(indexFile);
+      expect(JSON.parse(before.toString())).toMatchObject({ nextId: MAX_OUTPUT_RECORDS + 2 });
+      expect(JSON.parse(before.toString()).retentionThrough).toBe(1);
+      expect(readExecutionOutputMetadataStrict(workspace.id)).toHaveLength(MAX_OUTPUT_RECORDS - holes);
+      expect(getReconciledLegacyCommandIds(workspace)).toEqual(new Set([commandId]));
+      expect(listLegacyReconciliations(workspace)).toEqual([{ commandId, status: "reconciled" }]);
+      expect(previewCommandCleanup({ workspaceId: workspace.id, workspaceRoot: workspace.root, commandId: `new-${holes - 1}`, iteration: 1 as const, stateDir }).status).toBe("not_found");
+      expect(fs.readFileSync(indexFile)).toEqual(before);
+      expect(fs.readFileSync(legacyReconciliationFile(workspace.id))).toEqual(evidence);
     }
-    const indexFile = path.join(stateDir, "execution-outputs", workspace.id, "index.json");
-    const before = fs.readFileSync(indexFile);
-    expect(JSON.parse(before.toString())).toMatchObject({ nextId: MAX_OUTPUT_RECORDS + 2 });
-    expect(JSON.parse(before.toString()).retentionThrough).toBe(1);
-    expect(readExecutionOutputMetadataStrict(workspace.id)).toHaveLength(MAX_OUTPUT_RECORDS - holes);
-    expect(getReconciledLegacyCommandIds(workspace)).toEqual(new Set([commandId]));
-    expect(listLegacyReconciliations(workspace)).toEqual([{ commandId, status: "reconciled" }]);
-    expect(fs.readFileSync(indexFile)).toEqual(before);
-    expect(fs.readFileSync(legacyReconciliationFile(workspace.id))).toEqual(evidence);
   });
 
   it.each(["horizon_short", "older_retained", "invalid_next_id", "same_id_drift", "no_snapshot"])(
@@ -380,7 +384,8 @@ describe("legacy accepted reconciliation", () => {
       saveExecutionOutput(workspace.id, { command: "older", raw: "output" });
       const original = seedEvidenceSourcesFor(commandId);
       reconcileLegacyAccepted(workspace, commandId);
-      for (let i = 0; i < MAX_OUTPUT_RECORDS; i++) saveExecutionOutput(workspace.id, { command: "new", raw: "output" });
+      // 本矩阵只依赖 metadata；正文回收由其他 retention 用例覆盖。
+      for (let i = 0; i < MAX_OUTPUT_RECORDS; i++) saveExecutionOutput(workspace.id, { command: "new", raw: "" });
       const file = path.join(stateDir, "execution-outputs", workspace.id, "index.json");
       const index = JSON.parse(fs.readFileSync(file, "utf8"));
       delete index.retentionThrough; // Exercise legacy compatibility independently of the new eviction witness.

@@ -102,7 +102,8 @@ export function productionLoopDependencies(workspace: Workspace, assertLease: ()
   return {
     cycle: action => withSupervisorOperation(workspace.root, tx => {
       const assertOwned = () => { assertLease(); tx.assertOwned(); };
-      assertOwned();
+      // readConfig 已复核 operation；入口只补 lease，恢复前仍须同时复核两者。
+      assertLease();
       return action(tx.readConfig(), assertOwned);
     }),
     observe: () => observeSupervisorBridge(workspace),

@@ -70,7 +70,7 @@
 | G-OU2 | reconcile-unknown 5 重精确匹配 / 0-1-N 候选语义 | 冻结 | `src/desktop/unknown-reconciliation.ts` | 未知结果 |
 | G-OU3 | dispatch split-brain 保守收敛（绝不二次 send） | 冻结 | `src/executor-control/dispatch-service.ts` | 未知结果 |
 | G-RT1 | Route attestation VERIFIED（production reserve/begin-send 门禁） | 冻结 | `src/feedback/companion-route.ts` | Companion |
-| G-RT2 | route durable fence（仅 re-pair 重置） | 冻结 | `browser-companion/route-attestation.js` | Companion |
+| G-RT2 | route attestation durable state（仅 re-pair 重置） | 冻结 | `src/feedback/companion-route.ts` / `src/feedback/companion-rebind.ts` | Companion |
 | G-RT3 | pairing ≠ Send authority；local_user 不提供 Feedback principal | 冻结 | `src/feedback/companion-delivery.ts` | Companion |
 | G-SF1 | 单飞 in-flight ≤1（schema/事务/arbiter/adapter） | 冻结 | `src/bridge/delivery-arbiter.ts` | 状态机 |
 | G-SF2 | begin-send 唯一冻结点 + frozen attempt 不迁移 | 冻结 | `src/result-bus/delivery-lifecycle.ts` | 状态机 |

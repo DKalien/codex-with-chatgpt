@@ -56,7 +56,8 @@ describe("runtime build ID", () => {
       }
       expect(fs.readFileSync(path.join(dist, "core-assets/dependencies-sha256.txt"), "utf8"))
         .toBe(release.dependencyHash(path.resolve("node_modules")));
-      finalize();
+      // 重复完整 finalizer 由 packaging 完整 pipeline 覆盖，此处验证同一自定义目录重复发布 ID。
+      writeBuildId(dist);
       expect(fs.readFileSync(path.join(dist, "build-id.txt"), "utf8").trim()).toBe(first);
       fs.appendFileSync(path.join(dist, "core-assets/core-launcher.cjs"), "\n// changed");
       expect(computeBuildId(dist)).not.toBe(first);

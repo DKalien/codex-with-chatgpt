@@ -241,11 +241,13 @@ export function confirmWorkspaceHistoryFormat(raw: RoutingWorkspaceIdentity, con
           try { fs.writeFileSync(fd, JSON.stringify({ snapshot: value, confirmationSha256 })); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
           journal = readJournal(identity, stateDir)!;
         }
+        // 只缓存已校验相对路径推导的字符串；每轮仍实时核验路径与文件状态。
+        const artifacts = journal.snapshot.artifacts.map(artifact => ({ ...artifact, target: path.join(stateDir, ...artifact.relative.split("/")) }));
         const validate = () => {
           checkLocks(identity, stateDir, owned, journal!.snapshot.artifacts);
           if (!same(fileFingerprint(file, stateDir), journal!.fingerprint)) blocked();
-          for (const artifact of journal!.snapshot.artifacts) {
-            const target = artifactFile(artifact.relative, identity, stateDir), current = fileFingerprint(target, stateDir);
+          for (const artifact of artifacts) {
+            const current = fileFingerprint(artifact.target, stateDir);
             const after = afterBytes(artifact, confirmationSha256);
             if (!same(current, artifact.before) && !(after ? current?.sha256 === hash(after) : current === null)) blocked();
           }
@@ -254,16 +256,16 @@ export function confirmWorkspaceHistoryFormat(raw: RoutingWorkspaceIdentity, con
         };
         hook?.("journal"); validate();
         // Sources and bodies are emptied before the projection stores; no old-source backfill survives.
-        const ordered = [...journal.snapshot.artifacts].sort((a, b) => Number(a.relative.startsWith("feedback/")) - Number(b.relative.startsWith("feedback/")));
+        const ordered = [...artifacts].sort((a, b) => Number(a.relative.startsWith("feedback/")) - Number(b.relative.startsWith("feedback/")));
         for (const artifact of ordered) {
-          validate(); const target = artifactFile(artifact.relative, identity, stateDir);
-          if (artifact.after) replaceExact(target, artifact.before, afterBytes(artifact, confirmationSha256)!, stateDir, confirmationSha256);
-          else removeExact(target, artifact.before, stateDir);
+          validate();
+          if (artifact.after) replaceExact(artifact.target, artifact.before, afterBytes(artifact, confirmationSha256)!, stateDir, confirmationSha256);
+          else removeExact(artifact.target, artifact.before, stateDir);
           hook?.(artifact.relative);
         }
         validate();
-        for (const artifact of journal.snapshot.artifacts) {
-          const current = fileFingerprint(artifactFile(artifact.relative, identity, stateDir), stateDir), after = afterBytes(artifact, confirmationSha256);
+        for (const artifact of artifacts) {
+          const current = fileFingerprint(artifact.target, stateDir), after = afterBytes(artifact, confirmationSha256);
           if (after ? current?.sha256 !== hash(after) : current !== null) blocked();
         }
         removeExact(file, journal.fingerprint, stateDir);

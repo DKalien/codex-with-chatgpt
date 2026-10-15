@@ -27,16 +27,16 @@ afterEach(async () => {
   cleanup(root);
 });
 
-async function status(flag = "") {
+async function status(flag = "", entry = "tests/fixtures/probe-cli.ts") {
   const result = await runFile(process.execPath, [
-    "--import", "tsx", path.join(projectRoot, "src/cli/index.ts"),
+    "--import", "tsx", path.join(projectRoot, entry),
     "write-probe-status", "-w", root, "--json",
   ], { cwd: projectRoot, env: { ...process.env, C2C_ENABLE_WRITE_PROBE: flag }, windowsHide: true });
   return JSON.parse(result.stdout);
 }
 
 it("状态读取不创建 AppData 目录，也不把终端开关当作已运行工具", async () => {
-  expect(await status("1")).toMatchObject({ enabled: false, configured: true, bridgeState: "stopped", exists: false, nonce: null });
+  expect(await status("1", "src/cli/index.ts")).toMatchObject({ enabled: false, configured: true, bridgeState: "stopped", exists: false, nonce: null });
   expect(fs.existsSync(stateDir)).toBe(false);
 });
 
@@ -54,6 +54,8 @@ it("损坏的探针记录明确报错而不覆盖文件或泄漏其内容", asyn
   fs.mkdirSync(stateDir);
   const file = path.join(stateDir, "write-probe.json");
   fs.writeFileSync(file, "broken-sensitive-content");
-  await expect(status()).rejects.toMatchObject({ code: 1, stdout: expect.stringContaining("文件损坏或不可访问") });
+  const failed = status();
+  await expect(failed).rejects.toMatchObject({ code: 1, stdout: expect.stringContaining("文件损坏或不可访问") });
+  await expect(failed).rejects.toMatchObject({ stdout: expect.not.stringContaining("broken-sensitive-content") });
   expect(fs.readFileSync(file, "utf8")).toBe("broken-sensitive-content");
 });

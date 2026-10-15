@@ -4,39 +4,42 @@ import { randomUUID } from "node:crypto";
 import { activeFinalizerPath, workerClaimPath, readFinalizerRetirement } from "../src/core/post-turn-finalizer.js";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import { planGc } from "../src/core/gc-plan.js";
 import { applyGc, removeTreeNoFollow } from "../src/core/gc-apply.js";
 import {
   isMaintenanceLockBusy,
   tryAcquireMaintenanceLock,
 } from "../src/core/maintenance-lock.js";
-import { installCore } from "../src/core/install.js";
 import { Workspace } from "../src/workspace/manager.js";
-import { buildCoreFixture, cleanup, makeTmpDir, write } from "./helpers.js";
+import { makeTmpDir, write } from "./helpers.js";
+import { cleanupStrict } from "./strict-teardown.js";
+import { createGcFixtureCache } from "./gc-fixture.js";
 
 const project = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const dirs: string[] = [];
-afterEach(() => {
-  dirs.splice(0).forEach(cleanup);
+const fixtureCache = createGcFixtureCache();
+afterEach(async () => {
   vi.restoreAllMocks();
-  vi.unstubAllEnvs();
+  try {
+    fixtureCache.assertUnchanged();
+  } finally {
+    try { await cleanupStrict(...dirs.splice(0)); }
+    finally { vi.unstubAllEnvs(); }
+  }
+});
+afterAll(async () => {
+  vi.restoreAllMocks();
+  await fixtureCache.cleanup();
 });
 
 function fixture(markers: string[]) {
   const state = makeTmpDir("gc-apply-state");
+  dirs.push(state);
   const root = makeTmpDir("gc-apply-checkout");
-  dirs.push(state, root);
+  dirs.push(root);
   vi.stubEnv("C2C_STATE_DIR", state);
-  write(root, "bin/c2c.js", "// fixture");
-  write(root, "dist/cli/index.js", "// fixture");
-  write(root, "package.json", '{"type":"module"}');
-  fs.mkdirSync(path.join(root, "node_modules"), { recursive: true });
-  const releases = markers.map(marker => {
-    write(root, "dist/cli/index.js", `// ${marker}`);
-    return installCore(root, buildCoreFixture(root));
-  });
-  return { state, root, releases };
+  return fixtureCache.copy(state, root, markers);
 }
 
 function writeRuntime(state: string, root: string, runtimeBuildId: string, workspaceId: string): void {
@@ -553,9 +556,9 @@ describe("gc apply CLI contract", () => {
     });
   }
 
-  it("互斥模式：plain / --plan --apply 拒绝；--apply --json 成功", () => {
+  it("互斥模式：--plan --apply 拒绝；--apply --json 成功", () => {
     const { state, releases } = fixture(["A", "B"]);
-    expect(run(state).status).not.toBe(0);
+    // plain gc 拒绝已由 gc-plan.test.ts 验证非零退出及错误提示。
     expect(run(state, "--plan", "--apply").status).not.toBe(0);
     expect(run(state, "--dry-run", "--apply").status).not.toBe(0);
     expect(run(state, "--plan", "--dry-run").status).not.toBe(0);

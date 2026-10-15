@@ -52,12 +52,9 @@ Do not interrupt an active Review Bridge to clear pending status.
 
 以下为已退役旧 popup/SW 的历史诊断，不作为现役恢复步骤。本轮只退役源码及专属测试，尚未部署；Bridge 历史状态与恢复合同仍保留。现役流程见下方“日常连接与本机确认”。
 
-“ChatGPT 已接管”、保存的 binding VERIFIED、当前网页已验证和完整连接是不同阶段。先查看高级诊断的 connectState、recovery、currentPageMatchesBinding、bindingEpoch、routeAttestFence、reason，连同当前 route 核对；不要复制配对密钥或凭据。任务面板的 Codex/网页可用性也分别判断。
+旧 popup/SW 的 connectState、recovery、bindingEpoch、routeAttestFence 等字段只属于已退役历史界面，不是现役恢复入口；不要把旧 VERIFIED 快照当成当前页面状态。任务面板与 Bridge 的现役流程见下方“日常连接与本机确认”。
 
-- `recovery=verify_takeover`：一次显式“连接当前对话”只核验原服务端 immediate successor，不重发自举。`COMPANION_REBIND_NOT_SUCCESSOR` 表示尚无可继续的精确下一代绑定，不能当作接管成功。
-- `bootstrap_capability_missing` / `bootstrap_sender_invalid`：新版对精确零写入拒绝保留错误并允许后续显式重试；页面组件缺失可在更新扩展后刷新页面。旧流程的刷新/重载产生新 document 时，仍需按原恢复门禁确认 owner；不要把旧 VERIFIED 状态直接当成当前页面已连接。
-- `OUTCOME_UNKNOWN`：未证明发送结果，不能用“输入框为空”或新代码断言旧尝试未发送；不要反复发送、清除目标或重新配对。必要的人工恢复仅走高级区对应的 connect bootstrap 或 route-attest 专用确认入口；二者都不代表连接成功。`not_exact_owner` 表示当前 document 校验未通过，不是已清除。
-- popup、工具栏和任务面板统一使用 SW 的 `connectionReadiness`；缺失或 `ready=false` 不显示已连接/可接收。它同时核验受保护的认证 transport、DONE connect-flow、当前 tab/document/generation/route owner witness，以及同 workspace/adapter 的权威 Web Sink 同步且 available。自动回流开关另外核验。popup 可见时每2秒串行读取本地状态，GET /state 也是只读；它们不自动重连或发送。SW 重建后，已开启自动回流的精确 owner 心跳也能只读重建 Web Sink 权威投影；失败或 unavailable 至少间隔 2 秒复查，未恢复前不会新预约。同 document 的等价 URL（如 Project slug 改名）只在 fresh `/state` 和 Web Sink 复核后恢复 witness，不要求再次 Connect；不同对话或 unknown 继续隔离。
+- `OUTCOME_UNKNOWN`：未证明发送结果，不能用“输入框为空”或新代码断言旧尝试未发送；不要反复发送、清除目标或重新配对。当前只按 Bridge 保存的原目标和精确观察规则恢复。
 
 ### 日常连接与本机确认
 
@@ -79,19 +76,12 @@ Do not interrupt an active Review Bridge to clear pending status.
 
 ### 历史诊断：已连接，但旧扩展徽标显示 C×（2026-10-13 源码退役）
 
-以下徽标与旧弹窗描述仅供历史理解；现役轻量流程见上方“日常连接与本机确认”。当前对话已连接只表示页面连接成功。若旧本地发送日志为 `OUTCOME_UNKNOWN`，`C×` 表示某条回流是否送达尚未确认；自动回流开关可以仍为开启，但后续发送受恢复门禁阻挡。此时 popup 显示“已开启 · 回流待核验”，网页空闲且其他连接条件正常时，任务摘要也显示“回流待核验”；徽标悬停提示说明原因。不要清除日志或重复发送来消除标记。切换项目后徽标按所选项目重新计算，历史隔离记录的数量本身不决定徽标。
+旧徽标、popup 文案和 `C×` 展示规则仅供历史理解，现役轻量流程见上方“日常连接与本机确认”。当前代码不再提供这组徽标诊断；`OUTCOME_UNKNOWN` 仍不能通过清除日志或重复发送消除。
 
 ### 唯一发送标记存在，但回流仍未确认
 
-默认轻量链只观察原 attempt，精确匹配失败不 ACK、不重发。以下高级诊断字段属于 2026-10-13 已从源码退役的旧界面，仅供历史理解；共享 DOM 精确正文观察仍保留，轻量弹窗不提供这些旧按钮或统计。
+默认轻量链只观察原 attempt，精确匹配失败不 ACK、不重发。旧高级诊断的 `recoveryDiagnostic`、`richBody*` 与 `richBodyReasonCode` 字段已随 2026-10-13 源码退役；它们不再是可查询的恢复接口。当前仍以 Bridge 保存的目标身份、精确正文观察和 `OUTCOME_UNKNOWN` 门禁为准。
 
-高级诊断的 `recoveryDiagnostic.representation` 与手动恢复结果的 `diagnostic.representation` 仅在唯一精确 ATTEMPT 标记候选存在时报告已知结构的严格正文统计。`richBodyWrapperScannedCount` / `richBodyNodeScannedCount` 分别是已访问 wrapper / 正文节点数（上限 64 / 128）；`richBodyCount` 是扫描中已发现的正文数，扫描提前拒绝时不代表完整总数。因子节点数量预检而拒绝时，已访问计数可能尚未到上限。
-
-`richBodyRebuildSucceeded` 表示严格重建成功，`richBodyExact` 表示重建全文与目标相等。仅重建成功时提供 `richBodyRebuiltLength`、`richBodyRebuiltLineCount`、`richBodyLengthDelta`（重建减目标）和 `richBodyFirstMismatchIndex`（规范化字符串的 UTF-16 下标；相等为 -1，长度差异时为公共前缀长度）。这些只读数值不放宽匹配或授权 ACK。
-
-`richBodyReasonCode` 为固定整数：0 重建成功；1 缺少现代 user bubble 标记；2 无 computed style；3 wrapper 超过 64 节点预算；4 无法读取 wrapper children；5 正文数量不是 1；6 正文不符合已知结构；7 隐藏/透明节点；8 正文超过 128 节点预算；9 不支持的节点类型；10 text-transform；11 链接可见文本为空、含换行或与 textContent 不等；12 链接重建文本不等；13 不支持的标签/display/预格式 white-space；14 正文或 inline 可见文本与 textContent 不等，或 CODE 为空、含反引号/换行；15 其它 DOM/样式读取异常。诊断不包含原文、HTML、selector 或异常消息；收集原因后再定位，不能凭唯一标记或近似文本清除 `OUTCOME_UNKNOWN`。
-
-已知正文包括原有 `.rich-text-user-turn` 单 P，以及现代 user bubble 内唯一的 `DIV.whitespace-pre-wrap`（computed `white-space: pre-wrap`、直接文本与 inline CODE）。后者要求正文可见文本与 textContent 完全一致，仅为非空、可见、无嵌套元素且不含反引号/真实换行的 CODE 恢复单对反引号；保留空格、真实换行、字面 `\n` 和三反引号 fence。两个独立正文、隐藏/文本变换/未知样式均拒绝；折叠控件只在已知正文边界外排除，不任意剥离消息文字。重建全文仍须 canonical equality 和精确 ATTEMPT；隐藏数据流不是 ACK 依据。
 
 ### 清空任务面板的历史显示
 

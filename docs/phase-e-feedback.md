@@ -1,5 +1,7 @@
 # Phase E：部署基线与 ChatGPT 接收端预检
 
+> 本文件保留 2026-09-14 至 2026-10-08 的历史阶段记录。文中标为“现役”的旧 Service Worker、popup、route-attestation 和 journal 入口只表示当时源码，不是 2026-10-15 当前 Companion 合同；当前入口见[轻量 Companion](companion-lightweight.md)。
+
 2026-10-08 当前源码的 legacy 自动通知仅保留 `FINAL_RECEIPT_REQUIRED`；新执行结果经 Result Bus，历史执行反馈禁止新领取或发送，旧 attempt 的精确恢复仍受原门禁保护。详情见[执行与回流精简合同](runtime-simplification.md)，下方旧执行反馈路径按各自日期保留为历史记录。
 
 > **现役源码机制**：`GET /state` 已纯读，`alarms` 仅 discovery；有界维护由 Bridge 独立批次推进，生产发送仍需真实 exact-owner heartbeat。新 canonical result 由 Result Bus 统一发送，legacy 仅保留兼容范围。Unified Gateway 按显式 workspace/client grant 复用原 feedback 工具；Companion 的 local/session/alarm、页面选择与操作面板按 workspace 隔离，Pair 和 route VERIFIED 仍是独立门禁。`c2c record` 的 pending draft、trusted terminal receipt 与网页 ACK 是不同阶段。源码与现场验收边界见[官方路线](official-route.md)、[统一 Gateway 计划](unified-gateway-plan.md)；双项目真实 Send/observed、普通 Chat 原生 Events 与旧 Connector 退役仍未完成。下方带日期的 E0/E1/F 证据仅代表当轮，不是当前待办或机器快照。
@@ -524,7 +526,7 @@ messageId、模板、crash recovery、workspace 隔离、HTML 单实现、open_c
 
 # Phase E / E1a 收官状态（knowledge closeout）
 
-日期：2026-09-15。本节为现役终态；上方各段为历史过程记录。
+日期：2026-09-15。本节为当时现役终态；上方各段为历史过程记录。
 
 | 项 | 状态 |
 | --- | --- |
@@ -723,11 +725,11 @@ Ownership review-fix：popup `isOwner` 经 content script → SW（真实 Messag
 
 ---
 
-# Phase E1b3d3 production Send + late-positive closeout
+# Phase E1b3d3 production Send + late-positive closeout（历史记录）
 
-日期：2026-09-17。**现役终态**。本节覆盖代码与已部署 Core；上方各段为历史过程记录。E1b0 状态机图中 `outcome_unknown` 的“死端”只描述当时；现役允许 **exact late-positive** 闭环。
+日期：2026-09-17。**当时现役终态**。本节覆盖当时代码与已部署 Core；上方各段为历史过程记录。E1b0 状态机图中 `outcome_unknown` 的“死端”只描述当时；当时允许 **exact late-positive** 闭环。
 
-## 状态机（现役）
+## 状态机（当时现役，历史记录）
 
 ```
 ready → reserved → claimed → observed
@@ -747,7 +749,7 @@ ready → reserved → claimed → observed
 - 允许：本地 late-positive DOM 观察（exact canonical user turn）→ `OBSERVED_PENDING_ACK` → 复用既有 ACK。
 - 禁止：`retired_unknown` 再 ACK / resurrect；identity 或 attempt 不一致仍 fail closed。
 
-## 代码入口（现役）
+## 代码入口（当时现役，历史记录）
 
 | 层 | 文件 |
 | --- | --- |
@@ -779,7 +781,7 @@ ready → reserved → claimed → observed
 
 # Phase E1b3d3b2 autonomous trigger + exact message-body observation
 
-日期：2026-09-18。**现役终态**（extension Reload、independent review、live ACK closeout 均已完成）。
+日期：2026-09-18。**当时现役终态**（extension Reload、independent review、live ACK closeout 均已完成）。
 
 ## Autonomy（默认 OFF）
 
@@ -799,7 +801,7 @@ ready → reserved → claimed → observed
 - Ambiguity 按 **user turn** 计，不按 descendant 数。
 - Representation diagnostic（bounded numbers/booleans）解释 UI chrome vs nested exact body。
 
-## 代码入口（现役）
+## 代码入口（当时现役，历史记录）
 
 | 层 | 文件 |
 | --- | --- |

@@ -70,15 +70,16 @@ describe("Fork 更新检查（真实 Git 仓库）", () => {
     expect(fs.existsSync(missingUpstream)).toBe(false);
   });
   afterEach(async () => {
-    try {
-      if (seed) expect(pairSnapshot(seedRoot!)).toEqual(seed.snapshot);
-    } finally {
-      await cleanupStrict(...copies.splice(0));
-    }
+    await cleanupStrict(...copies.splice(0));
   });
   afterAll(async () => {
-    try { if (seedRoot) await cleanupStrict(seedRoot); }
-    finally { vi.unstubAllEnvs(); }
+    try {
+      // seedRoot 是复制前已验证的只读模板；每个副本仍完整校验，最后统一检查模板未变。
+      if (seed) expect(pairSnapshot(seedRoot!)).toEqual(seed.snapshot);
+    } finally {
+      try { if (seedRoot) await cleanupStrict(seedRoot); }
+      finally { vi.unstubAllEnvs(); }
+    }
   });
   const commit = (repo: string, name: string) => {
     write(repo, `${name}.txt`, name);
@@ -102,9 +103,8 @@ describe("Fork 更新检查（真实 Git 仓库）", () => {
     write(local, "hello.txt", "尚未暂存的修改");
     write(local, "untracked.txt", "未跟踪文件");
     const before = {
-      head: git(local, "rev-parse", "HEAD"), branch: git(local, "symbolic-ref", "HEAD"),
+      refs: git(local, "rev-parse", "HEAD", "refs/remotes/upstream/main"), branch: git(local, "symbolic-ref", "HEAD"),
       status: git(local, "status", "--porcelain"), stash: git(local, "stash", "list"),
-      upstream: git(local, "rev-parse", "refs/remotes/upstream/main"),
       index: fs.readFileSync(path.join(local, ".git", "index")),
     };
     expect(checkForUpdates(local, cache)).toMatchObject({
@@ -112,11 +112,10 @@ describe("Fork 更新检查（真实 Git 仓库）", () => {
       diverged: false, dirty: true, localAheadCount: 0, remoteAheadCount: 1,
     });
     expect(fs.readFileSync(path.join(local, ".git", "index"))).toEqual(before.index);
-    expect(git(local, "rev-parse", "HEAD")).toBe(before.head);
+    expect(git(local, "rev-parse", "HEAD", "refs/remotes/upstream/main")).toBe(before.refs);
     expect(git(local, "symbolic-ref", "HEAD")).toBe(before.branch);
     expect(git(local, "status", "--porcelain")).toBe(before.status);
     expect(git(local, "stash", "list")).toBe(before.stash);
-    expect(git(local, "rev-parse", "refs/remotes/upstream/main")).toBe(before.upstream);
     expect(fs.readFileSync(path.join(local, "hello.txt"), "utf8")).toBe("尚未暂存的修改");
     expect(fs.readFileSync(path.join(local, "untracked.txt"), "utf8")).toBe("未跟踪文件");
   });

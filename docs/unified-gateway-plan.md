@@ -4,9 +4,9 @@
 
 <a id="当前状态2026-10-08-当前-checkout"></a>
 
-## 当前状态（2026-10-13 当前 checkout）
+## 当前状态（2026-10-15 当前 checkout）
 
-三合一与轻量 Companion 已部署：两个 workspace 由同一 Gateway owner 托管，运行版本均为 current。正式串行门禁 194 files / 4,087 tests 通过，后续两处小修的定向门禁 7 files / 138 tests 通过；最终 typecheck/build/diff 与 Python 协议门禁通过。Desktop 经用户本机确认恢复可用；用户刷新真实 ChatGPT 页面后复核面板“可接收结果”。精确 build、运行身份、代理观察和验收边界统一见[轻量 Companion 部署快照](companion-lightweight.md#部署与验收观察快照)。真实 Desktop task delivery、DOM Send、M4/M5 双项目 Send/observed、浏览器运行版本直接核验、旧 Connector 退役、开机自启及异常恢复仍待完成。
+2026-10-13 的“三合一与轻量 Companion 已部署”及 **194 files / 4,087 tests** 是当时的源码/部署快照，不是当前 checkout 或当前运行态证明。随后 2026-10-14 至 2026-10-15 工作树继续有性能测试、workspace history 与 Supervisor 生产改动；最近一次正式串行全量为 2026-10-14 的 **180 files / 3,061 tests PASS**，其后只有定向验证，当前 checkout 尚未重新跑正式全量。安装、rollout、服务和浏览器 live 状态本轮未核验，统一标记为 `pending`；精确历史 build、运行身份和验收边界见[轻量 Companion 部署快照](companion-lightweight.md#部署与验收观察快照)。真实 Desktop task delivery、DOM Send、M4/M5 双项目 Send/observed、浏览器运行版本直接核验、旧 Connector 退役、开机自启及异常恢复仍待完成。
 
 ### 当前源码能力
 

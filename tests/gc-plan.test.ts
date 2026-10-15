@@ -2,37 +2,40 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import { planGc, gcPlanSummary, releaseLogicalSize, validateReleaseManifest } from "../src/core/gc-plan.js";
 import { collectReleaseReferences, readReleaseReferenceJson } from "../src/core/release-references.js";
-import { installCore } from "../src/core/install.js";
+import { readCurrentInstall } from "../src/core/install.js";
 import { Workspace } from "../src/workspace/manager.js";
-import { buildCoreFixture, cleanup, makeTmpDir, write } from "./helpers.js";
+import { makeTmpDir, write } from "./helpers.js";
+import { cleanupStrict } from "./strict-teardown.js";
+import { createGcFixtureCache, gcFixtureSnapshot, installGcFixture } from "./gc-fixture.js";
 
 const project = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const cliEntry = path.join(project, "tests/fixtures/gc-cli.ts");
 const dirs: string[] = [];
-afterEach(() => {
-  dirs.splice(0).forEach(cleanup);
+const fixtureCache = createGcFixtureCache();
+afterEach(async () => {
   vi.restoreAllMocks();
-  vi.unstubAllEnvs();
+  try {
+    fixtureCache.assertUnchanged();
+  } finally {
+    try { await cleanupStrict(...dirs.splice(0)); }
+    finally { vi.unstubAllEnvs(); }
+  }
+});
+afterAll(async () => {
+  vi.restoreAllMocks();
+  await fixtureCache.cleanup();
 });
 
 function fixture(markers: string[]) {
   const state = makeTmpDir("gc-state");
+  dirs.push(state);
   const root = makeTmpDir("gc-checkout");
-  dirs.push(state, root);
+  dirs.push(root);
   vi.stubEnv("C2C_STATE_DIR", state);
-  write(root, "bin/c2c.js", "// fixture");
-  write(root, "dist/cli/index.js", "// fixture");
-  write(root, "package.json", '{"type":"module"}');
-  fs.mkdirSync(path.join(root, "node_modules"), { recursive: true });
-
-  const releases = markers.map(marker => {
-    write(root, "dist/cli/index.js", `// ${marker}`);
-    return installCore(root, buildCoreFixture(root));
-  });
-  return { state, root, releases };
+  return fixtureCache.copy(state, root, markers);
 }
 
 function writeRuntime(state: string, root: string, runtimeBuildId: string, workspaceId: string, overrides: Record<string, unknown> = {}): void {
@@ -71,6 +74,69 @@ function dirLink(target: string, link: string): void {
 }
 
 describe("immutable Core release GC plan", () => {
+  it("seed 普通副本与真实安装等价，重复 marker、空序列及破坏操作相互隔离", () => {
+    const markers = ["A", "B", "A"];
+    const first = fixture(markers);
+    const second = fixture(markers);
+    const freshState = makeTmpDir("gc-fresh-state");
+    dirs.push(freshState);
+    const freshRoot = makeTmpDir("gc-fresh-checkout");
+    dirs.push(freshRoot);
+    const fresh = installGcFixture(freshState, freshRoot, markers);
+    expect(process.env.C2C_STATE_DIR).toBe(second.state);
+    const normalizeMetadata = ({ checkoutRoot, releaseRoot, installedAt, ...fields }: typeof fresh[number]) => fields;
+    const normalizePlan = (state: string) => {
+      const { stateDir, releases, ...plan } = planGc(state);
+      return { ...plan, releases: releases.map(({ path: releasePath, ...item }) => item) };
+    };
+    expect(first.releases.map(normalizeMetadata)).toEqual(fresh.map(normalizeMetadata));
+    expect(first.releases).toHaveLength(markers.length);
+    expect(first.releases[0].runtimeBuildId).toBe(first.releases[2].runtimeBuildId);
+    expect(first.releases[0]).not.toBe(first.releases[2]);
+    for (const [index, metadata] of first.releases.entries()) {
+      expect(new Date(metadata.installedAt).toISOString()).toBe(metadata.installedAt);
+      expect(metadata.installedAt).toBe(second.releases[index].installedAt);
+      expect(metadata).not.toBe(second.releases[index]);
+      expect(metadata.checkoutRoot).toBe(first.root);
+      expect(metadata.releaseRoot).toBe(path.join(first.state, "releases", metadata.runtimeBuildId));
+      expect(gcFixtureSnapshot(metadata.releaseRoot)).toBe(gcFixtureSnapshot(fresh[index].releaseRoot));
+    }
+    expect(readCurrentInstall(first.state, "full")).toEqual(first.releases[2]);
+    expect(normalizeMetadata(readCurrentInstall(freshState, "full")!)).toEqual(normalizeMetadata(first.releases[2]));
+    expect(gcFixtureSnapshot(first.root)).toBe(gcFixtureSnapshot(freshRoot));
+    expect(gcFixtureSnapshot(path.join(first.state, "bin"))).toBe(gcFixtureSnapshot(path.join(freshState, "bin")));
+    expect(normalizePlan(first.state)).toEqual(normalizePlan(freshState));
+
+    const secondStateSnapshot = gcFixtureSnapshot(second.state);
+    const secondRootSnapshot = gcFixtureSnapshot(second.root);
+    fs.unlinkSync(path.join(first.releases[2].releaseRoot, "release.json"));
+    write(first.releases[2].releaseRoot, "bin/c2c.js", "// changed release bootstrap");
+    write(first.state, "bin/c2c.js", "// changed machine bootstrap");
+    write(first.root, "dist/cli/index.js", "// changed checkout");
+    first.releases[0].installedAt = "changed metadata";
+    expect(() => readCurrentInstall(first.state, "full")).toThrow();
+    expect(gcFixtureSnapshot(second.state)).toBe(secondStateSnapshot);
+    expect(gcFixtureSnapshot(second.root)).toBe(secondRootSnapshot);
+    const third = fixture(markers);
+    expect(readCurrentInstall(second.state, "full")).toEqual(second.releases[2]);
+    expect(readCurrentInstall(third.state, "full")).toEqual(third.releases[2]);
+    expect(third.releases.map(normalizeMetadata)).toEqual(fresh.map(normalizeMetadata));
+    expect(third.releases.map(item => item.installedAt)).toEqual(second.releases.map(item => item.installedAt));
+    expect(gcFixtureSnapshot(third.root)).toBe(secondRootSnapshot);
+    expect(gcFixtureSnapshot(path.join(third.state, "bin"))).toBe(gcFixtureSnapshot(path.join(second.state, "bin")));
+
+    const empty = fixture([]);
+    const emptyCopy = fixture([]);
+    expect(empty.releases).toEqual([]);
+    expect(readCurrentInstall(empty.state, "full")).toBeNull();
+    expect(fs.existsSync(path.join(empty.state, "current.json"))).toBe(false);
+    expect(fs.readdirSync(path.join(empty.root, "node_modules"))).toEqual([]);
+    expect(fs.existsSync(path.join(empty.root, "dist/build-id.txt"))).toBe(false);
+    expect(fs.existsSync(path.join(empty.root, "dist/core-assets"))).toBe(false);
+    expect(gcFixtureSnapshot(empty.root)).toBe(gcFixtureSnapshot(emptyCopy.root));
+    expect(gcFixtureSnapshot(empty.state)).toBe(gcFixtureSnapshot(emptyCopy.state));
+  });
+
   it("合法 current 保留，未引用 release 成为回收候选并统计字节", () => {
     const { state, releases } = fixture(["A", "B"]);
     const plan = planGc(state);

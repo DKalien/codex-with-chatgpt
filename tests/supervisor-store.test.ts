@@ -27,9 +27,10 @@ import {
 } from "../src/supervisor/store.js";
 import { Workspace } from "../src/workspace/manager.js";
 import { makeTmpDir } from "./helpers.js";
-import { finishSupervisorFixtures, observeSupervisorAclCall, type SupervisorAclCall } from "./supervisor-acl-support.js";
+import { finishSupervisorFixtures, observeSupervisorAclCall, prepareSupervisorFixtureStore, type SupervisorAclCall } from "./supervisor-acl-support.js";
 import { validateSupervisorLaunch } from "../src/supervisor/run.js";
 import { runSupervisorLoop } from "../src/supervisor/lifecycle.js";
+import { supervisorConfigSchema, supervisorRuntimeSchema, type SupervisorConfig } from "../src/supervisor/schema.js";
 
 const roots: string[] = [];
 const aclCalls: SupervisorAclCall[] = [];
@@ -76,6 +77,13 @@ function optionsWithProbe(probe = fakeProbe()): SupervisorStoreOptions {
 
 async function createConfig(desiredState: "running" | "stopped" = "running") {
   return updateSupervisorConfig(workspaceRoot, { desiredState, tunnel: true }, options);
+}
+
+function seedConfig() {
+  const saved = supervisorConfigSchema.parse({ version: 1, workspaceId: workspace.id, workspaceRoot: workspace.root,
+    desiredState: "running", tunnel: true, registrationMode: "none", revision: 1, updatedAt: new Date().toISOString() });
+  fs.writeFileSync(supervisorConfigFile(workspace.id, stateDir), JSON.stringify(saved), { mode: 0o600 });
+  return saved;
 }
 
 function seedLock(file: string, kind: "operation" | "supervisor", identity: { pid: number; creationTime?: string; nonce?: string }) {
@@ -158,7 +166,7 @@ describe("supervisor durable config", () => {
   });
 
   it("rejects a config whose workspace root does not match its identity", async () => {
-    await createConfig();
+    await withSupervisorOperation(workspaceRoot, () => seedConfig(), options);
     const file = supervisorConfigFile(workspace.id, stateDir);
     const saved = JSON.parse(fs.readFileSync(file, "utf8"));
     const otherRoot = makeTmpDir("other-root"); roots.push(otherRoot);
@@ -167,7 +175,7 @@ describe("supervisor durable config", () => {
   });
 
   it("corrupt schemas, extra keys, hardlinks, links and interrupted temps fail closed", async () => {
-    await createConfig();
+    await withSupervisorOperation(workspaceRoot, () => seedConfig(), options);
     const file = supervisorConfigFile(workspace.id, stateDir);
     const saved = fs.readFileSync(file, "utf8");
     fs.writeFileSync(file, JSON.stringify({ ...JSON.parse(saved), extra: true }));
@@ -219,7 +227,7 @@ function seedLaunch() {
 
 describe("supervisor startup pin handoff", () => {
   it("validates the exact launch identity and installed release before handoff", async () => {
-    await withSupervisorOperation(workspaceRoot, () => {}, options);
+    prepareSupervisorFixtureStore(stateDir);
     const pin = seedLaunch();
     const moduleUrl = pathToFileURL(path.join(stateDir, "releases", pin.buildId, "dist/supervisor/run.js")).href;
     const launch = validateSupervisorLaunch(workspace, stateDir, pin.file, pin.buildId, pin.identity, moduleUrl);
@@ -231,8 +239,7 @@ describe("supervisor startup pin handoff", () => {
   });
 
   it("publishes runtime before consuming exact startup pin and retains it for a long session", async () => {
-    // 通过真实操作锁、ACL 和进程身份校验初始化私有目录。
-    await withSupervisorOperation(workspaceRoot, () => {}, options);
+    prepareSupervisorFixtureStore(stateDir);
     const pin = seedLaunch();
     const moduleUrl = pathToFileURL(path.join(stateDir, "releases", pin.buildId, "dist/supervisor/run.js")).href;
     const launch = validateSupervisorLaunch(workspace, stateDir, pin.file, pin.buildId, pin.identity, moduleUrl);
@@ -261,12 +268,12 @@ describe("supervisor startup pin handoff", () => {
   });
 
   it("terminal self-retirement releases the runtime lease without touching Bridge or sleeping", async () => {
-    await createConfig();
     const info = { launcherPath: path.join(stateDir, "bin", "c2c.js"), buildId: "a".repeat(64), registrationMode: "windows-scheduled-task" as const };
     const lease = await acquireSupervisorLease(workspaceRoot, info, options);
     const ensure = vi.fn(), observe = vi.fn(), sleep = vi.fn();
     try {
-      const retired = { ...readSupervisorConfig(workspaceRoot, options)!, desiredState: "stopped" as const, registrationMode: "none" as const };
+      const retired: SupervisorConfig = { version: 1, workspaceId: workspace.id, workspaceRoot: workspace.root,
+        desiredState: "stopped", tunnel: true, registrationMode: "none", revision: 1, updatedAt: "2026-10-03T00:00:00.000Z" };
       await runSupervisorLoop({ cycle: async action => action(retired, () => {}), observe, ensure, sleep,
         now: () => new Date().toISOString(), report: () => {} }, new AbortController().signal);
     } finally { expect(await lease.release()).toBe(true); }
@@ -276,8 +283,7 @@ describe("supervisor startup pin handoff", () => {
   });
 
   it("failure before acquiring the exact runtime leaves the startup pin intact", async () => {
-    // 此处只需初始化真实私有目录；配置写入由独立场景覆盖。
-    await withSupervisorOperation(workspaceRoot, () => {}, options); const pin = seedLaunch(), raw = fs.readFileSync(pin.file, "utf8");
+    prepareSupervisorFixtureStore(stateDir); const pin = seedLaunch(), raw = fs.readFileSync(pin.file, "utf8");
     const launch = readSupervisorLaunch(workspaceRoot, pin.file, pin.buildId, pin.identity, options), action = vi.fn();
     await expect(withSupervisorLaunch(workspaceRoot, launch, action, { ...options,
       probeProcess: async pid => processResult(pid, "unknown") })).rejects.toMatchObject({ code: "SUPERVISOR_IDENTITY_UNAVAILABLE" });
@@ -286,8 +292,7 @@ describe("supervisor startup pin handoff", () => {
   });
 
   it("identical-content replacement between validation and handoff is retained and fails closed", async () => {
-    // 此启动场景只需通过真实操作初始化独立私有目录。
-    await withSupervisorOperation(workspaceRoot, () => {}, options);
+    prepareSupervisorFixtureStore(stateDir);
     const pin = seedLaunch(), raw = fs.readFileSync(pin.file, "utf8");
     const launch = readSupervisorLaunch(workspaceRoot, pin.file, pin.buildId, pin.identity, options), action = vi.fn();
     let replaced = false;
@@ -304,7 +309,7 @@ describe("supervisor startup pin handoff", () => {
   });
 
   it("identical-content replacement before the child reads the pin fails the original launcher proof", async () => {
-    await withSupervisorOperation(workspaceRoot, () => {}, options); const pin = seedLaunch(), raw = fs.readFileSync(pin.file, "utf8");
+    prepareSupervisorFixtureStore(stateDir); const pin = seedLaunch(), raw = fs.readFileSync(pin.file, "utf8");
     fs.renameSync(pin.file, `${pin.file}.original`);
     fs.writeFileSync(pin.file, raw, { mode: 0o600 });
     expect(() => readSupervisorLaunch(workspaceRoot, pin.file, pin.buildId, pin.identity, options))
@@ -328,20 +333,28 @@ describe("supervisor startup pin handoff", () => {
 
   it("only exact process-missing proof reclaims the post-crash runtime and lease", async () => {
     const info = { launcherPath: path.join(stateDir, "bin", "c2c.js"), buildId: "a".repeat(64), registrationMode: "windows-scheduled-task" as const };
-    const lease = await acquireSupervisorLease(workspaceRoot, info, options);
-    const deadPid = 424242;
-    const runtime = { ...lease.runtime, pid: deadPid, creationTime: "dead-owner:123" };
-    // Model reboot: preserve exact on-disk records of a process now proven absent.
-    fs.writeFileSync(supervisorRuntimeFile(workspace.id, stateDir), JSON.stringify(runtime), { mode: 0o600 });
-    seedLock(supervisorLeaseFile(workspace.id, stateDir), "supervisor", runtime);
-    expect(fs.existsSync(supervisorRuntimeFile(workspace.id, stateDir))).toBe(true);
+    const deadPid = process.pid === 424242 ? 424243 : 424242;
+    const runtime = supervisorRuntimeSchema.parse({
+      version: 1, workspaceId: workspace.id, workspaceRoot: workspace.root,
+      pid: deadPid, creationTime: "dead-owner:123", executable: process.execPath,
+      startedAt: new Date().toISOString(), ...info, nonce: randomUUID(),
+    });
     // Unknown/reused owners remain covered by the singleton/operation cases.
     const missing = fakeProbe(new Set([deadPid]));
+    let seeded = false;
     let exactMissingProbes = 0;
     const next = await acquireSupervisorLease(workspaceRoot, info, optionsWithProbe(async (pid, expected) => {
+      // 真实入口先校验私有目录 ACL，再注入崩溃记录供后续真实回收检查。
+      if (!seeded && pid === process.pid && expected === undefined) {
+        fs.writeFileSync(supervisorRuntimeFile(workspace.id, stateDir), JSON.stringify(runtime), { mode: 0o600 });
+        seedLock(supervisorLeaseFile(workspace.id, stateDir), "supervisor", runtime);
+        seeded = true;
+        expect(fs.existsSync(supervisorRuntimeFile(workspace.id, stateDir))).toBe(true);
+      }
       if (pid === deadPid) { expect(expected).toBe(runtime.creationTime); exactMissingProbes++; }
       return missing(pid, expected);
     }));
+    expect(seeded).toBe(true);
     expect(exactMissingProbes).toBeGreaterThanOrEqual(2);
     expect(next.runtime.pid).toBe(process.pid); expect(next.runtime.nonce).not.toBe(runtime.nonce);
     expect(fs.readdirSync(path.dirname(supervisorRuntimeFile(workspace.id, stateDir))).filter(name => name.endsWith(".launch.json"))).toEqual([]);
@@ -353,10 +366,11 @@ describe("supervisor operation lock", () => {
   it("serializes config mutation across the complete async action and fails busy without running a rival action", async () => {
     let entered!: () => void;
     let finish!: () => void;
+    let saved: SupervisorConfig | undefined;
     const inside = new Promise<void>(resolve => { entered = resolve; });
     const gate = new Promise<void>(resolve => { finish = resolve; });
     const running = withSupervisorOperation(workspaceRoot, async operation => {
-      operation.updateConfig({ desiredState: "running" });
+      saved = operation.updateConfig({ desiredState: "running" });
       entered();
       await gate;
     }, options);
@@ -367,20 +381,37 @@ describe("supervisor operation lock", () => {
       operation.updateConfig({ desiredState: "stopped" });
     }, options)).rejects.toMatchObject({ code: "SUPERVISOR_BUSY" });
     expect(rivalActionRan).toBe(false);
-    expect(readSupervisorConfig(workspaceRoot, options)?.desiredState).toBe("running");
+    expect(fs.readFileSync(supervisorConfigFile(workspace.id, stateDir), "utf8")).toBe(JSON.stringify(saved));
+    expect(saved?.desiredState).toBe("running");
     finish();
     await running;
+    expect(fs.readFileSync(supervisorConfigFile(workspace.id, stateDir), "utf8")).toBe(JSON.stringify(saved));
     expect(fs.existsSync(supervisorOperationLockFile(workspace.id, stateDir))).toBe(false);
   });
 
   it("reclaims an exactly proven dead operation owner", async () => {
-    await createConfig();
     const file = supervisorOperationLockFile(workspace.id, stateDir);
     const deadPid = process.pid === 424242 ? 424243 : 424242;
-    seedLock(file, "operation", { pid: deadPid });
     const probe = fakeProbe(new Set([deadPid]));
-    const result = await withSupervisorOperation(workspaceRoot, operation => operation.readConfig()?.desiredState, { ...options, probeProcess: probe });
-    expect(result).toBe("running");
+    let saved: SupervisorConfig | undefined;
+    let seeded = false, exactMissingProbes = 0;
+    const result = await withSupervisorOperation(workspaceRoot, operation => operation.readConfig(), {
+      ...options, probeProcess: async (pid, expected) => {
+        // 真实入口先初始化私有目录；配置和旧锁只为后续回收准备。
+        if (!seeded && pid === process.pid && expected === undefined) {
+          saved = seedConfig();
+          seedLock(file, "operation", { pid: deadPid });
+          seeded = true;
+        }
+        if (pid === deadPid) { expect(expected).toBe("dead-owner:123"); exactMissingProbes++; }
+        return probe(pid, expected);
+      },
+    });
+    expect(seeded).toBe(true);
+    expect(exactMissingProbes).toBeGreaterThanOrEqual(2);
+    expect(result).toEqual(saved);
+    expect(result?.desiredState).toBe("running");
+    expect(fs.readFileSync(supervisorConfigFile(workspace.id, stateDir), "utf8")).toBe(JSON.stringify(saved));
     expect(fs.existsSync(file)).toBe(false);
   });
 
@@ -471,20 +502,40 @@ describe("supervisor singleton lease", () => {
     expect(fs.existsSync(supervisorLeaseFile(workspace.id, stateDir))).toBe(false);
   });
 
-  it("will not overwrite an orphan runtime unless its exact recorded process is proven missing", async () => {
+  it("runtime drift preserves the live lease and refuses a rival acquisition", async () => {
     const info = { launcherPath: null, buildId: null, registrationMode: "none" as const };
     const deadPid = process.pid === 515151 ? 515152 : 515151;
     const liveLease = await acquireSupervisorLease(workspaceRoot, info, options);
+    const leaseFile = supervisorLeaseFile(workspace.id, stateDir);
+    const runtimeFile = supervisorRuntimeFile(workspace.id, stateDir);
+    const leaseBytes = fs.readFileSync(leaseFile);
     const oldRuntime = { ...liveLease.runtime, pid: deadPid, creationTime: "dead-owner:123", nonce: randomUUID() };
-    fs.writeFileSync(supervisorRuntimeFile(workspace.id, stateDir), JSON.stringify(oldRuntime), { mode: 0o600 });
+    fs.writeFileSync(runtimeFile, JSON.stringify(oldRuntime), { mode: 0o600 });
+    const runtimeBytes = fs.readFileSync(runtimeFile);
+    // runtime 漂移使 release 失权，保留 lease 证据；竞争获取先被活 lease 阻断。
     expect(await liveLease.release()).toBe(false);
+    expect(fs.existsSync(leaseFile)).toBe(true);
+    expect(fs.readFileSync(leaseFile)).toEqual(leaseBytes);
 
+    let liveLeaseProbes = 0;
+    let driftedRuntimeProbes = 0;
     await expect(acquireSupervisorLease(workspaceRoot, info, {
       ...options,
-      probeProcess: async pid => pid === process.pid
-        ? processResult(pid, "identified", "fixture-creation:1")
-        : processResult(pid, "unknown"),
+      probeProcess: async (pid, expected) => {
+        if (pid === liveLease.runtime.pid && expected !== undefined) {
+          expect(expected).toBe(liveLease.runtime.creationTime);
+          liveLeaseProbes++;
+        }
+        if (pid === deadPid) driftedRuntimeProbes++;
+        return pid === process.pid
+          ? processResult(pid, "identified", "fixture-creation:1")
+          : processResult(pid, "unknown");
+      },
     })).rejects.toMatchObject({ code: "SUPERVISOR_BUSY" });
+    expect(liveLeaseProbes).toBeGreaterThan(0);
+    expect(driftedRuntimeProbes).toBe(0);
+    expect(fs.readFileSync(leaseFile)).toEqual(leaseBytes);
+    expect(fs.readFileSync(runtimeFile)).toEqual(runtimeBytes);
     expect(readSupervisorRuntime(workspaceRoot, options)?.pid).toBe(deadPid);
   });
 

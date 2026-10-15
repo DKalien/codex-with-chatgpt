@@ -227,6 +227,13 @@ function reconciliationState(): { revision: number; entries: Array<{ commandId: 
   };
 }
 
+function seedAcceptedReceipt(): void {
+  record = createAcceptedCommand({
+    commandId: COMMAND, plannerRouteId, executorRouteId, message: MESSAGE,
+    threadId: THREAD, turnId: TURN, bindingId: BINDING,
+  });
+}
+
 beforeEach(() => {
   stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "c2c-r4b-reconciler-state-"));
   root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "c2c-r4b-reconciler-root-")));
@@ -252,10 +259,6 @@ beforeEach(() => {
     },
     result: undefined,
   }));
-  record = createAcceptedCommand({
-    commandId: COMMAND, plannerRouteId, executorRouteId, message: MESSAGE,
-    threadId: THREAD, turnId: TURN, bindingId: BINDING,
-  });
 });
 
 afterEach(() => {
@@ -265,7 +268,7 @@ afterEach(() => {
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-describe("R4b trusted Desktop execution result reconciliation", () => {
+describe("Desktop outcome_unknown Command reconciliation", () => {
   it("outcome_unknown Command 在唯一 Desktop accepted proof 后收敛并生成 canonical result/Bus", () => {
     const commandId = "r4c3-outcome-unknown-recovery";
     createOutcomeUnknownCommand({ commandId, message: "recover R4c3" , deliveryStatus: "accepted" });
@@ -297,6 +300,10 @@ describe("R4b trusted Desktop execution result reconciliation", () => {
     expect(readRouting(workspace)?.commands.find(command => command.commandId === commandId)?.deliveryStatus)
       .toBe("outcome_unknown");
   });
+});
+
+describe("R4b trusted Desktop execution result reconciliation", () => {
+  beforeEach(seedAcceptedReceipt);
 
   it("accepted Command 与可信 Desktop receipt 生成 canonical result 和 Result Bus", () => {
     const result = reconcile();
@@ -552,6 +559,8 @@ describe("R4b trusted Desktop execution result reconciliation", () => {
 });
 
 describe("Desktop canonical Result Bus reconciliation", () => {
+  beforeEach(seedAcceptedReceipt);
+
   it("canonical result 通过生产 seam 进入唯一 Result Bus", () => {
     const outcome = reconcile();
     expect(outcome).toMatchObject({
@@ -602,6 +611,8 @@ describe("Desktop canonical Result Bus reconciliation", () => {
 
 
 describe("Desktop Result Bus durable recovery", () => {
+  beforeEach(seedAcceptedReceipt);
+
   it("receipt/result 已落盘而 Bus 写锁繁忙时保留 pending，重试只补当前 command", () => {
     const lock = `${resultBusFile(workspace.id)}.lock`;
     fs.mkdirSync(path.dirname(lock), { recursive: true });

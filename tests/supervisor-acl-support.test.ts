@@ -4,7 +4,7 @@ import * as childProcess from "node:child_process";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { makeTmpDir } from "./helpers.js";
 import { cleanupStrict } from "./strict-teardown.js";
-import { finishSupervisorFixtures, observeSupervisorAclCall, preserveSupervisorFailure, type SupervisorAclCall } from "./supervisor-acl-support.js";
+import { finishSupervisorFixtures, observeSupervisorAclCall, prepareSupervisorFixtureStore, preserveSupervisorFailure, type SupervisorAclCall } from "./supervisor-acl-support.js";
 import { readSupervisorConfig } from "../src/supervisor/store.js";
 
 const execute = vi.hoisted(() => vi.fn());
@@ -25,6 +25,65 @@ afterEach(async () => {
     if (path.dirname(directory) !== diagnosticRoot) throw new Error("unexpected evidence teardown target");
     fs.rmSync(directory, { recursive: true, force: true });
   }
+});
+
+describe("supervisor fixture store initialization", () => {
+  it("rejects outside roots, file roots and existing children before executing ACL setup", () => {
+    expect(() => prepareSupervisorFixtureStore(path.resolve("src"))).toThrow(/outside test-tmp/);
+    const root = fixture(), file = path.join(root, "file");
+    fs.writeFileSync(file, "ordinary file");
+    expect(() => prepareSupervisorFixtureStore(file)).toThrow(/not canonical/);
+    const child = path.join(root, "bridge-supervisor");
+    fs.mkdirSync(child);
+    expect(() => prepareSupervisorFixtureStore(root)).toThrow(/EEXIST/);
+    expect(fs.readdirSync(child)).toEqual([]);
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it("uses one bounded Windows ACL call and preserves subprocess failures without retry", () => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+    try {
+      const root = fixture();
+      execute.mockReturnValueOnce("OK:S-1-5-21\n");
+      prepareSupervisorFixtureStore(root);
+      expect(execute).toHaveBeenCalledTimes(1);
+      const [executable, args, options] = execute.mock.calls[0];
+      const systemRoot = process.env.SystemRoot ?? process.env.WINDIR ?? "C:\\Windows";
+      expect(executable).toBe(path.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"));
+      expect(args.slice(0, -1)).toEqual(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"]);
+      expect(args.at(-1)).toContain("$acl.SetOwner($identity)");
+      expect(args.at(-1)).toContain("Set-Acl -LiteralPath $target -AclObject $acl");
+      expect(args.at(-1)).not.toContain("SetAccessControl");
+      expect(options).toMatchObject({ timeout: 15_000, maxBuffer: 16 * 1024, windowsHide: true, encoding: "utf8", stdio: "pipe" });
+      expect(options.env).toEqual({ SystemRoot: systemRoot, WINDIR: process.env.WINDIR ?? systemRoot,
+        PATH: process.env.PATH ?? "", TEMP: process.env.TEMP ?? "", TMP: process.env.TMP ?? "", USERPROFILE: process.env.USERPROFILE ?? "",
+        C2C_SUPERVISOR_ACL_TARGETS: JSON.stringify([{ path: path.join(root, "bridge-supervisor"), mode: "set-directory" }]) });
+      const original = Object.assign(new Error("raw timeout"), { code: "ETIMEDOUT" });
+      execute.mockImplementationOnce(() => { throw original; });
+      try { prepareSupervisorFixtureStore(fixture()); throw new Error("did not fail"); }
+      catch (error) { expect(error).toBe(original); }
+      expect(execute).toHaveBeenCalledTimes(2);
+      execute.mockReturnValueOnce("unexpected stdout");
+      expect(() => prepareSupervisorFixtureStore(fixture())).toThrow(/invalid fixture ACL output/);
+      expect(execute).toHaveBeenCalledTimes(3);
+    } finally { Object.defineProperty(process, "platform", platform); }
+  });
+
+  it("creates a private non-Windows directory without executing a subprocess", () => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    const realPlatform = process.platform;
+    Object.defineProperty(process, "platform", { ...platform, value: "linux" });
+    try {
+      const root = fixture();
+      prepareSupervisorFixtureStore(root);
+      const stat = fs.statSync(path.join(root, "bridge-supervisor"));
+      expect(stat.isDirectory()).toBe(true);
+      // Windows chmod 不证明 POSIX 权限；mode 仅在真实非 Windows 主机验证。
+      if (realPlatform !== "win32") expect(stat.mode & 0o777).toBe(0o700);
+      expect(execute).not.toHaveBeenCalled();
+    } finally { Object.defineProperty(process, "platform", platform); }
+  });
 });
 
 describe("supervisor failed fixture evidence", () => {

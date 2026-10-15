@@ -6,8 +6,9 @@ import { ensureBridgeAndTunnel } from "../src/process/daemon.js";
 import { findBridgeObservation, runtimeFile } from "../src/bridge/runtime.js";
 import { readTunnelState } from "../src/tunnel/state.js";
 import { hasSupervisorState, readSupervisorConfig, withSupervisorOperation } from "../src/supervisor/store.js";
+import type { SupervisorOperation } from "../src/supervisor/store.js";
 import type { SupervisorConfig } from "../src/supervisor/schema.js";
-import { observeSupervisorBridge, recoverSupervisorBridge, runSupervisorLoop, withExplicitSupervisorIntent } from "../src/supervisor/lifecycle.js";
+import { productionLoopDependencies, observeSupervisorBridge, recoverSupervisorBridge, runSupervisorLoop, withExplicitSupervisorIntent } from "../src/supervisor/lifecycle.js";
 import { isolateStateDir, makeTmpDir } from "./helpers.js";
 import { cleanupStrict } from "./strict-teardown.js";
 
@@ -82,6 +83,53 @@ describe("independent supervisor decisions", () => {
 });
 
 describe("auto-recovery production adapter", () => {
+  const cycleFixture = () => {
+    const order: string[] = [];
+    let leaseOwned = true, operationOwned = true;
+    const assertLease = vi.fn(() => {
+      order.push("lease");
+      if (!leaseOwned) throw new Error("lease lost");
+    });
+    const assertOwned = vi.fn(() => {
+      order.push("operation");
+      if (!operationOwned) throw new Error("operation lost");
+    });
+    const readConfig = vi.fn(() => { order.push("read"); assertOwned(); return config(); });
+    const tx: SupervisorOperation = { assertOwned, readConfig, updateConfig: vi.fn() };
+    vi.mocked(withSupervisorOperation).mockImplementation(async (_root, action) => {
+      const result = await action(tx);
+      assertOwned();
+      return result;
+    });
+    return { deps: productionLoopDependencies(new Workspace(root), assertLease), order, assertOwned, readConfig,
+      lose: (owner: "lease" | "operation") => { if (owner === "lease") leaseOwned = false; else operationOwned = false; } };
+  };
+  it.each(["lease", "operation"] as const)("rejects lost %s ownership before running the cycle action", async owner => {
+    const fixture = cycleFixture(), action = vi.fn(async () => ({ reason: "healthy" as const }));
+    fixture.lose(owner);
+    await expect(fixture.deps.cycle(action)).rejects.toThrow(`${owner} lost`);
+    expect(action).not.toHaveBeenCalled();
+    expect(fixture.readConfig).toHaveBeenCalledTimes(owner === "lease" ? 0 : 1);
+  });
+  it("reads under ownership before action without a redundant entry operation check", async () => {
+    const fixture = cycleFixture();
+    const action = vi.fn(async saved => { fixture.order.push("action"); expect(saved).toEqual(config()); return { reason: "healthy" as const }; });
+    await expect(fixture.deps.cycle(action)).resolves.toEqual({ reason: "healthy" });
+    expect(fixture.order).toEqual(["lease", "read", "operation", "action", "operation"]);
+    expect(fixture.assertOwned).toHaveBeenCalledTimes(2);
+    expect(action).toHaveBeenCalledTimes(1);
+  });
+  it.each(["lease", "operation"] as const)("does not ensure after %s ownership is lost across observation await", async owner => {
+    const fixture = cycleFixture(), controller = new AbortController();
+    const observe = vi.fn(async () => { await Promise.resolve(); fixture.lose(owner); return { state: "stopped" as const }; });
+    const ensure = vi.fn(), report = vi.fn();
+    await runSupervisorLoop({ ...fixture.deps, observe, ensure, report,
+      sleep: async () => { controller.abort(); } }, controller.signal);
+    expect(observe).toHaveBeenCalledTimes(1);
+    expect(ensure).not.toHaveBeenCalled();
+    expect(fixture.order.filter(step => step === "lease")).toHaveLength(2);
+    expect(report).toHaveBeenCalledTimes(1);
+  });
   it("existing malformed runtime is unknown rather than legacy reader's missing", async () => {
     const workspace = new Workspace(root), file = runtimeFile(workspace.id);
     fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, "{broken");

@@ -45,9 +45,53 @@ export function observeSupervisorAclCall(records: SupervisorAclCall[], call: typ
 function assertFixtureRoot(root: string): void {
   const relative = path.relative(tempRoot, path.resolve(root));
   if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) throw new Error("diagnostic fixture outside test-tmp");
-  if (fs.lstatSync(root).isSymbolicLink() || fs.realpathSync.native(root).toLowerCase() !== path.resolve(root).toLowerCase()) {
+  const stat = fs.lstatSync(root);
+  if (!stat.isDirectory() || stat.isSymbolicLink() || fs.realpathSync.native(root).toLowerCase() !== path.resolve(root).toLowerCase()) {
     throw new Error("diagnostic fixture root is not canonical");
   }
+}
+
+const PREPARE_STORE_ACL = String.raw`
+$ErrorActionPreference = 'Stop'
+$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$target = [string](@(ConvertFrom-Json -InputObject $env:C2C_SUPERVISOR_ACL_TARGETS)[0].path)
+$directory = Get-Item -LiteralPath $target -Force
+if (-not $directory.PSIsContainer -or ($directory.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) { throw 'fixture is not an ordinary directory' }
+$acl = Get-Acl -LiteralPath $target
+$acl.SetAccessRuleProtection($true, $false)
+foreach ($rule in @($acl.Access)) { [void]$acl.RemoveAccessRuleSpecific($rule) }
+$identity = [System.Security.Principal.SecurityIdentifier]::new($sid)
+$acl.SetOwner($identity)
+$inheritance = [System.Security.AccessControl.InheritanceFlags]([int][System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [int][System.Security.AccessControl.InheritanceFlags]::ObjectInherit)
+$rule = [System.Security.AccessControl.FileSystemAccessRule]::new($identity,
+  [System.Security.AccessControl.FileSystemRights]::FullControl, $inheritance,
+  [System.Security.AccessControl.PropagationFlags]::None,
+  [System.Security.AccessControl.AccessControlType]::Allow)
+[void]$acl.AddAccessRule($rule)
+Set-Acl -LiteralPath $target -AclObject $acl
+[Console]::Out.WriteLine('OK:' + $sid)
+`;
+
+/** 只初始化新 fixture 目录；后续真实 store 入口仍校验 ACL 和启动身份。 */
+export function prepareSupervisorFixtureStore(stateDir: string): void {
+  const root = path.resolve(stateDir);
+  assertFixtureRoot(root);
+  const directory = path.join(root, "bridge-supervisor");
+  fs.mkdirSync(directory, { mode: 0o700 });
+  assertFixtureRoot(directory);
+  if (process.platform !== "win32") {
+    fs.chmodSync(directory, 0o700);
+    return;
+  }
+  const systemRoot = process.env.SystemRoot ?? process.env.WINDIR ?? "C:\\Windows";
+  const executable = path.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  const output = execFileSync(executable, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", PREPARE_STORE_ACL], {
+    encoding: "utf8", windowsHide: true, timeout: 15_000, maxBuffer: 16 * 1024, stdio: "pipe",
+    env: { SystemRoot: systemRoot, WINDIR: process.env.WINDIR ?? systemRoot, PATH: process.env.PATH ?? "",
+      TEMP: process.env.TEMP ?? "", TMP: process.env.TMP ?? "", USERPROFILE: process.env.USERPROFILE ?? "",
+      C2C_SUPERVISOR_ACL_TARGETS: JSON.stringify([{ path: directory, mode: "set-directory" }]) },
+  });
+  if (!/^OK:S-\d(?:-\d+)+\s*$/.test(output)) throw new Error("invalid fixture ACL output");
 }
 
 const READ_ACLS = String.raw`

@@ -1,5 +1,7 @@
 # Phase F1b Companion Resilience Hardening
 
+> 本文件是 2026-09-18 的历史阶段记录。文中 Service Worker、autonomy、journal 和旧发送编排入口只表示当时源码；2026-10-13 旧 Companion 编排已退役，当前入口见[轻量 Companion](companion-lightweight.md)。
+
 日期：2026-09-18。基线：`main@44075ea`（F1a operational readiness health 已合入）。
 
 本阶段目标不是新功能，而是**系统证明**：Browser Companion 在 SW 重启、页面 reload、网络中断、auth stale、durable journal 恢复等真实故障下仍保持 **exactly-once / fail-closed**。

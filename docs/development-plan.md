@@ -670,7 +670,7 @@ Windows API 边界：breakaway 受 Job/nested Job 配置约束，进程也可后
 
 #### 独立相邻问题：Browser refresh reconnect
 
-用户另行复现同一 ChatGPT conversation 刷新后，点击一次“连接当前对话”报错。本轮不操作浏览器，尚无该次 connect diagnostic/stage，不与 Bridge 进程退出合并归因。`browser-companion/ownership.js` 在 document replacement 后撤销旧 owner；heartbeat 不继承新 owner；`connect-flow.js` 的 explicit Connect 才能在指定 flow 状态刷新 document/generation witness。`service-worker.js` 的 connect/bind 和 `content-script.js` 的启动/pageshow heartbeat 是下一轮只读诊断入口。目标是一次显式 Connect 安全取得新 document owner，并保留/重新收敛同一 VERIFIED route 的 Web Sink，无需 re-pair 或清空 local target；不能清除 outcome_unknown/route-attest fence 来伪装成功。
+用户另行复现同一 ChatGPT conversation 刷新后，点击一次“连接当前对话”报错。本轮不操作浏览器，尚无该次 connect diagnostic/stage，不与 Bridge 进程退出合并归因。`browser-companion/ownership.js`、`connect-flow.js`、`service-worker.js` 和 `content-script.js` 是当时源码的诊断对象；2026-10-13 旧 Companion 编排已从源码退役，本段不再构成下一轮入口。当前轻量连接合同见[轻量 Companion](companion-lightweight.md)，不能清除 `outcome_unknown` 或历史 route 证明来伪装成功。
 
 #### 2026-10-02：Bridge application-timeout exact-process recovery
 
@@ -1661,12 +1661,14 @@ G 阶段聚焦用户体验与跨设备日常闭环，不再扩展 recovery 状�
 
 - **G2 已通过 independent review**（full suite 1628 passed）。
 
-### G3 — route-principal attestation（2026-09-19，live E2E **PASS**）
+### G3 — route-principal attestation（2026-09-19，历史源码与 live E2E 记录）
+
+> **历史归档（2026-10-13）**：本节描述的旧 SW、route-attestation runner、durable browser fence 和 classic packaging 已从默认 Companion 源码退役。保留本节用于追溯当时的安全决策；当前实现与操作入口以[轻量 Companion](companion-lightweight.md)和[架构](architecture.md)为准。
 
 G3 修复 Browser Companion 误绑错误 ChatGPT conversation 后 production Send 投错 chat 的问题。
 `paired ≠ origin conversation attested`：pair 只注册 credential+route，**reserve/begin-send 要求 route 已验证**。
 
-**现役实现（code committed `84e67e4`…`b961438`；workspace `2582910bf0d2` install `f728012c…`）**
+**当时实现（code committed `84e67e4`…`b961438`；workspace `2582910bf0d2` install `f728012c…`）**
 
 - **Server contract**：pair 铸 pending challenge（`challengeId` + `challengeDigest`，绑定 workspace/binding/epoch/companion/route）；MCP `feedback_companion_route_confirm`（scope `codex.feedback`，principal 仅来自 `openai/session`）。wrong principal **不消费** challenge。
 - **Browser gates**：route `PENDING` 时 Arm / Reserve / production begin-send 均拒绝；authenticated `/state` 为 **唯一** `VERIFIED` 权威；DOM 观察不得写 VERIFIED。
@@ -1674,7 +1676,7 @@ G3 修复 Browser Companion 误绑错误 ChatGPT conversation 后 production Sen
 - **Durable fence**（`chrome.storage.local`）：`NONE → PAIRING_TRANSITION → ROUTE_ATTEST_DISPATCH → OBSERVED_PENDING_CONFIRM → VERIFIED | OUTCOME_UNKNOWN`；session latch 不够；corrupt fence fail closed；**任何 non-NONE fence（含不同 identity）一律 block**；transport clear 不清 fence；仅 re-pair（新 companionId+challengeId）写 matching `NONE`。
 - **Pair barrier-first**：调 `/pair` 前 durable 写 `PAIRING_TRANSITION`；`prev*` 在改全局前捕获；`TRANSPORT+LOCAL+FENCE` 尽量同一次 `storage.local.set`；4xx 可恢复 prev fence，网络/5xx 保持 barrier；pair **非** success 若 durable commit 失败。
 - **Post-write ready gate**（`b961438`）：write/verify 后按 send-probe 契约 poll——仅 `kind=send` + `enabled` + form `data-testid=send-button` 才 dispatch；`idle` 不是 click target；成功判定为 `click.ok`（生产返回 `clicked:1`）。
-- **Classic packaging**：content_scripts **禁止** ESM `dom-adapter.js` / `turn-observer.js` / `route-attestation*.js`；CS 使用 `dom-adapter-global.js` / `turn-observer-global.js` / `route-attestation-global.js` / `route-attestation-run-global.js`；SW ESM import graph 保留原文件名；`send-probe-run` / `send-click-adapter` classic 为 IIFE + namespaced `__c2c*` 绑定；build fail-fast（manifest 禁 ESM、provider 先于 consumer、`new Function` parse、真实 `import()` dist ESM link 测试）。
+- **Classic packaging（历史）**：content_scripts **禁止** ESM `dom-adapter.js` / `turn-observer.js` / `route-attestation*.js`；CS 使用 `dom-adapter-global.js` / `turn-observer-global.js` / `route-attestation-global.js` / `route-attestation-run-global.js`；SW ESM import graph 保留原文件名；`send-probe-run` / `send-click-adapter` classic 为 IIFE + namespaced `__c2c*` 绑定；build fail-fast（manifest 禁 ESM、provider 先于 consumer、`new Function` parse、真实 `import()` dist ESM link 测试）。
 - **Popup Grant Bridge access**（`9dc88d7`）：`chrome.permissions.request` 在 click handler **同步**调用（gesture-first）；Pair 仅 `permissions.contains`，缺权限 `bridge_permission_missing`。
 - **门禁**：最近 full vitest **80 files / 1775 passed**；typecheck / build / `git diff --check`。Extension 需 Edge **Reload** `dist/browser-companion` 才加载新 CS/popup。
 

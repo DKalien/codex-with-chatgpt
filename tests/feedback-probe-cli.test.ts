@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -13,6 +14,9 @@ import { cleanup, isolateStateDir, makeTmpDir } from "./helpers.js";
 
 const runFile = promisify(execFile);
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+const entry = path.join(projectRoot, "tests/fixtures/probe-cli.ts");
+const productionEntry = path.join(projectRoot, "src/cli/index.ts");
 
 let wsRoot: string;
 let stateDir: string;
@@ -41,9 +45,13 @@ function principalA() {
 }
 
 async function cli(...args: string[]): Promise<{ stdout: string; code: number }> {
+  return runCli(entry, ...args);
+}
+
+async function runCli(cliEntry: string, ...args: string[]): Promise<{ stdout: string; code: number }> {
   try {
     const result = await runFile(process.execPath, [
-      "--import", "tsx", path.join(projectRoot, "src/cli/index.ts"),
+      "--import", "tsx", cliEntry,
       "feedback-probe", ...args, "-w", wsRoot, "--json",
     ], { cwd: projectRoot, env: { ...process.env, C2C_STATE_DIR: stateDir }, windowsHide: true });
     return { stdout: result.stdout, code: 0 };
@@ -54,8 +62,39 @@ async function cli(...args: string[]): Promise<{ stdout: string; code: number }>
 }
 
 describe("本机 feedback-probe CLI", () => {
+  it("轻量探针入口复用生产注册与 Commander 设置", () => {
+    const production = fs.readFileSync(productionEntry, "utf8");
+    const fixture = fs.readFileSync(entry, "utf8");
+    for (const [command, registration, module] of [
+      ["feedback-probe", "registerFeedbackProbeCommands", "feedback-probe"],
+      ["write-probe-status", "registerSetupCommands", "setup"],
+    ]) {
+      expect(production).toMatch(new RegExp(`import\\s+\\{[^}]*\\b${registration}\\b[^}]*\\}\\s+from "\\./${module}\\.js"`));
+      expect(production).toContain(`${registration}(program);`);
+      expect(fixture).toContain(`case "${command}": {`);
+      expect(fixture).toMatch(new RegExp(`const\\s+\\{\\s*${registration}\\s*\\}\\s*=\\s*await import\\("\\.\\./\\.\\./src/cli/${module}\\.js"\\);\\s*${registration}\\(program\\);\\s*break;`));
+    }
+    expect(fixture.match(/register\w+\(program\);/g)).toHaveLength(2);
+    expect(fixture.match(/case "[^"]+":/g)).toHaveLength(2);
+    expect(fixture).toContain("switch (process.argv[2])");
+    for (const setting of [
+      'import { Command } from "commander";',
+      'const program = new Command();',
+      '.name("c2c")',
+      '.description(`${PRODUCT_NAME} — ChatGPT thinks. Codex works.`)',
+      '.version(VERSION, "-v, --version")',
+      '.configureHelp({ sortSubcommands: true });',
+      'program.parseAsync(process.argv).catch((error: Error) => {',
+      'cross(error.message);',
+      'process.exit(1);',
+    ]) {
+      expect(production).toContain(setting);
+      expect(fixture).toContain(setting);
+    }
+  });
+
   it("status 未启用时可见空状态；emit 未启用拒绝", async () => {
-    const st = JSON.parse((await cli("status")).stdout);
+    const st = JSON.parse((await runCli(productionEntry, "status")).stdout);
     expect(st.enabled).toBe(false);
     expect(st.binding).toBeNull();
 

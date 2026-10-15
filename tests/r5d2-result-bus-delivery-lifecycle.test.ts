@@ -1,9 +1,11 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { Workspace } from "../src/workspace/manager.js";
 import { appendResult, createCommand, registerRoute } from "../src/routing/store.js";
+import { resultSchema } from "../src/routing/schema.js";
 import { canonicalRoutingResultDigest } from "../src/routing/execution-result-digest.js";
 import { bindCurrentWebSink, readActiveWebSinkBinding } from "../src/web-sink-control/index.js";
 import { projectChatgptRouteToWebSinkCandidate } from "../src/web-sink-control/index.js";
@@ -80,6 +82,22 @@ function canonicalResult(commandId: string, iteration = 1, status: "ok" | "faile
       changedFiles: [], testsSummary: "r5d2 passed",
     },
   }, stateDir);
+}
+
+// 纯 schema 和腐败读取测试只需合法 result，不需要 Routing 提交。
+function schemaResult(commandId: string) {
+  const now = new Date().toISOString();
+  return resultSchema.parse({
+    commandId, executorRouteId: EXECUTOR, iteration: 1, status: "ok",
+    rawSummary: `R5d2 canonical result ${commandId}`,
+    machineEvidence: {
+      version: 1, source: "codex_desktop_receipt", desktopReceiptSha256: HEX64,
+      taskId: `desktop_${commandId}`, iteration: 1, status: "ok", threadId: EXECUTOR,
+      originTurnId: EXECUTOR, resultTurnId: EXECUTOR, bindingId: BINDING,
+      changedFiles: [], testsSummary: "r5d2 passed",
+    },
+    resultId: randomUUID(), createdAt: now, updatedAt: now,
+  });
 }
 
 function queueEntry(commandId: string, iteration = 1) {
@@ -572,7 +590,7 @@ describe("R5d2 Result Bus delivery lifecycle", () => {
   });
 
   it("W: schema 拒绝不可能的 metadata/state 组合", () => {
-    const result = canonicalResult("r5d2-w");
+    const result = schemaResult("r5d2-w");
     const now = new Date().toISOString();
     const target = {
       version: 1 as const, bindingId: "binding-w", pluginId: "chatgpt-web", surfaceId: "chatgpt-web",
@@ -711,10 +729,10 @@ describe("R5d2 review-fix: persisted invariants", () => {
   });
 
   it("review-1b: 四个冻结状态均强制 reservation/target binding stamp 一致", () => {
-    const r1 = canonicalResult("r5d2-rf-p1");
-    const r2 = canonicalResult("r5d2-rf-p2");
-    const r3 = canonicalResult("r5d2-rf-p3");
-    const r4 = canonicalResult("r5d2-rf-p4");
+    const r1 = schemaResult("r5d2-rf-p1");
+    const r2 = schemaResult("r5d2-rf-p2");
+    const r3 = schemaResult("r5d2-rf-p3");
+    const r4 = schemaResult("r5d2-rf-p4");
     const frozenStates = [
       { deliveryStatus: "claimed", result: r1, extra: {} },
       { deliveryStatus: "observed", result: r2, extra: { observedAt: NOW } },
@@ -743,9 +761,9 @@ describe("R5d2 review-fix: persisted invariants", () => {
   });
 
   it("review-2a: schema 拒绝两个 durable in-flight；单 in-flight + 终态/queued 可接受", () => {
-    const r1 = canonicalResult("r5d2-rf-s1");
-    const r2 = canonicalResult("r5d2-rf-s2");
-    const r3 = canonicalResult("r5d2-rf-s3");
+    const r1 = schemaResult("r5d2-rf-s1");
+    const r2 = schemaResult("r5d2-rf-s2");
+    const r3 = schemaResult("r5d2-rf-s3");
     const reserved1 = fixtureEntry(r1, { deliveryStatus: "reserved", reservation: RESERVE_A });
     const reserved2 = fixtureEntry(r2, { deliveryStatus: "reserved", reservation: RESERVE_B });
     const claimed = fixtureEntry(r2, {
@@ -769,16 +787,18 @@ describe("R5d2 review-fix: persisted invariants", () => {
   });
 
   it("review-2b: readResultBus 将双 in-flight 持久化状态映射为 RESULT_BUS_STATE_CORRUPT", () => {
-    const r1 = canonicalResult("r5d2-rf-b1");
-    const r2 = canonicalResult("r5d2-rf-b2");
+    const r1 = schemaResult("r5d2-rf-b1");
+    const r2 = schemaResult("r5d2-rf-b2");
     const file = busFilePath();
     fs.mkdirSync(path.dirname(file), { recursive: true });
+    const entries = [
+      fixtureEntry(r1, { deliveryStatus: "reserved", reservation: RESERVE_A }),
+      fixtureEntry(r2, { deliveryStatus: "reserved", reservation: RESERVE_B }),
+    ];
+    expect(parseState([entries[0]])).toBeTruthy();
+    expect(parseState([entries[1]])).toBeTruthy();
     fs.writeFileSync(file, JSON.stringify({
-      version: 1, workspaceId: identity.id, workspaceRoot: identity.root, revision: 2,
-      entries: [
-        fixtureEntry(r1, { deliveryStatus: "reserved", reservation: RESERVE_A }),
-        fixtureEntry(r2, { deliveryStatus: "reserved", reservation: RESERVE_B }),
-      ],
+      version: 1, workspaceId: identity.id, workspaceRoot: identity.root, revision: 2, entries,
     }));
     expect(busErrorCode(() => readResultBus(identity, stateDir))).toBe("RESULT_BUS_STATE_CORRUPT");
   });

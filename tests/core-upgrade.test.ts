@@ -29,6 +29,12 @@ function fixture() {
     runtimeBuildId: build } as RuntimeState };
 }
 
+function bareFixture() {
+  const state = isolateStateDir(); const root = makeTmpDir("core-upgrade-bare");
+  dirs.push(state, root);
+  return { state, workspace: new Workspace(root) };
+}
+
 it("pending 严格无凭据、相同目标幂等，status 只读显示 runtime/current 差异", () => {
   const { workspace, build, runtime } = fixture();
   expect(readRuntimeUpgrade(workspace, runtime, "fast")).toMatchObject({ state: "current", upgradePending: false });
@@ -194,11 +200,16 @@ it("doctor --no-fix 不写入 Connector endpoint 或生成配对码", async () =
 });
 
 it("隐藏 rollout result-file 在维护前拒绝覆盖已有文件", async () => {
-  const { state, workspace } = fixture();
+  const { state, workspace } = bareFixture();
   const resultFile = write(state, "keep-result.json", "existing evidence");
-  await expect(promisify(execFile)(process.execPath, ["--import", "tsx/esm", path.resolve("src/cli/index.ts"),
+  const result = await promisify(execFile)(process.execPath, ["--import", "tsx/esm", path.resolve("src/cli/index.ts"),
     "rollout", "-w", workspace.root, "--json", "--result-file", resultFile],
-  { windowsHide: true, env: { ...process.env }, timeout: 15000 })).rejects.toMatchObject({ code: 1 });
+  { windowsHide: true, env: { ...process.env }, timeout: 15000 }).catch(error => {
+    if (error.code === 1 && typeof error.stdout === "string") return error as { code: number; stdout: string };
+    throw error;
+  });
+  expect(result).toMatchObject({ code: 1 });
+  expect(JSON.parse(result.stdout).error).toContain("EEXIST");
   expect(fs.readFileSync(resultFile, "utf8")).toBe("existing evidence");
   expect(fs.existsSync(path.join(state, "runtime"))).toBe(false);
 });
