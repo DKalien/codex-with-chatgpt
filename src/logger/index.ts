@@ -10,6 +10,7 @@ const LEVELS: Record<LogLevel, number> = { debug: 10, info: 20, warn: 30, error:
  */
 const REDACT_PATTERNS: RegExp[] = [
   /c2c_(?:at|rt|ac|admin)_[A-Za-z0-9_-]+/g,
+  /\bsk-[A-Za-z0-9_*-]{8,}/g, // OpenAI API / tunnel runtime keys（含已打码形式）
   /(authorization"?\s*[:=]\s*"?bearer\s+)[^\s"']+/gi,
   /((?:access_token|refresh_token|client_secret|code_verifier|code|token)"?\s*[:=]\s*"?)[A-Za-z0-9._~+/-]{16,}/gi,
   /\b[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}\b/g, // pairing-code shaped strings

@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { resolveChatGptComposer, resolveChatGptAction, observeChatGptSafety, normalizeCanonicalDomText, matchesSendTargetIdentity, inspectActiveComposerControls } from "../browser-companion/dom-adapter.js";
 
-import { inspectComposerWriteCapability, writeCanonicalMessage, verifyCanonicalComposer } from "../browser-companion/composer-write-adapter.js";
+import { inspectComposerWriteCapability, writeCanonicalMessage, verifyCanonicalComposer, clearComposerIfExact } from "../browser-companion/composer-write-adapter.js";
 import { dispatchNativeSend } from "../browser-companion/send-click-adapter.js";
 
 import { snapshotUserTurns, findCanonicalUserTurn, hasExactAttemptMarker, buildMarkerRepresentationDiagnostic } from "../browser-companion/turn-observer.js";
@@ -274,8 +274,8 @@ function makeEdgeDom(opts: {
       },
     },
     createRange: () => ({ selectNodeContents() {} }),
-    execCommand: (_cmd: string, _ui: boolean, value: string) => {
-      state.text = value;
+    execCommand: (cmd: string, _ui: boolean, value: string) => {
+      state.text = cmd === "delete" ? "" : value;
       return true;
     },
     queryCommandSupported: (cmd: string) => cmd === "insertText",
@@ -708,7 +708,7 @@ describe("runtime unreachability (E1b3b safety gate)", () => {
     expect(js).not.toContain("dom-adapter.js");
     expect(js).toContain("dom-adapter-global.js");
     expect(js).not.toContain("shadow-evidence.js");
-    expect(js).toContain("content-lite.js");
+    expect(js).toContain("content.js");
     for (const p of manifest.permissions ?? []) {
       expect(["scripting", "debugger", "nativeMessaging", "webRequest"]).not.toContain(p);
     }
@@ -1100,4 +1100,18 @@ describe("R3p current structural Send (observed 2026-09-25)", () => {
     expect(sendClicks.clicks).toBe(1);
     expect(voiceClicks.clicks).toBe(0);
   });
+});
+
+describe("F. clearComposerIfExact", () => {
+  for (const editorKind of ["contenteditable", "textarea"] as const) {
+    it(`${editorKind}: 只清空与消息完全一致的内容`, () => {
+      const same = makeEdgeDom({ mode: "send", text: MESSAGE, editorKind });
+      expect(clearComposerIfExact(same.doc, MESSAGE)).toBe(true);
+      expect(same.state.text).toBe("");
+
+      const edited = makeEdgeDom({ mode: "send", text: MESSAGE + "我的补充", editorKind });
+      expect(clearComposerIfExact(edited.doc, MESSAGE)).toBe(false);
+      expect(edited.state.text).toBe(MESSAGE + "我的补充");
+    });
+  }
 });

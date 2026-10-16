@@ -176,6 +176,35 @@ function setNativeValue(editor, value, win) {
 }
 
 /**
+ * 点击发送前失败时撤销本伴侣的写入：仅当输入框内容与 message 完全一致才清空，
+ * 用户改过或自己输入的内容一律不碰。返回是否已清空。
+ */
+export function clearComposerIfExact(doc, message) {
+  try {
+    const { editor, kind } = resolveChatGptComposer(doc);
+    const read = readCanonicalComposerText(editor);
+    if (!read.ok || read.text !== normalizeCanonicalDomText(message)) return false;
+    const win = doc.defaultView || globalThis;
+    if (kind === "textarea") {
+      setNativeValue(editor, "", win);
+      editor.dispatchEvent(new (win.Event || Event)("input", { bubbles: true }));
+    } else {
+      if (typeof editor.focus === "function") editor.focus();
+      const range = doc.createRange();
+      range.selectNodeContents(editor);
+      const sel = win.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+      doc.execCommand("delete");
+    }
+    const after = readCanonicalComposerText(editor);
+    return after.ok && after.text === "";
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Synchronous last-moment mutation fence.
  * false / throw → fail closed. Never Promise. No page logic between guard and write.
  */

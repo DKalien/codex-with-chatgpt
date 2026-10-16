@@ -3,10 +3,6 @@ import fs from "node:fs";
 import path from "node:path";
 import { z } from "zod";
 import { ensureDir, getStateDir, writeSecureJson } from "../config/paths.js";
-import { isWriteProbeEnabled, WRITE_PROBE_SCOPE } from "../mcp/write-probe.js";
-import { FEEDBACK_PROBE_SCOPE, isFeedbackProbeEnabled } from "../feedback/probe-store.js";
-import { CODEX_FEEDBACK_SCOPE } from "../feedback/store.js";
-
 export const SUPPORTED_SCOPES = [
   "workspace.read",
   "workspace.search",
@@ -17,53 +13,12 @@ export const SUPPORTED_SCOPES = [
 
 export const DESKTOP_CONTROL_SCOPE = "codex.desktop.control";
 export const DESKTOP_READ_SCOPE = "codex.desktop.read";
-export const EXECUTOR_CONTROL_SCOPE = "codex.executor.control";
-export const EXECUTOR_READ_SCOPE = "codex.executor.read";
-export const WEB_SINK_READ_SCOPE = "codex.websink.read";
-export const CONNECTOR_CONTRACT_VERSION = 1 as const;
-
-export type DesktopCompatibilityStatus =
-  | "none"
-  | "legacy"
-  | "incomplete"
-  | "current"
-  | "unknown"
-  | "corrupt";
-
-export interface DesktopCompatibility {
-  status: DesktopCompatibilityStatus;
-}
-
-export type Scope =
-  | (typeof SUPPORTED_SCOPES)[number]
-  | typeof WRITE_PROBE_SCOPE
-  | typeof FEEDBACK_PROBE_SCOPE
-  | typeof CODEX_FEEDBACK_SCOPE
-  | "codex.control"
-  | "codex.read"
-  | typeof DESKTOP_CONTROL_SCOPE
-  | typeof DESKTOP_READ_SCOPE
-  | typeof EXECUTOR_CONTROL_SCOPE
-  | typeof EXECUTOR_READ_SCOPE
-  | typeof WEB_SINK_READ_SCOPE;
 
 export function getSupportedScopes(): string[] {
-  const scopes = [
-    ...SUPPORTED_SCOPES,
-    "codex.control",
-    "codex.read",
-    DESKTOP_CONTROL_SCOPE,
-    DESKTOP_READ_SCOPE,
-    EXECUTOR_CONTROL_SCOPE,
-    EXECUTOR_READ_SCOPE,
-    WEB_SINK_READ_SCOPE,
-    CODEX_FEEDBACK_SCOPE,
-  ];
-  const optional: string[] = [];
-  if (isWriteProbeEnabled()) optional.push(WRITE_PROBE_SCOPE);
-  if (isFeedbackProbeEnabled()) optional.push(FEEDBACK_PROBE_SCOPE);
-  return [...scopes, ...optional];
+  return [...SUPPORTED_SCOPES, DESKTOP_CONTROL_SCOPE, DESKTOP_READ_SCOPE];
 }
+
+const MAX_CLIENTS = 50;
 
 export interface ClientRegistration {
   clientId: string;
@@ -100,12 +55,6 @@ interface PersistedAuthState {
   tokens: TokenRecord[];
 }
 
-type DesktopScopeProfile = "none" | "read" | "control" | "both";
-
-function isClientId(value: unknown): value is string {
-  return typeof value === "string" && value.length > 0 && value.length <= 256;
-}
-
 const persistedAuthStateSchema = z.object({
   clients: z.array(z.object({
     clientId: z.string().min(1).max(256),
@@ -124,21 +73,6 @@ const persistedAuthStateSchema = z.object({
     revoked: z.boolean(),
   }).passthrough()),
 }).passthrough();
-
-function desktopScopeProfile(scopes: readonly string[]): DesktopScopeProfile {
-  const read = scopes.includes(DESKTOP_READ_SCOPE);
-  const control = scopes.includes(DESKTOP_CONTROL_SCOPE);
-  if (read && control) return "both";
-  if (read) return "read";
-  if (control) return "control";
-  return "none";
-}
-
-function desktopCompatibilityStatus(profile: DesktopScopeProfile): DesktopCompatibilityStatus {
-  if (profile === "both") return "current";
-  if (profile === "none") return "legacy";
-  return "incomplete";
-}
 
 export type VerifyTokenResult =
   | { ok: true; record: TokenRecord }
@@ -238,6 +172,12 @@ export class AuthStore {
       redirectUris: input.redirectUris,
       createdAt: new Date().toISOString(),
     };
+    if (this.clients.size >= MAX_CLIENTS) {
+      // 公网无认证注册：淘汰最早且从未拿到 token 的 client，避免状态文件无限增长
+      const withToken = new Set([...this.tokens.values()].map((t) => t.clientId));
+      const victim = [...this.clients.keys()].find((id) => !withToken.has(id));
+      if (victim) this.clients.delete(victim);
+    }
     this.clients.set(client.clientId, client);
     this.save();
     return client;
@@ -342,41 +282,6 @@ export class AuthStore {
     if (record.revoked) return { ok: false, reason: "revoked" };
     if (Date.now() > record.expiresAt) return { ok: false, reason: "expired" };
     return { ok: true, record };
-  }
-
-  /** 描述当前 Desktop OAuth 兼容性；无上下文时汇总独立授权，不合并不同 token。 */
-  desktopCompatibility(accessToken?: string): DesktopCompatibility {
-    if (this.stateCorrupt) return { status: "corrupt" };
-
-    if (accessToken !== undefined) {
-      const verdict = this.verifyAccessToken(accessToken);
-      if (
-        !verdict.ok ||
-        verdict.record.workspaceId !== this.workspaceId ||
-        verdict.record.expiresAt <= Date.now() ||
-        !isClientId(verdict.record.clientId)
-      ) return { status: "unknown" };
-      return { status: desktopCompatibilityStatus(desktopScopeProfile(verdict.record.scopes)) };
-    }
-
-    const profiles = new Set<DesktopScopeProfile>();
-    let invalidContext = false;
-    const now = Date.now();
-    for (const record of this.tokens.values()) {
-      if (record.revoked || record.expiresAt <= now || record.workspaceId !== this.workspaceId) {
-        continue;
-      }
-      if (!isClientId(record.clientId)) {
-        invalidContext = true;
-        continue;
-      }
-      profiles.add(desktopScopeProfile(record.scopes));
-    }
-    if (invalidContext) return { status: "unknown" };
-    if (profiles.size === 0) return { status: "none" };
-    if (profiles.has("both")) return { status: "current" };
-    if (profiles.size !== 1) return { status: "unknown" };
-    return { status: desktopCompatibilityStatus(profiles.values().next().value as DesktopScopeProfile) };
   }
 
   /** Refresh-token rotation: old refresh token is revoked, a new pair is issued. */

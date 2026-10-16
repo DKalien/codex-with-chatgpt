@@ -1,7 +1,6 @@
 import { Router, type Request, type Response, urlencoded, json } from "express";
 import { randomBytes } from "node:crypto";
-import { AuthStore, DESKTOP_CONTROL_SCOPE, DESKTOP_READ_SCOPE, EXECUTOR_CONTROL_SCOPE, EXECUTOR_READ_SCOPE, WEB_SINK_READ_SCOPE, getSupportedScopes, base64UrlSha256, filterScopes, safeEqual } from "./store.js";
-import { WRITE_PROBE_SCOPE } from "../mcp/write-probe.js";
+import { AuthStore, DESKTOP_CONTROL_SCOPE, DESKTOP_READ_SCOPE, getSupportedScopes, base64UrlSha256, filterScopes, safeEqual } from "./store.js";
 import { PairingManager } from "../pairing/manager.js";
 import type { Logger } from "../logger/index.js";
 import { PRODUCT_NAME } from "../version.js";
@@ -77,14 +76,8 @@ function pairingPage(opts: {
     "workspace.search": "Search this workspace",
     "git.read": "Read git status and diffs",
     "execution.read": "Read Codex execution summaries",
-    "codex.control": "在本地已授权工作区创建 Codex 线程并派发任务（可修改文件，使用本机安全配置）",
-    "codex.read": "读取当前工作区的远程 Codex 任务和线程状态",
     [DESKTOP_CONTROL_SCOPE]: "Desktop Control：向本机已绑定会话发送任务；任务可能按该会话权限修改文件或执行命令（可随时在本机撤权）",
     [DESKTOP_READ_SCOPE]: "读取 Desktop 绑定、可用性和投递状态（只读）",
-    [EXECUTOR_CONTROL_SCOPE]: "Executor / 本地编程工具：向当前 active Executor Binding 发送任务；任务可能按该工具权限修改文件或执行命令（可随时在本机撤权）",
-    [EXECUTOR_READ_SCOPE]: "读取 Executor / 本地编程工具 插件列表与 active binding 状态（只读）",
-    [WEB_SINK_READ_SCOPE]: "读取 Active Web Sink / 当前结果接收 URL 绑定状态（只读）",
-    [WRITE_PROBE_SCOPE]: "实验：将测试 nonce 写入 C2C 自身的固定状态文件（不修改工作区）",
     offline_access: "Stay connected between sessions",
   };
   const scopeList = opts.scopes
@@ -99,20 +92,9 @@ function pairingPage(opts: {
   const desktopNotice = opts.scopes.includes(DESKTOP_CONTROL_SCOPE)
     ? `<p class="notice">启用期间，获授权客户端可以向此绑定会话发送任务；任务可能按该 Desktop 会话的现有权限修改文件或执行命令。可随时在本机撤权；网页不能自行启用、绑定或调整权限。</p>`
     : "";
-  const executorNotice = opts.scopes.includes(EXECUTOR_CONTROL_SCOPE)
-    ? `<p class="notice">Executor / 本地编程工具：获授权客户端可向当前 active Executor Binding 发送任务，任务可能按该本地工具权限修改文件或执行命令。网页不能自行绑定或切换本地 Executor；绑定必须在本机显式确认。可随时在本机撤权。</p>`
-    : "";
   const accessSummary = opts.scopes.includes(DESKTOP_CONTROL_SCOPE)
     ? "Desktop 任务投递，可修改文件或执行命令"
-    : opts.scopes.includes(EXECUTOR_CONTROL_SCOPE)
-      ? "Executor / 本地编程工具任务投递，可修改文件或执行命令"
-      : opts.scopes.includes("codex.control")
-        ? "远程 Codex 任务控制，可修改工作区"
-        : opts.scopes.includes(WRITE_PROBE_SCOPE)
-          ? "工作区只读；另含 C2C 状态写入实验"
-          : opts.scopes.includes(EXECUTOR_READ_SCOPE)
-            ? "读取 Executor / 本地编程工具状态（只读）"
-            : "read-only";
+    : "read-only";
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -149,7 +131,6 @@ function pairingPage(opts: {
   <p class="sub">ChatGPT is requesting access to workspace <strong>${escapedWorkspaceName}</strong> (${accessSummary}):</p>
   <ul>${scopeList}</ul>
   ${desktopNotice}
-  ${executorNotice}
   <form method="POST" action="authorize">
     <input type="hidden" name="request_id" value="${escapedRequestId}">
     <input type="text" name="pairing_code" id="pairing_code" placeholder="XXXX-XXXX"
@@ -162,6 +143,8 @@ function pairingPage(opts: {
 </body>
 </html>`;
 }
+
+const MAX_PENDING_REQUESTS = 100;
 
 export function createOAuthRouter(deps: OAuthDeps): Router {
   const router = Router();
@@ -248,6 +231,11 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
     }
     if (!query.code_challenge || query.code_challenge_method !== "S256") {
       fail("invalid_request", "PKCE with S256 is required");
+      return;
+    }
+    if (pendingRequests.size >= MAX_PENDING_REQUESTS) {
+      setAuthSecurityHeaders(res);
+      res.status(429).send("Too many pending authorization requests. Please retry later.");
       return;
     }
     const scopes = filterScopes(query.scope);
