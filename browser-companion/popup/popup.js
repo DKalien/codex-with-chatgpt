@@ -17,7 +17,11 @@ function button(label, onClick) {
 
 async function refresh() {
   const { lastStatus } = await chrome.storage.local.get("lastStatus");
-  $("status").textContent = lastStatus ? `最近状态：${lastStatus.text}（${new Date(lastStatus.at).toLocaleTimeString()}）` : "";
+  // 心跳每 5 秒一次（后台标签页会被限流）；长时间没更新多半是扩展重载后对话页未刷新
+  const stale = lastStatus && Date.now() - Date.parse(lastStatus.at) > 90_000;
+  $("status").textContent = lastStatus
+    ? `最近状态：${lastStatus.text}（${new Date(lastStatus.at).toLocaleTimeString()}）${stale ? "——心跳已停止，请刷新已连接的对话页" : ""}`
+    : "尚无心跳：请打开已连接的对话页";
   const list = $("workspaces");
   list.replaceChildren();
   try {

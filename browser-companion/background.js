@@ -24,6 +24,7 @@ export function createBackground(chrome, fetchImpl) {
       method,
       headers: { authorization: `Bearer ${token}`, ...(body ? { "content-type": "application/json" } : {}) },
       body: body ? JSON.stringify(body) : undefined,
+      signal: AbortSignal.timeout(10_000), // 避免挂起的请求一直占住 inFlight
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.message || `Gateway 返回 ${res.status}`);
