@@ -10,3 +10,6 @@ dist/
 coverage/
 __pycache__/
 *.pyc
+.pytest_cache/
+.claude/settings.json
+.claude/*.local.json
