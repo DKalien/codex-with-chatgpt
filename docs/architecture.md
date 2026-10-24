@@ -150,7 +150,7 @@ export function createCompanionRouter(deps: { registry: Registry }): express.Rou
 
 错误响应：`{ error: code, message }`，状态码 400/401/404/409。
 
-扩展（`browser-companion/`）：已连接对话页每 5 秒心跳一次。页面就绪条件只有“输入框存在、为空、没有停止按钮”；用户自己输入的内容不会被覆盖，此时等待。投递时写入→点击发送→在对话中确认 `ATTEMPT_ID` 后 ack；点击前失败则 requeue，并且仅当输入框内容与本次写入完全一致时清空。最近一次心跳结果写入 `chrome.storage.local.lastStatus`，在弹窗顶部显示。
+扩展（`browser-companion/`）：已连接对话页每 5 秒心跳一次。页面就绪条件只有“输入框存在、为空、没有停止按钮”；用户自己输入的内容不会被覆盖，此时等待。投递时写入→点击发送→在对话中确认 `ATTEMPT_ID` 后 ack；点击前失败则 requeue，并且仅当输入框内容与本次写入完全一致时清空。已连接对话页最近一次心跳结果写入 `chrome.storage.local.lastStatus`，在弹窗顶部显示；与页面的单次通信最多等 30 秒，超时按结果未知处理。
 
 ### gateway/*
 

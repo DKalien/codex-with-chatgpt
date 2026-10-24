@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import vm from "node:vm";
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 // @ts-expect-error 纯 JS 模块
 import { conversationId, createBackground } from "../browser-companion/background.js";
 
@@ -86,8 +86,31 @@ describe("companion background", () => {
   it("does nothing on an unsafe page", async () => {
     const { bg, calls, status } = setup([ws([note("n1", "pending")])]);
     await bg.heartbeat({ safety: { safe: false, reasons: ["generating"] } }, tab);
-    expect(calls).toEqual([]);
+    expect(calls).toEqual(["GET /state"]);
     expect(status()).toBe("页面未就绪：generating");
+  });
+
+  it("does not report status for an unconnected conversation page", async () => {
+    const { bg, status } = setup([ws([note("n1", "pending")], "https://chatgpt.com/c/other")]);
+    await bg.heartbeat({ safety: { safe: false, reasons: ["composer_dirty"] } }, tab);
+    expect(status()).toBeUndefined();
+  });
+
+  it("releases the tab when the page never answers", async () => {
+    vi.useFakeTimers();
+    try {
+      const { bg, calls, sent, status } = setup([ws([note("n1", "pending")])], new Promise(() => {}));
+      const first = bg.heartbeat({ safety: SAFE }, tab);
+      while (!sent.length) await Promise.resolve(); // 超时计时器与 sendMessage 同步注册
+      await vi.advanceTimersByTimeAsync(30_000);
+      await first;
+      expect(status()).toBe("发送 c1 失败：页面无响应");
+      await bg.heartbeat({ safety: { safe: false, reasons: ["generating"] } }, tab); // 未被 inFlight 跳过
+      expect(calls.filter((c) => c.startsWith("GET /state"))).toHaveLength(2);
+      expect(status()).toBe("页面未就绪：generating");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("handles one delivery per tab at a time", async () => {

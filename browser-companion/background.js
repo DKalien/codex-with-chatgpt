@@ -35,14 +35,19 @@ export function createBackground(chrome, fetchImpl) {
     const tabId = sender?.tab?.id;
     const convId = conversationId(sender?.url ?? message?.href);
     if (tabId == null || !convId || inFlight.has(tabId)) return;
-    if (!message?.safety?.safe) return void setStatus(`页面未就绪：${message?.safety?.reasons?.[0] ?? "unknown"}`);
     inFlight.add(tabId);
-    // 通信失败（页面跳转等）视为结果未知，返回 undefined
-    const ask = (msg) => chrome.tabs.sendMessage(tabId, msg).catch(() => undefined);
+    // 通信失败（页面跳转等）或 30 秒无响应（如后台标签页被冻结）视为结果未知，返回 undefined；
+    // 超时保证 inFlight 必定释放，否则同一 tabId 刷新页面后仍会被一直跳过
+    const ask = (msg) => Promise.race([
+      chrome.tabs.sendMessage(tabId, msg).catch(() => undefined),
+      new Promise((resolve) => setTimeout(resolve, 30_000)),
+    ]);
     try {
       const { workspaces } = await api("GET", "/state");
       for (const ws of workspaces) {
         if (conversationId(ws.conversationUrl) !== convId) continue;
+        // 只有已连接的对话页才写状态，避免其他对话页的草稿覆盖真实原因
+        if (!message?.safety?.safe) return void setStatus(`页面未就绪：${message?.safety?.reasons?.[0] ?? "unknown"}`);
         // 已领取但未确认：只读核对页面是否已出现该消息，出现则补 ack；否则结果未知，只能人工重发。
         const claimed = ws.notifications.find((n) => n.state === "claimed");
         if (claimed) {
