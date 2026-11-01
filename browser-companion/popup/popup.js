@@ -20,16 +20,28 @@ async function refresh() {
   // 心跳每 5 秒一次（后台标签页会被限流）；长时间没更新多半是扩展重载后对话页未刷新
   const stale = lastStatus && Date.now() - Date.parse(lastStatus.at) > 90_000;
   $("status").textContent = lastStatus
-    ? `最近状态：${lastStatus.text}（${new Date(lastStatus.at).toLocaleTimeString()}）${stale ? "——已连接的对话页没有心跳：请确认它已打开（地址与连接时一致），必要时刷新" : ""}`
-    : "尚无心跳：请打开已连接的对话页";
+    ? `最近状态：${lastStatus.text}（${new Date(lastStatus.at).toLocaleTimeString()}）${stale ? "——已连接的对话页没有心跳：请打开项目绑定的那个对话（同项目的其他对话不接收），必要时刷新" : ""}`
+    : "尚无心跳：请打开项目绑定的那个对话";
   const list = $("workspaces");
   list.replaceChildren();
   try {
     const { workspaces } = await send({ type: "c2c.state" });
+    // 与后台一致：只按地址里 /c/<id> 匹配，同项目的其他对话不算
+    const convId = (url) => /\/c\/([\w-]+)/.exec(url ?? "")?.[1] ?? null;
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    const here = convId(tab?.url);
+    const bound = workspaces.find((ws) => ws.conversationUrl && convId(ws.conversationUrl) === here);
+    if (here) $("status").append(document.createElement("br"), bound
+      ? `当前页是「${bound.name}」绑定的对话`
+      : "当前页未绑定任何项目，不会接收消息；要改用当前页，先断开该项目再点“连接当前对话”");
     if (!workspaces.length) list.textContent = "尚未登记项目";
     for (const ws of workspaces) {
       const li = document.createElement("li");
-      li.append(`${ws.name}：${ws.conversationUrl ? "已连接" : "未连接"} `);
+      li.append(`${ws.name}：${ws.conversationUrl ? (ws === bound ? "已连接（当前页）" : "已连接其他对话") : "未连接"} `);
+      if (ws.conversationUrl && ws !== bound) {
+        const a = Object.assign(document.createElement("a"), { href: ws.conversationUrl, target: "_blank", textContent: "打开" });
+        li.append(a, " ");
+      }
       li.append(ws.conversationUrl
         ? button("断开", () => send({ type: "c2c.disconnect", workspaceId: ws.workspaceId }))
         : button("连接当前对话", () => send({ type: "c2c.connect", workspaceId: ws.workspaceId })));

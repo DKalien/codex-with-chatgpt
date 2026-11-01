@@ -55,7 +55,7 @@ c2c record -w <workspace> --command-id <commandId> --status ok|failed|blocked --
    - `c2c gateway start`，再 `c2c gateway status` 确认 running。
 2. 在 ChatGPT 创建 Connector，MCP 地址为 `<publicUrl>/mcp`，认证选 OAuth。授权页要求配对码时运行 `c2c gateway pair` 取一次性配对码（短时有效），由用户在授权页输入。
 3. 登记项目：`c2c workspace add -w <workspace>`，`c2c workspace list` 确认 workspaceId。
-4. 安装网页伴侣：Chrome/Edge 打开扩展页，开启开发者模式，加载 `%LOCALAPPDATA%\codex-with-chatgpt\app\dist\browser-companion`（源码目录为 `dist/browser-companion`）；`c2c companion token` 取 token 填入伴侣弹窗，并在对应 ChatGPT 对话页点击连接（把该对话绑定到项目）。token 泄露时用 `c2c companion token --rotate` 轮换。
+4. 安装网页伴侣：Chrome/Edge 打开扩展页，开启开发者模式，加载 `%LOCALAPPDATA%\codex-with-chatgpt\app\dist\browser-companion`（源码目录为 `dist/browser-companion`）；`c2c companion token` 取 token 填入伴侣弹窗，并在对应 ChatGPT 对话页点击连接（把该对话绑定到项目；只有这个对话接收回传，同项目的其他对话不接收）。token 泄露时用 `c2c companion token --rotate` 轮换。
 5. 绑定会话（见下）。
 
 ## 绑定会话
